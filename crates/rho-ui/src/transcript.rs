@@ -245,6 +245,7 @@ impl Transcript {
                 let took = self.took[turn].map(|took| time::took(took).into());
                 let act = Rc::clone(act);
                 let line = work::worked_line(
+                    turn,
                     took,
                     open,
                     move |window, cx| act(Action::Worked { turn }, window, cx),

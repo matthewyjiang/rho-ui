@@ -351,8 +351,11 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
 }
 
 /// "Worked for 1m 20s": a finished turn's working, folded behind one line
-/// that opens it. `took` is the turn's length, when this run saw it.
+/// that opens it. `took` is the turn's length, when this run saw it. The
+/// line is keyed by `turn`: GPUI keeps hover and click state per element id,
+/// so turns sharing one id would hover and open as one.
 pub(crate) fn worked_line(
+    turn: usize,
     took: Option<SharedString>,
     disclosure: Disclosure,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
@@ -363,7 +366,7 @@ pub(crate) fn worked_line(
         None => "Worked".to_owned(),
     };
     line(None, label.into_any_element(), Some(disclosure), cx)
-        .id("worked")
+        .id(SharedString::from(format!("worked-{turn}")))
         .test_support()
         // A rule to the right, so the line reads as a divider.
         .child(Separator::horizontal().flex_1())

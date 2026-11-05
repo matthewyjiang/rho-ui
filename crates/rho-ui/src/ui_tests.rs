@@ -251,7 +251,7 @@ fn new_thread_runs_a_turn_through_an_approval() {
 
     // The finished turn's working folds behind "Worked for"; inside, a
     // lone tool call is one line, and opening it shows its output.
-    ui.click("worked");
+    ui.click("worked-0");
     ui.wait_until("the turn's working", |window, _, _| {
         is_visible(window, "step-1")
     });
@@ -669,11 +669,11 @@ fn finished_work_folds_and_opens_in_levels() {
     ui.click("session-old");
     // Entries: reply, question, thought, read, search, command, edit, answer.
     ui.wait_until("the turn folded behind one line", |window, _, _| {
-        is_visible(window, "worked") && !is_visible(window, "work-2")
+        is_visible(window, "worked-0") && !is_visible(window, "work-2")
     });
     ui.shot("worked");
 
-    ui.click("worked");
+    ui.click("worked-0");
     ui.wait_until("the steps as one summary line", |window, _, _| {
         is_visible(window, "work-2") && !is_visible(window, "step-3")
     });
@@ -718,7 +718,7 @@ fn a_new_prompt_leaves_finished_turns_folded() {
     });
     ui.click("session-old");
     ui.wait_until("the replayed turn, folded", |window, _, _| {
-        is_visible(window, "worked")
+        is_visible(window, "worked-0")
     });
     let took = |ui: &mut Harness, turn: usize| {
         let app = ui.app.clone();
@@ -734,7 +734,7 @@ fn a_new_prompt_leaves_finished_turns_folded() {
         window.press("enter", cx);
     });
     ui.act(|window, _| {
-        assert!(is_visible(window, "worked"), "the old turn stays folded");
+        assert!(is_visible(window, "worked-0"), "the old turn stays folded");
         assert!(!is_visible(window, "work-2"), "its rows stay hidden");
     });
     ui.wait_until("the approval card", |window, _, _| {
@@ -756,6 +756,16 @@ fn a_new_prompt_leaves_finished_turns_folded() {
         matches!(thread.state(), RunState::Failed(_))
     });
     assert_eq!(took(&mut ui, 0), None, "the refusal times no old turn");
+
+    // Each turn has its own "Worked" line: opening the second opens only it.
+    ui.click("worked-1");
+    ui.wait_until("the slow turn's tool call", |window, _, _| {
+        is_visible(window, "step-9")
+    });
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "work-2"), "the old turn stays folded");
+    });
+    ui.shot("second-open");
 }
 
 /// A wheel notch glides over several frames instead of jumping.
