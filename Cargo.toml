@@ -6,8 +6,9 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 publish = false
-# The suppression lints below need 1.81+; gpui-kit needs 1.92.
-rust-version = "1.92"
+# The suppression lints below need 1.81+; gpui-pre-util (under gpui-kit)
+# uses slice::as_array, stable in 1.93.
+rust-version = "1.93"
 
 [workspace.dependencies]
 # Exact pins on purpose: ACP v2 is a draft that changes between releases, and

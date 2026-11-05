@@ -1,0 +1,3 @@
+[tools]
+# Rust 1.92 can't build gpui-pre-util (it uses slice::as_array, stable in 1.93).
+rust = "1.98.0"
