@@ -435,6 +435,9 @@ impl ThreadView {
                     },
                 )
                 .with_list_style(StyleRefinement::default().px_4())
+                // Kit pads every row but the last by 32px. The transcript
+                // spaces its own rows, so a folded row can take no space.
+                .with_row_style(StyleRefinement::default().pb_0())
                 .with_bottom_fade(cx.theme().background)
                 .size_full(),
             )

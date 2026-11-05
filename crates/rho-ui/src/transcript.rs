@@ -250,7 +250,7 @@ impl Transcript {
                     cx,
                 );
                 v_flex()
-                    .gap_4()
+                    .gap_3()
                     .child(line)
                     // A folded turn builds none of its rows.
                     .when(open.is_open(), |this| this.child(content()))
@@ -259,12 +259,13 @@ impl Transcript {
             _ => content(),
         };
         // A readable measure on wide windows. The gap below is here, not in
-        // the scroller's row style, so rows in a folded turn take no space.
+        // the scroller's row style (which the thread view zeroes), so rows in
+        // a folded turn take no space.
         div()
             .w_full()
             .max_w(rems(48.))
             .mx_auto()
-            .pb_4()
+            .pb_3()
             .child(row)
             .into_any_element()
     }
