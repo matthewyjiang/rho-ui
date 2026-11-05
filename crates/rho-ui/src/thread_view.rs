@@ -644,6 +644,14 @@ impl ThreadView {
     }
 }
 
+#[cfg(test)]
+impl ThreadView {
+    /// The session state behind this view, for UI tests.
+    pub(crate) fn thread(&self) -> &Thread {
+        &self.thread
+    }
+}
+
 impl Render for ThreadView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         v_flex()

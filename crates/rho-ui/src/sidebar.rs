@@ -5,6 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -15,7 +16,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, Context, IntoElement, ParentElement as _, SharedString, StyleRefinement, Styled as _,
+    div, rems, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StyleRefinement, Styled as _,
 };
 use rho_ui_core::{SessionId, SessionSummary};
 
@@ -59,11 +61,16 @@ pub(crate) fn render(
             active,
             attention,
         } = row;
+        // The menu numbers its rows; the suffix carries the session's own ID
+        // so UI tests can find a row by session.
+        let suffix_id = SharedString::from(format!("session-{id}"));
         SidebarMenuItem::new(title)
             .active(active)
             .label_style(StyleRefinement::default().truncate())
             .suffix(move |_, cx| {
                 h_flex()
+                    .id(suffix_id.clone())
+                    .test_support()
                     .flex_shrink_0()
                     .gap_1()
                     .text_xs()

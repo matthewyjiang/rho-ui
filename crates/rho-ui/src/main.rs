@@ -12,12 +12,14 @@ mod sidebar;
 mod thread_view;
 mod tool_card;
 mod transcript;
+#[cfg(test)]
+mod ui_tests;
 
 use std::path::PathBuf;
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
-    px, size, AppContext as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size, App, AppContext as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
 };
 use rho_ui_core::AgentCommand;
 
@@ -98,31 +100,42 @@ fn main() {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
-            gpui_kit::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
-            cx.bind_keys([
-                KeyBinding::new("ctrl-n", NewThread, Some("RhoApp")),
-                KeyBinding::new("escape", StopTurn, Some("ThreadView")),
-                KeyBinding::new("ctrl-q", Quit, None),
-            ]);
+            init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
-
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1200.), px(800.)), cx)),
-                window_min_size: Some(size(px(720.), px(480.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("rho".into()),
-                    ..Default::default()
-                }),
-                app_id: Some("rho-ui".to_owned()),
-                ..Default::default()
-            };
+            let options = window_options(cx);
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| RhoApp::new(launch, window, cx))
             })
             .expect("failed to open the rho-ui window");
             cx.activate(true);
         });
+}
+
+/// App-wide setup shared by `main` and the UI tests: GPUI Kit, the theme,
+/// and key bindings.
+fn init(cx: &mut App) {
+    gpui_kit::init(cx);
+    Theme::change(ThemeMode::Dark, None, cx);
+    cx.bind_keys([
+        KeyBinding::new("ctrl-n", NewThread, Some("RhoApp")),
+        KeyBinding::new("escape", StopTurn, Some("ThreadView")),
+        KeyBinding::new("ctrl-q", Quit, None),
+    ]);
+}
+
+/// The main window: centered, large enough for the sidebar and a readable
+/// transcript side by side.
+fn window_options(cx: &App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(1200.), px(800.)), cx)),
+        window_min_size: Some(size(px(720.), px(480.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("rho".into()),
+            ..Default::default()
+        }),
+        app_id: Some("rho-ui".to_owned()),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

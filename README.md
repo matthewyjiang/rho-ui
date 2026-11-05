@@ -41,7 +41,10 @@ Neither crate is published to crates.io.
 ## Test
 
 ```bash
-cargo test -p rho-ui-core
+cargo test
 ```
 
-The agent tests run `crates/rho-ui-core/tests/fake_agent.py`, a scripted ACP agent, so they need `python3` but no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real `rho acp`.
+- `rho-ui-core` tests run `crates/rho-ui-core/tests/fake_agent.py`, a scripted ACP agent, so they need `python3` but no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real `rho acp`.
+- `rho-ui` UI tests (`crates/rho-ui/src/ui_tests.rs`) open the real app in an offscreen window, click and type through GPUI Kit's test helpers, and talk to the same fake agent. They need a working Vulkan driver; Mesa lavapipe works without a GPU. Each run saves screenshots to `target/ui-shots/` for review.
+
+`Cargo.lock` follows GPUI Kit 0.9.0's own lock file; its `test-support` feature does not resolve against newer versions of some shared crates.

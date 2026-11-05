@@ -465,6 +465,15 @@ impl RhoApp {
     }
 }
 
+#[cfg(test)]
+impl RhoApp {
+    /// The thread the main pane shows, for UI tests.
+    pub(crate) fn active_thread(&self) -> Option<Entity<ThreadView>> {
+        let id = self.active.as_ref()?;
+        self.threads.get(id).map(|open| open.view.clone())
+    }
+}
+
 impl Render for RhoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let _ = window;

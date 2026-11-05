@@ -19,6 +19,8 @@ For UI work in `crates/rho-ui`, follow GPUI Kit's own guides: https://gpui-kit.c
 - `rho-ui-core` has no GUI code and no async runtime. The UI drives it on GPUI's executors, and a future daemon will reuse it.
 - Lints are set once in the root `Cargo.toml` (`[workspace.lints]`, from BeautifulRust's `lints.toml`) and `clippy.toml`. Every crate opts in with `[lints] workspace = true`. Fix a lint rather than silencing it. When one is wrong for an item, use `#[expect(clippy::name, reason = "...")]` on that item.
 - Nothing here is published to crates.io (`publish = false`).
+- Check UI changes with the headless UI tests in `crates/rho-ui/src/ui_tests.rs`, and look at the screenshots in `target/ui-shots/`. Don't drive the user's live desktop with `wtype` or screenshots of their screen: they may be using it.
+- A UI test finds elements by `ElementId` (GPUI Kit controls register themselves; custom elements need `.test_support()`). Assert both what the user sees and the thread state.
 
 ## Before you hand back
 
