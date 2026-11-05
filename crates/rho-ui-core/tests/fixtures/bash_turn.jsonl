@@ -1,0 +1,14 @@
+{"sessionUpdate": "user_message", "messageId": "rho-replay-msg-fd64ea23-3123-416a-9cff-ec97c91951b7-0-0", "content": [{"type": "text", "text": "Run `echo hello-from-trace` with your bash tool, then reply with one short sentence."}]}
+{"sessionUpdate": "state_update", "state": "running"}
+{"sessionUpdate": "usage_update", "used": 13258, "size": 1000000}
+{"sessionUpdate": "tool_call_update", "toolCallId": "toolu_012vTAPCTTs85mxXWNQhAUS8", "name": "bash", "title": "echo hello-from-trace", "kind": "execute", "status": "in_progress", "content": [], "locations": [], "rawInput": {"command": "echo hello-from-trace"}}
+{"sessionUpdate": "tool_call_update", "toolCallId": "toolu_012vTAPCTTs85mxXWNQhAUS8", "status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "stdout:\nhello-from-trace\n\n\ntime: 0.0s"}}]}
+{"sessionUpdate": "usage_update", "used": 19795, "size": 1000000, "cost": {"amount": 0.002005, "currency": "USD"}}
+{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "The command print"}}
+{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "ed `hello-from-tr"}}
+{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "ace`, so"}}
+{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": " the bash t"}}
+{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "ool is"}}
+{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": " working."}}
+{"sessionUpdate": "usage_update", "used": 19837, "size": 1000000, "cost": {"amount": 0.002223, "currency": "USD"}}
+{"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"}

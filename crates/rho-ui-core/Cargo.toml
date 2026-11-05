@@ -1,0 +1,23 @@
+[package]
+name = "rho-ui-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# Everything the desktop UI needs from an agent, with no GUI dependency, so a
+# future daemon can host the same code. Runtime-agnostic: callers drive the
+# connection on whatever executor they own.
+[dependencies]
+agent-client-protocol = { workspace = true, features = ["process", "unstable_protocol_v2"] }
+async-channel = "2"
+futures = "0.3"
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+smol = "2"
+
+[lints]
+workspace = true
