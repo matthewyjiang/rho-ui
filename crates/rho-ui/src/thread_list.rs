@@ -1,6 +1,6 @@
 //! The sidebar's data: every listed thread as a flat row, which shelf each
 //! is on, and the items the sidebar's one scrolling list shows: active
-//! threads, then each shelf's header and, when it's open, its threads.
+//! threads, a gap, then each shelf's header and, when it's open, its threads.
 //! Plain data with no GUI code; [`crate::sidebar`] draws it.
 
 use std::{cmp::Reverse, path::PathBuf, time::Instant};
@@ -93,6 +93,11 @@ pub(crate) enum Item {
     Shelved(usize),
     /// A shelf's header, with its count; it opens and folds the shelf.
     Header(Shelf),
+    /// The gap above the shelves. The sidebar stretches it to fill the
+    /// space the list leaves, so folded shelves sit at the bottom and
+    /// only rise as opened shelves fill it. Search results have none: they
+    /// read from the top.
+    Gap,
 }
 
 #[derive(Default)]
@@ -260,6 +265,12 @@ impl ThreadList {
                 items.insert(start, Item::Header(shelf));
             }
         }
+        let first_header = items
+            .iter()
+            .position(|item| matches!(item, Item::Header(_)));
+        if let (Some(first), true) = (first_header, self.query.is_empty()) {
+            items.insert(first, Item::Gap);
+        }
         self.counts = counts;
         self.items = items;
     }
@@ -330,14 +341,15 @@ mod tests {
         }
     }
 
-    /// What the list shows: thread titles, and shelf headers as
-    /// `[Settled 2]`.
+    /// What the list shows: thread titles, shelf headers as `[Settled 2]`,
+    /// and the gap above them as `~`.
     fn shown(list: &ThreadList) -> Vec<String> {
         list.items()
             .iter()
             .map(|&item| match item {
                 Item::Thread(ix) | Item::Shelved(ix) => list.row_at(ix).title().to_string(),
                 Item::Header(shelf) => format!("[{} {}]", shelf.label(), list.count(shelf)),
+                Item::Gap => "~".to_owned(),
             })
             .collect()
     }
@@ -414,13 +426,22 @@ mod tests {
         shelves.settle("a", 5);
         shelves.snooze("old", 100);
         rebuild(&mut list, &shelves, 5);
-        assert_eq!(shown(&list), ["Fix boot", "[Snoozed 1]", "[Settled 1]"]);
+        assert_eq!(
+            shown(&list),
+            ["Fix boot", "~", "[Snoozed 1]", "[Settled 1]"]
+        );
 
         list.toggle(Shelf::Settled);
         rebuild(&mut list, &shelves, 5);
         assert_eq!(
             shown(&list),
-            ["Fix boot", "[Snoozed 1]", "[Settled 1]", "Design the UI"]
+            [
+                "Fix boot",
+                "~",
+                "[Snoozed 1]",
+                "[Settled 1]",
+                "Design the UI"
+            ]
         );
 
         // A search opens every shelf and counts only matches.
@@ -429,7 +450,10 @@ mod tests {
         rebuild(&mut list, &shelves, 5);
         shelves.settle("a", 5);
         rebuild(&mut list, &shelves, 5);
-        assert_eq!(shown(&list), ["Fix boot", "[Snoozed 1]", "[Settled 1]"]);
+        assert_eq!(
+            shown(&list),
+            ["Fix boot", "~", "[Snoozed 1]", "[Settled 1]"]
+        );
 
         list.set_query("work");
         rebuild(&mut list, &shelves, 5);

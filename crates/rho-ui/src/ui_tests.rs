@@ -15,7 +15,7 @@ use std::{
 use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, HeadlessAppContext,
-    MouseButton, Window, WindowBounds, WindowOptions,
+    MouseButton, Pixels, Window, WindowBounds, WindowOptions,
 };
 use rho_ui_core::{AgentCommand, ConfigKind, Entry, RunState, Thread, ToolStatus};
 
@@ -190,6 +190,14 @@ fn labels(window: &Window) -> Vec<String> {
 
 fn is_visible(window: &Window, id: &'static str) -> bool {
     window.try_find(id).is_some_and(|element| element.visible())
+}
+
+/// Where a visible element is drawn.
+fn bounds(window: &Window, id: &'static str) -> Option<Bounds<Pixels>> {
+    window
+        .try_find(id)
+        .filter(gpui_kit::test::ElementSnapshot::visible)
+        .map(|element| element.bounds())
 }
 
 /// Sidebar, new thread draft, prompt, approval, tool card, reply, idle.
@@ -376,23 +384,39 @@ fn settle_and_snooze_move_threads_between_lists() {
     ui.shot("both-shelves");
 }
 
-/// Threads from elsewhere start settled. A draft makes no session until its
-/// first message, and leaving it drops it. A thread can be deleted.
+/// Threads from elsewhere start settled, and with nothing active the folded
+/// shelf sits at the bottom of the sidebar. A draft makes no session until
+/// its first message, and leaving it drops it. A thread can be deleted.
 #[test]
 fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
     let mut ui = Harness::start_with("drafts", fake_agent(), Shelves::default());
-    ui.wait_until("the settled entry", |window, _, _| {
-        is_visible(window, "toggle-settled") && !is_visible(window, "session-s1")
+    // Below the list, the sidebar has only its footer (about 50 px).
+    ui.wait_until("the settled entry at the bottom", |window, _, _| {
+        bounds(window, "toggle-settled").is_some_and(|header| header.bottom() > px(700.))
+            && !is_visible(window, "session-s1")
     });
     ui.shot("settled-by-default");
+    let folded = ui
+        .cx
+        .update_window(ui.window, |_, window, _| bounds(window, "toggle-settled"))
+        .expect("window is open")
+        .expect("the settled header is drawn");
 
     // Leaving an unused draft drops it, and the agent never made a session.
     ui.click("new-thread");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.click("toggle-settled");
+    // Opening it lifts the header just enough for its rows to fit below.
     ui.wait_until("the settled shelf", |window, _, _| {
-        is_visible(window, "session-s1")
+        let (Some(header), Some(last)) = (
+            bounds(window, "toggle-settled"),
+            bounds(window, "session-old"),
+        ) else {
+            return false;
+        };
+        header.top() < folded.top() && last.top() > header.bottom() && last.bottom() > px(700.)
     });
+    ui.shot("settled-opened");
     ui.click("session-s1");
     ui.wait_until("the saved thread", |window, _, app| {
         !is_visible(window, "draft-view") && app.active_thread().is_some()

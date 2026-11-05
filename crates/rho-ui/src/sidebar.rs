@@ -1,5 +1,6 @@
 //! The thread list, drawn: one scrolling list of active threads, newest
-//! first, then the Snoozed and Settled shelves. An active row shows the
+//! first, then the Snoozed and Settled shelves, held at the bottom until
+//! opened shelves fill the list. An active row shows the
 //! project, the thread's status or age, its title, and its branch; hovering
 //! it swaps the status for Snooze and Settle. A shelf opens from its header
 //! into one-line rows, and hovering one shows its details in a card.
@@ -34,10 +35,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, size, Anchor, AnyElement, AppContext as _, Context, Entity, EventEmitter, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement, Rems, Render, ScrollStrategy,
-    SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task,
-    WeakEntity, Window,
+    canvas, div, px, rems, size, Anchor, AnyElement, AppContext as _, Context, Entity,
+    EventEmitter, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement, Pixels,
+    Rems, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement,
+    Styled, Subscription, Task, WeakEntity, Window,
 };
 use rho_ui_core::{SessionId, SessionSummary};
 
@@ -74,12 +75,14 @@ const SHELVED_ROW_REMS: f32 = TITLE_REMS + 2. * SHELVED_PAD_REMS + 2. * GUTTER_R
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
 
-/// Each item's height.
+/// Each item's height. The gap's comes from the list's height instead; see
+/// [`SidebarView::render_list`].
 fn item_rems(item: Item) -> f32 {
     match item {
         Item::Thread(_) => ROW_REMS,
         Item::Shelved(_) => SHELVED_ROW_REMS,
         Item::Header(_) => HEADER_REMS,
+        Item::Gap => 0.,
     }
 }
 
@@ -199,6 +202,9 @@ pub(crate) struct SidebarView {
     agent: Option<SharedString>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
+    /// The list's height in the last frame, which the gap above the
+    /// shelves fills up to.
+    viewport: Pixels,
     _subscriptions: [Subscription; 2],
     _tick: Task<()>,
 }
@@ -240,6 +246,7 @@ impl SidebarView {
             agent: None,
             search,
             scroll: VirtualListScrollHandle::new(),
+            viewport: Pixels::ZERO,
             _subscriptions: subscriptions,
             _tick: tick,
         }
@@ -465,6 +472,7 @@ impl SidebarView {
                     self.render_shelved(row, projects.get(row.project), clock, &view, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
+                Item::Gap => div().into_any_element(),
             })
             .collect()
     }
@@ -732,21 +740,50 @@ impl SidebarView {
         }
         // Heights are known, so the list never measures a row.
         let rem = window.rem_size();
-        let sizes = self
+        let mut sizes: Vec<_> = self
             .list
             .items()
             .iter()
             .map(|&item| size(px(0.), rem * item_rems(item)))
             .collect();
-        v_virtual_list(
-            cx.entity(),
-            "threads",
-            Rc::new(sizes),
-            |this, range, _, cx| this.render_items(range, cx),
+        // The gap takes whatever height the rows leave, pushing the shelves
+        // to the bottom; once they overflow it is gone.
+        if let Some(gap) = self.list.items().iter().position(|&item| item == Item::Gap) {
+            let rows: Pixels = sizes.iter().map(|size| size.height).sum();
+            sizes[gap].height = (self.viewport - rows).max(Pixels::ZERO);
+        }
+        let view = cx.entity().downgrade();
+        // Kit's list doesn't report its height, so a canvas behind it
+        // measures it and redraws the sidebar when it changes.
+        let measure = canvas(
+            move |bounds, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if this.viewport != bounds.size.height {
+                        this.viewport = bounds.size.height;
+                        cx.notify();
+                    }
+                });
+            },
+            |_, (), _, _| {},
         )
-        .track_scroll(&self.scroll)
-        .flex_1()
-        .into_any_element()
+        .absolute()
+        .size_full();
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(measure)
+            .child(
+                v_virtual_list(
+                    cx.entity(),
+                    "threads",
+                    Rc::new(sizes),
+                    |this, range, _, cx| this.render_items(range, cx),
+                )
+                .track_scroll(&self.scroll)
+                .size_full(),
+            )
+            .into_any_element()
     }
 
     fn render_footer(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
