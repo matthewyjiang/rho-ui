@@ -10,7 +10,7 @@
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     label::Label,
     list::{List, ListDelegate, ListEvent, ListItem, ListState},
@@ -223,7 +223,7 @@ impl SessionSettings {
                 .shown
                 .iter()
                 .filter(|option| option.category() == ConfigCategory::Mode)
-                .filter_map(|option| mode_menu(option, availability, &weak)),
+                .filter_map(|option| mode_menu(option, availability, &weak, cx)),
         )
     }
 
@@ -254,7 +254,7 @@ impl SessionSettings {
                 .when_some(focus, |this, focus| this.track_focus(&focus))
                 .trigger(
                     Button::new("config-panel")
-                        .ghost()
+                        .custom(footer_button(cx))
                         .small()
                         .when(settings.is_fast(), |this| {
                             this.icon(Lucide::Zap).tooltip("Fast mode")
@@ -318,11 +318,24 @@ impl SessionSettings {
     }
 }
 
-/// A ghost button naming the current mode, opening a menu of the others.
+/// A borderless button for the composer footer. Kit's ghost button hovers
+/// with `accent`, which the dark theme makes the same color as the
+/// composer's `secondary` background, so its hover can't be seen there. This
+/// one tints the background with the foreground color instead, which shows
+/// on any surface.
+fn footer_button(cx: &App) -> ButtonCustomVariant {
+    let foreground = cx.theme().foreground;
+    ButtonCustomVariant::new(cx)
+        .hover(foreground.alpha(0.08))
+        .active(foreground.alpha(0.12))
+}
+
+/// A footer button naming the current mode, opening a menu of the others.
 fn mode_menu(
     option: &ConfigOption,
     availability: Availability,
     settings: &WeakEntity<SessionSettings>,
+    cx: &App,
 ) -> Option<AnyElement> {
     let ConfigKind::Select { choices, .. } = option.kind() else {
         return None;
@@ -334,7 +347,7 @@ fn mode_menu(
     let settings = settings.clone();
     Some(
         Button::new(SharedString::from(format!("config-{config_id}")))
-            .ghost()
+            .custom(footer_button(cx))
             .small()
             .icon(Lucide::Shield)
             .label(current.name().to_owned())

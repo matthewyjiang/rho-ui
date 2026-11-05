@@ -309,6 +309,9 @@ fn composer_settings_change_the_session() {
         is_visible(window, "config-panel") && is_visible(window, "config-mode")
     });
     ui.shot("composer");
+    // Footer buttons sit on the composer's own color; hover must still show.
+    ui.act(|window, cx| window.hover("config-mode", cx));
+    ui.shot("mode-hover");
 
     // Arrows start at the model in use; Enter picks and closes the panel.
     ui.click("config-panel");
