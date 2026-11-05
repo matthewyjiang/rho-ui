@@ -7,20 +7,22 @@ use std::{collections::VecDeque, path::PathBuf, rc::Rc, time::Instant};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
     alert::Alert,
+    empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
     input::{InputEvent, TextareaState},
-    message_scroller::{MessageScroller, MessageScrollerState},
+    message_scroller::MessageScroller,
     spinner::Spinner,
     v_flex, ActiveTheme as _, Icon, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    div, px, rems, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Agent, AgentError, ConfigValue, PermissionRequest, RunState, SessionSetup, Thread, ThreadUpdate,
+    Agent, AgentError, ConfigValue, PermissionRequest, RunState, SessionId, SessionSetup, Thread,
+    ThreadUpdate,
 };
 
 use crate::{
@@ -28,9 +30,9 @@ use crate::{
     composer::ComposerMode,
     composer::{self, Composer},
     config_bar::{Availability, ConfigBar},
-    projects::ProjectRef,
+    projects::{Project, ProjectRef},
     thread_list::{Activity, LiveThread, NEW_THREAD, UNTITLED},
-    transcript::{self, Disclosure, RowContext, ToggleHandler},
+    transcript::{ActionHandler, Transcript},
     StopTurn,
 };
 
@@ -38,6 +40,8 @@ use crate::{
 pub(crate) enum ThreadEvent {
     /// Title or activity changed; see [`ThreadView::live`].
     LiveChanged,
+    /// The agent accepted a prompt from here, so the thread is rho-ui's.
+    Prompted,
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
     Saved,
@@ -60,10 +64,7 @@ pub(crate) struct ThreadView {
     /// The project and branch, for the header.
     project: ProjectRef,
     loading: Loading,
-    scroller: Entity<MessageScrollerState>,
-    /// One flag per entry the scroller knows about: the user opened this
-    /// thought or tool card.
-    expanded: Vec<bool>,
+    transcript: Transcript,
     composer: Entity<TextareaState>,
     config_bar: ConfigBar,
     /// `set_config` calls in flight.
@@ -101,11 +102,11 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+        let transcript = Transcript::new(cx);
         let composer = composer::new_state(window, cx);
         let subscriptions = vec![
             // The jump-to-latest button follows the scroll position.
-            cx.observe(&scroller, |_, _, cx| cx.notify()),
+            cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
             // The header shows the branch, which can change.
             cx.observe(project.table(), |_, _, cx| cx.notify()),
             cx.subscribe_in(
@@ -126,8 +127,7 @@ impl ThreadView {
             // A resumed session is already saved.
             prompted: matches!(loading, Loading::Resuming),
             loading,
-            scroller,
-            expanded: Vec::new(),
+            transcript,
             composer,
             config_bar: ConfigBar::default(),
             config_pending: 0,
@@ -141,10 +141,14 @@ impl ThreadView {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
-        view.append_rows(cx);
+        view.transcript.sync(view.thread.entries(), cx);
         view.config_bar.sync(view.thread.config(), window, cx);
         view.reported = (view.title().to_owned(), view.activity());
         view
+    }
+
+    pub(crate) fn id(&self) -> &SessionId {
+        self.thread.id()
     }
 
     /// What the sidebar shows for this thread.
@@ -193,12 +197,10 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        // The thread names the row it changed; only that row is remeasured.
+        // The thread names the entry it changed; only its row is remeasured.
+        // A new entry gets its row in `after_change`.
         if let Some(ix) = self.thread.apply(update) {
-            if ix < self.expanded.len() {
-                self.scroller
-                    .update(cx, |scroller, cx| scroller.remeasure_items(ix..ix + 1, cx));
-            }
+            self.transcript.changed(self.thread.entries(), ix, cx);
         }
         self.after_change(window, cx);
     }
@@ -239,16 +241,20 @@ impl ThreadView {
     /// Brings the scroller, settings, timers and sidebar up to date with
     /// `thread`.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.append_rows(cx);
+        self.transcript.sync(self.thread.entries(), cx);
         if !self.config_bar.is_synced(self.thread.config()) {
             self.config_bar.sync(self.thread.config(), window, cx);
         }
         let now = Instant::now();
         let busy = self.is_busy();
         match (busy, self.busy_since) {
-            (true, None) => self.busy_since = Some(now),
-            (false, Some(_)) => {
+            (true, None) => {
+                self.busy_since = Some(now);
+                self.transcript.begin_turn(cx);
+            }
+            (false, Some(since)) => {
                 self.busy_since = None;
+                self.transcript.end_turn(now - since, cx);
                 cx.emit(ThreadEvent::Saved);
             }
             _ => {}
@@ -265,26 +271,6 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// Tells the scroller about entries added since it last heard.
-    fn append_rows(&mut self, cx: &mut Context<'_, Self>) {
-        let len = self.thread.entries().len();
-        if len > self.expanded.len() {
-            let added = len - self.expanded.len();
-            self.scroller
-                .update(cx, |scroller, cx| scroller.append(added, cx));
-            self.expanded.resize(len, false);
-        }
-    }
-
-    fn toggle_expanded(&mut self, ix: usize, cx: &mut Context<'_, Self>) {
-        if let Some(expanded) = self.expanded.get_mut(ix) {
-            *expanded = !*expanded;
-            self.scroller
-                .update(cx, |scroller, cx| scroller.remeasure_items(ix..ix + 1, cx));
-            cx.notify();
-        }
-    }
-
     fn send(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.is_busy() || !matches!(self.loading, Loading::Ready) {
             return;
@@ -295,7 +281,14 @@ impl ThreadView {
         }
         self.composer
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.submit(text, window, cx);
+    }
+
+    /// Sends `text` as the next prompt. A failed send puts it back in the
+    /// composer.
+    pub(crate) fn submit(&mut self, text: String, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.sending = true;
+        self.transcript.expect_turn();
         self.error = None;
         self.after_change(window, cx);
 
@@ -307,6 +300,7 @@ impl ThreadView {
                 this.sending = false;
                 match result {
                     Ok(()) => {
+                        cx.emit(ThreadEvent::Prompted);
                         if !this.prompted {
                             this.prompted = true;
                             cx.emit(ThreadEvent::Saved);
@@ -391,108 +385,55 @@ impl ThreadView {
         .detach();
     }
 
-    /// The title, with the project and branch under it.
-    fn render_header(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let project = self.project.read(cx);
-        let project = h_flex()
-            .gap_1()
-            .min_w_0()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(div().truncate().child(project.name.clone()))
-            .when_some(project.branch.clone(), |this, branch| {
-                this.child(Icon::new(Lucide::GitBranch).xsmall().ml_2())
-                    .child(div().truncate().child(branch))
-            });
-        v_flex()
-            .flex_shrink_0()
-            .min_h(px(44.))
-            .justify_center()
-            .px_4()
-            .py_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .truncate()
-                    .font_medium()
-                    .child(self.title().to_owned()),
-            )
-            .child(project)
-    }
-
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> AnyElement {
         if self.thread.entries().is_empty() {
-            let placeholder = v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground);
+            let placeholder = Empty::new();
             return match &self.loading {
-                Loading::Resuming => placeholder.child(Spinner::new()).child("Loading thread…"),
-                Loading::Failed(message) => placeholder.child(
-                    div().max_w(rems(36.)).child(
+                Loading::Resuming => placeholder.header(
+                    EmptyHeader::new()
+                        .media(EmptyMedia::new().child(Spinner::new()))
+                        .description(EmptyDescription::new().child("Loading thread…")),
+                ),
+                Loading::Failed(message) => placeholder.content(
+                    EmptyContent::new().max_w(rems(36.)).child(
                         Alert::error("resume-error", SharedString::from(message.clone()))
                             .title("Couldn't open this thread"),
                     ),
                 ),
-                Loading::Ready => placeholder.child("Send a message to start."),
+                Loading::Ready => placeholder.header(
+                    EmptyHeader::new()
+                        .description(EmptyDescription::new().child("Send a message to start.")),
+                ),
             }
             .into_any_element();
         }
 
         let view = cx.entity().downgrade();
-        let row_view = view;
+        let act: ActionHandler = {
+            let view = view.clone();
+            Rc::new(move |action, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.transcript.act(action, this.thread.entries(), cx);
+                    cx.notify();
+                });
+            })
+        };
         div()
             .flex_1()
             .min_h_0()
             .child(
                 MessageScroller::new(
                     SharedString::from(format!("transcript-{}", self.thread.id())),
-                    self.scroller.clone(),
-                    move |ix, _, cx| {
-                        let Some(view) = row_view.upgrade() else {
-                            return div().into_any_element();
-                        };
-                        let this = view.read(cx);
-                        let entries = this.thread.entries();
-                        let Some(entry) = entries.get(ix) else {
-                            return div().into_any_element();
-                        };
-                        let disclosure = if this.expanded.get(ix).copied().unwrap_or(false) {
-                            Disclosure::Expanded
-                        } else {
-                            Disclosure::Collapsed
-                        };
-                        let live = this.is_busy() && ix + 1 == entries.len();
-                        let on_toggle: ToggleHandler = {
-                            let view = view.downgrade();
-                            Rc::new(move |_, cx| {
-                                let _ = view.update(cx, |this, cx| this.toggle_expanded(ix, cx));
-                            })
-                        };
-                        let row = transcript::render_row(
-                            entry,
-                            RowContext {
-                                ix,
-                                disclosure,
-                                live,
-                                on_toggle,
-                            },
-                            cx,
-                        );
-                        // A readable measure on wide windows.
-                        div()
-                            .w_full()
-                            .max_w(rems(48.))
-                            .mx_auto()
-                            .child(row)
-                            .into_any_element()
+                    self.transcript.scroller().clone(),
+                    move |ix, _, cx| match view.upgrade() {
+                        Some(view) => {
+                            let this = view.read(cx);
+                            this.transcript
+                                .render_row(ix, this.thread.entries(), &act, cx)
+                        }
+                        None => div().into_any_element(),
                     },
                 )
-                .with_row_style(StyleRefinement::default().pb_4())
                 .with_list_style(StyleRefinement::default().px_4())
                 .with_bottom_fade(cx.theme().background)
                 .size_full(),
@@ -596,6 +537,18 @@ impl ThreadView {
     pub(crate) fn thread(&self) -> &Thread {
         &self.thread
     }
+
+    /// The transcript, for UI tests.
+    pub(crate) fn transcript(&self) -> &Transcript {
+        &self.transcript
+    }
+
+    /// How far down the transcript is scrolled, in pixels from the top of
+    /// the first row on screen, for UI tests.
+    pub(crate) fn scroll_top(&self, cx: &App) -> (usize, f32) {
+        let top = self.transcript.scroller().read(cx).logical_scroll_top();
+        (top.item_ix, f32::from(top.offset_in_item))
+    }
 }
 
 impl Render for ThreadView {
@@ -606,8 +559,33 @@ impl Render for ThreadView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
             .size_full()
-            .child(self.render_header(cx))
+            .child(header(self.title().to_owned(), self.project.read(cx), cx))
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }
+}
+
+/// A thread's title, with its project and branch under it. Shared with the
+/// new-thread draft.
+pub(crate) fn header(title: String, project: &Project, cx: &App) -> impl IntoElement {
+    let details = h_flex()
+        .gap_1()
+        .min_w_0()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(div().truncate().child(project.name.clone()))
+        .when_some(project.branch.clone(), |this, branch| {
+            this.child(Icon::new(Lucide::GitBranch).xsmall().ml_2())
+                .child(div().truncate().child(branch))
+        });
+    v_flex()
+        .flex_shrink_0()
+        .min_h(px(44.))
+        .justify_center()
+        .px_4()
+        .py_1()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(div().truncate().font_medium().child(title))
+        .child(details)
 }

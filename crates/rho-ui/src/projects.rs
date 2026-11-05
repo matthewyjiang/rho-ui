@@ -15,17 +15,12 @@ use crate::repo::{self, Repo};
 /// How often branches are re-read. A branch switch shows within this long.
 const REREAD: Duration = Duration::from_secs(30);
 
-/// Badge colors come from a palette this size; see [`Repo::hue`].
-pub(crate) const PALETTE_SIZE: usize = 6;
-
 /// One workspace directory, with its display strings made once.
 pub(crate) struct Project {
     cwd: PathBuf,
     repo: Repo,
     pub(crate) name: SharedString,
     pub(crate) initials: SharedString,
-    /// Index into the badge palette.
-    pub(crate) hue: usize,
     pub(crate) branch: Option<SharedString>,
 }
 
@@ -35,7 +30,6 @@ impl Project {
             cwd,
             name: repo.name.clone().into(),
             initials: repo.initials().into(),
-            hue: repo.hue(PALETTE_SIZE),
             branch: repo.branch.clone().map(SharedString::from),
             repo,
         }

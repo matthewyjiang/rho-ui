@@ -39,20 +39,6 @@ impl Repo {
     fn short_name(&self) -> &str {
         self.name.rsplit('/').next().unwrap_or(&self.name)
     }
-
-    /// A stable index into a small palette, so one project keeps one color.
-    /// Hashes [`Self::short_name`], which the folder name usually matches
-    /// before the remote is read, so the color doesn't jump.
-    pub(crate) fn hue(&self, colors: usize) -> usize {
-        // FNV-1a: tiny, stable across runs, good enough to spread names.
-        let hash = self
-            .short_name()
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-            });
-        usize::try_from(hash % u64::try_from(colors.max(1)).unwrap_or(1)).unwrap_or(0)
-    }
 }
 
 /// What to show for `cwd` before [`inspect`] has read it: the folder name.

@@ -36,6 +36,8 @@ type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposerMode {
     Send,
+    /// The thread is being created: the box is disabled and Send spins.
+    Starting,
     /// A turn is running: the box is disabled and Stop replaces Send.
     Stop,
 }
@@ -43,7 +45,7 @@ pub(crate) enum ComposerMode {
 #[derive(IntoElement)]
 pub(crate) struct Composer {
     state: Entity<TextareaState>,
-    busy: bool,
+    mode: ComposerMode,
     /// Session settings, left of the footer.
     controls: Option<AnyElement>,
     /// Context use and cost, before Send.
@@ -61,7 +63,7 @@ impl Composer {
     ) -> Self {
         Self {
             state: state.clone(),
-            busy: mode == ComposerMode::Stop,
+            mode,
             controls: None,
             meta: None,
             on_send: Rc::new(on_send),
@@ -83,7 +85,7 @@ impl Composer {
 impl RenderOnce for Composer {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let empty = self.state.read(cx).value().trim().is_empty();
-        let action = if self.busy {
+        let action = if self.mode == ComposerMode::Stop {
             let on_stop = self.on_stop;
             Button::new("composer-stop")
                 .small()
@@ -100,6 +102,7 @@ impl RenderOnce for Composer {
                 .icon(IconName::ArrowUp)
                 .label("Send")
                 .disabled(empty)
+                .loading(self.mode == ComposerMode::Starting)
                 .on_click(move |_, window, cx| on_send(window, cx))
         };
         v_flex()
@@ -113,7 +116,7 @@ impl RenderOnce for Composer {
             .child(
                 Textarea::new(&self.state)
                     .appearance(false)
-                    .disabled(self.busy)
+                    .disabled(self.mode != ComposerMode::Send)
                     .aria_label("Prompt"),
             )
             .child(

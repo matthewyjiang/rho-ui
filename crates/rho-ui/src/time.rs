@@ -1,6 +1,7 @@
-//! Wall-clock helpers: Unix seconds, RFC 3339 parsing, and compact ages.
+//! Wall-clock helpers: Unix seconds, RFC 3339 parsing, compact ages and
+//! turn lengths.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Seconds since the Unix epoch, or 0 if the clock is before it.
 pub(crate) fn now_unix() -> i64 {
@@ -36,6 +37,36 @@ pub(crate) fn elapsed(seconds: u64) -> Option<String> {
         s if s < 3600 => Some(format!("{}m", s / 60)),
         s => Some(format!("{}h {}m", s / 3600, s % 3600 / 60)),
     }
+}
+
+/// How long a turn took, as T3 Code writes it: "850ms", "4.2s", "38s",
+/// "1m 20s", "2h 5m".
+pub(crate) fn took(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{}ms", millis.max(1));
+    }
+    if millis < 10_000 {
+        // Tenths of a second, rounded half up: 4_250 ms is "4.3s".
+        let tenths = (millis + 50) / 100;
+        return format!("{}.{}s", tenths / 10, tenths % 10);
+    }
+    // Round before choosing units, so 59.5 s never reads "60s".
+    let seconds = (millis + 500) / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let parts = [
+        (seconds / 3_600, "h"),
+        (seconds % 3_600 / 60, "m"),
+        (seconds % 60, "s"),
+    ];
+    parts
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, unit)| format!("{count}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Seconds since the Unix epoch for an RFC 3339 timestamp such as
@@ -93,6 +124,17 @@ mod tests {
             Some(1_793_793_600)
         );
         assert_eq!(unix_seconds("yesterday"), None);
+    }
+
+    #[test]
+    fn turn_lengths_read_like_t3_code() {
+        let ms = Duration::from_millis;
+        assert_eq!(took(ms(0)), "1ms");
+        assert_eq!(took(ms(4_250)), "4.3s");
+        assert_eq!(took(ms(59_400)), "59s");
+        assert_eq!(took(ms(59_600)), "1m");
+        assert_eq!(took(ms(80_000)), "1m 20s");
+        assert_eq!(took(ms(7_500_000)), "2h 5m");
     }
 
     #[test]

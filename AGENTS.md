@@ -14,6 +14,8 @@ These three come from [BeautifulRust](https://github.com/morganlinton/BeautifulR
 
 For UI work in `crates/rho-ui`, follow GPUI Kit's own guides: https://gpui-kit.com/docs/coding-guides.md and https://gpui-kit.com/docs/design-guides.md. Never invent a GPUI or GPUI Kit API. Check the source of the exact version in `Cargo.lock`.
 
+Use GPUI Kit's components (`gpui_kit::component`, `gpui_kit::base`); don't build an element Kit already has. `gpui_kit` also re-exports raw GPUI: use that only for layout, or with a comment saying Kit lacks the element.
+
 ## Rules
 
 - `rho-ui-core` has no GUI code and no async runtime. The UI drives it on GPUI's executors, and a future daemon will reuse it.

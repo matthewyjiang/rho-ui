@@ -183,6 +183,26 @@ pub enum ToolStatus {
     Cancelled,
 }
 
+/// What a tool call does, as the agent classes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolKind {
+    /// Reads files.
+    Read,
+    /// Edits, deletes or moves files.
+    Edit,
+    /// Searches files or code.
+    Search,
+    /// Runs a command.
+    Execute,
+    /// Planning the agent shows as a tool call.
+    Think,
+    /// Fetches something from the web.
+    Fetch,
+    /// Anything else.
+    #[default]
+    Other,
+}
+
 /// One piece of a tool card's body.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToolContent {
@@ -202,6 +222,7 @@ pub enum ToolContent {
 pub struct ToolCall {
     id: String,
     title: String,
+    kind: ToolKind,
     status: ToolStatus,
     content: Vec<ToolContent>,
 }
@@ -215,6 +236,11 @@ impl ToolCall {
     /// What it does, such as the command it runs. Empty until the agent says.
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// What the call does; [`ToolKind::Other`] until the agent says.
+    pub fn kind(&self) -> ToolKind {
+        self.kind
     }
 
     /// Where the call is in its life.
@@ -563,6 +589,7 @@ impl Thread {
             self.entries.push(Entry::Tool(ToolCall {
                 id: id.to_owned(),
                 title: String::new(),
+                kind: ToolKind::Other,
                 status: ToolStatus::Pending,
                 content: Vec::new(),
             }));
@@ -578,6 +605,17 @@ impl Thread {
         let (at, tool) = self.tool_mut(&update.tool_call_id.0);
         if let MaybeUndefined::Value(title) = update.title {
             tool.title = title;
+        }
+        if let MaybeUndefined::Value(kind) = update.kind {
+            tool.kind = match kind {
+                v2::ToolKind::Read => ToolKind::Read,
+                v2::ToolKind::Edit | v2::ToolKind::Delete | v2::ToolKind::Move => ToolKind::Edit,
+                v2::ToolKind::Search => ToolKind::Search,
+                v2::ToolKind::Execute => ToolKind::Execute,
+                v2::ToolKind::Think => ToolKind::Think,
+                v2::ToolKind::Fetch => ToolKind::Fetch,
+                _ => ToolKind::Other,
+            };
         }
         if let MaybeUndefined::Value(status) = update.status {
             tool.status = match status {

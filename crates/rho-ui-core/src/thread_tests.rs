@@ -100,7 +100,7 @@ fn interleaved_messages_and_tools_keep_first_seen_order() {
     ));
     let tool = thread.apply(update(
         json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
-        "title": "read a.rs", "status": "in_progress"}),
+        "title": "read a.rs", "kind": "read", "status": "in_progress"}),
     ));
     let message = thread.apply(update(
         json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1",
@@ -126,6 +126,7 @@ fn interleaved_messages_and_tools_keep_first_seen_order() {
     };
     assert_eq!(tool.status(), ToolStatus::Failed);
     assert_eq!(tool.title(), "read a.rs", "omitted fields keep their value");
+    assert_eq!(tool.kind(), ToolKind::Read);
 }
 
 #[test]

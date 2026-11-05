@@ -5,14 +5,15 @@
 //! The sidebar and the thread view are drawn as cached views: each redraws
 //! only when it changes, so a hover in one never rebuilds the other.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, rc::Rc};
 
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
+    empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
     h_flex,
     notification::Notification,
     spinner::Spinner,
-    v_flex, ActiveTheme as _, IconName, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, IconName, WindowExt as _,
 };
 use gpui_kit::{
     div, rems, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
@@ -24,11 +25,14 @@ use rho_ui_core::{
 };
 
 use crate::{
+    draft::{DraftView, Start},
+    kinetic::Kinetic,
     projects::{ProjectRef, Projects},
+    settings_view::{Closed, SettingsView},
     shelf::Shelves,
     sidebar::{SidebarEvent, SidebarView},
     thread_view::{Loading, ThreadEvent, ThreadView},
-    NewThread,
+    NewThread, OpenSettings,
 };
 
 /// What the command line asked for.
@@ -48,6 +52,24 @@ enum AgentStatus {
     Failed(String),
 }
 
+/// What the main pane shows.
+enum Pane {
+    Empty,
+    /// A new thread before its first message. Switching away drops it.
+    Draft {
+        view: Entity<DraftView>,
+        _subscription: Subscription,
+    },
+    /// One of [`RhoApp::threads`].
+    Thread(Entity<ThreadView>),
+}
+
+/// The settings screen, while open.
+struct SettingsScreen {
+    view: Entity<SettingsView>,
+    _subscription: Subscription,
+}
+
 /// A thread the user opened in this run, with the subscription that keeps
 /// the sidebar in step with it.
 struct OpenThread {
@@ -64,11 +86,12 @@ pub(crate) struct RhoApp {
     epoch: u64,
     projects: Entity<Projects>,
     sidebar: Entity<SidebarView>,
-    /// Threads opened in this run. Only appended to, and cleared when the
-    /// agent restarts, so `active` can be an index. A handful at most, so
-    /// lookups by ID scan.
+    /// Threads opened in this run. A handful at most, so lookups by ID scan.
     threads: Vec<OpenThread>,
-    active: Option<usize>,
+    pane: Pane,
+    settings: Option<SettingsScreen>,
+    /// Smooth wheel scrolling and touchpad flings for the whole window.
+    kinetic: Rc<Kinetic>,
     /// `new_session` calls in flight. While any are, updates for unknown
     /// sessions are kept, since they may belong to the session being made.
     creating: usize,
@@ -102,6 +125,8 @@ impl RhoApp {
                     this.open_session(id.clone(), cwd.clone(), title.clone(), window, cx);
                 }
                 SidebarEvent::NewThread => this.new_thread(window, cx),
+                SidebarEvent::Delete { id } => this.delete_thread(id.clone(), window, cx),
+                SidebarEvent::OpenSettings => this.open_settings(window, cx),
             },
         );
         let mut app = Self {
@@ -111,7 +136,9 @@ impl RhoApp {
             projects,
             sidebar,
             threads: Vec::new(),
-            active: None,
+            pane: Pane::Empty,
+            settings: None,
+            kinetic: Rc::default(),
             creating: 0,
             early_updates: Vec::new(),
             focus_handle,
@@ -129,8 +156,6 @@ impl RhoApp {
         self.forget_threads(cx);
         self.epoch += 1;
         self.creating = 0;
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_creating(0, cx));
         self.early_updates.clear();
         self.status = AgentStatus::Starting;
         cx.notify();
@@ -177,7 +202,7 @@ impl RhoApp {
     /// Drops every open thread: their sessions are gone with the agent.
     fn forget_threads(&mut self, cx: &mut Context<'_, Self>) {
         self.threads.clear();
-        self.active = None;
+        self.set_pane(Pane::Empty, cx);
         self.sidebar.update(cx, SidebarView::clear_live);
     }
 
@@ -235,17 +260,47 @@ impl RhoApp {
         });
     }
 
+    /// Shows a draft for a new thread. The session starts with its first
+    /// message; see [`Self::start_thread`].
     pub(crate) fn new_thread(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.agent().is_none() {
+            return;
+        }
+        // An open draft is reused, so its text survives.
+        let pane = std::mem::replace(&mut self.pane, Pane::Empty);
+        let pane = match pane {
+            Pane::Draft { .. } => pane,
+            Pane::Empty | Pane::Thread(_) => {
+                let cwd = self.launch.workspace.clone();
+                let project = ProjectRef::new(&self.projects, &cwd, cx);
+                let view = cx.new(|cx| DraftView::new(cwd, project, window, cx));
+                let subscription =
+                    cx.subscribe_in(&view, window, |this, draft, start: &Start, window, cx| {
+                        this.start_thread(draft.clone(), start.text.clone(), window, cx);
+                    });
+                Pane::Draft {
+                    view,
+                    _subscription: subscription,
+                }
+            }
+        };
+        self.show(pane, window, cx);
+    }
+
+    /// Makes the session for `draft` and sends its first message.
+    fn start_thread(
+        &mut self,
+        draft: Entity<DraftView>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Some(agent) = self.agent().cloned() else {
             return;
         };
-        let cwd = self.launch.workspace.clone();
+        let cwd = draft.read(cx).cwd().to_path_buf();
         let epoch = self.epoch;
         self.creating += 1;
-        let starting = self.creating;
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_creating(starting, cx));
-        cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = agent.new_session(&cwd).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -253,13 +308,25 @@ impl RhoApp {
                     return;
                 }
                 this.creating -= 1;
-                let starting = this.creating;
-                this.sidebar
-                    .update(cx, |sidebar, cx| sidebar.set_creating(starting, cx));
+                // The user may have moved on while it started.
+                let shown = matches!(&this.pane, Pane::Draft { view, .. } if *view == draft);
                 match result {
-                    Ok(setup) => this.open_new_session(agent, cwd, setup, window, cx),
+                    Ok(setup) => {
+                        let view = this.open_new_session(agent, cwd, setup, text, window, cx);
+                        if shown {
+                            this.set_pane(Pane::Thread(view), cx);
+                            // Behind the settings screen, the keyboard stays there.
+                            if this.settings.is_none() {
+                                this.focus_pane(window, cx);
+                            }
+                        }
+                    }
+                    Err(error) if shown => {
+                        draft.update(cx, |draft, cx| draft.fail(error.to_string(), cx));
+                    }
                     Err(error) => window.push_notification(
-                        Notification::error(error.to_string()).title("Couldn't start a thread"),
+                        Notification::error(format!("{error}\n\nYour message: {text}"))
+                            .title("Couldn't start the thread"),
                         cx,
                     ),
                 }
@@ -272,15 +339,104 @@ impl RhoApp {
         .detach();
     }
 
+    /// Deletes a saved thread in the agent, then drops it here.
+    fn delete_thread(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(agent) = self.agent().cloned() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = agent.delete_session(&id).await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    this.close_thread(&id, window, cx);
+                    this.sidebar
+                        .update(cx, |sidebar, cx| sidebar.remove(&id, cx));
+                    this.refresh_sessions(cx);
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(error.to_string()).title("Couldn't delete the thread"),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Drops the open thread `id`, if any, and empties the pane if it
+    /// showed it.
+    fn close_thread(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(ix) = self.threads.iter().position(|open| open.id == *id) else {
+            return;
+        };
+        let closed = self.threads.remove(ix);
+        if matches!(&self.pane, Pane::Thread(view) if *view == closed.view) {
+            self.show(Pane::Empty, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        let view = cx.new(|cx| SettingsView::new(window, cx));
+        let subscription = cx.subscribe_in(&view, window, |this, _, _: &Closed, window, cx| {
+            this.settings = None;
+            this.focus_pane(window, cx);
+            cx.notify();
+        });
+        self.settings = Some(SettingsScreen {
+            view,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Shows `pane` in the main area, closing settings, and puts the
+    /// keyboard in it.
+    fn show(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.settings = None;
+        self.set_pane(pane, cx);
+        self.focus_pane(window, cx);
+    }
+
+    /// Puts `pane` in the main area and marks its row in the sidebar,
+    /// leaving the keyboard where it is.
+    fn set_pane(&mut self, pane: Pane, cx: &mut Context<'_, Self>) {
+        let active = match &pane {
+            Pane::Thread(view) => Some(view.read(cx).id().clone()),
+            Pane::Empty | Pane::Draft { .. } => None,
+        };
+        self.pane = pane;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_active(active, cx));
+        cx.notify();
+    }
+
+    /// Puts the keyboard in the main pane's composer.
+    fn focus_pane(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let handle = match &self.pane {
+            Pane::Draft { view, .. } => view.read(cx).composer_focus_handle(cx),
+            Pane::Thread(view) => view.read(cx).composer_focus_handle(cx),
+            Pane::Empty => self.focus_handle.clone(),
+        };
+        window.focus(&handle, cx);
+    }
+
+    /// Opens the thread for a session just made and sends `text` as its
+    /// first prompt.
     fn open_new_session(
         &mut self,
         agent: Agent,
         cwd: PathBuf,
         setup: SessionSetup,
+        text: String,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> Entity<ThreadView> {
         let id = setup.id().clone();
+        // Made here, so rho-ui's own from the start, even if the prompt fails.
+        self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
         let mut thread = Thread::new(id.clone());
         thread.set_setup(setup);
         let project = ProjectRef::new(&self.projects, &cwd, cx);
@@ -295,8 +451,9 @@ impl RhoApp {
                 view.apply(update, window, cx);
             }
         });
-        let ix = self.insert_thread(id, view, window, cx);
-        self.activate(ix, window, cx);
+        self.insert_thread(id, view.clone(), window, cx);
+        view.update(cx, |view, cx| view.submit(text, window, cx));
+        view
     }
 
     /// Opens a saved session, or switches to it if it is already open.
@@ -309,8 +466,8 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if let Some(ix) = self.threads.iter().position(|open| open.id == id) {
-            self.activate(ix, window, cx);
+        if let Some(open) = self.thread(&id) {
+            self.show(Pane::Thread(open.view.clone()), window, cx);
             return;
         }
         let Some(agent) = self.agent().cloned() else {
@@ -332,8 +489,8 @@ impl RhoApp {
                 cx,
             )
         });
-        let ix = self.insert_thread(id.clone(), view.clone(), window, cx);
-        self.activate(ix, window, cx);
+        self.insert_thread(id.clone(), view.clone(), window, cx);
+        self.show(Pane::Thread(view.clone()), window, cx);
 
         let view = view.downgrade();
         cx.spawn_in(window, async move |_, cx| {
@@ -345,14 +502,14 @@ impl RhoApp {
         .detach();
     }
 
-    /// Adds `view` to the open threads and returns its index.
+    /// Adds `view` to the open threads.
     fn insert_thread(
         &mut self,
         id: SessionId,
         view: Entity<ThreadView>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) -> usize {
+    ) {
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -361,6 +518,10 @@ impl RhoApp {
                     let live = view.read(cx).live();
                     this.sidebar
                         .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
+                }
+                ThreadEvent::Prompted => {
+                    let id = view.read(cx).id().clone();
+                    this.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
                 }
                 ThreadEvent::Saved => this.refresh_sessions(cx),
             },
@@ -373,100 +534,72 @@ impl RhoApp {
             view,
             _subscription: subscription,
         });
-        self.threads.len() - 1
     }
 
-    fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let open = &self.threads[ix];
-        let handle = open.view.read(cx).composer_focus_handle(cx);
-        window.focus(&handle, cx);
-        let id = open.id.clone();
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_active(Some(id), cx));
-        self.active = Some(ix);
-        cx.notify();
-    }
-
-    fn render_starting(cx: &mut Context<'_, Self>) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .text_color(cx.theme().muted_foreground)
-            .child(Spinner::new())
-            .child(div().text_sm().child("Starting the agent…"))
+    fn render_starting() -> impl IntoElement {
+        Empty::new().size_full().header(
+            EmptyHeader::new()
+                .media(EmptyMedia::new().child(Spinner::new()))
+                .description(EmptyDescription::new().child("Starting the agent…")),
+        )
     }
 
     fn render_failed(&self, message: &str, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        v_flex()
+        Empty::new()
             .size_full()
-            .items_center()
-            .justify_center()
-            .p_8()
-            .child(
-                v_flex()
+            .header(
+                EmptyHeader::new()
+                    .title(EmptyTitle::new().text_lg().child("The agent isn't running"))
+                    .description(
+                        EmptyDescription::new()
+                            .child(format!("Command: {}", self.launch.command_line)),
+                    ),
+            )
+            .content(
+                EmptyContent::new()
                     .max_w(rems(36.))
-                    .gap_3()
                     .child(
-                        div()
-                            .text_lg()
-                            .font_semibold()
-                            .child("The agent isn't running"),
-                    )
-                    .child(
+                        // The agent's own words: often a stack trace, so
+                        // monospace and scrollable.
                         div()
                             .id("agent-error")
+                            .w_full()
                             .max_h(rems(16.))
                             .overflow_y_scroll()
                             .p_3()
                             .rounded(cx.theme().radius)
                             .bg(cx.theme().secondary)
-                            .text_sm()
+                            .text_left()
                             .font_family(cx.theme().mono_font_family.clone())
                             .child(message.to_owned()),
                     )
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("Command: {}", self.launch.command_line)),
-                    )
-                    .child(
-                        h_flex().child(
-                            Button::new("retry-agent")
-                                .primary()
-                                .icon(IconName::RotateCw)
-                                .label("Retry")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.start_agent(window, cx)),
-                                ),
-                        ),
+                        Button::new("retry-agent")
+                            .primary()
+                            .icon(IconName::RotateCw)
+                            .label("Retry")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.start_agent(window, cx)),
+                            ),
                     ),
             )
     }
 
     /// The main pane when no thread is open.
-    fn render_no_thread(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        v_flex()
-            .flex_1()
+    fn render_no_thread(cx: &mut Context<'_, Self>) -> impl IntoElement {
+        Empty::new()
             .h_full()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Open a thread from the sidebar or start a new one."),
-            )
-            .child(
-                Button::new("empty-new-thread")
-                    .outline()
-                    .icon(IconName::Plus)
-                    .label("New thread")
-                    .loading(self.creating > 0)
-                    .on_click(cx.listener(|this, _, window, cx| this.new_thread(window, cx))),
+            .header(EmptyHeader::new().description(
+                EmptyDescription::new().child("Open a thread from the sidebar or start a new one."),
+            ))
+            .content(
+                EmptyContent::new().child(
+                    Button::new("empty-new-thread")
+                        .outline()
+                        .icon(IconName::Plus)
+                        .label("New thread")
+                        .on_click(cx.listener(|this, _, window, cx| this.new_thread(window, cx))),
+                ),
             )
     }
 }
@@ -475,7 +608,10 @@ impl RhoApp {
 impl RhoApp {
     /// The thread the main pane shows, for UI tests.
     pub(crate) fn active_thread(&self) -> Option<Entity<ThreadView>> {
-        self.active.map(|ix| self.threads[ix].view.clone())
+        match &self.pane {
+            Pane::Thread(view) => Some(view.clone()),
+            Pane::Empty | Pane::Draft { .. } => None,
+        }
     }
 }
 
@@ -487,14 +623,18 @@ impl Render for RhoApp {
             .key_context("RhoApp")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
+            }))
+            .relative()
             .size_full()
             .bg(cx.theme().background)
-            .text_color(cx.theme().foreground);
+            .text_color(cx.theme().foreground)
+            // First, so it sees scroll events before any scroll area.
+            .child(Kinetic::hook(&self.kinetic));
 
         match &self.status {
-            AgentStatus::Starting => {
-                return root.child(Self::render_starting(cx)).into_any_element()
-            }
+            AgentStatus::Starting => return root.child(Self::render_starting()).into_any_element(),
             AgentStatus::Failed(message) => {
                 let message = message.clone();
                 return root
@@ -504,13 +644,14 @@ impl Render for RhoApp {
             AgentStatus::Ready(_) => {}
         }
 
-        let main = match self.active {
-            Some(ix) => self.threads[ix]
-                .view
-                .clone()
-                .cached(StyleRefinement::default().flex_1().min_w_0().h_full())
-                .into_any_element(),
-            None => self.render_no_thread(cx).into_any_element(),
+        if let Some(settings) = &self.settings {
+            return root.child(settings.view.clone()).into_any_element();
+        }
+        let pane_style = || StyleRefinement::default().flex_1().min_w_0().h_full();
+        let main = match &self.pane {
+            Pane::Thread(view) => view.clone().cached(pane_style()).into_any_element(),
+            Pane::Draft { view, .. } => view.clone().cached(pane_style()).into_any_element(),
+            Pane::Empty => Self::render_no_thread(cx).into_any_element(),
         };
         root.child(
             h_flex()

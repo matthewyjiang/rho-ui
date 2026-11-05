@@ -38,6 +38,12 @@ pub(crate) struct Choice {
     title: SharedString,
 }
 
+impl Choice {
+    pub(crate) fn new(value: SharedString, title: SharedString) -> Self {
+        Self { value, title }
+    }
+}
+
 impl SelectItem for Choice {
     type Value = SharedString;
 

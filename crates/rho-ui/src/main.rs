@@ -8,17 +8,22 @@ mod app;
 mod approval;
 mod composer;
 mod config_bar;
+mod draft;
+mod kinetic;
 mod projects;
 mod repo;
+mod settings;
+mod settings_view;
 mod shelf;
 mod sidebar;
+mod store;
 mod thread_list;
 mod thread_view;
 mod time;
-mod tool_card;
 mod transcript;
 #[cfg(test)]
 mod ui_tests;
+mod work;
 
 use std::{borrow::Cow, path::PathBuf};
 
@@ -31,6 +36,7 @@ use rho_ui_core::AgentCommand;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    settings::Settings,
     shelf::Shelves,
 };
 
@@ -41,6 +47,10 @@ gpui_kit::actions!(
         NewThread,
         /// Stop the running turn in the focused thread.
         StopTurn,
+        /// Open the settings screen.
+        OpenSettings,
+        /// Close the settings screen.
+        CloseSettings,
         /// Quit the app.
         Quit
     ]
@@ -49,7 +59,16 @@ gpui_kit::actions!(
 // Icons GPUI Kit's default bundle leaves out, borrowed from its full catalog.
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
-    [GitBranch, AlarmClock, Archive, SquarePen, CircleDashed]
+    [
+        GitBranch,
+        AlarmClock,
+        Archive,
+        SquarePen,
+        CircleDashed,
+        Terminal,
+        Brain,
+        Wrench
+    ]
 );
 
 /// GPUI Kit's default icons plus [`ExtraIcons`], all borrowed from static
@@ -133,6 +152,7 @@ fn main() {
 
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         init(cx);
+        Settings::load().apply(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         let options = window_options(cx);
         gpui_kit::open_window(options, cx, |window, cx| {
@@ -143,14 +163,17 @@ fn main() {
     });
 }
 
-/// App-wide setup shared by `main` and the UI tests: GPUI Kit, the theme,
-/// and key bindings.
+/// App-wide setup shared by `main` and the UI tests: GPUI Kit, the theme
+/// with default settings, and key bindings.
 fn init(cx: &mut App) {
     gpui_kit::init(cx);
     Theme::change(ThemeMode::Dark, None, cx);
+    Settings::default().apply(cx);
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewThread, Some("RhoApp")),
+        KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
         KeyBinding::new("escape", StopTurn, Some("ThreadView")),
+        KeyBinding::new("escape", CloseSettings, Some("SettingsView")),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
 }

@@ -3,6 +3,7 @@
 
 mod agent;
 mod thread;
+mod timeline;
 
 pub use agent::{
     Agent, AgentCommand, AgentError, AgentEvent, AgentEvents, AgentInfo, CommandInfo,
@@ -10,5 +11,7 @@ pub use agent::{
 };
 pub use thread::{
     ConfigChoice, ConfigKind, ConfigOption, ConfigValue, Entry, Message, Notice, NoticeLevel,
-    PlanItem, PlanStatus, RunState, Thread, ThreadUpdate, ToolCall, ToolContent, ToolStatus, Usage,
+    PlanItem, PlanStatus, RunState, Thread, ThreadUpdate, ToolCall, ToolContent, ToolKind,
+    ToolStatus, Usage,
 };
+pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};

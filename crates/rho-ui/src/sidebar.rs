@@ -1,47 +1,87 @@
-//! The thread list, drawn: one flat list, newest first. Each row shows the
-//! project, the thread's status or age, its title, and its branch. Hovering
-//! a row swaps its status for Snooze and Settle; settled and snoozed threads
-//! have their own lists, opened from the bottom of the sidebar.
+//! The thread list, drawn: one scrolling list of active threads, newest
+//! first, then the Snoozed and Settled shelves. An active row shows the
+//! project, the thread's status or age, its title, and its branch; hovering
+//! it swaps the status for Snooze and Settle. A shelf opens from its header
+//! into one-line rows, and hovering one shows its details in a card.
 //!
 //! The app draws this view as a cached view, so a hover or scroll here
-//! redraws only the sidebar, and [`uniform_list`] builds only the rows on
-//! screen. The data lives in [`ThreadList`] and [`Projects`], built when it
+//! redraws only the sidebar, and [`v_virtual_list`] builds only the rows on
+//! screen.
+//! The data lives in [`ThreadList`] and [`Projects`], built when it
 //! changes, never per frame.
 
 use std::{
     ops::Range,
     path::PathBuf,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
+    alert::Alert,
+    avatar::Avatar,
+    button::{Button, ButtonVariant, ButtonVariants as _},
+    description_list::DescriptionList,
+    empty::{Empty, EmptyDescription, EmptyHeader},
     h_flex,
+    hover_card::HoverCard,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
-    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, Theme,
+    v_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, Theme,
+    VirtualListScrollHandle, WindowExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, uniform_list, AnyElement, AppContext as _, Context, Entity, EventEmitter, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, ScrollStrategy,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window,
+    div, px, rems, size, Anchor, AnyElement, AppContext as _, Context, Entity, EventEmitter, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement, Rems, Render, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task,
+    WeakEntity, Window,
 };
 use rho_ui_core::{SessionId, SessionSummary};
 
 use crate::{
-    projects::{Project, Projects, PALETTE_SIZE},
+    projects::{Project, Projects},
     shelf::{Shelf, Shelves},
-    thread_list::{Activity, LiveThread, Row, SavedThread, ThreadList},
+    thread_list::{Activity, Item, LiveThread, Row, SavedThread, ThreadList},
     time,
 };
 
-/// Every row's height. [`uniform_list`] needs one height for all rows; this
-/// fits three lines (12, 14 and 12 px text) with padding.
-pub(crate) const ROW_HEIGHT: f32 = 64.;
+// A row's parts, in rems so they follow the UI scale.
+/// The project and branch lines.
+const LINE_REMS: f32 = 1.;
+/// The title line, a little taller for its larger text.
+const TITLE_REMS: f32 = 1.375;
+/// Between the lines.
+const GAP_REMS: f32 = 0.25;
+/// Inside the highlight, above and below the lines.
+const PAD_REMS: f32 = 0.625;
+/// Outside the highlight, so neighbours' highlights don't touch.
+const GUTTER_REMS: f32 = 0.0625;
+
+/// An active row's height. Every active row has it, so a row without a
+/// branch keeps the space.
+pub(crate) const ROW_REMS: f32 =
+    2. * LINE_REMS + TITLE_REMS + 2. * GAP_REMS + 2. * PAD_REMS + 2. * GUTTER_REMS;
+
+/// Inside a one-line shelved row's highlight, above and below its title.
+const SHELVED_PAD_REMS: f32 = 0.5;
+
+/// A snoozed or settled row's height.
+const SHELVED_ROW_REMS: f32 = TITLE_REMS + 2. * SHELVED_PAD_REMS + 2. * GUTTER_REMS;
+
+/// A shelf header's height.
+const HEADER_REMS: f32 = 2.5;
+
+/// Each item's height.
+fn item_rems(item: Item) -> f32 {
+    match item {
+        Item::Thread(_) => ROW_REMS,
+        Item::Shelved(_) => SHELVED_ROW_REMS,
+        Item::Header(_) => HEADER_REMS,
+    }
+}
 
 /// How often ages, timers and snooze wake-ups refresh. They show whole
 /// minutes, so 30 s keeps them current.
@@ -134,6 +174,11 @@ pub(crate) enum SidebarEvent {
         title: Option<SharedString>,
     },
     NewThread,
+    /// Delete a saved thread; the user has confirmed.
+    Delete {
+        id: SessionId,
+    },
+    OpenSettings,
 }
 
 /// The row under the mouse, which shows its actions instead of its status.
@@ -149,12 +194,11 @@ pub(crate) struct SidebarView {
     shelves: Shelves,
     active: Option<SessionId>,
     hover: Option<Hover>,
-    creating: bool,
     error: Option<SharedString>,
     /// The agent's name and version, for the footer.
     agent: Option<SharedString>,
     search: Entity<InputState>,
-    scroll: UniformListScrollHandle,
+    scroll: VirtualListScrollHandle,
     _subscriptions: [Subscription; 2],
     _tick: Task<()>,
 }
@@ -192,11 +236,10 @@ impl SidebarView {
             shelves,
             active: None,
             hover: None,
-            creating: false,
             error: None,
             agent: None,
             search,
-            scroll: UniformListScrollHandle::new(),
+            scroll: VirtualListScrollHandle::new(),
             _subscriptions: subscriptions,
             _tick: tick,
         }
@@ -239,6 +282,22 @@ impl SidebarView {
         }
     }
 
+    /// Marks a thread as started or continued here, so it stays active.
+    pub(crate) fn own(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+        self.shelves.own(id.as_str());
+        self.rebuild(cx);
+    }
+
+    /// Drops a thread the agent deleted.
+    pub(crate) fn remove(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+        self.list.remove(id);
+        self.shelves.forget(id.as_str());
+        if self.active.as_ref() == Some(id) {
+            self.active = None;
+        }
+        self.rebuild(cx);
+    }
+
     /// Forgets every open thread, after the agent restarts.
     pub(crate) fn clear_live(&mut self, cx: &mut Context<'_, Self>) {
         self.list.clear_live();
@@ -249,15 +308,6 @@ impl SidebarView {
     pub(crate) fn set_active(&mut self, id: Option<SessionId>, cx: &mut Context<'_, Self>) {
         if self.active != id {
             self.active = id;
-            cx.notify();
-        }
-    }
-
-    /// `starting` counts new threads still being made.
-    pub(crate) fn set_creating(&mut self, starting: usize, cx: &mut Context<'_, Self>) {
-        let creating = starting > 0;
-        if self.creating != creating {
-            self.creating = creating;
             cx.notify();
         }
     }
@@ -275,10 +325,8 @@ impl SidebarView {
         cx.notify();
     }
 
-    fn show(&mut self, list: Shelf, cx: &mut Context<'_, Self>) {
-        self.list.show(list);
-        self.hover = None;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+    fn toggle(&mut self, which: Shelf, cx: &mut Context<'_, Self>) {
+        self.list.toggle(which);
         self.rebuild(cx);
     }
 
@@ -387,7 +435,7 @@ impl SidebarView {
         Some(
             h_flex()
                 .flex_shrink_0()
-                .h(px(16.))
+                .h(rems(LINE_REMS))
                 // The buttons act on the row; they must not also open it.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .children(buttons)
@@ -395,9 +443,9 @@ impl SidebarView {
         )
     }
 
-    /// The rows in `range` of the shown list. Called by [`uniform_list`]
-    /// with only what is on screen.
-    fn render_rows(&self, range: Range<usize>, cx: &mut Context<'_, Self>) -> Vec<AnyElement> {
+    /// The items in `range`. Called by [`v_virtual_list`] with only what is
+    /// on screen.
+    fn render_items(&self, range: Range<usize>, cx: &mut Context<'_, Self>) -> Vec<AnyElement> {
         let clock = Clock {
             now: time::now_unix(),
             instant: Instant::now(),
@@ -405,9 +453,19 @@ impl SidebarView {
         let view = cx.entity().downgrade();
         let cx: &Context<'_, Self> = cx;
         let projects = self.projects.read(cx);
-        range
-            .filter_map(|ix| self.list.shown(ix))
-            .map(|row| self.render_row(row, projects.get(row.project), clock, &view, cx))
+        self.list.items()[range]
+            .iter()
+            .map(|&item| match item {
+                Item::Thread(row) => {
+                    let row = self.list.row_at(row);
+                    self.render_row(row, projects.get(row.project), clock, &view, cx)
+                }
+                Item::Shelved(row) => {
+                    let row = self.list.row_at(row);
+                    self.render_shelved(row, projects.get(row.project), clock, &view, cx)
+                }
+                Item::Header(which) => self.render_shelf_header(which, cx),
+            })
             .collect()
     }
 
@@ -420,65 +478,231 @@ impl SidebarView {
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let active = self.active.as_ref() == Some(&row.id);
-        let hovered = self.hover.as_ref().is_some_and(|hover| hover.id == row.id);
-        let right = hovered
+        let state = self.row_state(row);
+        let right = state
+            .hovered
             .then(|| self.render_actions(row, cx))
             .flatten()
             .unwrap_or_else(|| status(row, clock, theme));
+        let inner = v_flex()
+            .id(row.element_id.clone())
+            .test_support()
+            .gap(rems(GAP_REMS))
+            .py(rems(PAD_REMS))
+            .child(project_line(project, theme).child(right))
+            .child(
+                div()
+                    .h(rems(TITLE_REMS))
+                    .truncate()
+                    .text_sm()
+                    .when(state.active, StyledExt::font_medium)
+                    .child(row.title()),
+            )
+            .child(branch_line(project, theme));
+        Self::row_frame(rems(ROW_REMS), row, state, inner, view, cx).into_any_element()
+    }
+
+    fn row_state(&self, row: &Row) -> RowState {
+        RowState {
+            active: self.active.as_ref() == Some(&row.id),
+            hovered: self.hover.as_ref().is_some_and(|hover| hover.id == row.id),
+        }
+    }
+
+    /// What every thread row shares: its slot in the list, the highlight,
+    /// hover tracking, a click that opens the thread and the context menu.
+    /// Kit has no list-item element with a fixed height for
+    /// `v_virtual_list`, so rows are laid out by hand.
+    fn row_frame<E>(
+        height: Rems,
+        row: &Row,
+        state: RowState,
+        inner: E,
+        view: &WeakEntity<Self>,
+        cx: &Context<'_, Self>,
+    ) -> impl IntoElement + use<E>
+    where
+        E: StatefulInteractiveElement + ParentElement + Styled + IntoElement + 'static,
+    {
+        let theme = cx.theme();
         let accent = theme.sidebar_accent;
         let open_id = row.id.clone();
-        let hover_id = row.id.clone();
-        let menu = (
-            view.clone(),
-            row.id.clone(),
-            ShelfAction::offered(row.shelf, row.activity),
-        );
-        div()
-            .h(px(ROW_HEIGHT))
+        let menu = (view.clone(), MenuRow::new(row));
+        let (hover_id, hover_view) = (row.id.clone(), view.clone());
+        let inner = inner
+            .size_full()
             .px_2()
-            .py(px(1.))
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .map(|this| match (state.active, state.hovered) {
+                (true, _) => this.bg(accent).text_color(theme.sidebar_accent_foreground),
+                (false, true) => this.bg(accent.opacity(0.5)),
+                (false, false) => this,
+            })
+            .on_hover(move |hovered, _, cx| {
+                let _ = hover_view.update(cx, |this, cx| {
+                    if *hovered {
+                        this.hover(&hover_id, cx);
+                    } else {
+                        this.unhover(&hover_id, cx);
+                    }
+                });
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.open(&open_id, cx)));
+        div()
+            .h(height)
+            .px_2()
+            .py(rems(GUTTER_REMS))
+            .child(inner.context_menu(move |popup, _, _| {
+                let (view, row) = &menu;
+                row_menu(popup, view, row)
+            }))
+    }
+
+    /// A snoozed or settled thread on one line: badge, title, and when it
+    /// wakes or how old it is. Hovering it swaps that for Restore and, after
+    /// a moment, shows the thread's details beside the sidebar.
+    fn render_shelved(
+        &self,
+        row: &Row,
+        project: &Project,
+        clock: Clock,
+        view: &WeakEntity<Self>,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let state = self.row_state(row);
+        let wakes = self.shelves.wakes(row.id.as_str());
+        let offered = ShelfAction::offered(row.shelf, row.activity);
+        let right = if state.hovered && !offered.is_empty() {
+            // Icon-only: the row is one line.
+            h_flex()
+                // The buttons act on the row; they must not also open it.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(offered.iter().filter_map(|&action| {
+                    let id = match action {
+                        ShelfAction::Restore => "restore",
+                        ShelfAction::Settle => "settle",
+                        ShelfAction::Snooze(_) => return None,
+                    };
+                    let row_id = row.id.clone();
+                    Some(
+                        Button::new(id)
+                            .ghost()
+                            .xsmall()
+                            .icon(action.icon())
+                            .tooltip(action.label())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.shelve(&row_id, action, cx);
+                            })),
+                    )
+                }))
+                .into_any_element()
+        } else if let (Shelf::Snoozed, Some(wakes)) = (row.shelf, wakes) {
+            h_flex()
+                .gap_1()
+                .text_color(theme.blue)
+                .child(Icon::new(Lucide::AlarmClock).xsmall())
+                .child(time::relative_age(wakes - clock.now))
+                .into_any_element()
+        } else {
+            status(row, clock, theme)
+        };
+        let card = Card {
+            title: row.title(),
+            project: project.name.clone(),
+            initials: project.initials.clone(),
+            branch: project.branch.clone(),
+            wakes: wakes
+                .filter(|_| row.shelf == Shelf::Snoozed)
+                .map(|wakes| format!("Wakes in {}", time::relative_age(wakes - clock.now))),
+        };
+        let line = h_flex()
+            .id(row.element_id.clone())
+            .test_support()
+            .gap_2()
+            .py(rems(SHELVED_PAD_REMS))
+            .text_xs()
+            // Shelved badges recede until the row is hovered or open.
             .child(
-                v_flex()
-                    .id(row.element_id.clone())
+                badge(card.initials.clone())
+                    .when(!(state.active || state.hovered), |this| this.opacity(0.4)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h(rems(TITLE_REMS))
+                    .truncate()
+                    .text_sm()
+                    .child(card.title.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(theme.muted_foreground)
+                    .child(right),
+            );
+        let trigger = HoverCard::new(row.element_id.clone())
+            .anchor(Anchor::LeftCenter)
+            .trigger_style(StyleRefinement::default().size_full())
+            .ml_3()
+            .content(move |_, _, cx| card.render(cx));
+        let line = Self::row_frame(rems(SHELVED_ROW_REMS), row, state, line, view, cx);
+        div()
+            .w_full()
+            .h(rems(SHELVED_ROW_REMS))
+            .child(trigger.trigger(line))
+            .into_any_element()
+    }
+
+    /// "Snoozed 1 ⌄": the shelf's name and count; a click opens or folds it.
+    /// Kit's `Accordion` owns its items, which here are separate rows of
+    /// the virtual list, so the header is laid out by hand.
+    fn render_shelf_header(&self, which: Shelf, cx: &Context<'_, Self>) -> AnyElement {
+        let id = match which {
+            Shelf::Snoozed => "toggle-snoozed",
+            Shelf::Settled | Shelf::Active => "toggle-settled",
+        };
+        let theme = cx.theme();
+        let hover = theme.sidebar_accent.opacity(0.5);
+        let chevron = if self.list.is_open(which) {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        div()
+            .h(rems(HEADER_REMS))
+            .px_2()
+            .py(rems(GUTTER_REMS))
+            .child(
+                h_flex()
+                    .id(id)
                     .test_support()
                     .size_full()
-                    .justify_center()
-                    .gap(px(2.))
                     .px_2()
+                    .gap_1()
                     .rounded(theme.radius)
                     .cursor_pointer()
-                    .map(|this| match (active, hovered) {
-                        (true, _) => this.bg(accent).text_color(theme.sidebar_accent_foreground),
-                        (false, true) => this.bg(accent.opacity(0.5)),
-                        (false, false) => this,
-                    })
-                    .child(project_line(project, theme).child(right))
+                    .text_sm()
+                    .hover(move |style| style.bg(hover))
+                    .child(div().flex_1().child(which.label()))
                     .child(
                         div()
-                            .truncate()
-                            .text_sm()
-                            .when(active, StyledExt::font_medium)
-                            .child(row.title()),
+                            .text_color(theme.muted_foreground)
+                            .child(self.list.count(which).to_string()),
                     )
-                    .child(branch_line(project, theme))
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered {
-                            this.hover(&hover_id, cx);
-                        } else {
-                            this.unhover(&hover_id, cx);
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.open(&open_id, cx)))
-                    .context_menu(move |popup, _, _| {
-                        let (view, id, offered) = &menu;
-                        row_menu(popup, view, id, offered)
-                    }),
+                    .child(
+                        Icon::new(chevron)
+                            .xsmall()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(which, cx))),
             )
             .into_any_element()
     }
 
-    fn render_header(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render_header(cx: &mut Context<'_, Self>) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
             .h(px(44.))
@@ -490,121 +714,91 @@ impl SidebarView {
                     .ghost()
                     .small()
                     .icon(Lucide::SquarePen)
-                    .loading(self.creating)
                     .tooltip("New thread (Ctrl+N)")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewThread))),
             )
     }
 
-    fn render_list(&self, cx: &mut Context<'_, Self>) -> AnyElement {
+    fn render_list(&self, window: &Window, cx: &mut Context<'_, Self>) -> AnyElement {
         if self.list.is_empty() {
-            let message = match (self.list.query().is_empty(), self.list.list()) {
-                (false, _) => "No matching threads",
-                (true, Shelf::Active) => "No threads yet",
-                (true, Shelf::Snoozed) => "Nothing snoozed",
-                (true, Shelf::Settled) => "Nothing settled",
+            let message = if self.list.query().is_empty() {
+                "No threads yet"
+            } else {
+                "No matching threads"
             };
-            return div()
-                .flex_1()
-                .px_4()
-                .py_3()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(message)
+            return Empty::new()
+                .header(EmptyHeader::new().description(EmptyDescription::new().child(message)))
                 .into_any_element();
         }
-        uniform_list(
+        // Heights are known, so the list never measures a row.
+        let rem = window.rem_size();
+        let sizes = self
+            .list
+            .items()
+            .iter()
+            .map(|&item| size(px(0.), rem * item_rems(item)))
+            .collect();
+        v_virtual_list(
+            cx.entity(),
             "threads",
-            self.list.len(),
-            cx.processor(|this, range, _, cx| this.render_rows(range, cx)),
+            Rc::new(sizes),
+            |this, range, _, cx| this.render_items(range, cx),
         )
         .track_scroll(&self.scroll)
         .flex_1()
         .into_any_element()
     }
 
-    /// "Snoozed 3 >" or "Settled 191 >", under the active list.
-    fn shelf_entry(shelf: Shelf, count: usize, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let id = match shelf {
-            Shelf::Snoozed => "show-snoozed",
-            Shelf::Settled | Shelf::Active => "show-settled",
-        };
-        let theme = cx.theme();
-        let hover = theme.sidebar_accent.opacity(0.5);
-        h_flex()
-            .id(id)
-            .test_support()
-            .mx_2()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .rounded(theme.radius)
-            .cursor_pointer()
-            .text_sm()
-            .hover(move |style| style.bg(hover))
-            .child(div().flex_1().child(shelf.label()))
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child(count.to_string()),
-            )
-            .child(
-                Icon::new(IconName::ChevronRight)
-                    .xsmall()
-                    .text_color(theme.muted_foreground),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| this.show(shelf, cx)))
-    }
-
     fn render_footer(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let entries: Vec<AnyElement> = match self.list.list() {
-            Shelf::Active => [Shelf::Snoozed, Shelf::Settled]
-                .into_iter()
-                .map(|shelf| (shelf, self.list.shelf_count(shelf)))
-                .filter(|(_, count)| *count > 0)
-                .map(|(shelf, count)| Self::shelf_entry(shelf, count, cx).into_any_element())
-                .collect(),
-            Shelf::Snoozed | Shelf::Settled => Vec::new(),
-        };
         let theme = cx.theme();
         v_flex()
             .flex_shrink_0()
             .py_2()
             .gap_1()
-            .children(entries)
             .when_some(self.error.clone(), |this, error| {
                 this.child(
-                    div()
-                        .px_4()
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(format!("Couldn't load threads: {error}")),
+                    div().px_2().child(
+                        Alert::error("threads-error", error)
+                            .title("Couldn't load threads")
+                            .small(),
+                    ),
                 )
             })
-            .when_some(self.agent.clone(), |this, agent| {
-                this.child(
-                    div()
-                        .px_4()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(agent),
-                )
-            })
+            .child(
+                h_flex()
+                    .px_2()
+                    .gap_2()
+                    .child(
+                        Button::new("open-settings")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Settings)
+                            .tooltip("Settings (Ctrl+,)")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(SidebarEvent::OpenSettings);
+                            })),
+                    )
+                    .children(self.agent.clone().map(|agent| {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(agent)
+                    })),
+            )
     }
 }
 
 impl Render for SidebarView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let showing = self.list.list();
         v_flex()
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .child(self.render_header(cx))
+            .child(Self::render_header(cx))
             .child(
                 div().flex_shrink_0().px_2().pb_2().child(
                     Input::new(&self.search)
@@ -613,19 +807,7 @@ impl Render for SidebarView {
                         .cleanable(true),
                 ),
             )
-            .when(showing != Shelf::Active, |this| {
-                this.child(
-                    div().flex_shrink_0().px_2().pb_1().child(
-                        Button::new("show-active")
-                            .ghost()
-                            .small()
-                            .icon(IconName::ChevronLeft)
-                            .label(showing.label())
-                            .on_click(cx.listener(|this, _, _, cx| this.show(Shelf::Active, cx))),
-                    ),
-                )
-            })
-            .child(self.render_list(cx))
+            .child(self.render_list(window, cx))
             .child(self.render_footer(cx))
     }
 }
@@ -641,24 +823,11 @@ struct Clock {
 
 /// Badge and project name; the caller adds the status or actions.
 fn project_line(project: &Project, theme: &Theme) -> gpui_kit::Div {
-    let color = palette(theme)[project.hue];
     h_flex()
+        .h(rems(LINE_REMS))
         .gap_2()
         .text_xs()
-        .child(
-            div()
-                .flex_shrink_0()
-                .size(px(16.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.))
-                .bg(color.opacity(0.2))
-                .text_color(color)
-                .text_size(px(8.))
-                .font_bold()
-                .child(project.initials.clone()),
-        )
+        .child(badge(project.initials.clone()))
         .child(
             div()
                 .flex_1()
@@ -669,9 +838,73 @@ fn project_line(project: &Project, theme: &Theme) -> gpui_kit::Div {
         )
 }
 
+/// A project's initials, in colors Kit picks from them.
+fn badge(initials: SharedString) -> Avatar {
+    Avatar::new()
+        .name(initials)
+        .xsmall()
+        // In rems, so it follows the UI scale; square like a project tile.
+        .size(rems(LINE_REMS))
+        .rounded(rems(0.25))
+}
+
+/// How a row is lit: open in the pane, under the pointer, or both.
+#[derive(Clone, Copy)]
+struct RowState {
+    active: bool,
+    hovered: bool,
+}
+
+/// A shelved thread's details, shown beside the sidebar while hovered.
+/// Built with the row, so the card needs nothing from the view.
+struct Card {
+    title: SharedString,
+    project: SharedString,
+    initials: SharedString,
+    branch: Option<SharedString>,
+    wakes: Option<String>,
+}
+
+impl Card {
+    fn render(&self, cx: &gpui_kit::App) -> impl IntoElement {
+        let muted = |icon: Lucide| {
+            Icon::new(icon)
+                .small()
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element()
+        };
+        // Icons stand in for the labels, as in T3 Code.
+        let mut details = DescriptionList::horizontal()
+            .bordered(false)
+            .columns(1)
+            // The icon plus a gap: unbordered lists have no padding.
+            .label_width(rems(LINE_REMS + 0.75))
+            .item(
+                badge(self.initials.clone()).into_any_element(),
+                self.project.clone(),
+                1,
+            );
+        if let Some(branch) = &self.branch {
+            details = details.item(muted(Lucide::GitBranch), branch.clone(), 1);
+        }
+        if let Some(wakes) = &self.wakes {
+            details = details.item(muted(Lucide::AlarmClock), wakes.clone(), 1);
+        }
+        v_flex()
+            .id("thread-card")
+            .test_support()
+            .w(rems(20.))
+            .gap_1p5()
+            .text_sm()
+            .child(div().text_sm().font_medium().child(self.title.clone()))
+            .child(details)
+    }
+}
+
 /// The branch, when the workspace is a git repository.
 fn branch_line(project: &Project, theme: &Theme) -> gpui_kit::Div {
     h_flex()
+        .h(rems(LINE_REMS))
         .gap_1()
         .min_w_0()
         .text_xs()
@@ -721,27 +954,11 @@ fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
     }
 }
 
-/// Badge colors, one per project hue.
-fn palette(theme: &Theme) -> [Hsla; PALETTE_SIZE] {
-    [
-        theme.blue,
-        theme.magenta,
-        theme.green,
-        theme.yellow,
-        theme.cyan,
-        theme.red,
-    ]
-}
-
-/// The right-click menu: the same moves the hover buttons offer.
-fn row_menu(
-    menu: PopupMenu,
-    view: &WeakEntity<SidebarView>,
-    id: &SessionId,
-    offered: &[ShelfAction],
-) -> PopupMenu {
-    offered.iter().fold(menu, |menu, &action| {
-        let (view, id) = (view.clone(), id.clone());
+/// The right-click menu: the same moves the hover buttons offer, then
+/// Delete. A busy thread offers neither.
+fn row_menu(menu: PopupMenu, view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenu {
+    let menu = row.offered.iter().fold(menu, |menu, &action| {
+        let (view, id) = (view.clone(), row.id.clone());
         menu.item(
             PopupMenuItem::new(action.label())
                 .icon(action.icon())
@@ -749,7 +966,53 @@ fn row_menu(
                     let _ = view.update(cx, |this, cx| this.shelve(&id, action, cx));
                 }),
         )
-    })
+    });
+    if !row.deletable {
+        return menu;
+    }
+    let (view, id, title) = (view.clone(), row.id.clone(), row.title.clone());
+    menu.separator().item(
+        PopupMenuItem::new("Delete…")
+            .icon(Icon::new(IconName::Delete))
+            .on_click(move |_, window, cx| {
+                let (view, id, title) = (view.clone(), id.clone(), title.clone());
+                window.open_alert_dialog(cx, move |alert, _, cx| {
+                    let (view, id) = (view.clone(), id.clone());
+                    alert
+                        .icon(Icon::new(IconName::Delete).text_color(cx.theme().danger))
+                        .title(format!("Delete \"{title}\"?"))
+                        .description("rho deletes the saved thread. This can't be undone.")
+                        .confirm()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok(move |_, _, cx| {
+                            let id = id.clone();
+                            let _ = view.update(cx, |_, cx| cx.emit(SidebarEvent::Delete { id }));
+                            true
+                        })
+                });
+            }),
+    )
+}
+
+/// What a row's menu needs, captured when the row is drawn.
+struct MenuRow {
+    id: SessionId,
+    title: SharedString,
+    offered: &'static [ShelfAction],
+    /// Busy threads can't be deleted.
+    deletable: bool,
+}
+
+impl MenuRow {
+    fn new(row: &Row) -> Self {
+        Self {
+            id: row.id.clone(),
+            title: row.title(),
+            offered: ShelfAction::offered(row.shelf, row.activity),
+            deletable: row.activity.is_idle(),
+        }
+    }
 }
 
 #[cfg(test)]

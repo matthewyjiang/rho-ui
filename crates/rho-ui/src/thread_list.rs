@@ -1,6 +1,7 @@
 //! The sidebar's data: every listed thread as a flat row, which shelf each
-//! is on, and which rows the current list and search show. Plain data with
-//! no GUI code; [`crate::sidebar`] draws it.
+//! is on, and the items the sidebar's one scrolling list shows: active
+//! threads, then each shelf's header and, when it's open, its threads.
+//! Plain data with no GUI code; [`crate::sidebar`] draws it.
 
 use std::{cmp::Reverse, path::PathBuf, time::Instant};
 
@@ -83,18 +84,39 @@ impl Row {
     }
 }
 
+/// One entry in the sidebar's list. Each kind has its own height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Item {
+    /// An active thread, drawn in full. An index into the rows.
+    Thread(usize),
+    /// A snoozed or settled thread, drawn as one line.
+    Shelved(usize),
+    /// A shelf's header, with its count; it opens and folds the shelf.
+    Header(Shelf),
+}
+
 #[derive(Default)]
 pub(crate) struct ThreadList {
     /// Unsaved threads first, then saved ones, newest first.
     rows: Vec<Row>,
     /// Open threads' live state, laid over the saved list.
     live: Vec<LiveThread>,
-    /// Indices into `rows`: the current list, filtered by the search.
-    shown: Vec<usize>,
-    snoozed: usize,
-    settled: usize,
-    list: Shelf,
+    /// What the list shows, filtered by the search.
+    items: Vec<Item>,
+    /// Threads matching the search on each shelf, indexed by [`slot`].
+    counts: [usize; 3],
+    /// Which shelves show their threads; both start folded.
+    open: [bool; 3],
     query: String,
+}
+
+/// A shelf's index into per-shelf arrays.
+fn slot(shelf: Shelf) -> usize {
+    match shelf {
+        Shelf::Active => 0,
+        Shelf::Snoozed => 1,
+        Shelf::Settled => 2,
+    }
 }
 
 impl ThreadList {
@@ -162,6 +184,12 @@ impl ThreadList {
         true
     }
 
+    /// Drops a deleted thread.
+    pub(crate) fn remove(&mut self, id: &SessionId) {
+        self.rows.retain(|row| row.id != *id);
+        self.live.retain(|live| live.id != *id);
+    }
+
     /// Forgets every open thread, after the agent restarts.
     pub(crate) fn clear_live(&mut self) {
         self.live.clear();
@@ -175,13 +203,19 @@ impl ThreadList {
         query.clone_into(&mut self.query);
     }
 
-    pub(crate) fn show(&mut self, list: Shelf) {
-        self.list = list;
+    /// Opens a folded shelf or folds an open one.
+    pub(crate) fn toggle(&mut self, which: Shelf) {
+        self.open[slot(which)] ^= true;
     }
 
-    /// Puts every row on its shelf and rebuilds the shown rows and counts.
+    /// Whether `shelf` shows its threads. A search opens every shelf.
+    pub(crate) fn is_open(&self, which: Shelf) -> bool {
+        which == Shelf::Active || self.open[slot(which)] || !self.query.is_empty()
+    }
+
+    /// Puts every row on its shelf and rebuilds the items and counts.
     /// `project_name` gives a project's name, for the search. A busy thread
-    /// is always active. Leaves a shelf list that has emptied.
+    /// is always active.
     pub(crate) fn rebuild<'a>(
         &mut self,
         shelves: &Shelves,
@@ -195,62 +229,66 @@ impl ThreadList {
                 Shelf::Active
             };
         }
-        self.snoozed = self.count(Shelf::Snoozed);
-        self.settled = self.count(Shelf::Settled);
-        if self.list != Shelf::Active && self.count(self.list) == 0 {
-            self.list = Shelf::Active;
-        }
-        self.shown.clear();
-        for (ix, row) in self.rows.iter().enumerate() {
+        let matches = |row: &Row| {
             let matches = |text: &str| contains_ignore_case(text, &self.query);
-            if row.shelf == self.list
-                && (self.query.is_empty()
-                    || row.title.as_deref().is_some_and(matches)
-                    || matches(project_name(row.project)))
-            {
-                self.shown.push(ix);
+            self.query.is_empty()
+                || row.title.as_deref().is_some_and(matches)
+                || matches(project_name(row.project))
+        };
+        let mut items = Vec::with_capacity(self.rows.len() + 2);
+        let mut counts = [0; 3];
+        for shelf in [Shelf::Active, Shelf::Snoozed, Shelf::Settled] {
+            let start = items.len();
+            for (ix, row) in self.rows.iter().enumerate() {
+                if row.shelf == shelf && matches(row) {
+                    counts[slot(shelf)] += 1;
+                    items.push(match shelf {
+                        Shelf::Active => Item::Thread(ix),
+                        Shelf::Snoozed | Shelf::Settled => Item::Shelved(ix),
+                    });
+                }
+            }
+            let count = counts[slot(shelf)];
+            // An emptied shelf folds, so it comes back folded.
+            if count == 0 && self.query.is_empty() {
+                self.open[slot(shelf)] = false;
+            }
+            if shelf != Shelf::Active && count > 0 {
+                if !self.is_open(shelf) {
+                    items.truncate(start);
+                }
+                items.insert(start, Item::Header(shelf));
             }
         }
+        self.counts = counts;
+        self.items = items;
     }
 
-    fn count(&self, which: Shelf) -> usize {
-        self.rows.iter().filter(|row| row.shelf == which).count()
-    }
-
-    /// The list being shown.
-    pub(crate) fn list(&self) -> Shelf {
-        self.list
+    /// Threads matching the search on `shelf`.
+    pub(crate) fn count(&self, which: Shelf) -> usize {
+        self.counts[slot(which)]
     }
 
     pub(crate) fn query(&self) -> &str {
         &self.query
     }
 
-    /// How many rows the current list shows.
-    pub(crate) fn len(&self) -> usize {
-        self.shown.len()
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
-        self.shown.is_empty()
+        self.items.is_empty()
     }
 
-    /// The `ix`th shown row.
-    pub(crate) fn shown(&self, ix: usize) -> Option<&Row> {
-        self.shown.get(ix).map(|&row| &self.rows[row])
+    /// What the list shows, in order.
+    pub(crate) fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// The row an [`Item`] points at.
+    pub(crate) fn row_at(&self, ix: usize) -> &Row {
+        &self.rows[ix]
     }
 
     pub(crate) fn row(&self, id: &SessionId) -> Option<&Row> {
         self.rows.iter().find(|row| row.id == *id)
-    }
-
-    /// How many threads each shelf holds.
-    pub(crate) fn shelf_count(&self, which: Shelf) -> usize {
-        match which {
-            Shelf::Active => self.rows.len() - self.snoozed - self.settled,
-            Shelf::Snoozed => self.snoozed,
-            Shelf::Settled => self.settled,
-        }
     }
 }
 
@@ -292,11 +330,21 @@ mod tests {
         }
     }
 
-    fn shown_titles(list: &ThreadList) -> Vec<String> {
-        (0..list.len())
-            .filter_map(|ix| list.shown(ix))
-            .map(|row| row.title().to_string())
+    /// What the list shows: thread titles, and shelf headers as
+    /// `[Settled 2]`.
+    fn shown(list: &ThreadList) -> Vec<String> {
+        list.items()
+            .iter()
+            .map(|&item| match item {
+                Item::Thread(ix) | Item::Shelved(ix) => list.row_at(ix).title().to_string(),
+                Item::Header(shelf) => format!("[{} {}]", shelf.label(), list.count(shelf)),
+            })
             .collect()
+    }
+
+    /// Every thread these tests list, owned so it shows as active.
+    fn owned() -> Shelves {
+        Shelves::owning(["a", "b", "old", "new", "fresh"])
     }
 
     fn rebuild(list: &mut ThreadList, shelves: &Shelves, now: i64) {
@@ -308,8 +356,8 @@ mod tests {
         let mut list = ThreadList::default();
         list.set_saved(vec![saved("old", None, 1), saved("new", Some("newer"), 2)]);
         list.set_live(live("fresh", None, Activity::Idle), 0, 3);
-        rebuild(&mut list, &Shelves::default(), 3);
-        assert_eq!(shown_titles(&list), ["New thread", "newer", "Untitled"]);
+        rebuild(&mut list, &owned(), 3);
+        assert_eq!(shown(&list), ["New thread", "newer", "Untitled"]);
 
         // The agent saves it with its title; the live title (none yet)
         // doesn't hide the saved one.
@@ -317,8 +365,8 @@ mod tests {
             saved("fresh", Some("named"), 3),
             saved("old", None, 1),
         ]);
-        rebuild(&mut list, &Shelves::default(), 3);
-        assert_eq!(shown_titles(&list), ["named", "Untitled"]);
+        rebuild(&mut list, &owned(), 3);
+        assert_eq!(shown(&list), ["named", "Untitled"]);
     }
 
     #[test]
@@ -327,62 +375,73 @@ mod tests {
         list.set_saved(vec![saved("a", Some("saved title"), 1)]);
         list.set_live(live("a", Some("live title"), Activity::Idle), 0, 2);
         list.set_live(live("b", None, Activity::Idle), 0, 2);
-        rebuild(&mut list, &Shelves::default(), 2);
-        assert_eq!(shown_titles(&list), ["New thread", "live title"]);
+        rebuild(&mut list, &owned(), 2);
+        assert_eq!(shown(&list), ["New thread", "live title"]);
 
         list.clear_live();
-        rebuild(&mut list, &Shelves::default(), 2);
-        assert_eq!(shown_titles(&list), ["live title"]);
+        rebuild(&mut list, &owned(), 2);
+        assert_eq!(shown(&list), ["live title"]);
     }
 
     #[test]
     fn busy_threads_stay_active_and_a_finished_turn_unsettles() {
-        let mut shelves = Shelves::default();
+        let mut shelves = owned();
         let mut list = ThreadList::default();
         list.set_saved(vec![saved("a", Some("a"), 10)]);
         shelves.settle("a", 20);
         rebuild(&mut list, &shelves, 30);
-        assert_eq!(list.shelf_count(Shelf::Settled), 1);
+        assert_eq!(list.count(Shelf::Settled), 1);
 
         let started = Instant::now();
         list.set_live(live("a", None, Activity::Working(started)), 0, 40);
         rebuild(&mut list, &shelves, 40);
-        assert_eq!(list.shelf_count(Shelf::Active), 1, "busy shows as active");
+        assert_eq!(list.count(Shelf::Active), 1, "busy shows as active");
 
         list.set_live(live("a", None, Activity::Idle), 0, 50);
         rebuild(&mut list, &shelves, 50);
-        assert_eq!(
-            list.shelf_count(Shelf::Active),
-            1,
-            "the turn is new activity"
-        );
+        assert_eq!(list.count(Shelf::Active), 1, "the turn is new activity");
     }
 
     #[test]
-    fn an_emptied_shelf_list_returns_to_active_and_search_filters() {
-        let mut shelves = Shelves::default();
+    fn shelves_follow_the_active_threads_and_open_on_click_or_search() {
+        let mut shelves = owned();
         let mut list = ThreadList::default();
         list.set_saved(vec![
-            saved("a", Some("Design the UI"), 2),
-            saved("b", Some("Fix boot"), 1),
+            saved("a", Some("Design the UI"), 3),
+            saved("b", Some("Fix boot"), 2),
+            saved("old", Some("Old work"), 1),
         ]);
         shelves.settle("a", 5);
-        list.show(Shelf::Settled);
+        shelves.snooze("old", 100);
         rebuild(&mut list, &shelves, 5);
-        assert_eq!(shown_titles(&list), ["Design the UI"]);
+        assert_eq!(shown(&list), ["Fix boot", "[Snoozed 1]", "[Settled 1]"]);
 
+        list.toggle(Shelf::Settled);
+        rebuild(&mut list, &shelves, 5);
+        assert_eq!(
+            shown(&list),
+            ["Fix boot", "[Snoozed 1]", "[Settled 1]", "Design the UI"]
+        );
+
+        // A search opens every shelf and counts only matches.
+        // Emptied, it folds.
         shelves.restore("a");
         rebuild(&mut list, &shelves, 5);
-        assert_eq!(list.list(), Shelf::Active);
+        shelves.settle("a", 5);
+        rebuild(&mut list, &shelves, 5);
+        assert_eq!(shown(&list), ["Fix boot", "[Snoozed 1]", "[Settled 1]"]);
 
+        list.set_query("work");
+        rebuild(&mut list, &shelves, 5);
+        assert_eq!(shown(&list), ["[Snoozed 1]", "Old work"]);
+        list.set_query("DESIGN");
+        rebuild(&mut list, &shelves, 5);
+        assert_eq!(shown(&list), ["[Settled 1]", "Design the UI"]);
         list.set_query("design ui");
         rebuild(&mut list, &shelves, 5);
         assert!(list.is_empty(), "words must appear together");
-        list.set_query("DESIGN");
-        rebuild(&mut list, &shelves, 5);
-        assert_eq!(shown_titles(&list), ["Design the UI"]);
         list.set_query("proj");
         rebuild(&mut list, &shelves, 5);
-        assert_eq!(list.len(), 2, "the project name matches too");
+        assert_eq!(list.items.len(), 5, "the project name matches too");
     }
 }

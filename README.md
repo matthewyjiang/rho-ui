@@ -31,12 +31,14 @@ flowchart TD
 
 | Crate | Owns |
 | --- | --- |
-| `rho-ui-core` | Starting the agent, ACP requests, the event stream, and `Thread`, which turns `session/update` notifications into transcript rows. It has no GUI code and no async runtime: the caller drives the connection on its own executor, so a future daemon can reuse it unchanged. |
+| `rho-ui-core` | Starting the agent, ACP requests, the event stream, `Thread`, which turns `session/update` notifications into transcript entries, and `Timeline`, which groups each run of tool calls and thoughts into one row and splits rows into turns, so the UI can fold a finished turn's working behind one line. It has no GUI code and no async runtime: the caller drives the connection on its own executor, so a future daemon can reuse it unchanged. |
 | `rho-ui` | Windows, views, and input. |
 
 One `rho acp` process serves every thread; rho keeps sessions in a map, and a new session in a warm process takes about 20 ms. Sessions live in `~/.rho/sessions`, so they show up in the TUI and other ACP hosts as well.
 
-Settling and snoozing threads is rho-ui's own idea; rho has no such state. rho-ui keeps the marks in `$XDG_STATE_HOME/rho-ui/shelves` (by default `~/.local/state/rho-ui/shelves`), one line per thread. A settled thread comes back when it has new activity, and a snoozed one when its time is up.
+Settling and snoozing threads is rho-ui's own idea; rho has no such state. Threads started or continued in rho-ui list as active. Threads from elsewhere, such as rho's terminal UI, start out settled, so the sidebar doesn't fill with old history; snoozing or restoring one makes it rho-ui's. rho-ui keeps this in `$XDG_STATE_HOME/rho-ui/shelves` (by default `~/.local/state/rho-ui/shelves`). A settled thread comes back when it has new activity in rho-ui, and a snoozed one when its time is up. Snoozed and Settled sit under the active threads, folded; open one to see its threads on one line each, and hover a thread for its details.
+
+Settings (Ctrl+, or the gear at the bottom of the sidebar) hold the UI scale, the UI font (default Noto Sans) and the code font (default JetBrainsMono Nerd Font), saved in `$XDG_CONFIG_HOME/rho-ui/settings`.
 
 Neither crate is published to crates.io.
 
