@@ -219,6 +219,13 @@ fn new_thread_runs_a_turn_through_an_approval() {
         is_visible(window, "approval-yes")
     });
     assert_eq!(ui.thread().state(), &RunState::Running);
+    // rho names a session after its first turn; until then the header and
+    // the sidebar row both show the first prompt.
+    assert_eq!(ui.thread().title(), None);
+    ui.act(|window, _| {
+        assert_eq!(window.find("thread-title").label(), Some("list files"));
+        assert_eq!(window.find("session-new-1").label(), Some("list files"));
+    });
     ui.shot("approval");
 
     ui.click("approval-yes");

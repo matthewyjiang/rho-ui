@@ -5,6 +5,7 @@
 use std::{collections::VecDeque, path::PathBuf, rc::Rc, time::Instant};
 
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::Alert,
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia},
@@ -18,10 +19,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StyleRefinement, Styled as _, Subscription, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Agent, AgentError, PermissionRequest, RunState, SessionId, SessionSetup, Thread, ThreadUpdate,
+    Agent, AgentError, Entry, PermissionRequest, RunState, SessionId, SessionSetup, Thread,
+    ThreadUpdate,
 };
 
 use crate::{
@@ -149,7 +151,7 @@ impl ThreadView {
         };
         view.transcript.sync(view.thread.entries(), cx);
         view.sync_settings(window, cx);
-        view.reported = (view.title().to_owned(), view.activity());
+        view.reported = (view.title(), view.activity());
         view
     }
 
@@ -162,14 +164,23 @@ impl ThreadView {
         LiveThread {
             id: self.thread.id().clone(),
             cwd: self.cwd.clone(),
-            title: self.thread.title().map(|title| title.to_owned().into()),
+            title: self.name().map(SharedString::from),
             placeholder: self.placeholder(),
             activity: self.activity(),
         }
     }
 
-    fn title(&self) -> &str {
-        self.thread.title().unwrap_or(self.placeholder())
+    /// The agent's title, or until it sends one (rho names a session after
+    /// its first turn), the first prompt, as rho lists an untitled session.
+    fn name(&self) -> Option<String> {
+        self.thread
+            .title()
+            .map(str::to_owned)
+            .or_else(|| first_prompt(&self.thread))
+    }
+
+    fn title(&self) -> String {
+        self.name().unwrap_or_else(|| self.placeholder().to_owned())
     }
 
     /// The title until the agent gives one: a saved thread is untitled.
@@ -268,8 +279,9 @@ impl ThreadView {
             (false, since) => Some(since.unwrap_or(now)),
         };
         let activity = self.activity();
-        if self.reported.0 != self.title() || self.reported.1 != activity {
-            self.reported = (self.title().to_owned(), activity);
+        let title = self.title();
+        if self.reported.0 != title || self.reported.1 != activity {
+            self.reported = (title, activity);
             cx.emit(ThreadEvent::LiveChanged);
         }
         cx.notify();
@@ -552,7 +564,7 @@ impl Render for ThreadView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
             .size_full()
-            .child(header(self.title().to_owned(), self.project.read(cx), cx))
+            .child(header(self.title(), self.project.read(cx), cx))
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }
@@ -579,6 +591,36 @@ pub(crate) fn header(title: String, project: &Project, cx: &App) -> impl IntoEle
         .py_1()
         .border_b_1()
         .border_color(cx.theme().border)
-        .child(div().truncate().font_medium().child(title))
+        .child(
+            div()
+                .id("thread-title")
+                .test_support()
+                .aria_label(title.clone())
+                .truncate()
+                .font_medium()
+                .child(title),
+        )
         .child(details)
+}
+
+/// Longest first-prompt title, in characters: rho's `FALLBACK_TITLE_CHARS`,
+/// so the header matches the title rho lists for an untitled session.
+const PROMPT_TITLE_CHARS: usize = 80;
+
+/// The first prompt's text on one line, cut to [`PROMPT_TITLE_CHARS`].
+fn first_prompt(thread: &Thread) -> Option<String> {
+    let text = thread.entries().iter().find_map(|entry| match entry {
+        Entry::User(message) => Some(message.text()),
+        Entry::Agent(_) | Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) => None,
+    })?;
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= PROMPT_TITLE_CHARS {
+        return Some(line);
+    }
+    let mut cut: String = line.chars().take(PROMPT_TITLE_CHARS - 1).collect();
+    cut.push('…');
+    Some(cut)
 }

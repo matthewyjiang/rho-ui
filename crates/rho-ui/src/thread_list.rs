@@ -43,9 +43,10 @@ pub(crate) struct SavedThread {
 pub(crate) struct LiveThread {
     pub(crate) id: SessionId,
     pub(crate) cwd: PathBuf,
-    /// The agent's title, once it has one.
+    /// What the thread's own header shows: the agent's title, or until it
+    /// sends one, the first prompt.
     pub(crate) title: Option<SharedString>,
-    /// What the thread's own header shows until then: [`NEW_THREAD`] or
+    /// What the header shows before either: [`NEW_THREAD`] or
     /// [`UNTITLED`]. The row shows the same.
     pub(crate) placeholder: &'static str,
     pub(crate) activity: Activity,
@@ -61,7 +62,7 @@ pub(crate) struct Row {
     pub(crate) id: SessionId,
     /// `session-<id>`, made once: the row's element ID.
     pub(crate) element_id: SharedString,
-    /// The agent's title, if it has given one.
+    /// The open thread's title, else the one the agent lists.
     pub(crate) title: Option<SharedString>,
     /// Shown while `title` is `None`.
     placeholder: &'static str,

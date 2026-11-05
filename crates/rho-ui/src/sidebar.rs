@@ -538,6 +538,8 @@ impl SidebarView {
         let menu = (view.clone(), MenuRow::new(row));
         let (hover_id, hover_view) = (row.id.clone(), view.clone());
         let inner = inner
+            // Its accessible name; UI tests read the title from it.
+            .aria_label(row.title())
             .size_full()
             .px_2()
             .rounded(theme.radius)
