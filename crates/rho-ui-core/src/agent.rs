@@ -96,6 +96,13 @@ impl SessionId {
     }
 }
 
+/// For IDs read back from storage, such as rho-ui's settled list.
+impl From<&str> for SessionId {
+    fn from(id: &str) -> Self {
+        Self(id.into())
+    }
+}
+
 impl From<v2::SessionId> for SessionId {
     fn from(id: v2::SessionId) -> Self {
         Self(id.0)
@@ -271,6 +278,9 @@ impl Agent {
         let (startup_tx, startup_rx) = async_channel::bounded::<Startup>(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+        // Named in startup errors: "No such file or directory" alone doesn't
+        // say what was missing.
+        let program = command.program.display().to_string();
         let process = AcpAgent::new(AcpAgentConfig::new(command.program).args(command.args));
         let updates = event_tx.clone();
         let permissions = event_tx.clone();
@@ -329,9 +339,11 @@ impl Agent {
                 )
                 .await;
             let error = result.err().map(|error| describe_error(&error));
-            let _ = startup_tx.try_send(Err(error
-                .clone()
-                .map_or(AgentError::Exited, AgentError::Protocol)));
+            // Full when `initialize` already reported, so this only lands
+            // for a failed start.
+            let _ = startup_tx.try_send(Err(error.as_ref().map_or(AgentError::Exited, |error| {
+                AgentError::Protocol(format!("couldn't run {program}: {error}"))
+            })));
             let _ = event_tx.try_send(AgentEvent::Exited { error });
         };
         spawn(driver.boxed());

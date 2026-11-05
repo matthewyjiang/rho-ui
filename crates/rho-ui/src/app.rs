@@ -1,29 +1,32 @@
 //! The root view: owns the agent process, the event pump, and the open
 //! threads. Everything the agent pushes enters here and is routed to the
 //! [`ThreadView`] of its session.
+//!
+//! The sidebar and the thread view are drawn as cached views: each redraws
+//! only when it changes, so a hover in one never rebuilds the other.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     notification::Notification,
     spinner::Spinner,
-    status_bar::StatusBar,
     v_flex, ActiveTheme as _, IconName, StyledExt as _, WindowExt as _,
 };
 use gpui_kit::{
-    div, rems, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window,
+    div, rems, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Agent, AgentCommand, AgentError, AgentEvent, SessionId, SessionSetup, SessionSummary, Thread,
-    ThreadUpdate,
+    Agent, AgentCommand, AgentError, AgentEvent, SessionId, SessionSetup, Thread, ThreadUpdate,
 };
 
 use crate::{
-    sidebar::{self, SessionRow},
+    projects::{ProjectRef, Projects},
+    shelf::Shelves,
+    sidebar::{SidebarEvent, SidebarView},
     thread_view::{Loading, ThreadEvent, ThreadView},
     NewThread,
 };
@@ -48,6 +51,7 @@ enum AgentStatus {
 /// A thread the user opened in this run, with the subscription that keeps
 /// the sidebar in step with it.
 struct OpenThread {
+    id: SessionId,
     view: Entity<ThreadView>,
     _subscription: Subscription,
 }
@@ -55,11 +59,16 @@ struct OpenThread {
 pub(crate) struct RhoApp {
     launch: LaunchConfig,
     status: AgentStatus,
-    /// Saved sessions, newest first, from the last `list_sessions`.
-    sessions: Vec<SessionSummary>,
-    sessions_error: Option<String>,
-    threads: HashMap<SessionId, OpenThread>,
-    active: Option<SessionId>,
+    /// Counts agent starts. Replies to requests made before a restart
+    /// belong to the old process and are dropped.
+    epoch: u64,
+    projects: Entity<Projects>,
+    sidebar: Entity<SidebarView>,
+    /// Threads opened in this run. Only appended to, and cleared when the
+    /// agent restarts, so `active` can be an index. A handful at most, so
+    /// lookups by ID scan.
+    threads: Vec<OpenThread>,
+    active: Option<usize>,
     /// `new_session` calls in flight. While any are, updates for unknown
     /// sessions are kept, since they may belong to the session being made.
     creating: usize,
@@ -70,28 +79,45 @@ pub(crate) struct RhoApp {
     agent_task: Task<()>,
     /// The latest `list_sessions`; a newer refresh replaces it.
     sessions_task: Task<()>,
+    _sidebar_subscription: Subscription,
 }
 
 impl RhoApp {
+    /// `shelves` holds the settled and snoozed marks; see [`Shelves::load`].
     pub(crate) fn new(
         launch: LaunchConfig,
+        shelves: Shelves,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        let projects = cx.new(Projects::new);
+        let sidebar = cx.new(|cx| SidebarView::new(projects.clone(), shelves, window, cx));
+        let sidebar_subscription = cx.subscribe_in(
+            &sidebar,
+            window,
+            |this, _, event: &SidebarEvent, window, cx| match event {
+                SidebarEvent::Open { id, cwd, title } => {
+                    this.open_session(id.clone(), cwd.clone(), title.clone(), window, cx);
+                }
+                SidebarEvent::NewThread => this.new_thread(window, cx),
+            },
+        );
         let mut app = Self {
             launch,
             status: AgentStatus::Starting,
-            sessions: Vec::new(),
-            sessions_error: None,
-            threads: HashMap::new(),
+            epoch: 0,
+            projects,
+            sidebar,
+            threads: Vec::new(),
             active: None,
             creating: 0,
             early_updates: Vec::new(),
             focus_handle,
             agent_task: Task::ready(()),
             sessions_task: Task::ready(()),
+            _sidebar_subscription: sidebar_subscription,
         };
         app.start_agent(window, cx);
         app
@@ -100,11 +126,12 @@ impl RhoApp {
     /// (Re)starts the agent. Threads from a previous process are dropped:
     /// their sessions are not loaded in the new one.
     fn start_agent(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.threads.clear();
-        self.active = None;
+        self.forget_threads(cx);
+        self.epoch += 1;
         self.creating = 0;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_creating(0, cx));
         self.early_updates.clear();
-        self.sessions_error = None;
         self.status = AgentStatus::Starting;
         cx.notify();
 
@@ -115,6 +142,10 @@ impl RhoApp {
             let events = match started {
                 Ok((agent, events)) => {
                     let stored = this.update(cx, |this, cx| {
+                        let info = agent.info();
+                        let label = format!("{} {}", info.name(), info.version());
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.set_agent(label, cx));
                         this.status = AgentStatus::Ready(agent);
                         this.refresh_sessions(cx);
                         cx.notify();
@@ -143,6 +174,17 @@ impl RhoApp {
         });
     }
 
+    /// Drops every open thread: their sessions are gone with the agent.
+    fn forget_threads(&mut self, cx: &mut Context<'_, Self>) {
+        self.threads.clear();
+        self.active = None;
+        self.sidebar.update(cx, SidebarView::clear_live);
+    }
+
+    fn thread(&self, id: &SessionId) -> Option<&OpenThread> {
+        self.threads.iter().find(|open| open.id == *id)
+    }
+
     fn agent(&self) -> Option<&Agent> {
         match &self.status {
             AgentStatus::Ready(agent) => Some(agent),
@@ -153,7 +195,7 @@ impl RhoApp {
     fn route_event(&mut self, event: AgentEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         match event {
             AgentEvent::Update { session, update } => {
-                if let Some(open) = self.threads.get(&session) {
+                if let Some(open) = self.thread(&session) {
                     open.view
                         .update(cx, |view, cx| view.apply(update, window, cx));
                 } else if self.creating > 0 {
@@ -162,14 +204,13 @@ impl RhoApp {
             }
             AgentEvent::Permission(request) => {
                 // Unknown sessions drop the request, which answers "cancelled".
-                if let Some(open) = self.threads.get(request.session()) {
+                if let Some(open) = self.thread(request.session()) {
                     open.view
                         .update(cx, |view, cx| view.push_approval(request, window, cx));
                 }
             }
             AgentEvent::Exited { error } => {
-                self.threads.clear();
-                self.active = None;
+                self.forget_threads(cx);
                 self.status = AgentStatus::Failed(
                     error.unwrap_or_else(|| "The agent closed the connection.".to_owned()),
                 );
@@ -186,16 +227,10 @@ impl RhoApp {
         self.sessions_task = cx.spawn(async move |this, cx| {
             let result = agent.list_sessions().await;
             let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(mut sessions) => {
-                        // RFC 3339 stamps from one agent sort as text.
-                        sessions.sort_by(|a, b| b.updated_at().cmp(&a.updated_at()));
-                        this.sessions = sessions;
-                        this.sessions_error = None;
-                    }
-                    Err(error) => this.sessions_error = Some(error.to_string()),
-                }
-                cx.notify();
+                this.sidebar.update(cx, |sidebar, cx| match result {
+                    Ok(sessions) => sidebar.set_saved(sessions, cx),
+                    Err(error) => sidebar.set_error(error.to_string(), cx),
+                });
             });
         });
     }
@@ -205,12 +240,22 @@ impl RhoApp {
             return;
         };
         let cwd = self.launch.workspace.clone();
+        let epoch = self.epoch;
         self.creating += 1;
+        let starting = self.creating;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_creating(starting, cx));
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = agent.new_session(&cwd).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.epoch != epoch {
+                    return;
+                }
                 this.creating -= 1;
+                let starting = this.creating;
+                this.sidebar
+                    .update(cx, |sidebar, cx| sidebar.set_creating(starting, cx));
                 match result {
                     Ok(setup) => this.open_new_session(agent, cwd, setup, window, cx),
                     Err(error) => window.push_notification(
@@ -238,7 +283,9 @@ impl RhoApp {
         let id = setup.id().clone();
         let mut thread = Thread::new(id.clone());
         thread.set_setup(setup);
-        let view = cx.new(|cx| ThreadView::new(agent, thread, cwd, Loading::Ready, window, cx));
+        let project = ProjectRef::new(&self.projects, &cwd, cx);
+        let view =
+            cx.new(|cx| ThreadView::new(agent, thread, cwd, project, Loading::Ready, window, cx));
         let early = std::mem::take(&mut self.early_updates);
         let (mine, others): (Vec<_>, Vec<_>) =
             early.into_iter().partition(|(session, _)| *session == id);
@@ -248,20 +295,22 @@ impl RhoApp {
                 view.apply(update, window, cx);
             }
         });
-        self.insert_thread(id.clone(), view, window, cx);
-        self.activate(id, window, cx);
+        let ix = self.insert_thread(id, view, window, cx);
+        self.activate(ix, window, cx);
     }
 
     /// Opens a saved session, or switches to it if it is already open.
+    /// `title` is the saved title: resuming does not replay it.
     pub(crate) fn open_session(
         &mut self,
         id: SessionId,
         cwd: PathBuf,
+        title: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.threads.contains_key(&id) {
-            self.activate(id, window, cx);
+        if let Some(ix) = self.threads.iter().position(|open| open.id == id) {
+            self.activate(ix, window, cx);
             return;
         }
         let Some(agent) = self.agent().cloned() else {
@@ -269,19 +318,22 @@ impl RhoApp {
         };
         // The thread must exist before resume: history replays as events
         // before `resume_session` returns.
-        let thread = Thread::new(id.clone());
+        let mut thread = Thread::new(id.clone());
+        thread.set_title(title.map(String::from));
+        let project = ProjectRef::new(&self.projects, &cwd, cx);
         let view = cx.new(|cx| {
             ThreadView::new(
                 agent.clone(),
                 thread,
                 cwd.clone(),
+                project,
                 Loading::Resuming,
                 window,
                 cx,
             )
         });
-        self.insert_thread(id.clone(), view.clone(), window, cx);
-        self.activate(id.clone(), window, cx);
+        let ix = self.insert_thread(id.clone(), view.clone(), window, cx);
+        self.activate(ix, window, cx);
 
         let view = view.downgrade();
         cx.spawn_in(window, async move |_, cx| {
@@ -293,82 +345,46 @@ impl RhoApp {
         .detach();
     }
 
+    /// Adds `view` to the open threads and returns its index.
     fn insert_thread(
         &mut self,
         id: SessionId,
         view: Entity<ThreadView>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
-        let subscription =
-            cx.subscribe_in(
-                &view,
-                window,
-                |this, _, event: &ThreadEvent, _, cx| match event {
-                    ThreadEvent::SidebarChanged => cx.notify(),
-                    ThreadEvent::Saved => this.refresh_sessions(cx),
-                },
-            );
-        self.threads.insert(
-            id,
-            OpenThread {
-                view,
-                _subscription: subscription,
+    ) -> usize {
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, view, event: &ThreadEvent, _, cx| match event {
+                ThreadEvent::LiveChanged => {
+                    let live = view.read(cx).live();
+                    this.sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
+                }
+                ThreadEvent::Saved => this.refresh_sessions(cx),
             },
         );
+        let live = view.read(cx).live();
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
+        self.threads.push(OpenThread {
+            id,
+            view,
+            _subscription: subscription,
+        });
+        self.threads.len() - 1
     }
 
-    fn activate(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some(open) = self.threads.get(&id) {
-            let handle = open.view.read(cx).composer_focus_handle(cx);
-            window.focus(&handle, cx);
-        }
-        self.active = Some(id);
+    fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let open = &self.threads[ix];
+        let handle = open.view.read(cx).composer_focus_handle(cx);
+        window.focus(&handle, cx);
+        let id = open.id.clone();
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_active(Some(id), cx));
+        self.active = Some(ix);
         cx.notify();
-    }
-
-    /// Sidebar rows: threads opened in this run that the saved list does not
-    /// have yet, then the saved sessions.
-    fn session_rows(&self, cx: &App) -> Vec<SessionRow> {
-        let now = std::time::SystemTime::now();
-        let mut unsaved: Vec<SessionRow> = self
-            .threads
-            .iter()
-            .filter(|(id, _)| !self.sessions.iter().any(|session| session.id() == *id))
-            .map(|(id, open)| {
-                let view = open.view.read(cx);
-                SessionRow {
-                    id: id.clone(),
-                    cwd: view.cwd().to_path_buf(),
-                    title: view.title().into(),
-                    detail: sidebar::dir_name(view.cwd()).into(),
-                    active: self.active.as_ref() == Some(id),
-                    attention: view.attention(),
-                }
-            })
-            .collect();
-        unsaved.sort_by(|a, b| a.id.cmp(&b.id));
-        unsaved.extend(self.sessions.iter().map(|session| {
-            let open = self
-                .threads
-                .get(session.id())
-                .map(|open| open.view.read(cx));
-            let title = open
-                .and_then(|view| view.live_title())
-                .or(session.title())
-                .unwrap_or("Untitled");
-            SessionRow {
-                id: session.id().clone(),
-                cwd: session.cwd().to_path_buf(),
-                title: title.to_owned().into(),
-                detail: sidebar::session_detail(session, now).into(),
-                active: self.active.as_ref() == Some(session.id()),
-                attention: open
-                    .map(super::thread_view::ThreadView::attention)
-                    .unwrap_or_default(),
-            }
-        }));
-        unsaved
     }
 
     fn render_starting(cx: &mut Context<'_, Self>) -> impl IntoElement {
@@ -431,37 +447,27 @@ impl RhoApp {
     }
 
     /// The main pane when no thread is open.
-    fn render_no_thread(&self, agent: &Agent, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render_no_thread(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         v_flex()
-            .size_full()
+            .flex_1()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
             .child(
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Open a thread from the sidebar or start a new one."),
-                    )
-                    .child(
-                        Button::new("empty-new-thread")
-                            .outline()
-                            .icon(IconName::Plus)
-                            .label("New thread")
-                            .loading(self.creating > 0)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_thread(window, cx)),
-                            ),
-                    ),
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Open a thread from the sidebar or start a new one."),
             )
-            .child(StatusBar::new().right(format!(
-                "{} {}",
-                agent.info().name(),
-                agent.info().version()
-            )))
+            .child(
+                Button::new("empty-new-thread")
+                    .outline()
+                    .icon(IconName::Plus)
+                    .label("New thread")
+                    .loading(self.creating > 0)
+                    .on_click(cx.listener(|this, _, window, cx| this.new_thread(window, cx))),
+            )
     }
 }
 
@@ -469,8 +475,7 @@ impl RhoApp {
 impl RhoApp {
     /// The thread the main pane shows, for UI tests.
     pub(crate) fn active_thread(&self) -> Option<Entity<ThreadView>> {
-        let id = self.active.as_ref()?;
-        self.threads.get(id).map(|open| open.view.clone())
+        self.active.map(|ix| self.threads[ix].view.clone())
     }
 }
 
@@ -486,7 +491,7 @@ impl Render for RhoApp {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground);
 
-        let agent = match &self.status {
+        match &self.status {
             AgentStatus::Starting => {
                 return root.child(Self::render_starting(cx)).into_any_element()
             }
@@ -496,22 +501,30 @@ impl Render for RhoApp {
                     .child(self.render_failed(&message, cx))
                     .into_any_element();
             }
-            AgentStatus::Ready(agent) => agent.clone(),
-        };
+            AgentStatus::Ready(_) => {}
+        }
 
-        let rows = self.session_rows(cx);
-        let sessions_error = self.sessions_error.clone();
-        let main = match self.active.as_ref().and_then(|id| self.threads.get(id)) {
-            Some(open) => open.view.clone().into_any_element(),
-            None => self.render_no_thread(&agent, cx).into_any_element(),
+        let main = match self.active {
+            Some(ix) => self.threads[ix]
+                .view
+                .clone()
+                .cached(StyleRefinement::default().flex_1().min_w_0().h_full())
+                .into_any_element(),
+            None => self.render_no_thread(cx).into_any_element(),
         };
-
         root.child(
             h_flex()
                 .size_full()
                 .items_stretch()
-                .child(sidebar::render(rows, self.creating, sessions_error, cx))
-                .child(v_flex().flex_1().min_w_0().h_full().child(main)),
+                .child(
+                    self.sidebar.clone().cached(
+                        StyleRefinement::default()
+                            .w(rems(18.))
+                            .h_full()
+                            .flex_shrink_0(),
+                    ),
+                )
+                .child(main),
         )
         .into_any_element()
     }

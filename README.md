@@ -36,6 +36,8 @@ flowchart TD
 
 One `rho acp` process serves every thread; rho keeps sessions in a map, and a new session in a warm process takes about 20 ms. Sessions live in `~/.rho/sessions`, so they show up in the TUI and other ACP hosts as well.
 
+Settling and snoozing threads is rho-ui's own idea; rho has no such state. rho-ui keeps the marks in `$XDG_STATE_HOME/rho-ui/shelves` (by default `~/.local/state/rho-ui/shelves`), one line per thread. A settled thread comes back when it has new activity, and a snoozed one when its time is up.
+
 Neither crate is published to crates.io.
 
 ## Test
@@ -46,5 +48,7 @@ cargo test
 
 - `rho-ui-core` tests run `crates/rho-ui-core/tests/fake_agent.py`, a scripted ACP agent, so they need `python3` but no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real `rho acp`.
 - `rho-ui` UI tests (`crates/rho-ui/src/ui_tests.rs`) open the real app in an offscreen window, click and type through GPUI Kit's test helpers, and talk to the same fake agent. They need a working Vulkan driver; Mesa lavapipe works without a GPU. Each run saves screenshots to `target/ui-shots/` for review.
+
+To measure frame times with 300 saved threads and a 100-turn transcript, run `cargo test -p rho-ui --release frame_times -- --ignored --nocapture`.
 
 `Cargo.lock` follows GPUI Kit 0.9.0's own lock file; its `test-support` feature does not resolve against newer versions of some shared crates.

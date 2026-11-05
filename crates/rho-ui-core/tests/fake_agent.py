@@ -8,7 +8,11 @@ rho-ui-core's agent tests and rho-ui's headless UI tests both run it.
 - Settings: mode (select), model (select), fast_mode (toggle).
 - A prompt asks the host for permission, then runs a fake `ls` tool and
   replies "you chose <option id>". The prompt "fail" is refused.
+
+For load tests: FAKE_SESSIONS=N adds N more saved sessions to the list, and
+FAKE_REPLAY=N makes resume replay N Markdown messages and tool calls.
 """
+import os
 import json
 import sys
 
@@ -84,11 +88,26 @@ for line in sys.stdin:
                                                       "updatedAt": "2026-01-02T00:00:00Z"}],
                                         "nextCursor": "p2"}})
         else:
+            extra = [{"sessionId": f"bulk-{n}", "cwd": f"/w/project-{n % 7}",
+                      "title": f"Bulk session {n} with a longer title that truncates",
+                      "updatedAt": "2025-12-01T00:00:00Z"}
+                     for n in range(int(os.environ.get("FAKE_SESSIONS", "0")))]
             send({"id": rid, "result": {"sessions": [{"sessionId": "old", "cwd": "/w/b",
-                                                      "updatedAt": "2026-01-01T00:00:00Z"}]}})
+                                                      "updatedAt": "2026-01-01T00:00:00Z"}] + extra}})
     elif method == "session/resume":
         assert params["replayFrom"] == {"type": "start"}, params
         chunk(params["sessionId"], "m0", "replayed")
+        for n in range(int(os.environ.get("FAKE_REPLAY", "0"))):
+            session = params["sessionId"]
+            update(session, {"sessionUpdate": "user_message", "messageId": f"u{n}",
+                             "content": [{"type": "text", "text": f"Question {n}: what does this do?"}]})
+            update(session, {"sessionUpdate": "tool_call_update", "toolCallId": f"t{n}",
+                             "title": f"rg -n pattern src/{n}.rs", "status": "completed",
+                             "content": [{"type": "content", "content": {"type": "text",
+                                         "text": "\n".join(f"src/{n}.rs:{i}: match" for i in range(20))}}]})
+            chunk(session, f"r{n}", f"## Answer {n}\n\nThis **function** walks the `tree` and returns a list:\n\n"
+                  + "\n".join(f"- item {i} with `code` and *emphasis*" for i in range(6))
+                  + "\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n")
         update(params["sessionId"], {"sessionUpdate": "state_update", "state": "idle"})
         send({"id": rid, "result": {"configOptions": config(params["sessionId"]), "availableCommands": []}})
     elif method == "session/set_config_option":

@@ -8,22 +8,31 @@ mod app;
 mod approval;
 mod composer;
 mod config_bar;
+mod projects;
+mod repo;
+mod shelf;
 mod sidebar;
+mod thread_list;
 mod thread_view;
+mod time;
 mod tool_card;
 mod transcript;
 #[cfg(test)]
 mod ui_tests;
 
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
-    px, size, App, AppContext as _, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size, App, AppContext as _, AssetSource, KeyBinding, SharedString, TitlebarOptions,
+    WindowBounds, WindowOptions,
 };
 use rho_ui_core::AgentCommand;
 
-use crate::app::{LaunchConfig, RhoApp};
+use crate::{
+    app::{LaunchConfig, RhoApp},
+    shelf::Shelves,
+};
 
 gpui_kit::actions!(
     rho_ui,
@@ -36,6 +45,31 @@ gpui_kit::actions!(
         Quit
     ]
 );
+
+// Icons GPUI Kit's default bundle leaves out, borrowed from its full catalog.
+gpui_kit::assets::icon_assets!(
+    ExtraIcons,
+    [GitBranch, AlarmClock, Archive, SquarePen, CircleDashed]
+);
+
+/// GPUI Kit's default icons plus [`ExtraIcons`], all borrowed from static
+/// storage.
+struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
+        match ExtraIcons.load(path)? {
+            Some(icon) => Ok(Some(icon)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        Ok(paths)
+    }
+}
 
 const USAGE: &str = "usage: rho-ui [DIR] [-- AGENT COMMAND...]";
 
@@ -97,18 +131,16 @@ fn main() {
         }
     };
 
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx| {
-            init(cx);
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            let options = window_options(cx);
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| RhoApp::new(launch, window, cx))
-            })
-            .expect("failed to open the rho-ui window");
-            cx.activate(true);
-        });
+    gpui_kit::application().with_assets(Assets).run(move |cx| {
+        init(cx);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        let options = window_options(cx);
+        gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| RhoApp::new(launch, Shelves::load(time::now_unix()), window, cx))
+        })
+        .expect("failed to open the rho-ui window");
+        cx.activate(true);
+    });
 }
 
 /// App-wide setup shared by `main` and the UI tests: GPUI Kit, the theme,

@@ -1,31 +1,26 @@
-//! One thread: header with settings, transcript, approvals, composer and
-//! status bar. Owns the session's [`Thread`] state and every request the user
-//! makes in it.
+//! One thread: a header with its title and project, the transcript,
+//! approvals, and the composer with the session settings. Owns the session's
+//! [`Thread`] state and every request the user makes in it.
 
-use std::{
-    collections::{HashSet, VecDeque},
-    path::{Path, PathBuf},
-    rc::Rc,
-};
+use std::{collections::VecDeque, path::PathBuf, rc::Rc, time::Instant};
 
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
     alert::Alert,
     h_flex,
     input::{InputEvent, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
     spinner::Spinner,
-    status_bar::StatusBar,
-    v_flex, ActiveTheme as _, Sizable as _, StyledExt as _,
+    v_flex, ActiveTheme as _, Icon, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
+    div, px, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Agent, AgentError, ConfigValue, Entry, PermissionRequest, RunState, SessionSetup, Thread,
-    ThreadUpdate, ToolContent, ToolStatus,
+    Agent, AgentError, ConfigValue, PermissionRequest, RunState, SessionSetup, Thread, ThreadUpdate,
 };
 
 use crate::{
@@ -33,15 +28,16 @@ use crate::{
     composer::ComposerMode,
     composer::{self, Composer},
     config_bar::{Availability, ConfigBar},
-    sidebar::Attention,
+    projects::ProjectRef,
+    thread_list::{Activity, LiveThread, NEW_THREAD, UNTITLED},
     transcript::{self, Disclosure, RowContext, ToggleHandler},
     StopTurn,
 };
 
 /// What the app needs to hear from a thread.
 pub(crate) enum ThreadEvent {
-    /// Title or attention changed; redraw the sidebar.
-    SidebarChanged,
+    /// Title or activity changed; see [`ThreadView::live`].
+    LiveChanged,
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
     Saved,
@@ -57,53 +53,17 @@ pub(crate) enum Loading {
     Failed(String),
 }
 
-/// What decides a transcript row's height, to tell which rows to remeasure.
-#[derive(PartialEq)]
-enum RowStamp {
-    Message(usize),
-    Tool {
-        status: ToolStatus,
-        title: usize,
-        content: usize,
-    },
-    Notice,
-}
-
-impl RowStamp {
-    fn of(entry: &Entry) -> Self {
-        match entry {
-            Entry::User(message) | Entry::Agent(message) | Entry::Thought(message) => {
-                Self::Message(message.text().len())
-            }
-            Entry::Tool(tool) => Self::Tool {
-                status: tool.status(),
-                title: tool.title().len(),
-                content: tool
-                    .content()
-                    .iter()
-                    .map(|content| match content {
-                        ToolContent::Text(text) => text.len(),
-                        ToolContent::Diff { paths, patch } => {
-                            paths.len() + patch.as_ref().map_or(0, String::len)
-                        }
-                    })
-                    .sum(),
-            },
-            Entry::Notice(_) => Self::Notice,
-        }
-    }
-}
-
 pub(crate) struct ThreadView {
     agent: Agent,
     thread: Thread,
     cwd: PathBuf,
+    /// The project and branch, for the header.
+    project: ProjectRef,
     loading: Loading,
     scroller: Entity<MessageScrollerState>,
-    /// One stamp per entry, as the scroller last measured them.
-    row_stamps: Vec<RowStamp>,
-    /// Row keys of thoughts and tool cards the user opened.
-    expanded: HashSet<String>,
+    /// One flag per entry the scroller knows about: the user opened this
+    /// thought or tool card.
+    expanded: Vec<bool>,
     composer: Entity<TextareaState>,
     config_bar: ConfigBar,
     /// `set_config` calls in flight.
@@ -115,8 +75,12 @@ pub(crate) struct ThreadView {
     sending: bool,
     /// The first prompt was accepted, so the session is saved.
     prompted: bool,
-    was_busy: bool,
-    sidebar_snapshot: (Option<String>, Attention),
+    /// When the running turn started.
+    busy_since: Option<Instant>,
+    /// When the oldest waiting approval arrived.
+    waiting_since: Option<Instant>,
+    /// Title and activity as last reported in [`ThreadEvent::LiveChanged`].
+    reported: (String, Activity),
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
     focus_handle: FocusHandle,
@@ -132,6 +96,7 @@ impl ThreadView {
         agent: Agent,
         thread: Thread,
         cwd: PathBuf,
+        project: ProjectRef,
         loading: Loading,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -141,6 +106,8 @@ impl ThreadView {
         let subscriptions = vec![
             // The jump-to-latest button follows the scroll position.
             cx.observe(&scroller, |_, _, cx| cx.notify()),
+            // The header shows the branch, which can change.
+            cx.observe(project.table(), |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &composer,
                 window,
@@ -155,41 +122,53 @@ impl ThreadView {
             agent,
             thread,
             cwd,
+            project,
             // A resumed session is already saved.
             prompted: matches!(loading, Loading::Resuming),
             loading,
             scroller,
-            row_stamps: Vec::new(),
-            expanded: HashSet::new(),
+            expanded: Vec::new(),
             composer,
             config_bar: ConfigBar::default(),
             config_pending: 0,
             approvals: VecDeque::new(),
             approval_focus: cx.focus_handle(),
             sending: false,
-            was_busy: false,
-            sidebar_snapshot: (None, Attention::None),
+            busy_since: None,
+            waiting_since: None,
+            reported: (String::new(), Activity::Idle),
             error: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
-        view.sync_rows(cx);
+        view.append_rows(cx);
         view.config_bar.sync(view.thread.config(), window, cx);
-        view.sidebar_snapshot = view.sidebar_state();
+        view.reported = (view.title().to_owned(), view.activity());
         view
     }
 
-    pub(crate) fn cwd(&self) -> &Path {
-        &self.cwd
+    /// What the sidebar shows for this thread.
+    pub(crate) fn live(&self) -> LiveThread {
+        LiveThread {
+            id: self.thread.id().clone(),
+            cwd: self.cwd.clone(),
+            title: self.thread.title().map(|title| title.to_owned().into()),
+            placeholder: self.placeholder(),
+            activity: self.activity(),
+        }
     }
 
-    /// The agent's title for this session, once it has one.
-    pub(crate) fn live_title(&self) -> Option<&str> {
-        self.thread.title()
+    fn title(&self) -> &str {
+        self.thread.title().unwrap_or(self.placeholder())
     }
 
-    pub(crate) fn title(&self) -> &str {
-        self.thread.title().unwrap_or("New thread")
+    /// The title until the agent gives one: a saved thread is untitled.
+    fn placeholder(&self) -> &'static str {
+        if self.prompted {
+            UNTITLED
+        } else {
+            NEW_THREAD
+        }
     }
 
     pub(crate) fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
@@ -200,18 +179,12 @@ impl ThreadView {
         self.sending || self.thread.state().is_busy()
     }
 
-    pub(crate) fn attention(&self) -> Attention {
-        if !self.approvals.is_empty() {
-            Attention::Approval(self.approvals.len())
-        } else if self.is_busy() {
-            Attention::Busy
-        } else {
-            Attention::None
+    fn activity(&self) -> Activity {
+        match (self.waiting_since, self.busy_since) {
+            (Some(since), _) => Activity::Waiting(since),
+            (None, Some(since)) => Activity::Working(since),
+            (None, None) => Activity::Idle,
         }
-    }
-
-    fn sidebar_state(&self) -> (Option<String>, Attention) {
-        (self.thread.title().map(str::to_owned), self.attention())
     }
 
     pub(crate) fn apply(
@@ -220,7 +193,13 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.thread.apply(update);
+        // The thread names the row it changed; only that row is remeasured.
+        if let Some(ix) = self.thread.apply(update) {
+            if ix < self.expanded.len() {
+                self.scroller
+                    .update(cx, |scroller, cx| scroller.remeasure_items(ix..ix + 1, cx));
+            }
+        }
         self.after_change(window, cx);
     }
 
@@ -257,63 +236,53 @@ impl ThreadView {
         self.after_change(window, cx);
     }
 
-    /// Brings the scroller, settings, and sidebar up to date with `thread`.
+    /// Brings the scroller, settings, timers and sidebar up to date with
+    /// `thread`.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.sync_rows(cx);
+        self.append_rows(cx);
         if !self.config_bar.is_synced(self.thread.config()) {
             self.config_bar.sync(self.thread.config(), window, cx);
         }
+        let now = Instant::now();
         let busy = self.is_busy();
-        if self.was_busy && !busy {
-            cx.emit(ThreadEvent::Saved);
+        match (busy, self.busy_since) {
+            (true, None) => self.busy_since = Some(now),
+            (false, Some(_)) => {
+                self.busy_since = None;
+                cx.emit(ThreadEvent::Saved);
+            }
+            _ => {}
         }
-        self.was_busy = busy;
-        let snapshot = self.sidebar_state();
-        if snapshot != self.sidebar_snapshot {
-            self.sidebar_snapshot = snapshot;
-            cx.emit(ThreadEvent::SidebarChanged);
+        self.waiting_since = match (self.approvals.is_empty(), self.waiting_since) {
+            (true, _) => None,
+            (false, since) => Some(since.unwrap_or(now)),
+        };
+        let activity = self.activity();
+        if self.reported.0 != self.title() || self.reported.1 != activity {
+            self.reported = (self.title().to_owned(), activity);
+            cx.emit(ThreadEvent::LiveChanged);
         }
         cx.notify();
     }
 
-    /// Tells the scroller about new rows and rows whose height may have
-    /// changed. Entries are only ever appended or updated in place.
-    fn sync_rows(&mut self, cx: &mut Context<'_, Self>) {
-        let stamps: Vec<RowStamp> = self.thread.entries().iter().map(RowStamp::of).collect();
-        let old = std::mem::take(&mut self.row_stamps);
-        self.scroller.update(cx, |scroller, cx| {
-            if stamps.len() < old.len() {
-                scroller.reset(stamps.len(), cx);
-                return;
-            }
-            for (ix, (old, new)) in old.iter().zip(&stamps).enumerate() {
-                if old != new {
-                    scroller.remeasure_items(ix..ix + 1, cx);
-                }
-            }
-            if stamps.len() > old.len() {
-                scroller.append(stamps.len() - old.len(), cx);
-            }
-        });
-        self.row_stamps = stamps;
+    /// Tells the scroller about entries added since it last heard.
+    fn append_rows(&mut self, cx: &mut Context<'_, Self>) {
+        let len = self.thread.entries().len();
+        if len > self.expanded.len() {
+            let added = len - self.expanded.len();
+            self.scroller
+                .update(cx, |scroller, cx| scroller.append(added, cx));
+            self.expanded.resize(len, false);
+        }
     }
 
-    fn toggle_expanded(&mut self, key: &str, cx: &mut Context<'_, Self>) {
-        if !self.expanded.remove(key) {
-            self.expanded.insert(key.to_owned());
+    fn toggle_expanded(&mut self, ix: usize, cx: &mut Context<'_, Self>) {
+        if let Some(expanded) = self.expanded.get_mut(ix) {
+            *expanded = !*expanded;
+            self.scroller
+                .update(cx, |scroller, cx| scroller.remeasure_items(ix..ix + 1, cx));
+            cx.notify();
         }
-        let row = self
-            .thread
-            .entries()
-            .iter()
-            .enumerate()
-            .position(|(ix, entry)| transcript::row_key(entry, ix) == key);
-        if let Some(ix) = row {
-            self.scroller.update(cx, |scroller, cx| {
-                scroller.remeasure_items(ix..ix + 1, cx);
-            });
-        }
-        cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -422,40 +391,34 @@ impl ThreadView {
         .detach();
     }
 
+    /// The title, with the project and branch under it.
     fn render_header(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        h_flex()
+        let project = self.project.read(cx);
+        let project = h_flex()
+            .gap_1()
+            .min_w_0()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(div().truncate().child(project.name.clone()))
+            .when_some(project.branch.clone(), |this, branch| {
+                this.child(Icon::new(Lucide::GitBranch).xsmall().ml_2())
+                    .child(div().truncate().child(branch))
+            });
+        v_flex()
             .flex_shrink_0()
-            .gap_3()
+            .min_h(px(44.))
+            .justify_center()
             .px_4()
-            .py_2()
+            .py_1()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .truncate()
-                            .font_medium()
-                            .child(self.title().to_owned()),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(self.cwd.display().to_string()),
-                    ),
+                div()
+                    .truncate()
+                    .font_medium()
+                    .child(self.title().to_owned()),
             )
-            .child(self.config_bar.render(
-                if matches!(self.loading, Loading::Ready) && self.config_pending == 0 {
-                    Availability::Enabled
-                } else {
-                    Availability::Disabled
-                },
-                cx,
-            ))
+            .child(project)
     }
 
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> AnyElement {
@@ -495,11 +458,10 @@ impl ThreadView {
                         };
                         let this = view.read(cx);
                         let entries = this.thread.entries();
-                        let Some(entry) = entries.get(ix).cloned() else {
+                        let Some(entry) = entries.get(ix) else {
                             return div().into_any_element();
                         };
-                        let key = transcript::row_key(&entry, ix);
-                        let disclosure = if this.expanded.contains(key.as_ref()) {
+                        let disclosure = if this.expanded.get(ix).copied().unwrap_or(false) {
                             Disclosure::Expanded
                         } else {
                             Disclosure::Collapsed
@@ -507,15 +469,14 @@ impl ThreadView {
                         let live = this.is_busy() && ix + 1 == entries.len();
                         let on_toggle: ToggleHandler = {
                             let view = view.downgrade();
-                            let key = key.clone();
                             Rc::new(move |_, cx| {
-                                let _ = view.update(cx, |this, cx| this.toggle_expanded(&key, cx));
+                                let _ = view.update(cx, |this, cx| this.toggle_expanded(ix, cx));
                             })
                         };
                         let row = transcript::render_row(
                             entry,
                             RowContext {
-                                key,
+                                ix,
                                 disclosure,
                                 live,
                                 on_toggle,
@@ -546,6 +507,11 @@ impl ThreadView {
             _ => None,
         };
         let busy = self.is_busy();
+        let availability = if matches!(self.loading, Loading::Ready) && self.config_pending == 0 {
+            Availability::Enabled
+        } else {
+            Availability::Disabled
+        };
         let view = cx.entity().downgrade();
         let stop_view = view.clone();
         let send_view = view.clone();
@@ -585,62 +551,42 @@ impl ThreadView {
                     },
                 ))
             })
-            .child(Composer::new(
-                &self.composer,
-                if busy {
-                    ComposerMode::Stop
-                } else {
-                    ComposerMode::Send
-                },
-                move |window, cx| {
-                    let _ = send_view.update(cx, |this, cx| this.send(window, cx));
-                },
-                move |window, cx| {
-                    let _ = stop_view.update(cx, |this, cx| this.stop(window, cx));
-                },
-            ))
+            .child(
+                Composer::new(
+                    &self.composer,
+                    if busy {
+                        ComposerMode::Stop
+                    } else {
+                        ComposerMode::Send
+                    },
+                    move |window, cx| {
+                        let _ = send_view.update(cx, |this, cx| this.send(window, cx));
+                    },
+                    move |window, cx| {
+                        let _ = stop_view.update(cx, |this, cx| this.stop(window, cx));
+                    },
+                )
+                .controls(self.config_bar.render(availability, cx))
+                .meta(self.usage_label()),
+            )
     }
 
-    fn render_status_bar(&self) -> impl IntoElement {
-        let state = match (&self.loading, self.thread.state()) {
-            (Loading::Resuming, _) => "Loading",
-            (Loading::Failed(_), _) => "Couldn't open",
-            _ if self.sending => "Sending",
-            (_, RunState::Idle) => "Ready",
-            (_, RunState::Running) => "Working",
-            (_, RunState::NeedsAction) => "Waiting for approval",
-            (_, RunState::Cancelled) => "Stopped",
-            (_, RunState::Failed(_)) => "Failed",
-        };
-        let usage = self.thread.usage().map(|usage| {
-            let mut parts = Vec::new();
-            if usage.size() > 0 {
-                let percent = usage.used().saturating_mul(100) / usage.size();
-                parts.push(format!("Context {percent}%"));
-            }
-            if let Some((amount, currency)) = usage.cost() {
-                parts.push(if currency == "USD" {
-                    format!("${amount:.2}")
-                } else {
-                    format!("{amount:.2} {currency}")
-                });
-            }
-            parts.join(" · ")
-        });
-        let info = self.agent.info();
-        StatusBar::new()
-            .left(
-                h_flex()
-                    .gap_1()
-                    .when(self.is_busy(), |this| this.child(Spinner::new().xsmall()))
-                    .child(state),
-            )
-            .right(
-                h_flex()
-                    .gap_3()
-                    .when_some(usage, gpui_kit::ParentElement::child)
-                    .child(format!("{} {}", info.name(), info.version())),
-            )
+    /// "Context 25% · $0.01", once the agent reports usage.
+    fn usage_label(&self) -> Option<String> {
+        let usage = self.thread.usage()?;
+        let mut parts = Vec::new();
+        if usage.size() > 0 {
+            let percent = usage.used().saturating_mul(100) / usage.size();
+            parts.push(format!("Context {percent}%"));
+        }
+        if let Some((amount, currency)) = usage.cost() {
+            parts.push(if currency == "USD" {
+                format!("${amount:.2}")
+            } else {
+                format!("{amount:.2} {currency}")
+            });
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 }
 
@@ -663,6 +609,5 @@ impl Render for ThreadView {
             .child(self.render_header(cx))
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
-            .child(self.render_status_bar())
     }
 }

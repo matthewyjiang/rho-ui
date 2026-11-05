@@ -12,14 +12,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
+use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
-    px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, HeadlessAppContext, Window,
-    WindowBounds, WindowOptions,
+    px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, HeadlessAppContext,
+    MouseButton, Window, WindowBounds, WindowOptions,
 };
 use rho_ui_core::{AgentCommand, ConfigKind, Entry, RunState, Thread, ToolStatus};
 
-use crate::app::{LaunchConfig, RhoApp};
+use crate::{
+    app::{LaunchConfig, RhoApp},
+    shelf::Shelves,
+};
 
 /// Long enough for python to start and answer; the fake agent replies at once.
 const WAIT: Duration = Duration::from_secs(10);
@@ -42,7 +45,7 @@ impl Harness {
     fn start(name: &'static str, command: AgentCommand) -> Self {
         let mut cx = HeadlessAppContext::with_platform(
             gpui_kit::platform::current_platform(true).text_system(),
-            Arc::new(gpui_kit::assets::Assets),
+            Arc::new(crate::Assets),
             gpui_kit::platform::current_headless_renderer,
         );
         // The agent is a real process: its pipes wake tasks from another
@@ -67,7 +70,8 @@ impl Harness {
                         ..Default::default()
                     },
                     cx,
-                    |window, cx| cx.new(|cx| RhoApp::new(launch, window, cx)),
+                    // In-memory marks: tests never touch the user's state file.
+                    |window, cx| cx.new(|cx| RhoApp::new(launch, Shelves::default(), window, cx)),
                 )
             })
             .expect("open the app window");
@@ -246,6 +250,12 @@ fn opening_a_saved_session_replays_its_history() {
             && !thread.config().is_empty()
     });
     ui.shot("replayed");
+
+    // Resuming doesn't replay the title; the saved one carries over.
+    ui.click("session-s1");
+    ui.wait_for_thread("the titled thread", |thread| {
+        thread.title() == Some("first") && !thread.entries().is_empty()
+    });
 }
 
 /// The model picker sends the change and shows what the agent confirms.
@@ -276,6 +286,70 @@ fn model_picker_changes_the_session_model() {
     ui.shot("changed");
 }
 
+/// Settle and snooze from a row's hover buttons and its context menu, and
+/// bring threads back from the settled list.
+#[test]
+fn settle_and_snooze_move_threads_between_lists() {
+    let mut ui = Harness::start("shelves", fake_agent());
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-s1") && is_visible(window, "session-old")
+    });
+
+    ui.act(|window, cx| window.hover("session-s1", cx));
+    ui.shot("hover");
+    ui.click("settle");
+    ui.wait_until("s1 on the settled list", |window, _, _| {
+        !is_visible(window, "session-s1") && is_visible(window, "show-settled")
+    });
+    ui.shot("settled-entry");
+
+    ui.click("show-settled");
+    ui.wait_until("the settled list", |window, _, _| {
+        is_visible(window, "session-s1") && !is_visible(window, "session-old")
+    });
+    ui.shot("settled-list");
+
+    // Restoring the last settled thread returns to the active list.
+    ui.act(|window, cx| window.hover("session-s1", cx));
+    ui.click("restore");
+    ui.wait_until("s1 back on the active list", |window, _, _| {
+        is_visible(window, "session-s1")
+            && is_visible(window, "session-old")
+            && !is_visible(window, "show-settled")
+    });
+
+    ui.act(|window, cx| window.hover("session-old", cx));
+    ui.click("snooze");
+    ui.click("snooze-4h");
+    ui.wait_until("old on the snoozed list", |window, _, _| {
+        !is_visible(window, "session-old") && is_visible(window, "show-snoozed")
+    });
+
+    // The context menu offers the same moves.
+    ui.act(|window, cx| window.right_click("session-s1", cx));
+    ui.shot("menu");
+    let settle = ui
+        .cx
+        .update_window(ui.window, |_, window, _| {
+            // The hover buttons have a Settle too; take the menu's.
+            window
+                .find_all_by_label("Settle")
+                .into_iter()
+                .find(|item| item.path().contains(&"popup-menu".into()))
+                .map(|item| item.bounds().center())
+        })
+        .expect("window is open")
+        .expect("the context menu has a Settle item");
+    ui.act(|window, cx| {
+        window.pointer_down(settle, MouseButton::Left, cx);
+        window.pointer_up(settle, MouseButton::Left, cx);
+    });
+    ui.wait_until("s1 settled from the menu", |window, _, _| {
+        !is_visible(window, "session-s1") && is_visible(window, "show-settled")
+    });
+    ui.shot("both-shelves");
+}
+
 /// A missing agent program leaves a clear error with a way to retry.
 #[test]
 fn missing_agent_shows_an_error_and_retry() {
@@ -284,4 +358,117 @@ fn missing_agent_shows_an_error_and_retry() {
         is_visible(window, "retry-agent")
     });
     ui.shot("error");
+}
+
+/// Frame-time probe, not a pass/fail test: 300 saved sessions and a long
+/// resumed transcript, then hovering sidebar rows and wheel-scrolling the
+/// transcript. Run with
+/// `cargo test -p rho-ui --release frame_times -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement; run on demand"]
+fn frame_times() {
+    use gpui_kit::{
+        point, InputEvent as _, MouseMoveEvent, Pixels, Point, ScrollDelta, ScrollEvent,
+    };
+
+    // `TestEventExt::pointer_move` forces two full redraws around the
+    // event; the probe wants only the work the event itself causes.
+    fn move_pointer(window: &mut Window, position: Point<Pixels>, cx: &mut App) {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: window.modifiers(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rho-ui-core/tests/fake_agent.py");
+    let command = AgentCommand::new(
+        "env",
+        [
+            format!(
+                "FAKE_SESSIONS={}",
+                std::env::var("PERF_SESSIONS").unwrap_or_else(|_| "300".to_owned())
+            ),
+            format!(
+                "FAKE_REPLAY={}",
+                std::env::var("PERF_REPLAY").unwrap_or_else(|_| "100".to_owned())
+            ),
+            "python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+        ],
+    );
+    let mut ui = Harness::start("perf", command);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-old")
+    });
+    ui.click("session-old");
+    ui.wait_for_thread("the replayed history", |thread| {
+        thread.state() == &RunState::Idle && !thread.entries().is_empty()
+    });
+    ui.shot("loaded");
+
+    let report = |name: &str, mut samples: Vec<Duration>| {
+        samples.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        println!(
+            "{name:>14}: p50 {:6.2} ms  p90 {:6.2} ms  max {:6.2} ms  (n={})",
+            ms(samples[samples.len() / 2]),
+            ms(samples[samples.len() * 9 / 10]),
+            ms(samples[samples.len() - 1]),
+            samples.len()
+        );
+    };
+    let measure = |ui: &mut Harness, step: &dyn Fn(usize, &mut Window, &mut App)| {
+        (0..60)
+            .map(|n| {
+                ui.cx
+                    .update_window(ui.window, |_, window, cx| {
+                        let start = Instant::now();
+                        step(n, window, cx);
+                        // A plain draw, as the platform does: clean cached
+                        // views are reused. `render_frame` would force every
+                        // view to rebuild.
+                        window.draw(cx).clear(cx);
+                        start.elapsed()
+                    })
+                    .expect("window is open")
+            })
+            .collect::<Vec<_>>()
+    };
+
+    report(
+        "full redraw",
+        measure(&mut ui, &|_, window, _| window.refresh()),
+    );
+    report("idle frame", measure(&mut ui, &|_, _, _| {}));
+    report(
+        "sidebar hover",
+        measure(&mut ui, &|n, window, cx| {
+            let row = f32::from(u8::try_from(n % 20).expect("under 20"));
+            // One row per step, so every step moves the hover.
+            let y = 120.0 + row * crate::sidebar::ROW_HEIGHT;
+            move_pointer(window, point(px(100.), px(y)), cx);
+        }),
+    );
+    report(
+        "transcript wheel",
+        measure(&mut ui, &|n, window, cx| {
+            let dy = if n < 30 { 40.0 } else { -40.0 };
+            let position = point(px(700.), px(400.));
+            move_pointer(window, position, cx);
+            window.dispatch_event(
+                ScrollEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }),
+    );
 }

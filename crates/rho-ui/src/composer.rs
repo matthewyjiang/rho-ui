@@ -1,5 +1,6 @@
 //! The prompt box under the transcript. Enter sends, Shift+Enter starts a new
-//! line; while a turn runs the box is disabled and Send becomes Stop.
+//! line; while a turn runs the box is disabled and Send becomes Stop. Its
+//! footer holds the session settings, context use and cost.
 
 use std::rc::Rc;
 
@@ -10,8 +11,8 @@ use gpui_kit::component::{
     v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _,
 };
 use gpui_kit::{
-    div, App, AppContext as _, Entity, IntoElement, ParentElement as _, RenderOnce, Styled as _,
-    Window,
+    div, AnyElement, App, AppContext as _, Entity, IntoElement, ParentElement as _, RenderOnce,
+    Styled as _, Window,
 };
 
 /// Grows from one line to this many before it scrolls: enough for a short
@@ -43,6 +44,10 @@ pub(crate) enum ComposerMode {
 pub(crate) struct Composer {
     state: Entity<TextareaState>,
     busy: bool,
+    /// Session settings, left of the footer.
+    controls: Option<AnyElement>,
+    /// Context use and cost, before Send.
+    meta: Option<String>,
     on_send: Handler,
     on_stop: Handler,
 }
@@ -57,9 +62,21 @@ impl Composer {
         Self {
             state: state.clone(),
             busy: mode == ComposerMode::Stop,
+            controls: None,
+            meta: None,
             on_send: Rc::new(on_send),
             on_stop: Rc::new(on_stop),
         }
+    }
+
+    pub(crate) fn controls(mut self, controls: impl IntoElement) -> Self {
+        self.controls = Some(controls.into_any_element());
+        self
+    }
+
+    pub(crate) fn meta(mut self, meta: Option<String>) -> Self {
+        self.meta = meta;
+        self
     }
 }
 
@@ -101,18 +118,21 @@ impl RenderOnce for Composer {
             )
             .child(
                 h_flex()
-                    .justify_between()
                     .gap_2()
                     .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .children(self.controls),
+                    )
+                    .children(self.meta.map(|meta| {
                         div()
+                            .flex_shrink_0()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if self.busy {
-                                "Working. Esc stops the turn."
-                            } else {
-                                "Enter to send, Shift+Enter for a new line"
-                            }),
-                    )
+                            .child(meta)
+                    }))
                     .child(action),
             )
     }

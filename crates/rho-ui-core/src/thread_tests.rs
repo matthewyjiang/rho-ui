@@ -94,22 +94,24 @@ fn replayed_messages_replace_instead_of_appending() {
 #[test]
 fn interleaved_messages_and_tools_keep_first_seen_order() {
     let mut thread = thread();
-    thread.apply(update(
+    let thought = thread.apply(update(
         json!({"sessionUpdate": "agent_thought_chunk", "messageId": "t1",
         "content": {"type": "text", "text": "thinking"}}),
     ));
-    thread.apply(update(
+    let tool = thread.apply(update(
         json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
         "title": "read a.rs", "status": "in_progress"}),
     ));
-    thread.apply(update(
+    let message = thread.apply(update(
         json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1",
         "content": {"type": "text", "text": "done"}}),
     ));
+    assert_eq!((thought, tool, message), (Some(0), Some(1), Some(2)));
     // A late update to the first tool edits it in place.
-    thread.apply(update(
+    let late = thread.apply(update(
         json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed"}),
     ));
+    assert_eq!(late, Some(1), "the update names the row it changed");
 
     assert_eq!(
         texts(&thread),

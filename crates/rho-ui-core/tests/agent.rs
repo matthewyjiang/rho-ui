@@ -36,7 +36,9 @@ async fn next(events: &AgentEvents) -> AgentEvent {
 async fn until_permission(events: &AgentEvents, thread: &mut Thread) -> PermissionRequest {
     loop {
         match next(events).await {
-            AgentEvent::Update { update, .. } => thread.apply(update),
+            AgentEvent::Update { update, .. } => {
+                thread.apply(update);
+            }
             AgentEvent::Permission(request) => return request,
             AgentEvent::Exited { error } => panic!("agent exited: {error:?}"),
         }
@@ -47,7 +49,9 @@ async fn until_permission(events: &AgentEvents, thread: &mut Thread) -> Permissi
 async fn until_idle(events: &AgentEvents, thread: &mut Thread) {
     while thread.state().is_busy() || thread.entries().is_empty() {
         match next(events).await {
-            AgentEvent::Update { update, .. } => thread.apply(update),
+            AgentEvent::Update { update, .. } => {
+                thread.apply(update);
+            }
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -154,7 +158,10 @@ fn missing_program_fails_startup_with_a_reason() {
         })
         .await;
         match result {
-            Err(AgentError::Protocol(reason)) => assert!(!reason.is_empty()),
+            Err(AgentError::Protocol(reason)) => assert!(
+                reason.starts_with("couldn't run /nonexistent/rho: "),
+                "the reason names the program: {reason}"
+            ),
             Err(other) => panic!("expected a reason, got {other:?}"),
             Ok(_) => panic!("started a missing program"),
         }

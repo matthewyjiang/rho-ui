@@ -12,22 +12,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, AnyElement, App, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    div, AnyElement, App, ElementId, InteractiveElement as _, IntoElement as _, ParentElement as _,
     SharedString, Styled as _, Window,
 };
 use rho_ui_core::{Entry, NoticeLevel};
 
-use crate::tool_card::ToolCard;
-
-/// The element ID of the row for `entry`. Messages and tools use
-/// [`Entry::key`]; notices have no agent ID, but they are only ever
-/// appended, so their position is stable.
-pub(crate) fn row_key(entry: &Entry, ix: usize) -> SharedString {
-    match entry.key() {
-        key if key.is_empty() => format!("notice:{ix}").into(),
-        key => key.into(),
-    }
-}
+use crate::tool_card;
 
 /// Whether a thought or a tool card shows its body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +31,9 @@ pub(crate) type ToggleHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Everything a row needs beyond its entry.
 pub(crate) struct RowContext {
-    pub(crate) key: SharedString,
+    /// The entry's index. Entries are only appended or changed in place, so
+    /// it names the row for the thread's lifetime.
+    pub(crate) ix: usize,
     /// Thoughts and tool output start collapsed.
     pub(crate) disclosure: Disclosure,
     /// The entry is the newest one and the turn is still running.
@@ -49,13 +41,16 @@ pub(crate) struct RowContext {
     pub(crate) on_toggle: ToggleHandler,
 }
 
-pub(crate) fn render_row(entry: Entry, row: RowContext, cx: &App) -> AnyElement {
+/// Builds the row for `entry`. Copies only the text the row shows: a
+/// collapsed thought or tool card copies none of its body.
+pub(crate) fn render_row(entry: &Entry, row: RowContext, cx: &App) -> AnyElement {
     let RowContext {
-        key,
+        ix,
         disclosure,
         live,
         on_toggle,
     } = row;
+    let key = ElementId::named_usize("row", ix);
     let expanded = disclosure == Disclosure::Expanded;
     match entry {
         Entry::User(message) => Message::new()
@@ -70,12 +65,15 @@ pub(crate) fn render_row(entry: Entry, row: RowContext, cx: &App) -> AnyElement 
             )
             .into_any_element(),
         Entry::Agent(message) => div()
-            .id(key.clone())
+            .id(key)
             .w_full()
             .child(
-                TextView::markdown(key, message.text().to_owned())
-                    .selectable(true)
-                    .stream_fade(live),
+                TextView::markdown(
+                    ElementId::named_usize("markdown", ix),
+                    message.text().to_owned(),
+                )
+                .selectable(true)
+                .stream_fade(live),
             )
             .into_any_element(),
         Entry::Thought(message) => v_flex()
@@ -108,7 +106,7 @@ pub(crate) fn render_row(entry: Entry, row: RowContext, cx: &App) -> AnyElement 
                 )
             })
             .into_any_element(),
-        Entry::Tool(tool) => ToolCard::new(key, tool, disclosure, on_toggle).into_any_element(),
+        Entry::Tool(tool) => tool_card::render(tool, disclosure, on_toggle, cx),
         Entry::Notice(notice) => {
             let variant = match notice.level() {
                 NoticeLevel::Info => AlertVariant::Info,

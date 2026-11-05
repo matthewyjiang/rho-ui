@@ -5,7 +5,7 @@
 //! replaces (that is how resume replay and edits arrive). Tool calls are keyed
 //! by `toolCallId` and merge field by field.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use agent_client_protocol::schema::{v2, MaybeUndefined};
 
@@ -298,20 +298,6 @@ pub enum Entry {
     Notice(Notice),
 }
 
-impl Entry {
-    /// A stable key for this row, derived from the agent's IDs. Use it for
-    /// element identity.
-    pub fn key(&self) -> String {
-        match self {
-            Entry::User(message) | Entry::Agent(message) | Entry::Thought(message) => {
-                format!("msg:{}", message.id)
-            }
-            Entry::Tool(tool) => format!("tool:{}", tool.id),
-            Entry::Notice(_) => String::new(),
-        }
-    }
-}
-
 /// Progress on one [`PlanItem`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanStatus {
@@ -342,26 +328,19 @@ impl PlanItem {
     }
 }
 
-/// Index key for entries the agent may update later.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum EntryKey {
-    Message(String),
-    Tool(String),
-}
-
 /// A session's transcript and status.
 #[derive(Clone, Debug)]
 pub struct Thread {
     id: SessionId,
     title: Option<String>,
+    /// Only ever appended to or changed in place, so an index names one
+    /// entry for the thread's lifetime.
     entries: Vec<Entry>,
-    index: HashMap<EntryKey, usize>,
     state: RunState,
     usage: Option<Usage>,
     config: Vec<ConfigOption>,
     commands: Vec<CommandInfo>,
     plan: Vec<PlanItem>,
-    revision: u64,
 }
 
 impl Thread {
@@ -372,13 +351,11 @@ impl Thread {
             id,
             title: None,
             entries: Vec::new(),
-            index: HashMap::new(),
             state: RunState::Idle,
             usage: None,
             config: Vec::new(),
             commands: Vec::new(),
             plan: Vec::new(),
-            revision: 0,
         }
     }
 
@@ -386,25 +363,21 @@ impl Thread {
     pub fn set_setup(&mut self, setup: SessionSetup) {
         self.config = setup.config;
         self.commands = setup.commands;
-        self.revision += 1;
     }
 
     /// Replaces the settings after [`crate::Agent::set_config`].
     pub fn set_config(&mut self, config: Vec<ConfigOption>) {
         self.config = config;
-        self.revision += 1;
     }
 
     /// Sets the title, such as one from [`crate::SessionSummary::title`].
     pub fn set_title(&mut self, title: Option<String>) {
         self.title = title;
-        self.revision += 1;
     }
 
     /// Marks a prompt that the agent refused before it started.
     pub fn fail(&mut self, error: String) {
         self.state = RunState::Failed(error);
-        self.revision += 1;
     }
 
     /// The session this thread shows.
@@ -447,40 +420,52 @@ impl Thread {
         &self.plan
     }
 
-    /// Increases on every change, for cheap "did anything change" checks.
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// Applies one update from [`crate::AgentEvent::Update`].
-    pub fn apply(&mut self, update: ThreadUpdate) {
-        self.revision += 1;
+    /// Applies one update from [`crate::AgentEvent::Update`]. Returns the
+    /// index of the entry it added or changed, so a view can redraw just
+    /// that row.
+    pub fn apply(&mut self, update: ThreadUpdate) -> Option<usize> {
         match update.0 {
             v2::SessionUpdate::UserMessageChunk(chunk) => {
-                self.append_message(&chunk, Entry::User);
+                Some(self.append_message(&chunk, Entry::User))
             }
             v2::SessionUpdate::AgentMessageChunk(chunk) => {
-                self.append_message(&chunk, Entry::Agent);
+                Some(self.append_message(&chunk, Entry::Agent))
             }
             v2::SessionUpdate::AgentThoughtChunk(chunk) => {
-                self.append_message(&chunk, Entry::Thought);
+                Some(self.append_message(&chunk, Entry::Thought))
             }
             v2::SessionUpdate::UserMessage(message) => {
-                self.replace_message(&message.message_id, message.content, Entry::User);
+                Some(self.replace_message(&message.message_id, message.content, Entry::User))
             }
             v2::SessionUpdate::AgentMessage(message) => {
-                self.replace_message(&message.message_id, message.content, Entry::Agent);
+                Some(self.replace_message(&message.message_id, message.content, Entry::Agent))
             }
             v2::SessionUpdate::AgentThought(message) => {
-                self.replace_message(&message.message_id, message.content, Entry::Thought);
+                Some(self.replace_message(&message.message_id, message.content, Entry::Thought))
             }
-            v2::SessionUpdate::StateUpdate(state) => self.state = run_state(state),
-            v2::SessionUpdate::ToolCallUpdate(update) => self.update_tool(update),
+            v2::SessionUpdate::ToolCallUpdate(update) => Some(self.update_tool(update)),
             v2::SessionUpdate::ToolCallContentChunk(chunk) => {
-                let tool = self.tool_mut(&chunk.tool_call_id.0);
+                let (at, tool) = self.tool_mut(&chunk.tool_call_id.0);
                 if let Some(content) = tool_content(chunk.content) {
                     tool.content.push(content);
                 }
+                Some(at)
+            }
+            v2::SessionUpdate::Notice(notice) => {
+                self.entries.push(Entry::Notice(Notice {
+                    level: match notice.severity {
+                        v2::NoticeSeverity::Warning => NoticeLevel::Warning,
+                        v2::NoticeSeverity::Error => NoticeLevel::Error,
+                        _ => NoticeLevel::Info,
+                    },
+                    title: notice.title,
+                    description: notice.description,
+                }));
+                Some(self.entries.len() - 1)
+            }
+            v2::SessionUpdate::StateUpdate(state) => {
+                self.state = run_state(state);
+                None
             }
             v2::SessionUpdate::PlanUpdate(update) => {
                 if let v2::PlanUpdateContent::Items(items) = update.plan {
@@ -497,64 +482,60 @@ impl Thread {
                         })
                         .collect();
                 }
+                None
             }
             v2::SessionUpdate::AvailableCommandsUpdate(update) => {
                 self.commands = commands(update.available_commands);
+                None
             }
             v2::SessionUpdate::ConfigOptionUpdate(update) => {
                 self.config = config_options(update.config_options);
+                None
             }
-            v2::SessionUpdate::SessionInfoUpdate(update) => match update.title {
-                MaybeUndefined::Value(title) => self.title = Some(title),
-                MaybeUndefined::Null => self.title = None,
-                MaybeUndefined::Undefined => {}
-            },
+            v2::SessionUpdate::SessionInfoUpdate(update) => {
+                match update.title {
+                    MaybeUndefined::Value(title) => self.title = Some(title),
+                    MaybeUndefined::Null => self.title = None,
+                    MaybeUndefined::Undefined => {}
+                }
+                None
+            }
             v2::SessionUpdate::UsageUpdate(usage) => {
                 self.usage = Some(Usage {
                     used: usage.used,
                     size: usage.size,
                     cost: usage.cost.map(|cost| (cost.amount, cost.currency)),
                 });
+                None
             }
-            v2::SessionUpdate::Notice(notice) => self.entries.push(Entry::Notice(Notice {
-                level: match notice.severity {
-                    v2::NoticeSeverity::Warning => NoticeLevel::Warning,
-                    v2::NoticeSeverity::Error => NoticeLevel::Error,
-                    _ => NoticeLevel::Info,
-                },
-                title: notice.title,
-                description: notice.description,
-            })),
             // Terminals and compaction progress are not shown yet.
-            _ => {}
+            _ => None,
         }
     }
 
-    /// Index of the entry under `key`, inserting `make()` at the end if new.
-    fn upsert(&mut self, key: EntryKey, make: impl FnOnce() -> Entry) -> usize {
-        let entries = &mut self.entries;
-        *self.index.entry(key).or_insert_with(|| {
-            entries.push(make());
-            entries.len() - 1
-        })
-    }
-
-    fn message_mut(&mut self, id: &str, make: fn(Message) -> Entry) -> &mut Message {
-        let at = self.upsert(EntryKey::Message(id.to_owned()), || {
-            make(Message {
+    /// The message `id` and its index, appending `make(empty)` if it is new.
+    /// Searches from the end: updates almost always touch the newest rows.
+    fn message_mut(&mut self, id: &str, make: fn(Message) -> Entry) -> (usize, &mut Message) {
+        let found = self.entries.iter().rposition(|entry| {
+            matches!(entry, Entry::User(message) | Entry::Agent(message) | Entry::Thought(message) if message.id == id)
+        });
+        let at = found.unwrap_or_else(|| {
+            self.entries.push(make(Message {
                 id: id.to_owned(),
                 text: String::new(),
-            })
+            }));
+            self.entries.len() - 1
         });
         match &mut self.entries[at] {
-            Entry::User(message) | Entry::Agent(message) | Entry::Thought(message) => message,
-            _ => unreachable!("message keys index message entries"),
+            Entry::User(message) | Entry::Agent(message) | Entry::Thought(message) => (at, message),
+            _ => unreachable!("entry {at} was found or made as a message"),
         }
     }
 
-    fn append_message(&mut self, chunk: &v2::ContentChunk, make: fn(Message) -> Entry) {
-        let message = self.message_mut(&chunk.message_id.0, make);
+    fn append_message(&mut self, chunk: &v2::ContentChunk, make: fn(Message) -> Entry) -> usize {
+        let (at, message) = self.message_mut(&chunk.message_id.0, make);
         message.text.push_str(&block_text(&chunk.content));
+        at
     }
 
     fn replace_message(
@@ -562,32 +543,39 @@ impl Thread {
         id: &v2::MessageId,
         content: MaybeUndefined<Vec<v2::ContentBlock>>,
         make: fn(Message) -> Entry,
-    ) {
-        let message = self.message_mut(&id.0, make);
+    ) -> usize {
+        let (at, message) = self.message_mut(&id.0, make);
         match content {
             MaybeUndefined::Undefined => {}
             MaybeUndefined::Null => message.text.clear(),
             MaybeUndefined::Value(blocks) => message.text = blocks.iter().map(block_text).collect(),
         }
+        at
     }
 
-    fn tool_mut(&mut self, id: &str) -> &mut ToolCall {
-        let at = self.upsert(EntryKey::Tool(id.to_owned()), || {
-            Entry::Tool(ToolCall {
+    /// The tool call `id` and its index, appending a pending one if it is new.
+    fn tool_mut(&mut self, id: &str) -> (usize, &mut ToolCall) {
+        let found = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::Tool(tool) if tool.id == id));
+        let at = found.unwrap_or_else(|| {
+            self.entries.push(Entry::Tool(ToolCall {
                 id: id.to_owned(),
                 title: String::new(),
                 status: ToolStatus::Pending,
                 content: Vec::new(),
-            })
+            }));
+            self.entries.len() - 1
         });
         match &mut self.entries[at] {
-            Entry::Tool(tool) => tool,
-            _ => unreachable!("tool keys index tool entries"),
+            Entry::Tool(tool) => (at, tool),
+            _ => unreachable!("entry {at} was found or made as a tool call"),
         }
     }
 
-    fn update_tool(&mut self, update: v2::ToolCallUpdate) {
-        let tool = self.tool_mut(&update.tool_call_id.0);
+    fn update_tool(&mut self, update: v2::ToolCallUpdate) -> usize {
+        let (at, tool) = self.tool_mut(&update.tool_call_id.0);
         if let MaybeUndefined::Value(title) = update.title {
             tool.title = title;
         }
@@ -608,6 +596,7 @@ impl Thread {
                 tool.content = content.into_iter().filter_map(tool_content).collect();
             }
         }
+        at
     }
 }
 
