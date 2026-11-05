@@ -6,7 +6,7 @@
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    select::{SearchableVec, Select, SelectEvent, SelectItem as _, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPanel},
     v_flex, ActiveTheme as _, IconName, Sizable as _, StyledExt as _,
 };
@@ -17,10 +17,34 @@ use gpui_kit::{
 };
 
 use crate::{
-    config_bar::Choice,
     settings::{Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
     CloseSettings,
 };
+
+/// One choice in a font Select.
+#[derive(Clone)]
+struct Choice {
+    value: SharedString,
+    title: SharedString,
+}
+
+impl Choice {
+    fn new(value: SharedString, title: SharedString) -> Self {
+        Self { value, title }
+    }
+}
+
+impl SelectItem for Choice {
+    type Value = SharedString;
+
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    fn value(&self) -> &SharedString {
+        &self.value
+    }
+}
 
 type FontSelect = Entity<SelectState<SearchableVec<Choice>>>;
 

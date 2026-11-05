@@ -6,7 +6,8 @@ rho-ui-core's agent tests and rho-ui's headless UI tests both run it.
 - session/list returns two pages: "s1" (titled "first") and "old" (untitled),
   after any new session that has had a prompt. session/delete drops one.
 - session/resume replays one agent message, "replayed".
-- Settings: mode (select), model (select), fast_mode (toggle).
+- Settings, shaped like rho's: mode, model and thought_level (selects) and
+  fast_mode (a toggle), each with its ACP category.
 - A prompt asks the host for permission, then runs a fake `ls` tool and
   replies "you chose <option id>". The prompt "fail" is refused, and "slow"
   is echoed half a second late.
@@ -40,18 +41,21 @@ def update(session, body):
 
 
 def config(session):
-    values = settings.setdefault(session, {"mode": "auto", "model": "fake/small", "fast_mode": False})
+    values = settings.setdefault(session, {"mode": "auto", "model": "fake/small",
+                                           "thought_level": "medium", "fast_mode": False})
 
-    def select(config_id, name, choices):
-        return {"configId": config_id, "name": name, "type": "select",
+    def select(config_id, name, category, choices):
+        return {"configId": config_id, "name": name, "type": "select", "category": category,
                 "currentValue": values[config_id],
                 "options": [{"value": value, "name": label} for value, label in choices]}
 
     return [
-        select("mode", "Mode", [("auto", "Auto"), ("plan", "Plan")]),
-        select("model", "Model", MODELS),
-        {"configId": "fast_mode", "name": "Fast", "type": "boolean",
-         "currentValue": values["fast_mode"]},
+        select("mode", "Mode", "mode", [("auto", "Auto"), ("plan", "Plan")]),
+        select("model", "Model", "model", MODELS),
+        select("thought_level", "Reasoning", "thought_level",
+               [("low", "Low"), ("medium", "Medium"), ("high", "High")]),
+        {"configId": "fast_mode", "name": "Fast mode", "type": "boolean",
+         "category": "model_config", "currentValue": values["fast_mode"]},
     ]
 
 

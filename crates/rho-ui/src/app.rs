@@ -16,16 +16,16 @@ use gpui_kit::component::{
     ActiveTheme as _, IconName, WindowExt as _,
 };
 use gpui_kit::{
-    div, rems, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, Subscription, Task, Window,
+    div, rems, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
     Agent, AgentCommand, AgentError, AgentEvent, SessionId, SessionSetup, Thread, ThreadUpdate,
 };
 
 use crate::{
-    draft::{DraftView, Start},
+    draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
     projects::{ProjectRef, Projects},
     settings_view::{Closed, SettingsView},
@@ -223,6 +223,8 @@ impl RhoApp {
                 if let Some(open) = self.thread(&session) {
                     open.view
                         .update(cx, |view, cx| view.apply(update, window, cx));
+                } else if let Some(draft) = self.draft_with(&session, cx) {
+                    draft.update(cx, |draft, cx| draft.apply(update, window, cx));
                 } else if self.creating > 0 {
                     self.early_updates.push((session, update));
                 }
@@ -260,13 +262,13 @@ impl RhoApp {
         });
     }
 
-    /// Shows a draft for a new thread. The session starts with its first
-    /// message; see [`Self::start_thread`].
+    /// Shows a draft for a new thread and opens its session; see
+    /// [`DraftView`].
     pub(crate) fn new_thread(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.agent().is_none() {
             return;
         }
-        // An open draft is reused, so its text survives.
+        // An open draft is reused, so its text and settings survive.
         let pane = std::mem::replace(&mut self.pane, Pane::Empty);
         let pane = match pane {
             Pane::Draft { .. } => pane,
@@ -274,10 +276,17 @@ impl RhoApp {
                 let cwd = self.launch.workspace.clone();
                 let project = ProjectRef::new(&self.projects, &cwd, cx);
                 let view = cx.new(|cx| DraftView::new(cwd, project, window, cx));
-                let subscription =
-                    cx.subscribe_in(&view, window, |this, draft, start: &Start, window, cx| {
-                        this.start_thread(draft.clone(), start.text.clone(), window, cx);
-                    });
+                let subscription = cx.subscribe_in(
+                    &view,
+                    window,
+                    |this, draft, event: &DraftEvent, window, cx| match event {
+                        DraftEvent::Start { thread, text } => {
+                            this.start_thread(draft, (**thread).clone(), text.clone(), window, cx);
+                        }
+                        DraftEvent::Retry => this.open_draft_session(draft, window, cx),
+                    },
+                );
+                self.open_draft_session(&view, window, cx);
                 Pane::Draft {
                     view,
                     _subscription: subscription,
@@ -287,11 +296,21 @@ impl RhoApp {
         self.show(pane, window, cx);
     }
 
-    /// Makes the session for `draft` and sends its first message.
-    fn start_thread(
+    /// The shown draft, if its session is `id`.
+    fn draft_with(&self, id: &SessionId, cx: &App) -> Option<Entity<DraftView>> {
+        match &self.pane {
+            Pane::Draft { view, .. } if view.read(cx).session_id() == Some(id) => {
+                Some(view.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Makes the session for `draft`. A draft dropped meanwhile gets its
+    /// session closed.
+    fn open_draft_session(
         &mut self,
-        draft: Entity<DraftView>,
-        text: String,
+        draft: &Entity<DraftView>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -299,6 +318,7 @@ impl RhoApp {
             return;
         };
         let cwd = draft.read(cx).cwd().to_path_buf();
+        let draft = draft.downgrade();
         let epoch = self.epoch;
         self.creating += 1;
         cx.spawn_in(window, async move |this, cx| {
@@ -308,27 +328,27 @@ impl RhoApp {
                     return;
                 }
                 this.creating -= 1;
-                // The user may have moved on while it started.
-                let shown = matches!(&this.pane, Pane::Draft { view, .. } if *view == draft);
-                match result {
-                    Ok(setup) => {
-                        let view = this.open_new_session(agent, cwd, setup, text, window, cx);
-                        if shown {
-                            this.set_pane(Pane::Thread(view), cx);
-                            // Behind the settings screen, the keyboard stays there.
-                            if this.settings.is_none() {
-                                this.focus_pane(window, cx);
-                            }
+                match (result, draft.upgrade()) {
+                    (Ok(setup), Some(draft)) => {
+                        let id = setup.id().clone();
+                        let mut thread = Thread::new(id.clone());
+                        thread.set_setup(setup);
+                        for update in this.take_early_updates(&id) {
+                            thread.apply(update);
                         }
+                        draft.update(cx, |draft, cx| draft.open(agent, thread, window, cx));
                     }
-                    Err(error) if shown => {
+                    (Ok(setup), None) => {
+                        let id = setup.id().clone();
+                        cx.spawn(async move |_, _| {
+                            let _ = agent.close_session(&id).await;
+                        })
+                        .detach();
+                    }
+                    (Err(error), Some(draft)) => {
                         draft.update(cx, |draft, cx| draft.fail(error.to_string(), cx));
                     }
-                    Err(error) => window.push_notification(
-                        Notification::error(format!("{error}\n\nYour message: {text}"))
-                            .title("Couldn't start the thread"),
-                        cx,
-                    ),
+                    (Err(_), None) => {}
                 }
                 if this.creating == 0 {
                     this.early_updates.clear();
@@ -337,6 +357,37 @@ impl RhoApp {
             });
         })
         .detach();
+    }
+
+    /// Updates that arrived for session `id` before it was known here.
+    fn take_early_updates(&mut self, id: &SessionId) -> Vec<ThreadUpdate> {
+        let early = std::mem::take(&mut self.early_updates);
+        let (mine, others): (Vec<_>, Vec<_>) =
+            early.into_iter().partition(|(session, _)| session == id);
+        self.early_updates = others;
+        mine.into_iter().map(|(_, update)| update).collect()
+    }
+
+    /// Opens the thread for `draft`'s session and sends `text` as its first
+    /// prompt.
+    fn start_thread(
+        &mut self,
+        draft: &Entity<DraftView>,
+        thread: Thread,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(agent) = self.agent().cloned() else {
+            return;
+        };
+        let cwd = draft.read(cx).cwd().to_path_buf();
+        let view = self.open_new_session(agent, cwd, thread, text, window, cx);
+        self.set_pane(Pane::Thread(view), cx);
+        // Behind the settings screen, the keyboard stays there.
+        if self.settings.is_none() {
+            self.focus_pane(window, cx);
+        }
     }
 
     /// Deletes a saved thread in the agent, then drops it here.
@@ -429,28 +480,17 @@ impl RhoApp {
         &mut self,
         agent: Agent,
         cwd: PathBuf,
-        setup: SessionSetup,
+        thread: Thread,
         text: String,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Entity<ThreadView> {
-        let id = setup.id().clone();
+        let id = thread.id().clone();
         // Made here, so rho-ui's own from the start, even if the prompt fails.
         self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
-        let mut thread = Thread::new(id.clone());
-        thread.set_setup(setup);
         let project = ProjectRef::new(&self.projects, &cwd, cx);
         let view =
             cx.new(|cx| ThreadView::new(agent, thread, cwd, project, Loading::Ready, window, cx));
-        let early = std::mem::take(&mut self.early_updates);
-        let (mine, others): (Vec<_>, Vec<_>) =
-            early.into_iter().partition(|(session, _)| *session == id);
-        self.early_updates = others;
-        view.update(cx, |view, cx| {
-            for (_, update) in mine {
-                view.apply(update, window, cx);
-            }
-        });
         self.insert_thread(id, view.clone(), window, cx);
         view.update(cx, |view, cx| view.submit(text, window, cx));
         view

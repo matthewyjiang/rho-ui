@@ -7,11 +7,11 @@
 mod app;
 mod approval;
 mod composer;
-mod config_bar;
 mod draft;
 mod kinetic;
 mod projects;
 mod repo;
+mod session_settings;
 mod settings;
 mod settings_view;
 mod shelf;
@@ -67,7 +67,9 @@ gpui_kit::assets::icon_assets!(
         CircleDashed,
         Terminal,
         Brain,
-        Wrench
+        Wrench,
+        Shield,
+        Zap
     ]
 );
 

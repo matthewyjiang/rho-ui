@@ -283,34 +283,133 @@ fn opening_a_saved_session_replays_its_history() {
     });
 }
 
-/// The model picker sends the change and shows what the agent confirms.
+/// The current value of setting `id` on the active thread.
+fn setting(thread: &Thread, id: &str) -> Option<String> {
+    thread
+        .config()
+        .iter()
+        .find(|option| option.id() == id)
+        .map(|option| match option.kind() {
+            ConfigKind::Select { current, .. } => current.clone(),
+            ConfigKind::Toggle(on) => on.to_string(),
+        })
+}
+
+/// The composer's settings: the mode menu on the left, and a button naming
+/// the model and reasoning that opens the model list (with search) beside
+/// the reasoning levels and fast mode. Each change reaches the agent.
 #[test]
-fn model_picker_changes_the_session_model() {
-    let mut ui = Harness::start("model", fake_agent());
+fn composer_settings_change_the_session() {
+    let mut ui = Harness::start("settings-panel", fake_agent());
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-old")
     });
     ui.click("session-old");
-    ui.wait_until("the model picker", |window, _, _| {
-        is_visible(window, "config-model")
+    ui.wait_until("the session settings", |window, _, _| {
+        is_visible(window, "config-panel") && is_visible(window, "config-mode")
     });
-    ui.click("config-model");
-    ui.wait_until("the model menu to open", |window, _, _| {
-        window.find("config-model").expanded() == Some(true)
+    ui.shot("composer");
+
+    // Arrows start at the model in use; Enter picks and closes the panel.
+    ui.click("config-panel");
+    ui.wait_until("the model list", |window, _, _| {
+        is_visible(window, "model-fake/large") && is_visible(window, "config-thought_level-high")
     });
-    // No screenshot here: the dropdown is open (above), but GPUI Kit 0.9's
-    // deferred popover does not show up in the offscreen capture.
+    ui.shot("panel");
     ui.act(|window, cx| {
         window.press("down", cx);
         window.press("enter", cx);
     });
     ui.wait_for_thread("the new model", |thread| {
-        thread.config().iter().any(|option| {
-            option.id() == "model"
-                && matches!(option.kind(), ConfigKind::Select { current, .. } if current == "fake/large")
-        })
+        setting(thread, "model").as_deref() == Some("fake/large")
     });
+    ui.wait_until("the panel to close", |window, _, _| {
+        !is_visible(window, "model-fake/large")
+    });
+
+    // Search narrows the list by name or value.
+    ui.click("config-panel");
+    ui.wait_until("the model list", |window, _, _| {
+        is_visible(window, "model-fake/small")
+    });
+    ui.act(|window, cx| window.input("huge", cx));
+    ui.wait_until("only the match", |window, _, _| {
+        is_visible(window, "model-fake/huge") && !is_visible(window, "model-fake/small")
+    });
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_thread("the searched model", |thread| {
+        setting(thread, "model").as_deref() == Some("fake/huge")
+    });
+
+    // Reasoning and fast mode change in place; the panel stays open.
+    ui.click("config-panel");
+    ui.wait_until("the reasoning levels", |window, _, _| {
+        is_visible(window, "config-thought_level-high")
+    });
+    ui.click("config-thought_level-high");
+    ui.wait_for_thread("high reasoning", |thread| {
+        setting(thread, "thought_level").as_deref() == Some("high")
+    });
+    ui.wait_until("fast mode, enabled again", |window, _, _| {
+        window
+            .try_find("config-fast_mode")
+            .is_some_and(|switch| switch.visible() && switch.disabled() != Some(true))
+    });
+    ui.click("config-fast_mode");
+    ui.wait_for_thread("fast mode", |thread| {
+        setting(thread, "fast_mode").as_deref() == Some("true")
+    });
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.wait_until("the panel to close", |window, _, _| {
+        !is_visible(window, "config-thought_level-high")
+    });
+
+    // The mode menu opens above its button.
+    ui.click("config-mode");
+    click_label(&mut ui, "Plan");
+    ui.wait_for_thread("plan mode", |thread| {
+        setting(thread, "mode").as_deref() == Some("plan")
+    });
+    ui.wait_until(
+        "the button to name the model and reasoning",
+        |window, _, _| window.find("config-panel").label() == Some("Huge · High"),
+    );
     ui.shot("changed");
+}
+
+/// A new thread's draft already has its session's settings, and the thread
+/// keeps what was set there.
+#[test]
+fn a_draft_sets_the_session_before_the_first_message() {
+    let mut ui = Harness::start("draft-settings", fake_agent());
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "new-thread")
+    });
+    ui.click("new-thread");
+    ui.wait_until("the draft's settings", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "config-panel")
+    });
+    ui.shot("draft");
+
+    ui.click("config-panel");
+    ui.wait_until("the reasoning levels", |window, _, _| {
+        is_visible(window, "config-thought_level-high")
+    });
+    ui.click("config-thought_level-high");
+    ui.wait_until("the button to show it", |window, _, _| {
+        window.find("config-panel").label() == Some("Small · High")
+    });
+    ui.act(|window, cx| window.press("escape", cx));
+
+    ui.act(|window, cx| {
+        window.input("list files", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_for_thread("the first prompt in the draft's session", |thread| {
+        thread.id().as_str() == "new-1"
+            && !thread.entries().is_empty()
+            && setting(thread, "thought_level").as_deref() == Some("high")
+    });
 }
 
 /// Settle and snooze from a row's hover buttons and its context menu, and
@@ -402,9 +501,12 @@ fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
         .expect("window is open")
         .expect("the settled header is drawn");
 
-    // Leaving an unused draft drops it, and the agent never made a session.
+    // Leaving an unused draft drops it and closes its session, which,
+    // never prompted, the agent doesn't list.
     ui.click("new-thread");
-    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.wait_until("the draft's session", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "config-panel")
+    });
     ui.click("toggle-settled");
     // Opening it lifts the header just enough for its rows to fit below.
     ui.wait_until("the settled shelf", |window, _, _| {
@@ -432,18 +534,28 @@ fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
     ui.wait_until("the approval card", |window, _, _| {
         is_visible(window, "approval-yes")
     });
-    assert_eq!(ui.thread().id().as_str(), "new-1", "the first session made");
+    assert_eq!(
+        ui.thread().id().as_str(),
+        "new-2",
+        "the second draft's session"
+    );
     ui.click("approval-yes");
     ui.wait_until("the new thread listed as active", |window, _, _| {
-        is_visible(window, "session-new-1")
+        is_visible(window, "session-new-2")
+    });
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "session-new-1"),
+            "the unused draft's session isn't listed"
+        );
     });
 
-    ui.act(|window, cx| window.right_click("session-new-1", cx));
+    ui.act(|window, cx| window.right_click("session-new-2", cx));
     click_label(&mut ui, "Delete…");
     ui.shot("delete-confirm");
     click_label(&mut ui, "Delete");
     ui.wait_until("the thread gone", |window, _, app| {
-        !is_visible(window, "session-new-1") && app.active_thread().is_none()
+        !is_visible(window, "session-new-2") && app.active_thread().is_none()
     });
 }
 

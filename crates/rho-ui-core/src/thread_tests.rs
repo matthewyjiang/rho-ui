@@ -175,8 +175,10 @@ fn config_updates_flatten_groups_and_keep_toggles() {
     let mut thread = thread();
     thread.apply(update(json!({"sessionUpdate": "config_option_update", "configOptions": [
         {"configId": "model", "name": "Model", "type": "select", "currentValue": "a/x",
+         "category": "model",
          "options": [{"groupId": "a", "name": "A", "options": [{"value": "a/x", "name": "X"}]}]},
-        {"configId": "fast_mode", "name": "Fast", "type": "boolean", "currentValue": true}
+        {"configId": "fast_mode", "name": "Fast", "type": "boolean", "currentValue": true,
+         "category": "model_config"}
     ]})));
     let config = thread.config();
     assert_eq!(config.len(), 2);
@@ -191,4 +193,6 @@ fn config_updates_flatten_groups_and_keep_toggles() {
         }
     );
     assert_eq!(config[1].kind(), &ConfigKind::Toggle(true));
+    assert_eq!(config[0].category(), ConfigCategory::Model);
+    assert_eq!(config[1].category(), ConfigCategory::Other);
 }

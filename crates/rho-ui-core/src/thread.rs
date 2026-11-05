@@ -106,11 +106,25 @@ pub enum ConfigKind {
     Toggle(bool),
 }
 
+/// What a [`ConfigOption`] sets, so a host can give it its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigCategory {
+    /// The session mode; rho's is which tool calls run without asking.
+    Mode,
+    /// Which model answers.
+    Model,
+    /// How much the model reasons per turn.
+    ThoughtLevel,
+    /// Anything else, such as a model setting like fast mode, or no category.
+    Other,
+}
+
 /// A per-session setting the agent exposes, such as mode or model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigOption {
     id: String,
     name: String,
+    category: ConfigCategory,
     kind: ConfigKind,
 }
 
@@ -125,9 +139,38 @@ impl ConfigOption {
         &self.name
     }
 
+    /// What it sets.
+    pub fn category(&self) -> ConfigCategory {
+        self.category
+    }
+
     /// Its shape and current value.
     pub fn kind(&self) -> &ConfigKind {
         &self.kind
+    }
+
+    /// The choice a [`ConfigKind::Select`] has selected.
+    pub fn current_choice(&self) -> Option<&ConfigChoice> {
+        match &self.kind {
+            ConfigKind::Select { current, choices } => {
+                choices.iter().find(|choice| choice.value == *current)
+            }
+            ConfigKind::Toggle(_) => None,
+        }
+    }
+
+    /// This option holding `value`, to show a change before the agent
+    /// confirms it. A value of the other kind changes nothing.
+    #[must_use]
+    pub fn with_value(mut self, value: &ConfigValue) -> Self {
+        match (&mut self.kind, value) {
+            (ConfigKind::Select { current, .. }, ConfigValue::Select(value)) => {
+                current.clone_from(value);
+            }
+            (ConfigKind::Toggle(on), ConfigValue::Toggle(value)) => *on = *value,
+            _ => {}
+        }
+        self
     }
 }
 
@@ -159,9 +202,16 @@ pub(crate) fn config_options(options: Vec<v2::SessionConfigOption>) -> Vec<Confi
                 v2::SessionConfigKind::Boolean(toggle) => ConfigKind::Toggle(toggle.current_value),
                 _ => return None,
             };
+            let category = match option.category {
+                Some(v2::SessionConfigOptionCategory::Mode) => ConfigCategory::Mode,
+                Some(v2::SessionConfigOptionCategory::Model) => ConfigCategory::Model,
+                Some(v2::SessionConfigOptionCategory::ThoughtLevel) => ConfigCategory::ThoughtLevel,
+                _ => ConfigCategory::Other,
+            };
             Some(ConfigOption {
                 id: option.config_id.0.to_string(),
                 name: option.name,
+                category,
                 kind,
             })
         })

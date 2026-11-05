@@ -16,21 +16,20 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    div, px, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
+    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Agent, AgentError, ConfigValue, PermissionRequest, RunState, SessionId, SessionSetup, Thread,
-    ThreadUpdate,
+    Agent, AgentError, PermissionRequest, RunState, SessionId, SessionSetup, Thread, ThreadUpdate,
 };
 
 use crate::{
     approval::ApprovalCard,
     composer::ComposerMode,
     composer::{self, Composer},
-    config_bar::{Availability, ConfigBar},
     projects::{Project, ProjectRef},
+    session_settings::{Availability, SessionSettings, SettingsEvent},
     thread_list::{Activity, LiveThread, NEW_THREAD, UNTITLED},
     transcript::{ActionHandler, Transcript},
     StopTurn,
@@ -66,9 +65,7 @@ pub(crate) struct ThreadView {
     loading: Loading,
     transcript: Transcript,
     composer: Entity<TextareaState>,
-    config_bar: ConfigBar,
-    /// `set_config` calls in flight.
-    config_pending: usize,
+    settings: Entity<SessionSettings>,
     /// Waiting approvals, oldest first. Dropping one answers "cancelled".
     approvals: VecDeque<PermissionRequest>,
     approval_focus: FocusHandle,
@@ -104,7 +101,17 @@ impl ThreadView {
     ) -> Self {
         let transcript = Transcript::new(cx);
         let composer = composer::new_state(window, cx);
+        let settings = cx.new(|cx| {
+            SessionSettings::new(
+                agent.clone(),
+                thread.id().clone(),
+                thread.config(),
+                window,
+                cx,
+            )
+        });
         let subscriptions = vec![
+            cx.subscribe_in(&settings, window, Self::on_settings_event),
             // The jump-to-latest button follows the scroll position.
             cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
             // The header shows the branch, which can change.
@@ -129,8 +136,7 @@ impl ThreadView {
             loading,
             transcript,
             composer,
-            config_bar: ConfigBar::default(),
-            config_pending: 0,
+            settings,
             approvals: VecDeque::new(),
             approval_focus: cx.focus_handle(),
             sending: false,
@@ -142,7 +148,7 @@ impl ThreadView {
             _subscriptions: subscriptions,
         };
         view.transcript.sync(view.thread.entries(), cx);
-        view.config_bar.sync(view.thread.config(), window, cx);
+        view.sync_settings(window, cx);
         view.reported = (view.title().to_owned(), view.activity());
         view
     }
@@ -242,9 +248,7 @@ impl ThreadView {
     /// `thread`.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.transcript.sync(self.thread.entries(), cx);
-        if !self.config_bar.is_synced(self.thread.config()) {
-            self.config_bar.sync(self.thread.config(), window, cx);
-        }
+        self.sync_settings(window, cx);
         let now = Instant::now();
         let busy = self.is_busy();
         match (busy, self.busy_since) {
@@ -345,44 +349,34 @@ impl ThreadView {
         self.after_change(window, cx);
     }
 
-    /// Sends a settings change. The agent answers with every option, which
-    /// replaces the controls; on failure they snap back.
-    pub(crate) fn request_config(
+    /// Shows the thread's settings, changeable once the session is open.
+    fn sync_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let allowed = if matches!(self.loading, Loading::Ready) {
+            Availability::Enabled
+        } else {
+            Availability::Disabled
+        };
+        self.settings.update(cx, |settings, cx| {
+            settings.sync(self.thread.config(), window, cx);
+            settings.set_allowed(allowed, cx);
+        });
+    }
+
+    fn on_settings_event(
         &mut self,
-        config_id: String,
-        value: ConfigValue,
+        _: &Entity<SessionSettings>,
+        event: &SettingsEvent,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.config_bar.show_requested(&config_id, &value);
-        self.config_pending += 1;
-        self.error = None;
-        cx.notify();
-
-        let agent = self.agent.clone();
-        let id = self.thread.id().clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = agent.set_config(&id, &config_id, value).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.config_pending -= 1;
-                match result {
-                    Ok(options) => this.thread.set_config(options),
-                    Err(error) => {
-                        let name = this
-                            .config_bar
-                            .name_of(&config_id)
-                            .unwrap_or_else(|| config_id.clone().into());
-                        this.error =
-                            Some(format!("Couldn't change {}: {error}", name.to_lowercase()));
-                    }
-                }
-                // Always resync: success shows the new values, failure
-                // reverts the control the user touched.
-                this.config_bar.sync(this.thread.config(), window, cx);
-                this.after_change(window, cx);
-            });
-        })
-        .detach();
+        match event {
+            SettingsEvent::Changed(options) => {
+                self.error = None;
+                self.thread.set_config(options.clone());
+            }
+            SettingsEvent::Failed(message) => self.error = Some(message.clone()),
+        }
+        self.after_change(window, cx);
     }
 
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> AnyElement {
@@ -451,11 +445,6 @@ impl ThreadView {
             _ => None,
         };
         let busy = self.is_busy();
-        let availability = if matches!(self.loading, Loading::Ready) && self.config_pending == 0 {
-            Availability::Enabled
-        } else {
-            Availability::Disabled
-        };
         let view = cx.entity().downgrade();
         let stop_view = view.clone();
         let send_view = view.clone();
@@ -510,7 +499,8 @@ impl ThreadView {
                         let _ = stop_view.update(cx, |this, cx| this.stop(window, cx));
                     },
                 )
-                .controls(self.config_bar.render(availability, cx))
+                .leading(SessionSettings::render_modes(&self.settings, cx))
+                .trailing(SessionSettings::render_panel_button(&self.settings, cx))
                 .meta(self.usage_label()),
             )
     }

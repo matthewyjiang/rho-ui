@@ -10,8 +10,8 @@ pub use agent::{
     PermissionChoice, PermissionKind, PermissionRequest, SessionId, SessionSetup, SessionSummary,
 };
 pub use thread::{
-    ConfigChoice, ConfigKind, ConfigOption, ConfigValue, Entry, Message, Notice, NoticeLevel,
-    PlanItem, PlanStatus, RunState, Thread, ThreadUpdate, ToolCall, ToolContent, ToolKind,
-    ToolStatus, Usage,
+    ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue, Entry, Message, Notice,
+    NoticeLevel, PlanItem, PlanStatus, RunState, Thread, ThreadUpdate, ToolCall, ToolContent,
+    ToolKind, ToolStatus, Usage,
 };
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};
