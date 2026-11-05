@@ -262,6 +262,41 @@ fn new_thread_runs_a_turn_through_an_approval() {
     ui.shot("done");
 }
 
+/// A sent message renders as markdown; dragging across it selects the
+/// text, and copy puts it on the clipboard.
+#[test]
+fn a_sent_message_can_be_selected_and_copied() {
+    let mut ui = Harness::start("select", fake_agent());
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-thread");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.act(|window, cx| {
+        window.input("list **files**", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the sent message", |window, _, _| {
+        is_visible(window, "user-0")
+    });
+
+    ui.act(|window, cx| {
+        let text = bounds(window, "user-0").expect("the message is drawn");
+        let y = text.center().y;
+        window.drag(
+            gpui_kit::point(text.left() + px(1.), y),
+            gpui_kit::point(text.right() + px(20.), y),
+            cx,
+        );
+        window.press("ctrl-c", cx);
+    });
+    ui.shot("selected");
+    let copied = ui
+        .cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some("list files"));
+}
+
 /// Picking a saved session replays its history before it can be used.
 #[test]
 fn opening_a_saved_session_replays_its_history() {

@@ -5,6 +5,7 @@
 
 use std::{ops::Range, rc::Rc, time::Duration};
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::{Alert, AlertVariant},
     bubble::{Bubble, BubbleVariant},
@@ -289,9 +290,18 @@ fn render_message(entry: &Entry, ix: usize, phase: Phase) -> AnyElement {
             .alignment(MessageAlignment::End)
             .content(
                 MessageContent::new().bubble(
-                    Bubble::new()
-                        .with_variant(BubbleVariant::Muted)
-                        .child(message.text().to_owned()),
+                    Bubble::new().with_variant(BubbleVariant::Muted).child(
+                        div()
+                            .id(SharedString::from(format!("user-{ix}")))
+                            .test_support()
+                            .child(
+                                TextView::markdown(
+                                    ElementId::named_usize("user-markdown", ix),
+                                    message.text().to_owned(),
+                                )
+                                .selectable(true),
+                            ),
+                    ),
                 ),
             )
             .into_any_element(),
