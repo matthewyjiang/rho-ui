@@ -25,6 +25,7 @@ use crate::{
     app::{LaunchConfig, RhoApp},
     settings::{Settings, UiScale},
     shelf::Shelves,
+    turn_times::TurnTimes,
 };
 
 /// Long enough for python to start and answer; the fake agent replies at once.
@@ -655,6 +656,15 @@ fn settings_open_apply_and_close() {
     });
 }
 
+/// How long the active thread's turn `turn` took, as "Worked for" shows.
+fn turn_took(ui: &mut Harness, turn: usize) -> Option<Duration> {
+    let app = ui.app.clone();
+    ui.cx.update(|cx| {
+        let view = app.read(cx).active_thread().expect("a thread is open");
+        view.read(cx).transcript().took(turn)
+    })
+}
+
 /// A finished turn folds its working behind "Worked". Inside, a run of
 /// tool calls and thoughts is one summary line, which opens into a line per
 /// step, each of which opens into its details; an edit shows Kit's diff.
@@ -673,11 +683,16 @@ fn finished_work_folds_and_opens_in_levels() {
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-old")
     });
+    // An earlier run of rho-ui timed this turn, so it shows its time.
+    let took = Duration::from_secs(80);
+    ui.cx
+        .update(|cx| cx.global_mut::<TurnTimes>().record("u0", took));
     ui.click("session-old");
     // Entries: reply, question, thought, read, search, command, edit, answer.
     ui.wait_until("the turn folded behind one line", |window, _, _| {
         is_visible(window, "worked-0") && !is_visible(window, "work-2")
     });
+    assert_eq!(turn_took(&mut ui, 0), Some(took), "Worked for 1m 20s");
     ui.shot("worked");
 
     ui.click("worked-0");
@@ -727,13 +742,6 @@ fn a_new_prompt_leaves_finished_turns_folded() {
     ui.wait_until("the replayed turn, folded", |window, _, _| {
         is_visible(window, "worked-0")
     });
-    let took = |ui: &mut Harness, turn: usize| {
-        let app = ui.app.clone();
-        ui.cx.update(|cx| {
-            let view = app.read(cx).active_thread().expect("a thread is open");
-            view.read(cx).transcript().took(turn)
-        })
-    };
 
     // The agent echoes "slow" late; until then the old turn stays folded.
     ui.act(|window, cx| {
@@ -751,8 +759,10 @@ fn a_new_prompt_leaves_finished_turns_folded() {
     ui.wait_for_thread("the slow turn to finish", |thread| {
         thread.state() == &RunState::Idle
     });
-    assert_eq!(took(&mut ui, 0), None, "the replayed turn has no time");
-    assert!(took(&mut ui, 1).is_some(), "the slow turn was timed here");
+    assert_eq!(turn_took(&mut ui, 0), None, "the replayed turn has no time");
+    let slow = turn_took(&mut ui, 1).expect("the slow turn was timed here");
+    let saved = ui.cx.update(|cx| cx.global::<TurnTimes>().get("m1"));
+    assert_eq!(saved, Some(slow), "saved under its prompt for a replay");
 
     // A refused prompt starts no turn, so it times none.
     ui.act(|window, cx| {
@@ -762,7 +772,7 @@ fn a_new_prompt_leaves_finished_turns_folded() {
     ui.wait_for_thread("the refusal", |thread| {
         matches!(thread.state(), RunState::Failed(_))
     });
-    assert_eq!(took(&mut ui, 0), None, "the refusal times no old turn");
+    assert_eq!(turn_took(&mut ui, 0), None, "the refusal times no old turn");
 
     // Each turn has its own "Worked" line: opening the second opens only it.
     ui.click("worked-1");

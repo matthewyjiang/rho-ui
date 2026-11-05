@@ -23,6 +23,7 @@ use rho_ui_core::{Entry, NoticeLevel, Row, Timeline};
 
 use crate::{
     time,
+    turn_times::TurnTimes,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, WorkRow},
 };
 
@@ -48,8 +49,8 @@ pub(crate) struct Transcript {
     details: Vec<Disclosure>,
     /// Per turn: whether its folded working is open.
     worked: Vec<Disclosure>,
-    /// Per turn: how long it took, for turns run in this view. ACP sends no
-    /// turn times, so replayed turns have none.
+    /// Per turn: how long it took, for turns rho-ui ran. ACP sends no turn
+    /// times, so a replayed turn has one only from [`TurnTimes`].
     took: Vec<Option<Duration>>,
     /// The running turn's index. It may not have a prompt row yet: a sent
     /// prompt shows once the agent echoes it.
@@ -86,12 +87,17 @@ impl Transcript {
             self.scroller
                 .update(cx, |scroller, cx| scroller.append(synced.added, cx));
         }
+        let known = self.took.len();
         let turns = self.timeline.turns().len();
         self.steps
             .resize(self.timeline.rows().len(), Disclosure::Folded);
         self.details.resize(entries.len(), Disclosure::Folded);
         self.worked.resize(turns, Disclosure::Folded);
         self.took.resize(turns, None);
+        let times = cx.global::<TurnTimes>();
+        for turn in known..turns {
+            self.took[turn] = self.prompt_id(turn, entries).and_then(|id| times.get(id));
+        }
         // A finished turn that grows, as history replays, folds more rows.
         if let Some(newest) = turns.checked_sub(1) {
             if (synced.added > 0 || synced.grew.is_some()) && self.is_finished(newest) {
@@ -134,15 +140,31 @@ impl Transcript {
         }
     }
 
-    /// The running turn finished after `took`, and folds. A prompt that
-    /// never arrived leaves no turn to time.
-    pub(crate) fn end_turn(&mut self, took: Duration, cx: &mut App) {
+    /// The running turn finished after `took`, and folds. Its time is saved
+    /// for when the session replays. A prompt that never arrived leaves no
+    /// turn to time.
+    pub(crate) fn end_turn(&mut self, took: Duration, entries: &[Entry], cx: &mut App) {
         let Some(turn) = self.running.take() else {
             return;
         };
         if let Some(slot) = self.took.get_mut(turn) {
             *slot = Some(took);
+            if let Some(prompt) = self.prompt_id(turn, entries) {
+                cx.global_mut::<TurnTimes>().record(prompt, took);
+            }
             self.remeasure(self.timeline.turn_rows(turn), cx);
+        }
+    }
+
+    /// The message ID of `turn`'s prompt.
+    fn prompt_id<'a>(&self, turn: usize, entries: &'a [Entry]) -> Option<&'a str> {
+        let row = *self.timeline.turns().get(turn)?;
+        let Row::Message(ix) = self.timeline.rows().get(row)? else {
+            return None;
+        };
+        match entries.get(*ix)? {
+            Entry::User(prompt) => Some(prompt.id()),
+            _ => None,
         }
     }
 

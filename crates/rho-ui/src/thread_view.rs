@@ -269,7 +269,8 @@ impl ThreadView {
             }
             (false, Some(since)) => {
                 self.busy_since = None;
-                self.transcript.end_turn(now - since, cx);
+                self.transcript
+                    .end_turn(now - since, self.thread.entries(), cx);
                 cx.emit(ThreadEvent::Saved);
             }
             _ => {}

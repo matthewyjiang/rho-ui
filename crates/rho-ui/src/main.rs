@@ -21,6 +21,7 @@ mod thread_list;
 mod thread_view;
 mod time;
 mod transcript;
+mod turn_times;
 #[cfg(test)]
 mod ui_tests;
 mod work;
@@ -38,6 +39,7 @@ use crate::{
     app::{LaunchConfig, RhoApp},
     settings::Settings,
     shelf::Shelves,
+    turn_times::TurnTimes,
 };
 
 gpui_kit::actions!(
@@ -155,6 +157,7 @@ fn main() {
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         init(cx);
         Settings::load().apply(cx);
+        cx.set_global(TurnTimes::load());
         cx.on_action(|_: &Quit, cx| cx.quit());
         let options = window_options(cx);
         gpui_kit::open_window(options, cx, |window, cx| {
@@ -171,6 +174,8 @@ fn init(cx: &mut App) {
     gpui_kit::init(cx);
     Theme::change(ThemeMode::Dark, None, cx);
     Settings::default().apply(cx);
+    // In memory until `main` loads the saved times; tests keep it so.
+    cx.set_global(TurnTimes::default());
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewThread, Some("RhoApp")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
