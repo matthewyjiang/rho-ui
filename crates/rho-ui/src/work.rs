@@ -170,7 +170,7 @@ fn parse_patches(tool: &ToolCall) -> Patches {
 /// Everything a work row needs to draw.
 pub(crate) struct WorkRow<'a> {
     pub(crate) entries: &'a [Entry],
-    /// The first entry's index in the thread.
+    /// The first entry's index in the session.
     pub(crate) start: usize,
     /// Whether the steps are listed.
     pub(crate) steps: Disclosure,

@@ -27,7 +27,7 @@ impl Entry {
     }
 }
 
-/// One transcript row: entry indices into the thread.
+/// One transcript row: entry indices into the session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
     /// A user message, a reply or a notice.
@@ -45,7 +45,7 @@ impl Row {
     }
 }
 
-/// The rows for a thread's entries, kept up to date as entries arrive.
+/// The rows for a session's entries, kept up to date as entries arrive.
 #[derive(Debug, Default)]
 pub struct Timeline {
     rows: Vec<Row>,
@@ -267,12 +267,12 @@ pub fn thought_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionId, Thread, ThreadUpdate};
+    use crate::{Session, SessionId, SessionUpdate};
 
-    /// A thread built from ACP updates: `("tool", kind)`, `("thought", text)`,
+    /// A session built from ACP updates: `("tool", kind)`, `("thought", text)`,
     /// `("agent", text)`, `("notice", title)` or `("user", text)`.
     fn entries(script: &[(&str, &str)]) -> Vec<Entry> {
-        let mut thread = Thread::new(SessionId::from("s"));
+        let mut session = Session::new(SessionId::from("s"));
         for (n, (what, text)) in script.iter().enumerate() {
             let update = match *what {
                 "tool" => serde_json::json!({"sessionUpdate": "tool_call_update",
@@ -286,11 +286,11 @@ mod tests {
                 _ => serde_json::json!({"sessionUpdate": "user_message",
                     "messageId": format!("m{n}"), "content": [{"type": "text", "text": text}]}),
             };
-            thread.apply(ThreadUpdate(
+            session.apply(SessionUpdate(
                 serde_json::from_value(update).expect("the script is valid ACP"),
             ));
         }
-        thread.entries().to_vec()
+        session.entries().to_vec()
     }
 
     #[test]

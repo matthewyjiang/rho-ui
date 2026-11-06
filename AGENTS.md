@@ -22,7 +22,7 @@ Use GPUI Kit's components (`gpui_kit::component`, `gpui_kit::base`); don't build
 - Lints are set once in the root `Cargo.toml` (`[workspace.lints]`, from BeautifulRust's `lints.toml`) and `clippy.toml`. Every crate opts in with `[lints] workspace = true`. Fix a lint rather than silencing it. When one is wrong for an item, use `#[expect(clippy::name, reason = "...")]` on that item.
 - Nothing here is published to crates.io (`publish = false`).
 - Check UI changes with the headless UI tests in `crates/rho-ui/src/ui_tests.rs`, and look at the screenshots in `target/ui-shots/`. Don't drive the user's live desktop with `wtype` or screenshots of their screen: they may be using it.
-- A UI test finds elements by `ElementId` (GPUI Kit controls register themselves; custom elements need `.test_support()`). Assert both what the user sees and the thread state.
+- A UI test finds elements by `ElementId` (GPUI Kit controls register themselves; custom elements need `.test_support()`). Assert both what the user sees and the session state.
 
 ## Before you hand back
 

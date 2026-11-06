@@ -1,4 +1,4 @@
-//! The transcript: a thread's entries as rows in a scroller. Messages and
+//! The transcript: a session's entries as rows in a scroller. Messages and
 //! notices are drawn here; runs of tool calls and thoughts by
 //! [`crate::work`]. A finished turn's working folds behind one "Worked for"
 //! line. This owns what the user opened and folded, and the turns' lengths.
@@ -36,10 +36,10 @@ pub(crate) enum Action {
     Worked { turn: usize },
 }
 
-/// Carries out an [`Action`]; the thread view owns the transcript.
+/// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
 
-/// A thread's transcript state. Flat arrays indexed by row, entry or turn.
+/// A session's transcript state. Flat arrays indexed by row, entry or turn.
 pub(crate) struct Transcript {
     scroller: Entity<MessageScrollerState>,
     timeline: Timeline,
@@ -283,7 +283,7 @@ impl Transcript {
             _ => content(),
         };
         // A readable measure on wide windows. The gap below is here, not in
-        // the scroller's row style (which the thread view zeroes), so rows in
+        // the scroller's row style (which the session view zeroes), so rows in
         // a folded turn take no space.
         div()
             .w_full()

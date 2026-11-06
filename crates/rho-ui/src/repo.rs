@@ -1,4 +1,4 @@
-//! What a thread's workspace is: project name and branch, read straight from
+//! What a session's workspace is: project name and branch, read straight from
 //! `.git` files. No `git` process, no git library.
 
 use std::path::{Path, PathBuf};

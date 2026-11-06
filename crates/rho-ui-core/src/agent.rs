@@ -20,7 +20,7 @@ use agent_client_protocol::{
 };
 use futures::{channel::oneshot, future::BoxFuture, FutureExt};
 
-use crate::thread::{config_options, ConfigOption, ConfigValue, ThreadUpdate};
+use crate::session::{config_options, ConfigOption, ConfigValue, SessionUpdate};
 
 /// How to launch the agent process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,7 +166,7 @@ impl SessionSummary {
 }
 
 /// What `session/new` and `session/resume` return. Hand it to
-/// [`crate::Thread::set_setup`].
+/// [`crate::Session::set_setup`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSetup {
     pub(crate) id: SessionId,
@@ -212,12 +212,12 @@ pub(crate) fn commands(list: Vec<v2::AvailableCommand>) -> Vec<CommandInfo> {
 /// Everything the agent pushes without being asked.
 #[derive(Debug)]
 pub enum AgentEvent {
-    /// A change to one session's thread; apply it with [`crate::Thread::apply`].
+    /// A change to one session; apply it with [`crate::Session::apply`].
     Update {
         /// The session the change belongs to.
         session: SessionId,
         /// The change itself.
-        update: ThreadUpdate,
+        update: SessionUpdate,
     },
     /// The agent wants approval before running a tool.
     Permission(PermissionRequest),
@@ -296,7 +296,7 @@ impl Agent {
                         // Unbounded, so this never waits.
                         let _ = updates.try_send(AgentEvent::Update {
                             session: notification.session_id.into(),
-                            update: ThreadUpdate(notification.update),
+                            update: SessionUpdate(notification.update),
                         });
                         Ok(())
                     },
@@ -412,7 +412,7 @@ impl Agent {
     }
 
     /// Reopens a saved session. Its history replays as [`AgentEvent::Update`]s
-    /// before this returns, so create the session's thread first.
+    /// before this returns, so create its [`crate::Session`] first.
     ///
     /// # Errors
     ///
@@ -439,7 +439,7 @@ impl Agent {
     /// # Errors
     ///
     /// Fails if the agent refuses the prompt, for example because the session
-    /// is busy or unknown. Nothing was added to the thread in that case.
+    /// is busy or unknown. Nothing was added to the session in that case.
     pub async fn prompt(&self, id: &SessionId, text: &str) -> Result<(), AgentError> {
         let request = v2::PromptRequest::new(id.to_acp(), vec![text.into()]);
         self.connection.send_request(request).block_task().await?;

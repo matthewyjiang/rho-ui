@@ -1,11 +1,11 @@
-//! Settled and snoozed threads. This is rho-ui's own organization; rho knows
+//! Settled and snoozed sessions. This is rho-ui's own organization; rho knows
 //! nothing about it.
 //!
-//! rho-ui owns the threads started or continued in it. Every other thread,
+//! rho-ui owns the sessions started or continued in it. Every other session,
 //! such as one from rho's terminal UI, starts out settled, so the sidebar
 //! doesn't fill with history from elsewhere; snoozing or restoring one makes
-//! it rho-ui's. An owned thread that was settled comes back when it has new
-//! activity; a snoozed thread comes back when its time is up. Neither needs a
+//! it rho-ui's. An owned session that was settled comes back when it has new
+//! activity; a snoozed session comes back when its time is up. Neither needs a
 //! timer: the sidebar asks [`Shelves::shelf`] whenever it rebuilds.
 //!
 //! The state lives in one small text file, one line per fact:
@@ -20,7 +20,7 @@ use std::{fmt::Write as _, path::PathBuf};
 
 use crate::store;
 
-/// Which list a thread shows in.
+/// Which list a session shows in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Shelf {
     #[default]
@@ -47,7 +47,7 @@ enum Mark {
     Snoozed(i64),
 }
 
-/// What rho-ui knows about one thread.
+/// What rho-ui knows about one session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Entry {
     /// Started or continued in rho-ui.
@@ -55,7 +55,7 @@ struct Entry {
     mark: Option<Mark>,
 }
 
-/// Every thread rho-ui knows about, in one flat list sorted by session ID so
+/// Every session rho-ui knows about, in one flat list sorted by session ID so
 /// a lookup is a binary search.
 #[derive(Debug, Default)]
 pub(crate) struct Shelves {
@@ -99,7 +99,7 @@ impl Shelves {
         }
     }
 
-    /// When a snoozed thread wakes, in Unix seconds.
+    /// When a snoozed session wakes, in Unix seconds.
     pub(crate) fn wakes(&self, id: &str) -> Option<i64> {
         match self.entry(id).mark {
             Some(Mark::Snoozed(until)) => Some(until),
@@ -116,7 +116,7 @@ impl Shelves {
         self.change(id, |entry| entry.mark = Some(Mark::Settled(now)));
     }
 
-    /// Snoozing a thread makes it rho-ui's, so it wakes up active.
+    /// Snoozing a session makes it rho-ui's, so it wakes up active.
     pub(crate) fn snooze(&mut self, id: &str, until: i64) {
         self.change(id, |entry| {
             entry.owned = true;
@@ -134,7 +134,7 @@ impl Shelves {
         });
     }
 
-    /// Forgets a deleted thread.
+    /// Forgets a deleted session.
     pub(crate) fn forget(&mut self, id: &str) {
         self.change(id, |entry| *entry = Entry::default());
     }
@@ -170,7 +170,7 @@ impl Shelves {
         self.save();
     }
 
-    /// Best effort: losing a line only moves a thread between lists. Writes
+    /// Best effort: losing a line only moves a session between lists. Writes
     /// a temporary file and renames it, so a crash never leaves half a file.
     fn save(&self) {
         let Some(path) = &self.path else { return };
@@ -191,7 +191,7 @@ impl Shelves {
 }
 
 /// Reads entries, sorted by ID. Skips lines it cannot read, so one bad line
-/// costs one fact. A snooze that ended before `now` leaves the thread owned
+/// costs one fact. A snooze that ended before `now` leaves the session owned
 /// and active.
 fn parse(text: &str, now: i64) -> Vec<(String, Entry)> {
     let mut facts: Vec<(&str, Entry)> = text
@@ -209,7 +209,7 @@ fn parse(text: &str, now: i64) -> Vec<(String, Entry)> {
                     owned: false,
                     mark: Some(Mark::Settled(at)),
                 },
-                // Snoozing makes a thread rho-ui's, and files from before
+                // Snoozing makes a session rho-ui's, and files from before
                 // `owned` lines existed only say so this way.
                 ("snoozed", Some(until)) => Entry {
                     owned: true,
@@ -239,7 +239,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn threads_from_elsewhere_start_settled_until_rho_ui_takes_them() {
+    fn sessions_from_elsewhere_start_settled_until_rho_ui_takes_them() {
         let mut shelves = Shelves::default();
         assert_eq!(shelves.shelf("tui", 500, 600), Shelf::Settled);
         shelves.restore("tui");
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_settled_threads_return_on_new_activity() {
+    fn owned_settled_sessions_return_on_new_activity() {
         let mut shelves = Shelves::default();
         shelves.own("a");
         shelves.settle("a", 100);

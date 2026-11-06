@@ -1,9 +1,9 @@
-//! A new thread before its first message: a header, and a composer with the
+//! A new session before its first message: a header, and a composer with the
 //! session's settings. The app opens the session as soon as the draft
 //! appears, so the model, reasoning and mode can be set before the first
 //! message. rho writes no file for a session until its first prompt, and a
 //! draft closes its session when it goes away unused, so an unused New
-//! thread leaves nothing behind in the sidebar or in rho.
+//! session leaves nothing behind in the sidebar or in rho.
 
 use std::path::{Path, PathBuf};
 
@@ -20,32 +20,32 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     Subscription, Window,
 };
-use rho_ui_core::{Agent, SessionId, Thread, ThreadUpdate};
+use rho_ui_core::{Agent, Session, SessionId, SessionUpdate};
 
 use crate::{
     composer::{self, Composer, ComposerMode},
     projects::ProjectRef,
+    session_list::NEW_SESSION,
     session_settings::{SessionSettings, SettingsEvent},
-    thread_list::NEW_THREAD,
-    thread_view::header,
+    session_view::header,
 };
 
 /// What the draft asks of the app.
 pub(crate) enum DraftEvent {
-    /// Open `thread`, the draft's session, and send `text` as its first
+    /// Show `session`, the one the draft opened, and send `text` as its first
     /// prompt.
-    Start { thread: Box<Thread>, text: String },
+    Start { session: Box<Session>, text: String },
     /// The session couldn't be opened; try again.
     Retry,
 }
 
 /// The draft's session.
-enum Session {
+enum SessionState {
     /// The app is opening it.
     Opening,
     Open {
         agent: Agent,
-        thread: Box<Thread>,
+        session: Box<Session>,
         settings: Entity<SessionSettings>,
         _subscription: Subscription,
     },
@@ -59,7 +59,7 @@ pub(crate) struct DraftView {
     cwd: PathBuf,
     project: ProjectRef,
     composer: Entity<TextareaState>,
-    session: Session,
+    state: SessionState,
     /// The user sent while the session was opening; it goes out once open.
     queued: bool,
     /// Why opening the session, or a settings change, failed.
@@ -91,8 +91,8 @@ impl DraftView {
             cx.observe(project.table(), |_, _, cx| cx.notify()),
             // An unused session is freed with its draft.
             cx.on_release(|this, cx| {
-                if let Session::Open { agent, thread, .. } = &this.session {
-                    let (agent, id) = (agent.clone(), thread.id().clone());
+                if let SessionState::Open { agent, session, .. } = &this.state {
+                    let (agent, id) = (agent.clone(), session.id().clone());
                     cx.spawn(async move |_| {
                         let _ = agent.close_session(&id).await;
                     })
@@ -104,7 +104,7 @@ impl DraftView {
             cwd,
             project,
             composer,
-            session: Session::Opening,
+            state: SessionState::Opening,
             queued: false,
             error: None,
             focus_handle: cx.focus_handle(),
@@ -122,9 +122,9 @@ impl DraftView {
 
     /// The open session's ID, for routing its updates here.
     pub(crate) fn session_id(&self) -> Option<&SessionId> {
-        match &self.session {
-            Session::Open { thread, .. } => Some(thread.id()),
-            Session::Opening | Session::Failed | Session::Started => None,
+        match &self.state {
+            SessionState::Open { session, .. } => Some(session.id()),
+            SessionState::Opening | SessionState::Failed | SessionState::Started => None,
         }
     }
 
@@ -132,23 +132,23 @@ impl DraftView {
     pub(crate) fn open(
         &mut self,
         agent: Agent,
-        thread: Thread,
+        session: Session,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let settings = cx.new(|cx| {
             SessionSettings::new(
                 agent.clone(),
-                thread.id().clone(),
-                thread.config(),
+                session.id().clone(),
+                session.config(),
                 window,
                 cx,
             )
         });
         let subscription = cx.subscribe_in(&settings, window, Self::on_settings_event);
-        self.session = Session::Open {
+        self.state = SessionState::Open {
             agent,
-            thread: Box::new(thread),
+            session: Box::new(session),
             settings,
             _subscription: subscription,
         };
@@ -161,7 +161,7 @@ impl DraftView {
 
     /// The session couldn't be opened. The text stays; Send tries again.
     pub(crate) fn fail(&mut self, error: String, cx: &mut Context<'_, Self>) {
-        self.session = Session::Failed;
+        self.state = SessionState::Failed;
         self.queued = false;
         self.error = Some(error);
         cx.notify();
@@ -170,17 +170,17 @@ impl DraftView {
     /// Applies an update the agent sent for the open session.
     pub(crate) fn apply(
         &mut self,
-        update: ThreadUpdate,
+        update: SessionUpdate,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if let Session::Open {
-            thread, settings, ..
-        } = &mut self.session
+        if let SessionState::Open {
+            session, settings, ..
+        } = &mut self.state
         {
-            thread.apply(update);
+            session.apply(update);
             settings.update(cx, |settings, cx| {
-                settings.sync(thread.config(), window, cx);
+                settings.sync(session.config(), window, cx);
             });
         }
     }
@@ -195,8 +195,8 @@ impl DraftView {
         match event {
             SettingsEvent::Changed(options) => {
                 self.error = None;
-                if let Session::Open { thread, .. } = &mut self.session {
-                    thread.set_config(options.clone());
+                if let SessionState::Open { session, .. } = &mut self.state {
+                    session.set_config(options.clone());
                 }
             }
             SettingsEvent::Failed(message) => self.error = Some(message.clone()),
@@ -212,19 +212,19 @@ impl DraftView {
         if text.is_empty() {
             return;
         }
-        match std::mem::replace(&mut self.session, Session::Started) {
-            Session::Open { thread, .. } => cx.emit(DraftEvent::Start { thread, text }),
-            Session::Opening => {
-                self.session = Session::Opening;
+        match std::mem::replace(&mut self.state, SessionState::Started) {
+            SessionState::Open { session, .. } => cx.emit(DraftEvent::Start { session, text }),
+            SessionState::Opening => {
+                self.state = SessionState::Opening;
                 self.queued = true;
             }
-            Session::Failed => {
-                self.session = Session::Opening;
+            SessionState::Failed => {
+                self.state = SessionState::Opening;
                 self.queued = true;
                 self.error = None;
                 cx.emit(DraftEvent::Retry);
             }
-            Session::Started => {}
+            SessionState::Started => {}
         }
         cx.notify();
     }
@@ -233,14 +233,14 @@ impl DraftView {
 impl Render for DraftView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
-        let mode = if self.queued || matches!(self.session, Session::Started) {
+        let mode = if self.queued || matches!(self.state, SessionState::Started) {
             ComposerMode::Starting
         } else {
             ComposerMode::Send
         };
-        let settings = match &self.session {
-            Session::Open { settings, .. } => Some(settings),
-            Session::Opening | Session::Failed | Session::Started => None,
+        let settings = match &self.state {
+            SessionState::Open { settings, .. } => Some(settings),
+            SessionState::Opening | SessionState::Failed | SessionState::Started => None,
         };
         let mut composer = Composer::new(
             &self.composer,
@@ -260,7 +260,7 @@ impl Render for DraftView {
             .test_support()
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(header(NEW_THREAD.to_owned(), self.project.read(cx), cx))
+            .child(header(NEW_SESSION.to_owned(), self.project.read(cx), cx))
             .child(
                 Empty::new().header(
                     EmptyHeader::new()
@@ -279,7 +279,7 @@ impl Render for DraftView {
                     .when_some(self.error.clone(), |this, error| {
                         this.child(
                             Alert::error("draft-error", SharedString::from(error))
-                                .title("Couldn't start the thread")
+                                .title("Couldn't start the session")
                                 .small(),
                         )
                     })

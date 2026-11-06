@@ -1,14 +1,14 @@
-//! The thread list, drawn: one scrolling list of active threads, newest
+//! The session list, drawn: one scrolling list of active sessions, newest
 //! first, then the Snoozed and Settled shelves, held at the bottom until
 //! opened shelves fill the list. An active row shows the
-//! project, the thread's status or age, its title, and its branch; hovering
+//! project, the session's status or age, its title, and its branch; hovering
 //! it swaps the status for Snooze and Settle. A shelf opens from its header
 //! into one-line rows, and hovering one shows its details in a card.
 //!
 //! The app draws this view as a cached view, so a hover or scroll here
 //! redraws only the sidebar, and [`v_virtual_list`] builds only the rows on
 //! screen.
-//! The data lives in [`ThreadList`] and [`Projects`], built when it
+//! The data lives in [`SessionList`] and [`Projects`], built when it
 //! changes, never per frame.
 
 use std::{
@@ -44,8 +44,8 @@ use rho_ui_core::{SessionId, SessionSummary};
 
 use crate::{
     projects::{Project, Projects},
+    session_list::{Activity, Item, LiveSession, Row, SavedSession, SessionList},
     shelf::{Shelf, Shelves},
-    thread_list::{Activity, Item, LiveThread, Row, SavedThread, ThreadList},
     time,
 };
 
@@ -79,7 +79,7 @@ const HEADER_REMS: f32 = 2.5;
 /// [`SidebarView::render_list`].
 fn item_rems(item: Item) -> f32 {
     match item {
-        Item::Thread(_) => ROW_REMS,
+        Item::Session(_) => ROW_REMS,
         Item::Shelved(_) => SHELVED_ROW_REMS,
         Item::Header(_) => HEADER_REMS,
         Item::Gap => 0.,
@@ -90,7 +90,7 @@ fn item_rems(item: Item) -> f32 {
 /// minutes, so 30 s keeps them current.
 const TICK: Duration = Duration::from_secs(30);
 
-/// How long a thread can be snoozed for.
+/// How long a session can be snoozed for.
 #[derive(Debug, PartialEq, Eq)]
 struct Snooze {
     /// The inline button's element ID and label.
@@ -122,7 +122,7 @@ const SNOOZES: [Snooze; 3] = [
     },
 ];
 
-/// Moving a thread between shelves.
+/// Moving a session between shelves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShelfAction {
     Settle,
@@ -138,7 +138,7 @@ impl ShelfAction {
         ShelfAction::Snooze(&SNOOZES[2]),
     ];
 
-    /// What a row offers, inline and in its menu. A busy thread offers
+    /// What a row offers, inline and in its menu. A busy session offers
     /// nothing: it shows as active until its turn ends.
     fn offered(shelf: Shelf, activity: Activity) -> &'static [ShelfAction] {
         if !activity.is_idle() {
@@ -170,14 +170,14 @@ impl ShelfAction {
 
 /// What the sidebar asks of the app.
 pub(crate) enum SidebarEvent {
-    /// Open a thread. `title` is the saved one, if any.
+    /// Open a session. `title` is the saved one, if any.
     Open {
         id: SessionId,
         cwd: PathBuf,
         title: Option<SharedString>,
     },
-    NewThread,
-    /// Delete a saved thread; the user has confirmed.
+    NewSession,
+    /// Delete a saved session; the user has confirmed.
     Delete {
         id: SessionId,
     },
@@ -192,7 +192,7 @@ struct Hover {
 }
 
 pub(crate) struct SidebarView {
-    list: ThreadList,
+    list: SessionList,
     projects: Entity<Projects>,
     shelves: Shelves,
     active: Option<SessionId>,
@@ -237,7 +237,7 @@ impl SidebarView {
             }
         });
         Self {
-            list: ThreadList::default(),
+            list: SessionList::default(),
             projects,
             shelves,
             active: None,
@@ -252,12 +252,12 @@ impl SidebarView {
         }
     }
 
-    /// Replaces the saved threads with a fresh `list_sessions` result.
+    /// Replaces the saved sessions with a fresh `list_sessions` result.
     pub(crate) fn set_saved(&mut self, sessions: Vec<SessionSummary>, cx: &mut Context<'_, Self>) {
         let saved = self.projects.update(cx, |projects, cx| {
             sessions
                 .into_iter()
-                .map(|session| SavedThread {
+                .map(|session| SavedSession {
                     project: projects.index(session.cwd(), cx),
                     id: session.id().clone(),
                     cwd: session.cwd().to_path_buf(),
@@ -279,8 +279,8 @@ impl SidebarView {
         cx.notify();
     }
 
-    /// Records an open thread's title and activity.
-    pub(crate) fn set_live(&mut self, live: LiveThread, cx: &mut Context<'_, Self>) {
+    /// Records an open session's title and activity.
+    pub(crate) fn set_live(&mut self, live: LiveSession, cx: &mut Context<'_, Self>) {
         let project = self
             .projects
             .update(cx, |projects, cx| projects.index(&live.cwd, cx));
@@ -289,13 +289,13 @@ impl SidebarView {
         }
     }
 
-    /// Marks a thread as started or continued here, so it stays active.
+    /// Marks a session as started or continued here, so it stays active.
     pub(crate) fn own(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
         self.shelves.own(id.as_str());
         self.rebuild(cx);
     }
 
-    /// Drops a thread the agent deleted.
+    /// Drops a session the agent deleted.
     pub(crate) fn remove(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
         self.list.remove(id);
         self.shelves.forget(id.as_str());
@@ -305,7 +305,7 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    /// Forgets every open thread, after the agent restarts.
+    /// Forgets every open session, after the agent restarts.
     pub(crate) fn clear_live(&mut self, cx: &mut Context<'_, Self>) {
         self.list.clear_live();
         self.active = None;
@@ -463,7 +463,7 @@ impl SidebarView {
         self.list.items()[range]
             .iter()
             .map(|&item| match item {
-                Item::Thread(row) => {
+                Item::Session(row) => {
                     let row = self.list.row_at(row);
                     self.render_row(row, projects.get(row.project), clock, &view, cx)
                 }
@@ -517,8 +517,8 @@ impl SidebarView {
         }
     }
 
-    /// What every thread row shares: its slot in the list, the highlight,
-    /// hover tracking, a click that opens the thread and the context menu.
+    /// What every session row shares: its slot in the list, the highlight,
+    /// hover tracking, a click that opens the session and the context menu.
     /// Kit has no list-item element with a fixed height for
     /// `v_virtual_list`, so rows are laid out by hand.
     fn row_frame<E>(
@@ -569,9 +569,9 @@ impl SidebarView {
             }))
     }
 
-    /// A snoozed or settled thread on one line: badge, title, and when it
+    /// A snoozed or settled session on one line: badge, title, and when it
     /// wakes or how old it is. Hovering it swaps that for Restore and, after
-    /// a moment, shows the thread's details beside the sidebar.
+    /// a moment, shows the session's details beside the sidebar.
     fn render_shelved(
         &self,
         row: &Row,
@@ -720,21 +720,21 @@ impl SidebarView {
             .justify_between()
             .child(div().font_semibold().child("rho"))
             .child(
-                Button::new("new-thread")
+                Button::new("new-session")
                     .ghost()
                     .small()
                     .icon(Lucide::SquarePen)
-                    .tooltip("New thread (Ctrl+N)")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewThread))),
+                    .tooltip("New session (Ctrl+N)")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewSession))),
             )
     }
 
     fn render_list(&self, window: &Window, cx: &mut Context<'_, Self>) -> AnyElement {
         if self.list.is_empty() {
             let message = if self.list.query().is_empty() {
-                "No threads yet"
+                "No sessions yet"
             } else {
-                "No matching threads"
+                "No matching sessions"
             };
             return Empty::new()
                 .header(EmptyHeader::new().description(EmptyDescription::new().child(message)))
@@ -778,7 +778,7 @@ impl SidebarView {
             .child(
                 v_virtual_list(
                     cx.entity(),
-                    "threads",
+                    "sessions",
                     Rc::new(sizes),
                     |this, range, _, cx| this.render_items(range, cx),
                 )
@@ -797,8 +797,8 @@ impl SidebarView {
             .when_some(self.error.clone(), |this, error| {
                 this.child(
                     div().px_2().child(
-                        Alert::error("threads-error", error)
-                            .title("Couldn't load threads")
+                        Alert::error("sessions-error", error)
+                            .title("Couldn't load sessions")
                             .small(),
                     ),
                 )
@@ -894,7 +894,7 @@ struct RowState {
     hovered: bool,
 }
 
-/// A shelved thread's details, shown beside the sidebar while hovered.
+/// A shelved session's details, shown beside the sidebar while hovered.
 /// Built with the row, so the card needs nothing from the view.
 struct Card {
     title: SharedString,
@@ -930,7 +930,7 @@ impl Card {
             details = details.item(muted(Lucide::AlarmClock), wakes.clone(), 1);
         }
         v_flex()
-            .id("thread-card")
+            .id("session-card")
             .test_support()
             .w(rems(20.))
             .gap_1p5()
@@ -994,7 +994,7 @@ fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
 }
 
 /// The right-click menu: the same moves the hover buttons offer, then
-/// Delete. A busy thread offers neither.
+/// Delete. A busy session offers neither.
 fn row_menu(menu: PopupMenu, view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenu {
     let menu = row.offered.iter().fold(menu, |menu, &action| {
         let (view, id) = (view.clone(), row.id.clone());
@@ -1020,7 +1020,7 @@ fn row_menu(menu: PopupMenu, view: &WeakEntity<SidebarView>, row: &MenuRow) -> P
                     alert
                         .icon(Icon::new(IconName::Delete).text_color(cx.theme().danger))
                         .title(format!("Delete \"{title}\"?"))
-                        .description("rho deletes the saved thread. This can't be undone.")
+                        .description("rho deletes the saved session. This can't be undone.")
                         .confirm()
                         .ok_text("Delete")
                         .ok_variant(ButtonVariant::Danger)
@@ -1039,7 +1039,7 @@ struct MenuRow {
     id: SessionId,
     title: SharedString,
     offered: &'static [ShelfAction],
-    /// Busy threads can't be deleted.
+    /// Busy sessions can't be deleted.
     deletable: bool,
 }
 
@@ -1059,7 +1059,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn busy_threads_offer_no_moves_and_shelves_offer_a_way_back() {
+    fn busy_sessions_offer_no_moves_and_shelves_offer_a_way_back() {
         assert!(ShelfAction::offered(Shelf::Active, Activity::Working(Instant::now())).is_empty());
         assert_eq!(
             ShelfAction::offered(Shelf::Settled, Activity::Idle),

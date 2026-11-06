@@ -1,6 +1,6 @@
-//! One thread: a header with its title and project, the transcript,
+//! One session: a header with its title and project, the transcript,
 //! approvals, and the composer with the session settings. Owns the session's
-//! [`Thread`] state and every request the user makes in it.
+//! [`Session`] state and every request the user makes in it.
 
 use std::{collections::VecDeque, path::PathBuf, rc::Rc, time::Instant};
 
@@ -22,8 +22,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Agent, AgentError, Entry, PermissionRequest, RunState, SessionId, SessionSetup, Thread,
-    ThreadUpdate,
+    Agent, AgentError, Entry, PermissionRequest, RunState, Session, SessionId, SessionSetup,
+    SessionUpdate,
 };
 
 use crate::{
@@ -31,17 +31,17 @@ use crate::{
     composer::ComposerMode,
     composer::{self, Composer},
     projects::{Project, ProjectRef},
+    session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
-    thread_list::{Activity, LiveThread, NEW_THREAD, UNTITLED},
     transcript::{ActionHandler, Transcript},
     StopTurn,
 };
 
-/// What the app needs to hear from a thread.
-pub(crate) enum ThreadEvent {
-    /// Title or activity changed; see [`ThreadView::live`].
+/// What the app needs to hear from a session.
+pub(crate) enum SessionEvent {
+    /// Title or activity changed; see [`SessionView::live`].
     LiveChanged,
-    /// The agent accepted a prompt from here, so the thread is rho-ui's.
+    /// The agent accepted a prompt from here, so the session is rho-ui's.
     Prompted,
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
@@ -58,9 +58,9 @@ pub(crate) enum Loading {
     Failed(String),
 }
 
-pub(crate) struct ThreadView {
+pub(crate) struct SessionView {
     agent: Agent,
-    thread: Thread,
+    session: Session,
     cwd: PathBuf,
     /// The project and branch, for the header.
     project: ProjectRef,
@@ -79,7 +79,7 @@ pub(crate) struct ThreadView {
     busy_since: Option<Instant>,
     /// When the oldest waiting approval arrived.
     waiting_since: Option<Instant>,
-    /// Title and activity as last reported in [`ThreadEvent::LiveChanged`].
+    /// Title and activity as last reported in [`SessionEvent::LiveChanged`].
     reported: (String, Activity),
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
@@ -87,14 +87,14 @@ pub(crate) struct ThreadView {
     _subscriptions: Vec<Subscription>,
 }
 
-impl EventEmitter<ThreadEvent> for ThreadView {}
+impl EventEmitter<SessionEvent> for SessionView {}
 
-impl ThreadView {
+impl SessionView {
     /// A resumed session starts as [`Loading::Resuming`] until
     /// [`Self::finish_loading`].
     pub(crate) fn new(
         agent: Agent,
-        thread: Thread,
+        session: Session,
         cwd: PathBuf,
         project: ProjectRef,
         loading: Loading,
@@ -106,8 +106,8 @@ impl ThreadView {
         let settings = cx.new(|cx| {
             SessionSettings::new(
                 agent.clone(),
-                thread.id().clone(),
-                thread.config(),
+                session.id().clone(),
+                session.config(),
                 window,
                 cx,
             )
@@ -130,7 +130,7 @@ impl ThreadView {
         ];
         let mut view = Self {
             agent,
-            thread,
+            session,
             cwd,
             project,
             // A resumed session is already saved.
@@ -149,20 +149,20 @@ impl ThreadView {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
-        view.transcript.sync(view.thread.entries(), cx);
+        view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
         view.reported = (view.title(), view.activity());
         view
     }
 
     pub(crate) fn id(&self) -> &SessionId {
-        self.thread.id()
+        self.session.id()
     }
 
-    /// What the sidebar shows for this thread.
-    pub(crate) fn live(&self) -> LiveThread {
-        LiveThread {
-            id: self.thread.id().clone(),
+    /// What the sidebar shows for this session.
+    pub(crate) fn live(&self) -> LiveSession {
+        LiveSession {
+            id: self.session.id().clone(),
             cwd: self.cwd.clone(),
             title: self.name().map(SharedString::from),
             placeholder: self.placeholder(),
@@ -173,22 +173,22 @@ impl ThreadView {
     /// The agent's title, or until it sends one (rho names a session after
     /// its first turn), the first prompt, as rho lists an untitled session.
     fn name(&self) -> Option<String> {
-        self.thread
+        self.session
             .title()
             .map(str::to_owned)
-            .or_else(|| first_prompt(&self.thread))
+            .or_else(|| first_prompt(&self.session))
     }
 
     fn title(&self) -> String {
         self.name().unwrap_or_else(|| self.placeholder().to_owned())
     }
 
-    /// The title until the agent gives one: a saved thread is untitled.
+    /// The title until the agent gives one: a saved session is untitled.
     fn placeholder(&self) -> &'static str {
         if self.prompted {
             UNTITLED
         } else {
-            NEW_THREAD
+            NEW_SESSION
         }
     }
 
@@ -197,7 +197,7 @@ impl ThreadView {
     }
 
     fn is_busy(&self) -> bool {
-        self.sending || self.thread.state().is_busy()
+        self.sending || self.session.state().is_busy()
     }
 
     fn activity(&self) -> Activity {
@@ -210,14 +210,14 @@ impl ThreadView {
 
     pub(crate) fn apply(
         &mut self,
-        update: ThreadUpdate,
+        update: SessionUpdate,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        // The thread names the entry it changed; only its row is remeasured.
+        // The session names the entry it changed; only its row is remeasured.
         // A new entry gets its row in `after_change`.
-        if let Some(ix) = self.thread.apply(update) {
-            self.transcript.changed(self.thread.entries(), ix, cx);
+        if let Some(ix) = self.session.apply(update) {
+            self.transcript.changed(self.session.entries(), ix, cx);
         }
         self.after_change(window, cx);
     }
@@ -231,7 +231,7 @@ impl ThreadView {
     ) {
         match result {
             Ok(setup) => {
-                self.thread.set_setup(setup);
+                self.session.set_setup(setup);
                 self.loading = Loading::Ready;
             }
             Err(error) => self.loading = Loading::Failed(error.to_string()),
@@ -248,7 +248,7 @@ impl ThreadView {
         let first = self.approvals.is_empty();
         self.approvals.push_back(request);
         // Move the keyboard to the default choice if the user is in this
-        // thread; never steal focus from another one.
+        // session; never steal focus from another one.
         if first && self.focus_handle.contains_focused(window, cx) {
             window.focus(&self.approval_focus, cx);
         }
@@ -256,9 +256,9 @@ impl ThreadView {
     }
 
     /// Brings the scroller, settings, timers and sidebar up to date with
-    /// `thread`.
+    /// `session`.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.transcript.sync(self.thread.entries(), cx);
+        self.transcript.sync(self.session.entries(), cx);
         self.sync_settings(window, cx);
         let now = Instant::now();
         let busy = self.is_busy();
@@ -270,8 +270,8 @@ impl ThreadView {
             (false, Some(since)) => {
                 self.busy_since = None;
                 self.transcript
-                    .end_turn(now - since, self.thread.entries(), cx);
-                cx.emit(ThreadEvent::Saved);
+                    .end_turn(now - since, self.session.entries(), cx);
+                cx.emit(SessionEvent::Saved);
             }
             _ => {}
         }
@@ -283,7 +283,7 @@ impl ThreadView {
         let title = self.title();
         if self.reported.0 != title || self.reported.1 != activity {
             self.reported = (title, activity);
-            cx.emit(ThreadEvent::LiveChanged);
+            cx.emit(SessionEvent::LiveChanged);
         }
         cx.notify();
     }
@@ -310,21 +310,21 @@ impl ThreadView {
         self.after_change(window, cx);
 
         let agent = self.agent.clone();
-        let id = self.thread.id().clone();
+        let id = self.session.id().clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = agent.prompt(&id, &text).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 match result {
                     Ok(()) => {
-                        cx.emit(ThreadEvent::Prompted);
+                        cx.emit(SessionEvent::Prompted);
                         if !this.prompted {
                             this.prompted = true;
-                            cx.emit(ThreadEvent::Saved);
+                            cx.emit(SessionEvent::Saved);
                         }
                     }
                     Err(error) => {
-                        this.thread.fail(error.to_string());
+                        this.session.fail(error.to_string());
                         // Give the prompt back so it isn't lost.
                         if this.composer.read(cx).value().is_empty() {
                             this.composer
@@ -344,7 +344,7 @@ impl ThreadView {
         }
         // Pending approvals answer "cancelled" as they drop.
         self.approvals.clear();
-        if let Err(error) = self.agent.cancel(self.thread.id()) {
+        if let Err(error) = self.agent.cancel(self.session.id()) {
             self.error = Some(format!("Couldn't stop the turn: {error}"));
         }
         self.after_change(window, cx);
@@ -362,7 +362,7 @@ impl ThreadView {
         self.after_change(window, cx);
     }
 
-    /// Shows the thread's settings, changeable once the session is open.
+    /// Shows the session's settings, changeable once the session is open.
     fn sync_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let allowed = if matches!(self.loading, Loading::Ready) {
             Availability::Enabled
@@ -370,7 +370,7 @@ impl ThreadView {
             Availability::Disabled
         };
         self.settings.update(cx, |settings, cx| {
-            settings.sync(self.thread.config(), window, cx);
+            settings.sync(self.session.config(), window, cx);
             settings.set_allowed(allowed, cx);
         });
     }
@@ -385,7 +385,7 @@ impl ThreadView {
         match event {
             SettingsEvent::Changed(options) => {
                 self.error = None;
-                self.thread.set_config(options.clone());
+                self.session.set_config(options.clone());
             }
             SettingsEvent::Failed(message) => self.error = Some(message.clone()),
         }
@@ -393,18 +393,18 @@ impl ThreadView {
     }
 
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> AnyElement {
-        if self.thread.entries().is_empty() {
+        if self.session.entries().is_empty() {
             let placeholder = Empty::new();
             return match &self.loading {
                 Loading::Resuming => placeholder.header(
                     EmptyHeader::new()
                         .media(EmptyMedia::new().child(Spinner::new()))
-                        .description(EmptyDescription::new().child("Loading thread…")),
+                        .description(EmptyDescription::new().child("Loading session…")),
                 ),
                 Loading::Failed(message) => placeholder.content(
                     EmptyContent::new().max_w(rems(36.)).child(
                         Alert::error("resume-error", SharedString::from(message.clone()))
-                            .title("Couldn't open this thread"),
+                            .title("Couldn't open this session"),
                     ),
                 ),
                 Loading::Ready => placeholder.header(
@@ -420,7 +420,7 @@ impl ThreadView {
             let view = view.clone();
             Rc::new(move |action, _, cx| {
                 let _ = view.update(cx, |this, cx| {
-                    this.transcript.act(action, this.thread.entries(), cx);
+                    this.transcript.act(action, this.session.entries(), cx);
                     cx.notify();
                 });
             })
@@ -430,13 +430,13 @@ impl ThreadView {
             .min_h_0()
             .child(
                 MessageScroller::new(
-                    SharedString::from(format!("transcript-{}", self.thread.id())),
+                    SharedString::from(format!("transcript-{}", self.session.id())),
                     self.transcript.scroller().clone(),
                     move |ix, _, cx| match view.upgrade() {
                         Some(view) => {
                             let this = view.read(cx);
                             this.transcript
-                                .render_row(ix, this.thread.entries(), &act, cx)
+                                .render_row(ix, this.session.entries(), &act, cx)
                         }
                         None => div().into_any_element(),
                     },
@@ -453,7 +453,7 @@ impl ThreadView {
 
     /// Errors, approvals and the composer, under the transcript.
     fn render_footer(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let failure = match self.thread.state() {
+        let failure = match self.session.state() {
             RunState::Failed(message) => Some(message.clone()),
             _ => None,
         };
@@ -478,7 +478,7 @@ impl ThreadView {
             })
             .when_some(self.error.clone(), |this, message| {
                 this.child(
-                    Alert::warning("thread-error", SharedString::from(message))
+                    Alert::warning("session-error", SharedString::from(message))
                         .small()
                         .on_close(cx.listener(|this, _, _, cx| {
                             this.error = None;
@@ -520,7 +520,7 @@ impl ThreadView {
 
     /// "Context 25% · $0.01", once the agent reports usage.
     fn usage_label(&self) -> Option<String> {
-        let usage = self.thread.usage()?;
+        let usage = self.session.usage()?;
         let mut parts = Vec::new();
         if usage.size() > 0 {
             let percent = usage.used().saturating_mul(100) / usage.size();
@@ -538,10 +538,10 @@ impl ThreadView {
 }
 
 #[cfg(test)]
-impl ThreadView {
+impl SessionView {
     /// The session state behind this view, for UI tests.
-    pub(crate) fn thread(&self) -> &Thread {
-        &self.thread
+    pub(crate) fn session(&self) -> &Session {
+        &self.session
     }
 
     /// The transcript, for UI tests.
@@ -557,11 +557,11 @@ impl ThreadView {
     }
 }
 
-impl Render for ThreadView {
+impl Render for SessionView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         v_flex()
-            .id("thread-view")
-            .key_context("ThreadView")
+            .id("session-view")
+            .key_context("SessionView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
             .size_full()
@@ -571,8 +571,8 @@ impl Render for ThreadView {
     }
 }
 
-/// A thread's title, with its project and branch under it. Shared with the
-/// new-thread draft.
+/// A session's title, with its project and branch under it. Shared with the
+/// new-session draft.
 pub(crate) fn header(title: String, project: &Project, cx: &App) -> impl IntoElement {
     let details = h_flex()
         .gap_1()
@@ -594,7 +594,7 @@ pub(crate) fn header(title: String, project: &Project, cx: &App) -> impl IntoEle
         .border_color(cx.theme().border)
         .child(
             div()
-                .id("thread-title")
+                .id("session-title")
                 .test_support()
                 .aria_label(title.clone())
                 .truncate()
@@ -609,8 +609,8 @@ pub(crate) fn header(title: String, project: &Project, cx: &App) -> impl IntoEle
 const PROMPT_TITLE_CHARS: usize = 80;
 
 /// The first prompt's text on one line, cut to [`PROMPT_TITLE_CHARS`].
-fn first_prompt(thread: &Thread) -> Option<String> {
-    let text = thread.entries().iter().find_map(|entry| match entry {
+fn first_prompt(session: &Session) -> Option<String> {
+    let text = session.entries().iter().find_map(|entry| match entry {
         Entry::User(message) => Some(message.text()),
         Entry::Agent(_) | Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) => None,
     })?;

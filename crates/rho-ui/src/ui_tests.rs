@@ -17,7 +17,7 @@ use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, HeadlessAppContext,
     MouseButton, Pixels, Window, WindowBounds, WindowOptions,
 };
-use rho_ui_core::{AgentCommand, ConfigKind, Entry, RunState, Thread, ToolStatus};
+use rho_ui_core::{AgentCommand, ConfigKind, Entry, RunState, Session, ToolStatus};
 
 use gpui_kit::component::ActiveTheme as _;
 
@@ -46,7 +46,7 @@ struct Harness {
 
 impl Harness {
     /// Opens the app at 1200x800 with `command` as its agent. The fake
-    /// agent's saved threads count as started in rho-ui, so they list as
+    /// agent's saved sessions count as started in rho-ui, so they list as
     /// active.
     fn start(name: &'static str, command: AgentCommand) -> Self {
         Self::start_with(name, command, Shelves::owning(["s1", "old"]))
@@ -140,11 +140,11 @@ impl Harness {
         }
     }
 
-    /// Waits for the active thread to satisfy `ready`.
-    fn wait_for_thread(&mut self, what: &str, ready: impl Fn(&Thread) -> bool) {
+    /// Waits for the active session to satisfy `ready`.
+    fn wait_for_session(&mut self, what: &str, ready: impl Fn(&Session) -> bool) {
         self.wait_until(what, |_, cx, app| {
-            app.active_thread()
-                .is_some_and(|view| ready(view.read(cx).thread()))
+            app.active_session()
+                .is_some_and(|view| ready(view.read(cx).session()))
         });
     }
 
@@ -166,15 +166,15 @@ impl Harness {
         path
     }
 
-    /// The active thread's state, cloned out of the app.
-    fn thread(&mut self) -> Thread {
+    /// The active session's state, cloned out of the app.
+    fn session(&mut self) -> Session {
         let app = self.app.clone();
         self.cx.update(|cx| {
             app.read(cx)
-                .active_thread()
-                .expect("a thread is open")
+                .active_session()
+                .expect("a session is open")
                 .read(cx)
-                .thread()
+                .session()
                 .clone()
         })
     }
@@ -201,16 +201,16 @@ fn bounds(window: &Window, id: &'static str) -> Option<Bounds<Pixels>> {
         .map(|element| element.bounds())
 }
 
-/// Sidebar, new thread draft, prompt, approval, tool card, reply, idle.
+/// Sidebar, new session draft, prompt, approval, tool card, reply, idle.
 #[test]
-fn new_thread_runs_a_turn_through_an_approval() {
+fn new_session_runs_a_turn_through_an_approval() {
     let mut ui = Harness::start("turn", fake_agent());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-s1") && is_visible(window, "session-old")
     });
     ui.shot("sidebar");
 
-    ui.click("new-thread");
+    ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.act(|window, cx| {
         window.input("list files", cx);
@@ -219,22 +219,22 @@ fn new_thread_runs_a_turn_through_an_approval() {
     ui.wait_until("the approval card", |window, _, _| {
         is_visible(window, "approval-yes")
     });
-    assert_eq!(ui.thread().state(), &RunState::Running);
+    assert_eq!(ui.session().state(), &RunState::Running);
     // rho names a session after its first turn; until then the header and
     // the sidebar row both show the first prompt.
-    assert_eq!(ui.thread().title(), None);
+    assert_eq!(ui.session().title(), None);
     ui.act(|window, _| {
-        assert_eq!(window.find("thread-title").label(), Some("list files"));
+        assert_eq!(window.find("session-title").label(), Some("list files"));
         assert_eq!(window.find("session-new-1").label(), Some("list files"));
     });
     ui.shot("approval");
 
     ui.click("approval-yes");
-    ui.wait_for_thread("the turn to finish", |thread| {
-        thread.state() == &RunState::Idle && thread.entries().len() == 3
+    ui.wait_for_session("the turn to finish", |session| {
+        session.state() == &RunState::Idle && session.entries().len() == 3
     });
-    let thread = ui.thread();
-    let entries = thread.entries();
+    let session = ui.session();
+    let entries = session.entries();
     assert!(matches!(&entries[0], Entry::User(m) if m.text() == "list files"));
     assert!(
         matches!(&entries[1], Entry::Tool(t) if t.title() == "ls" && t.status() == ToolStatus::Done)
@@ -253,7 +253,7 @@ fn new_thread_runs_a_turn_through_an_approval() {
     });
 
     // Saved once prompted, and listed as rho-ui's own.
-    ui.wait_until("the new thread in the sidebar", |window, _, _| {
+    ui.wait_until("the new session in the sidebar", |window, _, _| {
         is_visible(window, "session-new-1")
     });
 
@@ -278,7 +278,7 @@ fn a_sent_message_can_be_selected_and_copied() {
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-s1")
     });
-    ui.click("new-thread");
+    ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.act(|window, cx| {
         window.input("list **files**", cx);
@@ -313,22 +313,22 @@ fn opening_a_saved_session_replays_its_history() {
         is_visible(window, "session-old")
     });
     ui.click("session-old");
-    ui.wait_for_thread("the replayed history", |thread| {
-        matches!(thread.entries(), [Entry::Agent(m)] if m.text() == "replayed")
-            && !thread.config().is_empty()
+    ui.wait_for_session("the replayed history", |session| {
+        matches!(session.entries(), [Entry::Agent(m)] if m.text() == "replayed")
+            && !session.config().is_empty()
     });
     ui.shot("replayed");
 
     // Resuming doesn't replay the title; the saved one carries over.
     ui.click("session-s1");
-    ui.wait_for_thread("the titled thread", |thread| {
-        thread.title() == Some("first") && !thread.entries().is_empty()
+    ui.wait_for_session("the titled session", |session| {
+        session.title() == Some("first") && !session.entries().is_empty()
     });
 }
 
-/// The current value of setting `id` on the active thread.
-fn setting(thread: &Thread, id: &str) -> Option<String> {
-    thread
+/// The current value of setting `id` on the active session.
+fn setting(session: &Session, id: &str) -> Option<String> {
+    session
         .config()
         .iter()
         .find(|option| option.id() == id)
@@ -366,8 +366,8 @@ fn composer_settings_change_the_session() {
         window.press("down", cx);
         window.press("enter", cx);
     });
-    ui.wait_for_thread("the new model", |thread| {
-        setting(thread, "model").as_deref() == Some("fake/large")
+    ui.wait_for_session("the new model", |session| {
+        setting(session, "model").as_deref() == Some("fake/large")
     });
     ui.wait_until("the panel to close", |window, _, _| {
         !is_visible(window, "model-fake/large")
@@ -383,8 +383,8 @@ fn composer_settings_change_the_session() {
         is_visible(window, "model-fake/huge") && !is_visible(window, "model-fake/small")
     });
     ui.act(|window, cx| window.press("enter", cx));
-    ui.wait_for_thread("the searched model", |thread| {
-        setting(thread, "model").as_deref() == Some("fake/huge")
+    ui.wait_for_session("the searched model", |session| {
+        setting(session, "model").as_deref() == Some("fake/huge")
     });
 
     // Reasoning and fast mode change in place; the panel stays open.
@@ -393,8 +393,8 @@ fn composer_settings_change_the_session() {
         is_visible(window, "config-thought_level-high")
     });
     ui.click("config-thought_level-high");
-    ui.wait_for_thread("high reasoning", |thread| {
-        setting(thread, "thought_level").as_deref() == Some("high")
+    ui.wait_for_session("high reasoning", |session| {
+        setting(session, "thought_level").as_deref() == Some("high")
     });
     ui.wait_until("fast mode, enabled again", |window, _, _| {
         window
@@ -402,8 +402,8 @@ fn composer_settings_change_the_session() {
             .is_some_and(|switch| switch.visible() && switch.disabled() != Some(true))
     });
     ui.click("config-fast_mode");
-    ui.wait_for_thread("fast mode", |thread| {
-        setting(thread, "fast_mode").as_deref() == Some("true")
+    ui.wait_for_session("fast mode", |session| {
+        setting(session, "fast_mode").as_deref() == Some("true")
     });
     ui.act(|window, cx| window.press("escape", cx));
     ui.wait_until("the panel to close", |window, _, _| {
@@ -413,8 +413,8 @@ fn composer_settings_change_the_session() {
     // The mode menu opens above its button.
     ui.click("config-mode");
     click_label(&mut ui, "Plan");
-    ui.wait_for_thread("plan mode", |thread| {
-        setting(thread, "mode").as_deref() == Some("plan")
+    ui.wait_for_session("plan mode", |session| {
+        setting(session, "mode").as_deref() == Some("plan")
     });
     ui.wait_until(
         "the button to name the model and reasoning",
@@ -423,15 +423,15 @@ fn composer_settings_change_the_session() {
     ui.shot("changed");
 }
 
-/// A new thread's draft already has its session's settings, and the thread
+/// A new session's draft already has the session's settings, and the session
 /// keeps what was set there.
 #[test]
 fn a_draft_sets_the_session_before_the_first_message() {
     let mut ui = Harness::start("draft-settings", fake_agent());
     ui.wait_until("the sidebar", |window, _, _| {
-        is_visible(window, "new-thread")
+        is_visible(window, "new-session")
     });
-    ui.click("new-thread");
+    ui.click("new-session");
     ui.wait_until("the draft's settings", |window, _, _| {
         is_visible(window, "draft-view") && is_visible(window, "config-panel")
     });
@@ -451,18 +451,18 @@ fn a_draft_sets_the_session_before_the_first_message() {
         window.input("list files", cx);
         window.press("enter", cx);
     });
-    ui.wait_for_thread("the first prompt in the draft's session", |thread| {
-        thread.id().as_str() == "new-1"
-            && !thread.entries().is_empty()
-            && setting(thread, "thought_level").as_deref() == Some("high")
+    ui.wait_for_session("the first prompt in the draft's session", |session| {
+        session.id().as_str() == "new-1"
+            && !session.entries().is_empty()
+            && setting(session, "thought_level").as_deref() == Some("high")
     });
 }
 
 /// Settle and snooze from a row's hover buttons and its context menu, and
-/// bring threads back from the opened Settled shelf, whose rows show their
+/// bring sessions back from the opened Settled shelf, whose rows show their
 /// details on hover.
 #[test]
-fn settle_and_snooze_move_threads_between_lists() {
+fn settle_and_snooze_move_sessions_between_lists() {
     let mut ui = Harness::start("shelves", fake_agent());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-s1") && is_visible(window, "session-old")
@@ -478,18 +478,18 @@ fn settle_and_snooze_move_threads_between_lists() {
 
     ui.click("toggle-settled");
     ui.wait_until(
-        "the settled shelf under the active threads",
+        "the settled shelf under the active sessions",
         |window, _, _| is_visible(window, "session-s1") && is_visible(window, "session-old"),
     );
     ui.act(|window, cx| window.hover("session-s1", cx));
     // The card opens after a short delay, on the scheduler's clock.
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.wait_until("the details card", |window, _, _| {
-        is_visible(window, "thread-card")
+        is_visible(window, "session-card")
     });
     ui.shot("settled-shelf");
 
-    // Restoring the last settled thread empties and folds the shelf.
+    // Restoring the last settled session empties and folds the shelf.
     ui.click("restore");
     ui.wait_until("s1 back on the active list", |window, _, _| {
         is_visible(window, "session-s1")
@@ -529,11 +529,11 @@ fn settle_and_snooze_move_threads_between_lists() {
     ui.shot("both-shelves");
 }
 
-/// Threads from elsewhere start settled, and with nothing active the folded
+/// Sessions from elsewhere start settled, and with nothing active the folded
 /// shelf sits at the bottom of the sidebar. A draft makes no session until
-/// its first message, and leaving it drops it. A thread can be deleted.
+/// its first message, and leaving it drops it. A session can be deleted.
 #[test]
-fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
+fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
     let mut ui = Harness::start_with("drafts", fake_agent(), Shelves::default());
     // Below the list, the sidebar has only its footer (about 50 px).
     ui.wait_until("the settled entry at the bottom", |window, _, _| {
@@ -549,7 +549,7 @@ fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
 
     // Leaving an unused draft drops it and closes its session, which,
     // never prompted, the agent doesn't list.
-    ui.click("new-thread");
+    ui.click("new-session");
     ui.wait_until("the draft's session", |window, _, _| {
         is_visible(window, "draft-view") && is_visible(window, "config-panel")
     });
@@ -566,12 +566,12 @@ fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
     });
     ui.shot("settled-opened");
     ui.click("session-s1");
-    ui.wait_until("the saved thread", |window, _, app| {
-        !is_visible(window, "draft-view") && app.active_thread().is_some()
+    ui.wait_until("the saved session", |window, _, app| {
+        !is_visible(window, "draft-view") && app.active_session().is_some()
     });
 
-    // A draft that gets a message becomes rho-ui's own thread.
-    ui.click("new-thread");
+    // A draft that gets a message becomes rho-ui's own session.
+    ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.act(|window, cx| {
         window.input("list files", cx);
@@ -581,12 +581,12 @@ fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
         is_visible(window, "approval-yes")
     });
     assert_eq!(
-        ui.thread().id().as_str(),
+        ui.session().id().as_str(),
         "new-2",
         "the second draft's session"
     );
     ui.click("approval-yes");
-    ui.wait_until("the new thread listed as active", |window, _, _| {
+    ui.wait_until("the new session listed as active", |window, _, _| {
         is_visible(window, "session-new-2")
     });
     ui.act(|window, _| {
@@ -600,8 +600,8 @@ fn drafts_are_free_outside_threads_start_settled_and_threads_delete() {
     click_label(&mut ui, "Delete…");
     ui.shot("delete-confirm");
     click_label(&mut ui, "Delete");
-    ui.wait_until("the thread gone", |window, _, app| {
-        !is_visible(window, "session-new-2") && app.active_thread().is_none()
+    ui.wait_until("the session gone", |window, _, app| {
+        !is_visible(window, "session-new-2") && app.active_session().is_none()
     });
 }
 
@@ -651,16 +651,16 @@ fn settings_open_apply_and_close() {
     ui.shot("scaled");
 
     ui.act(|window, cx| window.press("escape", cx));
-    ui.wait_until("the threads again", |window, _, _| {
-        !is_visible(window, "close-settings") && is_visible(window, "new-thread")
+    ui.wait_until("the sessions again", |window, _, _| {
+        !is_visible(window, "close-settings") && is_visible(window, "new-session")
     });
 }
 
-/// How long the active thread's turn `turn` took, as "Worked for" shows.
+/// How long the active session's turn `turn` took, as "Worked for" shows.
 fn turn_took(ui: &mut Harness, turn: usize) -> Option<Duration> {
     let app = ui.app.clone();
     ui.cx.update(|cx| {
-        let view = app.read(cx).active_thread().expect("a thread is open");
+        let view = app.read(cx).active_session().expect("a session is open");
         view.read(cx).transcript().took(turn)
     })
 }
@@ -756,8 +756,8 @@ fn a_new_prompt_leaves_finished_turns_folded() {
         is_visible(window, "approval-yes")
     });
     ui.click("approval-yes");
-    ui.wait_for_thread("the slow turn to finish", |thread| {
-        thread.state() == &RunState::Idle
+    ui.wait_for_session("the slow turn to finish", |session| {
+        session.state() == &RunState::Idle
     });
     assert_eq!(turn_took(&mut ui, 0), None, "the replayed turn has no time");
     let slow = turn_took(&mut ui, 1).expect("the slow turn was timed here");
@@ -769,8 +769,8 @@ fn a_new_prompt_leaves_finished_turns_folded() {
         window.input("fail", cx);
         window.press("enter", cx);
     });
-    ui.wait_for_thread("the refusal", |thread| {
-        matches!(thread.state(), RunState::Failed(_))
+    ui.wait_for_session("the refusal", |session| {
+        matches!(session.state(), RunState::Failed(_))
     });
     assert_eq!(turn_took(&mut ui, 0), None, "the refusal times no old turn");
 
@@ -804,15 +804,15 @@ fn a_wheel_notch_glides() {
         is_visible(window, "session-old")
     });
     ui.click("session-old");
-    ui.wait_for_thread("the replayed history", |thread| {
-        thread.state() == &RunState::Idle && thread.entries().len() > 20
+    ui.wait_for_session("the replayed history", |session| {
+        session.state() == &RunState::Idle && session.entries().len() > 20
     });
     let top = |ui: &mut Harness| {
         let app = ui.app.clone();
         ui.cx.update(|cx| {
             app.read(cx)
-                .active_thread()
-                .expect("a thread is open")
+                .active_session()
+                .expect("a session is open")
                 .read(cx)
                 .scroll_top(cx)
         })
@@ -943,8 +943,8 @@ fn frame_times() {
         is_visible(window, "session-old")
     });
     ui.click("session-old");
-    ui.wait_for_thread("the replayed history", |thread| {
-        thread.state() == &RunState::Idle && !thread.entries().is_empty()
+    ui.wait_for_session("the replayed history", |session| {
+        session.state() == &RunState::Idle && !session.entries().is_empty()
     });
     ui.shot("loaded");
 
