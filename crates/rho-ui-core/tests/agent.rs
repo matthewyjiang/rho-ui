@@ -6,7 +6,7 @@ use std::{path::Path, time::Duration};
 use futures::FutureExt;
 use rho_ui_core::{
     Agent, AgentCommand, AgentError, AgentEvent, AgentEvents, ConfigKind, ConfigValue, Entry,
-    PermissionKind, PermissionRequest, RunState, Thread,
+    PermissionKind, PermissionRequest, RunState, Session,
 };
 
 fn fake_agent() -> AgentCommand {
@@ -32,12 +32,12 @@ async fn next(events: &AgentEvents) -> AgentEvent {
     }
 }
 
-/// Applies updates to `thread` until a permission request arrives.
-async fn until_permission(events: &AgentEvents, thread: &mut Thread) -> PermissionRequest {
+/// Applies updates to `session` until a permission request arrives.
+async fn until_permission(events: &AgentEvents, session: &mut Session) -> PermissionRequest {
     loop {
         match next(events).await {
             AgentEvent::Update { update, .. } => {
-                thread.apply(update);
+                session.apply(update);
             }
             AgentEvent::Permission(request) => return request,
             AgentEvent::Exited { error } => panic!("agent exited: {error:?}"),
@@ -45,12 +45,12 @@ async fn until_permission(events: &AgentEvents, thread: &mut Thread) -> Permissi
     }
 }
 
-/// Applies updates to `thread` until the turn leaves the busy state.
-async fn until_idle(events: &AgentEvents, thread: &mut Thread) {
-    while thread.state().is_busy() || thread.entries().is_empty() {
+/// Applies updates to `session` until the turn leaves the busy state.
+async fn until_idle(events: &AgentEvents, session: &mut Session) {
+    while session.state().is_busy() || session.entries().is_empty() {
         match next(events).await {
             AgentEvent::Update { update, .. } => {
-                thread.apply(update);
+                session.apply(update);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -67,38 +67,38 @@ fn prompt_turn_with_permission_round_trip() {
         );
 
         let setup = agent.new_session(Path::new("/w/a")).await.unwrap();
-        let mut thread = Thread::new(setup.id().clone());
-        thread.set_setup(setup);
-        assert_eq!(thread.commands()[0].name(), "compact");
+        let mut session = Session::new(setup.id().clone());
+        session.set_setup(setup);
+        assert_eq!(session.commands()[0].name(), "compact");
 
-        agent.prompt(thread.id(), "list files").await.unwrap();
-        let request = until_permission(&events, &mut thread).await;
-        assert_eq!(thread.state(), &RunState::Running);
+        agent.prompt(session.id(), "list files").await.unwrap();
+        let request = until_permission(&events, &mut session).await;
+        assert_eq!(session.state(), &RunState::Running);
         assert_eq!(request.title(), "Run `ls`?");
-        assert_eq!(request.session(), thread.id());
+        assert_eq!(request.session(), session.id());
         assert_eq!(request.choices()[0].kind(), PermissionKind::AllowOnce);
         request.choose("yes");
 
-        until_idle(&events, &mut thread).await;
-        let Some(Entry::Agent(reply)) = thread.entries().last() else {
-            panic!("{:?}", thread.entries())
+        until_idle(&events, &mut session).await;
+        let Some(Entry::Agent(reply)) = session.entries().last() else {
+            panic!("{:?}", session.entries())
         };
         assert_eq!(reply.text(), "you chose yes");
     });
 }
 
-/// The UI may close a thread with an approval still pending; the agent must
+/// The UI may close a session with an approval still pending; the agent must
 /// hear "cancelled" instead of waiting forever.
 #[test]
 fn dropped_permission_answers_cancelled() {
     smol::block_on(async {
         let (agent, events) = start().await;
         let setup = agent.new_session(Path::new("/w/a")).await.unwrap();
-        let mut thread = Thread::new(setup.id().clone());
-        agent.prompt(thread.id(), "list files").await.unwrap();
-        drop(until_permission(&events, &mut thread).await);
-        until_idle(&events, &mut thread).await;
-        let Some(Entry::Agent(reply)) = thread.entries().last() else {
+        let mut session = Session::new(setup.id().clone());
+        agent.prompt(session.id(), "list files").await.unwrap();
+        drop(until_permission(&events, &mut session).await);
+        until_idle(&events, &mut session).await;
+        let Some(Entry::Agent(reply)) = session.entries().last() else {
             panic!()
         };
         assert_eq!(reply.text(), "you chose cancelled");
@@ -116,12 +116,12 @@ fn list_follows_cursor_and_resume_replays_first() {
         assert_eq!(sessions[1].cwd(), Path::new("/w/b"));
 
         let old = sessions[1].id().clone();
-        let mut thread = Thread::new(old.clone());
+        let mut session = Session::new(old.clone());
         let setup = agent.resume_session(&old, Path::new("/w/b")).await.unwrap();
-        thread.set_setup(setup);
+        session.set_setup(setup);
         // The replay was sent before the response, so it is already queued.
-        until_idle(&events, &mut thread).await;
-        assert!(matches!(&thread.entries()[0], Entry::Agent(m) if m.text() == "replayed"));
+        until_idle(&events, &mut session).await;
+        assert!(matches!(&session.entries()[0], Entry::Agent(m) if m.text() == "replayed"));
     });
 }
 

@@ -1,5 +1,5 @@
 //! Workspace directories and what their git repositories say: one table
-//! shared by the sidebar rows and the thread header, so both show the same
+//! shared by the sidebar rows and the session header, so both show the same
 //! project and branch. Read from `.git` files on the background executor,
 //! then re-read every [`REREAD`] to pick up branch switches.
 

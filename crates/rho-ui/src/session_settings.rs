@@ -5,7 +5,7 @@
 //! and any other setting the agent offers, such as fast mode.
 //!
 //! The agent owns the values. [`SessionSettings`] sends a user change itself
-//! and tells its owner, a thread or a new thread's draft, what the agent
+//! and tells its owner, a session or a new session's draft, what the agent
 //! answered; options the agent pushes come in through [`SessionSettings::sync`].
 
 use gpui_kit::assets::IconName as Lucide;
@@ -50,7 +50,7 @@ pub(crate) enum SettingsEvent {
     Failed(String),
 }
 
-/// The settings controls for one session, shared by its thread or draft.
+/// The settings controls for one session, shared by its session view or draft.
 pub(crate) struct SessionSettings {
     agent: Agent,
     session: SessionId,

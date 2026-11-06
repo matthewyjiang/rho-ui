@@ -15,7 +15,7 @@ use gpui_kit::Global;
 
 use crate::store;
 
-/// Turn times by prompt message ID. A global: every thread view reads and
+/// Turn times by prompt message ID. A global: every session view reads and
 /// records them.
 #[derive(Debug, Default)]
 pub(crate) struct TurnTimes {

@@ -11,11 +11,11 @@ use agent_client_protocol::schema::{v2, MaybeUndefined};
 
 use crate::agent::{commands, CommandInfo, SessionId, SessionSetup};
 
-/// An opaque update for one thread. Only [`Thread::apply`] reads it.
+/// An opaque update for one session. Only [`Session::apply`] reads it.
 #[derive(Debug)]
-pub struct ThreadUpdate(pub(crate) v2::SessionUpdate);
+pub struct SessionUpdate(pub(crate) v2::SessionUpdate);
 
-/// Whether the agent is working on this thread.
+/// Whether the agent is working on this session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunState {
     /// Waiting for a prompt.
@@ -406,11 +406,11 @@ impl PlanItem {
 
 /// A session's transcript and status.
 #[derive(Clone, Debug)]
-pub struct Thread {
+pub struct Session {
     id: SessionId,
     title: Option<String>,
     /// Only ever appended to or changed in place, so an index names one
-    /// entry for the thread's lifetime.
+    /// entry for the session's lifetime.
     entries: Vec<Entry>,
     state: RunState,
     usage: Option<Usage>,
@@ -419,8 +419,8 @@ pub struct Thread {
     plan: Vec<PlanItem>,
 }
 
-impl Thread {
-    /// An empty thread for `id`. Create it before resuming the session, so
+impl Session {
+    /// An empty session for `id`. Create it before resuming the session, so
     /// replayed history has somewhere to go.
     pub fn new(id: SessionId) -> Self {
         Self {
@@ -456,7 +456,7 @@ impl Thread {
         self.state = RunState::Failed(error);
     }
 
-    /// The session this thread shows.
+    /// The ID rho knows this session by.
     pub fn id(&self) -> &SessionId {
         &self.id
     }
@@ -499,7 +499,7 @@ impl Thread {
     /// Applies one update from [`crate::AgentEvent::Update`]. Returns the
     /// index of the entry it added or changed, so a view can redraw just
     /// that row.
-    pub fn apply(&mut self, update: ThreadUpdate) -> Option<usize> {
+    pub fn apply(&mut self, update: SessionUpdate) -> Option<usize> {
         match update.0 {
             v2::SessionUpdate::UserMessageChunk(chunk) => {
                 Some(self.append_message(&chunk, Entry::User))
@@ -748,5 +748,5 @@ fn tool_content(content: v2::ToolCallContent) -> Option<ToolContent> {
 }
 
 #[cfg(test)]
-#[path = "thread_tests.rs"]
+#[path = "session_tests.rs"]
 mod tests;

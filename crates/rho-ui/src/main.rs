@@ -1,7 +1,7 @@
 //! rho-ui: the desktop UI for the rho coding agent.
 //!
 //! `rho-ui [DIR] [-- AGENT COMMAND...]` opens one window. DIR is the
-//! workspace for new threads (default: the current directory); the agent
+//! workspace for new sessions (default: the current directory); the agent
 //! command defaults to `rho acp`.
 
 mod app;
@@ -11,14 +11,14 @@ mod draft;
 mod kinetic;
 mod projects;
 mod repo;
+mod session_list;
 mod session_settings;
+mod session_view;
 mod settings;
 mod settings_view;
 mod shelf;
 mod sidebar;
 mod store;
-mod thread_list;
-mod thread_view;
 mod time;
 mod transcript;
 mod turn_times;
@@ -45,9 +45,9 @@ use crate::{
 gpui_kit::actions!(
     rho_ui,
     [
-        /// Start a thread in the launch workspace.
-        NewThread,
-        /// Stop the running turn in the focused thread.
+        /// Start a session in the launch workspace.
+        NewSession,
+        /// Stop the running turn in the focused session.
         StopTurn,
         /// Open the settings screen.
         OpenSettings,
@@ -177,9 +177,9 @@ fn init(cx: &mut App) {
     // In memory until `main` loads the saved times; tests keep it so.
     cx.set_global(TurnTimes::default());
     cx.bind_keys([
-        KeyBinding::new("ctrl-n", NewThread, Some("RhoApp")),
+        KeyBinding::new("ctrl-n", NewSession, Some("RhoApp")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
-        KeyBinding::new("escape", StopTurn, Some("ThreadView")),
+        KeyBinding::new("escape", StopTurn, Some("SessionView")),
         KeyBinding::new("escape", CloseSettings, Some("SettingsView")),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);

@@ -1,4 +1,4 @@
-//! The approval card pinned above a thread's composer while the agent waits
+//! The approval card pinned above a session's composer while the agent waits
 //! for permission to run a tool.
 
 use std::rc::Rc;

@@ -20,7 +20,7 @@ use gpui_kit::{
 /// multi-paragraph prompt without pushing the transcript off a laptop screen.
 const MAX_ROWS: usize = 8;
 
-/// The text state, owned by the thread view. Its `PressEnter` event (without
+/// The text state, owned by the session view. Its `PressEnter` event (without
 /// Shift) is the send request.
 pub(crate) fn new_state(window: &mut Window, cx: &mut App) -> Entity<TextareaState> {
     cx.new(|cx| {
@@ -37,7 +37,7 @@ type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComposerMode {
     Send,
-    /// The thread is being created: the box is disabled and Send spins.
+    /// The session is being created: the box is disabled and Send spins.
     Starting,
     /// A turn is running: the box is disabled and Stop replaces Send.
     Stop,
