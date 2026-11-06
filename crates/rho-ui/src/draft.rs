@@ -24,10 +24,10 @@ use rho_ui_core::{Agent, Session, SessionId, SessionUpdate};
 
 use crate::{
     composer::{self, Composer, ComposerMode},
-    projects::ProjectRef,
     session_list::NEW_SESSION,
     session_settings::{SessionSettings, SettingsEvent},
     session_view::header,
+    workspaces::WorkspaceRef,
 };
 
 /// What the draft asks of the app.
@@ -57,7 +57,7 @@ enum SessionState {
 
 pub(crate) struct DraftView {
     cwd: PathBuf,
-    project: ProjectRef,
+    workspace: WorkspaceRef,
     composer: Entity<TextareaState>,
     state: SessionState,
     /// The user sent while the session was opening; it goes out once open.
@@ -73,7 +73,7 @@ impl EventEmitter<DraftEvent> for DraftView {}
 impl DraftView {
     pub(crate) fn new(
         cwd: PathBuf,
-        project: ProjectRef,
+        workspace: WorkspaceRef,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -88,7 +88,7 @@ impl DraftView {
                     _ => {}
                 },
             ),
-            cx.observe(project.table(), |_, _, cx| cx.notify()),
+            cx.observe(workspace.table(), |_, _, cx| cx.notify()),
             // An unused session is freed with its draft.
             cx.on_release(|this, cx| {
                 if let SessionState::Open { agent, session, .. } = &this.state {
@@ -102,7 +102,7 @@ impl DraftView {
         ];
         Self {
             cwd,
-            project,
+            workspace,
             composer,
             state: SessionState::Opening,
             queued: false,
@@ -260,7 +260,7 @@ impl Render for DraftView {
             .test_support()
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(header(NEW_SESSION.to_owned(), self.project.read(cx), cx))
+            .child(header(NEW_SESSION.to_owned(), self.workspace.read(cx), cx))
             .child(
                 Empty::new().header(
                     EmptyHeader::new()

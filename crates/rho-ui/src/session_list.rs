@@ -34,8 +34,8 @@ pub(crate) struct SavedSession {
     pub(crate) title: Option<SharedString>,
     /// Last activity in Unix seconds; 0 when unknown.
     pub(crate) updated: i64,
-    /// Index into [`crate::projects::Projects`].
-    pub(crate) project: usize,
+    /// Index into [`crate::workspaces::Workspaces`].
+    pub(crate) workspace: usize,
 }
 
 /// What an open session knows that the saved list may not have yet.
@@ -67,8 +67,8 @@ pub(crate) struct Row {
     /// Shown while `title` is `None`.
     placeholder: &'static str,
     pub(crate) cwd: PathBuf,
-    /// Index into [`crate::projects::Projects`].
-    pub(crate) project: usize,
+    /// Index into [`crate::workspaces::Workspaces`].
+    pub(crate) workspace: usize,
     /// Last activity in Unix seconds; 0 when unknown.
     pub(crate) updated: i64,
     pub(crate) activity: Activity,
@@ -141,7 +141,7 @@ impl SessionList {
                 activity: live.map(|live| live.activity).unwrap_or_default(),
                 id: session.id,
                 cwd: session.cwd,
-                project: session.project,
+                workspace: session.workspace,
                 updated: session.updated,
                 shelf: Shelf::Active,
                 saved: true,
@@ -150,10 +150,10 @@ impl SessionList {
         self.rows[unsaved..].sort_by_key(|row| Reverse(row.updated));
     }
 
-    /// Records an open session's title and activity; `project` is its
-    /// project index. A session the saved list doesn't have yet goes on top.
+    /// Records an open session's title and activity; `workspace` is its
+    /// workspace index. A session the saved list doesn't have yet goes on top.
     /// Returns whether anything changed.
-    pub(crate) fn set_live(&mut self, live: LiveSession, project: usize, now: i64) -> bool {
+    pub(crate) fn set_live(&mut self, live: LiveSession, workspace: usize, now: i64) -> bool {
         match self.live.iter_mut().find(|known| known.id == live.id) {
             Some(known) if *known == live => return false,
             Some(known) => *known = live.clone(),
@@ -179,7 +179,7 @@ impl SessionList {
                     title: live.title,
                     placeholder: live.placeholder,
                     cwd: live.cwd,
-                    project,
+                    workspace,
                     updated: now,
                     activity: live.activity,
                     shelf: Shelf::Active,
@@ -220,13 +220,13 @@ impl SessionList {
     }
 
     /// Puts every row on its shelf and rebuilds the items and counts.
-    /// `project_name` gives a project's name, for the search. A busy session
+    /// `workspace_name` gives a workspace's name, for the search. A busy session
     /// is always active.
     pub(crate) fn rebuild<'a>(
         &mut self,
         shelves: &Shelves,
         now: i64,
-        project_name: impl Fn(usize) -> &'a str,
+        workspace_name: impl Fn(usize) -> &'a str,
     ) {
         for row in &mut self.rows {
             row.shelf = if row.activity.is_idle() {
@@ -239,7 +239,7 @@ impl SessionList {
             let matches = |text: &str| contains_ignore_case(text, &self.query);
             self.query.is_empty()
                 || row.title.as_deref().is_some_and(matches)
-                || matches(project_name(row.project))
+                || matches(workspace_name(row.workspace))
         };
         let mut items = Vec::with_capacity(self.rows.len() + 2);
         let mut counts = [0; 3];
@@ -328,7 +328,7 @@ mod tests {
             cwd: PathBuf::from("/w"),
             title: title.map(SharedString::from),
             updated,
-            project: 0,
+            workspace: 0,
         }
     }
 
@@ -361,7 +361,7 @@ mod tests {
     }
 
     fn rebuild(list: &mut SessionList, shelves: &Shelves, now: i64) {
-        list.rebuild(shelves, now, |_| "project");
+        list.rebuild(shelves, now, |_| "atlas");
     }
 
     #[test]
@@ -465,8 +465,8 @@ mod tests {
         list.set_query("design ui");
         rebuild(&mut list, &shelves, 5);
         assert!(list.is_empty(), "words must appear together");
-        list.set_query("proj");
+        list.set_query("atl");
         rebuild(&mut list, &shelves, 5);
-        assert_eq!(list.items.len(), 5, "the project name matches too");
+        assert_eq!(list.items.len(), 5, "the workspace name matches too");
     }
 }
