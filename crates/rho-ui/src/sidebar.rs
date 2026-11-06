@@ -1,14 +1,14 @@
 //! The session list, drawn: one scrolling list of active sessions, newest
 //! first, then the Snoozed and Settled shelves, held at the bottom until
 //! opened shelves fill the list. An active row shows the
-//! project, the session's status or age, its title, and its branch; hovering
+//! workspace, the session's status or age, its title, and its branch; hovering
 //! it swaps the status for Snooze and Settle. A shelf opens from its header
 //! into one-line rows, and hovering one shows its details in a card.
 //!
 //! The app draws this view as a cached view, so a hover or scroll here
 //! redraws only the sidebar, and [`v_virtual_list`] builds only the rows on
 //! screen.
-//! The data lives in [`SessionList`] and [`Projects`], built when it
+//! The data lives in [`SessionList`] and [`Workspaces`], built when it
 //! changes, never per frame.
 
 use std::{
@@ -43,14 +43,14 @@ use gpui_kit::{
 use rho_ui_core::{SessionId, SessionSummary};
 
 use crate::{
-    projects::{Project, Projects},
     session_list::{Activity, Item, LiveSession, Row, SavedSession, SessionList},
     shelf::{Shelf, Shelves},
     time,
+    workspaces::{Workspace, Workspaces},
 };
 
 // A row's parts, in rems so they follow the UI scale.
-/// The project and branch lines.
+/// The workspace and branch lines.
 const LINE_REMS: f32 = 1.;
 /// The title line, a little taller for its larger text.
 const TITLE_REMS: f32 = 1.375;
@@ -193,7 +193,7 @@ struct Hover {
 
 pub(crate) struct SidebarView {
     list: SessionList,
-    projects: Entity<Projects>,
+    workspaces: Entity<Workspaces>,
     shelves: Shelves,
     active: Option<SessionId>,
     hover: Option<Hover>,
@@ -213,7 +213,7 @@ impl EventEmitter<SidebarEvent> for SidebarView {}
 
 impl SidebarView {
     pub(crate) fn new(
-        projects: Entity<Projects>,
+        workspaces: Entity<Workspaces>,
         shelves: Shelves,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -227,8 +227,8 @@ impl SidebarView {
                     this.rebuild(cx);
                 }
             }),
-            // Project names are searchable.
-            cx.observe(&projects, |this, _, cx| this.rebuild(cx)),
+            // Workspace names are searchable.
+            cx.observe(&workspaces, |this, _, cx| this.rebuild(cx)),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -238,7 +238,7 @@ impl SidebarView {
         });
         Self {
             list: SessionList::default(),
-            projects,
+            workspaces,
             shelves,
             active: None,
             hover: None,
@@ -254,11 +254,11 @@ impl SidebarView {
 
     /// Replaces the saved sessions with a fresh `list_sessions` result.
     pub(crate) fn set_saved(&mut self, sessions: Vec<SessionSummary>, cx: &mut Context<'_, Self>) {
-        let saved = self.projects.update(cx, |projects, cx| {
+        let saved = self.workspaces.update(cx, |workspaces, cx| {
             sessions
                 .into_iter()
                 .map(|session| SavedSession {
-                    project: projects.index(session.cwd(), cx),
+                    workspace: workspaces.index(session.cwd(), cx),
                     id: session.id().clone(),
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(|title| title.to_owned().into()),
@@ -281,10 +281,10 @@ impl SidebarView {
 
     /// Records an open session's title and activity.
     pub(crate) fn set_live(&mut self, live: LiveSession, cx: &mut Context<'_, Self>) {
-        let project = self
-            .projects
-            .update(cx, |projects, cx| projects.index(&live.cwd, cx));
-        if self.list.set_live(live, project, time::now_unix()) {
+        let workspace = self
+            .workspaces
+            .update(cx, |workspaces, cx| workspaces.index(&live.cwd, cx));
+        if self.list.set_live(live, workspace, time::now_unix()) {
             self.rebuild(cx);
         }
     }
@@ -325,9 +325,9 @@ impl SidebarView {
     }
 
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
-        let projects = self.projects.read(cx);
+        let workspaces = self.workspaces.read(cx);
         self.list.rebuild(&self.shelves, time::now_unix(), |ix| {
-            projects.get(ix).name.as_ref()
+            workspaces.get(ix).name.as_ref()
         });
         cx.notify();
     }
@@ -459,17 +459,17 @@ impl SidebarView {
         };
         let view = cx.entity().downgrade();
         let cx: &Context<'_, Self> = cx;
-        let projects = self.projects.read(cx);
+        let workspaces = self.workspaces.read(cx);
         self.list.items()[range]
             .iter()
             .map(|&item| match item {
                 Item::Session(row) => {
                     let row = self.list.row_at(row);
-                    self.render_row(row, projects.get(row.project), clock, &view, cx)
+                    self.render_row(row, workspaces.get(row.workspace), clock, &view, cx)
                 }
                 Item::Shelved(row) => {
                     let row = self.list.row_at(row);
-                    self.render_shelved(row, projects.get(row.project), clock, &view, cx)
+                    self.render_shelved(row, workspaces.get(row.workspace), clock, &view, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
                 Item::Gap => div().into_any_element(),
@@ -480,7 +480,7 @@ impl SidebarView {
     fn render_row(
         &self,
         row: &Row,
-        project: &Project,
+        workspace: &Workspace,
         clock: Clock,
         view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
@@ -497,7 +497,7 @@ impl SidebarView {
             .test_support()
             .gap(rems(GAP_REMS))
             .py(rems(PAD_REMS))
-            .child(project_line(project, theme).child(right))
+            .child(workspace_line(workspace, theme).child(right))
             .child(
                 div()
                     .h(rems(TITLE_REMS))
@@ -506,7 +506,7 @@ impl SidebarView {
                     .when(state.active, StyledExt::font_medium)
                     .child(row.title()),
             )
-            .child(branch_line(project, theme));
+            .child(branch_line(workspace, theme));
         Self::row_frame(rems(ROW_REMS), row, state, inner, view, cx).into_any_element()
     }
 
@@ -575,7 +575,7 @@ impl SidebarView {
     fn render_shelved(
         &self,
         row: &Row,
-        project: &Project,
+        workspace: &Workspace,
         clock: Clock,
         view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
@@ -620,9 +620,9 @@ impl SidebarView {
         };
         let card = Card {
             title: row.title(),
-            project: project.name.clone(),
-            initials: project.initials.clone(),
-            branch: project.branch.clone(),
+            workspace: workspace.name.clone(),
+            initials: workspace.initials.clone(),
+            branch: workspace.branch.clone(),
             wakes: wakes
                 .filter(|_| row.shelf == Shelf::Snoozed)
                 .map(|wakes| format!("Wakes in {}", time::relative_age(wakes - clock.now))),
@@ -860,29 +860,29 @@ struct Clock {
     instant: Instant,
 }
 
-/// Badge and project name; the caller adds the status or actions.
-fn project_line(project: &Project, theme: &Theme) -> gpui_kit::Div {
+/// Badge and workspace name; the caller adds the status or actions.
+fn workspace_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
     h_flex()
         .h(rems(LINE_REMS))
         .gap_2()
         .text_xs()
-        .child(badge(project.initials.clone()))
+        .child(badge(workspace.initials.clone()))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_color(theme.muted_foreground)
-                .child(project.name.clone()),
+                .child(workspace.name.clone()),
         )
 }
 
-/// A project's initials, in colors Kit picks from them.
+/// A workspace's initials, in colors Kit picks from them.
 fn badge(initials: SharedString) -> Avatar {
     Avatar::new()
         .name(initials)
         .xsmall()
-        // In rems, so it follows the UI scale; square like a project tile.
+        // In rems, so it follows the UI scale; square like a workspace tile.
         .size(rems(LINE_REMS))
         .rounded(rems(0.25))
 }
@@ -898,7 +898,7 @@ struct RowState {
 /// Built with the row, so the card needs nothing from the view.
 struct Card {
     title: SharedString,
-    project: SharedString,
+    workspace: SharedString,
     initials: SharedString,
     branch: Option<SharedString>,
     wakes: Option<String>,
@@ -920,7 +920,7 @@ impl Card {
             .label_width(rems(LINE_REMS + 0.75))
             .item(
                 badge(self.initials.clone()).into_any_element(),
-                self.project.clone(),
+                self.workspace.clone(),
                 1,
             );
         if let Some(branch) = &self.branch {
@@ -941,14 +941,14 @@ impl Card {
 }
 
 /// The branch, when the workspace is a git repository.
-fn branch_line(project: &Project, theme: &Theme) -> gpui_kit::Div {
+fn branch_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
     h_flex()
         .h(rems(LINE_REMS))
         .gap_1()
         .min_w_0()
         .text_xs()
         .text_color(theme.muted_foreground)
-        .when_some(project.branch.clone(), |this, branch| {
+        .when_some(workspace.branch.clone(), |this, branch| {
             this.child(Icon::new(Lucide::GitBranch).xsmall())
                 .child(div().truncate().child(branch))
         })

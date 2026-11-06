@@ -1,4 +1,4 @@
-//! One session: a header with its title and project, the transcript,
+//! One session: a header with its title and workspace, the transcript,
 //! approvals, and the composer with the session settings. Owns the session's
 //! [`Session`] state and every request the user makes in it.
 
@@ -30,10 +30,10 @@ use crate::{
     approval::ApprovalCard,
     composer::ComposerMode,
     composer::{self, Composer},
-    projects::{Project, ProjectRef},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
     transcript::{ActionHandler, Transcript},
+    workspaces::{Workspace, WorkspaceRef},
     StopTurn,
 };
 
@@ -62,8 +62,8 @@ pub(crate) struct SessionView {
     agent: Agent,
     session: Session,
     cwd: PathBuf,
-    /// The project and branch, for the header.
-    project: ProjectRef,
+    /// The workspace and branch, for the header.
+    workspace: WorkspaceRef,
     loading: Loading,
     transcript: Transcript,
     composer: Entity<TextareaState>,
@@ -96,7 +96,7 @@ impl SessionView {
         agent: Agent,
         session: Session,
         cwd: PathBuf,
-        project: ProjectRef,
+        workspace: WorkspaceRef,
         loading: Loading,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -117,7 +117,7 @@ impl SessionView {
             // The jump-to-latest button follows the scroll position.
             cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
             // The header shows the branch, which can change.
-            cx.observe(project.table(), |_, _, cx| cx.notify()),
+            cx.observe(workspace.table(), |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &composer,
                 window,
@@ -132,7 +132,7 @@ impl SessionView {
             agent,
             session,
             cwd,
-            project,
+            workspace,
             // A resumed session is already saved.
             prompted: matches!(loading, Loading::Resuming),
             loading,
@@ -565,22 +565,22 @@ impl Render for SessionView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
             .size_full()
-            .child(header(self.title(), self.project.read(cx), cx))
+            .child(header(self.title(), self.workspace.read(cx), cx))
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }
 }
 
-/// A session's title, with its project and branch under it. Shared with the
+/// A session's title, with its workspace and branch under it. Shared with the
 /// new-session draft.
-pub(crate) fn header(title: String, project: &Project, cx: &App) -> impl IntoElement {
+pub(crate) fn header(title: String, workspace: &Workspace, cx: &App) -> impl IntoElement {
     let details = h_flex()
         .gap_1()
         .min_w_0()
         .text_xs()
         .text_color(cx.theme().muted_foreground)
-        .child(div().truncate().child(project.name.clone()))
-        .when_some(project.branch.clone(), |this, branch| {
+        .child(div().truncate().child(workspace.name.clone()))
+        .when_some(workspace.branch.clone(), |this, branch| {
             this.child(Icon::new(Lucide::GitBranch).xsmall().ml_2())
                 .child(div().truncate().child(branch))
         });

@@ -27,11 +27,11 @@ use rho_ui_core::{
 use crate::{
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
-    projects::{ProjectRef, Projects},
     session_view::{Loading, SessionEvent, SessionView},
     settings_view::{Closed, SettingsView},
     shelf::Shelves,
     sidebar::{SidebarEvent, SidebarView},
+    workspaces::{WorkspaceRef, Workspaces},
     NewSession, OpenSettings,
 };
 
@@ -84,7 +84,7 @@ pub(crate) struct RhoApp {
     /// Counts agent starts. Replies to requests made before a restart
     /// belong to the old process and are dropped.
     epoch: u64,
-    projects: Entity<Projects>,
+    workspaces: Entity<Workspaces>,
     sidebar: Entity<SidebarView>,
     /// Sessions opened in this run. A handful at most, so lookups by ID scan.
     sessions: Vec<OpenSession>,
@@ -115,8 +115,8 @@ impl RhoApp {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        let projects = cx.new(Projects::new);
-        let sidebar = cx.new(|cx| SidebarView::new(projects.clone(), shelves, window, cx));
+        let workspaces = cx.new(Workspaces::new);
+        let sidebar = cx.new(|cx| SidebarView::new(workspaces.clone(), shelves, window, cx));
         let sidebar_subscription = cx.subscribe_in(
             &sidebar,
             window,
@@ -133,7 +133,7 @@ impl RhoApp {
             launch,
             status: AgentStatus::Starting,
             epoch: 0,
-            projects,
+            workspaces,
             sidebar,
             sessions: Vec::new(),
             pane: Pane::Empty,
@@ -275,8 +275,8 @@ impl RhoApp {
             Pane::Draft { .. } => pane,
             Pane::Empty | Pane::Session(_) => {
                 let cwd = self.launch.workspace.clone();
-                let project = ProjectRef::new(&self.projects, &cwd, cx);
-                let view = cx.new(|cx| DraftView::new(cwd, project, window, cx));
+                let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
+                let view = cx.new(|cx| DraftView::new(cwd, workspace, window, cx));
                 let subscription = cx.subscribe_in(
                     &view,
                     window,
@@ -495,9 +495,9 @@ impl RhoApp {
         let id = session.id().clone();
         // Made here, so rho-ui's own from the start, even if the prompt fails.
         self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
-        let project = ProjectRef::new(&self.projects, &cwd, cx);
-        let view =
-            cx.new(|cx| SessionView::new(agent, session, cwd, project, Loading::Ready, window, cx));
+        let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
+        let view = cx
+            .new(|cx| SessionView::new(agent, session, cwd, workspace, Loading::Ready, window, cx));
         self.insert_session(id, view.clone(), window, cx);
         view.update(cx, |view, cx| view.submit(text, window, cx));
         view
@@ -524,13 +524,13 @@ impl RhoApp {
         // before `resume_session` returns.
         let mut session = Session::new(id.clone());
         session.set_title(title.map(String::from));
-        let project = ProjectRef::new(&self.projects, &cwd, cx);
+        let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
         let view = cx.new(|cx| {
             SessionView::new(
                 agent.clone(),
                 session,
                 cwd.clone(),
-                project,
+                workspace,
                 Loading::Resuming,
                 window,
                 cx,

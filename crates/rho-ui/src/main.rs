@@ -9,7 +9,6 @@ mod approval;
 mod composer;
 mod draft;
 mod kinetic;
-mod projects;
 mod repo;
 mod session_list;
 mod session_settings;
@@ -25,6 +24,7 @@ mod turn_times;
 #[cfg(test)]
 mod ui_tests;
 mod work;
+mod workspaces;
 
 use std::{borrow::Cow, path::PathBuf};
 
