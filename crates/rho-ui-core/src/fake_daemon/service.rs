@@ -414,6 +414,7 @@ impl Service for Fake {
             error: None,
             queue: None,
             worktree: None,
+            worktree_stale: false,
             live: Some(JobLive {
                 title: session.title.clone(),
                 model: session.settings.model.clone(),

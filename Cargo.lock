@@ -6033,7 +6033,7 @@ dependencies = [
 [[package]]
 name = "rho-protocol"
 version = "0.1.0"
-source = "git+https://github.com/matthewyjiang/rho?rev=7c84788b0054bfc092f1d1f7132043b2bdf30783#7c84788b0054bfc092f1d1f7132043b2bdf30783"
+source = "git+https://github.com/matthewyjiang/rho?rev=b5d597ee8a12fb63465b075954175c66134507ec#b5d597ee8a12fb63465b075954175c66134507ec"
 dependencies = [
  "schemars",
  "serde",
