@@ -2,8 +2,9 @@
 //! session's settings. The app opens the session as soon as the draft
 //! appears, so the model, reasoning and mode can be set before the first
 //! message. rho writes no file for a session until its first prompt, and a
-//! draft closes its session when it goes away unused, so an unused New
-//! session leaves nothing behind in the sidebar or in rho.
+//! draft stops following its session when it goes away unused, which lets
+//! the daemon discard it, so an unused New session leaves nothing behind in
+//! the sidebar or in rho.
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +21,7 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     Subscription, Window,
 };
-use rho_ui_core::{Agent, Session, SessionId, SessionUpdate};
+use rho_ui_core::{Attached, Daemon, DaemonError, Session, SessionId, SessionUpdate};
 
 use crate::{
     composer::{self, Composer, ComposerMode},
@@ -44,7 +45,7 @@ enum SessionState {
     /// The app is opening it.
     Opening,
     Open {
-        agent: Agent,
+        daemon: Daemon,
         session: Box<Session>,
         settings: Entity<SessionSettings>,
         _subscription: Subscription,
@@ -89,12 +90,16 @@ impl DraftView {
                 },
             ),
             cx.observe(workspace.table(), |_, _, cx| cx.notify()),
-            // An unused session is freed with its draft.
+            // An unused session goes with its draft: unfollowed and
+            // unsaved, the daemon discards it.
             cx.on_release(|this, cx| {
-                if let SessionState::Open { agent, session, .. } = &this.state {
-                    let (agent, id) = (agent.clone(), session.id().clone());
+                if let SessionState::Open {
+                    daemon, session, ..
+                } = &this.state
+                {
+                    let (daemon, id) = (daemon.clone(), session.id().clone());
                     cx.spawn(async move |_| {
-                        let _ = agent.close_session(&id).await;
+                        let _ = daemon.detach(&id).await;
                     })
                     .detach();
                 }
@@ -120,7 +125,7 @@ impl DraftView {
         self.composer.focus_handle(cx)
     }
 
-    /// The open session's ID, for routing its updates here.
+    /// The open session's ID, for routing its events here.
     pub(crate) fn session_id(&self) -> Option<&SessionId> {
         match &self.state {
             SessionState::Open { session, .. } => Some(session.id()),
@@ -131,14 +136,14 @@ impl DraftView {
     /// Takes the session the app opened, and sends a waiting message.
     pub(crate) fn open(
         &mut self,
-        agent: Agent,
+        daemon: Daemon,
         session: Session,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let settings = cx.new(|cx| {
             SessionSettings::new(
-                agent.clone(),
+                daemon.clone(),
                 session.id().clone(),
                 session.config(),
                 window,
@@ -147,7 +152,7 @@ impl DraftView {
         });
         let subscription = cx.subscribe_in(&settings, window, Self::on_settings_event);
         self.state = SessionState::Open {
-            agent,
+            daemon,
             session: Box::new(session),
             settings,
             _subscription: subscription,
@@ -167,7 +172,32 @@ impl DraftView {
         cx.notify();
     }
 
-    /// Applies an update the agent sent for the open session.
+    /// Records the answer to the open session's attach. A session nothing
+    /// follows would be discarded under the draft, so a failure fails it.
+    pub(crate) fn attached(
+        &mut self,
+        attached: Result<Attached, DaemonError>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match (attached, &mut self.state) {
+            (
+                Ok(attached),
+                SessionState::Open {
+                    session, settings, ..
+                },
+            ) => {
+                session.attached(attached);
+                settings.update(cx, |settings, cx| {
+                    settings.sync(session.config(), window, cx);
+                });
+            }
+            (Err(error), _) => self.fail(error.to_string(), cx),
+            (Ok(_), _) => {}
+        }
+    }
+
+    /// Applies an event the daemon sent for the open session.
     pub(crate) fn apply(
         &mut self,
         update: SessionUpdate,

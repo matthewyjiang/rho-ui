@@ -16,3 +16,4 @@ workspace = true
 # Offscreen windows, simulated input and element queries for the UI tests.
 # Same source and version as the normal dependency, so features unify.
 gpui-kit = { workspace = true, features = ["test-support"] }
+rho-ui-core = { path = "../rho-ui-core", features = ["test-support"] }

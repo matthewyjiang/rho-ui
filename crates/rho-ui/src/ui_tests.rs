@@ -1,6 +1,6 @@
 //! Headless UI tests: the real app in an offscreen window, driven by
-//! simulated clicks and keys, against the scripted agent in
-//! `crates/rho-ui-core/tests/fake_agent.py` (a real process over real stdio).
+//! simulated clicks and keys, against rho-ui-core's scripted daemon
+//! (`fake_daemon`: rho-protocol's real server side over a real socket).
 //!
 //! Each test saves screenshots to `target/ui-shots/` for a person to review.
 //! Rendering needs a working Vulkan driver (WGPU); a software one such as
@@ -17,7 +17,10 @@ use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, HeadlessAppContext,
     MouseButton, Pixels, Window, WindowBounds, WindowOptions,
 };
-use rho_ui_core::{AgentCommand, ConfigKind, Entry, RunState, Session, ToolStatus};
+use rho_ui_core::{
+    fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
+    ConfigKind, DaemonTarget, Entry, RunState, Session, ToolStatus,
+};
 
 use gpui_kit::component::ActiveTheme as _;
 
@@ -28,13 +31,9 @@ use crate::{
     turn_times::TurnTimes,
 };
 
-/// Long enough for python to start and answer; the fake agent replies at once.
+/// Far longer than the fake daemon takes: it answers at once, and its
+/// slowest script waits half a second.
 const WAIT: Duration = Duration::from_secs(10);
-
-fn fake_agent() -> AgentCommand {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rho-ui-core/tests/fake_agent.py");
-    AgentCommand::new("python3", [script.to_string_lossy().into_owned()])
-}
 
 /// One app window and its context.
 struct Harness {
@@ -42,31 +41,43 @@ struct Harness {
     window: AnyWindowHandle,
     app: Entity<RhoApp>,
     name: &'static str,
+    /// Stops when the test ends.
+    _daemon: Option<FakeDaemon>,
 }
 
 impl Harness {
-    /// Opens the app at 1200x800 with `command` as its agent. The fake
-    /// agent's saved sessions count as started in rho-ui, so they list as
-    /// active.
-    fn start(name: &'static str, command: AgentCommand) -> Self {
-        Self::start_with(name, command, Shelves::owning(["s1", "old"]))
+    /// Opens the app at 1200x800 against a fake daemon holding `script`.
+    /// The fake's saved sessions count as started in rho-ui, so they list
+    /// as active.
+    fn start(name: &'static str, script: Script) -> Self {
+        Self::start_with(name, script, Shelves::owning(["s1", "old"]))
     }
 
     /// [`Self::start`] with the given settled and snoozed state.
-    fn start_with(name: &'static str, command: AgentCommand, shelves: Shelves) -> Self {
+    fn start_with(name: &'static str, script: Script, shelves: Shelves) -> Self {
+        let daemon = FakeDaemon::start(script);
+        Self::open(name, daemon.target(), Some(daemon), shelves)
+    }
+
+    /// Opens the app at 1200x800, reaching its daemon as `target` says.
+    fn open(
+        name: &'static str,
+        target: DaemonTarget,
+        daemon: Option<FakeDaemon>,
+        shelves: Shelves,
+    ) -> Self {
         let mut cx = HeadlessAppContext::with_platform(
             gpui_kit::platform::current_platform(true).text_system(),
             Arc::new(crate::Assets),
             gpui_kit::platform::current_headless_renderer,
         );
-        // The agent is a real process: its pipes wake tasks from another
-        // thread, which the deterministic scheduler only accepts this way.
+        // The daemon's answers arrive on a socket: its I/O thread wakes
+        // tasks, which the deterministic scheduler only accepts this way.
         cx.allow_parking();
         cx.update(crate::init);
         let launch = LaunchConfig {
             workspace: std::env::temp_dir(),
-            command,
-            command_line: "fake agent".to_owned(),
+            daemon: target,
         };
         let (window, app) = cx
             .update(|cx| {
@@ -91,6 +102,7 @@ impl Harness {
             window,
             app,
             name,
+            _daemon: daemon,
         };
         harness.frame();
         harness
@@ -114,7 +126,17 @@ impl Harness {
 
     /// Polls `ready` on fresh frames until it holds; panics after [`WAIT`].
     fn wait_until(&mut self, what: &str, ready: impl Fn(&Window, &App, &RhoApp) -> bool) {
-        let deadline = Instant::now() + WAIT;
+        self.wait_within(WAIT, what, ready);
+    }
+
+    /// [`Self::wait_until`] with its own limit, for a real model's turns.
+    fn wait_within(
+        &mut self,
+        limit: Duration,
+        what: &str,
+        ready: impl Fn(&Window, &App, &RhoApp) -> bool,
+    ) {
+        let deadline = Instant::now() + limit;
         loop {
             self.frame();
             let app = self.app.clone();
@@ -204,7 +226,7 @@ fn bounds(window: &Window, id: &'static str) -> Option<Bounds<Pixels>> {
 /// Sidebar, new session draft, prompt, approval, tool card, reply, idle.
 #[test]
 fn new_session_runs_a_turn_through_an_approval() {
-    let mut ui = Harness::start("turn", fake_agent());
+    let mut ui = Harness::start("turn", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-s1") && is_visible(window, "session-old")
     });
@@ -217,9 +239,9 @@ fn new_session_runs_a_turn_through_an_approval() {
         window.press("enter", cx);
     });
     ui.wait_until("the approval card", |window, _, _| {
-        is_visible(window, "approval-yes")
+        is_visible(window, "approval-allow-once")
     });
-    assert_eq!(ui.session().state(), &RunState::Running);
+    assert_eq!(ui.session().state(), &RunState::NeedsAction);
     // rho names a session after its first turn; until then the header and
     // the sidebar row both show the first prompt.
     assert_eq!(ui.session().title(), None);
@@ -229,7 +251,7 @@ fn new_session_runs_a_turn_through_an_approval() {
     });
     ui.shot("approval");
 
-    ui.click("approval-yes");
+    ui.click("approval-allow-once");
     ui.wait_for_session("the turn to finish", |session| {
         session.state() == &RunState::Idle && session.entries().len() == 3
     });
@@ -239,10 +261,10 @@ fn new_session_runs_a_turn_through_an_approval() {
     assert!(
         matches!(&entries[1], Entry::Tool(t) if t.title() == "ls" && t.status() == ToolStatus::Done)
     );
-    assert!(matches!(&entries[2], Entry::Agent(m) if m.text() == "you chose yes"));
+    assert!(matches!(&entries[2], Entry::Agent(m) if m.text() == "you chose allow_once"));
     ui.act(|window, _| {
         assert!(
-            window.try_find("approval-yes").is_none(),
+            window.try_find("approval-allow-once").is_none(),
             "the approval card closes"
         );
         assert_eq!(
@@ -274,7 +296,7 @@ fn new_session_runs_a_turn_through_an_approval() {
 /// text, and copy puts it on the clipboard.
 #[test]
 fn a_sent_message_can_be_selected_and_copied() {
-    let mut ui = Harness::start("select", fake_agent());
+    let mut ui = Harness::start("select", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-s1")
     });
@@ -305,10 +327,10 @@ fn a_sent_message_can_be_selected_and_copied() {
     assert_eq!(copied.as_deref(), Some("list files"));
 }
 
-/// Picking a saved session replays its history before it can be used.
+/// Picking a saved session attaches to it, which replays its conversation.
 #[test]
 fn opening_a_saved_session_replays_its_history() {
-    let mut ui = Harness::start("resume", fake_agent());
+    let mut ui = Harness::start("resume", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-old")
     });
@@ -319,10 +341,10 @@ fn opening_a_saved_session_replays_its_history() {
     });
     ui.shot("replayed");
 
-    // Resuming doesn't replay the title; the saved one carries over.
+    // The attach's answer carries the title and the settings.
     ui.click("session-s1");
     ui.wait_for_session("the titled session", |session| {
-        session.title() == Some("first") && !session.entries().is_empty()
+        session.title() == Some("first") && !session.config().is_empty()
     });
 }
 
@@ -340,10 +362,10 @@ fn setting(session: &Session, id: &str) -> Option<String> {
 
 /// The composer's settings: the mode menu on the left, and a button naming
 /// the model and reasoning that opens the model list (with search) beside
-/// the reasoning levels and fast mode. Each change reaches the agent.
+/// the reasoning levels and fast mode. Each change reaches the daemon.
 #[test]
 fn composer_settings_change_the_session() {
-    let mut ui = Harness::start("settings-panel", fake_agent());
+    let mut ui = Harness::start("settings-panel", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-old")
     });
@@ -427,7 +449,7 @@ fn composer_settings_change_the_session() {
 /// keeps what was set there.
 #[test]
 fn a_draft_sets_the_session_before_the_first_message() {
-    let mut ui = Harness::start("draft-settings", fake_agent());
+    let mut ui = Harness::start("draft-settings", Script::default());
     ui.wait_until("the sidebar", |window, _, _| {
         is_visible(window, "new-session")
     });
@@ -463,7 +485,7 @@ fn a_draft_sets_the_session_before_the_first_message() {
 /// details on hover.
 #[test]
 fn settle_and_snooze_move_sessions_between_lists() {
-    let mut ui = Harness::start("shelves", fake_agent());
+    let mut ui = Harness::start("shelves", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-s1") && is_visible(window, "session-old")
     });
@@ -534,7 +556,7 @@ fn settle_and_snooze_move_sessions_between_lists() {
 /// its first message, and leaving it drops it. A session can be deleted.
 #[test]
 fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
-    let mut ui = Harness::start_with("drafts", fake_agent(), Shelves::default());
+    let mut ui = Harness::start_with("drafts", Script::default(), Shelves::default());
     // Below the list, the sidebar has only its footer (about 50 px).
     ui.wait_until("the settled entry at the bottom", |window, _, _| {
         bounds(window, "toggle-settled").is_some_and(|header| header.bottom() > px(700.))
@@ -547,8 +569,8 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
         .expect("window is open")
         .expect("the settled header is drawn");
 
-    // Leaving an unused draft drops it and closes its session, which,
-    // never prompted, the agent doesn't list.
+    // Leaving an unused draft drops it and stops following its session,
+    // which, never prompted, the daemon doesn't list.
     ui.click("new-session");
     ui.wait_until("the draft's session", |window, _, _| {
         is_visible(window, "draft-view") && is_visible(window, "config-panel")
@@ -578,14 +600,14 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
         window.press("enter", cx);
     });
     ui.wait_until("the approval card", |window, _, _| {
-        is_visible(window, "approval-yes")
+        is_visible(window, "approval-allow-once")
     });
     assert_eq!(
         ui.session().id().as_str(),
         "new-2",
         "the second draft's session"
     );
-    ui.click("approval-yes");
+    ui.click("approval-allow-once");
     ui.wait_until("the new session listed as active", |window, _, _| {
         is_visible(window, "session-new-2")
     });
@@ -625,7 +647,7 @@ fn click_label(ui: &mut Harness, label: &str) {
 /// The gear opens settings; a new scale reaches the theme; Escape closes.
 #[test]
 fn settings_open_apply_and_close() {
-    let mut ui = Harness::start("settings", fake_agent());
+    let mut ui = Harness::start("settings", Script::default());
     ui.wait_until("the sidebar", |window, _, _| {
         is_visible(window, "open-settings")
     });
@@ -670,16 +692,11 @@ fn turn_took(ui: &mut Harness, turn: usize) -> Option<Duration> {
 /// step, each of which opens into its details; an edit shows Kit's diff.
 #[test]
 fn finished_work_folds_and_opens_in_levels() {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rho-ui-core/tests/fake_agent.py");
-    let command = AgentCommand::new(
-        "env",
-        [
-            "FAKE_REPLAY=1".to_owned(),
-            "python3".to_owned(),
-            script.to_string_lossy().into_owned(),
-        ],
-    );
-    let mut ui = Harness::start("work", command);
+    let script = Script {
+        replay_turns: 1,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("work", script);
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-old")
     });
@@ -721,20 +738,15 @@ fn finished_work_folds_and_opens_in_levels() {
     ui.shot("diff");
 }
 
-/// A sent prompt starts a new turn even before the agent echoes it, so the
+/// A sent prompt starts a new turn even before the daemon echoes it, so the
 /// last finished turn stays folded, and a refused prompt times no turn.
 #[test]
 fn a_new_prompt_leaves_finished_turns_folded() {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rho-ui-core/tests/fake_agent.py");
-    let command = AgentCommand::new(
-        "env",
-        [
-            "FAKE_REPLAY=1".to_owned(),
-            "python3".to_owned(),
-            script.to_string_lossy().into_owned(),
-        ],
-    );
-    let mut ui = Harness::start("pending", command);
+    let script = Script {
+        replay_turns: 1,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("pending", script);
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-old")
     });
@@ -743,7 +755,7 @@ fn a_new_prompt_leaves_finished_turns_folded() {
         is_visible(window, "worked-0")
     });
 
-    // The agent echoes "slow" late; until then the old turn stays folded.
+    // The daemon takes "slow" late; until then the old turn stays folded.
     ui.act(|window, cx| {
         window.input("slow", cx);
         window.press("enter", cx);
@@ -753,15 +765,15 @@ fn a_new_prompt_leaves_finished_turns_folded() {
         assert!(!is_visible(window, "work-2"), "its rows stay hidden");
     });
     ui.wait_until("the approval card", |window, _, _| {
-        is_visible(window, "approval-yes")
+        is_visible(window, "approval-allow-once")
     });
-    ui.click("approval-yes");
+    ui.click("approval-allow-once");
     ui.wait_for_session("the slow turn to finish", |session| {
         session.state() == &RunState::Idle
     });
     assert_eq!(turn_took(&mut ui, 0), None, "the replayed turn has no time");
     let slow = turn_took(&mut ui, 1).expect("the slow turn was timed here");
-    let saved = ui.cx.update(|cx| cx.global::<TurnTimes>().get("m1"));
+    let saved = ui.cx.update(|cx| cx.global::<TurnTimes>().get("u-turn-1"));
     assert_eq!(saved, Some(slow), "saved under its prompt for a replay");
 
     // A refused prompt starts no turn, so it times none.
@@ -790,16 +802,11 @@ fn a_new_prompt_leaves_finished_turns_folded() {
 fn a_wheel_notch_glides() {
     use gpui_kit::{point, InputEvent as _, MouseMoveEvent, ScrollDelta, ScrollEvent};
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rho-ui-core/tests/fake_agent.py");
-    let command = AgentCommand::new(
-        "env",
-        [
-            "FAKE_REPLAY=20".to_owned(),
-            "python3".to_owned(),
-            script.to_string_lossy().into_owned(),
-        ],
-    );
-    let mut ui = Harness::start("glide", command);
+    let script = Script {
+        replay_turns: 20,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("glide", script);
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-old")
     });
@@ -885,14 +892,88 @@ fn a_wheel_notch_glides() {
     );
 }
 
-/// A missing agent program leaves a clear error with a way to retry.
+/// A missing rho program leaves a clear error with a way to retry.
 #[test]
-fn missing_agent_shows_an_error_and_retry() {
-    let mut ui = Harness::start("missing", AgentCommand::new("/nonexistent/rho", ["acp"]));
+fn a_missing_rho_shows_an_error_and_retry() {
+    let target = DaemonTarget::Rho(PathBuf::from("/nonexistent/rho"));
+    let mut ui = Harness::open("missing", target, None, Shelves::default());
     ui.wait_until("the retry button", |window, _, _| {
-        is_visible(window, "retry-agent")
+        is_visible(window, "retry-daemon")
     });
     ui.shot("error");
+}
+
+/// A turn rho's terminal UI started shows in the sidebar as running, though
+/// the session is not rho-ui's. Opening it attaches mid-turn, and the
+/// composer steers the turn: a steer waits above the box until the model
+/// reads it, and can be taken back until then.
+#[test]
+fn a_job_started_elsewhere_is_listed_attached_and_steered() {
+    let script = Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    };
+    let mut ui = Harness::start_with("job", script, Shelves::default());
+    ui.wait_until("the running job among settled sessions", |window, _, _| {
+        is_visible(window, "session-tui-1") && !is_visible(window, "session-s1")
+    });
+    ui.shot("listed");
+
+    ui.click("session-tui-1");
+    ui.wait_for_session("the turn under way", |session| {
+        session.state() == &RunState::Running
+            && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "Reading the parser.")
+    });
+    assert_eq!(ui.session().id().as_str(), TUI_SESSION);
+    ui.act(|window, _| {
+        assert_eq!(window.find("session-title").label(), Some("from the tui"));
+        assert!(
+            is_visible(window, "composer-stop"),
+            "the turn can be stopped"
+        );
+    });
+
+    // The fake's model never reads "wait", so it stays queued.
+    ui.act(|window, cx| {
+        window.input("wait", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the queued steer", |window, _, _| {
+        window
+            .try_find("steer-0")
+            .and_then(|steer| steer.label().map(str::to_owned))
+            == Some("Queued: wait".to_owned())
+    });
+    ui.shot("queued");
+    ui.click("unsteer-0");
+    ui.wait_until("the steer back in the composer", |window, cx, app| {
+        let view = app.active_session().expect("a session is open");
+        !is_visible(window, "steer-0") && view.read(cx).composer_text(cx) == "wait"
+    });
+
+    ui.act(|window, cx| {
+        window.press("ctrl-a", cx);
+        window.input("keep the old API", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_for_session("the steered turn to finish", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "steered: keep the old API")
+    });
+    let session = ui.session();
+    let steer = &session.entries()[session.entries().len() - 2];
+    assert!(
+        matches!(steer, Entry::User(m) if m.text() == "keep the old API"),
+        "the steer joined the conversation: {steer:?}"
+    );
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "steer-0"), "nothing is left queued");
+        assert!(
+            is_visible(window, "session-tui-1"),
+            "steered here, so the session is rho-ui's and stays listed"
+        );
+    });
+    ui.shot("steered");
 }
 
 /// Frame-time probe, not a pass/fail test: 300 saved sessions and a long
@@ -920,25 +1001,20 @@ fn frame_times() {
         );
     }
 
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rho-ui-core/tests/fake_agent.py");
     let sessions: usize = std::env::var("PERF_SESSIONS")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(300);
-    let command = AgentCommand::new(
-        "env",
-        [
-            format!("FAKE_SESSIONS={sessions}"),
-            format!(
-                "FAKE_REPLAY={}",
-                std::env::var("PERF_REPLAY").unwrap_or_else(|_| "100".to_owned())
-            ),
-            "python3".to_owned(),
-            script.to_string_lossy().into_owned(),
-        ],
-    );
+    let script = Script {
+        sessions,
+        replay_turns: std::env::var("PERF_REPLAY")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(100),
+        ..Script::default()
+    };
     let owned = std::iter::once("old".to_owned()).chain((0..sessions).map(|n| format!("bulk-{n}")));
-    let mut ui = Harness::start_with("perf", command, Shelves::owning(owned));
+    let mut ui = Harness::start_with("perf", script, Shelves::owning(owned));
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-old")
     });
@@ -1009,4 +1085,104 @@ fn frame_times() {
             );
         }),
     );
+}
+
+/// The app against a real rho daemon and model, not a pass/fail unit test:
+/// it proves the wire works end to end, and saves screenshots. It starts
+/// the daemon through `RHO_UI_LIVE_RHO` (a rho built from the pinned
+/// `daemon-v3` commit) in the `RHO_HOME` it inherits, runs a turn of its
+/// own through an approval, then attaches to the session
+/// `RHO_UI_LIVE_ATTACH` names, one whose turn rho's terminal UI started
+/// and left waiting on an approval, answers it, and steers the turn.
+/// The README's Test section has the full recipe.
+#[test]
+#[ignore = "needs a real rho daemon and a signed-in model; see README"]
+fn live_daemon() {
+    /// A model turn with a tool call, with room for a slow provider.
+    const TURN: Duration = Duration::from_secs(180);
+
+    let rho = std::env::var("RHO_UI_LIVE_RHO").expect("RHO_UI_LIVE_RHO names a rho 3 program");
+    let target = DaemonTarget::Rho(PathBuf::from(rho));
+    let mut ui = Harness::open("live", target, None, Shelves::default());
+    ui.wait_within(TURN, "the daemon", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    ui.shot("connected");
+
+    ui.click("new-session");
+    ui.wait_within(TURN, "the draft's settings", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "config-panel")
+    });
+    ui.act(|window, cx| {
+        window.input(
+            "Run `echo hello-from-rho-ui` with your bash tool, then reply with one short sentence.",
+            cx,
+        );
+        window.press("enter", cx);
+    });
+    ui.wait_within(TURN, "the approval card", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.shot("approval");
+    ui.click("approval-allow-once");
+    ui.wait_within(TURN, "the turn to finish", |_, cx, app| {
+        app.active_session().is_some_and(|view| {
+            let session = view.read(cx).session();
+            session.state() == &RunState::Idle
+                && matches!(session.entries().last(), Some(Entry::Agent(_)))
+        })
+    });
+    let session = ui.session();
+    let ran = session.entries().iter().any(|entry| {
+        matches!(entry, Entry::Tool(tool) if tool.status() == ToolStatus::Done
+            && tool.title().contains("hello-from-rho-ui"))
+    });
+    assert!(ran, "the command ran: {:?}", session.entries());
+    assert!(session.usage().is_some(), "the daemon reported usage");
+    ui.shot("turn-done");
+
+    let Ok(attach) = std::env::var("RHO_UI_LIVE_ATTACH") else {
+        return;
+    };
+    let row: &'static str = Box::leak(format!("session-{attach}").into_boxed_str());
+    ui.wait_within(
+        TURN,
+        "the terminal UI's job in the sidebar",
+        |window, _, _| is_visible(window, row),
+    );
+    ui.shot("job-listed");
+    ui.click(row);
+    ui.wait_within(TURN, "its open approval", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.shot("job-attached");
+    ui.click("approval-allow-once");
+    ui.wait_within(TURN, "the turn to run on", |_, cx, app| {
+        app.active_session()
+            .is_some_and(|view| view.read(cx).session().state() == &RunState::Running)
+    });
+    ui.act(|window, cx| {
+        window.input("When you answer, end with the word STEERED.", cx);
+        window.press("enter", cx);
+    });
+    ui.shot("job-steered");
+    ui.wait_within(TURN, "the steered turn to finish", |_, cx, app| {
+        app.active_session()
+            .is_some_and(|view| view.read(cx).session().state() == &RunState::Idle)
+    });
+    let session = ui.session();
+    let steered = session
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry, Entry::User(message) if message.text().contains("STEERED")));
+    assert!(steered, "the steer joined the conversation");
+    let Some(Entry::Agent(reply)) = session.entries().last() else {
+        panic!("the turn ends in a reply: {:?}", session.entries());
+    };
+    assert!(
+        reply.text().contains("STEERED"),
+        "the model read it: {}",
+        reply.text()
+    );
+    ui.shot("job-done");
 }

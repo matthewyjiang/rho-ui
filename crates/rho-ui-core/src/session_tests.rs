@@ -1,13 +1,63 @@
+use rho_protocol::{
+    FastModeOptions, ModelChoice, ModelOptions, ModelRef, PermissionMode, PermissionModeOptions,
+    Replay, StreamId,
+};
 use serde_json::json;
 
 use super::*;
+use crate::{
+    input::InputChoice,
+    options::{ConfigCategory, ConfigChoice, ConfigKind},
+};
 
 fn update(value: serde_json::Value) -> SessionUpdate {
-    SessionUpdate(serde_json::from_value(value).expect("valid session update"))
+    SessionUpdate(serde_json::from_value(value).expect("a valid session event"))
+}
+
+fn options() -> SessionOptions {
+    let model = ModelRef {
+        provider: "a".to_owned(),
+        model: "org/x".to_owned(),
+    };
+    SessionOptions {
+        model: ModelOptions {
+            current: model.clone(),
+            auth: "key".to_owned(),
+            available: vec![ModelChoice {
+                model,
+                label: "X".to_owned(),
+            }],
+        },
+        reasoning: None,
+        fast_mode: Some(FastModeOptions { enabled: true }),
+        permission_mode: PermissionModeOptions {
+            current: PermissionMode::Plan,
+            available: vec![PermissionMode::Auto, PermissionMode::Plan],
+        },
+        commands: Vec::new(),
+        added_dirs: Vec::new(),
+    }
+}
+
+/// An attach response for a session in `state`, whose replay is `replay`
+/// events long.
+fn attach_response(state: JobState, replay: u64) -> Attached {
+    Attached(Box::new(SessionAttachResponse {
+        stream: StreamId::new("stream"),
+        workspace: PathBuf::from("/w"),
+        replay: Replay::Reset,
+        replay_events: replay,
+        state,
+        turn: None,
+        turn_elapsed_ms: None,
+        inputs: Vec::new(),
+        title: None,
+        options: options(),
+    }))
 }
 
 fn session() -> Session {
-    Session::new(SessionId::from(v2::SessionId::new("s1")))
+    Session::following(SessionId::from("s1"))
 }
 
 fn texts(session: &Session) -> Vec<(&'static str, String)> {
@@ -24,7 +74,8 @@ fn texts(session: &Session) -> Vec<(&'static str, String)> {
         .collect()
 }
 
-/// A real `rho acp` turn (rho 2.32.3): prompt, one bash call, streamed reply.
+/// A real turn from a rho daemon built from `daemon-v3` (bf3af5b): prompt,
+/// one bash call, streamed reply.
 #[test]
 fn recorded_bash_turn_becomes_user_tool_and_agent_rows() {
     let mut session = session();
@@ -36,80 +87,68 @@ fn recorded_bash_turn_becomes_user_tool_and_agent_rows() {
     assert_eq!(rows.len(), 3, "{rows:?}");
     assert_eq!(rows[0].0, "user");
     assert!(rows[0].1.starts_with("Run `echo hello-from-trace`"));
-    assert_eq!(rows[1], ("tool", "echo hello-from-trace".to_owned()));
+    assert_eq!(rows[1].0, "tool");
+    assert!(rows[1].1.contains("echo hello-from-trace"), "{}", rows[1].1);
     assert_eq!(rows[2].0, "agent");
-    assert!(
-        rows[2]
-            .1
-            .starts_with("The command printed `hello-from-trace`"),
-        "{}",
-        rows[2].1
-    );
+    assert!(rows[2].1.contains("hello-from-trace"), "{}", rows[2].1);
 
     let Entry::Tool(tool) = &session.entries()[1] else {
         unreachable!()
     };
     assert_eq!(tool.status(), ToolStatus::Done);
+    assert_eq!(tool.kind(), ToolKind::Execute);
     assert!(
         matches!(&tool.content()[0], ToolContent::Text(out) if out.contains("hello-from-trace"))
     );
 
     assert_eq!(session.state(), &RunState::Idle);
     let usage = session.usage().unwrap();
-    assert_eq!((usage.used(), usage.size()), (19_837, 1_000_000));
-    assert_eq!(usage.cost(), Some((0.002_223, "USD")));
+    assert!(usage.used() > 0 && usage.size().is_some(), "{usage:?}");
 }
 
-/// Resume replay sends each message empty, then its chunks, for messages
-/// the host may already hold. Replaying twice must not duplicate text.
+/// The replay can reach the UI before the attach response does. Nothing of
+/// it may be lost, and the response's own state must not undo the replay's.
 #[test]
-fn replayed_messages_replace_instead_of_appending() {
-    let mut session = session();
-    for _ in 0..2 {
-        session.apply(update(
-            json!({"sessionUpdate": "agent_message", "messageId": "m1", "content": []}),
-        ));
-        session.apply(update(
-            json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1",
-            "content": {"type": "text", "text": "hello "}}),
-        ));
-        session.apply(update(
-            json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1",
-            "content": {"type": "text", "text": "world"}}),
-        ));
-    }
-    assert_eq!(texts(&session), vec![("agent", "hello world".to_owned())]);
+fn events_before_the_attach_response_apply_after_it() {
+    let mut session = Session::new(SessionId::from("s1"));
+    let early = session.apply(update(
+        json!({"type": "agent_message_chunk", "message": "m1", "text": "hello"}),
+    ));
+    session.apply(update(json!({"type": "state", "state": "running"})));
+    assert_eq!(early, None, "held, so it names no row yet");
+    assert!(session.entries().is_empty());
+    assert!(session.is_replaying());
 
-    // An omitted `content` keeps the text; `null` clears it.
+    session.attached(attach_response(JobState::Idle, 3));
+
+    assert_eq!(texts(&session), vec![("agent", "hello".to_owned())]);
+    assert_eq!(session.state(), &RunState::Running);
+    assert!(
+        session.is_replaying(),
+        "one replayed event is still to come"
+    );
     session.apply(update(
-        json!({"sessionUpdate": "agent_message", "messageId": "m1"}),
+        json!({"type": "agent_message_chunk", "message": "m1", "text": " world"}),
     ));
+    assert!(!session.is_replaying());
     assert_eq!(texts(&session)[0].1, "hello world");
-    session.apply(update(
-        json!({"sessionUpdate": "agent_message", "messageId": "m1", "content": null}),
-    ));
-    assert_eq!(texts(&session)[0].1, "");
 }
 
 #[test]
 fn interleaved_messages_and_tools_keep_first_seen_order() {
     let mut session = session();
     let thought = session.apply(update(
-        json!({"sessionUpdate": "agent_thought_chunk", "messageId": "t1",
-        "content": {"type": "text", "text": "thinking"}}),
+        json!({"type": "thought_chunk", "message": "t1", "text": "thinking"}),
     ));
-    let tool = session.apply(update(
-        json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
-        "title": "read a.rs", "kind": "read", "status": "in_progress"}),
-    ));
+    let tool = session.apply(update(json!({"type": "tool_call", "id": "c1",
+        "title": "read a.rs", "kind": "read", "status": "in_progress"})));
     let message = session.apply(update(
-        json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1",
-        "content": {"type": "text", "text": "done"}}),
+        json!({"type": "agent_message_chunk", "message": "m1", "text": "done"}),
     ));
     assert_eq!((thought, tool, message), (Some(0), Some(1), Some(2)));
     // A late update to the first tool edits it in place.
     let late = session.apply(update(
-        json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed"}),
+        json!({"type": "tool_call", "id": "c1", "status": "failed"}),
     ));
     assert_eq!(late, Some(1), "the update names the row it changed");
 
@@ -129,70 +168,157 @@ fn interleaved_messages_and_tools_keep_first_seen_order() {
     assert_eq!(tool.kind(), ToolKind::Read);
 }
 
+/// The daemon sends an edit as the old and new text; viewers read a patch.
 #[test]
-fn tool_diffs_keep_paths_and_patch() {
+fn tool_diffs_become_git_patches() {
     let mut session = session();
     session.apply(update(
-        json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "title": "edit",
-        "content": [{"type": "diff",
-            "changes": [{"operation": "modify", "path": "/w/a.rs"}],
-            "patch": {"format": "git_patch", "text": "--- a/a.rs\n+++ b/a.rs\n"}}]}),
+        json!({"type": "tool_call", "id": "c1", "title": "edit",
+        "content": [
+            {"type": "diff", "path": "/w/a.rs", "old_text": "one\ntwo\n", "new_text": "one\n2\n"},
+            {"type": "diff", "path": "/w/new.rs", "new_text": "fresh\n"},
+        ]}),
     ));
     let Entry::Tool(tool) = &session.entries()[0] else {
         unreachable!()
     };
     assert_eq!(
         tool.content(),
-        &[ToolContent::Diff {
-            paths: vec![PathBuf::from("/w/a.rs")],
-            patch: Some("--- a/a.rs\n+++ b/a.rs\n".to_owned()),
-        }]
+        &[
+            ToolContent::Diff {
+                path: PathBuf::from("/w/a.rs"),
+                patch: "diff --git a/w/a.rs b/w/a.rs\n--- a/w/a.rs\n+++ b/w/a.rs\n\
+                        @@ -1,2 +1,2 @@\n one\n-two\n+2\n"
+                    .to_owned(),
+            },
+            ToolContent::Diff {
+                path: PathBuf::from("/w/new.rs"),
+                patch: "diff --git a/w/new.rs b/w/new.rs\n--- /dev/null\n+++ b/w/new.rs\n\
+                        @@ -0,0 +1 @@\n+fresh\n"
+                    .to_owned(),
+            },
+        ]
     );
 }
 
-/// Real error stop from rho when the provider fails.
+/// A failed turn says why in its `turn_ended`; the `state` after it must not
+/// wipe that out.
 #[test]
-fn error_stop_reports_the_agents_detail() {
+fn a_failed_turn_keeps_its_reason_past_the_job_state() {
     let mut session = session();
     session.apply(update(
-        json!({"sessionUpdate": "state_update", "state": "running"}),
+        json!({"type": "state", "state": "running", "turn": "t1"}),
     ));
     assert!(session.state().is_busy());
+    session.apply(update(json!({"type": "turn_ended", "turn": "t1",
+        "outcome": {"type": "failed",
+                    "error": {"kind": "provider", "message": "provider failed: invalid response"}}})));
     session.apply(update(
-        json!({"sessionUpdate": "state_update", "state": "idle", "stopReason": "error",
-        "error": {"code": -32603, "message": "Internal error",
-                  "data": "provider failed: provider reported an invalid response"}}),
+        json!({"type": "state", "state": "failed", "turn": "t1"}),
     ));
     assert_eq!(
         session.state(),
-        &RunState::Failed("provider failed: provider reported an invalid response".to_owned())
+        &RunState::Failed("provider failed: invalid response".to_owned())
     );
-    assert!(!session.state().is_busy());
+
+    // The next turn clears it, and a turn the daemon's restart cut short,
+    // which sends no `turn_ended`, still stops being busy.
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t2"}),
+    ));
+    session.apply(update(
+        json!({"type": "state", "state": "interrupted", "turn": "t2"}),
+    ));
+    assert_eq!(session.state(), &RunState::Idle);
 }
 
 #[test]
-fn config_updates_flatten_groups_and_keep_toggles() {
+fn options_become_the_settings_the_ui_lays_out() {
     let mut session = session();
-    session.apply(update(json!({"sessionUpdate": "config_option_update", "configOptions": [
-        {"configId": "model", "name": "Model", "type": "select", "currentValue": "a/x",
-         "category": "model",
-         "options": [{"groupId": "a", "name": "A", "options": [{"value": "a/x", "name": "X"}]}]},
-        {"configId": "fast_mode", "name": "Fast", "type": "boolean", "currentValue": true,
-         "category": "model_config"}
-    ]})));
+    session.apply(update(
+        json!({"type": "options_changed", "options": options()}),
+    ));
     let config = session.config();
-    assert_eq!(config.len(), 2);
+    let shape: Vec<_> = config
+        .iter()
+        .map(|option| (option.id(), option.category()))
+        .collect();
     assert_eq!(
-        config[0].kind(),
-        &ConfigKind::Select {
-            current: "a/x".to_owned(),
-            choices: vec![ConfigChoice {
-                value: "a/x".to_owned(),
-                name: "X".to_owned()
-            }],
-        }
+        shape,
+        [
+            ("mode", ConfigCategory::Mode),
+            ("model", ConfigCategory::Model),
+            ("fast_mode", ConfigCategory::Other),
+        ],
+        "no reasoning option: the model's cannot be configured"
     );
-    assert_eq!(config[1].kind(), &ConfigKind::Toggle(true));
-    assert_eq!(config[0].category(), ConfigCategory::Model);
-    assert_eq!(config[1].category(), ConfigCategory::Other);
+    assert_eq!(
+        config[0].current_choice().map(ConfigChoice::name),
+        Some("Plan")
+    );
+    assert_eq!(
+        config[1].current_choice().map(|c| (c.value(), c.name())),
+        Some(("a/org/x", "X"))
+    );
+    assert_eq!(config[2].kind(), &ConfigKind::Toggle(true));
+}
+
+fn approval(id: u64) -> serde_json::Value {
+    json!({"type": "input_requested", "request": {"id": id, "ask": {
+        "kind": "approval",
+        "source": {"kind": "built_in_tool", "name": "bash"},
+        "operation": {"kind": "run_process", "program": "cargo", "args": ["test"], "cwd": "/w"},
+        "reason": "runs a command"}}})
+}
+
+#[test]
+fn requests_open_once_and_close_when_any_client_answers() {
+    let mut session = session();
+    session.apply(update(approval(7)));
+    // A reset's replay may repeat a request the attach response listed.
+    session.apply(update(approval(7)));
+    assert_eq!(session.inputs().len(), 1);
+    let request = &session.inputs()[0];
+    assert_eq!(request.title(), "Run `cargo test`?");
+    assert_eq!(request.description(), Some("runs a command"));
+    let ids: Vec<_> = request.choices().iter().map(InputChoice::id).collect();
+    assert_eq!(ids, ["allow-once", "allow-session", "deny"]);
+
+    session.apply(update(
+        json!({"type": "input_resolved", "id": 7, "resolution": "answered"}),
+    ));
+    assert!(session.inputs().is_empty());
+}
+
+/// The steer's answer and its `user_message` reach the UI on separate
+/// paths, in either order.
+#[test]
+fn a_steer_waits_until_it_applies_and_comes_back_if_the_turn_drops_it() {
+    let applied = |id: &str| {
+        update(json!({"type": "user_message", "message": format!("u-{id}"),
+            "content": [{"type": "text", "text": "use tabs"}], "steer": id}))
+    };
+    let mut session = session();
+
+    session.steer_sent(SteerId("a".to_owned()), "use tabs".to_owned());
+    let pending: Vec<_> = session.pending_steers().map(|(_, text)| text).collect();
+    assert_eq!(pending, ["use tabs"]);
+    session.apply(applied("a"));
+    assert_eq!(session.pending_steers().count(), 0);
+
+    session.apply(applied("b"));
+    session.steer_sent(SteerId("b".to_owned()), "use tabs".to_owned());
+    assert_eq!(
+        session.pending_steers().count(),
+        0,
+        "it had already applied"
+    );
+
+    session.steer_sent(SteerId("c".to_owned()), "never read".to_owned());
+    session.apply(update(
+        json!({"type": "turn_ended", "turn": "t1", "outcome": {"type": "cancelled"}}),
+    ));
+    assert_eq!(session.pending_steers().count(), 0);
+    assert_eq!(session.take_dropped_steers(), ["never read"]);
+    assert_eq!(session.state(), &RunState::Cancelled);
 }

@@ -1,5 +1,5 @@
-//! The approval card pinned above a session's composer while the agent waits
-//! for permission to run a tool.
+//! The card pinned above a session's composer while a turn waits for a
+//! person: permission to run a tool, approval of a plan, or a question.
 
 use std::rc::Rc;
 
@@ -9,21 +9,22 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, App, FocusHandle, FontWeight, IntoElement, ParentElement as _, RenderOnce, SharedString,
-    Styled as _, Window,
+    div, rems, App, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window,
 };
-use rho_ui_core::{PermissionKind, PermissionRequest};
+use rho_ui_core::{ChoiceKind, InputRequest};
 
 /// Answers the request with a choice ID.
 type ChoiceHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
-/// A snapshot of the oldest waiting [`PermissionRequest`].
+/// A snapshot of the oldest open [`InputRequest`].
 #[derive(IntoElement)]
 pub(crate) struct ApprovalCard {
     title: SharedString,
     description: Option<SharedString>,
     /// (choice id, label, kind)
-    choices: Vec<(SharedString, SharedString, PermissionKind)>,
+    choices: Vec<(SharedString, SharedString, ChoiceKind)>,
     waiting: usize,
     default_focus: FocusHandle,
     on_choose: ChoiceHandler,
@@ -34,7 +35,7 @@ impl ApprovalCard {
     /// `default_focus` is tracked by the default choice so the owner can move
     /// keyboard focus to it.
     pub(crate) fn new(
-        request: &PermissionRequest,
+        request: &InputRequest,
         waiting: usize,
         default_focus: FocusHandle,
         on_choose: impl Fn(&str, &mut Window, &mut App) + 'static,
@@ -60,11 +61,12 @@ impl ApprovalCard {
     }
 }
 
-/// The choice Enter should pick: allow once, else the first one.
-fn default_choice(choices: &[(SharedString, SharedString, PermissionKind)]) -> usize {
+/// The choice Enter should pick: the one that lets the turn go on once,
+/// else the first one.
+fn default_choice(choices: &[(SharedString, SharedString, ChoiceKind)]) -> usize {
     choices
         .iter()
-        .position(|(_, _, kind)| *kind == PermissionKind::AllowOnce)
+        .position(|(_, _, kind)| *kind == ChoiceKind::Accept)
         .unwrap_or(0)
 }
 
@@ -106,7 +108,12 @@ impl RenderOnce for ApprovalCard {
             )
             .when_some(self.description, |this, description| {
                 this.child(
+                    // A plan runs long: it scrolls inside the card, so the
+                    // answers stay on screen.
                     div()
+                        .id("approval-detail")
+                        .max_h(rems(12.))
+                        .overflow_y_scroll()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .font_family(cx.theme().mono_font_family.clone())
@@ -115,6 +122,7 @@ impl RenderOnce for ApprovalCard {
             })
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_2()
                     .children(self.choices.into_iter().enumerate().map(
                         |(ix, (id, label, kind))| {
@@ -126,10 +134,7 @@ impl RenderOnce for ApprovalCard {
                                 .map(|button| {
                                     if ix == default_ix {
                                         button.primary().track_focus(&self.default_focus)
-                                    } else if matches!(
-                                        kind,
-                                        PermissionKind::RejectOnce | PermissionKind::RejectAlways
-                                    ) {
+                                    } else if kind == ChoiceKind::Reject {
                                         button.outline()
                                     } else {
                                         button

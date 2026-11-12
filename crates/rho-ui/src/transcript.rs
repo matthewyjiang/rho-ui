@@ -49,8 +49,9 @@ pub(crate) struct Transcript {
     details: Vec<Disclosure>,
     /// Per turn: whether its folded working is open.
     worked: Vec<Disclosure>,
-    /// Per turn: how long it took, for turns rho-ui ran. ACP sends no turn
-    /// times, so a replayed turn has one only from [`TurnTimes`].
+    /// Per turn: how long it took, for turns rho-ui watched. The daemon
+    /// replays no turn times, so a replayed turn has one only from
+    /// [`TurnTimes`].
     took: Vec<Option<Duration>>,
     /// The running turn's index. It may not have a prompt row yet: a sent
     /// prompt shows once the agent echoes it.

@@ -40,10 +40,10 @@ use gpui_kit::{
     Rems, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement,
     Styled, Subscription, Task, WeakEntity, Window,
 };
-use rho_ui_core::{SessionId, SessionSummary};
+use rho_ui_core::{Job, SessionId, SessionSummary};
 
 use crate::{
-    session_list::{Activity, Item, LiveSession, Row, SavedSession, SessionList},
+    session_list::{Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList},
     shelf::{Shelf, Shelves},
     time,
     workspaces::{Workspace, Workspaces},
@@ -198,7 +198,7 @@ pub(crate) struct SidebarView {
     active: Option<SessionId>,
     hover: Option<Hover>,
     error: Option<SharedString>,
-    /// The agent's name and version, for the footer.
+    /// rho's name and version, for the footer.
     agent: Option<SharedString>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
@@ -262,10 +262,7 @@ impl SidebarView {
                     id: session.id().clone(),
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(|title| title.to_owned().into()),
-                    updated: session
-                        .updated_at()
-                        .and_then(time::unix_seconds)
-                        .unwrap_or(0),
+                    updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
                 })
                 .collect()
         });
@@ -277,6 +274,23 @@ impl SidebarView {
     pub(crate) fn set_error(&mut self, error: String, cx: &mut Context<'_, Self>) {
         self.error = Some(error.into());
         cx.notify();
+    }
+
+    /// Replaces the sessions with work under way in the daemon.
+    pub(crate) fn set_jobs(&mut self, jobs: &[Job], cx: &mut Context<'_, Self>) {
+        let jobs = self.workspaces.update(cx, |workspaces, cx| {
+            jobs.iter()
+                .map(|job| JobSession {
+                    workspace: workspaces.index(job.cwd(), cx),
+                    id: job.session().clone(),
+                    cwd: job.cwd().to_path_buf(),
+                    title: job.title().map(|title| title.to_owned().into()),
+                    activity: job.activity(),
+                })
+                .collect()
+        });
+        self.list.set_jobs(jobs, Instant::now(), time::now_unix());
+        self.rebuild(cx);
     }
 
     /// Records an open session's title and activity.
@@ -305,7 +319,7 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    /// Forgets every open session, after the agent restarts.
+    /// Forgets every open session and job, once the connection is gone.
     pub(crate) fn clear_live(&mut self, cx: &mut Context<'_, Self>) {
         self.list.clear_live();
         self.active = None;

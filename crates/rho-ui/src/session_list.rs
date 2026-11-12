@@ -6,7 +6,7 @@
 use std::{cmp::Reverse, path::PathBuf, time::Instant};
 
 use gpui_kit::SharedString;
-use rho_ui_core::SessionId;
+use rho_ui_core::{JobActivity, SessionId};
 
 use crate::shelf::{Shelf, Shelves};
 
@@ -17,7 +17,8 @@ pub(crate) enum Activity {
     Idle,
     /// A turn is running; it started at this moment.
     Working(Instant),
-    /// Approvals are waiting; the first arrived at this moment.
+    /// The session waits for a person; the first request arrived at this
+    /// moment.
     Waiting(Instant),
 }
 
@@ -52,6 +53,24 @@ pub(crate) struct LiveSession {
     pub(crate) activity: Activity,
 }
 
+/// A session with work under way in the daemon, whichever client started
+/// it. It gives a session that isn't open here its activity, and lists one
+/// the saved list doesn't have.
+pub(crate) struct JobSession {
+    pub(crate) id: SessionId,
+    pub(crate) cwd: PathBuf,
+    pub(crate) title: Option<SharedString>,
+    pub(crate) activity: JobActivity,
+    /// Index into [`crate::workspaces::Workspaces`].
+    pub(crate) workspace: usize,
+}
+
+/// A [`JobSession`] as last polled, with the moment its activity began.
+struct Job {
+    id: SessionId,
+    activity: Activity,
+}
+
 /// The title of a saved session the agent hasn't named.
 pub(crate) const UNTITLED: &str = "Untitled";
 /// The title of a session the agent hasn't saved or named yet.
@@ -73,7 +92,8 @@ pub(crate) struct Row {
     pub(crate) updated: i64,
     pub(crate) activity: Activity,
     pub(crate) shelf: Shelf,
-    /// The agent has saved it. Unsaved rows are sessions made in this run.
+    /// The agent has saved it. Unsaved rows are sessions made in this run,
+    /// and sessions the daemon runs that it doesn't list as saved.
     pub(crate) saved: bool,
 }
 
@@ -107,6 +127,9 @@ pub(crate) struct SessionList {
     rows: Vec<Row>,
     /// Open sessions' live state, laid over the saved list.
     live: Vec<LiveSession>,
+    /// Sessions with work under way in the daemon. An open session's own
+    /// view knows better, so `live` wins over these.
+    jobs: Vec<Job>,
     /// What the list shows, filtered by the search.
     items: Vec<Item>,
     /// Sessions matching the search on each shelf, indexed by [`slot`].
@@ -138,7 +161,7 @@ impl SessionList {
                 element_id: format!("session-{}", session.id).into(),
                 title: live.and_then(|live| live.title.clone()).or(session.title),
                 placeholder: live.map_or(UNTITLED, |live| live.placeholder),
-                activity: live.map(|live| live.activity).unwrap_or_default(),
+                activity: self.activity(&session.id),
                 id: session.id,
                 cwd: session.cwd,
                 workspace: session.workspace,
@@ -190,15 +213,84 @@ impl SessionList {
         true
     }
 
+    /// What session `id` is doing: as its open view says, else as the
+    /// daemon's jobs do.
+    fn activity(&self, id: &SessionId) -> Activity {
+        let live = self.live.iter().find(|live| live.id == *id);
+        let job = || self.jobs.iter().find(|job| job.id == *id);
+        match live {
+            Some(live) => live.activity,
+            None => job().map(|job| job.activity).unwrap_or_default(),
+        }
+    }
+
+    /// Replaces the daemon's jobs. A session that isn't open here takes its
+    /// activity from them, and one the saved list doesn't have gets a row
+    /// while its job lasts. A job that goes on keeps the moment its
+    /// activity began, so its clock doesn't jump between polls.
+    pub(crate) fn set_jobs(&mut self, jobs: Vec<JobSession>, now: Instant, now_unix: i64) {
+        let before = std::mem::take(&mut self.jobs);
+        let began = |job: &JobSession| {
+            let was = before.iter().find(|was| was.id == job.id);
+            match (job.activity, was.map(|was| was.activity)) {
+                (JobActivity::Working(_), Some(was @ Activity::Working(_)))
+                | (JobActivity::Waiting, Some(was @ Activity::Waiting(_))) => was,
+                (JobActivity::Working(elapsed), _) => Activity::Working(
+                    elapsed
+                        .and_then(|elapsed| now.checked_sub(elapsed))
+                        .unwrap_or(now),
+                ),
+                (JobActivity::Waiting, _) => Activity::Waiting(now),
+            }
+        };
+        self.jobs = jobs
+            .iter()
+            .map(|job| Job {
+                id: job.id.clone(),
+                activity: began(job),
+            })
+            .collect();
+        let is_open = |id: &SessionId| self.live.iter().any(|live| live.id == *id);
+        let has_job = |id: &SessionId| self.jobs.iter().any(|job| job.id == *id);
+        self.rows
+            .retain(|row| row.saved || is_open(&row.id) || has_job(&row.id));
+        for job in jobs {
+            if self.rows.iter().any(|row| row.id == job.id) {
+                continue;
+            }
+            self.rows.insert(
+                0,
+                Row {
+                    element_id: format!("session-{}", job.id).into(),
+                    id: job.id,
+                    title: job.title,
+                    placeholder: UNTITLED,
+                    cwd: job.cwd,
+                    workspace: job.workspace,
+                    updated: now_unix,
+                    activity: Activity::Idle,
+                    shelf: Shelf::Active,
+                    saved: false,
+                },
+            );
+        }
+        for ix in 0..self.rows.len() {
+            self.rows[ix].activity = self.activity(&self.rows[ix].id);
+        }
+    }
+
     /// Drops a deleted session.
     pub(crate) fn remove(&mut self, id: &SessionId) {
         self.rows.retain(|row| row.id != *id);
         self.live.retain(|live| live.id != *id);
+        self.jobs.retain(|job| job.id != *id);
     }
 
-    /// Forgets every open session, after the agent restarts.
+    /// Forgets every open session and job, once the connection that
+    /// followed them is gone.
     pub(crate) fn clear_live(&mut self) {
         self.live.clear();
+        self.jobs.clear();
         self.rows.retain(|row| row.saved);
         for row in &mut self.rows {
             row.activity = Activity::Idle;

@@ -1,30 +1,67 @@
-//! One session's conversation as the UI shows it, rebuilt from ACP v2
-//! `session/update` notifications. Pure state: no I/O, no GUI.
+//! One session's conversation as the UI shows it, rebuilt from the daemon's
+//! session events. Pure state: no I/O, no GUI.
 //!
-//! Messages are keyed by `messageId`: a chunk appends, a full message
-//! replaces (that is how resume replay and edits arrive). Tool calls are keyed
-//! by `toolCallId` and merge field by field.
+//! Messages are keyed by their message ID: a chunk appends, a whole user
+//! message replaces. Tool calls are keyed by their call ID and merge field by
+//! field.
+//!
+//! A session starts out holding its events: the daemon sends an attachment's
+//! replay right after the attach response, and the two reach the UI on
+//! separate paths. [`Session::attached`] takes the response, then the events
+//! held so far, so the response always lands first.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
-use agent_client_protocol::schema::{v2, MaybeUndefined};
+use rho_protocol::{
+    AnswerStop, CardTone, ContentBlock, JobState, SessionAttachResponse, SessionEvent,
+    SessionOptions, ToolCallUpdate, TurnOutcome,
+};
 
-use crate::agent::{commands, CommandInfo, SessionId, SessionSetup};
+use crate::{
+    daemon::SessionId,
+    input::{InputId, InputRequest},
+    options::{commands, config_options, CommandInfo, ConfigOption},
+};
 
-/// An opaque update for one session. Only [`Session::apply`] reads it.
+/// An opaque event for one session. Only [`Session::apply`] reads it.
 #[derive(Debug)]
-pub struct SessionUpdate(pub(crate) v2::SessionUpdate);
+pub struct SessionUpdate(pub(crate) SessionEvent);
 
-/// Whether the agent is working on this session.
+/// What `rho/session/new` returned. Hand it to [`Session::set_setup`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSetup {
+    pub(crate) id: SessionId,
+    pub(crate) options: SessionOptions,
+}
+
+impl SessionSetup {
+    /// The session this setup belongs to.
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+}
+
+/// What `rho/session/attach` returned. Hand it to [`Session::attached`].
+#[derive(Debug)]
+pub struct Attached(pub(crate) Box<SessionAttachResponse>);
+
+impl Attached {
+    /// How long the turn under way had run when the attachment began.
+    pub fn turn_elapsed(&self) -> Option<Duration> {
+        self.0.turn_elapsed_ms.map(Duration::from_millis)
+    }
+}
+
+/// Whether rho is working on this session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunState {
     /// Waiting for a prompt.
     Idle,
-    /// A turn is in progress.
+    /// A turn is in progress, or waits for a slot to run in.
     Running,
-    /// Blocked on the user, such as an approval.
+    /// The turn waits for a person, such as an approval.
     NeedsAction,
-    /// The user stopped the last turn.
+    /// Someone stopped the last turn.
     Cancelled,
     /// The last turn failed.
     Failed(String),
@@ -37,12 +74,12 @@ impl RunState {
     }
 }
 
-/// Context fill and spend, as the agent last reported them.
+/// Context fill and spend, as the daemon last reported them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Usage {
     used: u64,
-    size: u64,
-    cost: Option<(f64, String)>,
+    size: Option<u64>,
+    cost_usd: Option<f64>,
 }
 
 impl Usage {
@@ -51,171 +88,15 @@ impl Usage {
         self.used
     }
 
-    /// Context window size in tokens.
-    pub fn size(&self) -> u64 {
+    /// Context window size in tokens, when the model's is known.
+    pub fn size(&self) -> Option<u64> {
         self.size
     }
 
-    /// Cumulative session cost: amount and ISO currency code.
-    pub fn cost(&self) -> Option<(f64, &str)> {
-        self.cost
-            .as_ref()
-            .map(|(amount, currency)| (*amount, currency.as_str()))
+    /// What the session has cost so far, in US dollars.
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.cost_usd
     }
-}
-
-/// A value to set with [`crate::Agent::set_config`].
-#[derive(Clone, Debug, PartialEq)]
-pub enum ConfigValue {
-    /// A [`ConfigChoice::value`] for a [`ConfigKind::Select`] option.
-    Select(String),
-    /// The new state of a [`ConfigKind::Toggle`] option.
-    Toggle(bool),
-}
-
-/// One choice in a [`ConfigKind::Select`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigChoice {
-    value: String,
-    name: String,
-}
-
-impl ConfigChoice {
-    /// Pass to [`crate::Agent::set_config`] as [`ConfigValue::Select`].
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-
-    /// Label to show.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-/// The shape of a [`ConfigOption`] and its current value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConfigKind {
-    /// Pick one of several values.
-    Select {
-        /// The selected [`ConfigChoice::value`].
-        current: String,
-        /// Every choice, groups flattened in order.
-        choices: Vec<ConfigChoice>,
-    },
-    /// On or off.
-    Toggle(bool),
-}
-
-/// What a [`ConfigOption`] sets, so a host can give it its place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConfigCategory {
-    /// The session mode; rho's is which tool calls run without asking.
-    Mode,
-    /// Which model answers.
-    Model,
-    /// How much the model reasons per turn.
-    ThoughtLevel,
-    /// Anything else, such as a model setting like fast mode, or no category.
-    Other,
-}
-
-/// A per-session setting the agent exposes, such as mode or model.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigOption {
-    id: String,
-    name: String,
-    category: ConfigCategory,
-    kind: ConfigKind,
-}
-
-impl ConfigOption {
-    /// Stable ID such as `mode`, `model`, `thought_level`.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Label to show, such as "Model".
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// What it sets.
-    pub fn category(&self) -> ConfigCategory {
-        self.category
-    }
-
-    /// Its shape and current value.
-    pub fn kind(&self) -> &ConfigKind {
-        &self.kind
-    }
-
-    /// The choice a [`ConfigKind::Select`] has selected.
-    pub fn current_choice(&self) -> Option<&ConfigChoice> {
-        match &self.kind {
-            ConfigKind::Select { current, choices } => {
-                choices.iter().find(|choice| choice.value == *current)
-            }
-            ConfigKind::Toggle(_) => None,
-        }
-    }
-
-    /// This option holding `value`, to show a change before the agent
-    /// confirms it. A value of the other kind changes nothing.
-    #[must_use]
-    pub fn with_value(mut self, value: &ConfigValue) -> Self {
-        match (&mut self.kind, value) {
-            (ConfigKind::Select { current, .. }, ConfigValue::Select(value)) => {
-                current.clone_from(value);
-            }
-            (ConfigKind::Toggle(on), ConfigValue::Toggle(value)) => *on = *value,
-            _ => {}
-        }
-        self
-    }
-}
-
-/// Converts ACP options, dropping kinds this UI cannot show.
-pub(crate) fn config_options(options: Vec<v2::SessionConfigOption>) -> Vec<ConfigOption> {
-    options
-        .into_iter()
-        .filter_map(|option| {
-            let kind = match option.kind {
-                v2::SessionConfigKind::Select(select) => {
-                    let choices = match select.options {
-                        v2::SessionConfigSelectOptions::Ungrouped(options) => options,
-                        v2::SessionConfigSelectOptions::Grouped(groups) => {
-                            groups.into_iter().flat_map(|group| group.options).collect()
-                        }
-                        _ => Vec::new(),
-                    };
-                    ConfigKind::Select {
-                        current: select.current_value.0.to_string(),
-                        choices: choices
-                            .into_iter()
-                            .map(|choice| ConfigChoice {
-                                value: choice.value.0.to_string(),
-                                name: choice.name,
-                            })
-                            .collect(),
-                    }
-                }
-                v2::SessionConfigKind::Boolean(toggle) => ConfigKind::Toggle(toggle.current_value),
-                _ => return None,
-            };
-            let category = match option.category {
-                Some(v2::SessionConfigOptionCategory::Mode) => ConfigCategory::Mode,
-                Some(v2::SessionConfigOptionCategory::Model) => ConfigCategory::Model,
-                Some(v2::SessionConfigOptionCategory::ThoughtLevel) => ConfigCategory::ThoughtLevel,
-                _ => ConfigCategory::Other,
-            };
-            Some(ConfigOption {
-                id: option.config_id.0.to_string(),
-                name: option.name,
-                category,
-                kind,
-            })
-        })
-        .collect()
 }
 
 /// Where a tool call is in its life.
@@ -227,13 +108,11 @@ pub enum ToolStatus {
     Running,
     /// Finished.
     Done,
-    /// Finished with an error.
+    /// Finished with an error, or was cut off.
     Failed,
-    /// Stopped before it finished.
-    Cancelled,
 }
 
-/// What a tool call does, as the agent classes it.
+/// What a tool call does, as rho classes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolKind {
     /// Reads files.
@@ -258,16 +137,16 @@ pub enum ToolKind {
 pub enum ToolContent {
     /// Output text, such as a command's stdout.
     Text(String),
-    /// Changed files, with a git patch when the agent sent one.
+    /// One changed file, with the change as a patch in git format.
     Diff {
-        /// Every file the change touches.
-        paths: Vec<PathBuf>,
-        /// Patch text in git format, when the agent sent one.
-        patch: Option<String>,
+        /// The file the change touches.
+        path: PathBuf,
+        /// The change, from the texts the daemon sent.
+        patch: String,
     },
 }
 
-/// A tool the agent ran, shown as a card.
+/// A tool rho ran, shown as a card.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
     id: String,
@@ -278,17 +157,17 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    /// The agent's `toolCallId`.
+    /// The daemon's ID for the call.
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// What it does, such as the command it runs. Empty until the agent says.
+    /// What it does, such as the command it runs. Empty until the daemon says.
     pub fn title(&self) -> &str {
         &self.title
     }
 
-    /// What the call does; [`ToolKind::Other`] until the agent says.
+    /// What the call does; [`ToolKind::Other`] until the daemon says.
     pub fn kind(&self) -> ToolKind {
         self.kind
     }
@@ -312,7 +191,7 @@ pub struct Message {
 }
 
 impl Message {
-    /// The agent's `messageId`.
+    /// The daemon's ID for the message.
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -334,7 +213,7 @@ pub enum NoticeLevel {
     Error,
 }
 
-/// A message from the agent that is not part of the conversation.
+/// A message from rho that is not part of the conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
     level: NoticeLevel,
@@ -404,6 +283,13 @@ impl PlanItem {
     }
 }
 
+/// A steer the turn accepted that has not reached the conversation yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Steer {
+    id: SteerId,
+    text: String,
+}
+
 /// A session's transcript and status.
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -417,11 +303,27 @@ pub struct Session {
     config: Vec<ConfigOption>,
     commands: Vec<CommandInfo>,
     plan: Vec<PlanItem>,
+    /// Open requests, oldest first.
+    inputs: Vec<InputRequest>,
+    /// Steers waiting to apply, oldest first.
+    steers: Vec<Steer>,
+    /// Steers a turn dropped when it ended; see [`Self::take_dropped_steers`].
+    dropped_steers: Vec<String>,
+    /// IDs of steers that reached the conversation before
+    /// [`Self::steer_sent`] recorded them: the daemon's answer to a steer
+    /// and the steer's own event race each other here.
+    early_steers: Vec<SteerId>,
+    /// Events that arrived before the attach response; `None` once
+    /// [`Self::attached`] has run.
+    held: Option<Vec<SessionEvent>>,
+    /// Events of the attachment's replay still to come.
+    replay_left: u64,
 }
 
 impl Session {
-    /// An empty session for `id`. Create it before resuming the session, so
-    /// replayed history has somewhere to go.
+    /// An empty session for `id`, holding its events until
+    /// [`Self::attached`]. Create it before attaching, so the replay has
+    /// somewhere to go.
     pub fn new(id: SessionId) -> Self {
         Self {
             id,
@@ -432,16 +334,40 @@ impl Session {
             config: Vec::new(),
             commands: Vec::new(),
             plan: Vec::new(),
+            inputs: Vec::new(),
+            steers: Vec::new(),
+            dropped_steers: Vec::new(),
+            early_steers: Vec::new(),
+            held: Some(Vec::new()),
+            replay_left: 0,
         }
     }
 
-    /// Records what `session/new` or `session/resume` returned.
+    /// Records what `rho/session/new` returned, so a new session's settings
+    /// show before its attachment answers.
     pub fn set_setup(&mut self, setup: SessionSetup) {
-        self.config = setup.config;
-        self.commands = setup.commands;
+        self.set_options(setup.options);
     }
 
-    /// Replaces the settings after [`crate::Agent::set_config`].
+    /// Records the attach response, then applies the events held for it.
+    /// The transcript may have grown; nothing in it changed before this.
+    pub fn attached(&mut self, attached: Attached) {
+        let response = *attached.0;
+        if response.title.is_some() {
+            self.title = response.title;
+        }
+        self.set_options(response.options);
+        self.settle(response.state);
+        for request in response.inputs {
+            self.open_input(InputRequest::from_wire(request));
+        }
+        self.replay_left = response.replay_events;
+        for event in self.held.take().unwrap_or_default() {
+            self.apply_event(event);
+        }
+    }
+
+    /// Replaces the settings after [`crate::Daemon::set_config`].
     pub fn set_config(&mut self, config: Vec<ConfigOption>) {
         self.config = config;
     }
@@ -451,7 +377,7 @@ impl Session {
         self.title = title;
     }
 
-    /// Marks a prompt that the agent refused before it started.
+    /// Marks a prompt that the daemon refused before its turn began.
     pub fn fail(&mut self, error: String) {
         self.state = RunState::Failed(error);
     }
@@ -461,7 +387,7 @@ impl Session {
         &self.id
     }
 
-    /// The agent's title for the session, once it has one.
+    /// rho's title for the session, once it has one.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
@@ -471,9 +397,16 @@ impl Session {
         &self.entries
     }
 
-    /// Whether the agent is working.
+    /// Whether rho is working.
     pub fn state(&self) -> &RunState {
         &self.state
+    }
+
+    /// Whether the attachment is still catching up: its response or part of
+    /// its replay has yet to arrive. State changes until then are history,
+    /// not something happening now.
+    pub fn is_replaying(&self) -> bool {
+        self.held.is_some() || self.replay_left > 0
     }
 
     /// Context fill and spend, once reported.
@@ -496,97 +429,230 @@ impl Session {
         &self.plan
     }
 
-    /// Applies one update from [`crate::AgentEvent::Update`]. Returns the
+    /// What the session waits on a person for, oldest first.
+    pub fn inputs(&self) -> &[InputRequest] {
+        &self.inputs
+    }
+
+    /// Takes request `id` out, as the UI does once it sends an answer, so
+    /// it can't be answered twice. The daemon's own word that it closed is
+    /// then a no-op; [`Self::open_input`] puts it back if the answer failed.
+    pub fn close_input(&mut self, id: InputId) -> Option<InputRequest> {
+        let at = self.inputs.iter().position(|request| request.id() == id)?;
+        Some(self.inputs.remove(at))
+    }
+
+    /// Adds an open request, replacing one of the same ID: an attach
+    /// response and its replay may both carry it.
+    pub fn open_input(&mut self, request: InputRequest) {
+        match self
+            .inputs
+            .iter_mut()
+            .find(|open| open.id() == request.id())
+        {
+            Some(open) => *open = request,
+            None => self.inputs.push(request),
+        }
+    }
+
+    /// Records a steer the running turn accepted, as `id`. It shows in
+    /// [`Self::pending_steers`] until it reaches the conversation.
+    pub fn steer_sent(&mut self, id: SteerId, text: String) {
+        match self.early_steers.iter().position(|early| *early == id) {
+            Some(at) => {
+                self.early_steers.swap_remove(at);
+            }
+            None => self.steers.push(Steer { id, text }),
+        }
+    }
+
+    /// Steers the turn accepted that the model has not read yet, oldest
+    /// first: each one's ID, for [`crate::Daemon::unsteer`], and its text.
+    pub fn pending_steers(&self) -> impl Iterator<Item = (&SteerId, &str)> {
+        self.steers
+            .iter()
+            .map(|steer| (&steer.id, steer.text.as_str()))
+    }
+
+    /// Forgets pending steer `id`, once the daemon withdrew it, and returns
+    /// its text.
+    pub fn withdraw_steer(&mut self, id: &SteerId) -> Option<String> {
+        let at = self.steers.iter().position(|steer| steer.id == *id)?;
+        Some(self.steers.remove(at).text)
+    }
+
+    /// Steers a turn dropped because it ended before reading them, so the
+    /// UI can hand the text back. Each is returned once.
+    pub fn take_dropped_steers(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.dropped_steers)
+    }
+
+    /// Applies one event from [`crate::DaemonEvent::Update`]. Returns the
     /// index of the entry it added or changed, so a view can redraw just
-    /// that row.
+    /// that row. Before [`Self::attached`] it keeps the event and returns
+    /// `None`.
     pub fn apply(&mut self, update: SessionUpdate) -> Option<usize> {
-        match update.0 {
-            v2::SessionUpdate::UserMessageChunk(chunk) => {
-                Some(self.append_message(&chunk, Entry::User))
+        match &mut self.held {
+            Some(held) => {
+                held.push(update.0);
+                None
             }
-            v2::SessionUpdate::AgentMessageChunk(chunk) => {
-                Some(self.append_message(&chunk, Entry::Agent))
-            }
-            v2::SessionUpdate::AgentThoughtChunk(chunk) => {
-                Some(self.append_message(&chunk, Entry::Thought))
-            }
-            v2::SessionUpdate::UserMessage(message) => {
-                Some(self.replace_message(&message.message_id, message.content, Entry::User))
-            }
-            v2::SessionUpdate::AgentMessage(message) => {
-                Some(self.replace_message(&message.message_id, message.content, Entry::Agent))
-            }
-            v2::SessionUpdate::AgentThought(message) => {
-                Some(self.replace_message(&message.message_id, message.content, Entry::Thought))
-            }
-            v2::SessionUpdate::ToolCallUpdate(update) => Some(self.update_tool(update)),
-            v2::SessionUpdate::ToolCallContentChunk(chunk) => {
-                let (at, tool) = self.tool_mut(&chunk.tool_call_id.0);
-                if let Some(content) = tool_content(chunk.content) {
-                    tool.content.push(content);
+            None => self.apply_event(update.0),
+        }
+    }
+
+    fn apply_event(&mut self, event: SessionEvent) -> Option<usize> {
+        self.replay_left = self.replay_left.saturating_sub(1);
+        match event {
+            SessionEvent::UserMessage {
+                message,
+                content,
+                steer,
+            } => {
+                if let Some(steer) = steer {
+                    let steer = SteerId(steer.as_str().to_owned());
+                    if self.withdraw_steer(&steer).is_none() {
+                        self.early_steers.push(steer);
+                    }
                 }
+                let (at, message) = self.message_mut(message.as_str(), Entry::User);
+                message.text = content.iter().map(block_text).collect();
                 Some(at)
             }
-            v2::SessionUpdate::Notice(notice) => {
-                self.entries.push(Entry::Notice(Notice {
-                    level: match notice.severity {
-                        v2::NoticeSeverity::Warning => NoticeLevel::Warning,
-                        v2::NoticeSeverity::Error => NoticeLevel::Error,
-                        _ => NoticeLevel::Info,
-                    },
-                    title: notice.title,
-                    description: notice.description,
-                }));
-                Some(self.entries.len() - 1)
+            SessionEvent::AgentMessageChunk { message, text } => {
+                Some(self.append_message(message.as_str(), &text, Entry::Agent))
             }
-            v2::SessionUpdate::StateUpdate(state) => {
-                self.state = run_state(state);
+            SessionEvent::ThoughtChunk { message, text } => {
+                Some(self.append_message(message.as_str(), &text, Entry::Thought))
+            }
+            SessionEvent::ToolCall(update) => Some(self.update_tool(*update)),
+            SessionEvent::Notice { text } => Some(self.push_notice(Notice {
+                level: NoticeLevel::Info,
+                title: text,
+                description: None,
+            })),
+            SessionEvent::Card {
+                title, plain, tone, ..
+            } => Some(self.push_notice(Notice {
+                level: match tone {
+                    CardTone::Warning => NoticeLevel::Warning,
+                    CardTone::Error => NoticeLevel::Error,
+                    _ => NoticeLevel::Info,
+                },
+                title,
+                description: Some(plain).filter(|text| !text.is_empty()),
+            })),
+            SessionEvent::State { state, .. } => {
+                self.settle(state);
                 None
             }
-            v2::SessionUpdate::PlanUpdate(update) => {
-                if let v2::PlanUpdateContent::Items(items) = update.plan {
-                    self.plan = items
-                        .entries
-                        .into_iter()
-                        .map(|entry| PlanItem {
-                            text: entry.content,
-                            status: match entry.status {
-                                v2::PlanEntryStatus::InProgress => PlanStatus::InProgress,
-                                v2::PlanEntryStatus::Completed => PlanStatus::Done,
-                                _ => PlanStatus::Pending,
-                            },
-                        })
-                        .collect();
-                }
+            SessionEvent::TurnEnded { outcome, .. } => {
+                self.end_turn(outcome);
                 None
             }
-            v2::SessionUpdate::AvailableCommandsUpdate(update) => {
-                self.commands = commands(update.available_commands);
+            SessionEvent::Plan { entries } => {
+                self.plan = entries
+                    .into_iter()
+                    .map(|entry| PlanItem {
+                        text: entry.content,
+                        status: match entry.status {
+                            rho_protocol::PlanStatus::InProgress => PlanStatus::InProgress,
+                            rho_protocol::PlanStatus::Completed => PlanStatus::Done,
+                            _ => PlanStatus::Pending,
+                        },
+                    })
+                    .collect();
                 None
             }
-            v2::SessionUpdate::ConfigOptionUpdate(update) => {
-                self.config = config_options(update.config_options);
+            SessionEvent::OptionsChanged { options } => {
+                self.set_options(*options);
                 None
             }
-            v2::SessionUpdate::SessionInfoUpdate(update) => {
-                match update.title {
-                    MaybeUndefined::Value(title) => self.title = Some(title),
-                    MaybeUndefined::Null => self.title = None,
-                    MaybeUndefined::Undefined => {}
-                }
+            SessionEvent::TitleChanged { title } => {
+                self.title = Some(title);
                 None
             }
-            v2::SessionUpdate::UsageUpdate(usage) => {
+            SessionEvent::Usage {
+                used_tokens,
+                window_tokens,
+                cost_usd_micros,
+            } => {
                 self.usage = Some(Usage {
-                    used: usage.used,
-                    size: usage.size,
-                    cost: usage.cost.map(|cost| (cost.amount, cost.currency)),
+                    used: used_tokens,
+                    size: window_tokens,
+                    cost_usd: cost_usd_micros.map(usd),
                 });
                 None
             }
-            // Terminals and compaction progress are not shown yet.
+            SessionEvent::InputRequested { request } => {
+                self.open_input(InputRequest::from_wire(*request));
+                None
+            }
+            SessionEvent::InputResolved { id, .. } => {
+                self.close_input(InputId(id.0));
+                None
+            }
+            // Compaction and provider progress, held timeouts, and cache
+            // warming are not shown yet.
             _ => None,
         }
+    }
+
+    fn set_options(&mut self, options: SessionOptions) {
+        self.config = config_options(&options);
+        self.commands = commands(options.commands);
+    }
+
+    /// Follows the job's state for whether a turn runs. How a turn ended
+    /// comes from its own event ([`Self::end_turn`]), which arrives first
+    /// and says why; a state alone only clears a turn that left none, as
+    /// one the daemon's restart cut short does.
+    fn settle(&mut self, state: JobState) {
+        match state {
+            JobState::Running | JobState::Queued => self.state = RunState::Running,
+            JobState::WaitingForInput => self.state = RunState::NeedsAction,
+            JobState::Idle
+            | JobState::Completed
+            | JobState::Failed
+            | JobState::Cancelled
+            | JobState::TimedOut
+            | JobState::Interrupted
+                if self.state.is_busy() =>
+            {
+                self.state = RunState::Idle;
+            }
+            // Already settled, or a state a newer daemon added.
+            _ => {}
+        }
+    }
+
+    fn end_turn(&mut self, outcome: TurnOutcome) {
+        self.state = match outcome {
+            TurnOutcome::Answered { stop, .. } => match stop {
+                AnswerStop::Refusal => RunState::Failed("the model refused".to_owned()),
+                AnswerStop::MaxTokens => RunState::Failed("hit the output token limit".to_owned()),
+                _ => RunState::Idle,
+            },
+            TurnOutcome::MaxSteps { .. } => {
+                RunState::Failed("stopped at the model-step limit".to_owned())
+            }
+            TurnOutcome::Cancelled => RunState::Cancelled,
+            TurnOutcome::TimedOut { timeout_ms } => RunState::Failed(format!(
+                "timed out after {:?}",
+                Duration::from_millis(timeout_ms)
+            )),
+            TurnOutcome::Failed { error } => RunState::Failed(error.message),
+            _ => RunState::Idle,
+        };
+        // The daemon drops a steer its turn never read.
+        let dropped = self.steers.drain(..).map(|steer| steer.text);
+        self.dropped_steers.extend(dropped);
+        self.early_steers.clear();
+    }
+
+    fn push_notice(&mut self, notice: Notice) -> usize {
+        self.entries.push(Entry::Notice(notice));
+        self.entries.len() - 1
     }
 
     /// The message `id` and its index, appending `make(empty)` if it is new.
@@ -608,24 +674,9 @@ impl Session {
         }
     }
 
-    fn append_message(&mut self, chunk: &v2::ContentChunk, make: fn(Message) -> Entry) -> usize {
-        let (at, message) = self.message_mut(&chunk.message_id.0, make);
-        message.text.push_str(&block_text(&chunk.content));
-        at
-    }
-
-    fn replace_message(
-        &mut self,
-        id: &v2::MessageId,
-        content: MaybeUndefined<Vec<v2::ContentBlock>>,
-        make: fn(Message) -> Entry,
-    ) -> usize {
-        let (at, message) = self.message_mut(&id.0, make);
-        match content {
-            MaybeUndefined::Undefined => {}
-            MaybeUndefined::Null => message.text.clear(),
-            MaybeUndefined::Value(blocks) => message.text = blocks.iter().map(block_text).collect(),
-        }
+    fn append_message(&mut self, id: &str, text: &str, make: fn(Message) -> Entry) -> usize {
+        let (at, message) = self.message_mut(id, make);
+        message.text.push_str(text);
         at
     }
 
@@ -651,100 +702,106 @@ impl Session {
         }
     }
 
-    fn update_tool(&mut self, update: v2::ToolCallUpdate) -> usize {
-        let (at, tool) = self.tool_mut(&update.tool_call_id.0);
-        if let MaybeUndefined::Value(title) = update.title {
+    fn update_tool(&mut self, update: ToolCallUpdate) -> usize {
+        use rho_protocol::{ToolKind as Kind, ToolStatus as Status};
+
+        let (at, tool) = self.tool_mut(update.id.as_str());
+        if let Some(title) = update.title {
             tool.title = title;
         }
-        if let MaybeUndefined::Value(kind) = update.kind {
+        if let Some(kind) = update.kind {
             tool.kind = match kind {
-                v2::ToolKind::Read => ToolKind::Read,
-                v2::ToolKind::Edit | v2::ToolKind::Delete | v2::ToolKind::Move => ToolKind::Edit,
-                v2::ToolKind::Search => ToolKind::Search,
-                v2::ToolKind::Execute => ToolKind::Execute,
-                v2::ToolKind::Think => ToolKind::Think,
-                v2::ToolKind::Fetch => ToolKind::Fetch,
+                Kind::Read => ToolKind::Read,
+                Kind::Edit | Kind::Delete | Kind::Move => ToolKind::Edit,
+                Kind::Search => ToolKind::Search,
+                Kind::Execute => ToolKind::Execute,
+                Kind::Think => ToolKind::Think,
+                Kind::Fetch => ToolKind::Fetch,
                 _ => ToolKind::Other,
             };
         }
-        if let MaybeUndefined::Value(status) = update.status {
+        if let Some(status) = update.status {
             tool.status = match status {
-                v2::ToolCallStatus::Pending => ToolStatus::Pending,
-                v2::ToolCallStatus::InProgress => ToolStatus::Running,
-                v2::ToolCallStatus::Completed => ToolStatus::Done,
-                v2::ToolCallStatus::Failed => ToolStatus::Failed,
-                v2::ToolCallStatus::Cancelled => ToolStatus::Cancelled,
+                Status::Pending => ToolStatus::Pending,
+                Status::InProgress => ToolStatus::Running,
+                Status::Completed => ToolStatus::Done,
+                Status::Failed => ToolStatus::Failed,
                 _ => tool.status,
             };
         }
-        match update.content {
-            MaybeUndefined::Undefined => {}
-            MaybeUndefined::Null => tool.content.clear(),
-            MaybeUndefined::Value(content) => {
-                tool.content = content.into_iter().filter_map(tool_content).collect();
-            }
+        if let Some(content) = update.content {
+            tool.content = content.into_iter().filter_map(tool_content).collect();
         }
         at
     }
 }
 
-fn run_state(state: v2::StateUpdate) -> RunState {
-    match state {
-        v2::StateUpdate::RequiresAction(_) => RunState::NeedsAction,
-        v2::StateUpdate::Idle(idle) => match idle.stop_reason {
-            Some(v2::StopReason::Cancelled) => RunState::Cancelled,
-            Some(v2::StopReason::Error(stop)) => RunState::Failed(match stop.error {
-                Some(error) => match error.data {
-                    Some(serde_json::Value::String(detail)) => detail,
-                    _ => error.message,
-                },
-                None => "the turn failed".to_owned(),
-            }),
-            Some(v2::StopReason::Refusal) => RunState::Failed("the model refused".to_owned()),
-            Some(v2::StopReason::MaxTokens) => {
-                RunState::Failed("hit the output token limit".to_owned())
-            }
-            _ => RunState::Idle,
-        },
-        // `running`, and draft states this UI does not know yet.
-        _ => RunState::Running,
+#[cfg(test)]
+impl Session {
+    /// A session past its attach response, for tests that only feed events.
+    pub(crate) fn following(id: SessionId) -> Self {
+        let mut session = Self::new(id);
+        session.held = None;
+        session
     }
 }
 
+/// A steer's ID, from [`crate::Daemon::steer`]; pass it to
+/// [`Session::steer_sent`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SteerId(pub(crate) String);
+
+/// Millionths of a US dollar as dollars, for display.
+fn usd(micros: u64) -> f64 {
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "a displayed amount: f64 holds every whole micro-dollar up to $9 billion"
+    )]
+    let micros = micros as f64;
+    micros / 1e6
+}
+
 /// Text for one content block. Non-text blocks become short placeholders.
-fn block_text(block: &v2::ContentBlock) -> String {
+fn block_text(block: &ContentBlock) -> String {
     match block {
-        v2::ContentBlock::Text(text) => text.text.clone(),
-        v2::ContentBlock::Image(_) => "[image]".to_owned(),
-        v2::ContentBlock::Audio(_) => "[audio]".to_owned(),
-        v2::ContentBlock::ResourceLink(link) => format!("[{}]", link.name),
-        v2::ContentBlock::Resource(_) => "[attachment]".to_owned(),
+        ContentBlock::Text { text } | ContentBlock::Resource { text, .. } => text.clone(),
+        ContentBlock::Image { .. } => "[image]".to_owned(),
+        ContentBlock::ResourceLink { name, .. } => format!("[{name}]"),
         _ => String::new(),
     }
 }
 
-fn tool_content(content: v2::ToolCallContent) -> Option<ToolContent> {
+fn tool_content(content: rho_protocol::ToolContent) -> Option<ToolContent> {
     match content {
-        v2::ToolCallContent::Content(content) => {
-            Some(ToolContent::Text(block_text(&content.content)))
+        rho_protocol::ToolContent::Text { text } => Some(ToolContent::Text(text)),
+        rho_protocol::ToolContent::Image { .. } => Some(ToolContent::Text("[image]".to_owned())),
+        rho_protocol::ToolContent::Diff {
+            path,
+            old_text,
+            new_text,
+            deleted,
+        } => {
+            let new_text = (!deleted).then_some(new_text.as_str());
+            let patch = git_patch(&path, old_text.as_deref(), new_text);
+            Some(ToolContent::Diff { path, patch })
         }
-        v2::ToolCallContent::Diff(diff) => Some(ToolContent::Diff {
-            paths: diff
-                .changes
-                .into_iter()
-                .filter_map(|change| match change.operation {
-                    v2::DiffChangeOperation::Add(change)
-                    | v2::DiffChangeOperation::Delete(change)
-                    | v2::DiffChangeOperation::Modify(change) => Some(change.path.0),
-                    v2::DiffChangeOperation::Move(change)
-                    | v2::DiffChangeOperation::Copy(change) => Some(change.path.0),
-                    _ => None,
-                })
-                .collect(),
-            patch: diff.patch.map(|patch| patch.text),
-        }),
         _ => None,
     }
+}
+
+/// The change from `old` to `new` as a one-file patch in git format, which
+/// is what diff viewers read. No `old` is a new file; no `new`, a deleted
+/// one.
+fn git_patch(path: &std::path::Path, old: Option<&str>, new: Option<&str>) -> String {
+    let name = path.to_string_lossy();
+    let name = name.trim_start_matches('/');
+    let (before, after) = (format!("a/{name}"), format!("b/{name}"));
+    let from = old.map_or("/dev/null", |_| before.as_str());
+    let to = new.map_or("/dev/null", |_| after.as_str());
+    let diff = similar::TextDiff::from_lines(old.unwrap_or_default(), new.unwrap_or_default());
+    let hunks = diff.unified_diff().header(from, to).to_string();
+    format!("diff --git {before} {after}\n{hunks}")
 }
 
 #[cfg(test)]
