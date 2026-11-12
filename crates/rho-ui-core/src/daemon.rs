@@ -68,7 +68,8 @@ impl DaemonTarget {
 
 /// The rho home as `rho` finds it: `$RHO_HOME`, else `$HOME/.rho`, with an
 /// empty variable taken as unset. rho-protocol does not export this rule,
-/// so it is copied from rho's `paths::rho_dir`.
+/// so it is copied from rho's `paths::rho_dir`, without its Windows
+/// fallbacks (rho-ui does not build there).
 fn rho_home(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let set = |name| var(name).filter(|value| !value.is_empty());
     set("RHO_HOME")
@@ -404,7 +405,7 @@ const _: () = {
 
 /// The runtime the connection's socket I/O runs on, made on first use and
 /// kept for the life of the process. One worker: the work is one socket's
-/// reads and writes.
+/// reads and writes, and `LocalDaemon` waiting on `rho daemon start`.
 fn io() -> &'static Runtime {
     static IO: OnceLock<Runtime> = OnceLock::new();
     IO.get_or_init(|| {
@@ -431,7 +432,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         DaemonTarget::Socket(socket) => {
             let stream = UnixStream::connect(&socket).await.map_err(|error| {
                 DaemonError::Unreachable(format!(
-                    "couldn't connect to the rho daemon at {}: {error}",
+                    "could not connect to the rho daemon at {}: {error}",
                     socket.display()
                 ))
             })?;
@@ -770,14 +771,10 @@ mod tests {
     #[test]
     fn the_rho_home_is_rho_home_else_dot_rho_in_home() {
         let home = |vars: &[(&str, &str)]| {
-            let vars: Vec<(String, OsString)> = vars
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
-                .collect();
             rho_home(|name| {
                 vars.iter()
-                    .find(|(set, _)| set == name)
-                    .map(|(_, value)| value.clone())
+                    .find(|(set, _)| *set == name)
+                    .map(|(_, value)| OsString::from(value))
             })
         };
         let both = [("RHO_HOME", "/srv/rho"), ("HOME", "/home/me")];

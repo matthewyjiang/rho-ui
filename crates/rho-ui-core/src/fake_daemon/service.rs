@@ -51,8 +51,9 @@ fn chosen(answer: &InputAnswer) -> &'static str {
     }
 }
 
-/// The methods rho-ui sends. Every other one answers rho-protocol's default,
-/// not served.
+/// The methods rho-ui sends, plus those every `Service` must answer (the
+/// handshake hooks, status, stop, restart, and the job list). Every other
+/// one answers rho-protocol's default, not served.
 #[expect(
     clippy::unused_async_trait_impl,
     reason = "the trait's methods return futures; a scripted answer has nothing to await"

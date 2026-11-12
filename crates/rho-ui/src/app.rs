@@ -298,8 +298,8 @@ impl RhoApp {
     }
 
     /// The connection ended. After the daemon said it was restarting, that
-    /// is expected, and answered by connecting again; if the restarted
-    /// daemon does not answer yet, `rho daemon start` waits until it does.
+    /// is expected, and answered by connecting again: the daemon restarts in
+    /// place on the same socket, and the handshake waits until it answers.
     fn disconnected(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.restarting {
             self.connect(window, cx);

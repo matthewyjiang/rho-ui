@@ -205,12 +205,15 @@ mod tests {
             launch.workspace,
             PathBuf::from("/tmp").canonicalize().unwrap()
         );
-        let rho = |launch: LaunchConfig| match launch.daemon {
-            DaemonTarget::Home { rho, .. } => rho,
-            DaemonTarget::Socket(_) => panic!("the command line names no socket"),
-        };
-        assert_eq!(rho(launch), PathBuf::from("/opt/rho/bin/rho"));
-        assert_eq!(rho(parse(&["/tmp"]).unwrap()), PathBuf::from("rho"));
+        // Both sides read the rho home from this process's environment.
+        assert_eq!(
+            launch.daemon,
+            DaemonTarget::rho("/opt/rho/bin/rho").unwrap()
+        );
+        assert_eq!(
+            parse(&["/tmp"]).unwrap().daemon,
+            DaemonTarget::rho("rho").unwrap()
+        );
     }
 
     #[test]
