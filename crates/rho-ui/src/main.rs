@@ -1,8 +1,8 @@
 //! rho-ui: the desktop UI for the rho coding agent.
 //!
-//! `rho-ui [DIR] [-- AGENT COMMAND...]` opens one window. DIR is the
-//! workspace for new sessions (default: the current directory); the agent
-//! command defaults to `rho acp`.
+//! `rho-ui [DIR] [--rho PROGRAM]` opens one window. DIR is the workspace for
+//! new sessions (default: the current directory); PROGRAM is the `rho` that
+//! starts and locates the daemon (default: `rho` on `PATH`).
 
 mod app;
 mod approval;

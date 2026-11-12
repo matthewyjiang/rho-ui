@@ -239,3 +239,94 @@ fn question(ask: QuestionAsk) -> (String, Option<String>, Vec<InputChoice>) {
     let choices = choices.chain([decline]).collect();
     (ask.title, Some(only.prompt.clone()), choices)
 }
+
+#[cfg(test)]
+mod tests {
+    use rho_protocol::PermissionMode;
+    use serde_json::json;
+
+    use super::*;
+
+    fn request(ask: &serde_json::Value) -> InputRequest {
+        let wire = serde_json::from_value(json!({"id": 1, "ask": ask})).expect("a valid request");
+        InputRequest::from_wire(wire)
+    }
+
+    fn offered(request: &InputRequest) -> Vec<(&str, &str)> {
+        let choices = request.choices().iter();
+        choices
+            .map(|choice| (choice.id(), choice.label()))
+            .collect()
+    }
+
+    #[test]
+    fn a_plan_approval_offers_each_mode_and_carries_the_plan() {
+        let request = request(&json!({"kind": "plan_approval", "plan": "1. Refactor",
+            "modes": ["allow_edits", "auto"]}));
+        assert_eq!(request.description(), Some("1. Refactor"));
+        assert_eq!(
+            offered(&request),
+            [
+                ("approve-allow_edits", "Approve in Allow edits"),
+                ("approve-auto", "Approve in Auto"),
+                ("keep-planning", "Keep planning"),
+            ]
+        );
+        assert_eq!(
+            request.choice("approve-auto").map(|choice| &choice.answer),
+            Some(&InputAnswer::ApprovePlan {
+                mode: PermissionMode::Auto,
+                feedback: None
+            })
+        );
+    }
+
+    fn question(id: &str, selection: &str) -> serde_json::Value {
+        json!({"id": id, "prompt": format!("Pick for {id}"), "selection": selection,
+            "allow_other": false, "required": true,
+            "choices": [{"value": "v1", "label": "One"}, {"value": "v2", "label": "Two"}]})
+    }
+
+    #[test]
+    fn one_single_choice_question_offers_its_choices() {
+        let request = request(&json!({"kind": "question", "title": "Which?",
+            "questions": [question("q1", "one")]}));
+        assert_eq!(request.title(), "Which?");
+        assert_eq!(
+            offered(&request),
+            [
+                ("choice-0", "One"),
+                ("choice-1", "Two"),
+                ("decline", "Decline")
+            ]
+        );
+        assert_eq!(
+            request.choice("choice-1").map(|choice| &choice.answer),
+            Some(&InputAnswer::Answers {
+                answers: BTreeMap::from([("q1".to_owned(), vec!["v2".to_owned()])])
+            })
+        );
+    }
+
+    /// Answering only part of a questionnaire would send the model a
+    /// half-answer as the user's own, so anything past the simplest shape
+    /// offers no answer but declining.
+    #[test]
+    fn any_other_question_can_only_be_declined_here() {
+        for questions in [
+            json!([question("q1", "many")]),
+            json!([question("q1", "one"), question("q2", "one")]),
+        ] {
+            let request = request(&json!({"kind": "question", "title": "Which?",
+                "questions": questions}));
+            assert_eq!(offered(&request), [("decline", "Decline")]);
+            assert!(
+                request
+                    .description()
+                    .is_some_and(|text| text.contains("terminal UI")),
+                "it says where to answer: {:?}",
+                request.description()
+            );
+        }
+    }
+}

@@ -1,7 +1,7 @@
-//! How long each turn took, kept across restarts for "Worked for". ACP
-//! replays a session's history without times, so rho-ui records each turn it
-//! runs under its prompt's message ID, which rho gives the prompt again when
-//! the session replays.
+//! How long each turn took, kept across restarts for "Worked for". The
+//! daemon replays a session's conversation without times, so rho-ui records
+//! each turn it watches under its prompt's message ID, which the daemon
+//! gives the prompt again when the session replays.
 //!
 //! The times live in one small text file, appended a line per turn:
 //!

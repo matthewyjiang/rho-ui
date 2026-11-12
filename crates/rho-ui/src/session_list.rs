@@ -3,7 +3,11 @@
 //! sessions, a gap, then each shelf's header and, when it's open, its sessions.
 //! Plain data with no GUI code; [`crate::sidebar`] draws it.
 
-use std::{cmp::Reverse, path::PathBuf, time::Instant};
+use std::{
+    cmp::Reverse,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::SharedString;
 use rho_ui_core::{JobActivity, SessionId};
@@ -28,7 +32,7 @@ impl Activity {
     }
 }
 
-/// A session from the agent's saved list.
+/// A session from the daemon's saved list.
 pub(crate) struct SavedSession {
     pub(crate) id: SessionId,
     pub(crate) cwd: PathBuf,
@@ -61,12 +65,14 @@ pub(crate) struct JobSession {
     pub(crate) cwd: PathBuf,
     pub(crate) title: Option<SharedString>,
     pub(crate) activity: JobActivity,
+    /// How long its turn has run, when the daemon says.
+    pub(crate) turn_elapsed: Option<Duration>,
     /// Index into [`crate::workspaces::Workspaces`].
     pub(crate) workspace: usize,
 }
 
 /// A [`JobSession`] as last polled, with the moment its activity began.
-struct Job {
+struct JobClock {
     id: SessionId,
     activity: Activity,
 }
@@ -92,7 +98,7 @@ pub(crate) struct Row {
     pub(crate) updated: i64,
     pub(crate) activity: Activity,
     pub(crate) shelf: Shelf,
-    /// The agent has saved it. Unsaved rows are sessions made in this run,
+    /// The daemon lists it as saved. Unsaved rows are sessions made in this run,
     /// and sessions the daemon runs that it doesn't list as saved.
     pub(crate) saved: bool,
 }
@@ -129,7 +135,7 @@ pub(crate) struct SessionList {
     live: Vec<LiveSession>,
     /// Sessions with work under way in the daemon. An open session's own
     /// view knows better, so `live` wins over these.
-    jobs: Vec<Job>,
+    jobs: Vec<JobClock>,
     /// What the list shows, filtered by the search.
     items: Vec<Item>,
     /// Sessions matching the search on each shelf, indexed by [`slot`].
@@ -149,7 +155,7 @@ fn slot(shelf: Shelf) -> usize {
 }
 
 impl SessionList {
-    /// Replaces the saved sessions. Unsaved sessions the agent now lists
+    /// Replaces the saved sessions. Unsaved sessions the daemon now lists
     /// become saved rows; live titles and activity carry over.
     pub(crate) fn set_saved(&mut self, saved: Vec<SavedSession>) {
         self.rows
@@ -233,10 +239,10 @@ impl SessionList {
         let began = |job: &JobSession| {
             let was = before.iter().find(|was| was.id == job.id);
             match (job.activity, was.map(|was| was.activity)) {
-                (JobActivity::Working(_), Some(was @ Activity::Working(_)))
+                (JobActivity::Working, Some(was @ Activity::Working(_)))
                 | (JobActivity::Waiting, Some(was @ Activity::Waiting(_))) => was,
-                (JobActivity::Working(elapsed), _) => Activity::Working(
-                    elapsed
+                (JobActivity::Working, _) => Activity::Working(
+                    job.turn_elapsed
                         .and_then(|elapsed| now.checked_sub(elapsed))
                         .unwrap_or(now),
                 ),
@@ -245,7 +251,7 @@ impl SessionList {
         };
         self.jobs = jobs
             .iter()
-            .map(|job| Job {
+            .map(|job| JobClock {
                 id: job.id.clone(),
                 activity: began(job),
             })
@@ -454,6 +460,90 @@ mod tests {
 
     fn rebuild(list: &mut SessionList, shelves: &Shelves, now: i64) {
         list.rebuild(shelves, now, |_| "atlas");
+    }
+
+    fn job(text: &str, activity: JobActivity, elapsed: Option<u64>) -> JobSession {
+        JobSession {
+            id: id(text),
+            cwd: PathBuf::from("/w"),
+            title: Some(SharedString::from(format!("job {text}"))),
+            activity,
+            turn_elapsed: elapsed.map(Duration::from_secs),
+            workspace: 0,
+        }
+    }
+
+    /// A turn another client runs makes its session active, though the
+    /// session is not rho-ui's, and its clock starts where the daemon says
+    /// and keeps that start as the turn goes on.
+    #[test]
+    fn a_job_makes_its_session_active_and_keeps_its_clock() {
+        let now = Instant::now();
+        let mut list = SessionList::default();
+        list.set_saved(vec![saved("old", Some("older"), 1)]);
+        let nobodys = Shelves::default();
+        rebuild(&mut list, &nobodys, 3);
+        assert_eq!(shown(&list), ["~", "[Settled 1]"]);
+
+        list.set_jobs(vec![job("old", JobActivity::Working, Some(90))], now, 3);
+        rebuild(&mut list, &nobodys, 3);
+        assert_eq!(shown(&list), ["older"]);
+        let began = now
+            .checked_sub(Duration::from_secs(90))
+            .expect("uptime over 90 s");
+        assert_eq!(
+            list.row(&id("old")).map(|row| row.activity),
+            Some(Activity::Working(began))
+        );
+
+        // A second later the daemon says 91 s; the row's clock doesn't move.
+        let later = now + Duration::from_secs(1);
+        list.set_jobs(vec![job("old", JobActivity::Working, Some(91))], later, 4);
+        assert_eq!(
+            list.row(&id("old")).map(|row| row.activity),
+            Some(Activity::Working(began))
+        );
+
+        // Waiting is another activity, with its own start.
+        list.set_jobs(vec![job("old", JobActivity::Waiting, Some(92))], later, 4);
+        assert_eq!(
+            list.row(&id("old")).map(|row| row.activity),
+            Some(Activity::Waiting(later))
+        );
+
+        list.set_jobs(Vec::new(), later, 5);
+        rebuild(&mut list, &nobodys, 5);
+        assert_eq!(
+            shown(&list),
+            ["~", "[Settled 1]"],
+            "its turn over, it settles again"
+        );
+    }
+
+    /// A running session the saved list lacks, such as one that has saved
+    /// nothing yet, is listed while its job lasts. An open session's own
+    /// view outranks the poll.
+    #[test]
+    fn a_job_without_a_saved_session_gets_a_row_while_it_runs() {
+        let now = Instant::now();
+        let mut list = SessionList::default();
+        list.set_jobs(vec![job("fresh", JobActivity::Working, None)], now, 3);
+        rebuild(&mut list, &Shelves::default(), 3);
+        assert_eq!(shown(&list), ["job fresh"]);
+        assert_eq!(
+            list.row(&id("fresh")).map(|row| row.activity),
+            Some(Activity::Working(now))
+        );
+
+        list.set_live(live("fresh", None, Activity::Idle), 0, 3);
+        assert_eq!(
+            list.row(&id("fresh")).map(|row| row.activity),
+            Some(Activity::Idle)
+        );
+
+        list.clear_live();
+        rebuild(&mut list, &Shelves::default(), 3);
+        assert!(shown(&list).is_empty(), "gone with the connection");
     }
 
     #[test]

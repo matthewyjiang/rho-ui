@@ -199,7 +199,7 @@ pub(crate) struct SidebarView {
     hover: Option<Hover>,
     error: Option<SharedString>,
     /// rho's name and version, for the footer.
-    agent: Option<SharedString>,
+    version: Option<SharedString>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
     /// The list's height in the last frame, which the gap above the
@@ -243,7 +243,7 @@ impl SidebarView {
             active: None,
             hover: None,
             error: None,
-            agent: None,
+            version: None,
             search,
             scroll: VirtualListScrollHandle::new(),
             viewport: Pixels::ZERO,
@@ -286,6 +286,7 @@ impl SidebarView {
                     cwd: job.cwd().to_path_buf(),
                     title: job.title().map(|title| title.to_owned().into()),
                     activity: job.activity(),
+                    turn_elapsed: job.turn_elapsed(),
                 })
                 .collect()
         });
@@ -309,7 +310,7 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    /// Drops a session the agent deleted.
+    /// Drops a session that was deleted.
     pub(crate) fn remove(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
         self.list.remove(id);
         self.shelves.forget(id.as_str());
@@ -333,8 +334,8 @@ impl SidebarView {
         }
     }
 
-    pub(crate) fn set_agent(&mut self, agent: String, cx: &mut Context<'_, Self>) {
-        self.agent = Some(agent.into());
+    pub(crate) fn set_version(&mut self, version: String, cx: &mut Context<'_, Self>) {
+        self.version = Some(version.into());
         cx.notify();
     }
 
@@ -831,11 +832,11 @@ impl SidebarView {
                                 cx.emit(SidebarEvent::OpenSettings);
                             })),
                     )
-                    .children(self.agent.clone().map(|agent| {
+                    .children(self.version.clone().map(|version| {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(agent)
+                            .child(version)
                     })),
             )
     }

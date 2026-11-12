@@ -25,7 +25,7 @@ use std::{
 use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ContentBlock,
     DaemonNotification, DetachReason, ErrorCode, IdleWake, JobKind, JobListParams, JobState,
-    Notifications, SessionAnswerParams, SessionAttachParams, SessionCancelParams,
+    JobSummary, Notifications, SessionAnswerParams, SessionAttachParams, SessionCancelParams,
     SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionListParams,
     SessionNewParams, SessionPart, SessionPromptParams, SessionSteerParams, SessionUnsteerParams,
     TurnOutcome, UnsteerOutcome,
@@ -178,20 +178,20 @@ impl SessionSummary {
 /// What a session's job is doing, from `rho/job/list`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobActivity {
-    /// A turn runs, or waits for a slot. Holds how long it has run, when
-    /// the daemon says.
-    Working(Option<Duration>),
+    /// A turn runs, or waits for a slot.
+    Working,
     /// The session waits for a person: an approval or a question.
     Waiting,
 }
 
 /// A session with work under way in the daemon, whichever client started it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Job {
     session: SessionId,
     cwd: PathBuf,
     title: Option<String>,
     activity: JobActivity,
+    turn_elapsed: Option<Duration>,
 }
 
 impl Job {
@@ -213,6 +213,50 @@ impl Job {
     /// What the job is doing.
     pub fn activity(&self) -> JobActivity {
         self.activity
+    }
+
+    /// How long the turn under way has run, when the daemon says. It grows
+    /// between two listings of the same job.
+    pub fn turn_elapsed(&self) -> Option<Duration> {
+        self.turn_elapsed
+    }
+
+    /// Whether `other` is this job as an earlier or later listing would
+    /// show it: everything but [`Self::turn_elapsed`] is the same. Two
+    /// listings that differ only in elapsed time changed nothing to show.
+    pub fn is_same_work(&self, other: &Job) -> bool {
+        self.session == other.session
+            && self.cwd == other.cwd
+            && self.title == other.title
+            && self.activity == other.activity
+    }
+
+    /// The job as the sidebar needs it, or `None` for one that is not a
+    /// session with work under way.
+    fn from_wire(job: JobSummary) -> Option<Self> {
+        // A subagent's or workflow's session belongs to the session that
+        // started it, and can't be attached to.
+        if job.kind != JobKind::Session {
+            return None;
+        }
+        let live = job.live.as_ref();
+        let asks = live.is_some_and(|live| !live.inputs.is_empty());
+        let activity = match job.state {
+            JobState::WaitingForInput => JobActivity::Waiting,
+            // A subagent's question waits whether or not a turn runs.
+            _ if asks => JobActivity::Waiting,
+            JobState::Running | JobState::Queued => JobActivity::Working,
+            _ => return None,
+        };
+        Some(Self {
+            session: job.session?.into(),
+            cwd: job.workspace,
+            turn_elapsed: live
+                .and_then(|live| live.turn_elapsed_ms)
+                .map(Duration::from_millis),
+            title: job.live.and_then(|live| live.title),
+            activity,
+        })
     }
 }
 
@@ -238,8 +282,6 @@ pub enum Detached {
     /// The daemon is restarting in place, as it does to upgrade. The
     /// connection closes next; connect again.
     Restarting,
-    /// The daemon is stopping, so the connection closes next.
-    Stopping,
 }
 
 /// Everything the daemon pushes without being asked.
@@ -259,43 +301,39 @@ pub enum DaemonEvent {
         /// Why.
         reason: Detached,
     },
-    /// The connection ended.
-    Closed,
 }
 
-/// The daemon's event stream. It ends after [`DaemonEvent::Closed`].
+/// The daemon's event stream. It ends when the connection does.
 pub struct DaemonEvents {
     notifications: Notifications,
-    closed: bool,
 }
 
 impl std::fmt::Debug for DaemonEvents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DaemonEvents")
-            .field("closed", &self.closed)
-            .finish_non_exhaustive()
+        f.debug_struct("DaemonEvents").finish_non_exhaustive()
     }
 }
 
 impl DaemonEvents {
-    /// Waits for the next event; `None` once the stream has ended.
+    /// Waits for the next event; `None` once the connection has closed.
     pub async fn recv(&mut self) -> Option<DaemonEvent> {
         loop {
-            match self.notifications.recv().await {
-                Some(DaemonNotification::SessionEvent(event)) => {
+            match self.notifications.recv().await? {
+                DaemonNotification::SessionEvent(event) => {
                     return Some(DaemonEvent::Update {
                         session: event.session.into(),
                         update: SessionUpdate(event.event),
                     });
                 }
-                Some(DaemonNotification::SessionDetached(detached)) => {
+                DaemonNotification::SessionDetached(detached) => {
                     let reason = match detached.reason {
                         DetachReason::Lagged => Detached::Behind,
                         DetachReason::Deleted => Detached::Deleted,
                         DetachReason::Restarting => Detached::Restarting,
-                        DetachReason::DaemonStopping => Detached::Stopping,
-                        // `not_loaded` ends an observe, which this client
-                        // never sends; the rest a newer daemon added.
+                        // `daemon_stopping` is followed by the connection
+                        // closing, which says as much; `not_loaded` ends an
+                        // observe, which this client never sends; the rest
+                        // a newer daemon added.
                         _ => continue,
                     };
                     return Some(DaemonEvent::Detached {
@@ -304,12 +342,7 @@ impl DaemonEvents {
                     });
                 }
                 // Logins and settings, which this client does not use.
-                Some(_) => {}
-                None if self.closed => return None,
-                None => {
-                    self.closed = true;
-                    return Some(DaemonEvent::Closed);
-                }
+                _ => {}
             }
         }
     }
@@ -394,7 +427,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         DaemonTarget::Socket(socket) => socket,
         DaemonTarget::Rho(program) => tokio::task::spawn_blocking(move || start(&program))
             .await
-            .map_err(|_| DaemonError::Closed)??,
+            .map_err(|error| DaemonError::Unreachable(format!("starting rho failed: {error}")))??,
     };
     let stream = UnixStream::connect(&socket).await.map_err(|error| {
         DaemonError::Unreachable(format!(
@@ -415,10 +448,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         client: Arc::new(client),
         info: Arc::new(info),
     };
-    let events = DaemonEvents {
-        notifications,
-        closed: false,
-    };
+    let events = DaemonEvents { notifications };
     Ok((daemon, events))
 }
 
@@ -497,32 +527,7 @@ impl Daemon {
             .client
             .request::<methods::JobList>(&JobListParams {})
             .await?;
-        let jobs = list.jobs.into_iter().filter_map(|job| {
-            // A subagent's or workflow's session belongs to the session
-            // that started it, and can't be attached to.
-            if job.kind != JobKind::Session {
-                return None;
-            }
-            let live = job.live.as_ref();
-            let asks = live.is_some_and(|live| !live.inputs.is_empty());
-            let activity = match job.state {
-                JobState::WaitingForInput => JobActivity::Waiting,
-                // A subagent's question waits whether or not a turn runs.
-                _ if asks => JobActivity::Waiting,
-                JobState::Running | JobState::Queued => JobActivity::Working(
-                    live.and_then(|live| live.turn_elapsed_ms)
-                        .map(Duration::from_millis),
-                ),
-                _ => return None,
-            };
-            Some(Job {
-                session: job.session?.into(),
-                cwd: job.workspace,
-                title: job.live.and_then(|live| live.title),
-                activity,
-            })
-        });
-        Ok(jobs.collect())
+        Ok(list.jobs.into_iter().filter_map(Job::from_wire).collect())
     }
 
     /// Opens a new session in `cwd`. Nothing follows it yet: create its
@@ -743,5 +748,70 @@ impl Daemon {
             .request::<methods::SessionDelete>(&params)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn job(kind: &str, state: &str, live: &serde_json::Value) -> Option<Job> {
+        let summary = serde_json::from_value(json!({"id": "j1", "kind": kind, "state": state,
+            "workspace": "/w", "session": "s1", "created_at": 0, "updated_at": 0, "live": live}));
+        Job::from_wire(summary.expect("a valid job summary"))
+    }
+
+    fn live(elapsed_ms: u64, inputs: &serde_json::Value) -> serde_json::Value {
+        json!({"title": "t", "model": {"provider": "p", "model": "m"},
+            "turn_elapsed_ms": elapsed_ms, "inputs": inputs})
+    }
+
+    #[test]
+    fn only_sessions_with_work_under_way_are_jobs_to_show() {
+        let none = json!([]);
+        let activity = |job: Option<Job>| job.map(|job| job.activity());
+        assert_eq!(
+            activity(job("session", "running", &live(5, &none))),
+            Some(JobActivity::Working)
+        );
+        assert_eq!(
+            activity(job("session", "queued", &live(5, &none))),
+            Some(JobActivity::Working)
+        );
+        assert_eq!(
+            activity(job("session", "waiting_for_input", &live(5, &none))),
+            Some(JobActivity::Waiting)
+        );
+        assert_eq!(activity(job("session", "completed", &live(5, &none))), None);
+        assert_eq!(activity(job("session", "idle", &json!(null))), None);
+        assert_eq!(
+            activity(job("subagent", "running", &live(5, &none))),
+            None,
+            "a subagent's session can't be attached to"
+        );
+
+        // A subagent's question keeps its parent waiting between turns.
+        let asks = json!([{"id": 1, "asker": "subagent", "ask": {"kind": "question",
+            "title": "Which?", "questions": []}}]);
+        assert_eq!(
+            activity(job("session", "completed", &live(5, &asks))),
+            Some(JobActivity::Waiting)
+        );
+    }
+
+    /// The daemon reports a running turn's elapsed time anew at each
+    /// listing. If that alone made a job look changed, the sidebar would
+    /// reload the session list at every poll while anything runs.
+    #[test]
+    fn elapsed_time_alone_does_not_change_a_job() {
+        let at = |ms| job("session", "running", &live(ms, &json!([]))).expect("a running job");
+        let (earlier, later) = (at(1_000), at(2_000));
+        assert_ne!(earlier.turn_elapsed(), later.turn_elapsed());
+        assert!(earlier.is_same_work(&later));
+
+        let waiting = job("session", "waiting_for_input", &live(2_000, &json!([])));
+        assert!(!earlier.is_same_work(&waiting.expect("a waiting job")));
     }
 }

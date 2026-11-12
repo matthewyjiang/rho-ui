@@ -54,7 +54,7 @@ pub(crate) struct Transcript {
     /// [`TurnTimes`].
     took: Vec<Option<Duration>>,
     /// The running turn's index. It may not have a prompt row yet: a sent
-    /// prompt shows once the agent echoes it.
+    /// prompt shows once the daemon echoes it.
     running: Option<usize>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
@@ -126,7 +126,7 @@ impl Transcript {
     }
 
     /// The user sent a prompt: the turn it starts runs, though its prompt
-    /// row comes only when the agent echoes it.
+    /// row comes only when the daemon echoes it.
     pub(crate) fn expect_turn(&mut self) {
         self.running = Some(self.timeline.turns().len());
     }

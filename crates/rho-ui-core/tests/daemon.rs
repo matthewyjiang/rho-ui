@@ -43,7 +43,7 @@ async fn until(events: &mut DaemonEvents, session: &mut Session, done: impl Fn(&
                     session.apply(update);
                 }
             }
-            other => panic!("unexpected event: {other:?}"),
+            other @ DaemonEvent::Detached { .. } => panic!("unexpected event: {other:?}"),
         }
     }
 }
@@ -54,8 +54,7 @@ async fn new_session(daemon: &Daemon) -> Session {
         .new_session(Path::new("/w/a"))
         .await
         .expect("the fake opens a session");
-    let mut session = Session::new(setup.id().clone());
-    session.set_setup(setup);
+    let mut session = Session::from_setup(setup);
     let attached = daemon.attach(session.id()).await;
     session.attached(attached.expect("the fake attaches to a session it opened"));
     session
@@ -73,7 +72,6 @@ fn a_prompt_runs_a_turn_through_an_approval() {
     let fake = FakeDaemon::start(Script::default());
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
-        assert_eq!(daemon.info().version(), "9.9.9");
         assert_eq!(daemon.info().notice(), None, "the fake is this build");
 
         let mut session = new_session(&daemon).await;
@@ -167,14 +165,13 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
         };
         assert_eq!(job.session().as_str(), TUI_SESSION);
         assert_eq!(job.title(), Some("from the tui"));
-        assert_eq!(
-            job.activity(),
-            JobActivity::Working(Some(Duration::from_secs(90)))
-        );
+        assert_eq!(job.activity(), JobActivity::Working);
+        let ran = Duration::from_secs(90);
+        assert!(job.turn_elapsed() >= Some(ran), "{:?}", job.turn_elapsed());
 
         let mut session = Session::new(job.session().clone());
         let attached = daemon.attach(session.id()).await.unwrap();
-        assert_eq!(attached.turn_elapsed(), Some(Duration::from_secs(90)));
+        assert!(attached.turn_elapsed() >= Some(ran));
         session.attached(attached);
         until(&mut events, &mut session, |s| !s.is_replaying()).await;
         assert_eq!(session.title(), Some("from the tui"));
@@ -261,7 +258,7 @@ fn deleting_a_followed_session_detaches_it() {
             DaemonEvent::Detached { session, reason } => {
                 assert_eq!((session, reason), (id, Detached::Deleted));
             }
-            other => panic!("expected the detach, got {other:?}"),
+            other @ DaemonEvent::Update { .. } => panic!("expected the detach, got {other:?}"),
         }
         let gone = daemon.attach(&SessionId::from("s1")).await.unwrap_err();
         assert_eq!(gone, DaemonError::Refused("no session s1".to_owned()));
@@ -281,12 +278,19 @@ fn a_missing_rho_fails_the_connection_with_a_reason() {
 }
 
 #[test]
-fn the_stream_reports_the_connection_closing_once() {
+fn the_stream_ends_when_the_connection_does() {
     let fake = FakeDaemon::start(Script::default());
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
         drop(daemon);
-        assert!(matches!(next(&mut events).await, DaemonEvent::Closed));
-        assert!(events.recv().now_or_never().flatten().is_none());
+        let timeout = async {
+            smol::Timer::after(Duration::from_secs(5)).await;
+            panic!("the stream stayed open for 5 s");
+        };
+        let ended = futures::select! {
+            event = events.recv().fuse() => event,
+            never = timeout.fuse() => never,
+        };
+        assert!(ended.is_none(), "{ended:?}");
     });
 }

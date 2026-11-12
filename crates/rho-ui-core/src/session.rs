@@ -27,7 +27,7 @@ use crate::{
 #[derive(Debug)]
 pub struct SessionUpdate(pub(crate) SessionEvent);
 
-/// What `rho/session/new` returned. Hand it to [`Session::set_setup`].
+/// What `rho/session/new` returned. Hand it to [`Session::from_setup`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSetup {
     pub(crate) id: SessionId,
@@ -309,15 +309,25 @@ pub struct Session {
     steers: Vec<Steer>,
     /// Steers a turn dropped when it ended; see [`Self::take_dropped_steers`].
     dropped_steers: Vec<String>,
-    /// IDs of steers that reached the conversation before
-    /// [`Self::steer_sent`] recorded them: the daemon's answer to a steer
-    /// and the steer's own event race each other here.
+    /// IDs of steers that reached the conversation and that
+    /// [`Self::steer_sent`] has not recorded. One sent from here lands in
+    /// it when its event beats the daemon's answer to the steer; another
+    /// client's steers land in it too, and stay. Emptied when a turn ends.
     early_steers: Vec<SteerId>,
-    /// Events that arrived before the attach response; `None` once
-    /// [`Self::attached`] has run.
-    held: Option<Vec<SessionEvent>>,
-    /// Events of the attachment's replay still to come.
-    replay_left: u64,
+    sync: Sync,
+}
+
+/// How far the session's attachment has come.
+#[derive(Clone, Debug)]
+enum Sync {
+    /// The attach has not answered. The events that arrive are kept until
+    /// it does.
+    Attaching(Vec<SessionEvent>),
+    /// The attach answered, and this many events of its replay are still
+    /// to come.
+    Replaying(u64),
+    /// Every event is something happening now.
+    Live,
 }
 
 impl Session {
@@ -338,15 +348,17 @@ impl Session {
             steers: Vec::new(),
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
-            held: Some(Vec::new()),
-            replay_left: 0,
+            sync: Sync::Attaching(Vec::new()),
         }
     }
 
-    /// Records what `rho/session/new` returned, so a new session's settings
-    /// show before its attachment answers.
-    pub fn set_setup(&mut self, setup: SessionSetup) {
-        self.set_options(setup.options);
+    /// The session `rho/session/new` opened, with the settings it answered
+    /// with, so they show before the session's attachment answers. Like
+    /// [`Self::new`], it holds its events until [`Self::attached`].
+    pub fn from_setup(setup: SessionSetup) -> Self {
+        let mut session = Self::new(setup.id);
+        session.set_options(setup.options);
+        session
     }
 
     /// Records the attach response, then applies the events held for it.
@@ -361,9 +373,14 @@ impl Session {
         for request in response.inputs {
             self.open_input(InputRequest::from_wire(request));
         }
-        self.replay_left = response.replay_events;
-        for event in self.held.take().unwrap_or_default() {
-            self.apply_event(event);
+        let replay = match response.replay_events {
+            0 => Sync::Live,
+            events => Sync::Replaying(events),
+        };
+        if let Sync::Attaching(held) = std::mem::replace(&mut self.sync, replay) {
+            for event in held {
+                self.apply_event(event);
+            }
         }
     }
 
@@ -406,7 +423,7 @@ impl Session {
     /// its replay has yet to arrive. State changes until then are history,
     /// not something happening now.
     pub fn is_replaying(&self) -> bool {
-        self.held.is_some() || self.replay_left > 0
+        !matches!(self.sync, Sync::Live)
     }
 
     /// Context fill and spend, once reported.
@@ -492,17 +509,22 @@ impl Session {
     /// that row. Before [`Self::attached`] it keeps the event and returns
     /// `None`.
     pub fn apply(&mut self, update: SessionUpdate) -> Option<usize> {
-        match &mut self.held {
-            Some(held) => {
+        match &mut self.sync {
+            Sync::Attaching(held) => {
                 held.push(update.0);
                 None
             }
-            None => self.apply_event(update.0),
+            Sync::Replaying(_) | Sync::Live => self.apply_event(update.0),
         }
     }
 
     fn apply_event(&mut self, event: SessionEvent) -> Option<usize> {
-        self.replay_left = self.replay_left.saturating_sub(1);
+        if let Sync::Replaying(left) = &mut self.sync {
+            *left -= 1;
+            if *left == 0 {
+                self.sync = Sync::Live;
+            }
+        }
         match event {
             SessionEvent::UserMessage {
                 message,
@@ -741,7 +763,7 @@ impl Session {
     /// A session past its attach response, for tests that only feed events.
     pub(crate) fn following(id: SessionId) -> Self {
         let mut session = Self::new(id);
-        session.held = None;
+        session.sync = Sync::Live;
         session
     }
 }

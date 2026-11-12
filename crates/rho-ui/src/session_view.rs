@@ -59,7 +59,7 @@ pub(crate) enum Loading {
     /// A new session, or a saved one the daemon has attached.
     Ready,
     /// The attach to a saved session has not answered yet.
-    Resuming,
+    Attaching,
     /// The attach failed.
     Failed(String),
 }
@@ -83,7 +83,7 @@ pub(crate) struct SessionView {
     busy_since: Option<Instant>,
     /// When the turn under way started, for a session attached mid-turn:
     /// the daemon says how long it had run.
-    resumed_at: Option<Instant>,
+    turn_began: Option<Instant>,
     /// When the oldest open request arrived.
     waiting_since: Option<Instant>,
     /// Title and activity as last reported in [`SessionEvent::LiveChanged`].
@@ -97,8 +97,8 @@ pub(crate) struct SessionView {
 impl EventEmitter<SessionEvent> for SessionView {}
 
 impl SessionView {
-    /// A resumed session starts as [`Loading::Resuming`] until
-    /// [`Self::finish_loading`].
+    /// A saved session starts as [`Loading::Attaching`] until
+    /// [`Self::attached`].
     pub(crate) fn new(
         daemon: Daemon,
         session: Session,
@@ -141,7 +141,7 @@ impl SessionView {
             cwd,
             workspace,
             // A resumed session is already saved.
-            prompted: matches!(loading, Loading::Resuming),
+            prompted: matches!(loading, Loading::Attaching),
             loading,
             transcript,
             composer,
@@ -149,7 +149,7 @@ impl SessionView {
             approval_focus: cx.focus_handle(),
             sending: false,
             busy_since: None,
-            resumed_at: None,
+            turn_began: None,
             waiting_since: None,
             reported: (String::new(), Activity::Idle),
             error: None,
@@ -242,7 +242,7 @@ impl SessionView {
     }
 
     /// Records the answer to the attach.
-    pub(crate) fn finish_loading(
+    pub(crate) fn attached(
         &mut self,
         result: Result<Attached, DaemonError>,
         window: &mut Window,
@@ -250,7 +250,7 @@ impl SessionView {
     ) {
         match result {
             Ok(attached) => {
-                self.resumed_at = attached
+                self.turn_began = attached
                     .turn_elapsed()
                     .and_then(|elapsed| Instant::now().checked_sub(elapsed));
                 self.session.attached(attached);
@@ -284,7 +284,7 @@ impl SessionView {
         let busy = self.is_busy();
         match (busy, self.busy_since) {
             (true, None) => {
-                self.busy_since = Some(self.resumed_at.take().unwrap_or(now));
+                self.busy_since = Some(self.turn_began.take().unwrap_or(now));
                 self.transcript.begin_turn(cx);
             }
             (false, Some(since)) => {
@@ -498,14 +498,14 @@ impl SessionView {
         if self.session.entries().is_empty() {
             let placeholder = Empty::new();
             return match &self.loading {
-                Loading::Resuming => placeholder.header(
+                Loading::Attaching => placeholder.header(
                     EmptyHeader::new()
                         .media(EmptyMedia::new().child(Spinner::new()))
                         .description(EmptyDescription::new().child("Loading session…")),
                 ),
                 Loading::Failed(message) => placeholder.content(
                     EmptyContent::new().max_w(rems(36.)).child(
-                        Alert::error("resume-error", SharedString::from(message.clone()))
+                        Alert::error("attach-error", SharedString::from(message.clone()))
                             .title("Couldn't open this session"),
                     ),
                 ),

@@ -199,9 +199,10 @@ impl RhoApp {
                 let routed =
                     this.update_in(cx, |this, window, cx| this.route_event(event, window, cx));
                 if routed.is_err() {
-                    break;
+                    return;
                 }
             }
+            let _ = this.update_in(cx, RhoApp::disconnected);
         });
     }
 
@@ -209,7 +210,7 @@ impl RhoApp {
         let info = daemon.info();
         let label = format!("rho {}", info.version());
         self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_agent(label, cx));
+            .update(cx, |sidebar, cx| sidebar.set_version(label, cx));
         if let Some(notice) = info.notice() {
             window.push_notification(
                 Notification::warning(notice.to_owned()).title("rho daemon is another build"),
@@ -239,7 +240,13 @@ impl RhoApp {
     /// also when the saved list goes stale: a session another client
     /// started appears, or one's turn ended.
     fn set_jobs(&mut self, jobs: Vec<Job>, cx: &mut Context<'_, Self>) {
-        if self.jobs == jobs {
+        let same = self.jobs.len() == jobs.len()
+            && self
+                .jobs
+                .iter()
+                .zip(&jobs)
+                .all(|(was, now)| was.is_same_work(now));
+        if same {
             return;
         }
         self.sidebar
@@ -283,15 +290,20 @@ impl RhoApp {
                 Detached::Behind => self.reopen_session(&session, window, cx),
                 Detached::Deleted => self.session_deleted(&session, window, cx),
                 Detached::Restarting => self.restarting = true,
-                // The connection closes next, which says so.
-                Detached::Stopping => {}
             },
-            DaemonEvent::Closed if self.restarting => self.connect(window, cx),
-            DaemonEvent::Closed => {
-                self.forget_sessions(cx);
-                self.status = DaemonStatus::Failed(DaemonError::Closed.to_string());
-                cx.notify();
-            }
+        }
+    }
+
+    /// The connection ended. After the daemon said it was restarting, that
+    /// is expected, and answered by connecting again; `rho daemon start`
+    /// waits until the restarted daemon answers.
+    fn disconnected(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.restarting {
+            self.connect(window, cx);
+        } else {
+            self.forget_sessions(cx);
+            self.status = DaemonStatus::Failed(DaemonError::Closed.to_string());
+            cx.notify();
         }
     }
 
@@ -406,9 +418,8 @@ impl RhoApp {
                 let draft = draft.upgrade().filter(|_| this.epoch == epoch)?;
                 match setup {
                     Ok(setup) => {
-                        let id = setup.id().clone();
-                        let mut session = Session::new(id.clone());
-                        session.set_setup(setup);
+                        let session = Session::from_setup(setup);
+                        let id = session.id().clone();
                         let daemon = daemon.clone();
                         draft.update(cx, |draft, cx| draft.open(daemon, session, window, cx));
                         Some(id)
@@ -445,7 +456,7 @@ impl RhoApp {
             draft.update(cx, |draft, cx| draft.attached(attached, window, cx));
         } else if let Some(open) = self.opened(id) {
             open.view
-                .update(cx, |view, cx| view.finish_loading(attached, window, cx));
+                .update(cx, |view, cx| view.attached(attached, window, cx));
         } else if attached.is_ok() {
             let (daemon, id) = (daemon.clone(), id.clone());
             cx.spawn(async move |_, _| {
@@ -607,7 +618,7 @@ impl RhoApp {
                 session,
                 cwd,
                 workspace,
-                Loading::Resuming,
+                Loading::Attaching,
                 window,
                 cx,
             )
