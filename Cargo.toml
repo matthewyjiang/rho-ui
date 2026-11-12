@@ -11,9 +11,11 @@ publish = false
 rust-version = "1.93"
 
 [workspace.dependencies]
-# Exact pins on purpose: ACP v2 is a draft that changes between releases, and
-# rho pins this same version, so both ends speak the same schema.
-agent-client-protocol = { version = "=3.5.0" }
+# rho's daemon protocol: wire types and the client. Unpublished while it is
+# 0.1, so pinned to a commit of rho's `daemon-v3` branch; a daemon built from
+# another commit may speak a different wire, which `rho/hello` reports. Move
+# to the crates.io release once there is one.
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "bf3af5b787bcd5753479e655303eaeb4d9c55645" }
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.0" }
 

@@ -1,8 +1,8 @@
 //! rho-ui: the desktop UI for the rho coding agent.
 //!
-//! `rho-ui [DIR] [-- AGENT COMMAND...]` opens one window. DIR is the
-//! workspace for new sessions (default: the current directory); the agent
-//! command defaults to `rho acp`.
+//! `rho-ui [DIR] [--rho PROGRAM]` opens one window. DIR is the workspace for
+//! new sessions (default: the current directory); PROGRAM is the `rho` that
+//! starts and locates the daemon (default: `rho` on `PATH`).
 
 mod app;
 mod approval;
@@ -33,7 +33,7 @@ use gpui_kit::{
     px, size, App, AppContext as _, AssetSource, KeyBinding, SharedString, TitlebarOptions,
     WindowBounds, WindowOptions,
 };
-use rho_ui_core::AgentCommand;
+use rho_ui_core::DaemonTarget;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
@@ -71,7 +71,8 @@ gpui_kit::assets::icon_assets!(
         Brain,
         Wrench,
         Shield,
-        Zap
+        Zap,
+        CornerDownRight
     ]
 );
 
@@ -94,28 +95,20 @@ impl AssetSource for Assets {
     }
 }
 
-const USAGE: &str = "usage: rho-ui [DIR] [-- AGENT COMMAND...]";
+const USAGE: &str = "usage: rho-ui [DIR] [--rho PROGRAM]";
 
-/// Parses `[DIR] [-- AGENT COMMAND...]`. Returns the usage text on bad input.
+/// Parses `[DIR] [--rho PROGRAM]`. Returns the usage text on bad input.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, String> {
     let mut args = args.into_iter();
     let mut dir: Option<PathBuf> = None;
-    let mut command = AgentCommand::rho();
-    let mut command_line = "rho acp".to_owned();
+    let mut daemon = DaemonTarget::rho();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--" => {
-                let rest = args.by_ref();
-                let program = rest
+            "--rho" => {
+                let program = args
                     .next()
-                    .ok_or_else(|| format!("missing agent command after --\n{USAGE}"))?;
-                let args: Vec<String> = rest.collect();
-                command_line = std::iter::once(program.as_str())
-                    .chain(args.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                command = AgentCommand::new(program, args);
-                break;
+                    .ok_or_else(|| format!("missing program after --rho\n{USAGE}"))?;
+                daemon = DaemonTarget::Rho(PathBuf::from(program));
             }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             flag if flag.starts_with('-') => return Err(format!("unknown option {flag}\n{USAGE}")),
@@ -134,11 +127,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
     if !workspace.is_dir() {
         return Err(format!("{} is not a directory", workspace.display()));
     }
-    Ok(LaunchConfig {
-        workspace,
-        command,
-        command_line,
-    })
+    Ok(LaunchConfig { workspace, daemon })
 }
 
 #[expect(
@@ -209,19 +198,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_command_follows_double_dash() {
-        let launch = parse(&["/tmp", "--", "rho", "--model", "x", "acp"]).unwrap();
+    fn rho_program_follows_its_flag() {
+        let launch = parse(&["/tmp", "--rho", "/opt/rho/bin/rho"]).unwrap();
         assert_eq!(
             launch.workspace,
             PathBuf::from("/tmp").canonicalize().unwrap()
         );
-        assert_eq!(launch.command_line, "rho --model x acp");
+        assert_eq!(
+            launch.daemon,
+            DaemonTarget::Rho(PathBuf::from("/opt/rho/bin/rho"))
+        );
+        assert_eq!(parse(&["/tmp"]).unwrap().daemon, DaemonTarget::rho());
     }
 
     #[test]
-    fn rejects_extra_positional_and_empty_command() {
+    fn rejects_extra_positional_and_missing_program() {
         assert!(parse(&["/tmp", "/var"]).is_err());
-        assert!(parse(&["--"]).is_err());
+        assert!(parse(&["--rho"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
     }
 }

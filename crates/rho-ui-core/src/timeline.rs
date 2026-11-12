@@ -269,25 +269,25 @@ mod tests {
     use super::*;
     use crate::{Session, SessionId, SessionUpdate};
 
-    /// A session built from ACP updates: `("tool", kind)`, `("thought", text)`,
-    /// `("agent", text)`, `("notice", title)` or `("user", text)`.
+    /// A session built from daemon events: `("tool", kind)`,
+    /// `("thought", text)`, `("agent", text)`, `("notice", text)` or
+    /// `("user", text)`.
     fn entries(script: &[(&str, &str)]) -> Vec<Entry> {
-        let mut session = Session::new(SessionId::from("s"));
+        let mut session = Session::following(SessionId::from("s"));
         for (n, (what, text)) in script.iter().enumerate() {
-            let update = match *what {
-                "tool" => serde_json::json!({"sessionUpdate": "tool_call_update",
-                    "toolCallId": format!("t{n}"), "title": "x", "kind": text}),
-                "thought" => serde_json::json!({"sessionUpdate": "agent_thought_chunk",
-                    "messageId": format!("m{n}"), "content": {"type": "text", "text": text}}),
-                "notice" => serde_json::json!({"sessionUpdate": "notice",
-                    "severity": "info", "title": text}),
-                "agent" => serde_json::json!({"sessionUpdate": "agent_message_chunk",
-                    "messageId": format!("m{n}"), "content": {"type": "text", "text": text}}),
-                _ => serde_json::json!({"sessionUpdate": "user_message",
-                    "messageId": format!("m{n}"), "content": [{"type": "text", "text": text}]}),
+            let event = match *what {
+                "tool" => serde_json::json!({"type": "tool_call",
+                    "id": format!("t{n}"), "title": "x", "kind": text}),
+                "thought" => serde_json::json!({"type": "thought_chunk",
+                    "message": format!("m{n}"), "text": text}),
+                "notice" => serde_json::json!({"type": "notice", "text": text}),
+                "agent" => serde_json::json!({"type": "agent_message_chunk",
+                    "message": format!("m{n}"), "text": text}),
+                _ => serde_json::json!({"type": "user_message",
+                    "message": format!("m{n}"), "content": [{"type": "text", "text": text}]}),
             };
             session.apply(SessionUpdate(
-                serde_json::from_value(update).expect("the script is valid ACP"),
+                serde_json::from_value(event).expect("the script is a valid event"),
             ));
         }
         session.entries().to_vec()

@@ -1,5 +1,5 @@
 //! The prompt box under the transcript. Enter sends, Shift+Enter starts a new
-//! line; while a turn runs the box is disabled and Send becomes Stop. Its
+//! line; while a turn runs Send becomes Stop, and Enter steers the turn. Its
 //! footer holds the session settings on both sides, then context use and
 //! cost, then the round Send button.
 
@@ -39,7 +39,7 @@ pub(crate) enum ComposerMode {
     Send,
     /// The session is being created: the box is disabled and Send spins.
     Starting,
-    /// A turn is running: the box is disabled and Stop replaces Send.
+    /// A turn is running: Stop replaces Send, and Enter steers the turn.
     Stop,
 }
 
@@ -126,7 +126,7 @@ impl RenderOnce for Composer {
             .child(
                 Textarea::new(&self.state)
                     .appearance(false)
-                    .disabled(self.mode != ComposerMode::Send)
+                    .disabled(self.mode == ComposerMode::Starting)
                     .aria_label("Prompt"),
             )
             .child(

@@ -39,6 +39,26 @@ pub(crate) enum Action {
 /// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
 
+/// The turn in progress, by its index among the timeline's turns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Running {
+    /// A turn a prompt starts. It may not have its prompt row yet: the row
+    /// comes when the daemon echoes the prompt, after the turn began.
+    Prompted(usize),
+    /// A turn with no prompt, as the daemon starts one when a session's
+    /// background work finishes. Its rows join this turn, the newest, which
+    /// keeps the time it took itself.
+    Joined(usize),
+}
+
+impl Running {
+    fn turn(self) -> usize {
+        match self {
+            Self::Prompted(turn) | Self::Joined(turn) => turn,
+        }
+    }
+}
+
 /// A session's transcript state. Flat arrays indexed by row, entry or turn.
 pub(crate) struct Transcript {
     scroller: Entity<MessageScrollerState>,
@@ -49,12 +69,11 @@ pub(crate) struct Transcript {
     details: Vec<Disclosure>,
     /// Per turn: whether its folded working is open.
     worked: Vec<Disclosure>,
-    /// Per turn: how long it took, for turns rho-ui ran. ACP sends no turn
-    /// times, so a replayed turn has one only from [`TurnTimes`].
+    /// Per turn: how long it took, for turns rho-ui watched. The daemon
+    /// replays no turn times, so a replayed turn has one only from
+    /// [`TurnTimes`].
     took: Vec<Option<Duration>>,
-    /// The running turn's index. It may not have a prompt row yet: a sent
-    /// prompt shows once the agent echoes it.
-    running: Option<usize>,
+    running: Option<Running>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
 }
@@ -98,6 +117,17 @@ impl Transcript {
         for turn in known..turns {
             self.took[turn] = self.prompt_id(turn, entries).and_then(|id| times.get(id));
         }
+        // Rows came for a turn that began without a prompt row to open it:
+        // they joined the newest turn, which unfolds to show them.
+        let grew = synced.added > 0 || synced.grew.is_some();
+        if let (Some(Running::Prompted(expected)), Some(newest)) =
+            (self.running, turns.checked_sub(1))
+        {
+            if expected == turns && grew {
+                self.running = Some(Running::Joined(newest));
+                self.remeasure(self.timeline.turn_rows(newest), cx);
+            }
+        }
         // A finished turn that grows, as history replays, folds more rows.
         if let Some(newest) = turns.checked_sub(1) {
             if (synced.added > 0 || synced.grew.is_some()) && self.is_finished(newest) {
@@ -124,36 +154,39 @@ impl Transcript {
         }
     }
 
-    /// The user sent a prompt: the turn it starts runs, though its prompt
-    /// row comes only when the agent echoes it.
+    /// A turn began, here or in another client: it is the next one, though
+    /// its prompt row comes only when the daemon echoes the prompt. The
+    /// turns before it stay folded.
     pub(crate) fn expect_turn(&mut self) {
-        self.running = Some(self.timeline.turns().len());
+        self.running = Some(Running::Prompted(self.timeline.turns().len()));
     }
 
-    /// The agent is working. Unless a sent prompt started the turn, it is
-    /// the newest one, which unfolds.
-    pub(crate) fn begin_turn(&mut self, cx: &mut App) {
-        if self.running.is_none() {
-            let newest = self.timeline.turns().len().saturating_sub(1);
-            self.running = Some(newest);
-            self.remeasure(self.timeline.turn_rows(newest), cx);
-        }
+    /// The session was attached with a turn under way: it is the newest
+    /// one, which unfolds.
+    pub(crate) fn resume_turn(&mut self, cx: &mut App) {
+        let newest = self.timeline.turns().len().saturating_sub(1);
+        self.running = Some(Running::Prompted(newest));
+        self.remeasure(self.timeline.turn_rows(newest), cx);
     }
 
     /// The running turn finished after `took`, and folds. Its time is saved
     /// for when the session replays. A prompt that never arrived leaves no
-    /// turn to time.
+    /// turn to time, and a turn without a prompt none to time it under.
     pub(crate) fn end_turn(&mut self, took: Duration, entries: &[Entry], cx: &mut App) {
-        let Some(turn) = self.running.take() else {
+        let Some(running) = self.running.take() else {
             return;
         };
-        if let Some(slot) = self.took.get_mut(turn) {
-            *slot = Some(took);
+        let turn = running.turn();
+        if turn >= self.took.len() {
+            return;
+        }
+        if let Running::Prompted(_) = running {
+            self.took[turn] = Some(took);
             if let Some(prompt) = self.prompt_id(turn, entries) {
                 cx.global_mut::<TurnTimes>().record(prompt, took);
             }
-            self.remeasure(self.timeline.turn_rows(turn), cx);
         }
+        self.remeasure(self.timeline.turn_rows(turn), cx);
     }
 
     /// The message ID of `turn`'s prompt.
@@ -204,7 +237,7 @@ impl Transcript {
     }
 
     fn is_finished(&self, turn: usize) -> bool {
-        self.running.is_none_or(|running| turn < running)
+        self.running.is_none_or(|running| turn < running.turn())
     }
 
     fn remeasure(&self, rows: Range<usize>, cx: &mut App) {
@@ -234,7 +267,7 @@ impl Transcript {
                 return div().into_any_element();
             }
         }
-        let running = self.running.is_some() && turn == self.running;
+        let running = turn.is_some() && turn == self.running.map(Running::turn);
         let phase = if running && ix + 1 == self.timeline.rows().len() {
             Phase::Live
         } else {

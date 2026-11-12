@@ -141,10 +141,7 @@ fn parse_patches(tool: &ToolCall) -> Patches {
     let mut shown = Vec::new();
     let mut rows = 0usize;
     for (ix, content) in tool.content().iter().enumerate() {
-        let ToolContent::Diff {
-            patch: Some(patch), ..
-        } = content
-        else {
+        let ToolContent::Diff { patch, .. } = content else {
             continue;
         };
         let Ok(parsed) = DiffFile::parse(patch) else {
@@ -471,10 +468,6 @@ fn status_icon(tool: &ToolCall, cx: &App) -> AnyElement {
         ToolStatus::Pending | ToolStatus::Running => Spinner::new().xsmall().into_any_element(),
         ToolStatus::Done => kind_icon(tool.kind(), cx),
         ToolStatus::Failed => failed_icon(cx),
-        ToolStatus::Cancelled => Icon::new(IconName::Ban)
-            .small()
-            .text_color(cx.theme().muted_foreground)
-            .into_any_element(),
     }
 }
 
@@ -488,18 +481,16 @@ fn output(tool: &ToolCall, diff: Option<&DiffView>, cx: &App) -> Option<AnyEleme
         .filter(|(ix, _)| diff.is_none_or(|diff| !diff.shown.contains(ix)))
         .map(|(_, content)| match content {
             ToolContent::Text(text) => monospace(text, cx).into_any_element(),
-            ToolContent::Diff { paths, patch } => v_flex()
+            ToolContent::Diff { path, patch } => v_flex()
                 .gap_1()
-                .children(paths.iter().map(|path| {
+                .child(
                     div()
                         .text_xs()
                         .font_semibold()
                         .font_family(cx.theme().mono_font_family.clone())
-                        .child(path.display().to_string())
-                }))
-                .when_some(patch.as_deref(), |this, patch| {
-                    this.child(monospace(patch, cx))
-                })
+                        .child(path.display().to_string()),
+                )
+                .child(monospace(patch, cx))
                 .into_any_element(),
         })
         .collect();

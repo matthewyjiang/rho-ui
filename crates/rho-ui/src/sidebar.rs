@@ -40,10 +40,10 @@ use gpui_kit::{
     Rems, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement,
     Styled, Subscription, Task, WeakEntity, Window,
 };
-use rho_ui_core::{SessionId, SessionSummary};
+use rho_ui_core::{Job, SessionId, SessionSummary};
 
 use crate::{
-    session_list::{Activity, Item, LiveSession, Row, SavedSession, SessionList},
+    session_list::{Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList},
     shelf::{Shelf, Shelves},
     time,
     workspaces::{Workspace, Workspaces},
@@ -198,8 +198,8 @@ pub(crate) struct SidebarView {
     active: Option<SessionId>,
     hover: Option<Hover>,
     error: Option<SharedString>,
-    /// The agent's name and version, for the footer.
-    agent: Option<SharedString>,
+    /// rho's name and version, for the footer.
+    version: Option<SharedString>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
     /// The list's height in the last frame, which the gap above the
@@ -243,7 +243,7 @@ impl SidebarView {
             active: None,
             hover: None,
             error: None,
-            agent: None,
+            version: None,
             search,
             scroll: VirtualListScrollHandle::new(),
             viewport: Pixels::ZERO,
@@ -262,10 +262,7 @@ impl SidebarView {
                     id: session.id().clone(),
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(|title| title.to_owned().into()),
-                    updated: session
-                        .updated_at()
-                        .and_then(time::unix_seconds)
-                        .unwrap_or(0),
+                    updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
                 })
                 .collect()
         });
@@ -279,6 +276,24 @@ impl SidebarView {
         cx.notify();
     }
 
+    /// Replaces the sessions with work under way in the daemon.
+    pub(crate) fn set_jobs(&mut self, jobs: &[Job], cx: &mut Context<'_, Self>) {
+        let jobs = self.workspaces.update(cx, |workspaces, cx| {
+            jobs.iter()
+                .map(|job| JobSession {
+                    workspace: workspaces.index(job.cwd(), cx),
+                    id: job.session().clone(),
+                    cwd: job.cwd().to_path_buf(),
+                    title: job.title().map(|title| title.to_owned().into()),
+                    activity: job.activity(),
+                    turn_elapsed: job.turn_elapsed(),
+                })
+                .collect()
+        });
+        self.list.set_jobs(jobs, Instant::now(), time::now_unix());
+        self.rebuild(cx);
+    }
+
     /// Records an open session's title and activity.
     pub(crate) fn set_live(&mut self, live: LiveSession, cx: &mut Context<'_, Self>) {
         let workspace = self
@@ -289,13 +304,19 @@ impl SidebarView {
         }
     }
 
+    /// Forgets an open session's own state, once its view is gone.
+    pub(crate) fn close_live(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+        self.list.close_live(id);
+        self.rebuild(cx);
+    }
+
     /// Marks a session as started or continued here, so it stays active.
     pub(crate) fn own(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
         self.shelves.own(id.as_str());
         self.rebuild(cx);
     }
 
-    /// Drops a session the agent deleted.
+    /// Drops a session that was deleted.
     pub(crate) fn remove(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
         self.list.remove(id);
         self.shelves.forget(id.as_str());
@@ -305,7 +326,7 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    /// Forgets every open session, after the agent restarts.
+    /// Forgets every open session and job, once the connection is gone.
     pub(crate) fn clear_live(&mut self, cx: &mut Context<'_, Self>) {
         self.list.clear_live();
         self.active = None;
@@ -319,8 +340,8 @@ impl SidebarView {
         }
     }
 
-    pub(crate) fn set_agent(&mut self, agent: String, cx: &mut Context<'_, Self>) {
-        self.agent = Some(agent.into());
+    pub(crate) fn set_version(&mut self, version: String, cx: &mut Context<'_, Self>) {
+        self.version = Some(version.into());
         cx.notify();
     }
 
@@ -817,11 +838,11 @@ impl SidebarView {
                                 cx.emit(SidebarEvent::OpenSettings);
                             })),
                     )
-                    .children(self.agent.clone().map(|agent| {
+                    .children(self.version.clone().map(|version| {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(agent)
+                            .child(version)
                     })),
             )
     }

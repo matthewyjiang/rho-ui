@@ -1,14 +1,24 @@
-{"sessionUpdate": "user_message", "messageId": "rho-replay-msg-fd64ea23-3123-416a-9cff-ec97c91951b7-0-0", "content": [{"type": "text", "text": "Run `echo hello-from-trace` with your bash tool, then reply with one short sentence."}]}
-{"sessionUpdate": "state_update", "state": "running"}
-{"sessionUpdate": "usage_update", "used": 13258, "size": 1000000}
-{"sessionUpdate": "tool_call_update", "toolCallId": "toolu_012vTAPCTTs85mxXWNQhAUS8", "name": "bash", "title": "echo hello-from-trace", "kind": "execute", "status": "in_progress", "content": [], "locations": [], "rawInput": {"command": "echo hello-from-trace"}}
-{"sessionUpdate": "tool_call_update", "toolCallId": "toolu_012vTAPCTTs85mxXWNQhAUS8", "status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "stdout:\nhello-from-trace\n\n\ntime: 0.0s"}}]}
-{"sessionUpdate": "usage_update", "used": 19795, "size": 1000000, "cost": {"amount": 0.002005, "currency": "USD"}}
-{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "The command print"}}
-{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "ed `hello-from-tr"}}
-{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "ace`, so"}}
-{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": " the bash t"}}
-{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": "ool is"}}
-{"sessionUpdate": "agent_message_chunk", "messageId": "rho-msg-b29d0250-4ef2-45b7-8170-b841a30c7270", "content": {"type": "text", "text": " working."}}
-{"sessionUpdate": "usage_update", "used": 19837, "size": 1000000, "cost": {"amount": 0.002223, "currency": "USD"}}
-{"sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"}
+{"type": "state", "state": "running", "turn": "fb69394e-8268-4ae6-8e1b-acdfc077bc33"}
+{"type": "user_message", "message": "saved-67565910-b146-42d9-ab03-b053057bba6f-0-0", "content": [{"type": "text", "text": "Run `echo hello-from-trace` with your bash tool, then reply with one short sentence."}]}
+{"type": "provider_request"}
+{"type": "usage", "used_tokens": 14459, "window_tokens": 1000000}
+{"type": "tool_call", "id": "toolu_01K6NdZJdYWTA96CXv3A1Tnz", "title": "bash", "kind": "other", "status": "pending", "display": {"card": {"status": "running", "family": "file_command", "header": {"kind": "shell", "prompt": "$"}}}}
+{"type": "tool_call", "id": "toolu_01K6NdZJdYWTA96CXv3A1Tnz", "display": {"card": {"status": "running", "family": "file_command", "header": {"kind": "shell", "prompt": "$", "command": "e"}, "facts": [{"kind": "timeout"}]}}}
+{"type": "tool_call", "id": "toolu_01K6NdZJdYWTA96CXv3A1Tnz", "display": {"card": {"status": "running", "family": "file_command", "header": {"kind": "shell", "prompt": "$", "command": "echo hel"}, "facts": [{"kind": "timeout"}]}}}
+{"type": "tool_call", "id": "toolu_01K6NdZJdYWTA96CXv3A1Tnz", "display": {"card": {"status": "running", "family": "file_command", "header": {"kind": "shell", "prompt": "$", "command": "echo hello-from"}, "facts": [{"kind": "timeout"}]}}}
+{"type": "tool_call", "id": "toolu_01K6NdZJdYWTA96CXv3A1Tnz", "display": {"card": {"status": "running", "family": "file_command", "header": {"kind": "shell", "prompt": "$", "command": "echo hello-from-trace"}, "facts": [{"kind": "timeout"}]}}}
+{"type": "usage", "used_tokens": 14459, "window_tokens": 1000000, "cost_usd_micros": 2173}
+{"type": "tool_call", "id": "toolu_01K6NdZJdYWTA96CXv3A1Tnz", "title": "echo hello-from-trace", "kind": "execute", "status": "in_progress", "raw_input": {"command": "echo hello-from-trace"}, "display": {"card": {"status": "running", "family": "file_command", "header": {"kind": "shell", "prompt": "$", "command": "echo hello-from-trace"}, "facts": [{"kind": "timeout"}]}}}
+{"type": "input_requested", "request": {"id": 0, "ask": {"kind": "approval", "source": {"kind": "built_in_tool", "name": "bash"}, "operation": {"kind": "run_process", "program": "bash", "args": ["-lc"], "shell_command": "echo hello-from-trace", "cwd": "/w"}, "reason": ""}, "tool_call": "toolu_01K6NdZJdYWTA96CXv3A1Tnz"}}
+{"type": "state", "state": "waiting_for_input", "turn": "fb69394e-8268-4ae6-8e1b-acdfc077bc33"}
+{"type": "input_resolved", "id": 0, "resolution": "answered"}
+{"type": "state", "state": "running", "turn": "fb69394e-8268-4ae6-8e1b-acdfc077bc33"}
+{"type": "tool_call", "id": "toolu_01K6NdZJdYWTA96CXv3A1Tnz", "status": "completed", "content": [{"type": "text", "text": "stdout:\nhello-from-trace\n\n\ntime: 0.0s"}], "display": {"card": {"status": "ok", "family": "file_command", "header": {"kind": "shell", "prompt": "$", "command": "echo hello-from-trace"}, "facts": [{"kind": "timeout"}, {"kind": "exit", "code": 0, "duration_ms": 0}], "body": {"kind": "lines", "lines": ["hello-from-trace"]}}}}
+{"type": "provider_request"}
+{"type": "usage", "used_tokens": 21482, "window_tokens": 1000000, "cost_usd_micros": 2173}
+{"type": "agent_message_chunk", "message": "msg-a764edb9-7228-4067-8be6-45de59bb62ba", "text": "The command printed `hello-"}
+{"type": "agent_message_chunk", "message": "msg-a764edb9-7228-4067-8be6-45de59bb62ba", "text": "from-trace`."}
+{"type": "usage", "used_tokens": 21482, "window_tokens": 1000000, "cost_usd_micros": 2404}
+{"type": "usage", "used_tokens": 21514, "window_tokens": 1000000, "cost_usd_micros": 2404}
+{"type": "turn_ended", "turn": "fb69394e-8268-4ae6-8e1b-acdfc077bc33", "outcome": {"type": "answered", "text": "The command printed `hello-from-trace`.", "stop": "end_turn"}}
+{"type": "state", "state": "completed", "turn": "fb69394e-8268-4ae6-8e1b-acdfc077bc33"}

@@ -1,19 +1,24 @@
 //! One session: a header with its title and workspace, the transcript,
 //! approvals, and the composer with the session settings. Owns the session's
 //! [`Session`] state and every request the user makes in it.
+//!
+//! While a turn runs, whoever started it, the composer steers it: Enter adds
+//! the text to the turn's next model request, and it waits above the box
+//! until the model reads it.
 
-use std::{collections::VecDeque, path::PathBuf, rc::Rc, time::Instant};
+use std::{path::PathBuf, rc::Rc, time::Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::Alert,
+    button::{Button, ButtonVariants as _},
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
     input::{InputEvent, TextareaState},
     message_scroller::MessageScroller,
     spinner::Spinner,
-    v_flex, ActiveTheme as _, Icon, Sizable as _, StyledExt as _,
+    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -22,8 +27,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Agent, AgentError, Entry, PermissionRequest, RunState, Session, SessionId, SessionSetup,
-    SessionUpdate,
+    Attached, Daemon, DaemonError, Entry, RunState, Session, SessionId, SessionUpdate, SteerId,
+    Unsteered,
 };
 
 use crate::{
@@ -41,7 +46,8 @@ use crate::{
 pub(crate) enum SessionEvent {
     /// Title or activity changed; see [`SessionView::live`].
     LiveChanged,
-    /// The agent accepted a prompt from here, so the session is rho-ui's.
+    /// The daemon took a prompt or a steer from here, so the session is
+    /// rho-ui's.
     Prompted,
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
@@ -50,16 +56,16 @@ pub(crate) enum SessionEvent {
 
 /// Whether the session is usable yet.
 pub(crate) enum Loading {
-    /// A new session, or a resumed one whose history has arrived.
+    /// A new session, or a saved one the daemon has attached.
     Ready,
-    /// `resume_session` is replaying history.
-    Resuming,
-    /// `resume_session` failed.
+    /// The attach to a saved session has not answered yet.
+    Attaching,
+    /// The attach failed.
     Failed(String),
 }
 
 pub(crate) struct SessionView {
-    agent: Agent,
+    daemon: Daemon,
     session: Session,
     cwd: PathBuf,
     /// The workspace and branch, for the header.
@@ -68,16 +74,17 @@ pub(crate) struct SessionView {
     transcript: Transcript,
     composer: Entity<TextareaState>,
     settings: Entity<SessionSettings>,
-    /// Waiting approvals, oldest first. Dropping one answers "cancelled".
-    approvals: VecDeque<PermissionRequest>,
     approval_focus: FocusHandle,
-    /// A prompt is on its way to the agent.
+    /// A prompt is on its way to the daemon.
     sending: bool,
     /// The first prompt was accepted, so the session is saved.
     prompted: bool,
     /// When the running turn started.
     busy_since: Option<Instant>,
-    /// When the oldest waiting approval arrived.
+    /// When the turn under way started, for a session attached mid-turn:
+    /// the daemon says how long it had run.
+    turn_began: Option<Instant>,
+    /// When the oldest open request arrived.
     waiting_since: Option<Instant>,
     /// Title and activity as last reported in [`SessionEvent::LiveChanged`].
     reported: (String, Activity),
@@ -90,10 +97,10 @@ pub(crate) struct SessionView {
 impl EventEmitter<SessionEvent> for SessionView {}
 
 impl SessionView {
-    /// A resumed session starts as [`Loading::Resuming`] until
-    /// [`Self::finish_loading`].
+    /// A saved session starts as [`Loading::Attaching`] until
+    /// [`Self::attached`].
     pub(crate) fn new(
-        agent: Agent,
+        daemon: Daemon,
         session: Session,
         cwd: PathBuf,
         workspace: WorkspaceRef,
@@ -105,7 +112,7 @@ impl SessionView {
         let composer = composer::new_state(window, cx);
         let settings = cx.new(|cx| {
             SessionSettings::new(
-                agent.clone(),
+                daemon.clone(),
                 session.id().clone(),
                 session.config(),
                 window,
@@ -129,20 +136,20 @@ impl SessionView {
             ),
         ];
         let mut view = Self {
-            agent,
+            daemon,
             session,
             cwd,
             workspace,
             // A resumed session is already saved.
-            prompted: matches!(loading, Loading::Resuming),
+            prompted: matches!(loading, Loading::Attaching),
             loading,
             transcript,
             composer,
             settings,
-            approvals: VecDeque::new(),
             approval_focus: cx.focus_handle(),
             sending: false,
             busy_since: None,
+            turn_began: None,
             waiting_since: None,
             reported: (String::new(), Activity::Idle),
             error: None,
@@ -159,6 +166,11 @@ impl SessionView {
         self.session.id()
     }
 
+    /// Whether the attach failed, so the view shows only why.
+    pub(crate) fn failed_to_attach(&self) -> bool {
+        matches!(self.loading, Loading::Failed(_))
+    }
+
     /// What the sidebar shows for this session.
     pub(crate) fn live(&self) -> LiveSession {
         LiveSession {
@@ -170,8 +182,8 @@ impl SessionView {
         }
     }
 
-    /// The agent's title, or until it sends one (rho names a session after
-    /// its first turn), the first prompt, as rho lists an untitled session.
+    /// rho's title, or until it sends one (rho names a session after its
+    /// first turn), the first prompt, as rho lists an untitled session.
     fn name(&self) -> Option<String> {
         self.session
             .title()
@@ -183,7 +195,7 @@ impl SessionView {
         self.name().unwrap_or_else(|| self.placeholder().to_owned())
     }
 
-    /// The title until the agent gives one: a saved session is untitled.
+    /// The title until rho gives one: a saved session is untitled.
     fn placeholder(&self) -> &'static str {
         if self.prompted {
             UNTITLED
@@ -214,24 +226,41 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let asked = !self.session.inputs().is_empty();
         // The session names the entry it changed; only its row is remeasured.
         // A new entry gets its row in `after_change`.
         if let Some(ix) = self.session.apply(update) {
             self.transcript.changed(self.session.entries(), ix, cx);
         }
+        // Move the keyboard to the default answer if the user is in this
+        // session; never steal focus from another one, nor from a message
+        // being typed, whose Enter would then approve instead of send.
+        let asks = !self.session.inputs().is_empty();
+        let typing = !self.composer.read(cx).value().is_empty();
+        if asks && !asked && !typing && self.focus_handle.contains_focused(window, cx) {
+            window.focus(&self.approval_focus, cx);
+        }
+        // A turn that ended before reading a steer dropped it.
+        let dropped = self.session.take_dropped_steers();
+        if !dropped.is_empty() {
+            self.give_back(&dropped.join("\n"), window, cx);
+        }
         self.after_change(window, cx);
     }
 
-    /// Records the result of `resume_session`.
-    pub(crate) fn finish_loading(
+    /// Records the answer to the attach.
+    pub(crate) fn attached(
         &mut self,
-        result: Result<SessionSetup, AgentError>,
+        result: Result<Attached, DaemonError>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         match result {
-            Ok(setup) => {
-                self.session.set_setup(setup);
+            Ok(attached) => {
+                self.turn_began = attached
+                    .turn_elapsed()
+                    .and_then(|elapsed| Instant::now().checked_sub(elapsed));
+                self.session.attached(attached);
                 self.loading = Loading::Ready;
             }
             Err(error) => self.loading = Loading::Failed(error.to_string()),
@@ -239,20 +268,16 @@ impl SessionView {
         self.after_change(window, cx);
     }
 
-    pub(crate) fn push_approval(
-        &mut self,
-        request: PermissionRequest,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let first = self.approvals.is_empty();
-        self.approvals.push_back(request);
-        // Move the keyboard to the default choice if the user is in this
-        // session; never steal focus from another one.
-        if first && self.focus_handle.contains_focused(window, cx) {
-            window.focus(&self.approval_focus, cx);
-        }
-        self.after_change(window, cx);
+    /// Puts `text` back in the composer, above anything typed since.
+    fn give_back(&self, text: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let typed = self.composer.read(cx).value();
+        let text = if typed.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{text}\n{typed}")
+        };
+        self.composer
+            .update(cx, |state, cx| state.set_value(text, window, cx));
     }
 
     /// Brings the scroller, settings, timers and sidebar up to date with
@@ -260,12 +285,24 @@ impl SessionView {
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.transcript.sync(self.session.entries(), cx);
         self.sync_settings(window, cx);
+        // Until the attachment has caught up, the session's state is the
+        // conversation's past: no turn starts or ends in it now.
+        if self.session.is_replaying() {
+            cx.notify();
+            return;
+        }
         let now = Instant::now();
         let busy = self.is_busy();
         match (busy, self.busy_since) {
+            // Attached with a turn under way: it is the newest one.
+            (true, None) if self.turn_began.is_some() => {
+                self.busy_since = self.turn_began.take();
+                self.transcript.resume_turn(cx);
+            }
+            // A turn began, from here or from another client.
             (true, None) => {
                 self.busy_since = Some(now);
-                self.transcript.begin_turn(cx);
+                self.transcript.expect_turn();
             }
             (false, Some(since)) => {
                 self.busy_since = None;
@@ -275,7 +312,7 @@ impl SessionView {
             }
             _ => {}
         }
-        self.waiting_since = match (self.approvals.is_empty(), self.waiting_since) {
+        self.waiting_since = match (self.session.inputs().is_empty(), self.waiting_since) {
             (true, _) => None,
             (false, since) => Some(since.unwrap_or(now)),
         };
@@ -288,8 +325,10 @@ impl SessionView {
         cx.notify();
     }
 
+    /// Sends the composer's text: as a prompt, or while a turn runs, as a
+    /// steer for it.
     fn send(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.is_busy() || !matches!(self.loading, Loading::Ready) {
+        if self.sending || !matches!(self.loading, Loading::Ready) {
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
@@ -298,25 +337,29 @@ impl SessionView {
         }
         self.composer
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.submit(text, window, cx);
+        if self.session.state().is_busy() {
+            self.steer(text, window, cx);
+        } else {
+            self.submit(text, window, cx);
+        }
     }
 
     /// Sends `text` as the next prompt. A failed send puts it back in the
     /// composer.
     pub(crate) fn submit(&mut self, text: String, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.sending = true;
-        self.transcript.expect_turn();
         self.error = None;
         self.after_change(window, cx);
 
-        let agent = self.agent.clone();
+        let daemon = self.daemon.clone();
         let id = self.session.id().clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = agent.prompt(&id, &text).await;
+            let result = daemon.prompt(&id, &text).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 match result {
-                    Ok(()) => {
+                    Ok(turn) => {
+                        this.session.turn_began(&turn);
                         cx.emit(SessionEvent::Prompted);
                         if !this.prompted {
                             this.prompted = true;
@@ -324,15 +367,74 @@ impl SessionView {
                         }
                     }
                     Err(error) => {
-                        this.session.fail(error.to_string());
-                        // Give the prompt back so it isn't lost.
-                        if this.composer.read(cx).value().is_empty() {
-                            this.composer
-                                .update(cx, |state, cx| state.set_value(text, window, cx));
+                        // A turn another client began meanwhile is not
+                        // what failed.
+                        if this.session.state().is_busy() {
+                            this.error = Some(format!("Couldn't send the message: {error}"));
+                        } else {
+                            this.session.fail(error.to_string());
                         }
+                        // Give the prompt back so it isn't lost.
+                        this.give_back(&text, window, cx);
                     }
                 }
                 this.after_change(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Adds `text` to the running turn. It shows above the composer until
+    /// the model reads it; a refused steer goes back in the composer.
+    fn steer(&mut self, text: String, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.error = None;
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = daemon.steer(&id, &text).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(steer) => {
+                        this.session.steer_sent(steer, text);
+                        // The turn may have ended before this answer came.
+                        let dropped = this.session.take_dropped_steers();
+                        if !dropped.is_empty() {
+                            this.give_back(&dropped.join("\n"), window, cx);
+                        }
+                        // Continued from here, so the session is rho-ui's.
+                        cx.emit(SessionEvent::Prompted);
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Couldn't steer the turn: {error}"));
+                        this.give_back(&text, window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Takes back a steer the model has not read, into the composer.
+    fn unsteer(&mut self, steer: SteerId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = daemon.unsteer(&id, &steer).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Unsteered::Withdrawn) => {
+                        if let Some(text) = this.session.withdraw_steer(&steer) {
+                            this.give_back(&text, window, cx);
+                        }
+                    }
+                    // The model has it; it joins the conversation shortly.
+                    Ok(Unsteered::Kept) => {}
+                    Err(error) => {
+                        this.error = Some(format!("Couldn't take the message back: {error}"));
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -342,23 +444,51 @@ impl SessionView {
         if !self.is_busy() {
             return;
         }
-        // Pending approvals answer "cancelled" as they drop.
-        self.approvals.clear();
-        if let Err(error) = self.agent.cancel(self.session.id()) {
-            self.error = Some(format!("Couldn't stop the turn: {error}"));
-        }
-        self.after_change(window, cx);
+        // The turn withdraws its open requests as it ends.
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = daemon.cancel(&id).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(format!("Couldn't stop the turn: {error}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
+    /// Answers the oldest open request with its choice `choice`. The
+    /// request leaves the view at once, so it can't be answered twice, and
+    /// comes back if the daemon didn't take the answer.
     fn choose(&mut self, choice: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some(request) = self.approvals.pop_front() {
-            request.choose(choice);
-        }
-        if self.approvals.is_empty() {
+        let answer = self.session.inputs().first().and_then(|request| {
+            let choice = request.choice(choice)?.clone();
+            Some((request.id(), choice))
+        });
+        let Some((request, choice)) = answer else {
+            return;
+        };
+        let Some(asked) = self.session.close_input(request) else {
+            return;
+        };
+        if self.session.inputs().is_empty() {
             window.focus(&self.composer.focus_handle(cx), cx);
         } else {
             window.focus(&self.approval_focus, cx);
         }
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = daemon.answer(&id, request, &choice).await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.session.open_input(asked);
+                    this.error = Some(format!("Couldn't send the answer: {error}"));
+                    this.after_change(window, cx);
+                });
+            }
+        })
+        .detach();
         self.after_change(window, cx);
     }
 
@@ -396,14 +526,14 @@ impl SessionView {
         if self.session.entries().is_empty() {
             let placeholder = Empty::new();
             return match &self.loading {
-                Loading::Resuming => placeholder.header(
+                Loading::Attaching => placeholder.header(
                     EmptyHeader::new()
                         .media(EmptyMedia::new().child(Spinner::new()))
                         .description(EmptyDescription::new().child("Loading session…")),
                 ),
                 Loading::Failed(message) => placeholder.content(
                     EmptyContent::new().max_w(rems(36.)).child(
-                        Alert::error("resume-error", SharedString::from(message.clone()))
+                        Alert::error("attach-error", SharedString::from(message.clone()))
                             .title("Couldn't open this session"),
                     ),
                 ),
@@ -486,17 +616,18 @@ impl SessionView {
                         })),
                 )
             })
-            .when_some(self.approvals.front(), |this, request| {
+            .when_some(self.session.inputs().first(), |this, request| {
                 let view = view.clone();
                 this.child(ApprovalCard::new(
                     request,
-                    self.approvals.len(),
+                    self.session.inputs().len(),
                     self.approval_focus.clone(),
                     move |choice, window, cx| {
                         let _ = view.update(cx, |this, cx| this.choose(choice, window, cx));
                     },
                 ))
             })
+            .children(self.render_steers(cx))
             .child(
                 Composer::new(
                     &self.composer,
@@ -518,20 +649,48 @@ impl SessionView {
             )
     }
 
-    /// "Context 25% · $0.01", once the agent reports usage.
+    /// The steers the turn has taken that the model has not read yet,
+    /// each with a button to take it back.
+    fn render_steers(&self, cx: &mut Context<'_, Self>) -> Vec<AnyElement> {
+        let steers = self.session.pending_steers().enumerate();
+        steers
+            .map(|(ix, (steer, text))| {
+                let steer = steer.clone();
+                h_flex()
+                    .id(SharedString::from(format!("steer-{ix}")))
+                    .test_support()
+                    .aria_label(format!("Queued: {text}"))
+                    .gap_2()
+                    .px_3()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(Icon::new(Lucide::CornerDownRight).xsmall())
+                    .child(div().flex_1().min_w_0().truncate().child(text.to_owned()))
+                    .child(
+                        Button::new(SharedString::from(format!("unsteer-{ix}")))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Take it back")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.unsteer(steer.clone(), window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// "Context 25% · $0.01", once the daemon reports usage.
     fn usage_label(&self) -> Option<String> {
         let usage = self.session.usage()?;
         let mut parts = Vec::new();
-        if usage.size() > 0 {
-            let percent = usage.used().saturating_mul(100) / usage.size();
+        if let Some(size) = usage.size().filter(|size| *size > 0) {
+            let percent = usage.used().saturating_mul(100) / size;
             parts.push(format!("Context {percent}%"));
         }
-        if let Some((amount, currency)) = usage.cost() {
-            parts.push(if currency == "USD" {
-                format!("${amount:.2}")
-            } else {
-                format!("{amount:.2} {currency}")
-            });
+        if let Some(cost) = usage.cost_usd() {
+            parts.push(format!("${cost:.2}"));
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
@@ -542,6 +701,11 @@ impl SessionView {
     /// The session state behind this view, for UI tests.
     pub(crate) fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// What the composer holds, for UI tests.
+    pub(crate) fn composer_text(&self, cx: &App) -> String {
+        self.composer.read(cx).value().to_string()
     }
 
     /// The transcript, for UI tests.

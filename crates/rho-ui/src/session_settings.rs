@@ -2,11 +2,13 @@
 //! session change. The mode (which tool calls run without asking) sits on the
 //! left as a menu. On the right, one button names the model and its reasoning
 //! and opens a panel: the model list with search, beside the reasoning levels
-//! and any other setting the agent offers, such as fast mode.
+//! and any other setting rho offers, such as fast mode.
 //!
-//! The agent owns the values. [`SessionSettings`] sends a user change itself
-//! and tells its owner, a session or a new session's draft, what the agent
-//! answered; options the agent pushes come in through [`SessionSettings::sync`].
+//! The daemon owns the values. [`SessionSettings`] sends a user change itself
+//! and tells its owner, a session or a new session's draft, what the daemon
+//! answered; options the daemon pushes come in through [`SessionSettings::sync`].
+//! A change made while a turn runs applies, and is answered, when the turn
+//! ends; the controls wait for it.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
@@ -27,11 +29,9 @@ use gpui_kit::{
     Window,
 };
 use rho_ui_core::{
-    Agent, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue, SessionId,
+    ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue, Daemon, SessionId,
+    FAST_MODE_ID,
 };
-
-/// rho's fast mode toggle, which shows as a lightning bolt.
-const FAST_MODE_ID: &str = "fast_mode";
 
 /// Whether the user can change settings right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,25 +41,25 @@ pub(crate) enum Availability {
     Disabled,
 }
 
-/// What the agent answered to a change.
+/// What the daemon answered to a change.
 pub(crate) enum SettingsEvent {
-    /// The agent took it; these are all the options now.
+    /// The daemon took it; these are all the options now.
     Changed(Vec<ConfigOption>),
-    /// The agent refused it, in these words; the controls show the old
+    /// The daemon refused it, in these words; the controls show the old
     /// values again.
     Failed(String),
 }
 
 /// The settings controls for one session, shared by its session view or draft.
 pub(crate) struct SessionSettings {
-    agent: Agent,
+    daemon: Daemon,
     session: SessionId,
-    /// Whether the owner lets the user change settings: not while a
-    /// resumed session replays.
+    /// Whether the owner lets the user change settings: not until a saved
+    /// session's attach has answered.
     allowed: Availability,
     /// `set_config` calls in flight. Controls wait for the answer.
     pending: usize,
-    /// The options as the agent last sent them.
+    /// The options as the daemon last sent them.
     synced: Vec<ConfigOption>,
     /// What the controls show: `synced` plus a change on its way.
     shown: Vec<ConfigOption>,
@@ -82,14 +82,14 @@ impl EventEmitter<SettingsEvent> for SessionSettings {}
 
 impl SessionSettings {
     pub(crate) fn new(
-        agent: Agent,
+        daemon: Daemon,
         session: SessionId,
         options: &[ConfigOption],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let mut settings = Self {
-            agent,
+            daemon,
             session,
             allowed: Availability::Enabled,
             pending: 0,
@@ -151,7 +151,7 @@ impl SessionSettings {
         }
     }
 
-    /// Sends a change. Until the agent answers, the controls show it and
+    /// Sends a change. Until the daemon answers, the controls show it and
     /// take no other.
     fn request(
         &mut self,
@@ -174,10 +174,10 @@ impl SessionSettings {
         self.pending += 1;
         cx.notify();
 
-        let agent = self.agent.clone();
+        let daemon = self.daemon.clone();
         let session = self.session.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = agent.set_config(&session, &id, value).await;
+            let result = daemon.set_config(&session, &id, value).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.pending -= 1;
                 match result {
@@ -192,7 +192,7 @@ impl SessionSettings {
                             .find(|option| option.id() == id)
                             .map_or(id.as_str(), ConfigOption::name)
                             .to_lowercase();
-                        // Put back what the agent still has.
+                        // Put back what the daemon still has.
                         let synced = std::mem::take(&mut this.synced);
                         this.sync(&synced, window, cx);
                         cx.emit(SettingsEvent::Failed(format!(
