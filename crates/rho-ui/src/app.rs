@@ -298,8 +298,8 @@ impl RhoApp {
     }
 
     /// The connection ended. After the daemon said it was restarting, that
-    /// is expected, and answered by connecting again; `rho daemon start`
-    /// waits until the restarted daemon answers.
+    /// is expected, and answered by connecting again: the daemon restarts in
+    /// place on the same socket, and the handshake waits until it answers.
     fn disconnected(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.restarting {
             self.connect(window, cx);
@@ -703,9 +703,11 @@ impl RhoApp {
 
     fn render_failed(&self, message: &str, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let reached = match &self.launch.daemon {
-            DaemonTarget::Rho(program) => {
-                format!("Started with: {} daemon start", program.display())
-            }
+            DaemonTarget::Home { home, rho } => format!(
+                "Rho home: {}, started with: {} daemon start",
+                home.display(),
+                rho.display()
+            ),
             DaemonTarget::Socket(socket) => format!("Socket: {}", socket.display()),
         };
         Empty::new()

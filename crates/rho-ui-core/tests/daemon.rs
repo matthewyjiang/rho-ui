@@ -270,10 +270,14 @@ fn a_followed_session_is_not_deleted_under_its_client() {
 
 #[test]
 fn a_missing_rho_fails_the_connection_with_a_reason() {
-    let target = DaemonTarget::Rho("/nonexistent/rho".into());
+    // A home with no daemon, so the connection must start one.
+    let target = DaemonTarget::Home {
+        home: "/nonexistent/rho-home".into(),
+        rho: "/nonexistent/rho".into(),
+    };
     match block_on(Daemon::connect(target)) {
         Err(DaemonError::Unreachable(reason)) => assert!(
-            reason.starts_with("couldn't run /nonexistent/rho daemon start: "),
+            reason.starts_with("could not run `/nonexistent/rho daemon start`: "),
             "the reason names the command: {reason}"
         ),
         other => panic!("expected a reason, got {other:?}"),
