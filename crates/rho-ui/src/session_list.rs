@@ -285,6 +285,15 @@ impl SessionList {
         }
     }
 
+    /// Forgets what an open session's view said about it, once the view is
+    /// gone: its row shows what the daemon's jobs say again.
+    pub(crate) fn close_live(&mut self, id: &SessionId) {
+        self.live.retain(|live| live.id != *id);
+        if let Some(ix) = self.rows.iter().position(|row| row.id == *id) {
+            self.rows[ix].activity = self.activity(id);
+        }
+    }
+
     /// Drops a deleted session.
     pub(crate) fn remove(&mut self, id: &SessionId) {
         self.rows.retain(|row| row.id != *id);

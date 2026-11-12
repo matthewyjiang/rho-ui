@@ -19,6 +19,7 @@ pub use options::{
 };
 pub use session::{
     Attached, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus, RunState, Session,
-    SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent, ToolKind, ToolStatus, Usage,
+    SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent, ToolKind, ToolStatus, TurnId,
+    Usage,
 };
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};

@@ -19,7 +19,7 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    ConfigKind, DaemonTarget, Entry, RunState, Session, ToolStatus,
+    ConfigKind, Daemon, DaemonTarget, Entry, RunState, Session, SessionId, ToolStatus,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -43,6 +43,7 @@ struct Harness {
     window: AnyWindowHandle,
     app: Entity<RhoApp>,
     name: &'static str,
+    target: DaemonTarget,
     /// Stops when the test ends.
     _daemon: Option<FakeDaemon>,
 }
@@ -79,7 +80,7 @@ impl Harness {
         cx.update(crate::init);
         let launch = LaunchConfig {
             workspace: std::env::temp_dir(),
-            daemon: target,
+            daemon: target.clone(),
         };
         let (window, app) = cx
             .update(|cx| {
@@ -104,6 +105,7 @@ impl Harness {
             window,
             app,
             name,
+            target,
             _daemon: daemon,
         };
         harness.frame();
@@ -174,6 +176,24 @@ impl Harness {
 
     fn click(&mut self, id: &'static str) {
         self.act(|window, cx| window.click(id, cx));
+    }
+
+    /// Sends `text` to session `id` as another client would, such as rho's
+    /// terminal UI: over a connection of its own, which it then closes.
+    fn prompt_from_elsewhere(&mut self, id: &str, text: &str) {
+        let (target, id, text) = (self.target.clone(), SessionId::from(id), text.to_owned());
+        self.cx.update(|cx| {
+            cx.spawn(async move |_| {
+                let (daemon, _events) = Daemon::connect(target)
+                    .await
+                    .expect("a second client connects");
+                daemon
+                    .prompt(&id, &text)
+                    .await
+                    .expect("the daemon takes the other client's prompt");
+            })
+            .detach();
+        });
     }
 
     /// Saves the window as `target/ui-shots/<test>-<step>.png`.
@@ -797,6 +817,67 @@ fn a_new_prompt_leaves_finished_turns_folded() {
         assert!(!is_visible(window, "work-2"), "the old turn stays folded");
     });
     ui.shot("second-open");
+}
+
+/// A turn another client starts in a session open here is a turn of its
+/// own: the turn before it stays folded and keeps its time. Its approval
+/// shows here too, without taking the keyboard from a message being typed,
+/// whose Enter would otherwise approve.
+#[test]
+fn a_turn_started_elsewhere_is_its_own_turn_and_leaves_typing_alone() {
+    let script = Script {
+        replay_turns: 1,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("elsewhere", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-old")
+    });
+    let took = Duration::from_secs(80);
+    ui.cx
+        .update(|cx| cx.global_mut::<TurnTimes>().record("u0", took));
+    ui.click("session-old");
+    ui.wait_until("the replayed turn, folded", |window, _, _| {
+        is_visible(window, "worked-0")
+    });
+
+    ui.act(|window, cx| window.input("half a thought", cx));
+    ui.prompt_from_elsewhere("old", "list files");
+    ui.wait_until("the other client's approval", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    let typing = ui
+        .cx
+        .update_window(ui.window, |_, window, cx| {
+            let view = ui.app.read(cx).active_session().expect("a session is open");
+            let composer = view.read(cx).composer_focus_handle(cx);
+            composer.is_focused(window)
+        })
+        .expect("window is open");
+    assert!(typing, "the keyboard stays in the composer");
+    ui.act(|window, _| {
+        assert!(is_visible(window, "worked-0"), "the old turn stays folded");
+        assert!(!is_visible(window, "work-2"), "its rows stay hidden");
+    });
+    ui.shot("approval");
+
+    ui.click("approval-allow-once");
+    ui.wait_for_session("the other client's turn to finish", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "you chose allow_once")
+    });
+    assert_eq!(
+        turn_took(&mut ui, 0),
+        Some(took),
+        "the old turn keeps its time"
+    );
+    assert!(turn_took(&mut ui, 1).is_some(), "the new turn has its own");
+    let view = ui.app.clone();
+    let typed = ui.cx.update(|cx| {
+        let view = view.read(cx).active_session().expect("a session is open");
+        view.read(cx).composer_text(cx)
+    });
+    assert_eq!(typed, "half a thought", "the message being typed is intact");
 }
 
 /// A wheel notch glides over several frames instead of jumping.

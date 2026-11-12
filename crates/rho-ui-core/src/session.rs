@@ -312,8 +312,12 @@ pub struct Session {
     /// IDs of steers that reached the conversation and that
     /// [`Self::steer_sent`] has not recorded. One sent from here lands in
     /// it when its event beats the daemon's answer to the steer; another
-    /// client's steers land in it too, and stay. Emptied when a turn ends.
+    /// client's steers land in it too, and stay. Emptied when the next
+    /// turn starts, by when every answer to this turn's steers is in.
     early_steers: Vec<SteerId>,
+    /// The turn that last ended, so [`Self::turn_began`] can tell an answer
+    /// that arrives after its whole turn.
+    ended_turn: Option<TurnId>,
     sync: Sync,
 }
 
@@ -348,6 +352,7 @@ impl Session {
             steers: Vec::new(),
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
+            ended_turn: None,
             sync: Sync::Attaching(Vec::new()),
         }
     }
@@ -394,9 +399,21 @@ impl Session {
         self.title = title;
     }
 
-    /// Marks a prompt that the daemon refused before its turn began.
+    /// Marks a prompt that the daemon refused before its turn began. Only
+    /// for a session at rest: a refusal says nothing about a turn another
+    /// client has under way.
     pub fn fail(&mut self, error: String) {
         self.state = RunState::Failed(error);
+    }
+
+    /// Records that the daemon took a prompt and began `turn`. The turn's
+    /// own events arrive on another path, before or after this: if none
+    /// has yet, the session is running from now, and if the turn already
+    /// ended, nothing changes.
+    pub fn turn_began(&mut self, turn: &TurnId) {
+        if self.ended_turn.as_ref() != Some(turn) && !self.state.is_busy() {
+            self.state = RunState::Running;
+        }
     }
 
     /// The ID rho knows this session by.
@@ -475,11 +492,14 @@ impl Session {
     /// Records a steer the running turn accepted, as `id`. It shows in
     /// [`Self::pending_steers`] until it reaches the conversation.
     pub fn steer_sent(&mut self, id: SteerId, text: String) {
-        match self.early_steers.iter().position(|early| *early == id) {
-            Some(at) => {
-                self.early_steers.swap_remove(at);
-            }
-            None => self.steers.push(Steer { id, text }),
+        if let Some(at) = self.early_steers.iter().position(|early| *early == id) {
+            self.early_steers.swap_remove(at);
+        } else if self.state.is_busy() {
+            self.steers.push(Steer { id, text });
+        } else {
+            // The turn ended before this answer arrived, and with it the
+            // steer the model never read.
+            self.dropped_steers.push(text);
         }
     }
 
@@ -564,26 +584,24 @@ impl Session {
                 title,
                 description: Some(plain).filter(|text| !text.is_empty()),
             })),
-            SessionEvent::State { state, .. } => {
+            SessionEvent::State { state, turn } => {
+                if !state.in_progress() {
+                    // A turn the daemon's restart cut short ends here,
+                    // with no `turn_ended` before it.
+                    if let Some(turn) = &turn {
+                        self.ended_turn = Some(TurnId::from_wire(turn));
+                    }
+                }
                 self.settle(state);
                 None
             }
-            SessionEvent::TurnEnded { outcome, .. } => {
+            SessionEvent::TurnEnded { turn, outcome } => {
+                self.ended_turn = Some(TurnId::from_wire(&turn));
                 self.end_turn(outcome);
                 None
             }
             SessionEvent::Plan { entries } => {
-                self.plan = entries
-                    .into_iter()
-                    .map(|entry| PlanItem {
-                        text: entry.content,
-                        status: match entry.status {
-                            rho_protocol::PlanStatus::InProgress => PlanStatus::InProgress,
-                            rho_protocol::PlanStatus::Completed => PlanStatus::Done,
-                            _ => PlanStatus::Pending,
-                        },
-                    })
-                    .collect();
+                self.plan = entries.into_iter().map(plan_item).collect();
                 None
             }
             SessionEvent::OptionsChanged { options } => {
@@ -631,7 +649,12 @@ impl Session {
     /// one the daemon's restart cut short does.
     fn settle(&mut self, state: JobState) {
         match state {
-            JobState::Running | JobState::Queued => self.state = RunState::Running,
+            JobState::Running | JobState::Queued => {
+                if !self.state.is_busy() {
+                    self.early_steers.clear();
+                }
+                self.state = RunState::Running;
+            }
             JobState::WaitingForInput => self.state = RunState::NeedsAction,
             JobState::Idle
             | JobState::Completed
@@ -669,7 +692,6 @@ impl Session {
         // The daemon drops a steer its turn never read.
         let dropped = self.steers.drain(..).map(|steer| steer.text);
         self.dropped_steers.extend(dropped);
-        self.early_steers.clear();
     }
 
     fn push_notice(&mut self, notice: Notice) -> usize {
@@ -768,10 +790,32 @@ impl Session {
     }
 }
 
+/// A turn's ID, from [`crate::Daemon::prompt`]; pass it to
+/// [`Session::turn_began`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnId(String);
+
+impl TurnId {
+    pub(crate) fn from_wire(id: &rho_protocol::TurnId) -> Self {
+        Self(id.as_str().to_owned())
+    }
+}
+
 /// A steer's ID, from [`crate::Daemon::steer`]; pass it to
 /// [`Session::steer_sent`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SteerId(pub(crate) String);
+
+fn plan_item(entry: rho_protocol::PlanEntry) -> PlanItem {
+    PlanItem {
+        text: entry.content,
+        status: match entry.status {
+            rho_protocol::PlanStatus::InProgress => PlanStatus::InProgress,
+            rho_protocol::PlanStatus::Completed => PlanStatus::Done,
+            _ => PlanStatus::Pending,
+        },
+    }
+}
 
 /// Millionths of a US dollar as dollars, for display.
 fn usd(micros: u64) -> f64 {

@@ -299,6 +299,9 @@ fn a_steer_waits_until_it_applies_and_comes_back_if_the_turn_drops_it() {
             "content": [{"type": "text", "text": "use tabs"}], "steer": id}))
     };
     let mut session = session();
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t1"}),
+    ));
 
     session.steer_sent(SteerId("a".to_owned()), "use tabs".to_owned());
     let pending: Vec<_> = session.pending_steers().map(|(_, text)| text).collect();
@@ -321,4 +324,62 @@ fn a_steer_waits_until_it_applies_and_comes_back_if_the_turn_drops_it() {
     assert_eq!(session.pending_steers().count(), 0);
     assert_eq!(session.take_dropped_steers(), ["never read"]);
     assert_eq!(session.state(), &RunState::Cancelled);
+}
+
+/// A steer's answer can arrive after its whole turn. One the model read
+/// must not come back as dropped, and one it never read must not wait on.
+#[test]
+fn a_steer_answered_after_its_turn_ended_is_settled_at_once() {
+    let mut session = session();
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t1"}),
+    ));
+    session.apply(update(json!({"type": "user_message", "message": "u-a",
+        "content": [{"type": "text", "text": "read"}], "steer": "a"})));
+    session.apply(update(
+        json!({"type": "turn_ended", "turn": "t1", "outcome": {"type": "cancelled"}}),
+    ));
+    session.apply(update(
+        json!({"type": "state", "state": "cancelled", "turn": "t1"}),
+    ));
+
+    session.steer_sent(SteerId("a".to_owned()), "read".to_owned());
+    session.steer_sent(SteerId("b".to_owned()), "unread".to_owned());
+
+    assert_eq!(session.pending_steers().count(), 0);
+    assert_eq!(session.take_dropped_steers(), ["unread"]);
+}
+
+fn turn(id: &str) -> TurnId {
+    TurnId::from_wire(&rho_protocol::TurnId::new(id))
+}
+
+/// The answer to a prompt and its turn's events reach the UI on separate
+/// paths. Whichever comes first, the session runs for exactly the turn.
+#[test]
+fn a_prompts_answer_and_its_turns_events_may_come_in_either_order() {
+    // The answer first: the session runs before any event says so.
+    let mut session = session();
+    session.turn_began(&turn("t1"));
+    assert_eq!(session.state(), &RunState::Running);
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t1"}),
+    ));
+    session.apply(update(json!({"type": "turn_ended", "turn": "t1",
+        "outcome": {"type": "answered", "text": "", "stop": "end_turn"}})));
+    assert_eq!(session.state(), &RunState::Idle);
+
+    // The whole turn first: the late answer must not start it again.
+    session.turn_began(&turn("t1"));
+    assert_eq!(session.state(), &RunState::Idle);
+
+    // A turn the daemon's restart cut short ends without a `turn_ended`.
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t2"}),
+    ));
+    session.apply(update(
+        json!({"type": "state", "state": "interrupted", "turn": "t2"}),
+    ));
+    session.turn_began(&turn("t2"));
+    assert_eq!(session.state(), &RunState::Idle);
 }

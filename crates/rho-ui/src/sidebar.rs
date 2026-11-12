@@ -304,6 +304,12 @@ impl SidebarView {
         }
     }
 
+    /// Forgets an open session's own state, once its view is gone.
+    pub(crate) fn close_live(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+        self.list.close_live(id);
+        self.rebuild(cx);
+    }
+
     /// Marks a session as started or continued here, so it stays active.
     pub(crate) fn own(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
         self.shelves.own(id.as_str());

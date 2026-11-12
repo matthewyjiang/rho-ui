@@ -220,13 +220,16 @@ impl RhoApp {
         self.jobs_task = cx.spawn({
             let daemon = daemon.clone();
             async move |this, cx| loop {
-                // An error means the connection is gone, which the event
-                // pump reports.
-                let Ok(jobs) = daemon.active_jobs().await else {
-                    return;
-                };
-                if this.update(cx, |this, cx| this.set_jobs(jobs, cx)).is_err() {
-                    return;
+                match daemon.active_jobs().await {
+                    Ok(jobs) => {
+                        if this.update(cx, |this, cx| this.set_jobs(jobs, cx)).is_err() {
+                            return;
+                        }
+                    }
+                    // The event pump reports the connection's end.
+                    Err(DaemonError::Closed) => return,
+                    // One refused listing is no reason to stop asking.
+                    Err(_) => {}
                 }
                 cx.background_executor().timer(JOB_POLL).await;
             }
@@ -318,6 +321,10 @@ impl RhoApp {
         self.forget_session(id, window, cx);
         if shown {
             self.open_session(live.id, live.cwd, live.title, window, cx);
+        } else {
+            // Its row follows the daemon's jobs again until it is reopened.
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.close_live(id, cx));
         }
     }
 
@@ -493,14 +500,24 @@ impl RhoApp {
         let Some(daemon) = self.daemon().cloned() else {
             return;
         };
+        // The daemon refuses to delete a session a client follows, so that
+        // one open in another client survives. This client lets go first.
+        let open = self.opened(&id).is_some();
         cx.spawn_in(window, async move |this, cx| {
+            if open {
+                let _ = daemon.detach(&id).await;
+            }
             let result = daemon.delete_session(&id).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(()) => this.session_deleted(&id, window, cx),
-                Err(error) => window.push_notification(
-                    Notification::error(error.to_string()).title("Couldn't delete the session"),
-                    cx,
-                ),
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(error.to_string()).title("Couldn't delete the session"),
+                        cx,
+                    );
+                    // Its view no longer follows it: read it afresh.
+                    this.reopen_session(&id, window, cx);
+                }
             });
         })
         .detach();
@@ -600,9 +617,16 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if let Some(open) = self.opened(&id) {
-            self.show(Pane::Session(open.view.clone()), window, cx);
-            return;
+        match self.opened(&id).map(|open| open.view.clone()) {
+            // A click on a session that couldn't be opened tries again.
+            Some(view) if view.read(cx).failed_to_attach() => {
+                self.forget_session(&id, window, cx);
+            }
+            Some(view) => {
+                self.show(Pane::Session(view), window, cx);
+                return;
+            }
+            None => {}
         }
         let Some(daemon) = self.daemon().cloned() else {
             return;

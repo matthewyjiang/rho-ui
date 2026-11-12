@@ -166,6 +166,11 @@ impl SessionView {
         self.session.id()
     }
 
+    /// Whether the attach failed, so the view shows only why.
+    pub(crate) fn failed_to_attach(&self) -> bool {
+        matches!(self.loading, Loading::Failed(_))
+    }
+
     /// What the sidebar shows for this session.
     pub(crate) fn live(&self) -> LiveSession {
         LiveSession {
@@ -228,9 +233,11 @@ impl SessionView {
             self.transcript.changed(self.session.entries(), ix, cx);
         }
         // Move the keyboard to the default answer if the user is in this
-        // session; never steal focus from another one.
+        // session; never steal focus from another one, nor from a message
+        // being typed, whose Enter would then approve instead of send.
         let asks = !self.session.inputs().is_empty();
-        if asks && !asked && self.focus_handle.contains_focused(window, cx) {
+        let typing = !self.composer.read(cx).value().is_empty();
+        if asks && !asked && !typing && self.focus_handle.contains_focused(window, cx) {
             window.focus(&self.approval_focus, cx);
         }
         // A turn that ended before reading a steer dropped it.
@@ -261,12 +268,16 @@ impl SessionView {
         self.after_change(window, cx);
     }
 
-    /// Puts `text` back in the composer, unless the user has typed since.
+    /// Puts `text` back in the composer, above anything typed since.
     fn give_back(&self, text: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.composer.read(cx).value().is_empty() {
-            self.composer
-                .update(cx, |state, cx| state.set_value(text.to_owned(), window, cx));
-        }
+        let typed = self.composer.read(cx).value();
+        let text = if typed.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{text}\n{typed}")
+        };
+        self.composer
+            .update(cx, |state, cx| state.set_value(text, window, cx));
     }
 
     /// Brings the scroller, settings, timers and sidebar up to date with
@@ -283,9 +294,15 @@ impl SessionView {
         let now = Instant::now();
         let busy = self.is_busy();
         match (busy, self.busy_since) {
+            // Attached with a turn under way: it is the newest one.
+            (true, None) if self.turn_began.is_some() => {
+                self.busy_since = self.turn_began.take();
+                self.transcript.resume_turn(cx);
+            }
+            // A turn began, from here or from another client.
             (true, None) => {
-                self.busy_since = Some(self.turn_began.take().unwrap_or(now));
-                self.transcript.begin_turn(cx);
+                self.busy_since = Some(now);
+                self.transcript.expect_turn();
             }
             (false, Some(since)) => {
                 self.busy_since = None;
@@ -331,7 +348,6 @@ impl SessionView {
     /// composer.
     pub(crate) fn submit(&mut self, text: String, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.sending = true;
-        self.transcript.expect_turn();
         self.error = None;
         self.after_change(window, cx);
 
@@ -342,7 +358,8 @@ impl SessionView {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 match result {
-                    Ok(()) => {
+                    Ok(turn) => {
+                        this.session.turn_began(&turn);
                         cx.emit(SessionEvent::Prompted);
                         if !this.prompted {
                             this.prompted = true;
@@ -350,7 +367,13 @@ impl SessionView {
                         }
                     }
                     Err(error) => {
-                        this.session.fail(error.to_string());
+                        // A turn another client began meanwhile is not
+                        // what failed.
+                        if this.session.state().is_busy() {
+                            this.error = Some(format!("Couldn't send the message: {error}"));
+                        } else {
+                            this.session.fail(error.to_string());
+                        }
                         // Give the prompt back so it isn't lost.
                         this.give_back(&text, window, cx);
                     }
@@ -373,6 +396,11 @@ impl SessionView {
                 match result {
                     Ok(steer) => {
                         this.session.steer_sent(steer, text);
+                        // The turn may have ended before this answer came.
+                        let dropped = this.session.take_dropped_steers();
+                        if !dropped.is_empty() {
+                            this.give_back(&dropped.join("\n"), window, cx);
+                        }
                         // Continued from here, so the session is rho-ui's.
                         cx.emit(SessionEvent::Prompted);
                     }

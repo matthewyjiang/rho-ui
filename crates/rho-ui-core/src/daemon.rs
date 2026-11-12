@@ -3,10 +3,9 @@
 //!
 //! ```ignore
 //! let (daemon, mut events) = Daemon::connect(DaemonTarget::rho()).await?;
-//! let setup = daemon.new_session(&cwd).await?;
-//! let mut session = Session::new(setup.id().clone());
+//! let mut session = Session::from_setup(daemon.new_session(&cwd).await?);
 //! session.attached(daemon.attach(session.id()).await?);
-//! daemon.prompt(session.id(), "hello").await?;
+//! session.turn_began(&daemon.prompt(session.id(), "hello").await?);
 //! while let Some(event) = events.recv().await { /* route by session id */ }
 //! ```
 //!
@@ -35,7 +34,7 @@ use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 use crate::{
     input::{InputChoice, InputId},
     options::{change, config_options, ConfigOption, ConfigValue},
-    session::{Attached, SessionSetup, SessionUpdate, SteerId},
+    session::{Attached, SessionSetup, SessionUpdate, SteerId, TurnId},
 };
 
 /// How to reach the daemon.
@@ -595,15 +594,15 @@ impl Daemon {
         Ok(())
     }
 
-    /// Sends a prompt. Returns once its turn began; the turn itself streams
-    /// as events.
+    /// Sends a prompt. Returns once its turn began; pass the turn to
+    /// [`crate::Session::turn_began`]. The turn itself streams as events.
     ///
     /// # Errors
     ///
     /// Fails if the daemon refuses the prompt, for example because the
     /// session already runs a turn, or the turn ended before it began.
     /// Nothing was added to the session in that case.
-    pub async fn prompt(&self, id: &SessionId, text: &str) -> Result<(), DaemonError> {
+    pub async fn prompt(&self, id: &SessionId, text: &str) -> Result<TurnId, DaemonError> {
         let params = SessionPromptParams {
             session: id.to_wire(),
             content: vec![ContentBlock::Text {
@@ -615,10 +614,11 @@ impl Daemon {
             idempotency_key: None,
             author: rho_protocol::PromptAuthor::Person,
         };
-        self.client
+        let response = self
+            .client
             .request::<methods::SessionPrompt>(&params)
             .await?;
-        Ok(())
+        Ok(TurnId::from_wire(&response.turn))
     }
 
     /// Adds `text` to the running turn's next model request, whichever
@@ -733,16 +733,19 @@ impl Daemon {
         Ok(config_options(&response.options))
     }
 
-    /// Deletes a saved session for good.
+    /// Deletes a saved session for good, unless a client follows it: the
+    /// daemon then refuses, so a session open in rho's terminal UI is not
+    /// deleted under it. [`Self::detach`] this client's own attachment
+    /// first.
     ///
     /// # Errors
     ///
-    /// Fails if the session is busy, the daemon rejects the request, or the
-    /// connection is gone.
+    /// Fails if the session is busy or followed, the daemon rejects the
+    /// request, or the connection is gone.
     pub async fn delete_session(&self, id: &SessionId) -> Result<(), DaemonError> {
         let params = SessionDeleteParams {
             session: id.to_wire(),
-            unless_attached: false,
+            unless_attached: true,
         };
         self.client
             .request::<methods::SessionDelete>(&params)

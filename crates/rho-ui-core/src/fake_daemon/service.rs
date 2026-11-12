@@ -443,7 +443,14 @@ impl Service for Fake {
         params: SessionDeleteParams,
     ) -> Result<SessionDeleteResponse, RpcError> {
         let mut state = self.lock();
-        state.session(&params.session)?;
+        let session = state.session(&params.session)?;
+        let followed = session.publishers.iter().any(|client| !client.is_gone());
+        if params.unless_attached && followed {
+            return Err(RpcError::new(
+                ErrorCode::SessionInUse,
+                "a client is attached to the session",
+            ));
+        }
         if let Some(session) = state.sessions.remove(params.session.as_str()) {
             for publisher in session.publishers {
                 publisher.close(DetachReason::Deleted);

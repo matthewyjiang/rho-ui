@@ -8,7 +8,7 @@ use futures::FutureExt;
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
     ChoiceKind, ConfigKind, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
-    DaemonTarget, Detached, Entry, JobActivity, RunState, Session, SessionId, Unsteered,
+    DaemonTarget, Entry, JobActivity, RunState, Session, SessionId, Unsteered,
 };
 use smol::block_on;
 
@@ -243,24 +243,27 @@ fn a_refused_prompt_is_an_error_in_the_daemons_words() {
     });
 }
 
+/// A session some client follows may be on that client's screen, so a
+/// delete leaves it alone until nobody follows it.
 #[test]
-fn deleting_a_followed_session_detaches_it() {
+fn a_followed_session_is_not_deleted_under_its_client() {
     let fake = FakeDaemon::start(Script::default());
     block_on(async {
-        let (daemon, mut events) = connect(&fake).await;
+        let (daemon, _events) = connect(&fake).await;
+        let (tui, _tui_events) = connect(&fake).await;
         let id = SessionId::from("s1");
-        let mut session = Session::new(id.clone());
-        session.attached(daemon.attach(&id).await.unwrap());
+        let mut theirs = Session::new(id.clone());
+        theirs.attached(tui.attach(&id).await.unwrap());
 
+        let refused = daemon.delete_session(&id).await.unwrap_err();
+        assert_eq!(
+            refused,
+            DaemonError::Refused("a client is attached to the session".to_owned())
+        );
+
+        tui.detach(&id).await.unwrap();
         daemon.delete_session(&id).await.unwrap();
-
-        match next(&mut events).await {
-            DaemonEvent::Detached { session, reason } => {
-                assert_eq!((session, reason), (id, Detached::Deleted));
-            }
-            other @ DaemonEvent::Update { .. } => panic!("expected the detach, got {other:?}"),
-        }
-        let gone = daemon.attach(&SessionId::from("s1")).await.unwrap_err();
+        let gone = daemon.attach(&id).await.unwrap_err();
         assert_eq!(gone, DaemonError::Refused("no session s1".to_owned()));
     });
 }
