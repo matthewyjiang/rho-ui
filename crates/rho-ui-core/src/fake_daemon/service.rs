@@ -8,29 +8,19 @@ use std::{
 
 use rho_protocol::{
     methods::{
-        AuthChooseStoreParams, AuthChooseStoreResponse, AuthKeyParams, AuthKeyResponse,
-        AuthListParams, AuthListResponse, AuthLoginCancelParams, AuthLoginCancelResponse,
-        AuthLoginParams, AuthLoginResponse, AuthLogoutParams, AuthLogoutResponse, ConfigGetParams,
-        ConfigRegisterParams, ConfigRegisterResponse, ConfigSchema, ConfigSetParams,
-        ConfigSetResponse, JobId, JobKind, JobListResponse, JobLive, JobState, JobSummary,
-        MessageId, Replay, Resolution, Seq, SessionConfigureParams, SessionConfigureResponse,
-        SessionDeleteParams, SessionDeleteResponse, SessionId, SessionInspectParams,
-        SessionInspectResponse, SessionListParams, SessionListResponse, SessionMcpCatalog,
-        SessionMcpCatalogParams, SessionMcpCompleteParams, SessionMcpCompleteResponse,
-        SessionMcpInventory, SessionMcpParams, SessionMcpResourceParams,
-        SessionMcpResourceResponse, SessionObserveParams, SessionProcessesParams,
-        SessionProcessesResponse, SessionRenameParams, SessionRenameResponse, SessionSummary,
+        JobId, JobKind, JobListResponse, JobLive, JobState, JobSummary, MessageId, Replay,
+        Resolution, Seq, SessionConfigureParams, SessionConfigureResponse, SessionDeleteParams,
+        SessionDeleteResponse, SessionId, SessionListParams, SessionListResponse, SessionSummary,
         SessionUnsteerParams, SessionUnsteerResponse, SteerId, StreamId,
     },
-    subscription, ApprovalAsk, ApprovalSource, Ask, BuildId, ClientInfo, ConfigWatch, ContentBlock,
+    subscription, ApprovalAsk, ApprovalSource, Ask, BuildId, ClientInfo, ContentBlock,
     CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason, ErrorCode, InputAnswer,
-    InputAsker, InputRequest, InputRequestId, LoginStream, Operation, ProtocolVersion, RestartCost,
-    RpcError, Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
+    InputAsker, InputRequest, InputRequestId, Operation, ProtocolVersion, RestartCost, RpcError,
+    Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
     SessionAttachResponse, SessionCancelParams, SessionCancelResponse, SessionChange, SessionEvent,
-    SessionHoldParams, SessionHoldResponse, SessionNewParams, SessionNewResponse,
-    SessionPromptParams, SessionPromptResponse, SessionSteerParams, SessionSteerResponse,
-    SettingsService, StoreSelectedBy, Subscription, ToolKind, ToolStatus, TurnOutcome,
-    UnsteerOutcome, PROTOCOL_VERSION,
+    SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
+    SessionSteerParams, SessionSteerResponse, SettingsService, StoreSelectedBy, Subscription,
+    ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
 use super::{text, user_message, FakeSession, State, Turn, BACKLOG};
@@ -51,13 +41,6 @@ fn not_steerable() -> RpcError {
     RpcError::new(ErrorCode::NotSteerable, "no model request is taking input")
 }
 
-fn unsupported(method: &str) -> RpcError {
-    RpcError::new(
-        ErrorCode::MethodNotFound,
-        format!("the fake daemon does not serve {method}"),
-    )
-}
-
 /// How an approval's answer reads in the turn's reply.
 fn chosen(answer: &InputAnswer) -> &'static str {
     match answer {
@@ -68,6 +51,8 @@ fn chosen(answer: &InputAnswer) -> &'static str {
     }
 }
 
+/// The methods rho-ui sends. Every other one answers rho-protocol's default,
+/// not served.
 #[expect(
     clippy::unused_async_trait_impl,
     reason = "the trait's methods return futures; a scripted answer has nothing to await"
@@ -95,6 +80,7 @@ impl Service for Fake {
             started_at: 0,
             uptime_secs: 0,
             jobs: 0,
+            in_progress: 0,
             socket: PathBuf::new(),
             credential_store: CredentialStoreStatus {
                 store: CredentialStoreKind::File,
@@ -120,6 +106,7 @@ impl Service for Fake {
         Ok(SessionNewResponse {
             session: SessionId::new(id),
             options,
+            worktree: None,
         })
     }
 
@@ -289,10 +276,6 @@ impl Service for Fake {
         Ok(SessionAnswerResponse {})
     }
 
-    async fn hold_session(&self, _: SessionHoldParams) -> Result<SessionHoldResponse, RpcError> {
-        Err(unsupported("rho/session/hold"))
-    }
-
     async fn configure_session(
         &self,
         params: SessionConfigureParams,
@@ -304,52 +287,18 @@ impl Service for Fake {
             SessionChange::Model { model, .. } => session.settings.model = model,
             SessionChange::Reasoning { level } => session.settings.reasoning = level,
             SessionChange::FastMode { enabled } => session.settings.fast = enabled,
-            _ => return Err(unsupported("that session change")),
+            _ => {
+                return Err(RpcError::new(
+                    ErrorCode::MethodNotFound,
+                    "the fake daemon does not serve that session change",
+                ))
+            }
         }
         let options = session.settings.options();
         session.publish(SessionEvent::OptionsChanged {
             options: Box::new(options.clone()),
         });
         Ok(SessionConfigureResponse { options })
-    }
-
-    async fn session_mcp(&self, _: SessionMcpParams) -> Result<SessionMcpInventory, RpcError> {
-        Err(unsupported("rho/session/mcp"))
-    }
-
-    async fn session_mcp_catalog(
-        &self,
-        _: SessionMcpCatalogParams,
-    ) -> Result<SessionMcpCatalog, RpcError> {
-        Err(unsupported("rho/session/mcp/catalog"))
-    }
-
-    async fn session_mcp_resource(
-        &self,
-        _: SessionMcpResourceParams,
-    ) -> Result<SessionMcpResourceResponse, RpcError> {
-        Err(unsupported("rho/session/mcp/resource"))
-    }
-
-    async fn session_mcp_complete(
-        &self,
-        _: SessionMcpCompleteParams,
-    ) -> Result<SessionMcpCompleteResponse, RpcError> {
-        Err(unsupported("rho/session/mcp/complete"))
-    }
-
-    async fn session_processes(
-        &self,
-        _: SessionProcessesParams,
-    ) -> Result<SessionProcessesResponse, RpcError> {
-        Err(unsupported("rho/session/processes"))
-    }
-
-    async fn inspect_session(
-        &self,
-        _: SessionInspectParams,
-    ) -> Result<SessionInspectResponse, RpcError> {
-        Err(unsupported("rho/session/inspect"))
     }
 
     async fn attach_session(
@@ -383,13 +332,6 @@ impl Service for Fake {
         let (publisher, subscription) = subscription(BACKLOG, replay);
         session.publishers.push(publisher);
         Ok((response, subscription))
-    }
-
-    async fn observe_session(
-        &self,
-        _: SessionObserveParams,
-    ) -> Result<(SessionAttachResponse, Subscription), RpcError> {
-        Err(unsupported("rho/session/observe"))
     }
 
     async fn list_sessions(
@@ -431,13 +373,6 @@ impl Service for Fake {
         })
     }
 
-    async fn rename_session(
-        &self,
-        _: SessionRenameParams,
-    ) -> Result<SessionRenameResponse, RpcError> {
-        Err(unsupported("rho/session/rename"))
-    }
-
     async fn delete_session(
         &self,
         params: SessionDeleteParams,
@@ -477,6 +412,7 @@ impl Service for Fake {
             updated_at: session.updated_at,
             error: None,
             queue: None,
+            worktree: None,
             live: Some(JobLive {
                 title: session.title.clone(),
                 model: session.settings.model.clone(),
@@ -493,62 +429,8 @@ impl Service for Fake {
             jobs: jobs.collect(),
         }
     }
-
-    async fn save_auth_key(&self, _: AuthKeyParams) -> Result<AuthKeyResponse, RpcError> {
-        Err(unsupported("rho/auth/key"))
-    }
-
-    async fn logout_auth(&self, _: AuthLogoutParams) -> Result<AuthLogoutResponse, RpcError> {
-        Err(unsupported("rho/auth/logout"))
-    }
-
-    async fn list_auths(&self, _: AuthListParams) -> Result<AuthListResponse, RpcError> {
-        Err(unsupported("rho/auth/list"))
-    }
-
-    async fn login(
-        &self,
-        _: AuthLoginParams,
-    ) -> Result<(AuthLoginResponse, LoginStream), RpcError> {
-        Err(unsupported("rho/auth/login"))
-    }
-
-    async fn cancel_login(
-        &self,
-        _: AuthLoginCancelParams,
-    ) -> Result<AuthLoginCancelResponse, RpcError> {
-        Err(unsupported("rho/auth/login_cancel"))
-    }
-
-    async fn choose_store(
-        &self,
-        _: AuthChooseStoreParams,
-    ) -> Result<AuthChooseStoreResponse, RpcError> {
-        Err(unsupported("rho/auth/choose_store"))
-    }
 }
 
-#[expect(
-    clippy::unused_async_trait_impl,
-    reason = "the trait's methods return futures; a scripted answer has nothing to await"
-)]
-impl SettingsService for Fake {
-    async fn config_schema(&self) -> Result<ConfigSchema, RpcError> {
-        Err(unsupported("rho/config/schema"))
-    }
-
-    async fn register_config(
-        &self,
-        _: ConfigRegisterParams,
-    ) -> Result<ConfigRegisterResponse, RpcError> {
-        Err(unsupported("rho/config/register"))
-    }
-
-    async fn get_config(&self, _: ConfigGetParams) -> Result<ConfigWatch, RpcError> {
-        Err(unsupported("rho/config/get"))
-    }
-
-    async fn set_config(&self, _: ConfigSetParams) -> Result<ConfigSetResponse, RpcError> {
-        Err(unsupported("rho/config/set"))
-    }
-}
+/// No settings: every `rho/config/*` method answers rho-protocol's default,
+/// not served.
+impl SettingsService for Fake {}

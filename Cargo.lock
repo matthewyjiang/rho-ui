@@ -6033,11 +6033,12 @@ dependencies = [
 [[package]]
 name = "rho-protocol"
 version = "0.1.0"
-source = "git+https://github.com/matthewyjiang/rho?rev=bf3af5b787bcd5753479e655303eaeb4d9c55645#bf3af5b787bcd5753479e655303eaeb4d9c55645"
+source = "git+https://github.com/matthewyjiang/rho?rev=7c84788b0054bfc092f1d1f7132043b2bdf30783#7c84788b0054bfc092f1d1f7132043b2bdf30783"
 dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -7211,6 +7212,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

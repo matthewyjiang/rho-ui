@@ -2,7 +2,7 @@
 //!
 //! `rho-ui [DIR] [--rho PROGRAM]` opens one window. DIR is the workspace for
 //! new sessions (default: the current directory); PROGRAM is the `rho` that
-//! starts and locates the daemon (default: `rho` on `PATH`).
+//! starts the daemon when none runs (default: `rho` on `PATH`).
 
 mod app;
 mod approval;
@@ -101,14 +101,14 @@ const USAGE: &str = "usage: rho-ui [DIR] [--rho PROGRAM]";
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, String> {
     let mut args = args.into_iter();
     let mut dir: Option<PathBuf> = None;
-    let mut daemon = DaemonTarget::rho();
+    let mut rho = PathBuf::from("rho");
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--rho" => {
-                let program = args
+                rho = args
                     .next()
-                    .ok_or_else(|| format!("missing program after --rho\n{USAGE}"))?;
-                daemon = DaemonTarget::Rho(PathBuf::from(program));
+                    .ok_or_else(|| format!("missing program after --rho\n{USAGE}"))?
+                    .into();
             }
             "-h" | "--help" => return Err(USAGE.to_owned()),
             flag if flag.starts_with('-') => return Err(format!("unknown option {flag}\n{USAGE}")),
@@ -127,6 +127,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
     if !workspace.is_dir() {
         return Err(format!("{} is not a directory", workspace.display()));
     }
+    let daemon = DaemonTarget::rho(rho).ok_or("can't find the rho home: set RHO_HOME or HOME")?;
     Ok(LaunchConfig { workspace, daemon })
 }
 
@@ -204,11 +205,12 @@ mod tests {
             launch.workspace,
             PathBuf::from("/tmp").canonicalize().unwrap()
         );
-        assert_eq!(
-            launch.daemon,
-            DaemonTarget::Rho(PathBuf::from("/opt/rho/bin/rho"))
-        );
-        assert_eq!(parse(&["/tmp"]).unwrap().daemon, DaemonTarget::rho());
+        let rho = |launch: LaunchConfig| match launch.daemon {
+            DaemonTarget::Home { rho, .. } => rho,
+            DaemonTarget::Socket(_) => panic!("the command line names no socket"),
+        };
+        assert_eq!(rho(launch), PathBuf::from("/opt/rho/bin/rho"));
+        assert_eq!(rho(parse(&["/tmp"]).unwrap()), PathBuf::from("rho"));
     }
 
     #[test]

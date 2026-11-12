@@ -978,7 +978,10 @@ fn a_wheel_notch_glides() {
 /// A missing rho program leaves a clear error with a way to retry.
 #[test]
 fn a_missing_rho_shows_an_error_and_retry() {
-    let target = DaemonTarget::Rho(PathBuf::from("/nonexistent/rho"));
+    let target = DaemonTarget::Home {
+        home: PathBuf::from("/nonexistent/rho-home"),
+        rho: PathBuf::from("/nonexistent/rho"),
+    };
     let mut ui = Harness::open("missing", target, None, Shelves::default());
     ui.wait_until("the retry button", |window, _, _| {
         is_visible(window, "retry-daemon")

@@ -1,6 +1,6 @@
 //! The app against a real rho daemon and model; see [`live_daemon`].
 
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
 use rho_ui_core::{DaemonTarget, Entry, RunState, ToolStatus};
@@ -23,7 +23,7 @@ fn live_daemon() {
     const TURN: Duration = Duration::from_secs(180);
 
     let rho = std::env::var("RHO_UI_LIVE_RHO").expect("RHO_UI_LIVE_RHO names a rho 3 program");
-    let target = DaemonTarget::Rho(PathBuf::from(rho));
+    let target = DaemonTarget::rho(rho).expect("RHO_HOME or HOME names the rho home");
     let mut ui = Harness::open("live", target, None, Shelves::default());
     ui.wait_within(TURN, "the daemon", |window, _, _| {
         is_visible(window, "new-session")

@@ -16,7 +16,7 @@ cargo run -p rho-ui -- [DIR] [--rho PROGRAM]
 
 `DIR` is where new sessions start; it defaults to the current directory. `PROGRAM` is the `rho` to reach the daemon through; it defaults to `rho` on `PATH`.
 
-rho-ui starts the daemon when none runs: it runs `rho daemon start`, then asks `rho daemon status --json` for the socket. The daemon belongs to the rho home (`~/.rho`, or `$RHO_HOME`), not to rho-ui, and keeps running after the app quits. Stop it with `rho daemon stop`.
+rho-ui connects to the daemon of the rho home (`$RHO_HOME`, or `~/.rho`) through `rho-protocol`'s `LocalDaemon`, which finds its socket the way rho does. When none runs, `LocalDaemon` starts it with `PROGRAM daemon start`, rho's own ensure-running path. The daemon belongs to the rho home, not to rho-ui, and keeps running after the app quits. Stop it with `rho daemon stop`.
 
 On Linux you need a Wayland or X11 session with a working Vulkan driver. See the GPUI Kit [installation guide](https://gpui-kit.com/docs/installation/) for the system packages. The daemon's socket is a Unix socket, so rho-ui does not build on Windows yet.
 

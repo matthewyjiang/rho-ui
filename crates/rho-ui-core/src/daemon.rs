@@ -2,7 +2,8 @@
 //! connection follows many sessions.
 //!
 //! ```ignore
-//! let (daemon, mut events) = Daemon::connect(DaemonTarget::rho()).await?;
+//! let target = DaemonTarget::rho("rho").expect("a rho home");
+//! let (daemon, mut events) = Daemon::connect(target).await?;
 //! let mut session = Session::from_setup(daemon.new_session(&cwd).await?);
 //! session.attached(daemon.attach(session.id()).await?);
 //! session.turn_began(&daemon.prompt(session.id(), "hello").await?);
@@ -15,8 +16,9 @@
 //! await, and replies cross over on channels.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -24,10 +26,10 @@ use std::{
 use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ContentBlock,
     DaemonNotification, DetachReason, ErrorCode, IdleWake, JobKind, JobListParams, JobState,
-    JobSummary, Notifications, SessionAnswerParams, SessionAttachParams, SessionCancelParams,
-    SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionListParams,
-    SessionNewParams, SessionPart, SessionPromptParams, SessionSteerParams, SessionUnsteerParams,
-    TurnOutcome, UnsteerOutcome,
+    JobSummary, LocalDaemon, LocalDaemonError, Notifications, SessionAnswerParams,
+    SessionAttachParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
+    SessionDetachParams, SessionListParams, SessionNewParams, SessionPart, SessionPromptParams,
+    SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 
@@ -40,19 +42,38 @@ use crate::{
 /// How to reach the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DaemonTarget {
-    /// Ask this `rho` program for it: `rho daemon start` starts the daemon
-    /// unless one runs, and `rho daemon status --json` says where it
-    /// listens. Which daemon that is follows from `RHO_HOME`, as for rho.
-    Rho(PathBuf),
+    /// The daemon of the rho home `home`, found where rho-protocol's
+    /// `LocalDaemon` says it listens. When none runs there, `rho daemon
+    /// start` through the program `rho` starts it.
+    Home {
+        /// The rho home, such as `~/.rho`.
+        home: PathBuf,
+        /// The `rho` program that starts the daemon.
+        rho: PathBuf,
+    },
     /// A daemon already listening on this socket.
     Socket(PathBuf),
 }
 
 impl DaemonTarget {
-    /// `rho`, found on `PATH`.
-    pub fn rho() -> Self {
-        Self::Rho(PathBuf::from("rho"))
+    /// The daemon of the rho home `rho` itself uses, started through the
+    /// program `rho`; `None` when neither `RHO_HOME` nor `HOME` is set.
+    pub fn rho(rho: impl Into<PathBuf>) -> Option<Self> {
+        Some(Self::Home {
+            home: rho_home(|name| std::env::var_os(name))?,
+            rho: rho.into(),
+        })
     }
+}
+
+/// The rho home as `rho` finds it: `$RHO_HOME`, else `$HOME/.rho`, with an
+/// empty variable taken as unset. rho-protocol does not export this rule,
+/// so it is copied from rho's `paths::rho_dir`.
+fn rho_home(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let set = |name| var(name).filter(|value| !value.is_empty());
+    set("RHO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".rho")))
 }
 
 /// Why the daemon could not be reached, or refused a request.
@@ -82,6 +103,16 @@ impl From<ClientError> for DaemonError {
             ClientError::Rpc { error, .. } => Self::Refused(error.message),
             // Each of these names the daemon and what to do, as rho's own
             // frontends show them.
+            other => Self::Unreachable(other.to_string()),
+        }
+    }
+}
+
+impl From<LocalDaemonError> for DaemonError {
+    fn from(error: LocalDaemonError) -> Self {
+        match error {
+            LocalDaemonError::Handshake(error) => error.into(),
+            // Each names the command or socket that failed, and why.
             other => Self::Unreachable(other.to_string()),
         }
     }
@@ -386,59 +417,27 @@ fn io() -> &'static Runtime {
     })
 }
 
-/// Runs `program` with `args` and returns what it printed, or what went
-/// wrong in words that name the command.
-fn run(program: &Path, args: &[&str]) -> Result<Vec<u8>, DaemonError> {
-    let shown = format!("{} {}", program.display(), args.join(" "));
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| DaemonError::Unreachable(format!("couldn't run {shown}: {error}")))?;
-    if output.status.success() {
-        return Ok(output.stdout);
-    }
-    let reason = String::from_utf8_lossy(&output.stderr);
-    Err(DaemonError::Unreachable(format!(
-        "{shown} failed: {}",
-        reason.trim()
-    )))
-}
-
-/// Starts the daemon through `program` unless one runs, and returns the
-/// socket it listens on. Blocks while rho waits for the daemon to answer.
-fn start(program: &Path) -> Result<PathBuf, DaemonError> {
-    run(program, &["daemon", "start"])?;
-    let status = run(program, &["daemon", "status", "--json"])?;
-    let socket = serde_json::from_slice::<serde_json::Value>(&status)
-        .ok()
-        .and_then(|status| Some(PathBuf::from(status.get("socket")?.as_str()?)));
-    socket.ok_or_else(|| {
-        DaemonError::Unreachable(format!(
-            "{} daemon status --json named no socket",
-            program.display()
-        ))
-    })
-}
-
 async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonError> {
-    let socket = match target {
-        DaemonTarget::Socket(socket) => socket,
-        DaemonTarget::Rho(program) => tokio::task::spawn_blocking(move || start(&program))
-            .await
-            .map_err(|error| DaemonError::Unreachable(format!("starting rho failed: {error}")))??,
-    };
-    let stream = UnixStream::connect(&socket).await.map_err(|error| {
-        DaemonError::Unreachable(format!(
-            "couldn't connect to the rho daemon at {}: {error}",
-            socket.display()
-        ))
-    })?;
     let hello = ClientHello::frontend(ClientInfo {
         name: "rho-ui".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
     });
-    let (client, notifications, hello) = Client::handshake(stream, hello).await?;
+    let (client, notifications, hello) = match target {
+        DaemonTarget::Home { home, rho } => {
+            LocalDaemon::new(home)
+                .connect_or_start(Command::new(rho), hello)
+                .await?
+        }
+        DaemonTarget::Socket(socket) => {
+            let stream = UnixStream::connect(&socket).await.map_err(|error| {
+                DaemonError::Unreachable(format!(
+                    "couldn't connect to the rho daemon at {}: {error}",
+                    socket.display()
+                ))
+            })?;
+            Client::handshake(stream, hello).await?
+        }
+    };
     let info = DaemonInfo {
         version: hello.daemon.version,
         notice: hello.skew.map(|skew| skew.to_string()),
@@ -468,9 +467,10 @@ impl Daemon {
     ///
     /// # Errors
     ///
-    /// Fails if rho cannot be run or its daemon does not start, the socket
-    /// refuses the connection, or the daemon speaks another protocol
-    /// version; the message then says which side to update.
+    /// Fails if no daemon runs and rho cannot be run or its daemon does not
+    /// start, the socket refuses the connection, or the daemon speaks
+    /// another protocol version; the message then says which side to
+    /// update.
     pub async fn connect(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonError> {
         let (reply, opened) = oneshot::channel();
         io().spawn(async move {
@@ -546,6 +546,7 @@ impl Daemon {
             setup: session_setup(),
             parent: None,
             grant: None,
+            worktree: false,
         };
         let response = self.client.request::<methods::SessionNew>(&params).await?;
         Ok(SessionSetup {
@@ -764,6 +765,26 @@ mod tests {
         let summary = serde_json::from_value(json!({"id": "j1", "kind": kind, "state": state,
             "workspace": "/w", "session": "s1", "created_at": 0, "updated_at": 0, "live": live}));
         Job::from_wire(summary.expect("a valid job summary"))
+    }
+
+    #[test]
+    fn the_rho_home_is_rho_home_else_dot_rho_in_home() {
+        let home = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, OsString)> = vars
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+                .collect();
+            rho_home(|name| {
+                vars.iter()
+                    .find(|(set, _)| set == name)
+                    .map(|(_, value)| value.clone())
+            })
+        };
+        let both = [("RHO_HOME", "/srv/rho"), ("HOME", "/home/me")];
+        assert_eq!(home(&both), Some(PathBuf::from("/srv/rho")));
+        let empty = [("RHO_HOME", ""), ("HOME", "/home/me")];
+        assert_eq!(home(&empty), Some(PathBuf::from("/home/me/.rho")));
+        assert_eq!(home(&[("HOME", "")]), None);
     }
 
     fn live(elapsed_ms: u64, inputs: &serde_json::Value) -> serde_json::Value {
