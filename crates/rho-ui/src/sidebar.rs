@@ -983,7 +983,8 @@ fn branch_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
 }
 
 /// "Working 24m", "Waiting 9m", or the age: "3h". Icons are static: an
-/// animated one would redraw the whole sidebar every frame.
+/// animated one would redraw the whole sidebar every frame. So Working
+/// gets a symmetric dashed circle, not a spinner frozen mid-turn.
 fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
     let label = |word: &str, since: Instant| match time::elapsed(
         clock.instant.duration_since(since).as_secs(),
@@ -1003,12 +1004,12 @@ fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
     match row.activity {
         Activity::Working(since) => busy(
             theme.blue,
-            Icon::new(IconName::LoaderCircle),
+            Icon::new(Lucide::CircleDashed),
             label("Working", since),
         ),
         Activity::Waiting(since) => busy(
             theme.warning,
-            Icon::new(Lucide::CircleDashed),
+            Icon::new(Lucide::CircleAlert),
             label("Waiting", since),
         ),
         Activity::Idle => div()
