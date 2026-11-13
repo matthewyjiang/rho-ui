@@ -13,7 +13,11 @@
 //! The session's running background work is listed above the box, with a
 //! button to stop each piece; what ended is behind a button in the header.
 
-use std::{path::PathBuf, rc::Rc, time::Instant};
+use std::{
+    path::PathBuf,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -31,7 +35,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
     Attached, Attachment, BackgroundId, Daemon, DaemonError, Entry, Prompt, RunState, Session,
@@ -44,10 +48,13 @@ use crate::{
     composer::{Composer, ComposerMode, ComposerState},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
-    transcript::{ActionHandler, Transcript},
+    transcript::{ActionHandler, RowContent, Transcript},
     workspaces::{Workspace, WorkspaceRef},
     StopTurn,
 };
+
+/// How often a running turn's header redraws: it counts whole seconds.
+const TICK: Duration = Duration::from_secs(1);
 
 /// What the app needs to hear from a session.
 pub(crate) enum SessionEvent {
@@ -101,6 +108,8 @@ pub(crate) struct SessionView {
     error: Option<String>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    /// Redraws "Working for" while a turn runs.
+    _tick: Task<()>,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -167,6 +176,17 @@ impl SessionView {
             error: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
+            _tick: cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(TICK).await;
+                let tick = this.update(cx, |this, cx| {
+                    if this.busy_since.is_some() {
+                        cx.notify();
+                    }
+                });
+                if tick.is_err() {
+                    break;
+                }
+            }),
         };
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
@@ -300,21 +320,21 @@ impl SessionView {
         }
         let now = Instant::now();
         let busy = self.is_busy();
-        match (busy, self.busy_since) {
+        match (busy, self.busy_since, self.turn_began) {
             // Attached with a turn under way: it is the newest one.
-            (true, None) if self.turn_began.is_some() => {
-                self.busy_since = self.turn_began.take();
-                self.transcript.resume_turn(cx);
+            (true, None, Some(since)) => {
+                self.turn_began = None;
+                self.busy_since = Some(since);
+                self.transcript.resume_turn(since, cx);
             }
             // A turn began, from here or from another client.
-            (true, None) => {
+            (true, None, None) => {
                 self.busy_since = Some(now);
-                self.transcript.expect_turn();
+                self.transcript.expect_turn(now);
             }
-            (false, Some(since)) => {
+            (false, Some(_), _) => {
                 self.busy_since = None;
-                self.transcript
-                    .end_turn(now - since, self.session.entries(), cx);
+                self.transcript.end_turn(self.session.entries(), cx);
                 cx.emit(SessionEvent::Saved);
             }
             _ => {}
@@ -689,6 +709,18 @@ impl SessionView {
                 });
             })
         };
+        let content: RowContent = {
+            let view = view.clone();
+            let act = Rc::clone(&act);
+            Rc::new(move |ix, _, cx| match view.upgrade() {
+                Some(view) => {
+                    let this = view.read(cx);
+                    this.transcript
+                        .render_content(ix, this.session.entries(), &act, cx)
+                }
+                None => div().into_any_element(),
+            })
+        };
         div()
             .flex_1()
             .min_h_0()
@@ -699,8 +731,13 @@ impl SessionView {
                     move |ix, _, cx| match view.upgrade() {
                         Some(view) => {
                             let this = view.read(cx);
-                            this.transcript
-                                .render_row(ix, this.session.entries(), &act, cx)
+                            this.transcript.render_row(
+                                ix,
+                                this.session.entries(),
+                                &act,
+                                &content,
+                                cx,
+                            )
                         }
                         None => div().into_any_element(),
                     },

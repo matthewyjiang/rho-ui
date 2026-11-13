@@ -197,6 +197,14 @@ impl Harness {
         self.act(|window, cx| window.click(id, cx));
     }
 
+    /// Clicks turn header `id`, and lets its working spring open or shut:
+    /// a frame starts the spring, then the clock jumps past its settling.
+    fn toggle_turn(&mut self, id: &'static str) {
+        self.click(id);
+        self.frame();
+        self.cx.advance_clock(Duration::from_secs(1));
+    }
+
     /// Sends `text` to session `id` as another client would, such as rho's
     /// terminal UI: over a connection of its own, which it then closes.
     fn prompt_from_elsewhere(&mut self, id: &str, text: &str) {
@@ -342,6 +350,14 @@ fn new_session_runs_a_turn_through_an_approval() {
     ui.act(|window, _| {
         assert_eq!(window.find("session-title").label(), Some("list files"));
         assert_eq!(window.find("session-new-1").label(), Some("list files"));
+        // The turn's header counts up while it runs.
+        let header = window.find("worked-0").label().map(str::to_owned);
+        assert!(
+            header
+                .as_deref()
+                .is_some_and(|header| header.starts_with("Working for ")),
+            "the running turn's header: {header:?}"
+        );
     });
     ui.shot("approval");
 
@@ -373,9 +389,26 @@ fn new_session_runs_a_turn_through_an_approval() {
         is_visible(window, "session-new-1")
     });
 
-    // The finished turn's working folds behind "Worked for"; inside, a
-    // lone tool call is one line, and opening it shows its output.
-    ui.click("worked-0");
+    // The same header now says how long the turn took, and its working
+    // folds behind it, over a few frames rather than at once.
+    let took = turn_took(&mut ui, 0).expect("the turn was timed here");
+    ui.act(|window, _| {
+        let header = format!("Worked for {}", crate::time::took(took));
+        assert_eq!(window.find("worked-0").label(), Some(header.as_str()));
+    });
+    ui.cx.advance_clock(Duration::from_millis(60));
+    ui.frame();
+    ui.act(|window, _| {
+        assert!(is_visible(window, "step-1"), "the working is folding");
+    });
+    ui.shot("folding");
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the working folded", |window, _, _| {
+        !is_visible(window, "step-1")
+    });
+
+    // Inside, a lone tool call is one line, and opening it shows its output.
+    ui.toggle_turn("worked-0");
     ui.wait_until("the turn's working", |window, _, _| {
         is_visible(window, "step-1")
     });
@@ -838,7 +871,7 @@ fn finished_work_folds_and_opens_in_levels() {
     assert_eq!(turn_took(&mut ui, 0), Some(took), "Worked for 1m 20s");
     ui.shot("worked");
 
-    ui.click("worked-0");
+    ui.toggle_turn("worked-0");
     ui.wait_until("the steps as one summary line", |window, _, _| {
         is_visible(window, "work-2") && !is_visible(window, "step-3")
     });
@@ -913,7 +946,7 @@ fn a_new_prompt_leaves_finished_turns_folded() {
     assert_eq!(turn_took(&mut ui, 0), None, "the refusal times no old turn");
 
     // Each turn has its own "Worked" line: opening the second opens only it.
-    ui.click("worked-1");
+    ui.toggle_turn("worked-1");
     ui.wait_until("the slow turn's tool call", |window, _, _| {
         is_visible(window, "step-9")
     });
@@ -960,7 +993,12 @@ fn a_turn_started_elsewhere_is_its_own_turn_and_leaves_typing_alone() {
         .expect("window is open");
     assert!(typing, "the keyboard stays in the composer");
     ui.act(|window, _| {
-        assert!(is_visible(window, "worked-0"), "the old turn stays folded");
+        // The new turn's header pushes the old one's just out of view.
+        assert_eq!(
+            window.find("worked-0").label(),
+            Some("Worked for 1m 20s"),
+            "the old turn stays folded"
+        );
         assert!(!is_visible(window, "work-2"), "its rows stay hidden");
     });
     ui.shot("approval");
@@ -1306,7 +1344,7 @@ fn the_theme_setting_switches_light_and_dark() {
     ui.wait_until("the turn folded behind one line", |window, _, _| {
         is_visible(window, "worked-0")
     });
-    ui.click("worked-0");
+    ui.toggle_turn("worked-0");
     ui.wait_until("the steps", |window, _, _| is_visible(window, "work-2"));
     ui.act(|window, cx| window.within("work-2").click("work-summary", cx));
     ui.wait_until("a line per step", |window, _, _| {

@@ -1,10 +1,16 @@
 //! The transcript: a session's entries as rows in a scroller. Messages and
 //! notices are drawn here; runs of tool calls and thoughts by
-//! [`crate::work`]. A finished turn's working folds behind one "Worked for"
-//! line. This owns what the user opened and folded, the turns' lengths, and
-//! the user messages' attachments, ready to draw.
+//! [`crate::work`]. Under each prompt, a header says "Working for 38s"
+//! while the turn runs; when it finishes, the same line says "Worked for"
+//! and the turn's working folds behind it. This owns what the user opened
+//! and folded, the turns' lengths, and the user messages' attachments,
+//! ready to draw.
 
-use std::{ops::Range, rc::Rc, time::Duration};
+use std::{
+    ops::Range,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -16,7 +22,7 @@ use gpui_kit::component::{
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
     text::TextView,
-    v_flex, ActiveTheme as _, Icon, Sizable as _,
+    ActiveTheme as _, Icon, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -28,9 +34,9 @@ use rho_ui_core::{Entry, NoticeLevel, Row, Timeline};
 
 use crate::{
     attachments::Preview,
-    time,
+    fold::Folding,
     turn_times::TurnTimes,
-    work::{self, DiffView, Disclosure, Fold, FoldHandler, WorkRow},
+    work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
 
 /// How tall an image attached to a user message is, in rems: a
@@ -50,6 +56,21 @@ pub(crate) enum Action {
 /// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
 
+/// Builds row `ix`'s content: [`Transcript::render_content`], reached
+/// through the session view, because a fold builds its rows only while they
+/// show, after [`Transcript::render_row`] returned.
+pub(crate) type RowContent = Rc<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
+
+/// The turn in progress.
+#[derive(Clone, Copy, Debug)]
+struct Running {
+    /// By its index among the timeline's turns. It may not have its opening
+    /// row yet: the prompt's comes when the daemon echoes it, and a turn
+    /// the daemon began itself opens with its first entry ([`Entry::Wake`]).
+    turn: usize,
+    since: Instant,
+}
+
 /// A session's transcript state. Flat arrays indexed by row, entry or turn.
 pub(crate) struct Transcript {
     scroller: Entity<MessageScrollerState>,
@@ -64,11 +85,7 @@ pub(crate) struct Transcript {
     /// replays no turn times, so a replayed turn has one only from
     /// [`TurnTimes`].
     took: Vec<Option<Duration>>,
-    /// The turn in progress, by its index among the timeline's turns. It
-    /// may not have its opening row yet: the prompt's comes when the daemon
-    /// echoes it, and a turn the daemon began itself opens with its first
-    /// entry ([`Entry::Wake`]).
-    running: Option<usize>,
+    running: Option<Running>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
     /// Per entry: a user message's attachments, ready to draw.
@@ -148,29 +165,35 @@ impl Transcript {
         }
     }
 
-    /// A turn began, here or in another client: it is the next one, though
-    /// its prompt row comes only when the daemon echoes the prompt. The
-    /// turns before it stay folded.
-    pub(crate) fn expect_turn(&mut self) {
-        self.running = Some(self.timeline.turns().len());
+    /// A turn began `since`, here or in another client: it is the next
+    /// one, though its prompt row comes only when the daemon echoes the
+    /// prompt. The turns before it stay folded.
+    pub(crate) fn expect_turn(&mut self, since: Instant) {
+        self.running = Some(Running {
+            turn: self.timeline.turns().len(),
+            since,
+        });
     }
 
-    /// The session was attached with a turn under way: it is the newest
-    /// one, which unfolds.
-    pub(crate) fn resume_turn(&mut self, cx: &mut App) {
+    /// The session was attached with a turn under way since `since`: it is
+    /// the newest one, which unfolds.
+    pub(crate) fn resume_turn(&mut self, since: Instant, cx: &mut App) {
         let newest = self.timeline.turns().len().saturating_sub(1);
-        self.running = Some(newest);
+        self.running = Some(Running {
+            turn: newest,
+            since,
+        });
         self.remeasure(self.timeline.turn_rows(newest), cx);
     }
 
-    /// The running turn finished after `took`, and folds. Its time is saved
-    /// for when the session replays, under its prompt: a turn the daemon
-    /// began itself has none, and a prompt that never arrived leaves no
-    /// turn to time.
-    pub(crate) fn end_turn(&mut self, took: Duration, entries: &[Entry], cx: &mut App) {
-        let Some(turn) = self.running.take() else {
+    /// The running turn finished, and folds. Its time is saved for when the
+    /// session replays, under its prompt: a turn the daemon began itself
+    /// has none, and a prompt that never arrived leaves no turn to time.
+    pub(crate) fn end_turn(&mut self, entries: &[Entry], cx: &mut App) {
+        let Some(Running { turn, since }) = self.running.take() else {
             return;
         };
+        let took = since.elapsed();
         if turn >= self.took.len() {
             return;
         }
@@ -229,7 +252,7 @@ impl Transcript {
     }
 
     fn is_finished(&self, turn: usize) -> bool {
-        self.running.is_none_or(|running| turn < running)
+        self.running.is_none_or(|running| turn < running.turn)
     }
 
     fn remeasure(&self, rows: Range<usize>, cx: &mut App) {
@@ -237,9 +260,100 @@ impl Transcript {
             .update(cx, |scroller, cx| scroller.remeasure_items(rows, cx));
     }
 
-    /// Row `ix`. A row inside a folded turn is empty, so it takes no space;
-    /// the turn's first working row shows the "Worked for" line.
+    /// Row `ix`, at a readable measure on wide windows. A turn's working
+    /// is open while the turn runs and folds once it finishes, so its rows
+    /// are built through `content`; a folded row takes no space. The gap
+    /// below each row is here, inside any fold, not in the scroller's row
+    /// style (which the session view zeroes).
     pub(crate) fn render_row(
+        &self,
+        ix: usize,
+        entries: &[Entry],
+        act: &ActionHandler,
+        content: &RowContent,
+        cx: &App,
+    ) -> AnyElement {
+        let measure = div().w_full().max_w(rems(48.)).mx_auto();
+        let Some(turn) = self.timeline.turn_of(ix) else {
+            return measure
+                .pb_3()
+                .child(self.render_content(ix, entries, act, cx))
+                .into_any_element();
+        };
+        let working = self.timeline.working(turn);
+        if working.as_ref().is_some_and(|rows| rows.contains(&ix)) {
+            let shows = if self.is_finished(turn) {
+                self.worked[turn]
+            } else {
+                Disclosure::Open
+            };
+            let content = Rc::clone(content);
+            return measure
+                .child(Folding::new(
+                    ElementId::named_usize("working", ix),
+                    shows,
+                    move |window, cx| {
+                        div()
+                            .pb_3()
+                            .child(content(ix, window, cx))
+                            .into_any_element()
+                    },
+                ))
+                .into_any_element();
+        }
+        let opens_turn = self.timeline.turns().get(turn) == Some(&ix);
+        measure
+            .pb_3()
+            .child(self.render_content(ix, entries, act, cx))
+            .when(opens_turn, |this| {
+                this.child(self.render_header(turn, act, cx))
+            })
+            .into_any_element()
+    }
+
+    /// `turn`'s header, under its opening row. It counts up while the turn
+    /// runs, then folds the turn's working; a turn with no working has no
+    /// header once it finishes, so the running one's folds away.
+    fn render_header(&self, turn: usize, act: &ActionHandler, cx: &App) -> AnyElement {
+        let finished = self.is_finished(turn);
+        let has_working = self.timeline.working(turn).is_some();
+        let header = match self.running {
+            Some(running) if !finished => Header::Working(running.since.elapsed()),
+            _ => Header::Worked {
+                took: self.took[turn],
+                fold: has_working.then_some(self.worked[turn]),
+            },
+        };
+        let act = Rc::clone(act);
+        let line = div()
+            .pt_3()
+            .child(work::turn_header(
+                turn,
+                header,
+                move |window, cx| act(Action::Worked { turn }, window, cx),
+                cx,
+            ))
+            .into_any_element();
+        if finished && has_working {
+            // Held still: a finished turn's history may replay its working
+            // after its prompt, which shouldn't animate in.
+            return line;
+        }
+        let shows = if finished {
+            Disclosure::Folded
+        } else {
+            Disclosure::Open
+        };
+        Folding::new(
+            ElementId::named_usize("turn-header", turn),
+            shows,
+            move |_, _| line,
+        )
+        .into_any_element()
+    }
+
+    /// Row `ix`'s own content: a message, or a run of work.
+    pub(crate) fn render_content(
         &self,
         ix: usize,
         entries: &[Entry],
@@ -250,22 +364,13 @@ impl Transcript {
             return div().into_any_element();
         };
         let turn = self.timeline.turn_of(ix);
-        let fold = turn
-            .filter(|&turn| self.is_finished(turn))
-            .and_then(|turn| Some((turn, self.timeline.working(turn)?)))
-            .filter(|(_, working)| working.contains(&ix));
-        if let Some((turn, working)) = &fold {
-            if !self.worked[*turn].is_open() && ix != working.start {
-                return div().into_any_element();
-            }
-        }
-        let running = turn.is_some() && turn == self.running;
+        let running = turn.is_some() && turn == self.running.map(|running| running.turn);
         let phase = if running && ix + 1 == self.timeline.rows().len() {
             Phase::Live
         } else {
             Phase::Settled
         };
-        let content = || match row {
+        match row {
             Row::Message(entry) => {
                 let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
                 render_message(&entries[*entry], *entry, attachments, phase, cx)
@@ -288,38 +393,7 @@ impl Transcript {
                     cx,
                 )
             }
-        };
-        let row = match fold {
-            Some((turn, working)) if ix == working.start => {
-                let open = self.worked[turn];
-                let took = self.took[turn].map(|took| time::took(took).into());
-                let act = Rc::clone(act);
-                let line = work::worked_line(
-                    turn,
-                    took,
-                    open,
-                    move |window, cx| act(Action::Worked { turn }, window, cx),
-                    cx,
-                );
-                v_flex()
-                    .gap_3()
-                    .child(line)
-                    // A folded turn builds none of its rows.
-                    .when(open.is_open(), |this| this.child(content()))
-                    .into_any_element()
-            }
-            _ => content(),
-        };
-        // A readable measure on wide windows. The gap below is here, not in
-        // the scroller's row style (which the session view zeroes), so rows in
-        // a folded turn take no space.
-        div()
-            .w_full()
-            .max_w(rems(48.))
-            .mx_auto()
-            .pb_3()
-            .child(row)
-            .into_any_element()
+        }
     }
 }
 

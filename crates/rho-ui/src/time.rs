@@ -52,7 +52,17 @@ pub(crate) fn took(duration: Duration) -> String {
         return format!("{}.{}s", tenths / 10, tenths % 10);
     }
     // Round before choosing units, so 59.5 s never reads "60s".
-    let seconds = (millis + 500) / 1_000;
+    hms((millis + 500) / 1_000)
+}
+
+/// How long a running turn has run, in whole seconds so it ticks once a
+/// second: "0s", "38s", "1m 20s". It reads as [`took`] from 10 s on.
+pub(crate) fn running(duration: Duration) -> String {
+    hms(u128::from(duration.as_secs()))
+}
+
+/// "38s", "1m 20s", "2h 5m": units with nothing in them are left out.
+fn hms(seconds: u128) -> String {
     if seconds < 60 {
         return format!("{seconds}s");
     }
@@ -82,6 +92,14 @@ mod tests {
         assert_eq!(took(ms(59_600)), "1m");
         assert_eq!(took(ms(80_000)), "1m 20s");
         assert_eq!(took(ms(7_500_000)), "2h 5m");
+    }
+
+    #[test]
+    fn a_running_turn_ticks_in_whole_seconds() {
+        let ms = Duration::from_millis;
+        assert_eq!(running(ms(400)), "0s");
+        assert_eq!(running(ms(4_900)), "4s");
+        assert_eq!(running(ms(80_999)), "1m 20s");
     }
 
     #[test]

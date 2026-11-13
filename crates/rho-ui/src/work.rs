@@ -4,7 +4,7 @@
 //! thought. A row with one step is just that step's line. While the turn
 //! runs, the summary line shows the newest step instead.
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -26,7 +26,7 @@ use gpui_kit::{
 };
 use rho_ui_core::{Entry, Step, ToolCall, ToolContent, ToolKind, ToolStatus};
 
-use crate::transcript::Phase;
+use crate::{time, transcript::Phase};
 
 /// Output past this many lines shows only its tail. At `text_xs` that is
 /// about seven screens of text, more than anyone reads inline, and it keeps
@@ -347,27 +347,46 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
         .into_any_element()
 }
 
-/// "Worked for 1m 20s": a finished turn's working, folded behind one line
-/// that opens it. `took` is the turn's length, when this run saw it. The
-/// line is keyed by `turn`: GPUI keeps hover and click state per element id,
-/// so turns sharing one id would hover and open as one.
-pub(crate) fn worked_line(
+/// What a turn's header, under its prompt, says.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Header {
+    /// "Working for 38s": the turn runs, and has for this long.
+    Working(Duration),
+    /// "Worked for 1m 20s". `took` is the turn's length, when this run saw
+    /// it; `fold` is whether its working shows, if it has any to fold.
+    Worked {
+        took: Option<Duration>,
+        fold: Option<Disclosure>,
+    },
+}
+
+/// A turn's header: a line with a rule to its right, so it reads as a
+/// divider. Once the turn finishes it opens and folds the turn's working.
+/// It is keyed by `turn`, the same element while the turn runs and after,
+/// and GPUI keeps hover and click state per element id, so turns sharing
+/// one id would hover and open as one.
+pub(crate) fn turn_header(
     turn: usize,
-    took: Option<SharedString>,
-    disclosure: Disclosure,
+    header: Header,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
-    let label = match took {
-        Some(took) => format!("Worked for {took}"),
-        None => "Worked".to_owned(),
+    let (label, fold) = match header {
+        Header::Working(running) => (format!("Working for {}", time::running(running)), None),
+        Header::Worked {
+            took: Some(took),
+            fold,
+        } => (format!("Worked for {}", time::took(took)), fold),
+        Header::Worked { took: None, fold } => ("Worked".to_owned(), fold),
     };
-    line(None, label.into_any_element(), Some(disclosure), cx)
+    line(None, label.clone().into_any_element(), fold, cx)
         .id(SharedString::from(format!("worked-{turn}")))
         .test_support()
-        // A rule to the right, so the line reads as a divider.
+        .aria_label(label)
         .child(Separator::horizontal().flex_1())
-        .on_click(move |_, window, cx| on_click(window, cx))
+        .when(fold.is_some(), |this| {
+            this.on_click(move |_, window, cx| on_click(window, cx))
+        })
         .into_any_element()
 }
 
