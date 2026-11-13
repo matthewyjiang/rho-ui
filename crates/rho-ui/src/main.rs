@@ -9,6 +9,7 @@ mod approval;
 mod background;
 mod composer;
 mod draft;
+mod fold;
 mod kinetic;
 mod project_picker;
 mod projects;
