@@ -14,13 +14,14 @@ use std::{
 
 use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
-    px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, HeadlessAppContext,
-    MouseButton, Pixels, Window, WindowBounds, WindowOptions,
+    px, size, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem,
+    ElementId, Entity, ExternalPaths, HeadlessAppContext, ImageFormat, MouseButton, Pixels, Window,
+    WindowBounds, WindowOptions,
 };
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget, Entry, RunState, Session,
-    SessionId, ToolStatus,
+    Attachment, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget, Entry, RunState,
+    Session, SessionId, ToolStatus,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -56,6 +57,14 @@ impl Harness {
     /// as active.
     fn start(name: &'static str, script: Script) -> Self {
         Self::start_with(name, script, Shelves::owning(["s1", "old"]))
+    }
+
+    /// Closes the app and opens it again on the same daemon, as a restart
+    /// does, with `shelves` as its settled and snoozed state.
+    fn reopen(mut self, name: &'static str, shelves: Shelves) -> Self {
+        let (target, daemon) = (self.target.clone(), self.daemon.take());
+        drop(self);
+        Self::open(name, target, daemon, shelves, Projects::default())
     }
 
     /// [`Self::start`] with the given settled and snoozed state.
@@ -198,7 +207,7 @@ impl Harness {
                     .await
                     .expect("a second client connects");
                 daemon
-                    .prompt(&id, &text)
+                    .prompt(&id, &text.into())
                     .await
                     .expect("the daemon takes the other client's prompt");
             })
@@ -234,6 +243,28 @@ impl Harness {
             }
             window.input(text, cx);
             window.press("enter", cx);
+        });
+    }
+
+    /// Pastes `image` in the composer with Ctrl+V, as from a screenshot
+    /// tool.
+    fn paste(&mut self, image: gpui_kit::Image) {
+        self.paste_entry(ClipboardEntry::Image(image));
+    }
+
+    /// Pastes `entry` in the composer with Ctrl+V. In a session, it first
+    /// moves the keyboard to the composer.
+    fn paste_entry(&mut self, entry: ClipboardEntry) {
+        let app = self.app.clone();
+        self.act(|window, cx| {
+            if let Some(view) = app.read(cx).active_session() {
+                let composer = view.read(cx).composer_focus_handle(cx);
+                window.focus(&composer, cx);
+            }
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![entry],
+            });
+            window.press("ctrl-v", cx);
         });
     }
 
@@ -1510,12 +1541,367 @@ fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
     let (typed, held) = ui.cx.update(|cx| {
         let view = view.read(cx).active_session().expect("a session is open");
         let view = view.read(cx);
-        (
-            view.composer_text(cx),
-            view.session().held().map(str::to_owned),
-        )
+        (view.composer_text(cx), view.session().held().cloned())
     });
     assert_eq!((typed.as_str(), held), ("deleting", None));
+}
+
+const RED: [u8; 4] = [220, 60, 60, 255];
+const BLUE: [u8; 4] = [60, 110, 220, 255];
+const GREEN: [u8; 4] = [60, 170, 90, 255];
+
+/// A pasted PNG of one colour, `width` × `height`.
+fn pasted_png(width: u32, height: u32, rgba: [u8; 4]) -> gpui_kit::Image {
+    gpui_kit::Image::from_bytes(
+        ImageFormat::Png,
+        crate::attachments::png(width, height, rgba),
+    )
+}
+
+/// The bytes of each image in `attachments`.
+fn image_bytes(attachments: &[Attachment]) -> Vec<&[u8]> {
+    let images = attachments
+        .iter()
+        .filter_map(|attachment| match attachment {
+            Attachment::Image(image) => Some(image.bytes()),
+            Attachment::File(_) => None,
+        });
+    images.collect()
+}
+
+/// The composer's attachments on screen, by number.
+fn composer_attachments(window: &Window) -> Vec<u64> {
+    (1..=10)
+        .filter(|n| {
+            window
+                .try_find(format!("composer-attachment-{n}"))
+                .is_some_and(|tile| tile.visible())
+        })
+        .collect()
+}
+
+/// Pasted images show as tiles above the composer's text, squares of one
+/// size whatever their images' proportions. Each comes off with its remove
+/// control, or the last with Backspace in the empty text box; an image rho
+/// can't take is refused, saying why.
+#[test]
+fn pasted_images_show_as_removable_tiles() {
+    let mut ui = Harness::start("paste", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+
+    // A wide image, a tall one, and a square one.
+    ui.paste(pasted_png(320, 180, RED));
+    ui.paste(pasted_png(90, 160, BLUE));
+    ui.paste(pasted_png(120, 120, GREEN));
+    ui.wait_until("three tiles", |window, _, _| {
+        composer_attachments(window) == [1, 2, 3]
+    });
+    ui.act(|window, cx| {
+        assert_eq!(
+            window.find("composer-attachment-1").label(),
+            Some("PNG image, 320 × 180")
+        );
+        let wide = bounds(window, "composer-attachment-1").expect("the wide tile");
+        let tall = bounds(window, "composer-attachment-2").expect("the tall tile");
+        assert_eq!(wide.size, tall.size, "tiles are one size");
+        window.hover("composer-attachment-2", cx);
+    });
+    ui.shot("pasted");
+
+    // The tall one comes off with its remove control...
+    let remove =
+        |n: u64| ElementId::from((ElementId::from(("composer-attachment-card", n)), "remove"));
+    ui.act(|window, cx| window.click(remove(2), cx));
+    ui.wait_until("the tall tile gone", |window, _, _| {
+        composer_attachments(window) == [1, 3]
+    });
+    // Backspace edits text before it removes a tile, even at the start...
+    ui.act(|window, cx| {
+        window.input("hi", cx);
+        window.press("home", cx);
+        window.press("backspace", cx);
+        window.press("end", cx);
+        window.press("backspace", cx);
+    });
+    ui.act(|window, _| assert_eq!(composer_attachments(window), [1, 3], "no tile went"));
+    // ...and in the empty text box, takes the last one.
+    ui.act(|window, cx| {
+        window.press("backspace", cx);
+        window.press("backspace", cx);
+    });
+    ui.wait_until("the square tile gone", |window, _, _| {
+        composer_attachments(window) == [1]
+    });
+    let held = |ui: &mut Harness| {
+        let app = ui.app.clone();
+        ui.cx.update(|cx| {
+            let draft = app.read(cx).draft().expect("the draft is open");
+            draft.read(cx).composer_prompt(cx)
+        })
+    };
+    let prompt = held(&mut ui);
+    assert_eq!(prompt.text(), "");
+    assert_eq!(
+        image_bytes(prompt.attachments()),
+        [crate::attachments::png(320, 180, RED)],
+        "the wide image is the one left"
+    );
+
+    // rho takes no BMP; only the start of one is read.
+    ui.paste(gpui_kit::Image::from_bytes(
+        ImageFormat::Bmp,
+        b"BM\0\0".to_vec(),
+    ));
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "composer-refusal")
+    });
+    ui.act(|window, _| assert_eq!(composer_attachments(window), [1], "the rest stay"));
+    assert_eq!(held(&mut ui), prompt);
+    ui.shot("refused");
+}
+
+/// Pasted images go with the text as one message, and the transcript shows
+/// them with it, also when the session is opened afresh. While a turn
+/// runs, a message with images waits for the turn to end: a steer carries
+/// only text. A failed send puts the images back.
+#[test]
+fn images_go_with_the_message() {
+    let mut ui = Harness::start("images", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.paste(pasted_png(320, 180, RED));
+    ui.act(|window, cx| {
+        window.input("what is this?", cx);
+        window.press("enter", cx);
+    });
+
+    ui.wait_until("the approval card", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    let session = ui.session();
+    let Entry::User(sent) = &session.entries()[0] else {
+        panic!("the prompt comes first: {:?}", session.entries());
+    };
+    assert_eq!(sent.text(), "what is this?");
+    assert_eq!(
+        image_bytes(sent.attachments()),
+        [crate::attachments::png(320, 180, RED)],
+        "the daemon echoed the image it got"
+    );
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "user-0-attachment-0"),
+            "the transcript shows it"
+        );
+        assert!(is_visible(window, "user-0"), "with the text under it");
+        assert!(
+            composer_attachments(window).is_empty(),
+            "the composer is empty"
+        );
+    });
+
+    // The turn waits on an approval, so this can't steer it: it waits.
+    ui.paste(pasted_png(160, 90, BLUE));
+    ui.send("and this");
+    ui.wait_until("the held message", |window, _, _| {
+        is_visible(window, "held")
+    });
+    ui.act(|window, _| {
+        assert_eq!(
+            window.find("held").label(),
+            Some("Sends after this turn: and this · 1 image")
+        );
+        assert!(composer_attachments(window).is_empty());
+        assert!(!shows_an_error(window));
+    });
+    ui.shot("held");
+
+    ui.click("approval-allow-once");
+    let images_sent = |session: &Session| -> Vec<(String, usize)> {
+        let users = session.entries().iter().filter_map(|entry| match entry {
+            Entry::User(message) => Some((message.text().to_owned(), message.attachments().len())),
+            _ => None,
+        });
+        users.collect()
+    };
+    ui.wait_for_session("the held message's own turn", |session| {
+        images_sent(session).len() == 2
+    });
+    let session = ui.session();
+    assert_eq!(
+        images_sent(&session),
+        [("what is this?".to_owned(), 1), ("and this".to_owned(), 1)]
+    );
+    ui.click("approval-allow-once");
+    ui.wait_for_session("that turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+    ui.shot("sent");
+
+    // The fake refuses "fail": the message comes back whole.
+    ui.paste(pasted_png(120, 120, GREEN));
+    ui.send("fail");
+    ui.wait_until("the refusal", |window, _, _| shows_an_error(window));
+    let app = ui.app.clone();
+    let back = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        view.read(cx).composer_prompt(cx)
+    });
+    assert_eq!(back.text(), "fail");
+    assert_eq!(
+        image_bytes(back.attachments()),
+        [crate::attachments::png(120, 120, GREEN)]
+    );
+    ui.act(|window, _| assert_eq!(composer_attachments(window).len(), 1, "its tile is back"));
+
+    // Opened afresh, the session replays its messages with their images.
+    let mut ui = ui.reopen("images-replayed", Shelves::owning(["s1", "old", "new-1"]));
+    ui.wait_until("the session in the sidebar", |window, _, _| {
+        is_visible(window, "session-new-1")
+    });
+    ui.click("session-new-1");
+    ui.wait_until("the newest image", |window, _, _| {
+        is_visible(window, "user-3-attachment-0")
+    });
+    assert_eq!(images_sent(&ui.session()), images_sent(&session));
+    ui.shot("replayed");
+}
+
+/// Files copied in a file manager and pasted attach as what they are: text
+/// whole, an image as one, anything else by its path. They go with the
+/// text as one message, and the transcript shows them with it. The attach
+/// button opens the desktop's file chooser, which reads files the same way.
+#[test]
+fn attached_files_go_with_the_message() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("write a file to attach");
+        path
+    };
+    let notes = write("notes.md", b"# Notes\n\nShip it.\n");
+    let report = write("report.pdf", b"%PDF-1.7\n\x00\xff\xfe binary");
+    let shot = write("shot.png", &crate::attachments::png(64, 36, GREEN));
+
+    let mut ui = Harness::start("files", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.act(|window, cx| {
+        let attach = window.find("composer-attach");
+        assert!(attach.visible() && attach.disabled() != Some(true));
+        // The chooser is the desktop's; headless, it never answers.
+        window.click("composer-attach", cx);
+    });
+
+    let paths = [notes.clone(), report.clone(), shot];
+    ui.paste_entry(ClipboardEntry::ExternalPaths(ExternalPaths(
+        paths.into_iter().collect(),
+    )));
+    ui.wait_until("three attachments", |window, _, _| {
+        composer_attachments(window) == [1, 2, 3]
+    });
+    ui.act(|window, cx| {
+        let label = |n: u64| {
+            let id = format!("composer-attachment-{n}");
+            window.find(id).label().map(str::to_owned)
+        };
+        assert_eq!(label(1).as_deref(), Some("notes.md, 3 lines"));
+        assert_eq!(label(2).as_deref(), Some("report.pdf, Sent by path"));
+        assert_eq!(label(3).as_deref(), Some("PNG image, 64 × 36"));
+        let chip = bounds(window, "composer-attachment-1").expect("the file chip");
+        let tile = bounds(window, "composer-attachment-3").expect("the image tile");
+        assert_eq!(chip.size.height, tile.size.height, "one row, one height");
+        window.hover("composer-attachment-2", cx);
+    });
+    ui.shot("attached");
+
+    ui.act(|window, cx| {
+        window.input("review these", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the approval card", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    let session = ui.session();
+    let Entry::User(sent) = &session.entries()[0] else {
+        panic!("the prompt comes first: {:?}", session.entries());
+    };
+    assert_eq!(sent.text(), "review these");
+    let [Attachment::File(text), Attachment::File(linked), Attachment::Image(_)] =
+        sent.attachments()
+    else {
+        panic!(
+            "the files and the image, in order: {:?}",
+            sent.attachments()
+        );
+    };
+    assert_eq!(text.text(), Some("# Notes\n\nShip it.\n"));
+    assert_eq!(text.path(), Some(notes.as_path()));
+    assert_eq!(linked.text(), None, "a binary file goes by path");
+    assert_eq!(linked.path(), Some(report.as_path()));
+    ui.act(|window, _| {
+        for n in 0..3 {
+            let id = format!("user-0-attachment-{n}");
+            assert!(
+                window
+                    .try_find(id.clone())
+                    .is_some_and(|card| card.visible()),
+                "{id} shows in the transcript"
+            );
+        }
+        assert!(composer_attachments(window).is_empty());
+    });
+    ui.shot("sent");
+}
+
+/// A running turn takes steers but not images, so a message with images
+/// waits for the turn to end, and a message sent after it waits with it
+/// instead of reaching the model first as a steer.
+#[test]
+fn a_message_after_a_waiting_image_waits_too() {
+    let script = Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    };
+    let mut ui = Harness::start_with("image-order", script, Shelves::default());
+    ui.wait_until("the running job", |window, _, _| {
+        is_visible(window, "session-tui-1")
+    });
+    ui.click("session-tui-1");
+    ui.wait_for_session("the turn under way", |session| {
+        session.state() == &RunState::Running && !session.entries().is_empty()
+    });
+    ui.paste(pasted_png(160, 90, BLUE));
+    ui.send("look at this");
+    ui.wait_until("the held message", |window, _, _| {
+        is_visible(window, "held")
+    });
+    ui.send("then fix it");
+    ui.wait_for_session("both held", |session| {
+        session.held().is_some_and(|held| {
+            held.text() == "look at this\nthen fix it" && held.attachments().len() == 1
+        })
+    });
+    let session = ui.session();
+    assert!(
+        !session
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Agent(m) if m.text().starts_with("steered"))),
+        "nothing steered past the held message: {:?}",
+        session.entries()
+    );
+    ui.shot("held");
 }
 
 /// The draft lists the user's projects, not every folder rho has sessions

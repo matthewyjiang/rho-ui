@@ -6049,14 +6049,17 @@ name = "rho-ui"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "image",
  "rho-ui-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "rho-ui-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "futures",
  "rho-protocol",
  "rho-ui-core",

@@ -6,6 +6,7 @@
 
 mod app;
 mod approval;
+mod attachments;
 mod background;
 mod composer;
 mod draft;
@@ -82,7 +83,13 @@ gpui_kit::assets::icon_assets!(
         Workflow,
         Bot,
         Cog,
-        Square
+        Square,
+        Paperclip,
+        FileCode,
+        FileBraces,
+        FileSpreadsheet,
+        FileArchive,
+        FileImage
     ]
 );
 

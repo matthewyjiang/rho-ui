@@ -12,6 +12,8 @@ rust-version.workspace = true
 test-support = ["dep:tempfile", "tokio/time"]
 
 [dependencies]
+# Prompt and user-message images travel base64-encoded.
+base64 = "0.22"
 rho-protocol.workspace = true
 similar = "2"
 tempfile = { version = "3", optional = true }

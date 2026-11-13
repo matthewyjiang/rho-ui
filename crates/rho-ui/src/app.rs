@@ -22,7 +22,7 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, DaemonTarget, Detached,
-    Job, Session, SessionId,
+    Job, Prompt, Session, SessionId,
 };
 
 use crate::{
@@ -395,19 +395,25 @@ impl RhoApp {
                     &view,
                     window,
                     |this, draft, event: &DraftEvent, window, cx| match event {
-                        DraftEvent::Start { session, text } => {
+                        DraftEvent::Start { session, prompt } => {
                             let cwd = draft.read(cx).cwd().to_path_buf();
                             this.start_session(
                                 draft,
                                 (**session).clone(),
                                 cwd,
-                                text.clone(),
+                                prompt.clone(),
                                 window,
                                 cx,
                             );
                         }
-                        DraftEvent::StartInWorktree { config, text } => {
-                            this.start_in_worktree(draft, config.clone(), text.clone(), window, cx);
+                        DraftEvent::StartInWorktree { config, prompt } => {
+                            this.start_in_worktree(
+                                draft,
+                                config.clone(),
+                                prompt.clone(),
+                                window,
+                                cx,
+                            );
                         }
                         DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
                     },
@@ -514,17 +520,17 @@ impl RhoApp {
         }
     }
 
-    /// Starts `draft`'s first message, `text`, in a session in a new
+    /// Starts `draft`'s first message, `prompt`, in a session in a new
     /// worktree of the draft's directory: opens it, which adds the
     /// worktree, gives it `config`, the draft session's settings, follows
-    /// it, then shows it and sends `text`. Until then the draft stays, with
+    /// it, then shows it and sends `prompt`. Until then the draft stays, with
     /// its own session, so a failure leaves it as it was, and only a
     /// session that starts makes a worktree.
     fn start_in_worktree(
         &mut self,
         draft: &Entity<DraftView>,
         config: Vec<ConfigOption>,
-        text: String,
+        prompt: Prompt,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -561,7 +567,7 @@ impl RhoApp {
                     (Ok((mut session, Ok(attached))), Some(draft)) => {
                         let cwd = attached.workspace().to_path_buf();
                         session.attached(attached);
-                        this.start_session(&draft, session, cwd, text, window, cx);
+                        this.start_session(&draft, session, cwd, prompt, window, cx);
                     }
                     (Ok((session, attached)), draft) => {
                         // Not wanted, or not set up: unfollowed and unsaved,
@@ -588,13 +594,13 @@ impl RhoApp {
     }
 
     /// Shows `draft`'s session, which works in `cwd`, in its own view and
-    /// sends `text` as its first prompt.
+    /// sends `prompt` as its first.
     fn start_session(
         &mut self,
         draft: &Entity<DraftView>,
         session: Session,
         cwd: PathBuf,
-        text: String,
+        prompt: Prompt,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -603,7 +609,7 @@ impl RhoApp {
         };
         // The project, not a worktree the daemon added in it.
         self.last_project = Some(draft.read(cx).cwd().to_path_buf());
-        let view = self.open_new_session(daemon, cwd, session, text, window, cx);
+        let view = self.open_new_session(daemon, cwd, session, prompt, window, cx);
         self.set_pane(Pane::Session(view), cx);
         self.focus_pane(window, cx);
     }
@@ -682,14 +688,14 @@ impl RhoApp {
         window.focus(&handle, cx);
     }
 
-    /// Opens a view for a session just made and sends `text` as its
-    /// first prompt.
+    /// Opens a view for a session just made and sends `prompt` as its
+    /// first.
     fn open_new_session(
         &mut self,
         daemon: Daemon,
         cwd: PathBuf,
         session: Session,
-        text: String,
+        prompt: Prompt,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Entity<SessionView> {
@@ -701,7 +707,7 @@ impl RhoApp {
             SessionView::new(daemon, session, cwd, workspace, Loading::Ready, window, cx)
         });
         self.insert_session(id, view.clone(), window, cx);
-        view.update(cx, |view, cx| view.submit(text, window, cx));
+        view.update(cx, |view, cx| view.submit(prompt, window, cx));
         view
     }
 

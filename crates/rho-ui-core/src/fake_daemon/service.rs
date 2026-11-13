@@ -24,7 +24,7 @@ use rho_protocol::{
     Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
-use super::{text, user_message, FakeSession, State, Turn, BACKLOG};
+use super::{text, FakeSession, State, Turn, BACKLOG};
 
 #[derive(Debug)]
 pub(super) struct Fake {
@@ -48,6 +48,16 @@ fn busy() -> RpcError {
 
 fn not_steerable() -> RpcError {
     RpcError::new(ErrorCode::NotSteerable, "no model request is taking input")
+}
+
+/// The user message a prompt for turn `turn` becomes, with all its content
+/// blocks, as the daemon echoes it.
+fn echo(turn: &rho_protocol::TurnId, prompt: &SessionPromptParams) -> SessionEvent {
+    SessionEvent::UserMessage {
+        message: MessageId::new(format!("u-{turn}")),
+        content: prompt.content.clone(),
+        steer: None,
+    }
 }
 
 /// How an approval's answer reads in the turn's reply.
@@ -182,7 +192,7 @@ impl Service for Fake {
         if prompt == "background" {
             session.turn = Some(turn);
             session.state(JobState::Running);
-            session.publish(user_message(&format!("u-{turn_id}"), &prompt));
+            session.publish(echo(&turn_id, &params));
             session.start_background(format!("p-{turn_id}"));
             session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
             return Ok(SessionPromptResponse { turn: turn_id });
@@ -211,7 +221,7 @@ impl Service for Fake {
             ..turn
         });
         session.state(JobState::Running);
-        session.publish(user_message(&format!("u-{turn_id}"), &prompt));
+        session.publish(echo(&turn_id, &params));
         session.tool(&tool, "ls", ToolKind::Execute, ToolStatus::Pending, None);
         session.publish(SessionEvent::InputRequested {
             request: Box::new(request),

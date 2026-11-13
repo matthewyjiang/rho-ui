@@ -21,11 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{
-    alert::Alert,
-    input::{InputEvent, TextareaState},
-    v_flex, Sizable as _,
-};
+use gpui_kit::component::{alert::Alert, input::InputEvent, v_flex, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     rems, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
@@ -33,11 +29,12 @@ use gpui_kit::{
     Subscription, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, Session, SessionId, SessionUpdate,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, Prompt, Session, SessionId,
+    SessionUpdate,
 };
 
 use crate::{
-    composer::{self, Composer, ComposerMode},
+    composer::{Composer, ComposerMode, ComposerState},
     project_picker::{PickerEvent, ProjectPicker},
     projects::Projects,
     session_list::NEW_SESSION,
@@ -48,15 +45,18 @@ use crate::{
 
 /// What the draft asks of the app.
 pub(crate) enum DraftEvent {
-    /// Show `session`, the one the draft opened, and send `text` as its first
-    /// prompt.
-    Start { session: Box<Session>, text: String },
+    /// Show `session`, the one the draft opened, and send `prompt` as its
+    /// first.
+    Start {
+        session: Box<Session>,
+        prompt: Prompt,
+    },
     /// Open a session in a new worktree of the draft's directory, give it
-    /// `config`, the draft session's settings, then show it and send `text`
-    /// as its first prompt. [`DraftView::launch_failed`] says it couldn't.
+    /// `config`, the draft session's settings, then show it and send
+    /// `prompt` as its first. [`DraftView::launch_failed`] says it couldn't.
     StartInWorktree {
         config: Vec<ConfigOption>,
-        text: String,
+        prompt: Prompt,
     },
     /// Open a session in the draft's directory: the first failed, or the
     /// project changed.
@@ -83,7 +83,7 @@ pub(crate) struct DraftView {
     cwd: PathBuf,
     workspace: WorkspaceRef,
     picker: Entity<ProjectPicker>,
-    composer: Entity<TextareaState>,
+    composer: Entity<ComposerState>,
     state: SessionState,
     /// Counts the sessions the draft asked the app to open; only the
     /// latest is wanted.
@@ -110,12 +110,13 @@ impl DraftView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let composer = composer::new_state(window, cx);
+        let composer = cx.new(|cx| ComposerState::new(window, cx));
+        let input = composer.read(cx).input().clone();
         let workspace = WorkspaceRef::new(workspaces, &cwd, cx);
         let picker = cx.new(|cx| ProjectPicker::new(workspaces, projects, cwd.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
-                &composer,
+                &input,
                 window,
                 |this, _, event: &InputEvent, _, cx| match event {
                     InputEvent::PressEnter { shift: false, .. } => this.send(cx),
@@ -123,6 +124,8 @@ impl DraftView {
                     _ => {}
                 },
             ),
+            // Attachments added or removed.
+            cx.observe(&composer, |_, _, cx| cx.notify()),
             cx.observe(workspace.table(), |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &picker,
@@ -364,8 +367,8 @@ impl DraftView {
         if self.queued || self.launching {
             return;
         }
-        let text = self.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() {
+        let prompt = self.composer.read(cx).prompt(cx);
+        if prompt.is_empty() {
             return;
         }
         let checkout = self.picker.read(cx).checkout();
@@ -374,7 +377,7 @@ impl DraftView {
             checkout,
         ) {
             (SessionState::Open { session, .. }, Checkout::Local) => {
-                cx.emit(DraftEvent::Start { session, text });
+                cx.emit(DraftEvent::Start { session, prompt });
             }
             // The draft's session stays, with its settings, until the
             // worktree's session takes over.
@@ -383,7 +386,7 @@ impl DraftView {
                     let config = session.config().to_vec();
                     self.launching = true;
                     self.error = None;
-                    cx.emit(DraftEvent::StartInWorktree { config, text });
+                    cx.emit(DraftEvent::StartInWorktree { config, prompt });
                 }
                 self.state = state;
             }
@@ -400,6 +403,14 @@ impl DraftView {
             (SessionState::Started, _) => {}
         }
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+impl DraftView {
+    /// The message the composer holds, attachments and all, for UI tests.
+    pub(crate) fn composer_prompt(&self, cx: &App) -> Prompt {
+        self.composer.read(cx).prompt(cx)
     }
 }
 

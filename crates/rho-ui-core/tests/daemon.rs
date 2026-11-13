@@ -7,9 +7,10 @@ use std::{path::Path, time::Duration};
 use futures::FutureExt;
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    BackgroundKind, BackgroundStatus, Checkout, ChoiceKind, ConfigKind, ConfigOption, ConfigValue,
-    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry, JobActivity, RunState,
-    Session, SessionId, Unsteered,
+    AttachedFile, Attachment, BackgroundKind, BackgroundStatus, Checkout, ChoiceKind, ConfigKind,
+    ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry,
+    Image, ImageFormat, JobActivity, Prompt, RunState, Session, SessionId, Unsteered,
+    MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -78,7 +79,10 @@ fn a_prompt_runs_a_turn_through_an_approval() {
         let mut session = new_session(&daemon).await;
         assert_eq!(session.commands()[0].name(), "compact");
 
-        daemon.prompt(session.id(), "list files").await.unwrap();
+        daemon
+            .prompt(session.id(), &"list files".into())
+            .await
+            .unwrap();
         until(&mut events, &mut session, |s| !s.inputs().is_empty()).await;
         until(&mut events, &mut session, |s| {
             s.state() == &RunState::NeedsAction
@@ -165,7 +169,10 @@ fn cancel_withdraws_the_approval_and_ends_the_turn() {
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
         let mut session = new_session(&daemon).await;
-        daemon.prompt(session.id(), "list files").await.unwrap();
+        daemon
+            .prompt(session.id(), &"list files".into())
+            .await
+            .unwrap();
         until(&mut events, &mut session, |s| !s.inputs().is_empty()).await;
 
         daemon.cancel(session.id()).await.unwrap();
@@ -190,7 +197,7 @@ fn list_follows_the_cursor_and_attach_replays_the_conversation() {
         // A prompted new session is saved, so with three the list takes
         // more than one page.
         let mut new = new_session(&daemon).await;
-        daemon.prompt(new.id(), "list files").await.unwrap();
+        daemon.prompt(new.id(), &"list files".into()).await.unwrap();
         until(&mut events, &mut new, |s| !s.inputs().is_empty()).await;
         let sessions = daemon.list_sessions().await.unwrap();
         let ids: Vec<_> = sessions.iter().map(|s| s.id().as_str()).collect();
@@ -290,8 +297,63 @@ fn a_refused_prompt_is_an_error_in_the_daemons_words() {
     block_on(async {
         let (daemon, _events) = connect(&fake).await;
         let session = new_session(&daemon).await;
-        let error = daemon.prompt(session.id(), "fail").await.unwrap_err();
+        let error = daemon
+            .prompt(session.id(), &"fail".into())
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "the fake daemon refuses this prompt");
+    });
+}
+
+/// A prompt's attachments reach the daemon with its text, and come back in
+/// the user message it echoes.
+#[test]
+fn a_prompts_attachments_come_back_in_its_user_message() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut session = new_session(&daemon).await;
+        let attachments = vec![
+            Attachment::Image(Image::new(ImageFormat::Png, b"\x89PNG\r\n\x1a\n".to_vec())),
+            Attachment::File(AttachedFile::with_text(
+                Path::new("/w/a/notes.md"),
+                "# Notes",
+            )),
+            Attachment::File(AttachedFile::linked(Path::new("/w/a/report.pdf"))),
+        ];
+        let prompt = Prompt::new("what is this?".to_owned(), attachments.clone());
+        daemon.prompt(session.id(), &prompt).await.unwrap();
+        until(&mut events, &mut session, |s| !s.entries().is_empty()).await;
+        let Entry::User(message) = &session.entries()[0] else {
+            panic!("the prompt comes back first: {:?}", session.entries());
+        };
+        assert_eq!(message.text(), "what is this?");
+        assert_eq!(message.attachments(), attachments);
+    });
+}
+
+/// A prompt too large for one message is refused before it is sent, in
+/// words that say why, and the connection stays up.
+#[test]
+fn a_prompt_past_the_message_limit_is_refused_and_the_connection_lives() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let session = new_session(&daemon).await;
+        let huge = Image::new(
+            ImageFormat::Png,
+            vec![0; MAX_PROMPT_ATTACHMENT_BYTES / 4 * 3 + 1],
+        );
+        let prompt = Prompt::new(String::new(), vec![Attachment::Image(huge)]);
+        let error = daemon.prompt(session.id(), &prompt).await.unwrap_err();
+        assert!(
+            matches!(&error, DaemonError::Refused(why) if why.contains("over the 16.0 MiB")),
+            "{error:?}"
+        );
+        daemon
+            .prompt(session.id(), &"list files".into())
+            .await
+            .expect("the connection survives the refusal");
     });
 }
 
@@ -303,7 +365,10 @@ fn a_prompt_during_a_turn_is_refused_as_busy() {
     block_on(async {
         let (daemon, _events) = connect(&fake).await;
         let session = new_session(&daemon).await;
-        let error = daemon.prompt(session.id(), "busy").await.unwrap_err();
+        let error = daemon
+            .prompt(session.id(), &"busy".into())
+            .await
+            .unwrap_err();
         assert!(matches!(error, DaemonError::Busy(_)), "{error:?}");
     });
 }
@@ -377,7 +442,10 @@ fn background_work_is_listed_until_the_model_has_its_result() {
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
         let mut session = new_session(&daemon).await;
-        daemon.prompt(session.id(), "background").await.unwrap();
+        daemon
+            .prompt(session.id(), &"background".into())
+            .await
+            .unwrap();
         until(&mut events, &mut session, |session| {
             session.state() == &RunState::Idle && !session.background().is_empty()
         })

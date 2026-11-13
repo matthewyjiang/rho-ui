@@ -6,7 +6,7 @@
 //! let (daemon, mut events) = Daemon::connect(target).await?;
 //! let mut session = Session::from_setup(daemon.new_session(&cwd, Checkout::Local).await?);
 //! session.attached(daemon.attach(session.id()).await?);
-//! session.turn_began(&daemon.prompt(session.id(), "hello").await?);
+//! session.turn_began(&daemon.prompt(session.id(), &"hello".into()).await?);
 //! while let Some(event) = events.recv().await { /* route by session id */ }
 //! ```
 //!
@@ -24,12 +24,12 @@ use std::{
 };
 
 use rho_protocol::{
-    methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ContentBlock,
-    DaemonNotification, DetachReason, ErrorCode, IdleWake, JobKind, JobListParams, JobState,
-    JobSummary, LocalDaemon, LocalDaemonError, Notifications, SessionAnswerParams,
-    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
-    SessionDeleteParams, SessionDetachParams, SessionListParams, SessionNewParams, SessionPart,
-    SessionPromptParams, SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
+    methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, DaemonNotification,
+    DetachReason, ErrorCode, FrameError, IdleWake, JobKind, JobListParams, JobState, JobSummary,
+    LocalDaemon, LocalDaemonError, Notifications, SessionAnswerParams, SessionAttachParams,
+    SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
+    SessionDetachParams, SessionListParams, SessionNewParams, SessionPart, SessionPromptParams,
+    SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 
@@ -37,6 +37,7 @@ use crate::{
     background::BackgroundId,
     input::{InputChoice, InputId},
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
+    prompt::{mebibytes, Prompt},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
 };
 
@@ -624,13 +625,13 @@ impl Daemon {
     ///
     /// Fails if the daemon refuses the prompt, or the turn ended before it
     /// began; [`DaemonError::Busy`] when the session already runs a turn.
-    /// Nothing was added to the session in that case.
-    pub async fn prompt(&self, id: &SessionId, text: &str) -> Result<TurnId, DaemonError> {
+    /// Nothing was added to the session in that case. A prompt too large
+    /// for one message to the daemon (see [`crate::MAX_PROMPT_ATTACHMENT_BYTES`])
+    /// is [`DaemonError::Refused`], and the connection stays up.
+    pub async fn prompt(&self, id: &SessionId, prompt: &Prompt) -> Result<TurnId, DaemonError> {
         let params = SessionPromptParams {
             session: id.to_wire(),
-            content: vec![ContentBlock::Text {
-                text: text.to_owned(),
-            }],
+            content: prompt.to_wire(),
             timeout_ms: None,
             environment: ClientEnvironment::of_this_process(),
             grant: None,
@@ -640,7 +641,19 @@ impl Daemon {
         let response = self
             .client
             .request::<methods::SessionPrompt>(&params)
-            .await?;
+            .await
+            .map_err(|error| match error {
+                // Refused before any of it was written.
+                ClientError::Frame(FrameError::LineTooLong { limit, observed }) => {
+                    DaemonError::Refused(format!(
+                        "it is {} encoded, over the {} the daemon reads in one message; \
+                         send fewer or smaller attachments",
+                        mebibytes(observed),
+                        mebibytes(limit)
+                    ))
+                }
+                other => other.into(),
+            })?;
         Ok(TurnId::from_wire(&response.turn))
     }
 

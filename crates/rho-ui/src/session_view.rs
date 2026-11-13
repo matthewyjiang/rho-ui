@@ -6,7 +6,9 @@
 //! the text to the turn's next model request, and it waits above the box
 //! until the model reads it. A message the turn can't take, as one sent
 //! just as the daemon began a turn of its own to deliver background work,
-//! waits above the box too, and goes as a prompt once that turn ends.
+//! waits above the box too, and goes as a prompt once that turn ends. So
+//! does a message with attachments, as a steer carries only text, and any
+//! message after one waiting, which would otherwise overtake it.
 //!
 //! The session's background work is listed above the box, with a button to
 //! stop each piece that runs.
@@ -20,7 +22,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
-    input::{InputEvent, TextareaState},
+    input::InputEvent,
     message_scroller::MessageScroller,
     spinner::Spinner,
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
@@ -32,15 +34,14 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Attached, BackgroundId, Daemon, DaemonError, Entry, RunState, Session, SessionId,
-    SessionUpdate, SteerId, TurnId, Unsteered,
+    Attached, Attachment, BackgroundId, Daemon, DaemonError, Entry, Prompt, RunState, Session,
+    SessionId, SessionUpdate, SteerId, TurnId, Unsteered,
 };
 
 use crate::{
     approval::ApprovalCard,
     background::BackgroundList,
-    composer::ComposerMode,
-    composer::{self, Composer},
+    composer::{Composer, ComposerMode, ComposerState},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
     transcript::{ActionHandler, Transcript},
@@ -78,7 +79,7 @@ pub(crate) struct SessionView {
     workspace: WorkspaceRef,
     loading: Loading,
     transcript: Transcript,
-    composer: Entity<TextareaState>,
+    composer: Entity<ComposerState>,
     settings: Entity<SessionSettings>,
     approval_focus: FocusHandle,
     /// A prompt is on its way to the daemon.
@@ -117,7 +118,8 @@ impl SessionView {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let transcript = Transcript::new(cx);
-        let composer = composer::new_state(window, cx);
+        let composer = cx.new(|cx| ComposerState::new(window, cx));
+        let input = composer.read(cx).input().clone();
         let settings = cx.new(|cx| {
             SessionSettings::new(
                 daemon.clone(),
@@ -127,22 +129,23 @@ impl SessionView {
                 cx,
             )
         });
-        let subscriptions = vec![
-            cx.subscribe_in(&settings, window, Self::on_settings_event),
-            // The jump-to-latest button follows the scroll position.
-            cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
-            // The header shows the branch, which can change.
-            cx.observe(workspace.table(), |_, _, cx| cx.notify()),
-            cx.subscribe_in(
-                &composer,
-                window,
-                |this, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
-                    InputEvent::Change => cx.notify(),
-                    _ => {}
-                },
-            ),
-        ];
+        let subscriptions =
+            vec![
+                cx.subscribe_in(&settings, window, Self::on_settings_event),
+                // The jump-to-latest button follows the scroll position.
+                cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
+                // The header shows the branch, which can change.
+                cx.observe(workspace.table(), |_, _, cx| cx.notify()),
+                cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                    match event {
+                        InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+                        InputEvent::Change => cx.notify(),
+                        _ => {}
+                    }
+                }),
+                // Attachments added or removed.
+                cx.observe(&composer, |_, _, cx| cx.notify()),
+            ];
         let mut view = Self {
             daemon,
             session,
@@ -245,14 +248,14 @@ impl SessionView {
         // session; never steal focus from another one, nor from a message
         // being typed, whose Enter would then approve instead of send.
         let asks = !self.session.inputs().is_empty();
-        let typing = !self.composer.read(cx).value().is_empty();
+        let typing = !self.composer.read(cx).is_empty(cx);
         if asks && !asked && !typing && self.focus_handle.contains_focused(window, cx) {
             window.focus(&self.approval_focus, cx);
         }
         // A turn that ended before reading a steer dropped it.
         let dropped = self.session.take_dropped_steers();
         if !dropped.is_empty() {
-            self.give_back(&dropped.join("\n"), window, cx);
+            self.give_back(dropped.join("\n").into(), window, cx);
         }
         self.after_change(window, cx);
     }
@@ -277,16 +280,11 @@ impl SessionView {
         self.after_change(window, cx);
     }
 
-    /// Puts `text` back in the composer, above anything typed since.
-    fn give_back(&self, text: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let typed = self.composer.read(cx).value();
-        let text = if typed.is_empty() {
-            text.to_owned()
-        } else {
-            format!("{text}\n{typed}")
-        };
+    /// Puts `prompt` back in the composer, before anything typed or pasted
+    /// since.
+    fn give_back(&self, prompt: Prompt, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.composer
-            .update(cx, |state, cx| state.set_value(text, window, cx));
+            .update(cx, |composer, cx| composer.give_back(prompt, window, cx));
     }
 
     /// Brings the scroller, settings, timers and sidebar up to date with
@@ -339,28 +337,38 @@ impl SessionView {
         self.send_held(window, cx);
     }
 
-    /// Sends the composer's text: as a prompt, or while a turn runs, as a
-    /// steer for it.
+    /// Sends the composer's message: as a prompt, or while a turn runs, as
+    /// a steer for it. A message with attachments can't steer, so it waits
+    /// for the turn to end, and so does any message after one waiting.
     fn send(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.sending || !matches!(self.loading, Loading::Ready) {
             return;
         }
-        let text = self.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() {
+        if self.composer.read(cx).prompt(cx).is_empty() {
             return;
         }
-        self.composer
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        if self.session.state().is_busy() {
-            self.steer(text, window, cx);
+        let prompt = self
+            .composer
+            .update(cx, |composer, cx| composer.take(window, cx));
+        if !self.session.state().is_busy() {
+            self.submit(prompt, window, cx);
+        } else if prompt.attachments().is_empty() && self.session.held().is_none() {
+            self.steer(prompt.into_parts().0, window, cx);
         } else {
-            self.submit(text, window, cx);
+            // After a held message, a steer would reach the model first.
+            let ended = self.session.ended_turn().cloned();
+            self.hold(prompt, ended, window, cx);
         }
     }
 
-    /// Sends `text` as the next prompt. A failed send puts it back in the
+    /// Sends `prompt` as the next prompt. A failed send puts it back in the
     /// composer.
-    pub(crate) fn submit(&mut self, text: String, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(crate) fn submit(
+        &mut self,
+        prompt: Prompt,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         self.sending = true;
         self.error = None;
         self.after_change(window, cx);
@@ -369,7 +377,7 @@ impl SessionView {
         let id = self.session.id().clone();
         let ended = self.session.ended_turn().cloned();
         cx.spawn_in(window, async move |this, cx| {
-            let result = daemon.prompt(&id, &text).await;
+            let result = daemon.prompt(&id, &prompt).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 match result {
@@ -382,7 +390,7 @@ impl SessionView {
                         }
                     }
                     Err(DaemonError::Busy(error)) => {
-                        this.refused_busy(text, ended, error, window, cx);
+                        this.refused_busy(prompt, ended, error, window, cx);
                     }
                     Err(error) => {
                         // A turn another client began meanwhile is not
@@ -393,7 +401,7 @@ impl SessionView {
                             this.session.fail(error.to_string());
                         }
                         // Give the prompt back so it isn't lost.
-                        this.give_back(&text, window, cx);
+                        this.give_back(prompt, window, cx);
                     }
                 }
                 this.after_change(window, cx);
@@ -418,18 +426,18 @@ impl SessionView {
                         // The turn may have ended before this answer came.
                         let dropped = this.session.take_dropped_steers();
                         if !dropped.is_empty() {
-                            this.give_back(&dropped.join("\n"), window, cx);
+                            this.give_back(dropped.join("\n").into(), window, cx);
                         }
                         // Continued from here, so the session is rho-ui's.
                         cx.emit(SessionEvent::Prompted);
                     }
                     // The turn is past its last model request, or ended.
                     Err(DaemonError::Busy(error)) => {
-                        this.refused_busy(text, ended, error, window, cx);
+                        this.refused_busy(text.into(), ended, error, window, cx);
                     }
                     Err(error) => {
                         this.error = Some(format!("Couldn't steer the turn: {error}"));
-                        this.give_back(&text, window, cx);
+                        this.give_back(text.into(), window, cx);
                     }
                 }
                 cx.notify();
@@ -438,21 +446,21 @@ impl SessionView {
         .detach();
     }
 
-    /// `text` was refused as busy, the daemon saying `why`. A turn this
-    /// view knows of, under way or ended since `text` was sent, explains
-    /// it: `text` waits for that turn. Otherwise either the turn's events
+    /// `prompt` was refused as busy, the daemon saying `why`. A turn this
+    /// view knows of, under way or ended since `prompt` was sent, explains
+    /// it: `prompt` waits for that turn. Otherwise either the turn's events
     /// have yet to arrive, or the session is busy with no turn at all, as
     /// while it is deleted; the daemon's job list tells which.
     fn refused_busy(
         &mut self,
-        text: String,
+        prompt: Prompt,
         sent_after: Option<TurnId>,
         why: String,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.session.has_turn_since(sent_after.as_ref()) {
-            self.hold(text, sent_after, window, cx);
+            self.hold(prompt, sent_after, window, cx);
             return;
         }
         let daemon = self.daemon.clone();
@@ -463,10 +471,10 @@ impl SessionView {
                 let listed = jobs.is_ok_and(|jobs| jobs.iter().any(|job| job.session() == id));
                 // The turn's events may have come in meanwhile.
                 if listed || this.session.has_turn_since(sent_after.as_ref()) {
-                    this.hold(text, sent_after, window, cx);
+                    this.hold(prompt, sent_after, window, cx);
                 } else {
                     this.error = Some(format!("Couldn't send the message: {why}"));
-                    this.give_back(&text, window, cx);
+                    this.give_back(prompt, window, cx);
                     cx.notify();
                 }
             });
@@ -474,16 +482,16 @@ impl SessionView {
         .detach();
     }
 
-    /// Holds `text`, which the session's turn could not take, to send as a
-    /// prompt once that turn ends; see [`Session::hold`].
+    /// Holds `prompt`, which the session's turn could not take, to send as
+    /// a prompt once that turn ends; see [`Session::hold`].
     fn hold(
         &mut self,
-        text: String,
+        prompt: Prompt,
         sent_after: Option<TurnId>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.session.hold(text, sent_after);
+        self.session.hold(prompt, sent_after);
         cx.notify();
         self.send_held(window, cx);
     }
@@ -493,15 +501,15 @@ impl SessionView {
         if self.sending {
             return;
         }
-        if let Some(text) = self.session.take_due() {
-            self.submit(text, window, cx);
+        if let Some(prompt) = self.session.take_due() {
+            self.submit(prompt, window, cx);
         }
     }
 
     /// Takes back the held message, into the composer.
     fn take_back_held(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some(text) = self.session.take_held() {
-            self.give_back(&text, window, cx);
+        if let Some(prompt) = self.session.take_held() {
+            self.give_back(prompt, window, cx);
         }
         cx.notify();
     }
@@ -551,7 +559,7 @@ impl SessionView {
                 match result {
                     Ok(Unsteered::Withdrawn) => {
                         if let Some(text) = this.session.withdraw_steer(&steer) {
-                            this.give_back(&text, window, cx);
+                            this.give_back(text.into(), window, cx);
                         }
                     }
                     // The model has it; it joins the conversation shortly.
@@ -831,7 +839,7 @@ impl SessionView {
     /// The message held for when the turn ends, with a button to take it
     /// back.
     fn render_held(&self, cx: &mut Context<'_, Self>) -> Option<AnyElement> {
-        let text = self.session.held()?;
+        let text = held_summary(self.session.held()?);
         let row = h_flex()
             .id("held")
             .test_support()
@@ -841,7 +849,7 @@ impl SessionView {
             .text_sm()
             .text_color(cx.theme().muted_foreground)
             .child(Icon::new(Lucide::Clock).xsmall())
-            .child(div().flex_1().min_w_0().truncate().child(text.to_owned()))
+            .child(div().flex_1().min_w_0().truncate().child(text))
             .child(div().text_xs().child("After this turn"))
             .child(
                 Button::new("take-back-held")
@@ -878,7 +886,12 @@ impl SessionView {
 
     /// What the composer holds, for UI tests.
     pub(crate) fn composer_text(&self, cx: &App) -> String {
-        self.composer.read(cx).value().to_string()
+        self.composer.read(cx).input().read(cx).value().to_string()
+    }
+
+    /// The message the composer holds, attachments and all, for UI tests.
+    pub(crate) fn composer_prompt(&self, cx: &App) -> Prompt {
+        self.composer.read(cx).prompt(cx)
     }
 
     /// The transcript, for UI tests.
@@ -939,6 +952,31 @@ pub(crate) fn header(title: String, workspace: &Workspace, cx: &App) -> impl Int
                 .child(title),
         )
         .child(details)
+}
+
+/// A held message on one line: its text, and what is attached to it, such
+/// as "look · 1 image, 2 files".
+fn held_summary(held: &Prompt) -> String {
+    let attachments = held.attachments();
+    let images = attachments
+        .iter()
+        .filter(|attachment| matches!(attachment, Attachment::Image(_)))
+        .count();
+    let count = |count: usize, one: &str| match count {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        count => Some(format!("{count} {one}s")),
+    };
+    let attached = [
+        count(images, "image"),
+        count(attachments.len() - images, "file"),
+    ];
+    let attached: Vec<_> = attached.into_iter().flatten().collect();
+    match (held.text().is_empty(), attached.is_empty()) {
+        (_, true) => held.text().to_owned(),
+        (true, false) => attached.join(", "),
+        (false, false) => format!("{} · {}", held.text(), attached.join(", ")),
+    }
 }
 
 /// Longest first-prompt title, in characters: rho's `FALLBACK_TITLE_CHARS`,

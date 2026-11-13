@@ -16,8 +16,8 @@ use std::{
 };
 
 use rho_protocol::{
-    AnswerStop, CardTone, ContentBlock, JobState, SessionAttachResponse, SessionEvent,
-    SessionOptions, ToolCallUpdate, TurnOutcome,
+    AnswerStop, CardTone, JobState, SessionAttachResponse, SessionEvent, SessionOptions,
+    ToolCallUpdate, TurnOutcome,
 };
 
 use crate::{
@@ -25,6 +25,7 @@ use crate::{
     daemon::SessionId,
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
+    prompt::{Attachment, Prompt},
 };
 
 /// An opaque event for one session. Only [`Session::apply`] reads it.
@@ -232,7 +233,31 @@ impl ToolCall {
     }
 }
 
-/// Text from the user or the agent, as Markdown.
+/// What the user sent: Markdown text and what was attached to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserMessage {
+    id: String,
+    prompt: Prompt,
+}
+
+impl UserMessage {
+    /// The daemon's ID for the message.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Its text, which may be empty when it is only attachments.
+    pub fn text(&self) -> &str {
+        self.prompt.text()
+    }
+
+    /// Its images and files, in order.
+    pub fn attachments(&self) -> &[Attachment] {
+        self.prompt.attachments()
+    }
+}
+
+/// Text from the agent, as Markdown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     id: String,
@@ -291,7 +316,7 @@ impl Notice {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     /// What the user sent.
-    User(Message),
+    User(UserMessage),
     /// The agent's reply.
     Agent(Message),
     /// The agent's visible reasoning.
@@ -347,7 +372,7 @@ struct Steer {
 /// A message held until the turn that could not take it ends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
-    text: String,
+    prompt: Prompt,
     /// The turn that had ended last when it was sent. Once a later one
     /// ended and none runs, it is due.
     after: Option<TurnId>,
@@ -555,38 +580,40 @@ impl Session {
         self.state.is_busy() || self.ended_turn.as_ref() != ended
     }
 
-    /// Holds `text`, a message refused because a turn was under way, to
-    /// send as a prompt once that turn ends; see [`Self::take_due`].
-    /// `sent_after` is [`Self::ended_turn`] as it was when `text` was sent:
-    /// the refusing turn is a later one, which may have ended already, or
-    /// whose events may not have arrived yet. A second message joins the
+    /// Holds `prompt`, a message sent while a turn was under way that the
+    /// turn refused, or that a steer can't carry (attachments), or that
+    /// would overtake one already held. It goes as a prompt once that turn ends;
+    /// see [`Self::take_due`].
+    /// `sent_after` is [`Self::ended_turn`] as it was when `prompt` was
+    /// sent: the refusing turn is a later one, which may have ended already,
+    /// or whose events may not have arrived yet. A second message joins the
     /// first.
-    pub fn hold(&mut self, text: String, sent_after: Option<TurnId>) {
+    pub fn hold(&mut self, prompt: Prompt, sent_after: Option<TurnId>) {
         self.held = Some(match self.held.take() {
-            Some(held) => Held {
-                text: format!("{}\n{text}", held.text),
-                after: held.after,
-            },
+            Some(mut held) => {
+                held.prompt.append(prompt);
+                held
+            }
             None => Held {
-                text,
+                prompt,
                 after: sent_after,
             },
         });
     }
 
     /// The held message, if any.
-    pub fn held(&self) -> Option<&str> {
-        self.held.as_ref().map(|held| held.text.as_str())
+    pub fn held(&self) -> Option<&Prompt> {
+        self.held.as_ref().map(|held| &held.prompt)
     }
 
     /// Takes the held message back, as when the user withdraws it.
-    pub fn take_held(&mut self) -> Option<String> {
-        self.held.take().map(|held| held.text)
+    pub fn take_held(&mut self) -> Option<Prompt> {
+        self.held.take().map(|held| held.prompt)
     }
 
     /// Takes the held message once it is due: a turn ended after it was
     /// sent, and none runs.
-    pub fn take_due(&mut self) -> Option<String> {
+    pub fn take_due(&mut self) -> Option<Prompt> {
         let due = self
             .held
             .as_ref()
@@ -693,9 +720,10 @@ impl Session {
                         self.early_steers.push(steer);
                     }
                 }
-                let (at, message) = self.message_mut(message.as_str(), Entry::User);
-                message.text = content.iter().map(block_text).collect();
-                Some(at)
+                Some(self.put_user(UserMessage {
+                    id: message.as_str().to_owned(),
+                    prompt: Prompt::from_wire(&content),
+                }))
             }
             SessionEvent::AgentMessageChunk { message, text } => {
                 Some(self.append_message(message.as_str(), &text, Entry::Agent))
@@ -858,11 +886,29 @@ impl Session {
         self.entries.len() - 1
     }
 
-    /// The message `id` and its index, appending `make(empty)` if it is new.
-    /// Searches from the end: updates almost always touch the newest rows.
+    /// Puts `message` in place of the user message with its ID, or after
+    /// the rest if it is new, and returns its index: a user message always
+    /// comes whole.
+    fn put_user(&mut self, message: UserMessage) -> usize {
+        let found = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::User(user) if user.id == message.id));
+        if let Some(at) = found {
+            self.entries[at] = Entry::User(message);
+            at
+        } else {
+            self.entries.push(Entry::User(message));
+            self.entries.len() - 1
+        }
+    }
+
+    /// The agent message `id` and its index, appending `make(empty)` if it
+    /// is new. Searches from the end: updates almost always touch the
+    /// newest rows.
     fn message_mut(&mut self, id: &str, make: fn(Message) -> Entry) -> (usize, &mut Message) {
         let found = self.entries.iter().rposition(|entry| {
-            matches!(entry, Entry::User(message) | Entry::Agent(message) | Entry::Thought(message) if message.id == id)
+            matches!(entry, Entry::Agent(message) | Entry::Thought(message) if message.id == id)
         });
         let at = found.unwrap_or_else(|| {
             self.entries.push(make(Message {
@@ -872,7 +918,7 @@ impl Session {
             self.entries.len() - 1
         });
         match &mut self.entries[at] {
-            Entry::User(message) | Entry::Agent(message) | Entry::Thought(message) => (at, message),
+            Entry::Agent(message) | Entry::Thought(message) => (at, message),
             _ => unreachable!("entry {at} was found or made as a message"),
         }
     }
@@ -1009,16 +1055,6 @@ fn usd(micros: u64) -> f64 {
     )]
     let micros = micros as f64;
     micros / 1e6
-}
-
-/// Text for one content block. Non-text blocks become short placeholders.
-fn block_text(block: &ContentBlock) -> String {
-    match block {
-        ContentBlock::Text { text } | ContentBlock::Resource { text, .. } => text.clone(),
-        ContentBlock::Image { .. } => "[image]".to_owned(),
-        ContentBlock::ResourceLink { name, .. } => format!("[{name}]"),
-        _ => String::new(),
-    }
 }
 
 fn tool_content(content: rho_protocol::ToolContent) -> Option<ToolContent> {

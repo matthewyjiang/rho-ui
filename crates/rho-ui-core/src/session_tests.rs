@@ -8,6 +8,7 @@ use super::*;
 use crate::{
     input::InputChoice,
     options::{ConfigCategory, ConfigChoice, ConfigKind},
+    prompt::{Image, ImageFormat},
 };
 
 fn update(value: serde_json::Value) -> SessionUpdate {
@@ -464,23 +465,36 @@ fn a_held_message_is_due_once_a_later_turn_ended() {
     // Sent after t1; the daemon's own t2 refused it.
     let sent_after = session.ended_turn().cloned();
     run(&mut session, "t2");
-    session.hold("one".to_owned(), sent_after);
-    session.hold("two".to_owned(), None);
+    session.hold("one".into(), sent_after);
+    session.hold("two".into(), None);
     assert_eq!(session.take_due(), None, "t2 still runs");
     end(&mut session, "t2");
-    assert_eq!(session.take_due().as_deref(), Some("one\ntwo"));
+    assert_eq!(session.take_due(), Some("one\ntwo".into()));
     assert_eq!(session.held(), None);
 
     // The refusing turn ended before the refusal came back.
     run(&mut session, "t3");
     let sent_after = session.ended_turn().cloned();
     end(&mut session, "t3");
-    session.hold("three".to_owned(), sent_after);
-    assert_eq!(session.take_due().as_deref(), Some("three"));
+    session.hold("three".into(), sent_after);
+    assert_eq!(session.take_due(), Some("three".into()));
 
     // Idle with no turn ended since: the refusing turn's events are late.
     let sent_after = session.ended_turn().cloned();
-    session.hold("four".to_owned(), sent_after);
+    session.hold("four".into(), sent_after);
     assert_eq!(session.take_due(), None);
-    assert_eq!(session.take_held().as_deref(), Some("four"));
+    assert_eq!(session.take_held(), Some("four".into()));
+}
+
+/// A message with attachments can't steer; held, it keeps them, after the
+/// text and attachments held before it.
+#[test]
+fn a_held_message_keeps_its_attachments() {
+    let image = |byte: u8| Attachment::Image(Image::new(ImageFormat::Png, vec![byte]));
+    let mut session = session();
+    session.hold(Prompt::new("one".to_owned(), vec![image(1)]), None);
+    session.hold(Prompt::new(String::new(), vec![image(2)]), None);
+    let held = session.held().expect("a held message");
+    assert_eq!(held.text(), "one");
+    assert_eq!(held.attachments(), [image(1), image(2)]);
 }

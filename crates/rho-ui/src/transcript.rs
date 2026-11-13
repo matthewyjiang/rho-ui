@@ -1,7 +1,8 @@
 //! The transcript: a session's entries as rows in a scroller. Messages and
 //! notices are drawn here; runs of tool calls and thoughts by
 //! [`crate::work`]. A finished turn's working folds behind one "Worked for"
-//! line. This owns what the user opened and folded, and the turns' lengths.
+//! line. This owns what the user opened and folded, the turns' lengths, and
+//! the user messages' attachments, ready to draw.
 
 use std::{ops::Range, rc::Rc, time::Duration};
 
@@ -9,6 +10,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::{Alert, AlertVariant},
+    attachment::Attachment as Card,
     bubble::{Bubble, BubbleVariant},
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
@@ -19,15 +21,22 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, rems, AnyElement, App, AppContext as _, ElementId, Entity, InteractiveElement as _,
-    IntoElement as _, ParentElement as _, SharedString, Styled as _, Window,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window,
 };
 use rho_ui_core::{Entry, NoticeLevel, Row, Timeline};
 
 use crate::{
+    attachments::Preview,
     time,
     turn_times::TurnTimes,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, WorkRow},
 };
+
+/// How tall an image attached to a user message is, in rems: a
+/// screenshot's layout reads at this size, and two side by side fit the
+/// transcript's measure.
+const IMAGE_HEIGHT: f32 = 10.;
 
 /// What a click in the transcript asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +71,8 @@ pub(crate) struct Transcript {
     running: Option<usize>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
+    /// Per entry: a user message's attachments, ready to draw.
+    attachments: Vec<Vec<Preview>>,
 }
 
 impl Transcript {
@@ -75,6 +86,7 @@ impl Transcript {
             took: Vec::new(),
             running: None,
             diffs: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -94,6 +106,9 @@ impl Transcript {
         }
         let known = self.took.len();
         let turns = self.timeline.turns().len();
+        let seen = self.attachments.len();
+        self.attachments
+            .extend(entries.iter().skip(seen).map(previews));
         self.steps
             .resize(self.timeline.rows().len(), Disclosure::Folded);
         self.details.resize(entries.len(), Disclosure::Folded);
@@ -114,6 +129,10 @@ impl Transcript {
     /// Entry `ix` was added or changed. A new entry gets its row in
     /// [`Self::sync`].
     pub(crate) fn changed(&mut self, entries: &[Entry], ix: usize, cx: &mut App) {
+        // A new entry gets its attachments in `sync`.
+        if let (Some(attachments), Some(entry)) = (self.attachments.get_mut(ix), entries.get(ix)) {
+            *attachments = previews(entry);
+        }
         if let Some(Entry::Tool(tool)) = entries.get(ix) {
             match self.diffs.iter_mut().find(|diff| diff.entry == ix) {
                 Some(diff) => diff.update(tool, cx),
@@ -247,7 +266,10 @@ impl Transcript {
             Phase::Settled
         };
         let content = || match row {
-            Row::Message(entry) => render_message(&entries[*entry], *entry, phase, cx),
+            Row::Message(entry) => {
+                let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
+                render_message(&entries[*entry], *entry, attachments, phase, cx)
+            }
             Row::Work(run) => {
                 let act = Rc::clone(act);
                 let on_fold: FoldHandler = Rc::new(move |fold, window, cx| {
@@ -309,31 +331,95 @@ pub(crate) enum Phase {
     Settled,
 }
 
+/// The previews of `entry`'s attachments, if it is a user message; an
+/// image whose header doesn't read is left out.
+fn previews(entry: &Entry) -> Vec<Preview> {
+    match entry {
+        Entry::User(message) => message
+            .attachments()
+            .iter()
+            .filter_map(Preview::new)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One row of a user message's attachments, against the message's edge;
+/// `None` when there are none.
+fn attachment_row(cells: impl Iterator<Item = AnyElement>) -> Option<impl IntoElement> {
+    let cells: Vec<_> = cells.collect();
+    (!cells.is_empty()).then(|| {
+        h_flex()
+            .w_full()
+            .flex_wrap()
+            .justify_end()
+            .gap_2()
+            .children(cells)
+    })
+}
+
+/// Attachment `n` of user message `ix`, drawn as `card`. Wrapped so UI
+/// tests can find it: Kit's Attachment does not register its ID with them.
+fn attachment_cell(ix: usize, n: usize, preview: &Preview, card: Card) -> AnyElement {
+    let id = SharedString::from(format!("user-{ix}-attachment-{n}"));
+    div()
+        .id(id.clone())
+        .test_support()
+        .aria_label(preview.label())
+        .child(card.id((ElementId::from(id), "card")))
+        .into_any_element()
+}
+
 /// Builds the row for a user message, a reply or a notice: entry `ix`.
-/// Tool calls and thoughts are drawn by [`crate::work`].
-fn render_message(entry: &Entry, ix: usize, phase: Phase, cx: &App) -> AnyElement {
+/// `attachments` are a user message's. Tool calls and thoughts are drawn
+/// by [`crate::work`].
+fn render_message(
+    entry: &Entry,
+    ix: usize,
+    attachments: &[Preview],
+    phase: Phase,
+    cx: &App,
+) -> AnyElement {
     let key = ElementId::named_usize("row", ix);
     match entry {
-        Entry::User(message) => Message::new()
-            .id(key)
-            .alignment(MessageAlignment::End)
-            .content(
-                MessageContent::new().bubble(
-                    Bubble::new().with_variant(BubbleVariant::Muted).child(
-                        div()
-                            .id(SharedString::from(format!("user-{ix}")))
-                            .test_support()
-                            .child(
-                                TextView::markdown(
-                                    ElementId::named_usize("user-markdown", ix),
-                                    message.text().to_owned(),
-                                )
-                                .selectable(true),
-                            ),
-                    ),
-                ),
-            )
-            .into_any_element(),
+        Entry::User(message) => {
+            // Above the text, the images in their own proportions on one
+            // row, then the file chips on the next: one height to a row.
+            // IDs number the attachments in the order they were sent.
+            let numbered = || attachments.iter().enumerate();
+            let images = attachment_row(numbered().filter_map(|(n, preview)| {
+                let tile = preview.image()?.tile(IMAGE_HEIGHT);
+                Some(attachment_cell(ix, n, preview, tile))
+            }));
+            let files = attachment_row(
+                numbered()
+                    .filter(|(_, preview)| preview.image().is_none())
+                    .map(|(n, preview)| attachment_cell(ix, n, preview, preview.card())),
+            );
+            let text = (!message.text().is_empty()).then(|| {
+                Bubble::new().with_variant(BubbleVariant::Muted).child(
+                    div()
+                        .id(SharedString::from(format!("user-{ix}")))
+                        .test_support()
+                        .child(
+                            TextView::markdown(
+                                ElementId::named_usize("user-markdown", ix),
+                                message.text().to_owned(),
+                            )
+                            .selectable(true),
+                        ),
+                )
+            });
+            let mut content = MessageContent::new().children(images).children(files);
+            if let Some(text) = text {
+                content = content.bubble(text);
+            }
+            Message::new()
+                .id(key)
+                .alignment(MessageAlignment::End)
+                .content(content)
+                .into_any_element()
+        }
         Entry::Agent(message) => div()
             .id(key)
             .w_full()
