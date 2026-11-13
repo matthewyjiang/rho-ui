@@ -4,7 +4,12 @@
 //!
 //! While a turn runs, whoever started it, the composer steers it: Enter adds
 //! the text to the turn's next model request, and it waits above the box
-//! until the model reads it.
+//! until the model reads it. A message the turn can't take, as one sent
+//! just as the daemon began a turn of its own to deliver background work,
+//! waits above the box too, and goes as a prompt once that turn ends.
+//!
+//! The session's background work is listed above the box, with a button to
+//! stop each piece that runs.
 
 use std::{path::PathBuf, rc::Rc, time::Instant};
 
@@ -27,12 +32,13 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    Attached, Daemon, DaemonError, Entry, RunState, Session, SessionId, SessionUpdate, SteerId,
-    Unsteered,
+    Attached, BackgroundId, Daemon, DaemonError, Entry, RunState, Session, SessionId,
+    SessionUpdate, SteerId, TurnId, Unsteered,
 };
 
 use crate::{
     approval::ApprovalCard,
+    background::BackgroundList,
     composer::ComposerMode,
     composer::{self, Composer},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
@@ -77,6 +83,8 @@ pub(crate) struct SessionView {
     approval_focus: FocusHandle,
     /// A prompt is on its way to the daemon.
     sending: bool,
+    /// Background work the user asked to stop that still runs.
+    stopping: Vec<BackgroundId>,
     /// The first prompt was accepted, so the session is saved.
     prompted: bool,
     /// When the running turn started.
@@ -148,6 +156,7 @@ impl SessionView {
             settings,
             approval_focus: cx.focus_handle(),
             sending: false,
+            stopping: Vec::new(),
             busy_since: None,
             turn_began: None,
             waiting_since: None,
@@ -316,6 +325,10 @@ impl SessionView {
             (true, _) => None,
             (false, since) => Some(since.unwrap_or(now)),
         };
+        // A stop that took leaves the work no longer running.
+        let work = self.session.background();
+        self.stopping
+            .retain(|id| work.iter().any(|work| work.id() == id && work.can_stop()));
         let activity = self.activity();
         let title = self.title();
         if self.reported.0 != title || self.reported.1 != activity {
@@ -323,6 +336,7 @@ impl SessionView {
             cx.emit(SessionEvent::LiveChanged);
         }
         cx.notify();
+        self.send_held(window, cx);
     }
 
     /// Sends the composer's text: as a prompt, or while a turn runs, as a
@@ -353,6 +367,7 @@ impl SessionView {
 
         let daemon = self.daemon.clone();
         let id = self.session.id().clone();
+        let ended = self.session.ended_turn().cloned();
         cx.spawn_in(window, async move |this, cx| {
             let result = daemon.prompt(&id, &text).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -365,6 +380,9 @@ impl SessionView {
                             this.prompted = true;
                             cx.emit(SessionEvent::Saved);
                         }
+                    }
+                    Err(DaemonError::Busy(error)) => {
+                        this.refused_busy(text, ended, error, window, cx);
                     }
                     Err(error) => {
                         // A turn another client began meanwhile is not
@@ -390,6 +408,7 @@ impl SessionView {
         self.error = None;
         let daemon = self.daemon.clone();
         let id = self.session.id().clone();
+        let ended = self.session.ended_turn().cloned();
         cx.spawn_in(window, async move |this, cx| {
             let result = daemon.steer(&id, &text).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -404,6 +423,10 @@ impl SessionView {
                         // Continued from here, so the session is rho-ui's.
                         cx.emit(SessionEvent::Prompted);
                     }
+                    // The turn is past its last model request, or ended.
+                    Err(DaemonError::Busy(error)) => {
+                        this.refused_busy(text, ended, error, window, cx);
+                    }
                     Err(error) => {
                         this.error = Some(format!("Couldn't steer the turn: {error}"));
                         this.give_back(&text, window, cx);
@@ -411,6 +434,109 @@ impl SessionView {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// `text` was refused as busy, the daemon saying `why`. A turn this
+    /// view knows of, under way or ended since `text` was sent, explains
+    /// it: `text` waits for that turn. Otherwise either the turn's events
+    /// have yet to arrive, or the session is busy with no turn at all, as
+    /// while it is deleted; the daemon's job list tells which.
+    fn refused_busy(
+        &mut self,
+        text: String,
+        sent_after: Option<TurnId>,
+        why: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.session.has_turn_since(sent_after.as_ref()) {
+            self.hold(text, sent_after, window, cx);
+            return;
+        }
+        let daemon = self.daemon.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let jobs = daemon.active_jobs().await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let id = this.session.id();
+                let listed = jobs.is_ok_and(|jobs| jobs.iter().any(|job| job.session() == id));
+                // The turn's events may have come in meanwhile.
+                if listed || this.session.has_turn_since(sent_after.as_ref()) {
+                    this.hold(text, sent_after, window, cx);
+                } else {
+                    this.error = Some(format!("Couldn't send the message: {why}"));
+                    this.give_back(&text, window, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Holds `text`, which the session's turn could not take, to send as a
+    /// prompt once that turn ends; see [`Session::hold`].
+    fn hold(
+        &mut self,
+        text: String,
+        sent_after: Option<TurnId>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.session.hold(text, sent_after);
+        cx.notify();
+        self.send_held(window, cx);
+    }
+
+    /// Sends the held message as a prompt once it is due.
+    fn send_held(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.sending {
+            return;
+        }
+        if let Some(text) = self.session.take_due() {
+            self.submit(text, window, cx);
+        }
+    }
+
+    /// Takes back the held message, into the composer.
+    fn take_back_held(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(text) = self.session.take_held() {
+            self.give_back(&text, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks the daemon to stop background work `work`. Its row says so
+    /// until the work ends.
+    fn stop_background(
+        &mut self,
+        work: BackgroundId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.stopping.contains(&work) {
+            return;
+        }
+        self.stopping.push(work.clone());
+        cx.notify();
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = daemon.stop_background(&id, &work).await {
+                let _ = this.update(cx, |this, cx| {
+                    this.stopping.retain(|asked| *asked != work);
+                    // Work that ended meanwhile needs no stop; the list
+                    // already says how it ended.
+                    let work_list = this.session.background();
+                    if work_list
+                        .iter()
+                        .any(|listed| *listed.id() == work && listed.can_stop())
+                    {
+                        this.error = Some(format!("Couldn't stop it: {error}"));
+                    }
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
@@ -599,21 +725,27 @@ impl SessionView {
             .gap_2()
             .px_4()
             .pb_3()
+            // Each alert is wrapped so UI tests can find it: Kit's Alert
+            // does not register its ID with them.
             .when_some(failure, |this, message| {
                 this.child(
-                    Alert::error("turn-error", SharedString::from(message))
-                        .title("The turn failed")
-                        .small(),
+                    div().id("turn-error").test_support().child(
+                        Alert::error("turn-error-alert", SharedString::from(message))
+                            .title("The turn failed")
+                            .small(),
+                    ),
                 )
             })
             .when_some(self.error.clone(), |this, message| {
                 this.child(
-                    Alert::warning("session-error", SharedString::from(message))
-                        .small()
-                        .on_close(cx.listener(|this, _, _, cx| {
-                            this.error = None;
-                            cx.notify();
-                        })),
+                    div().id("session-error").test_support().child(
+                        Alert::warning("session-error-alert", SharedString::from(message))
+                            .small()
+                            .on_close(cx.listener(|this, _, _, cx| {
+                                this.error = None;
+                                cx.notify();
+                            })),
+                    ),
                 )
             })
             .when_some(self.session.inputs().first(), |this, request| {
@@ -627,7 +759,9 @@ impl SessionView {
                     },
                 ))
             })
+            .children(self.render_background(cx))
             .children(self.render_steers(cx))
+            .children(self.render_held(cx))
             .child(
                 Composer::new(
                     &self.composer,
@@ -679,6 +813,45 @@ impl SessionView {
                     .into_any_element()
             })
             .collect()
+    }
+
+    fn render_background(&self, cx: &mut Context<'_, Self>) -> Option<BackgroundList> {
+        let view = cx.entity().downgrade();
+        BackgroundList::new(
+            self.session.background(),
+            &self.stopping,
+            move |work, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.stop_background(work.clone(), window, cx);
+                });
+            },
+        )
+    }
+
+    /// The message held for when the turn ends, with a button to take it
+    /// back.
+    fn render_held(&self, cx: &mut Context<'_, Self>) -> Option<AnyElement> {
+        let text = self.session.held()?;
+        let row = h_flex()
+            .id("held")
+            .test_support()
+            .aria_label(format!("Sends after this turn: {text}"))
+            .gap_2()
+            .px_3()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(Lucide::Clock).xsmall())
+            .child(div().flex_1().min_w_0().truncate().child(text.to_owned()))
+            .child(div().text_xs().child("After this turn"))
+            .child(
+                Button::new("take-back-held")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Take it back")
+                    .on_click(cx.listener(|this, _, window, cx| this.take_back_held(window, cx))),
+            );
+        Some(row.into_any_element())
     }
 
     /// "Context 25% · $0.01", once the daemon reports usage.
@@ -776,7 +949,9 @@ const PROMPT_TITLE_CHARS: usize = 80;
 fn first_prompt(session: &Session) -> Option<String> {
     let text = session.entries().iter().find_map(|entry| match entry {
         Entry::User(message) => Some(message.text()),
-        Entry::Agent(_) | Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) => None,
+        Entry::Agent(_) | Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) | Entry::Wake => {
+            None
+        }
     })?;
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.is_empty() {

@@ -53,6 +53,7 @@ fn attach_response(state: JobState, replay: u64) -> Attached {
         inputs: Vec::new(),
         title: None,
         options: options(),
+        background: Vec::new(),
     }))
 }
 
@@ -70,6 +71,7 @@ fn texts(session: &Session) -> Vec<(&'static str, String)> {
             Entry::Thought(m) => ("thought", m.text().to_owned()),
             Entry::Tool(t) => ("tool", t.title().to_owned()),
             Entry::Notice(n) => ("notice", n.title().to_owned()),
+            Entry::Wake => ("wake", String::new()),
         })
         .collect()
 }
@@ -382,4 +384,103 @@ fn a_prompts_answer_and_its_turns_events_may_come_in_either_order() {
     ));
     session.turn_began(&turn("t2"));
     assert_eq!(session.state(), &RunState::Idle);
+}
+
+/// A turn the daemon begins by itself, to deliver finished background work,
+/// opens with a wake row, so it is a turn of its own. A prompt's turn opens
+/// with its prompt, even after a notice the daemon sent first. A turn under
+/// way when the session was attached opens nothing as it runs on.
+#[test]
+fn a_turn_without_a_prompt_opens_with_a_wake() {
+    let ended = |session: &mut Session, id: &str| {
+        session.apply(update(json!({"type": "turn_ended", "turn": id,
+            "outcome": {"type": "answered", "text": "", "stop": "end_turn"}})));
+        session.apply(update(
+            json!({"type": "state", "state": "completed", "turn": id}),
+        ));
+    };
+    let turn = |session: &mut Session, id: &str, first: serde_json::Value| {
+        session.apply(update(
+            json!({"type": "state", "state": "running", "turn": id}),
+        ));
+        session.apply(update(first));
+        ended(session, id);
+    };
+    let mut session = Session::new(SessionId::from("s1"));
+    session.attached(attach_response(JobState::Running, 1));
+    // Running since before the attach: the replay's state is history.
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t0"}),
+    ));
+    session.apply(update(
+        json!({"type": "agent_message_chunk", "message": "m0", "text": "still going"}),
+    ));
+    ended(&mut session, "t0");
+    turn(
+        &mut session,
+        "t1",
+        json!({"type": "user_message", "message": "u1", "content": [{"type": "text", "text": "hi"}]}),
+    );
+    turn(
+        &mut session,
+        "t2",
+        json!({"type": "agent_message_chunk", "message": "m2", "text": "it exited"}),
+    );
+    // A notice before the prompt's echo, as a settings change sends.
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t3"}),
+    ));
+    session.apply(update(json!({"type": "notice", "text": "advisor changed"})));
+    turn(
+        &mut session,
+        "t3",
+        json!({"type": "user_message", "message": "u3", "content": [{"type": "text", "text": "go"}]}),
+    );
+    let kinds: Vec<&str> = texts(&session).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(kinds, ["agent", "user", "wake", "agent", "notice", "user"]);
+}
+
+/// A message refused because a turn was under way is due once a turn ended
+/// after it was sent and none runs: not while the refusing turn runs, and
+/// at once if that turn ended before the refusal came back.
+#[test]
+fn a_held_message_is_due_once_a_later_turn_ended() {
+    let run = |session: &mut Session, id: &str| {
+        session.apply(update(
+            json!({"type": "state", "state": "running", "turn": id}),
+        ));
+    };
+    let end = |session: &mut Session, id: &str| {
+        session.apply(update(json!({"type": "turn_ended", "turn": id,
+            "outcome": {"type": "answered", "text": "", "stop": "end_turn"}})));
+        session.apply(update(
+            json!({"type": "state", "state": "completed", "turn": id}),
+        ));
+    };
+    let mut session = session();
+    run(&mut session, "t1");
+    end(&mut session, "t1");
+
+    // Sent after t1; the daemon's own t2 refused it.
+    let sent_after = session.ended_turn().cloned();
+    run(&mut session, "t2");
+    session.hold("one".to_owned(), sent_after);
+    session.hold("two".to_owned(), None);
+    assert_eq!(session.take_due(), None, "t2 still runs");
+    end(&mut session, "t2");
+    assert_eq!(session.take_due().as_deref(), Some("one\ntwo"));
+    assert_eq!(session.held(), None);
+
+    // The refusing turn ended before the refusal came back.
+    run(&mut session, "t3");
+    let sent_after = session.ended_turn().cloned();
+    end(&mut session, "t3");
+    session.hold("three".to_owned(), sent_after);
+    assert_eq!(session.take_due().as_deref(), Some("three"));
+
+    // Idle with no turn ended since: the refusing turn's events are late.
+    let sent_after = session.ended_turn().cloned();
+    session.hold("four".to_owned(), sent_after);
+    assert_eq!(session.take_due(), None);
+    assert_eq!(session.take_held().as_deref(), Some("four"));
 }
