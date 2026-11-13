@@ -5,31 +5,38 @@
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
+    dialog::DialogEntrance,
+    group_box::GroupBoxVariant,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPanel},
-    IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
 };
 use gpui_kit::{
-    div, rems, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
+    div, rems, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StyleRefinement, Styled as _,
+    Subscription, Window,
 };
 
 use crate::settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT};
 
-/// The dialog's width and the panel's height, in rems so they follow the UI
-/// scale: 832 x 480 px at 100%, inside the default 1200 x 800 window with
-/// the sidebar still in view. The dialog shrinks to fit a smaller window.
+/// The dialog's width and height, in rems so they follow the UI scale:
+/// 832 x 384 px at 100%, inside the default 1200 x 800 window with the
+/// sidebar still in view. The dialog shrinks to fit a smaller window.
 /// GPUI Kit gives an item's label up to 3/5 of its row, so the width also
-/// has to leave the font pickers ([`FONT_PICKER_REMS`]) their 2/5.
+/// has to leave the controls ([`CONTROL_REMS`]) their 2/5.
 const WIDTH_REMS: f32 = 52.;
-const HEIGHT_REMS: f32 = 30.;
+const HEIGHT_REMS: f32 = 24.;
 /// The page list on the panel's left.
 const PAGES_REMS: f32 = 11.;
-const FONT_PICKER_REMS: f32 = 14.;
+/// Every control's width, so they line up in one column.
+const CONTROL_REMS: f32 = 14.;
+/// Room on the right of the page title for the dialog's close button.
+const CLOSE_ROOM_REMS: f32 = 3.;
 
 /// Opens settings in a dialog, unless a dialog is already open. The dialog
 /// owns the view: Escape, its close button, or a click outside drops it, and
-/// the keyboard goes back where it was.
+/// the keyboard goes back where it was. The dialog has no title or padding:
+/// the panel fills it, and the page title heads it.
 pub(crate) fn open(window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
@@ -38,9 +45,10 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, move |dialog, window, _| {
         let view = view.clone();
         dialog
-            .title("Settings")
+            .entrance(DialogEntrance::Fade)
             .centered()
             .w(window.rem_size() * WIDTH_REMS)
+            .p_0()
             .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
 }
@@ -148,7 +156,7 @@ impl SettingsView {
                     .id(role.element_id())
                     .with_size(options.size())
                     .accessibility_label(title)
-                    .w(rems(FONT_PICKER_REMS))
+                    .w(rems(CONTROL_REMS))
                     .menu_width(rems(20.))
             })
             .on_reset(
@@ -209,7 +217,9 @@ fn set_font(role: FontRole, family: SharedString, cx: &mut App) {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let control =
+            |field: SettingField<SharedString>| field.w(rems(CONTROL_REMS)).justify_between();
         let scales: Vec<(SharedString, SharedString)> = UiScale::CHOICES
             .into_iter()
             .map(|scale| {
@@ -225,42 +235,54 @@ impl Render for SettingsView {
             .icon(IconName::Palette)
             .default_open(true)
             .resettable(true)
+            .header_style(
+                &StyleRefinement::default()
+                    .border_b_0()
+                    .pr(rems(CLOSE_ROOM_REMS))
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD),
+            )
             .group(
-                SettingGroup::new().title("Interface").items([
+                // One group: a title would only repeat the page's.
+                SettingGroup::new().items([
                     SettingItem::new(
                         "Theme",
-                        SettingField::dropdown(
-                            themes,
-                            |cx: &App| cx.global::<Settings>().appearance.name().into(),
-                            |name: SharedString, cx: &mut App| {
-                                if let Some(appearance) = Appearance::from_name(&name) {
-                                    update(cx, |settings| settings.appearance = appearance);
-                                }
-                            },
-                        )
-                        .default_value(Appearance::default().name()),
+                        control(
+                            SettingField::dropdown(
+                                themes,
+                                |cx: &App| cx.global::<Settings>().appearance.name().into(),
+                                |name: SharedString, cx: &mut App| {
+                                    if let Some(appearance) = Appearance::from_name(&name) {
+                                        update(cx, |settings| settings.appearance = appearance);
+                                    }
+                                },
+                            )
+                            .default_value(Appearance::default().name()),
+                        ),
                     )
                     .description("Dark, light, or whichever your desktop uses."),
                     SettingItem::new(
                         "UI scale",
-                        SettingField::dropdown(
-                            scales,
-                            |cx: &App| {
-                                cx.global::<Settings>()
-                                    .ui_scale
-                                    .percent()
-                                    .to_string()
-                                    .into()
-                            },
-                            |percent: SharedString, cx: &mut App| {
-                                if let Some(scale) =
-                                    percent.parse().ok().and_then(UiScale::from_percent)
-                                {
-                                    update(cx, |settings| settings.ui_scale = scale);
-                                }
-                            },
-                        )
-                        .default_value(UiScale::default().percent().to_string()),
+                        control(
+                            SettingField::dropdown(
+                                scales,
+                                |cx: &App| {
+                                    cx.global::<Settings>()
+                                        .ui_scale
+                                        .percent()
+                                        .to_string()
+                                        .into()
+                                },
+                                |percent: SharedString, cx: &mut App| {
+                                    if let Some(scale) =
+                                        percent.parse().ok().and_then(UiScale::from_percent)
+                                    {
+                                        update(cx, |settings| settings.ui_scale = scale);
+                                    }
+                                },
+                            )
+                            .default_value(UiScale::default().percent().to_string()),
+                        ),
                     )
                     .description("The size of text and controls."),
                     self.font_item(FontRole::Ui, "UI font", "The font for interface text."),
@@ -271,6 +293,12 @@ impl Render for SettingsView {
                     ),
                 ]),
             );
+        let theme = cx.theme();
+        // The page list is tinted and rounded where it meets the dialog's
+        // corners, since the dialog has no padding to keep it inside.
+        let pages = StyleRefinement::default()
+            .bg(theme.tokens.sidebar)
+            .rounded_l(theme.radius_lg);
         div()
             .id("settings-view")
             .test_support()
@@ -279,6 +307,8 @@ impl Render for SettingsView {
             .child(
                 SettingsPanel::new("settings")
                     .sidebar_width(window.rem_size() * PAGES_REMS)
+                    .sidebar_style(&pages)
+                    .with_group_variant(GroupBoxVariant::Fill)
                     .page(appearance),
             )
     }
