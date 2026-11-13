@@ -848,7 +848,9 @@ fn turn_took(ui: &mut Harness, turn: usize) -> Option<Duration> {
 
 /// A finished turn folds its working behind "Worked". Inside, a run of
 /// tool calls and thoughts is one summary line, which opens into a line per
-/// step, each of which opens into its details; an edit shows Kit's diff.
+/// step, each of which opens into what rho's card for it shows: a search's
+/// matches, a command's output, an edit's diff. What the model read and no
+/// person needs, such as a read file or an edit's receipt, stays hidden.
 #[test]
 fn finished_work_folds_and_opens_in_levels() {
     use gpui_kit::{point, ScrollDelta};
@@ -913,21 +915,21 @@ fn finished_work_folds_and_opens_in_levels() {
     ui.shot("command");
     ui.act(|window, cx| window.within("step-5").click("step-line", cx));
 
-    ui.act(|window, cx| window.within("step-3").click("step-line", cx));
-    ui.wait_until("the read's output", |window, _, _| {
-        is_visible(window, "details-3")
+    ui.act(|window, cx| window.within("step-4").click("step-line", cx));
+    ui.wait_until("the search's matches", |window, _, _| {
+        is_visible(window, "details-4")
     });
     ui.act(|window, _| {
         assert!(
-            window.try_find("command-3").is_none(),
-            "a read's title is all on its line"
+            window.try_find("command-4").is_none(),
+            "a search's label is all on its line"
         );
     });
 
     // The output scrolls inside its box, and the transcript stays put.
     ui.act(|window, cx| {
         let up = ScrollDelta::Pixels(point(px(0.), px(400.)));
-        window.within("step-4").scroll("step-line", up, cx);
+        window.within("step-5").scroll("step-line", up, cx);
     });
     let top = |ui: &mut Harness| {
         let app = ui.app.clone();
@@ -941,14 +943,14 @@ fn finished_work_folds_and_opens_in_levels() {
     };
     let text_y = |ui: &mut Harness| {
         let text = ui.cx.update_window(ui.window, |_, window, _| {
-            window.find("output-text-3").bounds().top()
+            window.find("output-text-4").bounds().top()
         });
         text.expect("window is open")
     };
     let (transcript, text) = (top(&mut ui), text_y(&mut ui));
     ui.act(|window, cx| {
         let down = ScrollDelta::Pixels(point(px(0.), px(-100.)));
-        window.scroll("output-3", down, cx);
+        window.scroll("output-4", down, cx);
     });
     assert_eq!(text_y(&mut ui), text - px(100.), "the output scrolled");
     assert_eq!(top(&mut ui), transcript, "the transcript did not");
@@ -962,6 +964,69 @@ fn finished_work_folds_and_opens_in_levels() {
         is_visible(window, "details-6")
     });
     ui.shot("diff");
+}
+
+/// A step shows what rho's terminal UI shows for it, once: an edit's line
+/// names the file and what changed, and it opens into the diff alone, not
+/// the receipt the model read; a read's line says how much it read, and the
+/// file it read was for the model.
+#[test]
+fn a_step_shows_its_card_not_what_the_model_read() {
+    let script = Script {
+        replay_turns: 1,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("cards", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-old")
+    });
+    ui.click("session-old");
+    ui.wait_until("the turn folded", |window, _, _| {
+        is_visible(window, "worked-0")
+    });
+    ui.toggle_turn("worked-0");
+    ui.wait_until("the steps as one summary line", |window, _, _| {
+        is_visible(window, "work-2")
+    });
+    ui.act(|window, cx| window.within("work-2").click("work-summary", cx));
+    ui.wait_until("a line per step", |window, _, _| {
+        is_visible(window, "step-6")
+    });
+
+    let session = ui.session();
+    let tool = |ix: usize| match session.entries().get(ix) {
+        Some(Entry::Tool(tool)) => tool,
+        other => panic!("entry {ix} is a tool call, not {other:?}"),
+    };
+    assert_eq!(tool(3).label(), "read_file(src/0.rs)");
+    let edit = tool(6);
+    assert_eq!(edit.label(), "str_replace(src/0.rs)");
+    let changed = rho_ui_core::ToolFact::Changed {
+        added: 2,
+        removed: 1,
+    };
+    assert_eq!(
+        edit.card().map(rho_ui_core::ToolCard::facts),
+        Some(&[changed][..]),
+        "its line says what changed"
+    );
+
+    ui.act(|window, cx| window.within("step-3").click("step-line", cx));
+    ui.act(|window, cx| window.within("step-6").click("step-line", cx));
+    ui.wait_until("the edit's diff", |window, _, _| {
+        is_visible(window, "details-6")
+    });
+    ui.act(|window, _| {
+        assert!(
+            window.try_find("details-3").is_none(),
+            "a read has nothing to open"
+        );
+        assert!(
+            window.try_find("output-6").is_none(),
+            "an edit shows its diff alone, not the receipt the model read"
+        );
+    });
+    ui.shot("edit");
 }
 
 /// A sent prompt starts a new turn even before the daemon echoes it, so the

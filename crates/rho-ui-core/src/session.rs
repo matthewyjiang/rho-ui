@@ -26,6 +26,7 @@ use crate::{
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
     prompt::{Attachment, Prompt},
+    tool_card::ToolCard,
 };
 
 /// An opaque event for one session. Only [`Session::apply`] reads it.
@@ -204,6 +205,7 @@ pub struct ToolCall {
     kind: ToolKind,
     status: ToolStatus,
     content: Vec<ToolContent>,
+    card: Option<ToolCard>,
 }
 
 impl ToolCall {
@@ -227,9 +229,25 @@ impl ToolCall {
         self.status
     }
 
-    /// Output and file changes, in order.
+    /// Output and file changes, in order. The output is what the model
+    /// read; [`Self::card`] says what to show a person instead.
     pub fn content(&self) -> &[ToolContent] {
         &self.content
+    }
+
+    /// How the call looks, once the daemon sent its card. A call cut off
+    /// before it finished keeps its last one.
+    pub fn card(&self) -> Option<&ToolCard> {
+        self.card.as_ref()
+    }
+
+    /// The call in one line: its card's header, or else its title.
+    pub fn label(&self) -> &str {
+        self.card
+            .as_ref()
+            .map(ToolCard::header)
+            .filter(|header| !header.is_empty())
+            .unwrap_or(&self.title)
     }
 }
 
@@ -416,6 +434,9 @@ pub struct Session {
     /// A turn began live and nothing of it that [`opening`] reads has
     /// arrived yet: its prompt opens it, or else an [`Entry::Wake`] does.
     unopened_turn: bool,
+    /// The directory the session works in, once attached. Diffs name their
+    /// files relative to it.
+    workspace: Option<PathBuf>,
     sync: Sync,
 }
 
@@ -455,6 +476,7 @@ impl Session {
             early_steers: Vec::new(),
             ended_turn: None,
             unopened_turn: false,
+            workspace: None,
             sync: Sync::Attaching(Vec::new()),
         }
     }
@@ -472,6 +494,7 @@ impl Session {
     /// The transcript may have grown; nothing in it changed before this.
     pub fn attached(&mut self, attached: Attached) {
         let response = *attached.0;
+        self.workspace = Some(response.workspace);
         if response.title.is_some() {
             self.title = response.title;
         }
@@ -969,6 +992,7 @@ impl Session {
                 kind: ToolKind::Other,
                 status: ToolStatus::Pending,
                 content: Vec::new(),
+                card: None,
             }));
             self.entries.len() - 1
         });
@@ -981,6 +1005,7 @@ impl Session {
     fn update_tool(&mut self, update: ToolCallUpdate) -> usize {
         use rho_protocol::{ToolKind as Kind, ToolStatus as Status};
 
+        let workspace = self.workspace.clone();
         let (at, tool) = self.tool_mut(update.id.as_str());
         if let Some(title) = update.title {
             tool.title = title;
@@ -1006,7 +1031,13 @@ impl Session {
             };
         }
         if let Some(content) = update.content {
-            tool.content = content.into_iter().filter_map(tool_content).collect();
+            tool.content = content
+                .into_iter()
+                .filter_map(|content| tool_content(content, workspace.as_deref()))
+                .collect();
+        }
+        if let Some(display) = update.display {
+            tool.card = Some(ToolCard::from_wire(display));
         }
         at
     }
@@ -1084,7 +1115,10 @@ fn usd(micros: u64) -> f64 {
     micros / 1e6
 }
 
-fn tool_content(content: rho_protocol::ToolContent) -> Option<ToolContent> {
+fn tool_content(
+    content: rho_protocol::ToolContent,
+    workspace: Option<&Path>,
+) -> Option<ToolContent> {
     match content {
         rho_protocol::ToolContent::Text { text } => Some(ToolContent::Text(text)),
         rho_protocol::ToolContent::Image { .. } => Some(ToolContent::Text("[image]".to_owned())),
@@ -1095,7 +1129,10 @@ fn tool_content(content: rho_protocol::ToolContent) -> Option<ToolContent> {
             deleted,
         } => {
             let new_text = (!deleted).then_some(new_text.as_str());
-            let patch = git_patch(&path, old_text.as_deref(), new_text);
+            let name = workspace
+                .and_then(|workspace| path.strip_prefix(workspace).ok())
+                .unwrap_or(&path);
+            let patch = git_patch(name, old_text.as_deref(), new_text);
             Some(ToolContent::Diff { path, patch })
         }
         _ => None,
@@ -1103,9 +1140,9 @@ fn tool_content(content: rho_protocol::ToolContent) -> Option<ToolContent> {
 }
 
 /// The change from `old` to `new` as a one-file patch in git format, which
-/// is what diff viewers read. No `old` is a new file; no `new`, a deleted
-/// one.
-fn git_patch(path: &std::path::Path, old: Option<&str>, new: Option<&str>) -> String {
+/// is what diff viewers read, naming the file `path`. No `old` is a new
+/// file; no `new`, a deleted one.
+fn git_patch(path: &Path, old: Option<&str>, new: Option<&str>) -> String {
     let name = path.to_string_lossy();
     let name = name.trim_start_matches('/');
     let (before, after) = (format!("a/{name}"), format!("b/{name}"));

@@ -4,7 +4,7 @@
 cargo test
 ```
 
-- `rho-ui-core` has a scripted daemon for tests (`fake_daemon`, behind the `test-support` feature): `rho-protocol`'s real server side on a real Unix socket, with no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real daemon.
+- `rho-ui-core` has a scripted daemon for tests (`fake_daemon`, behind the `test-support` feature): `rho-protocol`'s real server side on a real Unix socket, with no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real daemon, and `tests/fixtures/tool_cards.jsonl` holds tool calls a rho 3 daemon sent with their cards, streamed and finished.
 - `rho-ui` UI tests (`crates/rho-ui/src/ui_tests.rs`) open the real app in an offscreen window, click and type through GPUI Kit's test helpers, and talk to the same fake daemon. They need a working Vulkan driver; Mesa lavapipe works without a GPU. Each run saves screenshots to `target/ui-shots/` for review.
 
 To measure frame times with 300 saved sessions and a 100-turn transcript, run `cargo test -p rho-ui --release frame_times -- --ignored --nocapture`.

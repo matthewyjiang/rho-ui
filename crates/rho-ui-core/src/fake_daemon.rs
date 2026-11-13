@@ -36,6 +36,9 @@ use std::{
 };
 
 use rho_protocol::{
+    display::{
+        DiffRow, DiffRowKind, ToolBody, ToolCard, ToolCardStatus, ToolFact, ToolFamily, ToolHeader,
+    },
     methods::{
         BackgroundItem, BackgroundStatus, BackgroundWork, FastModeOptions, JobState, MessageId,
         ModelChoice, ModelOptions, ModelRef, PermissionModeOptions, ReasoningLevel,
@@ -347,13 +350,16 @@ impl FakeSession {
         });
     }
 
+    /// Publishes tool call `id` as a rho 3 daemon does: its title, kind and
+    /// status, `content` as the model read it, and `card`, what rho's
+    /// terminal UI draws for it.
     fn tool(
         &mut self,
         id: &ToolCallId,
-        title: &str,
-        kind: ToolKind,
+        (title, kind): (&str, ToolKind),
         status: ToolStatus,
-        output: Option<ToolContent>,
+        content: Vec<ToolContent>,
+        card: ToolCard,
     ) {
         self.publish(SessionEvent::tool_call(ToolCallUpdate {
             id: id.clone(),
@@ -361,9 +367,9 @@ impl FakeSession {
             kind: Some(kind),
             status: Some(status),
             raw_input: None,
-            content: output.map(|output| vec![output]),
+            content: (!content.is_empty()).then_some(content),
             locations: None,
-            display: None,
+            display: Some(card.into()),
         }));
     }
 
@@ -443,6 +449,36 @@ fn text(text: &str) -> ToolContent {
     }
 }
 
+/// The card of a call that is in `status`, headed `header`.
+fn card(status: ToolStatus, family: ToolFamily, header: ToolHeader) -> ToolCard {
+    let status = match status {
+        ToolStatus::Completed => ToolCardStatus::Ok,
+        ToolStatus::Failed => ToolCardStatus::Error,
+        _ => ToolCardStatus::Running,
+    };
+    ToolCard::new(status, family, header)
+}
+
+/// The card of shell command `command`, which printed `output` once done.
+fn shell_card(command: &str, status: ToolStatus, output: Option<&str>) -> ToolCard {
+    let header = ToolHeader::shell("$", Some(command.to_owned()));
+    let mut card = card(status, ToolFamily::FileCommand, header);
+    card.push_fact(ToolFact::Timeout { seconds: None });
+    if let Some(output) = output {
+        card.push_fact(ToolFact::Exit {
+            code: 0,
+            duration_ms: Some(100),
+        });
+        card.body = ToolBody::Lines(output.lines().map(str::to_owned).collect());
+    }
+    card
+}
+
+/// What a shell call's content holds for the model: its output, wrapped.
+fn shell_output(output: &str) -> ToolContent {
+    text(&format!("stdout:\n{output}\n\ntime: 0.1s"))
+}
+
 fn user_message(id: &str, text: &str) -> SessionEvent {
     SessionEvent::UserMessage {
         message: MessageId::new(id),
@@ -467,44 +503,7 @@ fn replay(session: &mut FakeSession, turns: usize) {
                 "**Finding the walker**\n\nThe tree walk for {n} is probably in src/{n}.rs."
             ),
         });
-        let matches: Vec<String> = (0..60).map(|i| format!("src/{n}.rs:{i}: match")).collect();
-        // A run of tool calls, as agents make them.
-        for (k, (kind, title)) in [
-            (ToolKind::Read, format!("Read src/{n}.rs")),
-            (ToolKind::Search, format!("rg -n pattern src/{n}.rs")),
-            // A heredoc, so the title runs over several lines.
-            (
-                ToolKind::Execute,
-                format!("python3 - <<'EOF'\nprint(walk({n}))\nEOF"),
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            session.tool(
-                &ToolCallId::new(format!("t{n}-{k}")),
-                &title,
-                kind,
-                ToolStatus::Completed,
-                Some(text(&matches.join("\n"))),
-            );
-        }
-        session.tool(
-            &ToolCallId::new(format!("t{n}-edit")),
-            &format!("Edit src/{n}.rs"),
-            ToolKind::Edit,
-            ToolStatus::Completed,
-            Some(ToolContent::Diff {
-                path: PathBuf::from(format!("/w/b/src/{n}.rs")),
-                old_text: Some(
-                    "fn walk(tree: &Tree) -> Vec<Node> {\n    let mut out = vec![];\n    out\n}\n"
-                        .to_owned(),
-                ),
-                new_text: "fn walk(tree: &Tree) -> Vec<Node> {\n    let mut out = Vec::with_capacity(tree.len());\n    out.extend(tree.roots());\n    out\n}\n"
-                    .to_owned(),
-                deleted: false,
-            }),
-        );
+        tool_calls(session, n);
         let items: Vec<String> = (0..6)
             .map(|i| format!("- item {i} with `code` and *emphasis*"))
             .collect();
@@ -516,6 +515,104 @@ fn replay(session: &mut FakeSession, turns: usize) {
             ),
         );
     }
+}
+
+/// Turn `n`'s run of tool calls, as agents make them: a read, a search, a
+/// command and an edit.
+fn tool_calls(session: &mut FakeSession, n: usize) {
+    let matches: Vec<String> = (0..60).map(|i| format!("src/{n}.rs:{i}: match")).collect();
+    let found = matches.join("\n");
+    let read = card(
+        ToolStatus::Completed,
+        ToolFamily::FileCommand,
+        ToolHeader::call("read_file", Some(format!("src/{n}.rs"))),
+    )
+    .with_facts(vec![ToolFact::Count {
+        label: "lines".to_owned(),
+        value: 60,
+        detail: None,
+    }]);
+    session.tool(
+        &ToolCallId::new(format!("t{n}-0")),
+        (&format!("read_file(src/{n}.rs)"), ToolKind::Read),
+        ToolStatus::Completed,
+        vec![text(&found)],
+        read,
+    );
+    let search = card(
+        ToolStatus::Completed,
+        ToolFamily::FileCommand,
+        ToolHeader::call("grep", Some(format!("pattern, src/{n}.rs"))),
+    )
+    .with_facts(vec![ToolFact::Count {
+        label: "matches".to_owned(),
+        value: 60,
+        detail: Some("in 1 file".to_owned()),
+    }])
+    .with_body(ToolBody::Search {
+        pattern: "pattern".to_owned(),
+        literal: false,
+        case_sensitive: true,
+        lines: matches,
+    });
+    session.tool(
+        &ToolCallId::new(format!("t{n}-1")),
+        (&format!("grep(pattern, src/{n}.rs)"), ToolKind::Search),
+        ToolStatus::Completed,
+        vec![text(&found)],
+        search,
+    );
+    // A heredoc, so the command runs over several lines.
+    let command = format!("python3 - <<'EOF'\nprint(walk({n}))\nEOF");
+    session.tool(
+        &ToolCallId::new(format!("t{n}-2")),
+        (&command, ToolKind::Execute),
+        ToolStatus::Completed,
+        vec![shell_output(&found)],
+        shell_card(&command, ToolStatus::Completed, Some(&found)),
+    );
+    let (old, new) = (
+        "fn walk(tree: &Tree) -> Vec<Node> {\n    let mut out = vec![];\n    out\n}\n",
+        "fn walk(tree: &Tree) -> Vec<Node> {\n    let mut out = Vec::with_capacity(tree.len());\n    out.extend(tree.roots());\n    out\n}\n",
+    );
+    let edited = card(
+        ToolStatus::Completed,
+        ToolFamily::FileDiff,
+        ToolHeader::call("str_replace", Some(format!("src/{n}.rs"))),
+    )
+    .with_facts(vec![ToolFact::DiffStat {
+        added: 2,
+        removed: 1,
+        path: None,
+    }])
+    .with_body(ToolBody::Diff(vec![
+        DiffRow::new(DiffRowKind::Removed, Some(2), "    let mut out = vec![];"),
+        DiffRow::new(
+            DiffRowKind::Added,
+            Some(2),
+            "    let mut out = Vec::with_capacity(tree.len());",
+        ),
+        DiffRow::new(DiffRowKind::Added, Some(3), "    out.extend(tree.roots());"),
+    ]));
+    session.tool(
+        &ToolCallId::new(format!("t{n}-edit")),
+        (&format!("str_replace(src/{n}.rs)"), ToolKind::Edit),
+        ToolStatus::Completed,
+        // The receipt the model reads: what changed, then the file.
+        vec![
+            text(&format!(
+                "edited src/{n}.rs; replaced 1 occurrence(s)\n\nsrc/{n}.rs\n1:{}",
+                new.lines().next().unwrap_or_default()
+            )),
+            ToolContent::Diff {
+                path: PathBuf::from(format!("/w/b/src/{n}.rs")),
+                old_text: Some(old.to_owned()),
+                new_text: new.to_owned(),
+                deleted: false,
+            },
+        ],
+        edited,
+    );
 }
 
 /// An info card and a warning card, as background work and failing hooks
