@@ -252,6 +252,13 @@ impl Harness {
     /// Types `text` in the composer and presses Enter. In a session, it
     /// first moves the keyboard to the composer, as a click in it would.
     fn send(&mut self, text: &str) {
+        self.type_in(text);
+        self.act(|window, cx| window.press("enter", cx));
+    }
+
+    /// Types `text` in the composer. In a session, it first moves the
+    /// keyboard to the composer, as a click in it would.
+    fn type_in(&mut self, text: &str) {
         let app = self.app.clone();
         self.act(|window, cx| {
             if let Some(view) = app.read(cx).active_session() {
@@ -259,8 +266,16 @@ impl Harness {
                 window.focus(&composer, cx);
             }
             window.input(text, cx);
-            window.press("enter", cx);
         });
+    }
+
+    /// What the active session's composer holds.
+    fn composer_text(&mut self) -> String {
+        let app = self.app.clone();
+        self.cx.update(|cx| {
+            let view = app.read(cx).active_session().expect("a session is open");
+            view.read(cx).composer_text(cx)
+        })
     }
 
     /// Pastes `image` in the composer with Ctrl+V, as from a screenshot
@@ -2423,4 +2438,104 @@ fn the_project_list_shows_whole_rows() {
         });
     }
     ui.shot("scaled");
+}
+
+/// Typing `/` at the start of a message, or `$` anywhere in it, opens a
+/// menu of the session's commands or skills above the composer. Enter or
+/// Tab completes the highlighted name and Down picks the next; Enter on a
+/// name typed out sends. Escape closes the menu, and only the next Escape
+/// stops the turn.
+#[test]
+fn the_composer_completes_commands_and_skills() {
+    let mut ui = Harness::start("completion", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    // A draft offers its session's names too.
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.type_in("$");
+    ui.wait_until("the draft's skills", |window, _, _| {
+        is_visible(window, "completion-pstack")
+    });
+
+    ui.click("session-s1");
+    ui.wait_for_session("its commands", |session| !session.commands().is_empty());
+    let sent = ui.session().entries().len();
+
+    ui.type_in("/");
+    ui.act(|window, _| {
+        assert_eq!(window.find("completion-menu").label(), Some("Commands"));
+        assert!(is_visible(window, "completion-compact"));
+        assert!(is_visible(window, "completion-prompt:review"));
+        assert!(
+            !is_visible(window, "completion-pstack"),
+            "skills wait for a $"
+        );
+    });
+    ui.shot("commands");
+
+    // Enter completes a name typed in part, and sends nothing.
+    ui.act(|window, cx| {
+        window.input("co", cx);
+        window.press("enter", cx);
+    });
+    assert_eq!(ui.composer_text(), "/compact ");
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "completion-menu"), "the menu closes");
+    });
+    assert_eq!(ui.session().entries().len(), sent, "nothing was sent");
+
+    // A skill completes anywhere in the message.
+    ui.type_in("keep $p");
+    ui.act(|window, _| {
+        assert_eq!(window.find("completion-menu").label(), Some("Skills"));
+        assert!(is_visible(window, "completion-pstack"));
+        assert!(is_visible(window, "completion-prove-it-works"));
+    });
+    ui.shot("skills");
+    ui.act(|window, cx| {
+        window.press("down", cx);
+        window.press("tab", cx);
+    });
+    assert_eq!(ui.composer_text(), "/compact keep $prove-it-works ");
+
+    // Escape closes the menu; typing on opens it again.
+    ui.type_in("$");
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "completion-menu"), "Escape closes it");
+    });
+    ui.type_in("ps");
+    ui.act(|window, _| {
+        assert!(is_visible(window, "completion-pstack"), "typing reopens it");
+    });
+
+    // A name typed out leaves Enter to send.
+    ui.type_in("tack");
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_session("the message, as typed", |session| {
+        matches!(
+            session.entries().get(sent),
+            Some(Entry::User(m)) if m.text() == "/compact keep $prove-it-works $pstack"
+        )
+    });
+
+    ui.wait_until("the turn's approval", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.type_in("$p");
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "completion-menu"), "Escape closes it");
+    });
+    assert_eq!(
+        ui.session().state(),
+        &RunState::NeedsAction,
+        "the turn runs on"
+    );
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.wait_for_session("the next Escape to stop the turn", |session| {
+        session.state() != &RunState::NeedsAction
+    });
 }

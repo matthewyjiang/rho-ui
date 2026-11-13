@@ -646,7 +646,8 @@ impl SessionView {
         self.after_change(window, cx);
     }
 
-    /// Shows the session's settings, changeable once the session is open.
+    /// Shows the session's settings, changeable once the session is open,
+    /// and offers its commands and skills in the composer.
     fn sync_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let allowed = if matches!(self.loading, Loading::Ready) {
             Availability::Enabled
@@ -656,6 +657,9 @@ impl SessionView {
         self.settings.update(cx, |settings, cx| {
             settings.sync(self.session.config(), window, cx);
             settings.set_allowed(allowed, cx);
+        });
+        self.composer.update(cx, |composer, cx| {
+            composer.set_commands(self.session.commands(), cx);
         });
     }
 

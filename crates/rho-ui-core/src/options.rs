@@ -149,30 +149,74 @@ impl ConfigOption {
     }
 }
 
-/// A slash command or skill the session offers.
+/// A slash command or skill the session offers. rho runs both itself: a
+/// prompt names one as typed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandInfo {
     name: String,
+    kind: CommandKind,
     description: String,
+    input_hint: Option<String>,
 }
 
 impl CommandInfo {
-    /// The command's name, such as `compact`.
+    /// The name without its sigil, such as `compact` or `prompt:review`.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether a prompt names it as `/name` or as `$name`.
+    pub fn kind(&self) -> CommandKind {
+        self.kind
     }
 
     /// One line on what it does.
     pub fn description(&self) -> &str {
         &self.description
     }
+
+    /// What to type after the name, such as `<task>` or `[instructions]`;
+    /// `None` for a command that takes nothing.
+    pub fn input_hint(&self) -> Option<&str> {
+        self.input_hint.as_deref()
+    }
 }
 
+/// How a prompt runs a [`CommandInfo`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandKind {
+    /// The prompt starts with `/name`, then the command's input.
+    Slash,
+    /// `$name` anywhere in the prompt loads the skill before the turn.
+    Skill,
+}
+
+impl CommandKind {
+    /// What a prompt puts before the name: `/` or `$`.
+    pub fn sigil(self) -> char {
+        match self {
+            Self::Slash => '/',
+            Self::Skill => '$',
+        }
+    }
+}
+
+/// The commands in `list` this UI knows how to offer, in the daemon's menu
+/// order. A kind a newer daemon added is left out.
 pub(crate) fn commands(list: Vec<SessionCommand>) -> Vec<CommandInfo> {
     list.into_iter()
-        .map(|command| CommandInfo {
-            name: command.name,
-            description: command.description,
+        .filter_map(|command| {
+            let kind = match command.kind {
+                rho_protocol::CommandKind::Slash => CommandKind::Slash,
+                rho_protocol::CommandKind::Skill => CommandKind::Skill,
+                _ => return None,
+            };
+            Some(CommandInfo {
+                name: command.name,
+                kind,
+                description: command.description,
+                input_hint: command.input_hint,
+            })
         })
         .collect()
 }

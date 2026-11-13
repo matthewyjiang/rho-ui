@@ -2,6 +2,7 @@
 //! keep each session's state. No GUI code lives here.
 
 mod background;
+mod completion;
 mod daemon;
 #[cfg(feature = "test-support")]
 pub mod fake_daemon;
@@ -13,13 +14,15 @@ mod timeline;
 mod tool_card;
 
 pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
+pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached, Job,
     JobActivity, SessionId, SessionSummary, Unsteered,
 };
 pub use input::{ChoiceKind, InputChoice, InputId, InputRequest};
 pub use options::{
-    CommandInfo, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue, FAST_MODE_ID,
+    CommandInfo, CommandKind, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue,
+    FAST_MODE_ID,
 };
 pub use prompt::{
     check_attachment_total, AttachedFile, Attachment, AttachmentsTooLarge, Image, ImageFormat,

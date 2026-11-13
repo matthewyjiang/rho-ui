@@ -320,6 +320,9 @@ impl DraftView {
                 settings.update(cx, |settings, cx| {
                     settings.sync(session.config(), window, cx);
                 });
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_commands(session.commands(), cx);
+                });
             }
             (Err(error), _) => self.fail(error.to_string(), cx),
             (Ok(_), _) => {}
@@ -340,6 +343,9 @@ impl DraftView {
             session.apply(update);
             settings.update(cx, |settings, cx| {
                 settings.sync(session.config(), window, cx);
+            });
+            self.composer.update(cx, |composer, cx| {
+                composer.set_commands(session.commands(), cx);
             });
         }
     }

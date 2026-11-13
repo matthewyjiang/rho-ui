@@ -8,6 +8,12 @@
 //! file chosen with the attach button, dropped on the box, or pasted as a
 //! copied file. Each has a remove control on hover; Backspace in the empty
 //! text box removes the last.
+//!
+//! Typing a slash command at the start of the text, or a `$skill` anywhere
+//! in it, opens a menu of the session's names that complete it, floating
+//! above the box. Up and Down move the highlight, Tab completes, and Enter
+//! completes unless the name is typed out already, or reads as an amount
+//! such as `$20`: then it sends. Escape closes the menu.
 
 use std::{path::PathBuf, rc::Rc};
 
@@ -18,16 +24,19 @@ use gpui_kit::component::{
     attachment::AttachmentGroup,
     button::{Button, ButtonRounded, ButtonVariants as _},
     h_flex,
-    input::{Backspace, Textarea, TextareaState},
-    v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _,
+    input::{Backspace, Enter, Escape, IndentInline, MoveDown, MoveUp, Textarea, TextareaState},
+    list::ListItem,
+    v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _, ThemeStyled as _,
 };
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity,
-    ExternalPaths, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    deferred, div, rems, Action, AnyElement, App, AppContext as _, ClipboardEntry, ClipboardItem,
+    Context, Entity, ExternalPaths, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
+    ParentElement as _, PathPromptOptions, RenderOnce, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
-use rho_ui_core::{check_attachment_total, Attachment, Prompt};
+use rho_ui_core::{
+    check_attachment_total, Attachment, CommandInfo, CommandKind, Completion, Prompt,
+};
 
 use crate::attachments::{self, Preview};
 
@@ -47,6 +56,15 @@ pub(crate) struct ComposerState {
     /// Why the last attachment was refused, until it is dismissed, or the
     /// next attachment or send.
     refusal: Option<SharedString>,
+    /// The session's slash commands and skills, which the menu offers.
+    commands: Vec<CommandInfo>,
+    /// The name being typed at the cursor, as last seen.
+    typing: Option<Completion>,
+    /// The names that complete it, while their menu is open.
+    menu: Option<Menu>,
+    /// The name Escape closed the menu on; typing on opens it again.
+    dismissed: Option<Completion>,
+    _subscription: Subscription,
 }
 
 /// An attachment in the composer.
@@ -54,6 +72,28 @@ struct Item {
     id: u64,
     attachment: Attachment,
     preview: Preview,
+}
+
+/// The open menu of names that complete the one at the cursor.
+struct Menu {
+    completion: Completion,
+    matches: Vec<CommandInfo>,
+    /// The highlighted match.
+    selected: usize,
+    /// The user moved the highlight, so Enter takes it whatever is typed.
+    picked: bool,
+    /// Keeps the highlighted match in view.
+    scroll: ScrollHandle,
+}
+
+/// A key the open menu takes from the text box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuKey {
+    Up,
+    Down,
+    Tab,
+    Enter,
+    Escape,
 }
 
 impl ComposerState {
@@ -64,12 +104,114 @@ impl ComposerState {
                 .submit_on_enter(true)
                 .placeholder("Ask rho to do something")
         });
+        // The text box notifies when its text or cursor moves.
+        let subscription = cx.observe(&input, |this, _, cx| this.update_menu(cx));
         Self {
             input,
             attachments: Vec::new(),
             next_id: 0,
             refusal: None,
+            commands: Vec::new(),
+            typing: None,
+            menu: None,
+            dismissed: None,
+            _subscription: subscription,
         }
+    }
+
+    /// Offers `commands`, the session's slash commands and skills, to
+    /// complete.
+    pub(crate) fn set_commands(&mut self, commands: &[CommandInfo], cx: &mut Context<'_, Self>) {
+        if self.commands != commands {
+            self.commands = commands.to_vec();
+            self.typing = None;
+            self.update_menu(cx);
+        }
+    }
+
+    /// Opens, updates or closes the menu for the name at the cursor.
+    fn update_menu(&mut self, cx: &mut Context<'_, Self>) {
+        let input = self.input.read(cx);
+        let typing = Completion::at(&input.value(), input.cursor());
+        if typing == self.typing {
+            return;
+        }
+        if self.dismissed != typing {
+            self.dismissed = None;
+        }
+        let menu = typing
+            .clone()
+            .filter(|_| self.dismissed.is_none())
+            .and_then(|completion| {
+                let matches: Vec<_> = completion.matches(&self.commands).cloned().collect();
+                (!matches.is_empty()).then(|| Menu {
+                    completion,
+                    matches,
+                    selected: 0,
+                    picked: false,
+                    scroll: ScrollHandle::new(),
+                })
+            });
+        self.typing = typing;
+        if menu.is_some() || self.menu.is_some() {
+            self.menu = menu;
+            cx.notify();
+        }
+    }
+
+    /// Takes `key` from the text box if the menu is open and has a use for
+    /// it; says whether it did.
+    fn menu_key(&mut self, key: MenuKey, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
+        self.update_menu(cx);
+        let Some(menu) = &mut self.menu else {
+            return false;
+        };
+        let last = menu.matches.len() - 1;
+        let selected = menu.selected;
+        match key {
+            MenuKey::Up | MenuKey::Down => {
+                menu.selected = match key {
+                    MenuKey::Up if selected == 0 => last,
+                    MenuKey::Up => selected - 1,
+                    _ if selected == last => 0,
+                    _ => selected + 1,
+                };
+                menu.picked = true;
+                menu.scroll.scroll_to_item(menu.selected);
+                cx.notify();
+            }
+            MenuKey::Escape => {
+                self.dismissed = self.menu.take().map(|menu| menu.completion);
+                cx.notify();
+            }
+            MenuKey::Tab => self.complete(selected, window, cx),
+            MenuKey::Enter => {
+                let completion = &menu.completion;
+                if completion.is_typed_out(&menu.matches[selected])
+                    || !(menu.picked || completion.reads_as_name())
+                {
+                    return false;
+                }
+                self.complete(selected, window, cx);
+            }
+        }
+        true
+    }
+
+    /// Completes the name at the cursor to the menu's match `ix`.
+    fn complete(&mut self, ix: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(menu) = self.menu.take() else {
+            return;
+        };
+        let edit = menu
+            .completion
+            .edit(&self.input.read(cx).value(), &menu.matches[ix]);
+        self.input.update(cx, |input, cx| {
+            input.set_selected_range(edit.range, cx);
+            input.replace(edit.text, window, cx);
+            input.set_selected_range(edit.cursor..edit.cursor, cx);
+        });
+        cx.notify();
     }
 
     /// The text box. Its `PressEnter` event (without Shift) is the send
@@ -400,16 +542,144 @@ impl Composer {
             ),
         )
     }
+
+    /// The text box. An open completion menu takes its keys before the box
+    /// sees them, and the box passes Backspace on only when it has nothing
+    /// to delete.
+    fn render_text_box(&self, cx: &App) -> impl IntoElement {
+        let input = self.state.read(cx).input.clone();
+        let starting = self.mode == ComposerMode::Starting;
+        let enter = self.state.clone();
+        let backspace = self.state.clone();
+        let paste_into = self.state.clone();
+        div()
+            .capture_action(menu_key::<MoveUp>(&self.state, MenuKey::Up))
+            .capture_action(menu_key::<MoveDown>(&self.state, MenuKey::Down))
+            .capture_action(menu_key::<IndentInline>(&self.state, MenuKey::Tab))
+            .capture_action(menu_key::<Escape>(&self.state, MenuKey::Escape))
+            .capture_action(move |action: &Enter, window, cx| {
+                // Shift+Enter starts a line, Ctrl+Enter sends.
+                if !action.shift && !action.secondary {
+                    offer_key(&enter, MenuKey::Enter, window, cx);
+                }
+            })
+            .on_action(move |_: &Backspace, _, cx| {
+                if !backspace.update(cx, ComposerState::remove_last) {
+                    cx.propagate();
+                }
+            })
+            .child(
+                Textarea::new(&input)
+                    .appearance(false)
+                    .disabled(starting)
+                    .aria_label("Prompt")
+                    .on_paste(move |item, _, cx| {
+                        paste_into.update(cx, |state, cx| state.paste(item, cx))
+                    }),
+            )
+    }
+
+    /// The names that complete the one at the cursor, floating above the
+    /// box. Kit's completion menu belongs to its code editor, so this one is
+    /// built from Kit's list rows on its popover surface.
+    fn render_menu(&self, cx: &App) -> Option<impl IntoElement> {
+        if self.mode == ComposerMode::Starting {
+            return None;
+        }
+        let menu = self.state.read(cx).menu.as_ref()?;
+        let kind = menu.completion.kind();
+        let muted = cx.theme().muted_foreground;
+        let rows = menu.matches.iter().enumerate().map(|(ix, command)| {
+            let name = format!("{}{}", kind.sigil(), command.name());
+            let state = self.state.clone();
+            ListItem::new(SharedString::from(format!("completion-{}", command.name())))
+                .selected(ix == menu.selected)
+                .accessibility_label(name.clone())
+                .px_2()
+                .text_sm()
+                .rounded(cx.theme().radius)
+                .on_click(move |_, window, cx| {
+                    state.update(cx, |state, cx| {
+                        state.complete(ix, window, cx);
+                        window.focus(&state.input.focus_handle(cx), cx);
+                    });
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_shrink_0().child(name))
+                        .children(command.input_hint().map(|hint| {
+                            div()
+                                .flex_shrink_0()
+                                .text_color(muted)
+                                .child(hint.to_owned())
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(muted)
+                                .child(command.description().to_owned()),
+                        ),
+                )
+        });
+        let label = match kind {
+            CommandKind::Slash => "Commands",
+            CommandKind::Skill => "Skills",
+        };
+        // Deferred, so it paints over the transcript rather than pushing it.
+        Some(
+            deferred(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_full()
+                    .mb_2()
+                    .child(
+                        v_flex()
+                            .id("completion-menu")
+                            .test_support()
+                            .aria_label(label)
+                            .occlude()
+                            .popover_style(cx)
+                            .p_1()
+                            .max_h(rems(18.))
+                            .overflow_y_scroll()
+                            .track_scroll(&menu.scroll)
+                            .children(rows),
+                    ),
+            )
+            .with_priority(1),
+        )
+    }
+}
+
+/// Offers the text box's `A` key to the completion menu first, as `key`;
+/// the menu keeps it only while open.
+fn menu_key<A: Action>(
+    state: &Entity<ComposerState>,
+    key: MenuKey,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    let state = state.clone();
+    move |_, window, cx| offer_key(&state, key, window, cx)
+}
+
+fn offer_key(state: &Entity<ComposerState>, key: MenuKey, window: &mut Window, cx: &mut App) {
+    if state.update(cx, |state, cx| state.menu_key(key, window, cx)) {
+        cx.stop_propagation();
+    }
 }
 
 impl RenderOnce for Composer {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let attachments = self.render_attachments(cx);
         let refusal = self.render_refusal(cx);
-        let state = self.state.read(cx);
-        let input = state.input.clone();
-        let empty = state.prompt(cx).is_empty();
+        let menu = self.render_menu(cx);
+        let empty = self.state.read(cx).prompt(cx).is_empty();
         let starting = self.mode == ComposerMode::Starting;
+        let text_box = self.render_text_box(cx);
         let attach = self.render_attach();
         let action = if self.mode == ComposerMode::Stop {
             let on_stop = self.on_stop;
@@ -430,8 +700,6 @@ impl RenderOnce for Composer {
                 .loading(starting)
                 .on_click(move |_, window, cx| on_send(window, cx))
         };
-        let paste_into = self.state.clone();
-        let backspace = self.state.clone();
         let drop_into = self.state.clone();
         // Kit's remove control rides 6px, 0.375 rem at the default rem,
         // above and right of each card, in room the card keeps for it. Above
@@ -459,26 +727,10 @@ impl RenderOnce for Composer {
                     drop_into.update(cx, |_, cx| ComposerState::attach_paths(paths, cx));
                 }
             })
+            .relative()
+            .children(menu)
             .children(attachments)
-            .child(
-                // The text box passes Backspace on only when it has nothing
-                // to delete.
-                div()
-                    .on_action(move |_: &Backspace, _, cx| {
-                        if !backspace.update(cx, ComposerState::remove_last) {
-                            cx.propagate();
-                        }
-                    })
-                    .child(
-                        Textarea::new(&input)
-                            .appearance(false)
-                            .disabled(starting)
-                            .aria_label("Prompt")
-                            .on_paste(move |item, _, cx| {
-                                paste_into.update(cx, |state, cx| state.paste(item, cx))
-                            }),
-                    ),
-            )
+            .child(text_box)
             .child(
                 h_flex()
                     .gap_1()

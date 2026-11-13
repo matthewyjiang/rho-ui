@@ -26,7 +26,9 @@
 //!   is read at once, answered, and ends the turn. The steer "wait" is
 //!   never read: it stays queued until withdrawn or the turn is cancelled.
 //! - Settings are shaped like rho's: four permission modes, three models,
-//!   three reasoning levels, and fast mode.
+//!   three reasoning levels, and fast mode. Every session offers the slash
+//!   commands `compact` and `prompt:review` and the skills `pstack` and
+//!   `prove-it-works`.
 
 use std::{
     collections::BTreeMap,
@@ -244,12 +246,32 @@ impl Settings {
                     PermissionMode::Supervised,
                 ],
             },
-            commands: vec![SessionCommand {
-                name: "compact".to_owned(),
-                kind: CommandKind::Slash,
-                description: "Compact".to_owned(),
-                input_hint: None,
-            }],
+            commands: vec![
+                SessionCommand {
+                    name: "compact".to_owned(),
+                    kind: CommandKind::Slash,
+                    description: "Compact".to_owned(),
+                    input_hint: Some("[instructions]".to_owned()),
+                },
+                SessionCommand {
+                    name: "prompt:review".to_owned(),
+                    kind: CommandKind::Slash,
+                    description: "Review the change".to_owned(),
+                    input_hint: None,
+                },
+                SessionCommand {
+                    name: "pstack".to_owned(),
+                    kind: CommandKind::Skill,
+                    description: "Route engineering work".to_owned(),
+                    input_hint: None,
+                },
+                SessionCommand {
+                    name: "prove-it-works".to_owned(),
+                    kind: CommandKind::Skill,
+                    description: "Verify through the real path".to_owned(),
+                    input_hint: None,
+                },
+            ],
             added_dirs: Vec::new(),
         }
     }
