@@ -41,7 +41,7 @@ const SCHEMA_VERSION: i32 = 1;
 /// Every table. Each belongs to the module that reads and writes it.
 /// Tables keyed by text are `WITHOUT ROWID`, so the key is stored once
 /// rather than in the table and again in its index, which halved the file
-/// with text-keyed turn times. `state_sizes` measures the whole file.
+/// with text-keyed turn times.
 const SCHEMA: &str = "
     -- Settled and snoozed sessions; see crate::shelf. A row with neither
     -- mark nor ownership is deleted.
@@ -62,8 +62,9 @@ const SCHEMA: &str = "
     CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT, WITHOUT ROWID;
 ";
 
-/// How the file is kept, set on every connection. Sizes from
-/// `state_sizes`; times from a probe of one-row writes on an `NVMe` disk.
+/// How the file is kept, set on every connection. Sizes measured with rows
+/// shaped like rho's (UUID sessions, 46-character prompt IDs); times with
+/// one-row writes on an `NVMe` disk.
 ///
 /// - `page_size`, before the first table: with 1 KiB pages the file is
 ///   6 KiB empty and 116 KiB with 300 sessions and 5,000 turns, against 24
@@ -269,56 +270,6 @@ mod tests {
             Some("collapsed")
         );
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// Size probe, not a pass/fail test: the file and its WAL with as many
-    /// rows as a long-used rho-ui keeps, written one change at a time
-    /// through the real owners. IDs are shaped like rho's: sessions are
-    /// UUIDs, prompts `saved-<uuid>-0-0`. Run with
-    /// `cargo test -p rho-ui --release state_sizes -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "measurement; run on demand"]
-    fn state_sizes() {
-        use crate::{projects::Projects, shelf::Shelves, turn_times::TurnTimes};
-        use std::time::Duration;
-
-        let size = |path: &Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
-        for (sessions, turns) in [(0_u32, 0_u32), (300, 5_000), (1_000, 20_000)] {
-            let dir = std::env::temp_dir().join(format!(
-                "rho-ui-sizes-{}-{sessions}-{turns}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            let path = dir.join("state.sqlite3");
-            let wal = dir.join("state.sqlite3-wal");
-            let db = StateDb::open_at(&path).expect("the database opens");
-            let mut shelves = Shelves::load(&db, 0);
-            let mut projects = Projects::load(&db);
-            let mut times = TurnTimes::load(&db);
-            let mut wal_peak = 0;
-            for i in 0..sessions {
-                let id = format!("{i:08x}-0000-4000-8000-{i:012x}");
-                shelves.own(&id);
-                // Most sessions end up settled.
-                if i % 10 < 7 {
-                    shelves.settle(&id, 1_790_000_000 + i64::from(i));
-                }
-            }
-            for i in 0..20 {
-                projects.add(PathBuf::from(format!("/home/me/Projects/project-{i}")));
-            }
-            for i in 0..turns {
-                let prompt = format!("saved-{i:08x}-0000-4000-8000-{i:012x}-0-0");
-                times.record(&prompt, Duration::from_millis(5_000 + u64::from(i)));
-                wal_peak = wal_peak.max(size(&wal));
-            }
-            db.query("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
-            println!(
-                "{sessions:>5} sessions {turns:>6} turns: file {:>7} B, WAL peak {wal_peak:>6} B",
-                size(&path)
-            );
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
 
     #[test]
