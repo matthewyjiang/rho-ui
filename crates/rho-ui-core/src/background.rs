@@ -31,11 +31,34 @@ pub enum BackgroundStatus {
 }
 
 /// Names one piece of background work to [`crate::Daemon::stop_background`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Two are equal when they name the same work: a subagent gains its
+/// session partway through its life, and stays the same run.
+#[derive(Clone, Debug)]
 pub struct BackgroundId(pub(crate) rho_protocol::BackgroundItem);
 
+impl BackgroundId {
+    /// What names the work for its whole life. `None` for a kind this
+    /// client does not know, which equals nothing.
+    fn key(&self) -> Option<(BackgroundKind, &str)> {
+        use rho_protocol::BackgroundItem as Item;
+
+        match &self.0 {
+            Item::Process { id } => Some((BackgroundKind::Process, id)),
+            Item::Workflow { run } => Some((BackgroundKind::Workflow, run)),
+            Item::Subagent { run, .. } => Some((BackgroundKind::Subagent, run)),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for BackgroundId {
+    fn eq(&self, other: &Self) -> bool {
+        self.key().is_some() && self.key() == other.key()
+    }
+}
+
 /// One piece of a session's background work.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BackgroundWork {
     id: BackgroundId,
     title: String,
@@ -67,14 +90,9 @@ impl BackgroundWork {
 
     /// What it is.
     pub fn kind(&self) -> BackgroundKind {
-        use rho_protocol::BackgroundItem as Item;
-
-        match self.id.0 {
-            Item::Process { .. } => BackgroundKind::Process,
-            Item::Workflow { .. } => BackgroundKind::Workflow,
-            Item::Subagent { .. } => BackgroundKind::Subagent,
-            _ => BackgroundKind::Other,
-        }
+        self.id
+            .key()
+            .map_or(BackgroundKind::Other, |(kind, _)| kind)
     }
 
     /// What it shows as: a process's command line, a workflow's name, a
@@ -97,5 +115,37 @@ impl BackgroundWork {
     /// this client knows.
     pub fn can_stop(&self) -> bool {
         self.status == BackgroundStatus::Running && self.kind() != BackgroundKind::Other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_protocol::{BackgroundItem, SessionId};
+
+    use super::BackgroundId;
+
+    /// A subagent's session opens partway through its run; a stop asked
+    /// for before then still names the same run.
+    #[test]
+    fn a_subagent_is_the_same_work_once_its_session_opens() {
+        let subagent = |session: Option<&str>| {
+            BackgroundId(BackgroundItem::Subagent {
+                run: "r1".to_owned(),
+                session: session.map(SessionId::new),
+            })
+        };
+        assert_eq!(subagent(None), subagent(Some("child")));
+        let process = BackgroundId(BackgroundItem::Process {
+            id: "r1".to_owned(),
+        });
+        assert_ne!(
+            process,
+            subagent(None),
+            "a process and a subagent are never one"
+        );
+        assert_ne!(
+            BackgroundId(BackgroundItem::Unknown),
+            BackgroundId(BackgroundItem::Unknown)
+        );
     }
 }

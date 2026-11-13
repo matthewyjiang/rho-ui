@@ -501,6 +501,12 @@ impl Session {
         self.ended_turn.as_ref()
     }
 
+    /// Whether a turn runs now, or one ended after `ended`, an earlier
+    /// [`Self::ended_turn`].
+    pub fn has_turn_since(&self, ended: Option<&TurnId>) -> bool {
+        self.state.is_busy() || self.ended_turn.as_ref() != ended
+    }
+
     /// Holds `text`, a message refused because a turn was under way, to
     /// send as a prompt once that turn ends; see [`Self::take_due`].
     /// `sent_after` is [`Self::ended_turn`] as it was when `text` was sent:
@@ -620,23 +626,13 @@ impl Session {
     }
 
     fn apply_event(&mut self, event: SessionEvent) -> Option<usize> {
-        let changed = self.apply_change(event);
-        // Counted once applied, so the replay's last event is history too.
         if let Sync::Replaying(left) = &mut self.sync {
             *left -= 1;
             if *left == 0 {
                 self.sync = Sync::Live;
             }
         }
-        changed
-    }
-
-    fn apply_change(&mut self, event: SessionEvent) -> Option<usize> {
-        if let Some(opening) = opening(&event) {
-            if std::mem::take(&mut self.unopened_turn) && opening == Opening::Wake {
-                self.entries.push(Entry::Wake);
-            }
-        }
+        self.open_turn(&event);
         match event {
             SessionEvent::UserMessage {
                 message,
@@ -731,6 +727,16 @@ impl Session {
             // Compaction and provider progress, held timeouts, and cache
             // warming are not shown yet.
             _ => None,
+        }
+    }
+
+    /// Opens the turn that began live, if `event` is the first of it that
+    /// [`opening`] reads: with an [`Entry::Wake`], unless it is the prompt.
+    fn open_turn(&mut self, event: &SessionEvent) {
+        if let Some(opening) = opening(event) {
+            if std::mem::take(&mut self.unopened_turn) && opening == Opening::Wake {
+                self.entries.push(Entry::Wake);
+            }
         }
     }
 

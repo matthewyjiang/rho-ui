@@ -134,6 +134,12 @@ impl Service for Fake {
                 "the fake daemon refuses this prompt",
             ));
         }
+        if prompt == "deleting" {
+            return Err(RpcError::new(
+                ErrorCode::SessionBusy,
+                "the session is being deleted",
+            ));
+        }
         if prompt == "slow" {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }

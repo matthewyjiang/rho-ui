@@ -388,27 +388,34 @@ fn a_prompts_answer_and_its_turns_events_may_come_in_either_order() {
 
 /// A turn the daemon begins by itself, to deliver finished background work,
 /// opens with a wake row, so it is a turn of its own. A prompt's turn opens
-/// with its prompt, even after a notice the daemon sent first, and a turn
-/// of the replay opens with nothing.
+/// with its prompt, even after a notice the daemon sent first. A turn under
+/// way when the session was attached opens nothing as it runs on.
 #[test]
 fn a_turn_without_a_prompt_opens_with_a_wake() {
-    let turn = |session: &mut Session, id: &str, first: serde_json::Value| {
-        session.apply(update(
-            json!({"type": "state", "state": "running", "turn": id}),
-        ));
-        session.apply(update(first));
+    let ended = |session: &mut Session, id: &str| {
         session.apply(update(json!({"type": "turn_ended", "turn": id,
             "outcome": {"type": "answered", "text": "", "stop": "end_turn"}})));
         session.apply(update(
             json!({"type": "state", "state": "completed", "turn": id}),
         ));
     };
+    let turn = |session: &mut Session, id: &str, first: serde_json::Value| {
+        session.apply(update(
+            json!({"type": "state", "state": "running", "turn": id}),
+        ));
+        session.apply(update(first));
+        ended(session, id);
+    };
     let mut session = Session::new(SessionId::from("s1"));
-    session.attached(attach_response(JobState::Idle, 1));
-    // Replayed: history, not a turn beginning now.
+    session.attached(attach_response(JobState::Running, 1));
+    // Running since before the attach: the replay's state is history.
     session.apply(update(
         json!({"type": "state", "state": "running", "turn": "t0"}),
     ));
+    session.apply(update(
+        json!({"type": "agent_message_chunk", "message": "m0", "text": "still going"}),
+    ));
+    ended(&mut session, "t0");
     turn(
         &mut session,
         "t1",
@@ -430,7 +437,7 @@ fn a_turn_without_a_prompt_opens_with_a_wake() {
         json!({"type": "user_message", "message": "u3", "content": [{"type": "text", "text": "go"}]}),
     );
     let kinds: Vec<&str> = texts(&session).into_iter().map(|(kind, _)| kind).collect();
-    assert_eq!(kinds, ["user", "wake", "agent", "notice", "user"]);
+    assert_eq!(kinds, ["agent", "user", "wake", "agent", "notice", "user"]);
 }
 
 /// A message refused because a turn was under way is due once a turn ended

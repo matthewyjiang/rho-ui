@@ -381,7 +381,9 @@ impl SessionView {
                             cx.emit(SessionEvent::Saved);
                         }
                     }
-                    Err(DaemonError::Busy(_)) => this.hold(text, ended, window, cx),
+                    Err(DaemonError::Busy(error)) => {
+                        this.refused_busy(text, ended, error, window, cx);
+                    }
                     Err(error) => {
                         // A turn another client began meanwhile is not
                         // what failed.
@@ -422,13 +424,51 @@ impl SessionView {
                         cx.emit(SessionEvent::Prompted);
                     }
                     // The turn is past its last model request, or ended.
-                    Err(DaemonError::Busy(_)) => this.hold(text, ended, window, cx),
+                    Err(DaemonError::Busy(error)) => {
+                        this.refused_busy(text, ended, error, window, cx);
+                    }
                     Err(error) => {
                         this.error = Some(format!("Couldn't steer the turn: {error}"));
                         this.give_back(&text, window, cx);
                     }
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `text` was refused as busy, the daemon saying `why`. A turn this
+    /// view knows of, under way or ended since `text` was sent, explains
+    /// it: `text` waits for that turn. Otherwise either the turn's events
+    /// have yet to arrive, or the session is busy with no turn at all, as
+    /// while it is deleted; the daemon's job list tells which.
+    fn refused_busy(
+        &mut self,
+        text: String,
+        sent_after: Option<TurnId>,
+        why: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.session.has_turn_since(sent_after.as_ref()) {
+            self.hold(text, sent_after, window, cx);
+            return;
+        }
+        let daemon = self.daemon.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let jobs = daemon.active_jobs().await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let id = this.session.id();
+                let listed = jobs.is_ok_and(|jobs| jobs.iter().any(|job| job.session() == id));
+                // The turn's events may have come in meanwhile.
+                if listed || this.session.has_turn_since(sent_after.as_ref()) {
+                    this.hold(text, sent_after, window, cx);
+                } else {
+                    this.error = Some(format!("Couldn't send the message: {why}"));
+                    this.give_back(&text, window, cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -485,7 +525,15 @@ impl SessionView {
             if let Err(error) = daemon.stop_background(&id, &work).await {
                 let _ = this.update(cx, |this, cx| {
                     this.stopping.retain(|asked| *asked != work);
-                    this.error = Some(format!("Couldn't stop it: {error}"));
+                    // Work that ended meanwhile needs no stop; the list
+                    // already says how it ended.
+                    let work_list = this.session.background();
+                    if work_list
+                        .iter()
+                        .any(|listed| *listed.id() == work && listed.can_stop())
+                    {
+                        this.error = Some(format!("Couldn't stop it: {error}"));
+                    }
                     cx.notify();
                 });
             }
@@ -677,21 +725,27 @@ impl SessionView {
             .gap_2()
             .px_4()
             .pb_3()
+            // Each alert is wrapped so UI tests can find it: Kit's Alert
+            // does not register its ID with them.
             .when_some(failure, |this, message| {
                 this.child(
-                    Alert::error("turn-error", SharedString::from(message))
-                        .title("The turn failed")
-                        .small(),
+                    div().id("turn-error").test_support().child(
+                        Alert::error("turn-error-alert", SharedString::from(message))
+                            .title("The turn failed")
+                            .small(),
+                    ),
                 )
             })
             .when_some(self.error.clone(), |this, message| {
                 this.child(
-                    Alert::warning("session-error", SharedString::from(message))
-                        .small()
-                        .on_close(cx.listener(|this, _, _, cx| {
-                            this.error = None;
-                            cx.notify();
-                        })),
+                    div().id("session-error").test_support().child(
+                        Alert::warning("session-error-alert", SharedString::from(message))
+                            .small()
+                            .on_close(cx.listener(|this, _, _, cx| {
+                                this.error = None;
+                                cx.notify();
+                            })),
+                    ),
                 )
             })
             .when_some(self.session.inputs().first(), |this, request| {

@@ -18,7 +18,9 @@
 //!   ends it, and drops the work it delivered from the list as it ends.
 //! - A session's first prompt "busy" is refused as busy: the daemon has
 //!   just started a turn of its own, which answers and ends at once. The
-//!   next "busy" is taken like any prompt.
+//!   next "busy" is taken like any prompt. The prompt "deleting" is
+//!   refused as busy with no turn under way, as a session being deleted
+//!   refuses it.
 //! - With [`Script::tui_job`], the session "tui-1" has a turn under way, as
 //!   one rho's terminal UI started: it is listed, its job runs, and a steer
 //!   is read at once, answered, and ends the turn. The steer "wait" is

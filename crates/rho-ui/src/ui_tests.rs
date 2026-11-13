@@ -1304,7 +1304,8 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
 /// A message the session's turn can't take waits above the composer and
 /// goes as a prompt once the turn ends, with no error: one sent while the
 /// turn waits on an approval, and one the daemon refused because it had
-/// just begun a turn of its own.
+/// just begun a turn of its own. A busy refusal with no turn behind it is
+/// an error, and the message goes back in the composer.
 #[test]
 fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
     let mut ui = Harness::start("queued", Script::default());
@@ -1360,4 +1361,23 @@ fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
         session.entries()
     );
     ui.shot("after-busy");
+    ui.click("approval-allow-once");
+    ui.wait_for_session("that turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+
+    ui.send("deleting");
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "session-error")
+    });
+    let view = ui.app.clone();
+    let (typed, held) = ui.cx.update(|cx| {
+        let view = view.read(cx).active_session().expect("a session is open");
+        let view = view.read(cx);
+        (
+            view.composer_text(cx),
+            view.session().held().map(str::to_owned),
+        )
+    });
+    assert_eq!((typed.as_str(), held), ("deleting", None));
 }
