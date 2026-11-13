@@ -10,8 +10,8 @@
 //! does a message with attachments, as a steer carries only text, and any
 //! message after one waiting, which would otherwise overtake it.
 //!
-//! The session's background work is listed above the box, with a button to
-//! stop each piece that runs.
+//! The session's running background work is listed above the box, with a
+//! button to stop each piece; what ended is behind a button in the header.
 
 use std::{path::PathBuf, rc::Rc, time::Instant};
 
@@ -40,7 +40,7 @@ use rho_ui_core::{
 
 use crate::{
     approval::ApprovalCard,
-    background::BackgroundList,
+    background::{BackgroundHistory, BackgroundList},
     composer::{Composer, ComposerMode, ComposerState},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
@@ -915,15 +915,25 @@ impl Render for SessionView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
             .size_full()
-            .child(header(self.title(), self.workspace.read(cx), cx))
+            .child(header(
+                self.title(),
+                self.workspace.read(cx),
+                BackgroundHistory::new(self.session.ended_background()),
+                cx,
+            ))
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }
 }
 
-/// A session's title, with its workspace and branch under it. Shared with the
-/// new-session draft.
-pub(crate) fn header(title: String, workspace: &Workspace, cx: &App) -> impl IntoElement {
+/// A session's title, with its workspace and branch under it, and
+/// `trailing` controls at the right. Shared with the new-session draft.
+pub(crate) fn header(
+    title: String,
+    workspace: &Workspace,
+    trailing: Option<impl IntoElement>,
+    cx: &App,
+) -> impl IntoElement {
     let details = h_flex()
         .gap_1()
         .min_w_0()
@@ -934,24 +944,30 @@ pub(crate) fn header(title: String, workspace: &Workspace, cx: &App) -> impl Int
             this.child(Icon::new(Lucide::GitBranch).xsmall().ml_2())
                 .child(div().truncate().child(branch))
         });
-    v_flex()
+    h_flex()
         .flex_shrink_0()
         .min_h(px(44.))
-        .justify_center()
+        .gap_2()
         .px_4()
         .py_1()
         .border_b_1()
         .border_color(cx.theme().border)
         .child(
-            div()
-                .id("session-title")
-                .test_support()
-                .aria_label(title.clone())
-                .truncate()
-                .font_medium()
-                .child(title),
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .id("session-title")
+                        .test_support()
+                        .aria_label(title.clone())
+                        .truncate()
+                        .font_medium()
+                        .child(title),
+                )
+                .child(details),
         )
-        .child(details)
+        .children(trailing)
 }
 
 /// A held message on one line: its text, and what is attached to it, such

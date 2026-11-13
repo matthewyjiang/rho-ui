@@ -498,3 +498,40 @@ fn a_held_message_keeps_its_attachments() {
     assert_eq!(held.text(), "one");
     assert_eq!(held.attachments(), [image(1), image(2)]);
 }
+
+/// Work that ended stays in the session's record of ended work after the
+/// daemon drops it from its list, once, in the order it ended.
+#[test]
+fn ended_background_work_outlives_the_daemons_list() {
+    let mut session = session();
+    let list = |work: serde_json::Value| update(json!({"type": "background", "work": work}));
+    let process = |id: &str, status: &str| json!({"item": {"kind": "process", "id": id}, "title": id, "status": status});
+    session.apply(list(json!([
+        process("a", "running"),
+        process("b", "running")
+    ])));
+    assert!(session.ended_background().is_empty());
+    session.apply(list(json!([
+        process("a", "running"),
+        process("b", "cancelled")
+    ])));
+    session.apply(list(json!([
+        process("a", "completed"),
+        process("b", "cancelled")
+    ])));
+    session.apply(list(json!([])));
+
+    assert!(session.background().is_empty());
+    let ended: Vec<_> = session
+        .ended_background()
+        .iter()
+        .map(|work| (work.title(), work.status()))
+        .collect();
+    assert_eq!(
+        ended,
+        [
+            ("b", BackgroundStatus::Cancelled),
+            ("a", BackgroundStatus::Completed)
+        ]
+    );
+}

@@ -21,7 +21,7 @@ use rho_protocol::{
 };
 
 use crate::{
-    background::BackgroundWork,
+    background::{BackgroundKind, BackgroundStatus, BackgroundWork},
     daemon::SessionId,
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
@@ -397,6 +397,9 @@ pub struct Session {
     steers: Vec<Steer>,
     /// Background work, as the daemon last listed it.
     background: Vec<BackgroundWork>,
+    /// Background work seen to end since this session was created, in the
+    /// order it ended; see [`Self::ended_background`].
+    ended_background: Vec<BackgroundWork>,
     /// A message the turn could not take; see [`Self::hold`].
     held: Option<Held>,
     /// Steers a turn dropped when it ended; see [`Self::take_dropped_steers`].
@@ -446,6 +449,7 @@ impl Session {
             inputs: Vec::new(),
             steers: Vec::new(),
             background: Vec::new(),
+            ended_background: Vec::new(),
             held: None,
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
@@ -566,6 +570,15 @@ impl Session {
     /// whose result the model has yet to be given, with how it ended.
     pub fn background(&self) -> &[BackgroundWork] {
         &self.background
+    }
+
+    /// Background work this session has seen end, with how it ended, in
+    /// the order it ended. Unlike [`Self::background`], it keeps work the
+    /// daemon stopped listing once the model had its result, so how each
+    /// piece ended can still be looked up. Work the daemon dropped without
+    /// listing it ended, as before an attach, is not here.
+    pub fn ended_background(&self) -> &[BackgroundWork] {
+        &self.ended_background
     }
 
     /// The turn that ended last, as far as this session has heard. Take it
@@ -818,6 +831,20 @@ impl Session {
 
     fn set_background(&mut self, work: Vec<rho_protocol::BackgroundWork>) {
         self.background = work.into_iter().map(BackgroundWork::from_wire).collect();
+        // A kind this client doesn't know has no ID to tell it apart from
+        // the same work in the next list, so it is left out.
+        let ended = self.background.iter().filter(|work| {
+            work.status() != BackgroundStatus::Running && work.kind() != BackgroundKind::Other
+        });
+        for work in ended {
+            if !self
+                .ended_background
+                .iter()
+                .any(|seen| seen.id() == work.id())
+            {
+                self.ended_background.push(work.clone());
+            }
+        }
     }
 
     fn set_options(&mut self, options: SessionOptions) {

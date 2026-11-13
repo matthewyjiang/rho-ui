@@ -80,6 +80,7 @@ gpui_kit::assets::icon_assets!(
         CornerDownRight,
         Clock,
         SquareTerminal,
+        ListChecks,
         Workflow,
         Bot,
         Cog,

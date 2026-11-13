@@ -212,20 +212,19 @@ fn start_two_processes(ui: &mut Harness) -> usize {
         .expect("the long process is listed")
 }
 
-/// Stops row `long`, sees it listed as stopped and the daemon's own turn
+/// Stops row `long`, sees it end as stopped and the daemon's own turn
 /// begin, and sends a message during that turn.
 fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
     let stop: &'static str = Box::leak(format!("background-stop-{long}").into_boxed_str());
-    let row: &'static str = Box::leak(format!("background-{long}").into_boxed_str());
     let sent = prompts(&ui.session());
     ui.click(stop);
-    ui.wait_within(BACKGROUND_TURN, "the stopped process", |window, _, _| {
-        window
-            .try_find(row)
-            .and_then(|row| row.label().map(|label| label.ends_with(": Stopped")))
-            .unwrap_or(false)
+    ui.wait_within(BACKGROUND_TURN, "the stopped process", |_, cx, app| {
+        app.active_session()
+            .is_some_and(|view| ended(view.read(cx).session(), "600", BackgroundStatus::Cancelled))
     });
-    eprintln!("stopped: {:?}", ui.label(row));
+    ui.click("background-history-button");
+    eprintln!("stopped: {:?}", labels_of(ui, ": Stopped"));
+    ui.act(|window, cx| window.press("escape", cx));
     ui.shot("stopped");
     // Sent as soon as the daemon's turn begins. Its wake row comes with
     // its first model output, which can come just before it ends.
@@ -274,13 +273,19 @@ fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
 /// Waits for `sleep 120` to exit by itself and the daemon's turn that tells
 /// the model to end, with the list empty.
 fn follow_the_exit(ui: &mut Harness) {
-    ui.wait_within(BACKGROUND_TURN, "the exited process", |window, _, _| {
-        labels(window)
-            .iter()
-            .any(|label| label.contains("first-done") && label.contains(": Exited "))
+    ui.wait_within(BACKGROUND_TURN, "the exited process", |_, cx, app| {
+        app.active_session().is_some_and(|view| {
+            ended(
+                view.read(cx).session(),
+                "first-done",
+                BackgroundStatus::Completed,
+            )
+        })
     });
+    ui.click("background-history-button");
     eprintln!("exited: {:?}", labels_of(ui, ": Exited "));
     ui.shot("exited");
+    ui.act(|window, cx| window.press("escape", cx));
     ui.wait_within(
         BACKGROUND_TURN,
         "the list to empty and the turn to end",
@@ -302,6 +307,14 @@ fn follow_the_exit(ui: &mut Harness) {
     };
     eprintln!("the daemon's last turn replied: {}", reply.text());
     ui.shot("done");
+}
+
+/// Whether `session` saw work titled with `part` end as `status`.
+fn ended(session: &Session, part: &str, status: BackgroundStatus) -> bool {
+    session
+        .ended_background()
+        .iter()
+        .any(|work| work.title().contains(part) && work.status() == status)
 }
 
 /// Every drawn accessibility label holding `part`.

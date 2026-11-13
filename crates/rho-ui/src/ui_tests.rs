@@ -1379,10 +1379,11 @@ fn shows_an_error(window: &Window) -> bool {
 }
 
 /// A turn ends while the process it started runs on, which is listed above
-/// the composer. Stopping it lists it as stopped while the daemon's own turn
-/// tells the model, which shows like any turn and takes a steer; the
-/// process leaves the list as that turn ends. A process that exits by
-/// itself shows its exit status the same way.
+/// the composer. Stopping it takes it off that list, and the header's ended
+/// work says it was stopped, while the daemon's own turn tells the model,
+/// which shows like any turn and takes a steer. Ended work stays there
+/// after that turn. A process that exits by itself shows its exit status
+/// the same way, newest first.
 #[test]
 fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
     let mut ui = Harness::start("background", Script::default());
@@ -1407,17 +1408,20 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
             && session.background()[0].status() == BackgroundStatus::Cancelled
     });
     ui.act(|window, _| {
-        assert_eq!(
-            window.find("background-0").label(),
-            Some("sleep 30: Stopped"),
-            "the list says how it ended"
-        );
-        assert!(!is_visible(window, "background-stop-0"), "nothing to stop");
+        assert!(!is_visible(window, "background"), "nothing runs");
         assert!(
             is_visible(window, "composer-stop"),
             "the turn shows as running"
         );
     });
+    ui.click("background-history-button");
+    assert_eq!(
+        ui.label("background-ended-0").as_deref(),
+        Some("sleep 30: Stopped"),
+        "the ended work says how it ended"
+    );
+    ui.shot("stopped-history");
+    ui.act(|window, cx| window.press("escape", cx));
     let session = ui.session();
     assert!(
         matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "`sleep 30` was stopped."),
@@ -1440,6 +1444,10 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
     });
     ui.act(|window, _| {
         assert!(!is_visible(window, "background"), "the list is gone");
+        assert!(
+            is_visible(window, "background-history-button"),
+            "ended work outlives the daemon's list"
+        );
         assert!(!shows_an_error(window));
     });
     assert!(
@@ -1457,11 +1465,19 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
         session.state() == &RunState::Running
             && session.background()[0].status() == BackgroundStatus::Completed
     });
+    ui.act(|window, _| assert!(!is_visible(window, "background"), "it left the list"));
+    ui.click("background-history-button");
     assert_eq!(
-        ui.label("background-0").as_deref(),
-        Some("sleep 30: Exited 0")
+        ui.label("background-ended-0").as_deref(),
+        Some("sleep 30: Exited 0"),
+        "the newest first"
+    );
+    assert_eq!(
+        ui.label("background-ended-1").as_deref(),
+        Some("sleep 30: Stopped")
     );
     ui.shot("exited");
+    ui.act(|window, cx| window.press("escape", cx));
     ui.send("ok");
     ui.wait_for_session("the list to empty", |session| {
         session.state() == &RunState::Idle && session.background().is_empty()
