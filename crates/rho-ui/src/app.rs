@@ -28,6 +28,7 @@ use crate::{
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
     session_view::{Loading, SessionEvent, SessionView},
+    settings::{Appearance, Settings},
     settings_view::{Closed, SettingsView},
     shelf::Shelves,
     sidebar::{SidebarEvent, SidebarView},
@@ -116,6 +117,7 @@ pub(crate) struct RhoApp {
     /// The latest `list_sessions`; a newer refresh replaces it.
     sessions_task: Task<()>,
     _sidebar_subscription: Subscription,
+    _appearance_subscription: Subscription,
 }
 
 impl RhoApp {
@@ -159,6 +161,14 @@ impl RhoApp {
             jobs: Vec::new(),
             sessions_task: Task::ready(()),
             _sidebar_subscription: sidebar_subscription,
+            // With the system appearance, follow the desktop from light to
+            // dark and back.
+            _appearance_subscription: cx.observe_window_appearance(window, |_, _, cx| {
+                let settings = cx.global::<Settings>().clone();
+                if settings.appearance == Appearance::System {
+                    settings.apply(cx);
+                }
+            }),
         };
         app.connect(window, cx);
         app

@@ -1,11 +1,11 @@
-//! rho-ui's own settings: UI scale and fonts. They live in
+//! rho-ui's own settings: light or dark, UI scale and fonts. They live in
 //! `$XDG_CONFIG_HOME/rho-ui/settings` (by default `~/.config/rho-ui/settings`),
 //! one `key = value` per line, and apply to GPUI Kit's theme.
 
 use std::path::PathBuf;
 
-use gpui_kit::component::Theme;
-use gpui_kit::{px, App, Global, SharedString};
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::{px, App, Global, SharedString, WindowAppearance};
 
 use crate::store;
 
@@ -55,8 +55,62 @@ impl Default for UiScale {
     }
 }
 
+/// Whether rho-ui shows its light or dark theme.
+///
+/// Dark by default, not [`Appearance::System`]: on Linux the app starts
+/// before the desktop portal says light or dark, so a dark desktop would
+/// see a light first frame, and with no portal (bare sway or i3) stay
+/// light.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Appearance {
+    /// The one the desktop asks for, changing when it does.
+    System,
+    Light,
+    #[default]
+    Dark,
+}
+
+impl Appearance {
+    pub(crate) const CHOICES: [Appearance; 3] =
+        [Appearance::Dark, Appearance::Light, Appearance::System];
+
+    /// What the settings file calls it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Appearance::System => "system",
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+        }
+    }
+
+    /// What the settings screen calls it.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Appearance::System => "System",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::CHOICES
+            .into_iter()
+            .find(|choice| choice.name() == name)
+    }
+
+    /// The theme mode to show while the desktop asks for `system`.
+    pub(crate) fn mode(self, system: WindowAppearance) -> ThemeMode {
+        match self {
+            Appearance::System => system.into(),
+            Appearance::Light => ThemeMode::Light,
+            Appearance::Dark => ThemeMode::Dark,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Settings {
+    pub(crate) appearance: Appearance,
     pub(crate) ui_scale: UiScale,
     pub(crate) ui_font: SharedString,
     pub(crate) code_font: SharedString,
@@ -67,6 +121,7 @@ pub(crate) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            appearance: Appearance::default(),
             ui_scale: UiScale::default(),
             ui_font: DEFAULT_UI_FONT.into(),
             code_font: DEFAULT_CODE_FONT.into(),
@@ -96,7 +151,8 @@ impl Settings {
     pub(crate) fn save(&self) {
         let Some(path) = &self.file else { return };
         let text = format!(
-            "ui_scale = {}\nui_font = {}\ncode_font = {}\n",
+            "appearance = {}\nui_scale = {}\nui_font = {}\ncode_font = {}\n",
+            self.appearance.name(),
             self.ui_scale.percent(),
             self.ui_font,
             self.code_font
@@ -107,6 +163,9 @@ impl Settings {
     /// Makes `self` the current settings and applies them to the theme and
     /// every window.
     pub(crate) fn apply(self, cx: &mut App) {
+        // First: loading a mode's theme resets what the theme file sets.
+        let mode = self.appearance.mode(cx.window_appearance());
+        Theme::change(mode, None, cx);
         let installed = cx.text_system().all_font_names();
         // A font that isn't installed falls back to the default, and if that
         // is missing too, to GPUI Kit's own choice: a missing family can
@@ -146,6 +205,11 @@ fn parse(text: &str) -> Settings {
         };
         let value = value.trim();
         match key.trim() {
+            "appearance" => {
+                if let Some(appearance) = Appearance::from_name(value) {
+                    settings.appearance = appearance;
+                }
+            }
             "ui_scale" => {
                 if let Some(scale) = value.parse().ok().and_then(UiScale::from_percent) {
                     settings.ui_scale = scale;
@@ -165,10 +229,14 @@ mod tests {
 
     #[test]
     fn parsing_keeps_defaults_for_missing_or_bad_values() {
-        let settings = parse("ui_scale = 125\ncode_font = Fira Code\nui_font =\nbogus = 1\n");
+        let settings = parse(
+            "appearance = light\nui_scale = 125\ncode_font = Fira Code\nui_font =\nbogus = 1\n",
+        );
+        assert_eq!(settings.appearance, Appearance::Light);
         assert_eq!(settings.ui_scale, UiScale(125));
         assert_eq!(settings.code_font, "Fira Code");
         assert_eq!(settings.ui_font, DEFAULT_UI_FONT);
         assert_eq!(parse("ui_scale = 133").ui_scale, UiScale::default());
+        assert_eq!(parse("appearance = sepia").appearance, Appearance::Dark);
     }
 }

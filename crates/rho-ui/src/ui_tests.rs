@@ -1205,6 +1205,94 @@ fn frame_times() {
     );
 }
 
+/// The theme setting switches between rho-ui's light and dark themes,
+/// keeping the UI scale. Screenshots of the same busy screen in both modes,
+/// for a person to judge: a turn's steps, a diff, code, notices, an
+/// approval.
+#[test]
+fn the_theme_setting_switches_light_and_dark() {
+    use gpui_kit::component::Theme;
+
+    use crate::settings::Appearance;
+
+    let script = Script {
+        replay_turns: 1,
+        cards: true,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("theme", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-old")
+    });
+    ui.click("session-old");
+    ui.wait_until("the turn folded behind one line", |window, _, _| {
+        is_visible(window, "worked-0")
+    });
+    ui.click("worked-0");
+    ui.wait_until("the steps", |window, _, _| is_visible(window, "work-2"));
+    ui.act(|window, cx| window.within("work-2").click("work-summary", cx));
+    ui.wait_until("a line per step", |window, _, _| {
+        is_visible(window, "step-6")
+    });
+    ui.act(|window, cx| window.within("step-6").click("step-line", cx));
+    ui.wait_until("the edit's diff", |window, _, _| {
+        is_visible(window, "details-6")
+    });
+    // What each theme's file sets: its background and link colors.
+    let color = |hex: &str| gpui_kit::component::try_parse_color(hex).expect("a color");
+    let show = |ui: &mut Harness, step: &str| {
+        for (appearance, background, link) in [
+            (Appearance::Dark, "#161618", "#9db4ec"),
+            (Appearance::Light, "#fcfcfd", "#3a5fc0"),
+        ] {
+            let shown = ui.cx.update(|cx| {
+                let mut settings = cx.global::<Settings>().clone();
+                settings.appearance = appearance;
+                settings.ui_scale = UiScale::from_percent(125).expect("125% is on offer");
+                settings.apply(cx);
+                let theme = Theme::global(cx);
+                (theme.background, theme.link, theme.font_size)
+            });
+            ui.frame();
+            let want = (color(background), color(link), px(20.));
+            assert_eq!(shown, want, "{appearance:?} keeps the scale");
+            // Shots at the default scale, to compare with the other tests'.
+            ui.cx.update(|cx| {
+                let mut settings = cx.global::<Settings>().clone();
+                settings.ui_scale = UiScale::default();
+                settings.apply(cx);
+            });
+            ui.shot(&format!("{step}-{}", appearance.name()));
+        }
+    };
+    // The diff sits above the fold: bring its row to the top.
+    let app = ui.app.clone();
+    let scroller = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        view.read(cx).transcript().scroller().clone()
+    });
+    ui.cx
+        .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(2, cx)));
+    show(&mut ui, "diff");
+    ui.prompt_from_elsewhere("old", "list files");
+    ui.wait_until("the approval", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.cx.update(|cx| {
+        scroller.update(
+            cx,
+            gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end,
+        );
+    });
+    show(&mut ui, "approval");
+
+    ui.click("open-settings");
+    ui.wait_until("the settings screen", |window, _, _| {
+        is_visible(window, "close-settings")
+    });
+    ui.shot("settings-light");
+}
+
 /// Whether the session view shows an error: a failed turn, or a request
 /// that failed.
 fn shows_an_error(window: &Window) -> bool {

@@ -17,7 +17,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    settings::{Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
+    settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
     CloseSettings,
 };
 
@@ -201,12 +201,30 @@ impl Render for SettingsView {
                 (percent, format!("{}%", scale.percent()).into())
             })
             .collect();
+        let themes: Vec<(SharedString, SharedString)> = Appearance::CHOICES
+            .into_iter()
+            .map(|choice| (choice.name().into(), choice.label().into()))
+            .collect();
         let appearance = SettingPage::new("Appearance")
             .icon(IconName::Palette)
             .default_open(true)
             .resettable(true)
             .group(
                 SettingGroup::new().title("Interface").items([
+                    SettingItem::new(
+                        "Theme",
+                        SettingField::dropdown(
+                            themes,
+                            |cx: &App| cx.global::<Settings>().appearance.name().into(),
+                            |name: SharedString, cx: &mut App| {
+                                if let Some(appearance) = Appearance::from_name(&name) {
+                                    update(cx, |settings| settings.appearance = appearance);
+                                }
+                            },
+                        )
+                        .default_value(Appearance::default().name()),
+                    )
+                    .description("Dark, light, or whichever your desktop uses."),
                     SettingItem::new(
                         "UI scale",
                         SettingField::dropdown(
