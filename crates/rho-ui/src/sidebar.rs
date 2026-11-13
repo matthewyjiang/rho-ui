@@ -65,7 +65,7 @@ const GUTTER_REMS: f32 = 0.0625;
 
 /// An active row's height. Every active row has it, so a row without a
 /// branch keeps the space.
-pub(crate) const ROW_REMS: f32 =
+const ROW_REMS: f32 =
     2. * LINE_REMS + TITLE_REMS + 2. * GAP_REMS + 2. * PAD_REMS + 2. * GUTTER_REMS;
 
 /// Inside a one-line shelved row's highlight, above and below its title.
