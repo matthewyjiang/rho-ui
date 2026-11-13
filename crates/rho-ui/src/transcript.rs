@@ -44,16 +44,18 @@ use crate::{
 /// transcript's measure.
 const IMAGE_HEIGHT: f32 = 10.;
 
-/// A code block's top padding: the 14px Kit pads its bottom with. Kit pads
-/// a block with a language name 28px at the top, so the code starts under
-/// the name; the name sits in the corner instead, in the padding, as it is
-/// not part of the code.
-const CODE_BLOCK_TOP: f32 = 14.;
+/// A code block's padding above and below its code: just room for the
+/// language name in the top corner, which Kit sets 7px down on a 16px line.
+/// Kit pads 28px above the code and 14px below, so the name reads as a line
+/// of the block rather than a label in its margin.
+const CODE_BLOCK_PAD_Y: f32 = 7. + 16.;
 
 /// How messages draw their Markdown.
 fn message_style() -> TextViewStyle {
     TextViewStyle {
-        code_block: StyleRefinement::default().pt(px(CODE_BLOCK_TOP)),
+        code_block: StyleRefinement::default()
+            .pt(px(CODE_BLOCK_PAD_Y))
+            .pb(px(CODE_BLOCK_PAD_Y)),
         ..TextViewStyle::default()
     }
 }
