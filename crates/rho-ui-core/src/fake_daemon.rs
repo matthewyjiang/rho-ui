@@ -31,9 +31,9 @@ use rho_protocol::{
         PermissionModeOptions, ReasoningLevel, ReasoningOptions, Seq, SessionCommand, SessionId,
         SessionOptions, SteerId, ToolCallId, ToolCallUpdate, TurnId,
     },
-    serve_connection, AnswerStop, BuildId, CommandKind, ContentBlock, DaemonInfo, ErrorCode,
-    InputRequest, PermissionMode, Published, Publisher, RpcError, SessionEvent, ToolContent,
-    ToolKind, ToolStatus, TurnOutcome,
+    serve_connection, AnswerStop, BuildId, CardTone, CommandKind, ContentBlock, DaemonInfo,
+    ErrorCode, InputRequest, PermissionMode, Published, Publisher, RpcError, SessionEvent,
+    ToolContent, ToolKind, ToolStatus, TurnOutcome,
 };
 use tokio::{net::UnixListener, runtime::Runtime};
 
@@ -55,6 +55,8 @@ pub struct Script {
     pub sessions: usize,
     /// Whether [`TUI_SESSION`] exists, with a turn under way.
     pub tui_job: TuiJob,
+    /// Whether "old"'s replay ends with an info card and a warning card.
+    pub cards: bool,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -422,6 +424,31 @@ fn replay(session: &mut FakeSession, turns: usize) {
     }
 }
 
+/// An info card and a warning card, as background work and failing hooks
+/// send them.
+fn cards(session: &mut FakeSession) {
+    for (title, plain, tone) in [
+        (
+            "Completed · cargo test",
+            "ran 2m 04s\n142 passed",
+            CardTone::Neutral,
+        ),
+        (
+            "Hook failed · pre-commit",
+            "exit status 1",
+            CardTone::Warning,
+        ),
+    ] {
+        session.publish(SessionEvent::Card {
+            title: title.to_owned(),
+            markdown: plain.to_owned(),
+            plain: plain.to_owned(),
+            tone,
+            display: None,
+        });
+    }
+}
+
 #[derive(Debug)]
 struct State {
     sessions: BTreeMap<String, FakeSession>,
@@ -440,6 +467,9 @@ impl State {
         );
         let mut old = FakeSession::new("/w/b", None, 1_767_225_600);
         replay(&mut old, script.replay_turns);
+        if script.cards {
+            cards(&mut old);
+        }
         sessions.insert("old".to_owned(), old);
         for n in 0..script.sessions {
             let title = format!("Bulk session {n} with a longer title that truncates");

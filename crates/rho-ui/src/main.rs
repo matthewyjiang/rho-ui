@@ -18,6 +18,7 @@ mod settings_view;
 mod shelf;
 mod sidebar;
 mod store;
+mod themes;
 mod time;
 mod transcript;
 mod turn_times;
@@ -28,7 +29,6 @@ mod workspaces;
 
 use std::{borrow::Cow, path::PathBuf};
 
-use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
     px, size, App, AppContext as _, AssetSource, KeyBinding, SharedString, TitlebarOptions,
     WindowBounds, WindowOptions,
@@ -162,7 +162,7 @@ fn main() {
 /// with default settings, and key bindings.
 fn init(cx: &mut App) {
     gpui_kit::init(cx);
-    Theme::change(ThemeMode::Dark, None, cx);
+    themes::install(cx);
     Settings::default().apply(cx);
     // In memory until `main` loads the saved times; tests keep it so.
     cx.set_global(TurnTimes::default());

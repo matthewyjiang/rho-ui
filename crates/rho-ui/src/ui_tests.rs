@@ -1172,3 +1172,79 @@ fn frame_times() {
         }),
     );
 }
+
+/// The theme setting switches between rho-ui's light and dark themes, and
+/// saves the choice. Screenshots of the same busy screen in both modes, for
+/// a person to judge: a turn's steps, a diff, code, an approval.
+#[test]
+fn the_theme_setting_switches_light_and_dark() {
+    use gpui_kit::component::{Theme, ThemeMode};
+
+    use crate::settings::Appearance;
+
+    let script = Script {
+        replay_turns: 1,
+        cards: true,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("theme", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-old")
+    });
+    ui.click("session-old");
+    ui.wait_until("the turn folded behind one line", |window, _, _| {
+        is_visible(window, "worked-0")
+    });
+    ui.click("worked-0");
+    ui.wait_until("the steps", |window, _, _| is_visible(window, "work-2"));
+    ui.act(|window, cx| window.within("work-2").click("work-summary", cx));
+    ui.wait_until("a line per step", |window, _, _| {
+        is_visible(window, "step-6")
+    });
+    ui.act(|window, cx| window.within("step-6").click("step-line", cx));
+    ui.wait_until("the edit's diff", |window, _, _| {
+        is_visible(window, "details-6")
+    });
+    let mode = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            (
+                Theme::global(cx).mode,
+                Theme::global(cx).theme_name().clone(),
+            )
+        })
+    };
+    let show = |ui: &mut Harness, step: &str| {
+        for (appearance, want, name) in [
+            (Appearance::Dark, ThemeMode::Dark, "rho Dark"),
+            (Appearance::Light, ThemeMode::Light, "rho Light"),
+        ] {
+            ui.cx.update(|cx| {
+                let mut settings = cx.global::<Settings>().clone();
+                settings.appearance = appearance;
+                settings.apply(cx);
+            });
+            ui.frame();
+            assert_eq!(mode(ui), (want, name.into()));
+            ui.shot(&format!("{step}-{}", appearance.name()));
+        }
+    };
+    // The diff sits above the fold: bring its row to the top.
+    let app = ui.app.clone();
+    ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        let scroller = view.read(cx).transcript().scroller().clone();
+        scroller.update(cx, |scroller, cx| scroller.scroll_to_item(2, cx));
+    });
+    show(&mut ui, "diff");
+    ui.prompt_from_elsewhere("old", "list files");
+    ui.wait_until("the approval", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    show(&mut ui, "approval");
+
+    ui.click("open-settings");
+    ui.wait_until("the settings screen", |window, _, _| {
+        is_visible(window, "close-settings")
+    });
+    ui.shot("settings-light");
+}
