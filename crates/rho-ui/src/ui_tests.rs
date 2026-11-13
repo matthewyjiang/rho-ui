@@ -28,7 +28,7 @@ use gpui_kit::component::ActiveTheme as _;
 use crate::{
     app::{LaunchConfig, RhoApp},
     projects::Projects,
-    settings::{Settings, UiScale},
+    settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
     turn_times::TurnTimes,
 };
@@ -733,7 +733,7 @@ fn settings_open_apply_and_close() {
             is_visible(window, "new-session"),
             "the sidebar shows behind settings"
         );
-        // Kit's dialog surface: the panel plus the dialog's title and padding.
+        // Kit's dialog surface, which the panel fills.
         let dialog = bounds(window, "surface").expect("the settings dialog");
         let above = dialog.top();
         let below = viewport.height - dialog.bottom();
@@ -757,6 +757,13 @@ fn settings_open_apply_and_close() {
         assert_eq!(code, px(16.25), "13 px at 125%");
     });
     ui.shot("scaled");
+
+    ui.cx.update(|cx| {
+        let mut settings = cx.global::<Settings>().clone();
+        settings.appearance = Appearance::Light;
+        settings.apply(cx);
+    });
+    ui.shot("light");
 
     ui.act(|window, cx| window.press("escape", cx));
     // Past the dialog's exit transition.
