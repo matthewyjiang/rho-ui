@@ -215,15 +215,11 @@ fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
     });
     eprintln!("stopped: {:?}", ui.label(row));
     ui.shot("stopped");
+    // Sent as soon as the daemon's turn begins. Its wake row comes with
+    // its first model output, which can come just before it ends.
     ui.wait_within(BACKGROUND_TURN, "the daemon's own turn", |_, cx, app| {
-        app.active_session().is_some_and(|view| {
-            let session = view.read(cx).session();
-            session.state().is_busy()
-                && session
-                    .entries()
-                    .iter()
-                    .any(|entry| matches!(entry, Entry::Wake))
-        })
+        app.active_session()
+            .is_some_and(|view| view.read(cx).session().state().is_busy())
     });
     assert_eq!(
         prompts(&ui.session()),
@@ -249,6 +245,11 @@ fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
         .iter()
         .any(|entry| matches!(entry, Entry::User(message) if message.text().contains("FOLLOWED")));
     assert!(followed, "the message sent during the daemon's turn joined");
+    let wakes = session
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::Wake));
+    assert!(wakes.count() >= 1, "the daemon's turn opened with a wake");
     let left: Vec<_> = session
         .background()
         .iter()
