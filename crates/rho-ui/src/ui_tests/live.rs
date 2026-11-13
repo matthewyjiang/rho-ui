@@ -15,9 +15,9 @@ use crate::{projects::Projects, shelf::Shelves};
 /// own through an approval, then attaches to the session
 /// `RHO_UI_LIVE_ATTACH` names, one whose turn rho's terminal UI started
 /// and left waiting on an approval, answers it, and steers the turn.
-/// The README's Test section has the full recipe.
+/// docs/testing.md has the full recipe.
 #[test]
-#[ignore = "needs a real rho daemon and a signed-in model; see README"]
+#[ignore = "needs a real rho daemon and a signed-in model; see docs/testing.md"]
 fn live_daemon() {
     /// A model turn with a tool call, with room for a slow provider.
     const TURN: Duration = Duration::from_secs(180);
@@ -126,7 +126,7 @@ const BACKGROUND_TURN: Duration = Duration::from_secs(240);
 /// list. Runs as [`live_daemon`] does, through `RHO_UI_LIVE_RHO`; it takes
 /// a few minutes.
 #[test]
-#[ignore = "needs a real rho daemon and a signed-in model; see README"]
+#[ignore = "needs a real rho daemon and a signed-in model; see docs/testing.md"]
 fn live_background() {
     let rho = std::env::var("RHO_UI_LIVE_RHO").expect("RHO_UI_LIVE_RHO names a rho 3 program");
     let target = DaemonTarget::rho(rho).expect("RHO_HOME or HOME names the rho home");

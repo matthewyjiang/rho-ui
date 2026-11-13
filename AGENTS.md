@@ -1,6 +1,6 @@
 # AGENTS.md
 
-rho-ui is the desktop app for rho. See README.md for the crate layout.
+rho-ui is the desktop app for rho. See docs/architecture.md for the crate layout, docs/features.md for behavior, and docs/testing.md for tests.
 
 ## Skills
 
