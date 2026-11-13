@@ -1320,14 +1320,14 @@ fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
     // The approval took the keyboard; `send` clicks back into the box.
     ui.send("and then this");
     ui.wait_until("the held message", |window, _, _| {
-        is_visible(window, "queued")
+        is_visible(window, "held")
     });
     ui.act(|window, _| assert!(!shows_an_error(window)));
     ui.shot("held");
 
     ui.click("approval-allow-once");
     ui.wait_until("the held message's own turn", |window, _, _| {
-        !is_visible(window, "queued") && is_visible(window, "approval-allow-once")
+        !is_visible(window, "held") && is_visible(window, "approval-allow-once")
     });
     let prompts = |session: &Session| -> Vec<String> {
         let users = session.entries().iter().filter_map(|entry| match entry {

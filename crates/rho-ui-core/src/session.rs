@@ -253,8 +253,8 @@ pub enum Entry {
     /// A notice from the agent.
     Notice(Notice),
     /// The daemon began a turn of its own, as it does when the session's
-    /// background work finishes, to give the model the result. It opens
-    /// that turn, as a prompt opens one. Only a turn followed live has
+    /// background work finishes or a subagent asks its parent to act, to
+    /// give the model the result. It opens that turn, as a prompt opens one. Only a turn followed live has
     /// one: the daemon's replay of a conversation does not mark them.
     Wake,
 }
@@ -296,6 +296,15 @@ struct Steer {
     text: String,
 }
 
+/// A message held until the turn that could not take it ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    text: String,
+    /// The turn that had ended last when it was sent. Once a later one
+    /// ended and none runs, it is due.
+    after: Option<TurnId>,
+}
+
 /// A session's transcript and status.
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -315,6 +324,8 @@ pub struct Session {
     steers: Vec<Steer>,
     /// Background work, as the daemon last listed it.
     background: Vec<BackgroundWork>,
+    /// A message the turn could not take; see [`Self::hold`].
+    held: Option<Held>,
     /// Steers a turn dropped when it ended; see [`Self::take_dropped_steers`].
     dropped_steers: Vec<String>,
     /// IDs of steers that reached the conversation and that
@@ -326,8 +337,8 @@ pub struct Session {
     /// The turn that last ended, so [`Self::turn_began`] can tell an answer
     /// that arrives after its whole turn.
     ended_turn: Option<TurnId>,
-    /// A turn began live and nothing of it has arrived yet. Its first entry
-    /// says whether a prompt opened it; if not, an [`Entry::Wake`] does.
+    /// A turn began live and nothing of it that [`opening`] reads has
+    /// arrived yet: its prompt opens it, or else an [`Entry::Wake`] does.
     unopened_turn: bool,
     sync: Sync,
 }
@@ -362,6 +373,7 @@ impl Session {
             inputs: Vec::new(),
             steers: Vec::new(),
             background: Vec::new(),
+            held: None,
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
             ended_turn: None,
@@ -483,11 +495,53 @@ impl Session {
         &self.background
     }
 
-    /// The turn that ended last, as far as this session has heard. A
-    /// refusal because a turn was under way can compare it with the one
-    /// before sending, to tell whether that turn has already ended.
+    /// The turn that ended last, as far as this session has heard. Take it
+    /// when sending a message, for [`Self::hold`].
     pub fn ended_turn(&self) -> Option<&TurnId> {
         self.ended_turn.as_ref()
+    }
+
+    /// Holds `text`, a message refused because a turn was under way, to
+    /// send as a prompt once that turn ends; see [`Self::take_due`].
+    /// `sent_after` is [`Self::ended_turn`] as it was when `text` was sent:
+    /// the refusing turn is a later one, which may have ended already, or
+    /// whose events may not have arrived yet. A second message joins the
+    /// first.
+    pub fn hold(&mut self, text: String, sent_after: Option<TurnId>) {
+        self.held = Some(match self.held.take() {
+            Some(held) => Held {
+                text: format!("{}\n{text}", held.text),
+                after: held.after,
+            },
+            None => Held {
+                text,
+                after: sent_after,
+            },
+        });
+    }
+
+    /// The held message, if any.
+    pub fn held(&self) -> Option<&str> {
+        self.held.as_ref().map(|held| held.text.as_str())
+    }
+
+    /// Takes the held message back, as when the user withdraws it.
+    pub fn take_held(&mut self) -> Option<String> {
+        self.held.take().map(|held| held.text)
+    }
+
+    /// Takes the held message once it is due: a turn ended after it was
+    /// sent, and none runs.
+    pub fn take_due(&mut self) -> Option<String> {
+        let due = self
+            .held
+            .as_ref()
+            .is_some_and(|held| !self.state.is_busy() && self.ended_turn != held.after);
+        if due {
+            self.take_held()
+        } else {
+            None
+        }
     }
 
     /// What the session waits on a person for, oldest first.
@@ -578,21 +632,21 @@ impl Session {
     }
 
     fn apply_change(&mut self, event: SessionEvent) -> Option<usize> {
+        if let Some(opening) = opening(&event) {
+            if std::mem::take(&mut self.unopened_turn) && opening == Opening::Wake {
+                self.entries.push(Entry::Wake);
+            }
+        }
         match event {
             SessionEvent::UserMessage {
                 message,
                 content,
                 steer,
             } => {
-                match steer {
-                    // A prompt opens its own turn.
-                    None => self.unopened_turn = false,
-                    Some(steer) => {
-                        self.open_turn();
-                        let steer = SteerId(steer.as_str().to_owned());
-                        if self.withdraw_steer(&steer).is_none() {
-                            self.early_steers.push(steer);
-                        }
+                if let Some(steer) = steer {
+                    let steer = SteerId(steer.as_str().to_owned());
+                    if self.withdraw_steer(&steer).is_none() {
+                        self.early_steers.push(steer);
                     }
                 }
                 let (at, message) = self.message_mut(message.as_str(), Entry::User);
@@ -600,17 +654,12 @@ impl Session {
                 Some(at)
             }
             SessionEvent::AgentMessageChunk { message, text } => {
-                self.open_turn();
                 Some(self.append_message(message.as_str(), &text, Entry::Agent))
             }
             SessionEvent::ThoughtChunk { message, text } => {
-                self.open_turn();
                 Some(self.append_message(message.as_str(), &text, Entry::Thought))
             }
-            SessionEvent::ToolCall(update) => {
-                self.open_turn();
-                Some(self.update_tool(*update))
-            }
+            SessionEvent::ToolCall(update) => Some(self.update_tool(*update)),
             SessionEvent::Notice { text } => Some(self.push_notice(Notice {
                 level: NoticeLevel::Info,
                 title: text,
@@ -750,16 +799,7 @@ impl Session {
         self.dropped_steers.extend(dropped);
     }
 
-    /// Opens the turn that began live with an [`Entry::Wake`], if nothing
-    /// of it arrived yet. A prompt's turn opens with the prompt instead.
-    fn open_turn(&mut self) {
-        if std::mem::take(&mut self.unopened_turn) {
-            self.entries.push(Entry::Wake);
-        }
-    }
-
     fn push_notice(&mut self, notice: Notice) -> usize {
-        self.open_turn();
         self.entries.push(Entry::Notice(notice));
         self.entries.len() - 1
     }
@@ -852,6 +892,30 @@ impl Session {
         let mut session = Self::new(id);
         session.sync = Sync::Live;
         session
+    }
+}
+
+/// What opens a turn that began live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opening {
+    /// Its prompt, which the daemon echoes as the turn's user message.
+    Prompt,
+    /// Model output or a steer before any prompt: the daemon began the turn
+    /// itself.
+    Wake,
+}
+
+/// Whether `event` opens the turn under way, and how. A notice or card does
+/// not: the daemon may send one before a prompt's echo, as a settings
+/// change does.
+fn opening(event: &SessionEvent) -> Option<Opening> {
+    match event {
+        SessionEvent::UserMessage { steer: None, .. } => Some(Opening::Prompt),
+        SessionEvent::UserMessage { steer: Some(_), .. }
+        | SessionEvent::AgentMessageChunk { .. }
+        | SessionEvent::ThoughtChunk { .. }
+        | SessionEvent::ToolCall(_) => Some(Opening::Wake),
+        _ => None,
     }
 }
 

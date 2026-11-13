@@ -366,7 +366,7 @@ fn render_message(entry: &Entry, ix: usize, phase: Phase, cx: &App) -> AnyElemen
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(Icon::new(Lucide::Bell).xsmall())
-            .child("Background work finished")
+            .child("rho continued on its own")
             .into_any_element(),
         // The timeline puts these in work rows, never message rows.
         Entry::Thought(_) | Entry::Tool(_) => div().into_any_element(),

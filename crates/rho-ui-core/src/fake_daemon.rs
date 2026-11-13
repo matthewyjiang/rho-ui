@@ -111,14 +111,13 @@ impl FakeDaemon {
         });
         let serving = Arc::clone(&service);
         runtime.spawn(async move {
-            let service = serving;
             let info = DaemonInfo {
                 version: "9.9.9".to_owned(),
                 pid: std::process::id(),
                 build: BuildId::of_this_crate(),
             };
             while let Ok((stream, _)) = listener.accept().await {
-                let (service, info) = (Arc::clone(&service), info.clone());
+                let (service, info) = (Arc::clone(&serving), info.clone());
                 tokio::spawn(async move {
                     // Runs until the client leaves; the fake never stops
                     // a connection itself.

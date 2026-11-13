@@ -70,14 +70,6 @@ pub(crate) enum Loading {
     Failed(String),
 }
 
-/// A message held until the turn that could not take it ends.
-struct Queued {
-    text: String,
-    /// The turn that had ended last when it was sent. Once another turn
-    /// ended and none runs, it goes.
-    after: Option<TurnId>,
-}
-
 pub(crate) struct SessionView {
     daemon: Daemon,
     session: Session,
@@ -91,8 +83,6 @@ pub(crate) struct SessionView {
     approval_focus: FocusHandle,
     /// A prompt is on its way to the daemon.
     sending: bool,
-    /// A message the session's turn could not take; see [`Self::hold`].
-    queued: Option<Queued>,
     /// Background work the user asked to stop that still runs.
     stopping: Vec<BackgroundId>,
     /// The first prompt was accepted, so the session is saved.
@@ -166,7 +156,6 @@ impl SessionView {
             settings,
             approval_focus: cx.focus_handle(),
             sending: false,
-            queued: None,
             stopping: Vec::new(),
             busy_since: None,
             turn_began: None,
@@ -347,7 +336,7 @@ impl SessionView {
             cx.emit(SessionEvent::LiveChanged);
         }
         cx.notify();
-        self.send_queued(window, cx);
+        self.send_held(window, cx);
     }
 
     /// Sends the composer's text: as a prompt, or while a turn runs, as a
@@ -445,45 +434,34 @@ impl SessionView {
         .detach();
     }
 
-    /// Holds `text`, which the session's turn could not take, and sends it
-    /// as a prompt once that turn ends. `ended` is the turn that had ended
-    /// last when `text` was sent: the refusing turn is a later one, which
-    /// may already have ended, or whose events may not have arrived yet.
+    /// Holds `text`, which the session's turn could not take, to send as a
+    /// prompt once that turn ends; see [`Session::hold`].
     fn hold(
         &mut self,
         text: String,
-        ended: Option<TurnId>,
+        sent_after: Option<TurnId>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.queued = Some(match self.queued.take() {
-            Some(queued) => Queued {
-                text: format!("{}\n{text}", queued.text),
-                after: queued.after,
-            },
-            None => Queued { text, after: ended },
-        });
+        self.session.hold(text, sent_after);
         cx.notify();
-        self.send_queued(window, cx);
+        self.send_held(window, cx);
     }
 
-    /// Sends the held message once a turn ended after it was sent, and
-    /// none runs.
-    fn send_queued(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let due = self.queued.as_ref().is_some_and(|queued| {
-            !self.is_busy() && self.session.ended_turn() != queued.after.as_ref()
-        });
-        if due {
-            if let Some(queued) = self.queued.take() {
-                self.submit(queued.text, window, cx);
-            }
+    /// Sends the held message as a prompt once it is due.
+    fn send_held(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.sending {
+            return;
+        }
+        if let Some(text) = self.session.take_due() {
+            self.submit(text, window, cx);
         }
     }
 
     /// Takes back the held message, into the composer.
-    fn unqueue(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some(queued) = self.queued.take() {
-            self.give_back(&queued.text, window, cx);
+    fn take_back_held(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(text) = self.session.take_held() {
+            self.give_back(&text, window, cx);
         }
         cx.notify();
     }
@@ -729,7 +707,7 @@ impl SessionView {
             })
             .children(self.render_background(cx))
             .children(self.render_steers(cx))
-            .children(self.render_queued(cx))
+            .children(self.render_held(cx))
             .child(
                 Composer::new(
                     &self.composer,
@@ -798,10 +776,10 @@ impl SessionView {
 
     /// The message held for when the turn ends, with a button to take it
     /// back.
-    fn render_queued(&self, cx: &mut Context<'_, Self>) -> Option<AnyElement> {
-        let text = &self.queued.as_ref()?.text;
+    fn render_held(&self, cx: &mut Context<'_, Self>) -> Option<AnyElement> {
+        let text = self.session.held()?;
         let row = h_flex()
-            .id("queued")
+            .id("held")
             .test_support()
             .aria_label(format!("Sends after this turn: {text}"))
             .gap_2()
@@ -809,15 +787,15 @@ impl SessionView {
             .text_sm()
             .text_color(cx.theme().muted_foreground)
             .child(Icon::new(Lucide::Clock).xsmall())
-            .child(div().flex_1().min_w_0().truncate().child(text.clone()))
+            .child(div().flex_1().min_w_0().truncate().child(text.to_owned()))
             .child(div().text_xs().child("After this turn"))
             .child(
-                Button::new("unqueue")
+                Button::new("take-back-held")
                     .ghost()
                     .xsmall()
                     .icon(IconName::Close)
                     .tooltip("Take it back")
-                    .on_click(cx.listener(|this, _, window, cx| this.unqueue(window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.take_back_held(window, cx))),
             );
         Some(row.into_any_element())
     }
@@ -847,11 +825,6 @@ impl SessionView {
     /// What the composer holds, for UI tests.
     pub(crate) fn composer_text(&self, cx: &App) -> String {
         self.composer.read(cx).value().to_string()
-    }
-
-    /// The message held for when the turn ends, for UI tests.
-    pub(crate) fn queued(&self) -> Option<&str> {
-        self.queued.as_ref().map(|queued| queued.text.as_str())
     }
 
     /// The transcript, for UI tests.

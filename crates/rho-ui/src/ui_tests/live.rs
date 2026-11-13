@@ -236,7 +236,7 @@ fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
     ui.wait_within(BACKGROUND_TURN, "the daemon's turn to end", |_, cx, app| {
         app.active_session().is_some_and(|view| {
             let view = view.read(cx);
-            idle(view.session()) && view.queued().is_none()
+            idle(view.session()) && view.session().held().is_none()
         })
     });
     ui.act(|window, _| {
