@@ -63,11 +63,13 @@ enum SessionState {
 
 pub(crate) struct DraftView {
     cwd: PathBuf,
-    workspaces: Entity<Workspaces>,
     workspace: WorkspaceRef,
     picker: Entity<ProjectPicker>,
     composer: Entity<TextareaState>,
     state: SessionState,
+    /// Counts the sessions the draft asked the app to open; only the
+    /// latest is wanted.
+    request: u64,
     /// The user sent while the session was opening; it goes out once open.
     queued: bool,
     /// Why opening the session, or a settings change, failed.
@@ -83,13 +85,13 @@ impl DraftView {
     /// `workspaces`.
     pub(crate) fn new(
         cwd: PathBuf,
-        workspaces: Entity<Workspaces>,
+        workspaces: &Entity<Workspaces>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let composer = composer::new_state(window, cx);
-        let workspace = WorkspaceRef::new(&workspaces, &cwd, cx);
-        let picker = cx.new(|cx| ProjectPicker::new(&workspaces, cwd.clone(), window, cx));
+        let workspace = WorkspaceRef::new(workspaces, &cwd, cx);
+        let picker = cx.new(|cx| ProjectPicker::new(workspaces, cwd.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &composer,
@@ -100,7 +102,7 @@ impl DraftView {
                     _ => {}
                 },
             ),
-            cx.observe(&workspaces, |_, _, cx| cx.notify()),
+            cx.observe(workspace.table(), |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &picker,
                 window,
@@ -112,25 +114,17 @@ impl DraftView {
             // An unused session goes with its draft: unfollowed and
             // unsaved, the daemon discards it.
             cx.on_release(|this, cx| {
-                if let SessionState::Open {
-                    daemon, session, ..
-                } = &this.state
-                {
-                    let (daemon, id) = (daemon.clone(), session.id().clone());
-                    cx.spawn(async move |_| {
-                        let _ = daemon.detach(&id).await;
-                    })
-                    .detach();
-                }
+                let state = std::mem::replace(&mut this.state, SessionState::Started);
+                let_go(state, cx);
             }),
         ];
         Self {
             cwd,
-            workspaces,
             workspace,
             picker,
             composer,
             state: SessionState::Opening,
+            request: 0,
             queued: false,
             error: None,
             focus_handle: cx.focus_handle(),
@@ -168,41 +162,48 @@ impl DraftView {
             window.focus(&self.composer.focus_handle(cx), cx);
             return;
         }
-        self.workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
+        self.workspace = WorkspaceRef::new(self.workspace.table(), &cwd, cx);
         self.picker
             .update(cx, |picker, cx| picker.set_current(cwd.clone(), window, cx));
         self.cwd = cwd;
-        if let SessionState::Open {
-            daemon, session, ..
-        } = std::mem::replace(&mut self.state, SessionState::Opening)
-        {
-            let id = session.id().clone();
-            cx.spawn(async move |_, _| {
-                let _ = daemon.detach(&id).await;
-            })
-            .detach();
-        }
+        let_go(
+            std::mem::replace(&mut self.state, SessionState::Opening),
+            cx,
+        );
         self.error = None;
-        cx.emit(DraftEvent::OpenSession);
+        self.reopen(cx);
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
-    /// Takes the session the app opened in `cwd`, and sends a waiting
-    /// message. Returns whether it took it: a session opened for a
-    /// directory the draft has left, or after another, is not wanted, and
-    /// the app lets it go.
+    /// The draft's directory, and which of its requests to open a session
+    /// there this is, for [`Self::awaits`].
+    pub(crate) fn request(&self) -> (PathBuf, u64) {
+        (self.cwd.clone(), self.request)
+    }
+
+    /// Whether the draft still waits for the answer to `request`. An
+    /// earlier request's session, such as one opened before the project
+    /// changed, is not wanted: the app leaves it unfollowed, and the daemon
+    /// discards it.
+    pub(crate) fn awaits(&self, request: u64) -> bool {
+        request == self.request && matches!(self.state, SessionState::Opening)
+    }
+
+    /// Asks the app for a session in the draft's directory.
+    fn reopen(&mut self, cx: &mut Context<'_, Self>) {
+        self.request += 1;
+        cx.emit(DraftEvent::OpenSession);
+    }
+
+    /// Takes the session the app opened, and sends a waiting message.
     pub(crate) fn open(
         &mut self,
-        cwd: &Path,
         daemon: Daemon,
         session: Session,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) -> bool {
-        if cwd != self.cwd || !matches!(self.state, SessionState::Opening) {
-            return false;
-        }
+    ) {
         let settings = cx.new(|cx| {
             SessionSettings::new(
                 daemon.clone(),
@@ -224,15 +225,10 @@ impl DraftView {
             self.send(cx);
         }
         cx.notify();
-        true
     }
 
-    /// Opening a session in `cwd` failed. The text stays; Send tries again.
-    /// A failure for a directory the draft has left is old news.
-    pub(crate) fn fail(&mut self, cwd: &Path, error: String, cx: &mut Context<'_, Self>) {
-        if cwd != self.cwd || !matches!(self.state, SessionState::Opening) {
-            return;
-        }
+    /// The session couldn't be opened. The text stays; Send tries again.
+    pub(crate) fn fail(&mut self, error: String, cx: &mut Context<'_, Self>) {
         self.state = SessionState::Failed;
         self.queued = false;
         self.error = Some(error);
@@ -259,12 +255,7 @@ impl DraftView {
                     settings.sync(session.config(), window, cx);
                 });
             }
-            (Err(error), _) => {
-                self.state = SessionState::Failed;
-                self.queued = false;
-                self.error = Some(error.to_string());
-                cx.notify();
-            }
+            (Err(error), _) => self.fail(error.to_string(), cx),
             (Ok(_), _) => {}
         }
     }
@@ -324,11 +315,25 @@ impl DraftView {
                 self.state = SessionState::Opening;
                 self.queued = true;
                 self.error = None;
-                cx.emit(DraftEvent::OpenSession);
+                self.reopen(cx);
             }
             SessionState::Started => {}
         }
         cx.notify();
+    }
+}
+
+/// Lets an unused draft's session go: unfollowed and unsaved, the daemon
+/// discards it.
+fn let_go(state: SessionState, cx: &mut App) {
+    if let SessionState::Open {
+        daemon, session, ..
+    } = state
+    {
+        cx.spawn(async move |_| {
+            let _ = daemon.detach(session.id()).await;
+        })
+        .detach();
     }
 }
 

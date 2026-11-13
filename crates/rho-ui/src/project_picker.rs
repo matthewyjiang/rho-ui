@@ -29,7 +29,7 @@ use gpui_kit::{
 use crate::{
     sidebar::badge,
     time,
-    workspaces::{Workspace, Workspaces},
+    workspaces::{self, Workspaces},
 };
 
 /// The search field's height, measured at 2.1 rem with the default scale.
@@ -195,33 +195,36 @@ impl Render for ProjectPicker {
     }
 }
 
-/// A folder typed into the search that exists and isn't listed.
-struct Typed {
+/// A folder typed into the search that exists and is no known project.
+#[derive(Clone)]
+struct Folder {
     cwd: PathBuf,
     /// The canonical path, for its row.
     shown: SharedString,
 }
 
-/// The projects for a searchable [`List`]: a typed folder, if any, then the
-/// workspaces that match the search.
+/// One row of the list.
+#[derive(Clone)]
+enum Row {
+    /// A known project: its index in the workspaces.
+    Project(usize),
+    Folder(Folder),
+}
+
+/// The projects for a searchable [`List`]: what a typed path names, if
+/// anything, then the projects that match the search.
 struct ProjectList {
     workspaces: Entity<Workspaces>,
     /// The draft's directory, checked in the list.
     current: PathBuf,
     query: String,
-    /// Indices into `workspaces` that match `query`, most recent first.
-    matches: Vec<usize>,
-    typed: Option<Typed>,
+    /// What the search names as a path, once checked.
+    found: Option<Row>,
+    rows: Vec<Row>,
     /// How many projects there are, matching or not.
     total: usize,
     /// Unix seconds when the list was last filtered, for ages.
     now: i64,
-}
-
-/// What a row of the list is.
-enum Choice<'a> {
-    Typed(&'a Typed),
-    Workspace(&'a Workspace),
 }
 
 impl ProjectList {
@@ -230,8 +233,8 @@ impl ProjectList {
             workspaces,
             current,
             query: String::new(),
-            matches: Vec::new(),
-            typed: None,
+            found: None,
+            rows: Vec::new(),
             total: 0,
             now: 0,
         };
@@ -239,61 +242,51 @@ impl ProjectList {
         list
     }
 
-    /// Filters the workspaces by the search again, keeping their order.
+    /// Lists what the search names as a path, then the projects whose name
+    /// or path matches it, most recently used first.
     fn refilter(&mut self, cx: &App) {
         let workspaces = self.workspaces.read(cx);
         let query = self.query.to_lowercase();
         let recent = workspaces.recent();
         self.total = recent.len();
-        self.matches = recent
+        let found_ix = match self.found {
+            Some(Row::Project(ix)) => Some(ix),
+            Some(Row::Folder(_)) | None => None,
+        };
+        self.rows = self
+            .found
+            .clone()
             .into_iter()
-            .filter(|&ix| {
-                let workspace = workspaces.get(ix);
-                workspace.name.to_lowercase().contains(&query)
-                    || workspace.path.to_lowercase().contains(&query)
-            })
+            .chain(
+                recent
+                    .into_iter()
+                    .filter(|&ix| {
+                        let workspace = workspaces.get(ix);
+                        Some(ix) != found_ix
+                            && (workspace.name.to_lowercase().contains(&query)
+                                || workspace.path.to_lowercase().contains(&query))
+                    })
+                    .map(Row::Project),
+            )
             .collect();
         self.now = time::now_unix();
-        if let Some(typed) = &self.typed {
-            if self.listed(&typed.cwd, cx) {
-                self.typed = None;
-            }
-        }
-    }
-
-    /// Whether `cwd` already has a row among the matches.
-    fn listed(&self, cwd: &Path, cx: &App) -> bool {
-        let workspaces = self.workspaces.read(cx);
-        self.matches
-            .iter()
-            .any(|&ix| workspaces.get(ix).cwd() == cwd)
-    }
-
-    fn choice_at<'a>(&'a self, ix: IndexPath, cx: &'a App) -> Option<Choice<'a>> {
-        let row = match &self.typed {
-            Some(typed) if ix.row == 0 => return Some(Choice::Typed(typed)),
-            Some(_) => ix.row - 1,
-            None => ix.row,
-        };
-        let workspace = *self.matches.get(row)?;
-        Some(Choice::Workspace(self.workspaces.read(cx).get(workspace)))
     }
 
     fn cwd_at(&self, ix: IndexPath, cx: &App) -> Option<PathBuf> {
-        Some(match self.choice_at(ix, cx)? {
-            Choice::Typed(typed) => typed.cwd.clone(),
-            Choice::Workspace(workspace) => workspace.cwd().to_path_buf(),
+        Some(match self.rows.get(ix.row)? {
+            Row::Folder(folder) => folder.cwd.clone(),
+            Row::Project(ix) => self.workspaces.read(cx).get(*ix).cwd().to_path_buf(),
         })
     }
 
     /// The row of the draft's project, if it matches the search.
     fn current_row(&self, cx: &App) -> Option<IndexPath> {
         let workspaces = self.workspaces.read(cx);
-        let row = self
-            .matches
-            .iter()
-            .position(|&ix| workspaces.get(ix).cwd() == self.current)?;
-        Some(IndexPath::default().row(row + usize::from(self.typed.is_some())))
+        let row = self.rows.iter().position(|row| match row {
+            Row::Project(ix) => workspaces.get(*ix).cwd() == self.current,
+            Row::Folder(_) => false,
+        })?;
+        Some(IndexPath::default().row(row))
     }
 }
 
@@ -301,43 +294,63 @@ impl ListDelegate for ProjectList {
     type Item = ListItem;
 
     /// Matches the project name or its path. A query that is a path is
-    /// checked in the background, and offered when it names a directory.
+    /// checked in the background: a known project it names comes first, and
+    /// any other directory is offered as a folder.
+    ///
+    /// Kit picks the first row when a search starts only if the last frame
+    /// drew any, so a search that follows an empty one, as typing a new
+    /// folder's path does, selects it here once its rows are known; Enter
+    /// then takes it.
     fn perform_search(
         &mut self,
         query: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<'_, ListState<Self>>,
     ) -> Task<()> {
         query.clone_into(&mut self.query);
-        self.typed = None;
+        self.found = None;
         self.refilter(cx);
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let Some(path) = typed_path(query, home.as_deref()) else {
-            return Task::ready(());
-        };
-        let query = query.to_owned();
-        cx.spawn(async move |list, cx| {
-            let dir = cx
-                .background_executor()
-                .spawn(async move { path.canonicalize().ok().filter(|path| path.is_dir()) })
-                .await;
-            let _ = list.update(cx, |list, cx| {
-                let this = list.delegate_mut();
-                let Some(cwd) = dir.filter(|dir| this.query == query && !this.listed(dir, cx))
-                else {
-                    return;
-                };
-                this.typed = Some(Typed {
-                    shown: cwd.display().to_string().into(),
-                    cwd,
-                });
+        let path = workspaces::typed_path(query, workspaces::home().as_deref());
+        cx.spawn_in(window, async move |list, cx| {
+            let checked = match path {
+                Some(path) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            let dir = path.canonicalize().ok().filter(|dir| dir.is_dir());
+                            dir.map(|dir| (path, dir))
+                        })
+                        .await
+                }
+                None => None,
+            };
+            let _ = list.update_in(cx, |list, window, cx| {
+                if let Some((path, dir)) = checked {
+                    let this = list.delegate_mut();
+                    // The daemon's directories may be the typed or the
+                    // resolved spelling.
+                    let known = this
+                        .workspaces
+                        .read(cx)
+                        .find(&[path.as_path(), dir.as_path()]);
+                    this.found = Some(match known {
+                        Some(ix) => Row::Project(ix),
+                        None => Row::Folder(Folder {
+                            shown: dir.display().to_string().into(),
+                            cwd: dir,
+                        }),
+                    });
+                    this.refilter(cx);
+                }
+                if list.selected_index().is_none() && !list.delegate().rows.is_empty() {
+                    list.set_selected_index(Some(IndexPath::default()), window, cx);
+                }
                 cx.notify();
             });
         })
     }
 
     fn items_count(&self, _: usize, _: &App) -> usize {
-        self.matches.len() + usize::from(self.typed.is_some())
+        self.rows.len()
     }
 
     fn render_item(
@@ -347,17 +360,18 @@ impl ListDelegate for ProjectList {
         cx: &mut Context<'_, ListState<Self>>,
     ) -> Option<ListItem> {
         let radius = cx.theme().radius;
-        let item = match self.choice_at(ix, cx)? {
-            Choice::Typed(typed) => ListItem::new("project-typed")
-                .accessibility_label(typed.shown.clone())
+        let item = match self.rows.get(ix.row)? {
+            Row::Folder(folder) => ListItem::new("project-typed")
+                .accessibility_label(folder.shown.clone())
                 .child(row(
                     folder_tile(cx).into_any_element(),
-                    format!("Open {}", folder_name(&typed.cwd)).into(),
-                    div().child(typed.shown.clone()),
+                    format!("Open {}", folder_name(&folder.cwd)).into(),
+                    div().child(folder.shown.clone()),
                     None,
                     cx,
                 )),
-            Choice::Workspace(workspace) => {
+            Row::Project(ix) => {
+                let workspace = self.workspaces.read(cx).get(*ix);
                 let path = h_flex()
                     .gap_1()
                     .min_w_0()
@@ -468,35 +482,4 @@ fn folder_name(cwd: &Path) -> String {
         || cwd.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
-}
-
-/// The directory a search names, if it is a path: absolute, `~`, or under
-/// `~/`. Whether it exists is checked later, off the UI thread.
-fn typed_path(query: &str, home: Option<&Path>) -> Option<PathBuf> {
-    if query == "~" {
-        return home.map(Path::to_path_buf);
-    }
-    if let Some(rest) = query.strip_prefix("~/") {
-        return home.map(|home| home.join(rest));
-    }
-    let path = Path::new(query);
-    path.is_absolute().then(|| path.to_path_buf())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paths_are_absolute_or_from_home() {
-        let home = Some(Path::new("/home/me"));
-        assert_eq!(typed_path("~", home), Some(PathBuf::from("/home/me")));
-        assert_eq!(
-            typed_path("~/code/rho", home),
-            Some(PathBuf::from("/home/me/code/rho"))
-        );
-        assert_eq!(typed_path("/srv/x", home), Some(PathBuf::from("/srv/x")));
-        assert_eq!(typed_path("rho-ui", home), None, "a name is a search");
-        assert_eq!(typed_path("~/code", None), None, "no home, no ~");
-    }
 }

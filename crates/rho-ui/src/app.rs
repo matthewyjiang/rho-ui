@@ -389,7 +389,7 @@ impl RhoApp {
         let pane = match pane {
             Pane::Draft { .. } => pane,
             Pane::Empty | Pane::Session(_) => {
-                let workspaces = self.workspaces.clone();
+                let workspaces = &self.workspaces;
                 let view = cx.new(|cx| DraftView::new(cwd, workspaces, window, cx));
                 let subscription = cx.subscribe_in(
                     &view,
@@ -447,7 +447,7 @@ impl RhoApp {
         let Some(daemon) = self.daemon().cloned() else {
             return;
         };
-        let cwd = draft.read(cx).cwd().to_path_buf();
+        let (cwd, request) = draft.read(cx).request();
         let draft = draft.downgrade();
         let epoch = self.epoch;
         cx.spawn_in(window, async move |this, cx| {
@@ -456,19 +456,19 @@ impl RhoApp {
                 // A draft dropped meanwhile, or moved to another project,
                 // leaves the session unfollowed, and the daemon discards one
                 // that saved nothing.
-                let draft = draft.upgrade().filter(|_| this.epoch == epoch)?;
+                let draft = draft
+                    .upgrade()
+                    .filter(|draft| this.epoch == epoch && draft.read(cx).awaits(request))?;
                 match setup {
                     Ok(setup) => {
                         let session = Session::from_setup(setup);
                         let id = session.id().clone();
                         let daemon = daemon.clone();
-                        let taken = draft.update(cx, |draft, cx| {
-                            draft.open(&cwd, daemon, session, window, cx)
-                        });
-                        taken.then_some(id)
+                        draft.update(cx, |draft, cx| draft.open(daemon, session, window, cx));
+                        Some(id)
                     }
                     Err(error) => {
-                        draft.update(cx, |draft, cx| draft.fail(&cwd, error.to_string(), cx));
+                        draft.update(cx, |draft, cx| draft.fail(error.to_string(), cx));
                         None
                     }
                 }

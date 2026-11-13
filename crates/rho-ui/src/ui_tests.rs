@@ -1506,9 +1506,20 @@ fn a_new_session_starts_in_the_project_chosen() {
     });
     ui.shot("list");
 
-    // Ctrl+Shift+N in the draft goes to the search.
+    // Ctrl+Shift+N in the draft goes to the search. A path that names a
+    // known project, however spelled, shows that project.
+    let launch = std::env::temp_dir();
+    let launch_row: &'static str = format!("project-{}", launch.display()).leak();
+    let spelled = format!("{}/.", launch.display());
     ui.act(|window, cx| {
         window.press("ctrl-shift-n", cx);
+        window.input(&spelled, cx);
+    });
+    ui.wait_until("the launch project for its path", |window, _, _| {
+        is_visible(window, launch_row) && !is_visible(window, "project-typed")
+    });
+    ui.act(|window, cx| {
+        window.press("ctrl-a", cx);
         window.input("/w/b", cx);
     });
     ui.wait_until("the search to filter", |window, _, _| {
@@ -1534,13 +1545,20 @@ fn a_new_session_starts_in_the_project_chosen() {
     std::fs::create_dir_all(&folder).expect("make a folder to type");
     ui.act(|window, cx| window.press("ctrl-shift-n", cx));
     ui.wait_until("a draft in /w/b", draft_in(Path::new("/w/b")));
+    // Typed a key at a time, the path names nothing until its last key;
+    // then the folder is offered, selected, and Enter takes it.
     let typed = folder.display().to_string();
-    ui.act(|window, cx| window.input(&typed, cx));
+    let (head, last) = typed.split_at(typed.len() - 1);
+    ui.act(|window, cx| window.input(head, cx));
+    ui.wait_until("nothing to match the partial path", |window, _, _| {
+        !is_visible(window, "project-typed") && !is_visible(window, "project-/w/b")
+    });
+    ui.act(|window, cx| window.input(last, cx));
     ui.wait_until("the typed folder", |window, _, _| {
         is_visible(window, "project-typed")
     });
     ui.shot("typed");
-    ui.click("project-typed");
+    ui.act(|window, cx| window.press("enter", cx));
     ui.wait_until("the draft in the typed folder", draft_in(&folder));
     let _ = std::fs::remove_dir(&folder);
 }

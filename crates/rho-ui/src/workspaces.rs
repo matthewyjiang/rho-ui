@@ -28,22 +28,18 @@ pub(crate) struct Workspace {
     pub(crate) path: SharedString,
     /// Unix seconds of its newest saved session; 0 with none.
     pub(crate) last_used: i64,
-    /// How many saved sessions run in it.
-    pub(crate) sessions: usize,
 }
 
 impl Workspace {
     fn new(cwd: PathBuf, repo: Repo) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         Self {
-            path: tilde(&cwd, home.as_deref()).into(),
+            path: tilde(&cwd, home().as_deref()).into(),
             cwd,
             name: repo.name.clone().into(),
             initials: repo.initials().into(),
             branch: repo.branch.clone().map(SharedString::from),
             repo,
             last_used: 0,
-            sessions: 0,
         }
     }
 
@@ -60,6 +56,11 @@ impl Workspace {
     }
 }
 
+/// The user's home directory, which paths show as `~`.
+pub(crate) fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 /// `cwd` with a leading `home` written as `~`, as a shell shows it.
 fn tilde(cwd: &Path, home: Option<&Path>) -> String {
     match home.map(|home| cwd.strip_prefix(home)) {
@@ -67,6 +68,20 @@ fn tilde(cwd: &Path, home: Option<&Path>) -> String {
         Some(Ok(rest)) => format!("~/{}", rest.display()),
         _ => cwd.display().to_string(),
     }
+}
+
+/// The directory `text` names, if it is a path: absolute, `~`, or under
+/// `~/`. The reverse of [`tilde`]; whether it exists is the caller's to
+/// check, off the UI thread.
+pub(crate) fn typed_path(text: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if text == "~" {
+        return home.map(Path::to_path_buf);
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        return home.map(|home| home.join(rest));
+    }
+    let path = Path::new(text);
+    path.is_absolute().then(|| path.to_path_buf())
 }
 
 /// One workspace in a shared [`Workspaces`] table, for a view that shows it.
@@ -150,24 +165,28 @@ impl Workspaces {
         order
     }
 
-    /// Counts the saved sessions, given as `(workspace, updated)`, and
-    /// notifies if that changed any workspace's use.
+    /// The workspace whose directory is one of `paths`, if any.
+    pub(crate) fn find(&self, paths: &[&Path]) -> Option<usize> {
+        self.list
+            .iter()
+            .position(|workspace| paths.contains(&workspace.cwd.as_path()))
+    }
+
+    /// Dates each workspace by its newest saved session, given as
+    /// `(workspace, updated)`, and notifies if that changed any.
     pub(crate) fn set_history(
         &mut self,
         sessions: impl IntoIterator<Item = (usize, i64)>,
         cx: &mut Context<'_, Self>,
     ) {
-        let mut uses = vec![(0_i64, 0_usize); self.list.len()];
+        let mut newest = vec![0_i64; self.list.len()];
         for (ix, updated) in sessions {
-            let (last_used, count) = &mut uses[ix];
-            *last_used = (*last_used).max(updated);
-            *count += 1;
+            newest[ix] = newest[ix].max(updated);
         }
         let mut changed = false;
-        for (workspace, (last_used, sessions)) in self.list.iter_mut().zip(uses) {
-            if (workspace.last_used, workspace.sessions) != (last_used, sessions) {
+        for (workspace, last_used) in self.list.iter_mut().zip(newest) {
+            if workspace.last_used != last_used {
                 workspace.last_used = last_used;
-                workspace.sessions = sessions;
                 changed = true;
             }
         }
@@ -213,6 +232,25 @@ impl Workspaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_paths_are_absolute_or_from_home() {
+        let home = Some(Path::new("/home/me"));
+        assert_eq!(typed_path("~", home), Some(PathBuf::from("/home/me")));
+        assert_eq!(
+            typed_path("~/code/rho", home),
+            Some(PathBuf::from("/home/me/code/rho"))
+        );
+        assert_eq!(typed_path("/srv/x", home), Some(PathBuf::from("/srv/x")));
+        assert_eq!(typed_path("rho-ui", home), None, "a name is a search");
+        assert_eq!(typed_path("~/code", None), None, "no home, no ~");
+        let rho = Path::new("/home/me/code/rho");
+        assert_eq!(
+            typed_path(&tilde(rho, home), home).as_deref(),
+            Some(rho),
+            "tilde and typed_path undo each other"
+        );
+    }
 
     #[test]
     fn home_shows_as_tilde() {
