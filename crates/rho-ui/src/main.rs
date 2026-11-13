@@ -6,6 +6,7 @@
 
 mod app;
 mod approval;
+mod background;
 mod composer;
 mod draft;
 mod kinetic;
@@ -72,7 +73,13 @@ gpui_kit::assets::icon_assets!(
         Wrench,
         Shield,
         Zap,
-        CornerDownRight
+        CornerDownRight,
+        Clock,
+        SquareTerminal,
+        Workflow,
+        Bot,
+        Cog,
+        Square
     ]
 );
 

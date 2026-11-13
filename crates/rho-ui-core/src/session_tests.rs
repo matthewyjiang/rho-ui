@@ -53,6 +53,7 @@ fn attach_response(state: JobState, replay: u64) -> Attached {
         inputs: Vec::new(),
         title: None,
         options: options(),
+        background: Vec::new(),
     }))
 }
 
@@ -70,6 +71,7 @@ fn texts(session: &Session) -> Vec<(&'static str, String)> {
             Entry::Thought(m) => ("thought", m.text().to_owned()),
             Entry::Tool(t) => ("tool", t.title().to_owned()),
             Entry::Notice(n) => ("notice", n.title().to_owned()),
+            Entry::Wake => ("wake", String::new()),
         })
         .collect()
 }
@@ -382,4 +384,45 @@ fn a_prompts_answer_and_its_turns_events_may_come_in_either_order() {
     ));
     session.turn_began(&turn("t2"));
     assert_eq!(session.state(), &RunState::Idle);
+}
+
+/// A turn the daemon begins by itself, to deliver finished background work,
+/// opens with a wake row, so it is a turn of its own; a prompt's turn opens
+/// with its prompt, steered or not, and a turn of the replay with nothing.
+#[test]
+fn a_turn_without_a_prompt_opens_with_a_wake() {
+    let turn = |session: &mut Session, id: &str, first: serde_json::Value| {
+        session.apply(update(
+            json!({"type": "state", "state": "running", "turn": id}),
+        ));
+        session.apply(update(first));
+        session.apply(update(json!({"type": "turn_ended", "turn": id,
+            "outcome": {"type": "answered", "text": "", "stop": "end_turn"}})));
+        session.apply(update(
+            json!({"type": "state", "state": "completed", "turn": id}),
+        ));
+    };
+    let mut session = Session::new(SessionId::from("s1"));
+    session.attached(attach_response(JobState::Idle, 1));
+    // Replayed: history, not a turn beginning now.
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t0"}),
+    ));
+    turn(
+        &mut session,
+        "t1",
+        json!({"type": "user_message", "message": "u1", "content": [{"type": "text", "text": "hi"}]}),
+    );
+    turn(
+        &mut session,
+        "t2",
+        json!({"type": "agent_message_chunk", "message": "m2", "text": "it exited"}),
+    );
+    turn(
+        &mut session,
+        "t3",
+        json!({"type": "card", "title": "Stopped", "markdown": "", "plain": "", "tone": "info"}),
+    );
+    let kinds: Vec<&str> = texts(&session).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(kinds, ["user", "wake", "agent", "wake", "notice"]);
 }

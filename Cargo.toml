@@ -15,7 +15,7 @@ rust-version = "1.93"
 # 0.1, so pinned to a commit of rho's `daemon-v3` branch; a daemon built from
 # another commit may speak a different wire, which `rho/hello` reports. Move
 # to the crates.io release once there is one.
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "7c84788b0054bfc092f1d1f7132043b2bdf30783" }
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "bc47bd773a8431638aac618dc558c8b3bfb201fa" }
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.0" }
 

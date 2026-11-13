@@ -1,6 +1,7 @@
 //! The desktop UI's rho layer: connect to the rho daemon, talk to it, and
 //! keep each session's state. No GUI code lives here.
 
+mod background;
 mod daemon;
 #[cfg(feature = "test-support")]
 pub mod fake_daemon;
@@ -9,6 +10,7 @@ mod options;
 mod session;
 mod timeline;
 
+pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached, Job,
     JobActivity, SessionId, SessionSummary, Unsteered,

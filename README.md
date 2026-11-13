@@ -39,7 +39,9 @@ flowchart TD
 
 The composer's footer holds the session's settings: the permission mode (which tool calls run without asking) on the left, and on the right one button naming the model and reasoning, which opens the model list with search beside the reasoning levels and fast mode. New session opens the session right away, so these can be set before the first message; rho writes no file for a session until its first prompt, and the daemon discards an unused draft's session, so nothing is left behind. A setting changed while a turn runs applies when the turn ends.
 
-While a turn runs, Enter in the composer steers it: the text joins the turn's next model request. Until the model reads it, it waits above the composer, where you can take it back.
+While a turn runs, Enter in the composer steers it: the text joins the turn's next model request. Until the model reads it, it waits above the composer, where you can take it back. A message the turn can't take (it waits on an approval, or the daemon had just begun a turn of its own) waits above the composer too, and goes as the next prompt once the turn ends.
+
+Background work a session's turns started (processes, workflow runs, subagents) is listed above the composer while it runs, with a button to stop each one. A turn ends while its background work runs on: rho-ui opens sessions with `idle_wake: turn`, so when the work finishes the daemon starts a turn of its own that gives the model the result, and rho-ui shows that turn like any other. Work that ended stays listed with how it ended (its exit status, or stopped) until the model has its result.
 
 The sidebar lists the daemon's saved sessions. Once a second it also asks the daemon which sessions have work under way, so a session that runs a turn or waits for an approval shows as working or waiting whichever client started it.
 
@@ -64,6 +66,12 @@ To check rho-ui against a real daemon and model, build `rho` from the commit `Ca
 
 ```bash
 RHO_UI_LIVE_RHO=/path/to/rho cargo test -p rho-ui live_daemon -- --ignored --nocapture
+```
+
+`live_background` checks background work the same way: a turn starts two background processes and ends while they run, one is stopped from the list, and the other exits by itself; each time the daemon's own turn tells the model, and the test sends a message during one of those turns. It takes a few minutes:
+
+```bash
+RHO_UI_LIVE_RHO=/path/to/rho cargo test -p rho-ui live_background -- --ignored --nocapture
 ```
 
 Set `RHO_UI_LIVE_ATTACH` to the ID of a session whose turn waits on an approval, such as one you started in rho's terminal UI, and the test also opens that session, answers the approval, and steers the turn. Use a `RHO_HOME` of its own to keep the run away from your sessions.

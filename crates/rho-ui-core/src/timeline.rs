@@ -1,7 +1,8 @@
 //! A transcript's rows and turns. A user message, a reply or a notice is a
 //! row of its own; each run of tool calls and thoughts between them is one
 //! work row, which a UI draws as a single line that expands. Each prompt
-//! starts a turn, whose working a UI can fold once it finishes.
+//! starts a turn, as does each turn the daemon began itself
+//! ([`Entry::Wake`]); a UI can fold a turn's working once it finishes.
 
 use std::ops::Range;
 
@@ -22,7 +23,7 @@ impl Entry {
         match self {
             Entry::Thought(thought) => Some(Step::Thought(thought)),
             Entry::Tool(tool) => Some(Step::Tool(tool)),
-            Entry::User(_) | Entry::Agent(_) | Entry::Notice(_) => None,
+            Entry::User(_) | Entry::Agent(_) | Entry::Notice(_) | Entry::Wake => None,
         }
     }
 }
@@ -30,7 +31,7 @@ impl Entry {
 /// One transcript row: entry indices into the session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
-    /// A user message, a reply or a notice.
+    /// A user message, a reply, a notice, or a turn's wake.
     Message(usize),
     /// Consecutive tool calls and thoughts.
     Work(Range<usize>),
@@ -81,7 +82,7 @@ impl Timeline {
                 }
                 _ if is_work(entry) => self.rows.push(Row::Work(ix..ix + 1)),
                 _ => {
-                    if matches!(entry, Entry::User(_)) {
+                    if matches!(entry, Entry::User(_) | Entry::Wake) {
                         self.turns.push(self.rows.len());
                     }
                     self.rows.push(Row::Message(ix));

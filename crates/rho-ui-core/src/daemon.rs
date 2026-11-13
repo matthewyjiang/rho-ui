@@ -27,13 +27,14 @@ use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ContentBlock,
     DaemonNotification, DetachReason, ErrorCode, IdleWake, JobKind, JobListParams, JobState,
     JobSummary, LocalDaemon, LocalDaemonError, Notifications, SessionAnswerParams,
-    SessionAttachParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
-    SessionDetachParams, SessionListParams, SessionNewParams, SessionPart, SessionPromptParams,
-    SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
+    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
+    SessionDeleteParams, SessionDetachParams, SessionListParams, SessionNewParams, SessionPart,
+    SessionPromptParams, SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 
 use crate::{
+    background::BackgroundId,
     input::{InputChoice, InputId},
     options::{change, config_options, ConfigOption, ConfigValue},
     session::{Attached, SessionSetup, SessionUpdate, SteerId, TurnId},
@@ -88,6 +89,12 @@ pub enum DaemonError {
     /// which is meant for people.
     #[error("{0}")]
     Refused(String),
+    /// The session's turn could not take the request now: a prompt found
+    /// a turn under way, as one the daemon starts itself when background
+    /// work finishes, or a steer found no model request taking input.
+    /// Holds the daemon's message.
+    #[error("{0}")]
+    Busy(String),
     /// The connection is gone.
     #[error("the rho daemon closed the connection")]
     Closed,
@@ -101,7 +108,10 @@ impl From<ClientError> for DaemonError {
         }
         match error {
             ClientError::Closed => Self::Closed,
-            ClientError::Rpc { error, .. } => Self::Refused(error.message),
+            ClientError::Rpc { error, .. } => match error.error_code() {
+                Some(ErrorCode::SessionBusy | ErrorCode::NotSteerable) => Self::Busy(error.message),
+                _ => Self::Refused(error.message),
+            },
             // Each of these names the daemon and what to do, as rho's own
             // frontends show them.
             other => Self::Unreachable(other.to_string()),
@@ -601,8 +611,8 @@ impl Daemon {
     ///
     /// # Errors
     ///
-    /// Fails if the daemon refuses the prompt, for example because the
-    /// session already runs a turn, or the turn ended before it began.
+    /// Fails if the daemon refuses the prompt, or the turn ended before it
+    /// began; [`DaemonError::Busy`] when the session already runs a turn.
     /// Nothing was added to the session in that case.
     pub async fn prompt(&self, id: &SessionId, text: &str) -> Result<TurnId, DaemonError> {
         let params = SessionPromptParams {
@@ -631,7 +641,8 @@ impl Daemon {
     ///
     /// # Errors
     ///
-    /// Fails if no model request is taking input, as between turns.
+    /// Fails with [`DaemonError::Busy`] if no model request is taking
+    /// input, as between turns.
     pub async fn steer(&self, id: &SessionId, text: &str) -> Result<SteerId, DaemonError> {
         let params = SessionSteerParams {
             session: id.to_wire(),
@@ -677,6 +688,29 @@ impl Daemon {
         };
         self.client
             .request::<methods::SessionCancel>(&params)
+            .await?;
+        Ok(())
+    }
+
+    /// Asks the daemon to stop background work `work` of session `id`.
+    /// Returns once the stop is asked for: the work ends shortly after,
+    /// and the session's background list then says how.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the work already ended or the session does not know it,
+    /// the session is not loaded, or the connection is gone.
+    pub async fn stop_background(
+        &self,
+        id: &SessionId,
+        work: &BackgroundId,
+    ) -> Result<(), DaemonError> {
+        let params = SessionBackgroundStopParams {
+            session: id.to_wire(),
+            work: work.0.clone(),
+        };
+        self.client
+            .request::<methods::SessionBackgroundStop>(&params)
             .await?;
         Ok(())
     }

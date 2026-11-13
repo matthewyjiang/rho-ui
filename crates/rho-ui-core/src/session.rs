@@ -18,6 +18,7 @@ use rho_protocol::{
 };
 
 use crate::{
+    background::BackgroundWork,
     daemon::SessionId,
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
@@ -251,6 +252,11 @@ pub enum Entry {
     Tool(ToolCall),
     /// A notice from the agent.
     Notice(Notice),
+    /// The daemon began a turn of its own, as it does when the session's
+    /// background work finishes, to give the model the result. It opens
+    /// that turn, as a prompt opens one. Only a turn followed live has
+    /// one: the daemon's replay of a conversation does not mark them.
+    Wake,
 }
 
 /// Progress on one [`PlanItem`].
@@ -307,6 +313,8 @@ pub struct Session {
     inputs: Vec<InputRequest>,
     /// Steers waiting to apply, oldest first.
     steers: Vec<Steer>,
+    /// Background work, as the daemon last listed it.
+    background: Vec<BackgroundWork>,
     /// Steers a turn dropped when it ended; see [`Self::take_dropped_steers`].
     dropped_steers: Vec<String>,
     /// IDs of steers that reached the conversation and that
@@ -318,6 +326,9 @@ pub struct Session {
     /// The turn that last ended, so [`Self::turn_began`] can tell an answer
     /// that arrives after its whole turn.
     ended_turn: Option<TurnId>,
+    /// A turn began live and nothing of it has arrived yet. Its first entry
+    /// says whether a prompt opened it; if not, an [`Entry::Wake`] does.
+    unopened_turn: bool,
     sync: Sync,
 }
 
@@ -350,9 +361,11 @@ impl Session {
             plan: Vec::new(),
             inputs: Vec::new(),
             steers: Vec::new(),
+            background: Vec::new(),
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
             ended_turn: None,
+            unopened_turn: false,
             sync: Sync::Attaching(Vec::new()),
         }
     }
@@ -378,6 +391,7 @@ impl Session {
         for request in response.inputs {
             self.open_input(InputRequest::from_wire(request));
         }
+        self.set_background(response.background);
         let replay = match response.replay_events {
             0 => Sync::Live,
             events => Sync::Replaying(events),
@@ -463,6 +477,19 @@ impl Session {
         &self.plan
     }
 
+    /// The session's background work: what still runs, and what ended
+    /// whose result the model has yet to be given, with how it ended.
+    pub fn background(&self) -> &[BackgroundWork] {
+        &self.background
+    }
+
+    /// The turn that ended last, as far as this session has heard. A
+    /// refusal because a turn was under way can compare it with the one
+    /// before sending, to tell whether that turn has already ended.
+    pub fn ended_turn(&self) -> Option<&TurnId> {
+        self.ended_turn.as_ref()
+    }
+
     /// What the session waits on a person for, oldest first.
     pub fn inputs(&self) -> &[InputRequest] {
         &self.inputs
@@ -539,22 +566,33 @@ impl Session {
     }
 
     fn apply_event(&mut self, event: SessionEvent) -> Option<usize> {
+        let changed = self.apply_change(event);
+        // Counted once applied, so the replay's last event is history too.
         if let Sync::Replaying(left) = &mut self.sync {
             *left -= 1;
             if *left == 0 {
                 self.sync = Sync::Live;
             }
         }
+        changed
+    }
+
+    fn apply_change(&mut self, event: SessionEvent) -> Option<usize> {
         match event {
             SessionEvent::UserMessage {
                 message,
                 content,
                 steer,
             } => {
-                if let Some(steer) = steer {
-                    let steer = SteerId(steer.as_str().to_owned());
-                    if self.withdraw_steer(&steer).is_none() {
-                        self.early_steers.push(steer);
+                match steer {
+                    // A prompt opens its own turn.
+                    None => self.unopened_turn = false,
+                    Some(steer) => {
+                        self.open_turn();
+                        let steer = SteerId(steer.as_str().to_owned());
+                        if self.withdraw_steer(&steer).is_none() {
+                            self.early_steers.push(steer);
+                        }
                     }
                 }
                 let (at, message) = self.message_mut(message.as_str(), Entry::User);
@@ -562,12 +600,17 @@ impl Session {
                 Some(at)
             }
             SessionEvent::AgentMessageChunk { message, text } => {
+                self.open_turn();
                 Some(self.append_message(message.as_str(), &text, Entry::Agent))
             }
             SessionEvent::ThoughtChunk { message, text } => {
+                self.open_turn();
                 Some(self.append_message(message.as_str(), &text, Entry::Thought))
             }
-            SessionEvent::ToolCall(update) => Some(self.update_tool(*update)),
+            SessionEvent::ToolCall(update) => {
+                self.open_turn();
+                Some(self.update_tool(*update))
+            }
             SessionEvent::Notice { text } => Some(self.push_notice(Notice {
                 level: NoticeLevel::Info,
                 title: text,
@@ -632,10 +675,18 @@ impl Session {
                 self.close_input(InputId(id.0));
                 None
             }
+            SessionEvent::Background { work } => {
+                self.set_background(work);
+                None
+            }
             // Compaction and provider progress, held timeouts, and cache
             // warming are not shown yet.
             _ => None,
         }
+    }
+
+    fn set_background(&mut self, work: Vec<rho_protocol::BackgroundWork>) {
+        self.background = work.into_iter().map(BackgroundWork::from_wire).collect();
     }
 
     fn set_options(&mut self, options: SessionOptions) {
@@ -652,6 +703,9 @@ impl Session {
             JobState::Running | JobState::Queued => {
                 if !self.state.is_busy() {
                     self.early_steers.clear();
+                    // A turn of the past, as an attach catches up, opens
+                    // nothing here.
+                    self.unopened_turn = matches!(self.sync, Sync::Live);
                 }
                 self.state = RunState::Running;
             }
@@ -665,6 +719,7 @@ impl Session {
                 if self.state.is_busy() =>
             {
                 self.state = RunState::Idle;
+                self.unopened_turn = false;
             }
             // Already settled, or a state a newer daemon added.
             _ => {}
@@ -672,6 +727,7 @@ impl Session {
     }
 
     fn end_turn(&mut self, outcome: TurnOutcome) {
+        self.unopened_turn = false;
         self.state = match outcome {
             TurnOutcome::Answered { stop, .. } => match stop {
                 AnswerStop::Refusal => RunState::Failed("the model refused".to_owned()),
@@ -694,7 +750,16 @@ impl Session {
         self.dropped_steers.extend(dropped);
     }
 
+    /// Opens the turn that began live with an [`Entry::Wake`], if nothing
+    /// of it arrived yet. A prompt's turn opens with the prompt instead.
+    fn open_turn(&mut self) {
+        if std::mem::take(&mut self.unopened_turn) {
+            self.entries.push(Entry::Wake);
+        }
+    }
+
     fn push_notice(&mut self, notice: Notice) -> usize {
+        self.open_turn();
         self.entries.push(Entry::Notice(notice));
         self.entries.len() - 1
     }

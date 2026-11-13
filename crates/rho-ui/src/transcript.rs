@@ -5,14 +5,16 @@
 
 use std::{ops::Range, rc::Rc, time::Duration};
 
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::{Alert, AlertVariant},
     bubble::{Bubble, BubbleVariant},
+    h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
     text::TextView,
-    v_flex, Sizable as _,
+    v_flex, ActiveTheme as _, Icon, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -39,26 +41,6 @@ pub(crate) enum Action {
 /// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
 
-/// The turn in progress, by its index among the timeline's turns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Running {
-    /// A turn a prompt starts. It may not have its prompt row yet: the row
-    /// comes when the daemon echoes the prompt, after the turn began.
-    Prompted(usize),
-    /// A turn with no prompt, as the daemon starts one when a session's
-    /// background work finishes. Its rows join this turn, the newest, which
-    /// keeps the time it took itself.
-    Joined(usize),
-}
-
-impl Running {
-    fn turn(self) -> usize {
-        match self {
-            Self::Prompted(turn) | Self::Joined(turn) => turn,
-        }
-    }
-}
-
 /// A session's transcript state. Flat arrays indexed by row, entry or turn.
 pub(crate) struct Transcript {
     scroller: Entity<MessageScrollerState>,
@@ -73,7 +55,11 @@ pub(crate) struct Transcript {
     /// replays no turn times, so a replayed turn has one only from
     /// [`TurnTimes`].
     took: Vec<Option<Duration>>,
-    running: Option<Running>,
+    /// The turn in progress, by its index among the timeline's turns. It
+    /// may not have its opening row yet: the prompt's comes when the daemon
+    /// echoes it, and a turn the daemon began itself opens with its first
+    /// entry ([`Entry::Wake`]).
+    running: Option<usize>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
 }
@@ -117,17 +103,6 @@ impl Transcript {
         for turn in known..turns {
             self.took[turn] = self.prompt_id(turn, entries).and_then(|id| times.get(id));
         }
-        // Rows came for a turn that began without a prompt row to open it:
-        // they joined the newest turn, which unfolds to show them.
-        let grew = synced.added > 0 || synced.grew.is_some();
-        if let (Some(Running::Prompted(expected)), Some(newest)) =
-            (self.running, turns.checked_sub(1))
-        {
-            if expected == turns && grew {
-                self.running = Some(Running::Joined(newest));
-                self.remeasure(self.timeline.turn_rows(newest), cx);
-            }
-        }
         // A finished turn that grows, as history replays, folds more rows.
         if let Some(newest) = turns.checked_sub(1) {
             if (synced.added > 0 || synced.grew.is_some()) && self.is_finished(newest) {
@@ -158,33 +133,31 @@ impl Transcript {
     /// its prompt row comes only when the daemon echoes the prompt. The
     /// turns before it stay folded.
     pub(crate) fn expect_turn(&mut self) {
-        self.running = Some(Running::Prompted(self.timeline.turns().len()));
+        self.running = Some(self.timeline.turns().len());
     }
 
     /// The session was attached with a turn under way: it is the newest
     /// one, which unfolds.
     pub(crate) fn resume_turn(&mut self, cx: &mut App) {
         let newest = self.timeline.turns().len().saturating_sub(1);
-        self.running = Some(Running::Prompted(newest));
+        self.running = Some(newest);
         self.remeasure(self.timeline.turn_rows(newest), cx);
     }
 
     /// The running turn finished after `took`, and folds. Its time is saved
-    /// for when the session replays. A prompt that never arrived leaves no
-    /// turn to time, and a turn without a prompt none to time it under.
+    /// for when the session replays, under its prompt: a turn the daemon
+    /// began itself has none, and a prompt that never arrived leaves no
+    /// turn to time.
     pub(crate) fn end_turn(&mut self, took: Duration, entries: &[Entry], cx: &mut App) {
-        let Some(running) = self.running.take() else {
+        let Some(turn) = self.running.take() else {
             return;
         };
-        let turn = running.turn();
         if turn >= self.took.len() {
             return;
         }
-        if let Running::Prompted(_) = running {
-            self.took[turn] = Some(took);
-            if let Some(prompt) = self.prompt_id(turn, entries) {
-                cx.global_mut::<TurnTimes>().record(prompt, took);
-            }
+        self.took[turn] = Some(took);
+        if let Some(prompt) = self.prompt_id(turn, entries) {
+            cx.global_mut::<TurnTimes>().record(prompt, took);
         }
         self.remeasure(self.timeline.turn_rows(turn), cx);
     }
@@ -237,7 +210,7 @@ impl Transcript {
     }
 
     fn is_finished(&self, turn: usize) -> bool {
-        self.running.is_none_or(|running| turn < running.turn())
+        self.running.is_none_or(|running| turn < running)
     }
 
     fn remeasure(&self, rows: Range<usize>, cx: &mut App) {
@@ -267,14 +240,14 @@ impl Transcript {
                 return div().into_any_element();
             }
         }
-        let running = turn.is_some() && turn == self.running.map(Running::turn);
+        let running = turn.is_some() && turn == self.running;
         let phase = if running && ix + 1 == self.timeline.rows().len() {
             Phase::Live
         } else {
             Phase::Settled
         };
         let content = || match row {
-            Row::Message(entry) => render_message(&entries[*entry], *entry, phase),
+            Row::Message(entry) => render_message(&entries[*entry], *entry, phase, cx),
             Row::Work(run) => {
                 let act = Rc::clone(act);
                 let on_fold: FoldHandler = Rc::new(move |fold, window, cx| {
@@ -338,7 +311,7 @@ pub(crate) enum Phase {
 
 /// Builds the row for a user message, a reply or a notice: entry `ix`.
 /// Tool calls and thoughts are drawn by [`crate::work`].
-fn render_message(entry: &Entry, ix: usize, phase: Phase) -> AnyElement {
+fn render_message(entry: &Entry, ix: usize, phase: Phase, cx: &App) -> AnyElement {
     let key = ElementId::named_usize("row", ix);
     match entry {
         Entry::User(message) => Message::new()
@@ -386,6 +359,15 @@ fn render_message(entry: &Entry, ix: usize, phase: Phase) -> AnyElement {
             };
             alert.with_variant(variant).small().into_any_element()
         }
+        Entry::Wake => h_flex()
+            .id(SharedString::from(format!("wake-{ix}")))
+            .test_support()
+            .gap_2()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(Lucide::Bell).xsmall())
+            .child("Background work finished")
+            .into_any_element(),
         // The timeline puts these in work rows, never message rows.
         Entry::Thought(_) | Entry::Tool(_) => div().into_any_element(),
     }
