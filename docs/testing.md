@@ -9,6 +9,8 @@ cargo test
 
 To measure frame times with 300 saved sessions and a 100-turn transcript, run `cargo test -p rho-ui --release frame_times -- --ignored --nocapture`.
 
+To measure the state database's size with the rows of a long-used rho-ui, run `cargo test -p rho-ui --release state_sizes -- --ignored --nocapture`.
+
 To check rho-ui against a real daemon and model, install rho 3, sign it in, and run the `live_daemon` test. It starts the daemon, runs a turn through an approval, and saves screenshots. A new rho home starts in `bypass`, which asks for no approvals, so set `permission_mode = "supervised"` under `[behavior]` in its `config.toml`:
 
 ```bash

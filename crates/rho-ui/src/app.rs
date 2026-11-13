@@ -33,9 +33,9 @@ use crate::{
     settings::{Appearance, Settings},
     settings_view,
     shelf::Shelves,
-    sidebar::{SidebarEvent, SidebarView},
+    sidebar::{SidebarEvent, SidebarLayout, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
-    NewSession, NewSessionIn, OpenSettings,
+    NewSession, NewSessionIn, OpenSettings, ToggleSidebar,
 };
 
 /// How often the sidebar asks the daemon which sessions have work under
@@ -120,12 +120,14 @@ pub(crate) struct RhoApp {
 }
 
 impl RhoApp {
-    /// `shelves` holds the settled and snoozed marks, and `projects` the
-    /// user's projects; see [`Shelves::load`] and [`Projects::load`].
+    /// `shelves` holds the settled and snoozed marks, `projects` the user's
+    /// projects, and `layout` whether the sidebar is collapsed; see
+    /// [`Shelves::load`], [`Projects::load`] and [`SidebarLayout::load`].
     pub(crate) fn new(
         launch: LaunchConfig,
         shelves: Shelves,
         projects: Projects,
+        layout: SidebarLayout,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -133,7 +135,8 @@ impl RhoApp {
         window.focus(&focus_handle, cx);
         let workspaces = cx.new(Workspaces::new);
         let projects = cx.new(|_| projects);
-        let sidebar = cx.new(|cx| SidebarView::new(workspaces.clone(), shelves, window, cx));
+        let sidebar =
+            cx.new(|cx| SidebarView::new(workspaces.clone(), shelves, layout, window, cx));
         let sidebar_subscription = cx.subscribe_in(
             &sidebar,
             window,
@@ -144,6 +147,7 @@ impl RhoApp {
                 SidebarEvent::NewSession => this.new_session(window, cx),
                 SidebarEvent::Delete { id } => this.delete_session(id.clone(), window, cx),
                 SidebarEvent::OpenSettings => settings_view::open(window, cx),
+                SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
             },
         );
         let mut app = Self {
@@ -426,6 +430,27 @@ impl RhoApp {
             }
         };
         self.show(pane, window, cx);
+    }
+
+    /// Collapses the sidebar to its rail, or opens it again. The keyboard
+    /// stays where it is, unless it was in the sidebar's search, which
+    /// collapsing hides: then it goes to the main pane.
+    fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Until the daemon answers, the window shows no sidebar.
+        if self.daemon().is_none() {
+            return;
+        }
+        let searching = self
+            .sidebar
+            .read(cx)
+            .search_focus_handle(cx)
+            .is_focused(window);
+        let collapsed = self.sidebar.update(cx, SidebarView::toggle_collapsed);
+        if collapsed && searching {
+            self.focus_pane(window, cx);
+        }
+        // The sidebar's width is laid out here.
+        cx.notify();
     }
 
     /// Shows a new session's draft with its project list open.
@@ -895,6 +920,10 @@ impl RhoApp {
     pub(crate) fn projects<'a>(&self, cx: &'a App) -> &'a [PathBuf] {
         self.projects.read(cx).roots()
     }
+    /// The sidebar's search, for UI tests.
+    pub(crate) fn sidebar_search(&self, cx: &App) -> FocusHandle {
+        self.sidebar.read(cx).search_focus_handle(cx)
+    }
 }
 
 impl Render for RhoApp {
@@ -909,6 +938,9 @@ impl Render for RhoApp {
                 this.new_session_in(window, cx);
             }))
             .on_action(|_: &OpenSettings, window, cx| settings_view::open(window, cx))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.toggle_sidebar(window, cx);
+            }))
             .relative()
             .size_full()
             .bg(cx.theme().background)
@@ -930,6 +962,7 @@ impl Render for RhoApp {
         }
 
         let pane_style = || StyleRefinement::default().flex_1().min_w_0().h_full();
+        let sidebar_width = self.sidebar.read(cx).width();
         let main = match &self.pane {
             Pane::Session(view) => view.clone().cached(pane_style()).into_any_element(),
             Pane::Draft { view, .. } => view.clone().cached(pane_style()).into_any_element(),
@@ -942,7 +975,7 @@ impl Render for RhoApp {
                 .child(
                     self.sidebar.clone().cached(
                         StyleRefinement::default()
-                            .w(rems(18.))
+                            .w(sidebar_width)
                             .h_full()
                             .flex_shrink_0(),
                     ),

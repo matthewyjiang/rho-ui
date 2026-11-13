@@ -31,6 +31,8 @@ use crate::{
     projects::Projects,
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
+    sidebar::SidebarLayout,
+    store::{Key, StateDb},
     turn_times::TurnTimes,
 };
 
@@ -49,6 +51,8 @@ struct Harness {
     target: DaemonTarget,
     /// Stops when the test ends.
     daemon: Option<FakeDaemon>,
+    /// The state database the app's sidebar layout saves to, in memory.
+    state: StateDb,
 }
 
 impl Harness {
@@ -100,6 +104,8 @@ impl Harness {
             workspace: std::env::temp_dir(),
             daemon: target.clone(),
         };
+        let state = StateDb::in_memory();
+        let layout = SidebarLayout::load(&state);
         let (window, app) = cx
             .update(|cx| {
                 gpui_kit::open_window(
@@ -113,9 +119,11 @@ impl Harness {
                         ..Default::default()
                     },
                     cx,
-                    // In-memory marks and projects: tests never touch the
-                    // user's state files.
-                    |window, cx| cx.new(|cx| RhoApp::new(launch, shelves, projects, window, cx)),
+                    // In-memory marks, projects and layout: tests never
+                    // touch the user's state database.
+                    |window, cx| {
+                        cx.new(|cx| RhoApp::new(launch, shelves, projects, layout, window, cx))
+                    },
                 )
             })
             .expect("open the app window");
@@ -126,6 +134,7 @@ impl Harness {
             name,
             target,
             daemon,
+            state,
         };
         harness.frame();
         harness
@@ -1170,6 +1179,116 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
         );
     });
     ui.shot("steered");
+}
+
+/// The sidebar collapses to a rail and opens again, with Ctrl+B or its
+/// toggle, and the state database remembers which. The toggle and Settings
+/// stay where they were at any UI scale, the pane takes the width, the
+/// keyboard leaves the search it hides, and the rail still starts a session
+/// and shows one at work.
+#[test]
+fn the_sidebar_collapses_to_a_rail_and_back() {
+    let script = Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("rail", script);
+    ui.wait_until("sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-s1") && is_visible(window, "session-tui-1")
+    });
+    ui.click("session-s1");
+    ui.wait_for_session("the open session", |session| {
+        session.title() == Some("first")
+    });
+    // Where the toggle, Settings and the pane's title are drawn.
+    let places = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                ["toggle-sidebar", "open-settings", "session-title"]
+                    .map(|id| bounds(window, id).unwrap_or_else(|| panic!("{id} is drawn")))
+            })
+            .expect("window is open")
+    };
+    let [toggle, settings, title] = places(&mut ui);
+    assert_eq!(
+        ui.label("toggle-sidebar").as_deref(),
+        Some("Collapse sidebar")
+    );
+
+    // From the sidebar's search, which the rail doesn't show.
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        let search = app.read(cx).sidebar_search(cx);
+        window.focus(&search, cx);
+        window.press("ctrl-b", cx);
+    });
+    ui.wait_until("the rail", |window, _, _| {
+        is_visible(window, "sidebar-rail") && !is_visible(window, "session-s1")
+    });
+    ui.act(|window, cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        assert!(
+            view.read(cx).composer_focus_handle(cx).is_focused(window),
+            "the keyboard goes to the composer"
+        );
+    });
+    assert_eq!(
+        ui.state.get(Key::SidebarLayout).as_deref(),
+        Some("collapsed")
+    );
+    let [rail_toggle, rail_settings, rail_title] = places(&mut ui);
+    assert_eq!(rail_toggle, toggle, "the toggle stays put");
+    assert_eq!(rail_settings, settings, "Settings stays put");
+    assert!(
+        rail_title.left() < title.left() - px(200.),
+        "the pane takes the sidebar's width: {title:?} became {rail_title:?}"
+    );
+    assert_eq!(
+        ui.label("toggle-sidebar").as_deref(),
+        Some("Expand sidebar")
+    );
+    // The terminal UI's turn runs on, so the rail shows it.
+    assert_eq!(
+        ui.label("rail-working").as_deref(),
+        Some("1 session working")
+    );
+    ui.shot("collapsed");
+
+    ui.click("new-session");
+    ui.wait_until("a draft beside the rail", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "sidebar-rail")
+    });
+
+    // At another scale and theme the rail and the open sidebar still line
+    // up, as both place their buttons in rems.
+    ui.cx.update(|cx| {
+        let mut settings = cx.global::<Settings>().clone();
+        settings.appearance = Appearance::Light;
+        settings.ui_scale = UiScale::from_percent(125).expect("125% is on offer");
+        settings.apply(cx);
+    });
+    ui.frame();
+    let [scaled_rail_toggle, scaled_rail_settings, _] = places(&mut ui);
+    ui.shot("collapsed-light");
+    ui.click("toggle-sidebar");
+    ui.wait_until("the open sidebar", |window, _, _| {
+        is_visible(window, "session-s1") && !is_visible(window, "sidebar-rail")
+    });
+    assert_eq!(ui.state.get(Key::SidebarLayout).as_deref(), Some("open"));
+    let [scaled_toggle, scaled_settings, _] = places(&mut ui);
+    assert_eq!(
+        scaled_toggle, scaled_rail_toggle,
+        "the toggle stays put at 125%"
+    );
+    assert_eq!(
+        scaled_settings, scaled_rail_settings,
+        "Settings stays put at 125%"
+    );
+    assert_eq!(
+        ui.label("toggle-sidebar").as_deref(),
+        Some("Collapse sidebar")
+    );
+    ui.shot("open-light");
 }
 
 /// Frame-time probe, not a pass/fail test: 300 saved sessions and a long

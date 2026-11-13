@@ -5,6 +5,8 @@
 //! it swaps the status for Snooze and Settle. A shelf opens from its header
 //! into one-line rows, and hovering one shows its details in a card.
 //!
+//! The sidebar collapses to a rail of buttons; see [`rail`].
+//!
 //! The app draws this view as a cached view, so a hover or scroll here
 //! redraws only the sidebar, and [`v_virtual_list`] builds only the rows on
 //! screen.
@@ -35,10 +37,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    canvas, div, px, rems, size, Anchor, AnyElement, AppContext as _, Context, Entity,
-    EventEmitter, Hsla, InteractiveElement as _, IntoElement, MouseButton, ParentElement, Pixels,
-    Rems, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement,
-    Styled, Subscription, Task, WeakEntity, Window,
+    canvas, div, px, rems, size, Anchor, AnyElement, App, AppContext as _, Context, Entity,
+    EventEmitter, FocusHandle, Focusable as _, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement, Pixels, Rems, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
 };
 use rho_ui_core::{Job, SessionId, SessionSummary};
 
@@ -74,6 +76,15 @@ const SHELVED_ROW_REMS: f32 = TITLE_REMS + 2. * SHELVED_PAD_REMS + 2. * GUTTER_R
 
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
+
+/// The sidebar's top row, open or collapsed, so the toggle sits at the same
+/// height in both.
+const TOP_ROW: Pixels = px(44.);
+
+mod rail;
+
+pub(crate) use rail::SidebarLayout;
+use rail::{toggle_button, Layout};
 
 /// Each item's height. The gap's comes from the list's height instead; see
 /// [`SidebarView::render_list`].
@@ -182,6 +193,9 @@ pub(crate) enum SidebarEvent {
         id: SessionId,
     },
     OpenSettings,
+    /// Collapse the sidebar to its rail, or open it again; see
+    /// [`SidebarView::toggle_collapsed`].
+    ToggleCollapsed,
 }
 
 /// The row under the mouse, which shows its actions instead of its status.
@@ -195,6 +209,7 @@ pub(crate) struct SidebarView {
     list: SessionList,
     workspaces: Entity<Workspaces>,
     shelves: Shelves,
+    layout: SidebarLayout,
     active: Option<SessionId>,
     hover: Option<Hover>,
     error: Option<SharedString>,
@@ -215,6 +230,7 @@ impl SidebarView {
     pub(crate) fn new(
         workspaces: Entity<Workspaces>,
         shelves: Shelves,
+        layout: SidebarLayout,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -240,6 +256,7 @@ impl SidebarView {
             list: SessionList::default(),
             workspaces,
             shelves,
+            layout,
             active: None,
             hover: None,
             error: None,
@@ -350,6 +367,27 @@ impl SidebarView {
     pub(crate) fn set_version(&mut self, version: String, cx: &mut Context<'_, Self>) {
         self.version = Some(version.into());
         cx.notify();
+    }
+
+    /// How wide the app lays the sidebar out.
+    pub(crate) fn width(&self) -> Rems {
+        self.layout.current().width()
+    }
+
+    /// The search's, which the collapsed sidebar doesn't show.
+    pub(crate) fn search_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.search.read(cx).focus_handle(cx)
+    }
+
+    /// Collapses the sidebar to its rail, or opens it again, and remembers
+    /// which for the next run. Returns whether it is collapsed now. The
+    /// search and scroll stay as they were.
+    pub(crate) fn toggle_collapsed(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        self.layout.toggle();
+        // No row is under the pointer once the rows are gone.
+        self.hover = None;
+        cx.notify();
+        self.layout.current() == Layout::Rail
     }
 
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
@@ -740,21 +778,16 @@ impl SidebarView {
             .into_any_element()
     }
 
-    fn render_header(cx: &mut Context<'_, Self>) -> impl IntoElement {
+    /// The toggle, "rho", and New session at the far end.
+    fn render_header(cx: &Context<'_, Self>) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
-            .h(px(44.))
+            .h(TOP_ROW)
             .px_3()
-            .justify_between()
-            .child(div().font_semibold().child("rho"))
-            .child(
-                Button::new("new-session")
-                    .ghost()
-                    .small()
-                    .icon(Lucide::SquarePen)
-                    .tooltip("New session (Ctrl+N)")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewSession))),
-            )
+            .gap_1()
+            .child(toggle_button(Layout::Open, cx))
+            .child(div().flex_1().font_semibold().child("rho"))
+            .child(new_session_button(cx))
     }
 
     fn render_list(&self, window: &Window, cx: &mut Context<'_, Self>) -> AnyElement {
@@ -832,25 +865,15 @@ impl SidebarView {
                 )
             })
             .child(
-                h_flex()
-                    .px_2()
-                    .gap_2()
-                    .child(
-                        Button::new("open-settings")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Settings)
-                            .tooltip("Settings (Ctrl+,)")
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(SidebarEvent::OpenSettings);
-                            })),
-                    )
-                    .children(self.version.clone().map(|version| {
+                // The toggle's inset, so Settings stays put in the rail.
+                h_flex().px_3().gap_2().child(settings_button(cx)).children(
+                    self.version.clone().map(|version| {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(version)
-                    })),
+                    }),
+                ),
             )
     }
 }
@@ -859,12 +882,16 @@ impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        v_flex()
+        let frame = v_flex()
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
             .border_r_1()
-            .border_color(theme.sidebar_border)
+            .border_color(theme.sidebar_border);
+        if self.layout.current() == Layout::Rail {
+            return frame.child(self.render_rail(cx));
+        }
+        frame
             .child(Self::render_header(cx))
             .child(
                 div().flex_shrink_0().px_2().pb_2().child(
@@ -877,6 +904,26 @@ impl Render for SidebarView {
             .child(self.render_list(window, cx))
             .child(self.render_footer(cx))
     }
+}
+
+fn new_session_button(cx: &Context<'_, SidebarView>) -> Button {
+    Button::new("new-session")
+        .ghost()
+        .small()
+        .icon(Lucide::SquarePen)
+        .accessibility_label("New session")
+        .tooltip("New session (Ctrl+N)")
+        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewSession)))
+}
+
+fn settings_button(cx: &Context<'_, SidebarView>) -> Button {
+    Button::new("open-settings")
+        .ghost()
+        .small()
+        .icon(IconName::Settings)
+        .accessibility_label("Settings")
+        .tooltip("Settings (Ctrl+,)")
+        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenSettings)))
 }
 
 /// The time, read once per frame for every row's age and timer.

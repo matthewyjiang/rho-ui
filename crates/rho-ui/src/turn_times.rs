@@ -3,78 +3,71 @@
 //! each turn it watches under its prompt's message ID, which the daemon
 //! gives the prompt again when the session replays.
 //!
-//! The times live in one small text file, appended a line per turn:
-//!
-//! ```text
-//! <prompt message id> <milliseconds>
-//! ```
+//! The times live in the state database's `turn_times` table (see
+//! [`StateDb`]), the only one that grows with every turn. So it keeps a
+//! 64-bit hash of the message ID rather than the ID: rho's IDs run to 46
+//! characters, and the hash cuts the table to about a third. Two IDs share
+//! a hash with odds of about 1 in 10^11 at 20,000 turns, and then one turn
+//! would show the other's time.
 
-use std::{collections::HashMap, io::Write as _, path::PathBuf, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use gpui_kit::Global;
 
-use crate::store;
+use crate::store::StateDb;
 
-/// Turn times by prompt message ID. A global: every session view reads and
-/// records them.
-#[derive(Debug, Default)]
+/// Turn times by the [`key`] of their prompt's message ID. A global: every
+/// session view reads and records them.
+#[derive(Debug)]
 pub(crate) struct TurnTimes {
-    times: HashMap<String, Duration>,
-    /// Where to save; `None` keeps times in memory only (tests).
-    path: Option<PathBuf>,
+    times: HashMap<i64, Duration>,
+    db: StateDb,
 }
 
 impl Global for TurnTimes {}
 
 impl TurnTimes {
-    /// Loads `$XDG_STATE_HOME/rho-ui/turn-times`, or `~/.local/state/...`.
-    /// A missing or unreadable file starts empty.
-    pub(crate) fn load() -> Self {
-        let path =
-            store::xdg_dir("XDG_STATE_HOME", ".local/state").map(|dir| dir.join("turn-times"));
-        let times = path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| parse(&text))
-            .unwrap_or_default();
-        Self { times, path }
+    /// Loads every saved time.
+    pub(crate) fn load(db: &StateDb) -> Self {
+        let times = db.query("SELECT prompt, ms FROM turn_times", [], |row| {
+            let ms: i64 = row.get(1)?;
+            let took = Duration::from_millis(u64::try_from(ms).unwrap_or_default());
+            Ok((row.get(0)?, took))
+        });
+        Self {
+            times: times.into_iter().collect(),
+            db: db.clone(),
+        }
     }
 
     /// How long the turn that `prompt` started took, if rho-ui ran it.
     pub(crate) fn get(&self, prompt: &str) -> Option<Duration> {
-        self.times.get(prompt).copied()
+        self.times.get(&key(prompt)).copied()
     }
 
     /// Records that the turn `prompt` started took `took`. Best effort on
-    /// disk: a lost line only loses one turn's time.
+    /// disk: a lost write only loses one turn's time.
     pub(crate) fn record(&mut self, prompt: &str, took: Duration) {
-        self.times.insert(prompt.to_owned(), took);
-        let Some(path) = &self.path else {
-            return;
-        };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let line = format!("{prompt} {}\n", took.as_millis());
-        // One `write` per line, so appends from two windows don't interleave.
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut file| file.write_all(line.as_bytes()));
+        let prompt = key(prompt);
+        self.times.insert(prompt, took);
+        let ms = i64::try_from(took.as_millis()).unwrap_or(i64::MAX);
+        self.db.execute(
+            "INSERT OR REPLACE INTO turn_times (prompt, ms) VALUES (?1, ?2)",
+            (prompt, ms),
+        );
     }
 }
 
-/// Reads `<id> <ms>` lines; a later line for an ID wins. Bad lines are
-/// skipped.
-fn parse(text: &str) -> HashMap<String, Duration> {
-    text.lines()
-        .filter_map(|line| {
-            let (id, ms) = line.rsplit_once(' ')?;
-            Some((id.to_owned(), Duration::from_millis(ms.parse().ok()?)))
-        })
-        .filter(|(id, _)| !id.is_empty())
-        .collect()
+/// A message ID's 64-bit FNV-1a hash, as SQLite's signed integer. Saved
+/// keys depend on it, so it must never change: std's hashers promise no
+/// stable output.
+fn key(message: &str) -> i64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let hash = message.bytes().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    });
+    i64::from_ne_bytes(hash.to_ne_bytes())
 }
 
 #[cfg(test)]
@@ -83,28 +76,24 @@ mod tests {
 
     #[test]
     fn a_recorded_time_survives_a_reload() {
-        let dir = std::env::temp_dir().join(format!("rho-ui-turn-times-{}", std::process::id()));
-        let path = dir.join("turn-times");
-        let _ = std::fs::remove_file(&path);
-        let mut times = TurnTimes {
-            times: HashMap::new(),
-            path: Some(path.clone()),
-        };
+        let db = StateDb::in_memory();
+        let mut times = TurnTimes::load(&db);
         times.record("u1", Duration::from_millis(9_400));
         times.record("u2", Duration::from_secs(337));
         times.record("u1", Duration::from_millis(9_500));
 
-        let text = std::fs::read_to_string(&path).expect("the times were saved");
-        let reloaded = parse(&text);
-        assert_eq!(reloaded.get("u1"), Some(&Duration::from_millis(9_500)));
-        assert_eq!(reloaded.get("u2"), Some(&Duration::from_secs(337)));
-        let _ = std::fs::remove_dir_all(dir);
+        let reloaded = TurnTimes::load(&db);
+        assert_eq!(reloaded.get("u1"), Some(Duration::from_millis(9_500)));
+        assert_eq!(reloaded.get("u2"), Some(Duration::from_secs(337)));
+        assert_eq!(reloaded.get("u3"), None);
     }
 
     #[test]
-    fn parsing_skips_bad_lines() {
-        let times = parse("ok 5\nnonsense\n 7\nneg -1\nok two\n");
-        assert_eq!(times.len(), 1);
-        assert_eq!(times.get("ok"), Some(&Duration::from_millis(5)));
+    fn the_key_is_fnv_1a() {
+        // The published 64-bit FNV-1a test vectors.
+        let fnv = |hash: u64| i64::from_ne_bytes(hash.to_ne_bytes());
+        assert_eq!(key(""), fnv(0xcbf2_9ce4_8422_2325));
+        assert_eq!(key("a"), fnv(0xaf63_dc4c_8601_ec8c));
+        assert_eq!(key("foobar"), fnv(0x8594_4171_f739_67e8));
     }
 }
