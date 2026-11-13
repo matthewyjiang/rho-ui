@@ -358,7 +358,10 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
                             div()
                                 .id(SharedString::from(format!("details-{ix}")))
                                 .test_support()
-                                .my_1()
+                                // Straight under the line, whose own box
+                                // already spaces it as from the next line;
+                                // a gap only below, before the next step.
+                                .mb_1()
                                 .border_l_1()
                                 .border_color(cx.theme().border)
                                 // The rest of the icon column and the line's
