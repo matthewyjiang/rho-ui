@@ -14,7 +14,7 @@ rust-version = "1.93"
 # rho's daemon protocol: wire types and the client, released with rho 3.
 rho-protocol = "1.0.0"
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
-gpui-kit = { version = "=0.9.0", features = ["syntect"] }
+gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 
 # From BeautifulRust lints/lints.toml (https://github.com/morganlinton/BeautifulRust),
 # matching the rust-best-practices skill in .agents/skills. CI-strict form:
