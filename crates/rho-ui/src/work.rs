@@ -1,7 +1,7 @@
 //! A work row: a run of tool calls and thoughts, drawn as one summary line
 //! ("Ran 3 commands and read 2 files") that opens into a line per step, each
-//! of which opens into its details: a tool's output or diff, or the whole
-//! thought. A row with one step is just that step's line. While the turn
+//! of which opens into its details: a tool's command, output or diff, or the
+//! whole thought. A row with one step is just that step's line. While the turn
 //! runs, the summary line shows the newest step instead.
 
 use std::rc::Rc;
@@ -12,6 +12,7 @@ use gpui_kit::component::{
     collapsible::Collapsible,
     diff::{Diff, DiffFile, DiffState},
     h_flex,
+    scroll::ScrollableElement as _,
     separator::Separator,
     shimmer::ShimmerText,
     spinner::Spinner,
@@ -38,6 +39,9 @@ const MAX_DETAILS_REMS: f32 = 24.;
 
 /// The icon column every line starts with, so labels line up.
 const ICON_REMS: f32 = 1.5;
+
+/// The gap between a line's icon column and its label: `gap_1p5`.
+const LABEL_GAP_REMS: f32 = 0.375;
 
 /// Whether something that opens is open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -271,40 +275,10 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
             kind_icon(ToolKind::Think, cx),
             !thought.text().trim().is_empty(),
         ),
-        Step::Tool(tool) => (status_icon(tool, cx), !tool.content().is_empty()),
-    };
-    // Built only when open: a folded step copies none of its text.
-    let body = || {
-        let boxed = |content: AnyElement| {
-            div()
-                .id(SharedString::from(format!("output-{ix}")))
-                .max_h(rems(MAX_DETAILS_REMS))
-                .overflow_y_scroll()
-                .p_2()
-                .rounded(cx.theme().radius)
-                .bg(cx.theme().secondary)
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(content)
-        };
-        match step {
-            Step::Thought(thought) => boxed(
-                TextView::markdown(
-                    ElementId::named_usize("thought", ix),
-                    thought.text().to_owned(),
-                )
-                .selectable(true)
-                .into_any_element(),
-            )
-            .into_any_element(),
-            Step::Tool(tool) => v_flex()
-                .gap_2()
-                .when_some(output(tool, diff, cx), |this, output| {
-                    this.child(boxed(output))
-                })
-                .when_some(diff, |this, diff| this.child(diff.render(cx)))
-                .into_any_element(),
-        }
+        Step::Tool(tool) => (
+            status_icon(tool, cx),
+            !tool.content().is_empty() || full_title(tool).is_some(),
+        ),
     };
     // An open thought's text is right below, so its line just says so.
     let label = match step {
@@ -333,18 +307,86 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
             this.child(
                 Collapsible::new()
                     .open(details.is_open())
-                    .pl(rems(ICON_REMS))
+                    // From the middle of the icon column, so the rule hangs
+                    // under the icon.
+                    .pl(rems(ICON_REMS / 2.))
                     .when(details.is_open(), |this| {
                         this.content(
                             div()
                                 .id(SharedString::from(format!("details-{ix}")))
                                 .test_support()
-                                .child(body()),
+                                .my_1()
+                                .border_l_1()
+                                .border_color(cx.theme().border)
+                                // The rest of the icon column and the line's
+                                // gap, so the text starts under the label.
+                                .pl(rems(ICON_REMS / 2. + LABEL_GAP_REMS))
+                                .text_color(cx.theme().muted_foreground)
+                                // Built only when open: a folded step
+                                // copies none of its text.
+                                .child(details_body(step, ix, diff, cx)),
                         )
                     }),
             )
         })
         .into_any_element()
+}
+
+/// What an open step shows: a thought's text, or a tool's command, output
+/// and diff.
+fn details_body(step: Step<'_>, ix: usize, diff: Option<&DiffView>, cx: &App) -> AnyElement {
+    match step {
+        Step::Thought(thought) => part(
+            "output",
+            ix,
+            TextView::markdown(
+                ElementId::named_usize("thought", ix),
+                thought.text().to_owned(),
+            )
+            .selectable(true)
+            .into_any_element(),
+        )
+        .into_any_element(),
+        Step::Tool(tool) => v_flex()
+            .gap_1p5()
+            // The command as written, then what it printed, dimmer.
+            .when_some(full_title(tool), |this, title| {
+                let command = div()
+                    .text_color(cx.theme().foreground)
+                    .child(monospace(title, cx));
+                this.child(part("command", ix, command.into_any_element()))
+            })
+            .when_some(output(tool, diff, cx), |this, output| {
+                this.child(part("output", ix, output))
+            })
+            .when_some(diff, |this, diff| this.child(diff.render(cx)))
+            .into_any_element(),
+    }
+}
+
+/// A part of step `ix`'s details, scrolling past `MAX_DETAILS_REMS`. Kit's
+/// scroll area, not a raw `overflow_y_scroll`: the transcript takes every
+/// wheel event no scroll area inside it claims, and only Kit's areas claim
+/// them.
+fn part(name: &str, ix: usize, content: AnyElement) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!("{name}-{ix}")))
+        .test_support()
+        .text_sm()
+        .child(
+            div()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{name}-text-{ix}")))
+                        .test_support()
+                        .child(content),
+                )
+                .overflow_y_scrollbar()
+                // One call site makes every part, so each needs its own id or
+                // they would share one scroll position.
+                .id(SharedString::from(format!("{name}-scroll-{ix}")))
+                .max_h(rems(MAX_DETAILS_REMS)),
+        )
 }
 
 /// "Worked for 1m 20s": a finished turn's working, folded behind one line
@@ -427,9 +469,22 @@ fn step_label(step: Step<'_>) -> SharedString {
                 line.into()
             }
         }
-        Step::Tool(tool) if tool.title().is_empty() => "Tool call".into(),
-        Step::Tool(tool) => tool.title().to_owned().into(),
+        Step::Tool(tool) if tool.title().trim().is_empty() => "Tool call".into(),
+        // `truncate` cuts a line too wide, not a line break, so a title over
+        // several lines (a heredoc) is cut here, marked the same way.
+        Step::Tool(tool) => match tool.title().trim().split_once('\n') {
+            Some((first, _)) => format!("{} …", first.trim_end()).into(),
+            None => tool.title().trim().to_owned().into(),
+        },
     }
+}
+
+/// A tool's whole title, for its details, when its line may cut it short:
+/// a command, which is often wider than the line, or any title over one line.
+fn full_title(tool: &ToolCall) -> Option<&str> {
+    let title = tool.title().trim();
+    (!title.is_empty() && (tool.kind() == ToolKind::Execute || title.contains('\n')))
+        .then_some(title)
 }
 
 fn is_running(step: Step<'_>) -> bool {
@@ -525,7 +580,6 @@ fn monospace(text: &str, cx: &App) -> impl IntoElement {
         .child(
             div()
                 .text_xs()
-                .text_color(cx.theme().foreground)
                 .font_family(cx.theme().mono_font_family.clone())
                 .child(shown.to_owned()),
         )

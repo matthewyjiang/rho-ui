@@ -467,12 +467,16 @@ fn replay(session: &mut FakeSession, turns: usize) {
                 "**Finding the walker**\n\nThe tree walk for {n} is probably in src/{n}.rs."
             ),
         });
-        let matches: Vec<String> = (0..20).map(|i| format!("src/{n}.rs:{i}: match")).collect();
+        let matches: Vec<String> = (0..60).map(|i| format!("src/{n}.rs:{i}: match")).collect();
         // A run of tool calls, as agents make them.
         for (k, (kind, title)) in [
             (ToolKind::Read, format!("Read src/{n}.rs")),
             (ToolKind::Search, format!("rg -n pattern src/{n}.rs")),
-            (ToolKind::Execute, format!("cargo test walk_{n}")),
+            // A heredoc, so the title runs over several lines.
+            (
+                ToolKind::Execute,
+                format!("python3 - <<'EOF'\nprint(walk({n}))\nEOF"),
+            ),
         ]
         .into_iter()
         .enumerate()
