@@ -10,6 +10,7 @@ mod background;
 mod composer;
 mod draft;
 mod kinetic;
+mod project_picker;
 mod repo;
 mod session_list;
 mod session_settings;
@@ -46,8 +47,10 @@ use crate::{
 gpui_kit::actions!(
     rho_ui,
     [
-        /// Start a session in the launch workspace.
+        /// Start a session in the project on screen, or the last one used.
         NewSession,
+        /// Start a session, choosing its project first.
+        NewSessionIn,
         /// Stop the running turn in the focused session.
         StopTurn,
         /// Open the settings screen.
@@ -175,6 +178,7 @@ fn init(cx: &mut App) {
     cx.set_global(TurnTimes::default());
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewSession, Some("RhoApp")),
+        KeyBinding::new("ctrl-shift-n", NewSessionIn, Some("RhoApp")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
         KeyBinding::new("escape", CloseSettings, Some("SettingsView")),

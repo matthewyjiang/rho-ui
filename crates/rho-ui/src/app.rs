@@ -33,7 +33,7 @@ use crate::{
     shelf::Shelves,
     sidebar::{SidebarEvent, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
-    NewSession, OpenSettings,
+    NewSession, NewSessionIn, OpenSettings,
 };
 
 /// How often the sidebar asks the daemon which sessions have work under
@@ -99,6 +99,8 @@ pub(crate) struct RhoApp {
     /// is expected, and answered by connecting again.
     restarting: bool,
     workspaces: Entity<Workspaces>,
+    /// Where the last new session started, for the next one.
+    last_project: Option<PathBuf>,
     sidebar: Entity<SidebarView>,
     /// Sessions opened in this run. A handful at most, so lookups by ID scan.
     sessions: Vec<OpenSession>,
@@ -150,6 +152,7 @@ impl RhoApp {
             epoch: 0,
             restarting: false,
             workspaces,
+            last_project: None,
             sidebar,
             sessions: Vec::new(),
             pane: Pane::Empty,
@@ -362,20 +365,32 @@ impl RhoApp {
         });
     }
 
+    /// Where a new session starts: in the project of the session on screen,
+    /// else where the last new session started, else the launch directory.
+    fn new_session_cwd(&self, cx: &App) -> PathBuf {
+        match &self.pane {
+            Pane::Session(view) => view.read(cx).live().cwd,
+            Pane::Empty | Pane::Draft { .. } => self
+                .last_project
+                .clone()
+                .unwrap_or_else(|| self.launch.workspace.clone()),
+        }
+    }
+
     /// Shows a draft for a new session and opens the session right away; see
     /// [`DraftView`].
     pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.daemon().is_none() {
             return;
         }
+        let cwd = self.new_session_cwd(cx);
         // An open draft is reused, so its text and settings survive.
         let pane = std::mem::replace(&mut self.pane, Pane::Empty);
         let pane = match pane {
             Pane::Draft { .. } => pane,
             Pane::Empty | Pane::Session(_) => {
-                let cwd = self.launch.workspace.clone();
-                let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
-                let view = cx.new(|cx| DraftView::new(cwd, workspace, window, cx));
+                let workspaces = self.workspaces.clone();
+                let view = cx.new(|cx| DraftView::new(cwd, workspaces, window, cx));
                 let subscription = cx.subscribe_in(
                     &view,
                     window,
@@ -389,7 +404,7 @@ impl RhoApp {
                                 cx,
                             );
                         }
-                        DraftEvent::Retry => this.open_draft_session(draft, window, cx),
+                        DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
                     },
                 );
                 self.open_draft_session(&view, window, cx);
@@ -400,6 +415,14 @@ impl RhoApp {
             }
         };
         self.show(pane, window, cx);
+    }
+
+    /// Shows a new session's draft with its project list open.
+    fn new_session_in(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.new_session(window, cx);
+        if let Pane::Draft { view, .. } = &self.pane {
+            view.update(cx, |draft, cx| draft.choose_project(window, cx));
+        }
     }
 
     /// The shown draft, if its session is `id`.
@@ -430,19 +453,22 @@ impl RhoApp {
         cx.spawn_in(window, async move |this, cx| {
             let setup = daemon.new_session(&cwd).await;
             let opened = this.update_in(cx, |this, window, cx| {
-                // A draft dropped meanwhile leaves the session unfollowed,
-                // and the daemon discards one that saved nothing.
+                // A draft dropped meanwhile, or moved to another project,
+                // leaves the session unfollowed, and the daemon discards one
+                // that saved nothing.
                 let draft = draft.upgrade().filter(|_| this.epoch == epoch)?;
                 match setup {
                     Ok(setup) => {
                         let session = Session::from_setup(setup);
                         let id = session.id().clone();
                         let daemon = daemon.clone();
-                        draft.update(cx, |draft, cx| draft.open(daemon, session, window, cx));
-                        Some(id)
+                        let taken = draft.update(cx, |draft, cx| {
+                            draft.open(&cwd, daemon, session, window, cx)
+                        });
+                        taken.then_some(id)
                     }
                     Err(error) => {
-                        draft.update(cx, |draft, cx| draft.fail(error.to_string(), cx));
+                        draft.update(cx, |draft, cx| draft.fail(&cwd, error.to_string(), cx));
                         None
                     }
                 }
@@ -497,6 +523,7 @@ impl RhoApp {
             return;
         };
         let cwd = draft.read(cx).cwd().to_path_buf();
+        self.last_project = Some(cwd.clone());
         let view = self.open_new_session(daemon, cwd, session, text, window, cx);
         self.set_pane(Pane::Session(view), cx);
         // Behind the settings screen, the keyboard stays there.
@@ -790,6 +817,13 @@ impl RhoApp {
             Pane::Empty | Pane::Draft { .. } => None,
         }
     }
+    /// The new session's draft the main pane shows, for UI tests.
+    pub(crate) fn draft(&self) -> Option<Entity<DraftView>> {
+        match &self.pane {
+            Pane::Draft { view, .. } => Some(view.clone()),
+            Pane::Empty | Pane::Session(_) => None,
+        }
+    }
 }
 
 impl Render for RhoApp {
@@ -800,6 +834,9 @@ impl Render for RhoApp {
             .key_context("RhoApp")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
+            .on_action(cx.listener(|this, _: &NewSessionIn, window, cx| {
+                this.new_session_in(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
             }))

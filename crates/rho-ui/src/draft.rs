@@ -5,13 +5,16 @@
 //! draft stops following its session when it goes away unused, which lets
 //! the daemon discard it, so an unused New session leaves nothing behind in
 //! the sidebar or in rho.
+//!
+//! Above the composer, a [`ProjectPicker`] lists the projects it can start
+//! in. A session's directory is fixed when it opens, so a move
+//! lets the open session go and opens another in the new directory.
 
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::Alert,
-    empty::{Empty, EmptyDescription, EmptyHeader},
     input::{InputEvent, TextareaState},
     v_flex, Sizable as _,
 };
@@ -25,10 +28,11 @@ use rho_ui_core::{Attached, Daemon, DaemonError, Session, SessionId, SessionUpda
 
 use crate::{
     composer::{self, Composer, ComposerMode},
+    project_picker::{PickerEvent, ProjectPicker},
     session_list::NEW_SESSION,
     session_settings::{SessionSettings, SettingsEvent},
     session_view::header,
-    workspaces::WorkspaceRef,
+    workspaces::{WorkspaceRef, Workspaces},
 };
 
 /// What the draft asks of the app.
@@ -36,8 +40,9 @@ pub(crate) enum DraftEvent {
     /// Show `session`, the one the draft opened, and send `text` as its first
     /// prompt.
     Start { session: Box<Session>, text: String },
-    /// The session couldn't be opened; try again.
-    Retry,
+    /// Open a session in the draft's directory: the first failed, or the
+    /// project changed.
+    OpenSession,
 }
 
 /// The draft's session.
@@ -58,7 +63,9 @@ enum SessionState {
 
 pub(crate) struct DraftView {
     cwd: PathBuf,
+    workspaces: Entity<Workspaces>,
     workspace: WorkspaceRef,
+    picker: Entity<ProjectPicker>,
     composer: Entity<TextareaState>,
     state: SessionState,
     /// The user sent while the session was opening; it goes out once open.
@@ -72,13 +79,17 @@ pub(crate) struct DraftView {
 impl EventEmitter<DraftEvent> for DraftView {}
 
 impl DraftView {
+    /// A draft for a session in `cwd`, which the user can move to any of
+    /// `workspaces`.
     pub(crate) fn new(
         cwd: PathBuf,
-        workspace: WorkspaceRef,
+        workspaces: Entity<Workspaces>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let composer = composer::new_state(window, cx);
+        let workspace = WorkspaceRef::new(&workspaces, &cwd, cx);
+        let picker = cx.new(|cx| ProjectPicker::new(&workspaces, cwd.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &composer,
@@ -89,7 +100,15 @@ impl DraftView {
                     _ => {}
                 },
             ),
-            cx.observe(workspace.table(), |_, _, cx| cx.notify()),
+            cx.observe(&workspaces, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &picker,
+                window,
+                |this, _, event: &PickerEvent, window, cx| match event {
+                    PickerEvent::Picked(cwd) => this.move_to(cwd.clone(), window, cx),
+                    PickerEvent::Dismissed => window.focus(&this.composer.focus_handle(cx), cx),
+                },
+            ),
             // An unused session goes with its draft: unfollowed and
             // unsaved, the daemon discards it.
             cx.on_release(|this, cx| {
@@ -107,7 +126,9 @@ impl DraftView {
         ];
         Self {
             cwd,
+            workspaces,
             workspace,
+            picker,
             composer,
             state: SessionState::Opening,
             queued: false,
@@ -133,14 +154,55 @@ impl DraftView {
         }
     }
 
-    /// Takes the session the app opened, and sends a waiting message.
+    /// Puts the keyboard in the project search, as Ctrl+Shift+N does.
+    pub(crate) fn choose_project(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.picker
+            .update(cx, |picker, cx| picker.focus(window, cx));
+    }
+
+    /// Moves the draft to `cwd`. The session opened for the old directory
+    /// goes, unfollowed and unsaved, and the app opens one in the new; the
+    /// text in the composer stays.
+    fn move_to(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if cwd == self.cwd || matches!(self.state, SessionState::Started) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+            return;
+        }
+        self.workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
+        self.picker
+            .update(cx, |picker, cx| picker.set_current(cwd.clone(), window, cx));
+        self.cwd = cwd;
+        if let SessionState::Open {
+            daemon, session, ..
+        } = std::mem::replace(&mut self.state, SessionState::Opening)
+        {
+            let id = session.id().clone();
+            cx.spawn(async move |_, _| {
+                let _ = daemon.detach(&id).await;
+            })
+            .detach();
+        }
+        self.error = None;
+        cx.emit(DraftEvent::OpenSession);
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Takes the session the app opened in `cwd`, and sends a waiting
+    /// message. Returns whether it took it: a session opened for a
+    /// directory the draft has left, or after another, is not wanted, and
+    /// the app lets it go.
     pub(crate) fn open(
         &mut self,
+        cwd: &Path,
         daemon: Daemon,
         session: Session,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> bool {
+        if cwd != self.cwd || !matches!(self.state, SessionState::Opening) {
+            return false;
+        }
         let settings = cx.new(|cx| {
             SessionSettings::new(
                 daemon.clone(),
@@ -162,10 +224,15 @@ impl DraftView {
             self.send(cx);
         }
         cx.notify();
+        true
     }
 
-    /// The session couldn't be opened. The text stays; Send tries again.
-    pub(crate) fn fail(&mut self, error: String, cx: &mut Context<'_, Self>) {
+    /// Opening a session in `cwd` failed. The text stays; Send tries again.
+    /// A failure for a directory the draft has left is old news.
+    pub(crate) fn fail(&mut self, cwd: &Path, error: String, cx: &mut Context<'_, Self>) {
+        if cwd != self.cwd || !matches!(self.state, SessionState::Opening) {
+            return;
+        }
         self.state = SessionState::Failed;
         self.queued = false;
         self.error = Some(error);
@@ -192,7 +259,12 @@ impl DraftView {
                     settings.sync(session.config(), window, cx);
                 });
             }
-            (Err(error), _) => self.fail(error.to_string(), cx),
+            (Err(error), _) => {
+                self.state = SessionState::Failed;
+                self.queued = false;
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
             (Ok(_), _) => {}
         }
     }
@@ -252,7 +324,7 @@ impl DraftView {
                 self.state = SessionState::Opening;
                 self.queued = true;
                 self.error = None;
-                cx.emit(DraftEvent::Retry);
+                cx.emit(DraftEvent::OpenSession);
             }
             SessionState::Started => {}
         }
@@ -292,10 +364,19 @@ impl Render for DraftView {
             .size_full()
             .child(header(NEW_SESSION.to_owned(), self.workspace.read(cx), cx))
             .child(
-                Empty::new().header(
-                    EmptyHeader::new()
-                        .description(EmptyDescription::new().child("Send a message to start.")),
-                ),
+                // The project list, centered in the space above the
+                // composer, at its width.
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .justify_center()
+                    .w_full()
+                    .max_w(rems(48.))
+                    .mx_auto()
+                    .px_4()
+                    .pt_4()
+                    .pb_4()
+                    .child(self.picker.clone()),
             )
             .child(
                 v_flex()

@@ -1469,3 +1469,78 @@ fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
     });
     assert_eq!((typed.as_str(), held), ("deleting", None));
 }
+
+/// The draft lists the projects it can start in, the most recently used
+/// first; search filters them, and choosing one opens the draft's session in
+/// that directory. A new session follows the session on screen, and a typed
+/// folder that exists is offered too.
+#[test]
+fn a_new_session_starts_in_the_project_chosen() {
+    let mut ui = Harness::start("project", Script::default());
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    let draft_in = |dir: &Path| {
+        let dir = dir.to_path_buf();
+        move |_: &Window, cx: &App, app: &RhoApp| {
+            app.draft().is_some_and(|draft| draft.read(cx).cwd() == dir)
+        }
+    };
+
+    // Nothing on screen: the draft starts in the launch directory, and
+    // lists every project under the composer's eye.
+    ui.click("new-session");
+    ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
+    ui.wait_until("the project list", |window, _, _| {
+        is_visible(window, "project-/w/a") && is_visible(window, "project-/w/b")
+    });
+    ui.act(|window, _| {
+        let (a, b) = (
+            bounds(window, "project-/w/a"),
+            bounds(window, "project-/w/b"),
+        );
+        assert!(
+            a.unwrap().origin.y < b.unwrap().origin.y,
+            "/w/a has the newest session, so it comes first"
+        );
+    });
+    ui.shot("list");
+
+    // Ctrl+Shift+N in the draft goes to the search.
+    ui.act(|window, cx| {
+        window.press("ctrl-shift-n", cx);
+        window.input("/w/b", cx);
+    });
+    ui.wait_until("the search to filter", |window, _, _| {
+        !is_visible(window, "project-/w/a") && is_visible(window, "project-/w/b")
+    });
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_until("the draft in /w/b", draft_in(Path::new("/w/b")));
+    ui.wait_until("the search to clear", |window, _, _| {
+        is_visible(window, "project-/w/a")
+    });
+    ui.shot("moved");
+
+    // The keyboard is back in the composer, and the session runs in /w/b.
+    ui.send("list files");
+    ui.wait_until("the session in /w/b", |_, cx, app| {
+        app.active_session()
+            .is_some_and(|view| view.read(cx).live().cwd == Path::new("/w/b"))
+    });
+
+    // From that session, a new one starts in its project, and a typed
+    // folder is offered.
+    let folder = std::env::temp_dir().join(format!("rho-ui-project-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("make a folder to type");
+    ui.act(|window, cx| window.press("ctrl-shift-n", cx));
+    ui.wait_until("a draft in /w/b", draft_in(Path::new("/w/b")));
+    let typed = folder.display().to_string();
+    ui.act(|window, cx| window.input(&typed, cx));
+    ui.wait_until("the typed folder", |window, _, _| {
+        is_visible(window, "project-typed")
+    });
+    ui.shot("typed");
+    ui.click("project-typed");
+    ui.wait_until("the draft in the typed folder", draft_in(&folder));
+    let _ = std::fs::remove_dir(&folder);
+}
