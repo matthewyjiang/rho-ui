@@ -10,7 +10,10 @@
 //! separate paths. [`Session::attached`] takes the response, then the events
 //! held so far, so the response always lands first.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use rho_protocol::{
     AnswerStop, CardTone, ContentBlock, JobState, SessionAttachResponse, SessionEvent,
@@ -33,12 +36,51 @@ pub struct SessionUpdate(pub(crate) SessionEvent);
 pub struct SessionSetup {
     pub(crate) id: SessionId,
     pub(crate) options: SessionOptions,
+    pub(crate) worktree: Option<Worktree>,
 }
 
 impl SessionSetup {
     /// The session this setup belongs to.
     pub fn id(&self) -> &SessionId {
         &self.id
+    }
+
+    /// The worktree the daemon added for the session, for one opened in
+    /// [`Checkout::NewWorktree`].
+    pub fn worktree(&self) -> Option<&Worktree> {
+        self.worktree.as_ref()
+    }
+}
+
+/// Where a new session works.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Checkout {
+    /// In its workspace, as it is.
+    #[default]
+    Local,
+    /// In a git worktree the daemon adds for it, on a new branch from the
+    /// repository's `HEAD`, so sessions in one repository never write the
+    /// same files. The daemon removes the worktree once it is clean and
+    /// merged, and keeps the branch.
+    NewWorktree,
+}
+
+/// A git worktree the daemon added for a session to work in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worktree {
+    pub(crate) branch: String,
+    pub(crate) path: PathBuf,
+}
+
+impl Worktree {
+    /// The branch checked out in it, new when the session opened.
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Its root directory, under the rho home.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -47,6 +89,12 @@ impl SessionSetup {
 pub struct Attached(pub(crate) Box<SessionAttachResponse>);
 
 impl Attached {
+    /// The directory the session works in: in its worktree, for one that
+    /// has one.
+    pub fn workspace(&self) -> &Path {
+        &self.0.workspace
+    }
+
     /// How long the turn under way had run when the attachment began.
     pub fn turn_elapsed(&self) -> Option<Duration> {
         self.0.turn_elapsed_ms.map(Duration::from_millis)

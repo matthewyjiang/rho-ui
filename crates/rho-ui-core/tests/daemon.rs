@@ -7,9 +7,9 @@ use std::{path::Path, time::Duration};
 use futures::FutureExt;
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    BackgroundKind, BackgroundStatus, ChoiceKind, ConfigKind, ConfigValue, Daemon, DaemonError,
-    DaemonEvent, DaemonEvents, DaemonTarget, Entry, JobActivity, RunState, Session, SessionId,
-    Unsteered,
+    BackgroundKind, BackgroundStatus, Checkout, ChoiceKind, ConfigKind, ConfigValue, Daemon,
+    DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry, JobActivity, RunState, Session,
+    SessionId, Unsteered,
 };
 use smol::block_on;
 
@@ -52,7 +52,7 @@ async fn until(events: &mut DaemonEvents, session: &mut Session, done: impl Fn(&
 /// Opens a new session and follows it.
 async fn new_session(daemon: &Daemon) -> Session {
     let setup = daemon
-        .new_session(Path::new("/w/a"))
+        .new_session(Path::new("/w/a"), Checkout::Local)
         .await
         .expect("the fake opens a session");
     let mut session = Session::from_setup(setup);
@@ -105,6 +105,24 @@ fn a_prompt_runs_a_turn_through_an_approval() {
         let usage = session.usage().unwrap();
         assert_eq!((usage.used(), usage.size()), (2500, Some(10_000)));
         assert_eq!(usage.cost_usd(), Some(0.01));
+    });
+}
+
+/// A session asked for a new worktree names it, and works in it.
+#[test]
+fn a_new_worktree_session_works_in_its_worktree() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let setup = daemon
+            .new_session(Path::new("/w/a"), Checkout::NewWorktree)
+            .await
+            .expect("the fake adds a worktree");
+        let worktree = setup.worktree().cloned().expect("the setup names it");
+        assert!(worktree.branch().starts_with("rho/a-"));
+        let id = setup.id().clone();
+        let attached = daemon.attach(&id).await.expect("the fake attaches");
+        assert_eq!(attached.workspace(), worktree.path());
     });
 }
 

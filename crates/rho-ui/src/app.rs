@@ -27,6 +27,7 @@ use rho_ui_core::{
 use crate::{
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
+    projects::Projects,
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
@@ -93,6 +94,8 @@ pub(crate) struct RhoApp {
     /// is expected, and answered by connecting again.
     restarting: bool,
     workspaces: Entity<Workspaces>,
+    /// The projects a new session can start in.
+    projects: Entity<Projects>,
     /// Where the last new session started, for the next one.
     last_project: Option<PathBuf>,
     sidebar: Entity<SidebarView>,
@@ -116,16 +119,19 @@ pub(crate) struct RhoApp {
 }
 
 impl RhoApp {
-    /// `shelves` holds the settled and snoozed marks; see [`Shelves::load`].
+    /// `shelves` holds the settled and snoozed marks, and `projects` the
+    /// user's projects; see [`Shelves::load`] and [`Projects::load`].
     pub(crate) fn new(
         launch: LaunchConfig,
         shelves: Shelves,
+        projects: Projects,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let workspaces = cx.new(Workspaces::new);
+        let projects = cx.new(|_| projects);
         let sidebar = cx.new(|cx| SidebarView::new(workspaces.clone(), shelves, window, cx));
         let sidebar_subscription = cx.subscribe_in(
             &sidebar,
@@ -145,6 +151,7 @@ impl RhoApp {
             epoch: 0,
             restarting: false,
             workspaces,
+            projects,
             last_project: None,
             sidebar,
             sessions: Vec::new(),
@@ -381,16 +388,17 @@ impl RhoApp {
         let pane = match pane {
             Pane::Draft { .. } => pane,
             Pane::Empty | Pane::Session(_) => {
-                let workspaces = &self.workspaces;
-                let view = cx.new(|cx| DraftView::new(cwd, workspaces, window, cx));
+                let (workspaces, projects) = (&self.workspaces, &self.projects);
+                let view = cx.new(|cx| DraftView::new(cwd, workspaces, projects, window, cx));
                 let subscription = cx.subscribe_in(
                     &view,
                     window,
                     |this, draft, event: &DraftEvent, window, cx| match event {
-                        DraftEvent::Start { session, text } => {
+                        DraftEvent::Start { session, cwd, text } => {
                             this.start_session(
                                 draft,
                                 (**session).clone(),
+                                cwd.clone(),
                                 text.clone(),
                                 window,
                                 cx,
@@ -439,11 +447,11 @@ impl RhoApp {
         let Some(daemon) = self.daemon().cloned() else {
             return;
         };
-        let (cwd, request) = draft.read(cx).request();
+        let (cwd, checkout, request) = draft.read(cx).request(cx);
         let draft = draft.downgrade();
         let epoch = self.epoch;
         cx.spawn_in(window, async move |this, cx| {
-            let setup = daemon.new_session(&cwd).await;
+            let setup = daemon.new_session(&cwd, checkout).await;
             let opened = this.update_in(cx, |this, window, cx| {
                 // A draft dropped meanwhile, or moved to another project,
                 // leaves the session unfollowed, and the daemon discards one
@@ -453,10 +461,13 @@ impl RhoApp {
                     .filter(|draft| this.epoch == epoch && draft.read(cx).awaits(request))?;
                 match setup {
                     Ok(setup) => {
+                        let worktree = setup.worktree().cloned();
                         let session = Session::from_setup(setup);
                         let id = session.id().clone();
                         let daemon = daemon.clone();
-                        draft.update(cx, |draft, cx| draft.open(daemon, session, window, cx));
+                        draft.update(cx, |draft, cx| {
+                            draft.open(daemon, session, worktree, window, cx);
+                        });
                         Some(id)
                     }
                     Err(error) => {
@@ -501,12 +512,13 @@ impl RhoApp {
         }
     }
 
-    /// Shows `draft`'s session in its own view and sends `text` as its first
-    /// prompt.
+    /// Shows `draft`'s session, which works in `cwd`, in its own view and
+    /// sends `text` as its first prompt.
     fn start_session(
         &mut self,
         draft: &Entity<DraftView>,
         session: Session,
+        cwd: PathBuf,
         text: String,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -514,8 +526,8 @@ impl RhoApp {
         let Some(daemon) = self.daemon().cloned() else {
             return;
         };
-        let cwd = draft.read(cx).cwd().to_path_buf();
-        self.last_project = Some(cwd.clone());
+        // The project, not a worktree the daemon added in it.
+        self.last_project = Some(draft.read(cx).cwd().to_path_buf());
         let view = self.open_new_session(daemon, cwd, session, text, window, cx);
         self.set_pane(Pane::Session(view), cx);
         self.focus_pane(window, cx);
@@ -797,6 +809,10 @@ impl RhoApp {
             Pane::Draft { view, .. } => Some(view.clone()),
             Pane::Empty | Pane::Session(_) => None,
         }
+    }
+    /// The user's projects, for UI tests.
+    pub(crate) fn projects<'a>(&self, cx: &'a App) -> &'a [PathBuf] {
+        self.projects.read(cx).roots()
     }
 }
 

@@ -11,6 +11,10 @@ pub(crate) struct Repo {
     /// The checked-out branch, or a short commit hash when detached.
     /// `None` outside a git repository.
     pub(crate) branch: Option<String>,
+    /// The project the workspace belongs to: the repository's main checkout,
+    /// so a linked worktree or a subfolder names the same project as the
+    /// checkout itself. Outside a git repository, the folder.
+    pub(crate) root: PathBuf,
 }
 
 impl Repo {
@@ -46,6 +50,7 @@ pub(crate) fn folder(cwd: &Path) -> Repo {
     Repo {
         name: folder_name(cwd),
         branch: None,
+        root: cwd.to_path_buf(),
     }
 }
 
@@ -83,7 +88,13 @@ pub(crate) fn inspect(cwd: &Path) -> Repo {
     let branch = std::fs::read_to_string(git_dir.join("HEAD"))
         .ok()
         .and_then(|head| branch_name(&head));
-    Repo { name, branch }
+    // The main checkout holds the common dir as its `.git`. A bare
+    // repository has no main checkout, so its worktree stands alone.
+    let root = common_dir
+        .parent()
+        .filter(|_| common_dir.file_name().is_some_and(|name| name == ".git"))
+        .map_or(work_tree, Path::to_path_buf);
+    Repo { name, branch, root }
 }
 
 /// The work tree root and git dir for `start`, searching upward. `.git` is a
@@ -149,6 +160,29 @@ fn url_name(url: &str) -> Option<String> {
     })
 }
 
+/// For tests: a checkout `project` with a linked worktree `wt` beside it,
+/// under `dir`, made of bare `.git` files. Returns both folders; the
+/// worktree has a `src` subfolder and the checkout a `docs` one.
+#[cfg(test)]
+pub(crate) fn fake_worktree(dir: &Path) -> (PathBuf, PathBuf) {
+    let main = dir.join("project");
+    let tree = dir.join("wt");
+    let git = main.join(".git");
+    std::fs::create_dir_all(git.join("worktrees/wt")).unwrap();
+    std::fs::create_dir_all(tree.join("src")).unwrap();
+    std::fs::create_dir_all(main.join("docs")).unwrap();
+    std::fs::write(git.join("config"), "[core]\n").unwrap();
+    std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(git.join("worktrees/wt/HEAD"), "ref: refs/heads/feature\n").unwrap();
+    std::fs::write(git.join("worktrees/wt/commondir"), "../..\n").unwrap();
+    std::fs::write(
+        tree.join(".git"),
+        format!("gitdir: {}\n", git.join("worktrees/wt").display()),
+    )
+    .unwrap();
+    (main, tree)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +191,7 @@ mod tests {
         Repo {
             name: name.to_owned(),
             branch: None,
+            root: PathBuf::from("/"),
         }
     }
 
@@ -198,37 +233,27 @@ mod tests {
         );
     }
 
-    /// A linked worktree: `.git` file pointing into the main repository.
+    /// A linked worktree: `.git` file pointing into the main repository. It
+    /// and any subfolder belong to the main checkout's project.
     #[test]
     fn linked_worktrees_use_the_main_repository() {
         let root = std::env::temp_dir().join(format!("rho-ui-repo-test-{}", std::process::id()));
-        let main = root.join("project");
-        let tree = root.join("wt");
-        let git = main.join(".git");
-        std::fs::create_dir_all(git.join("worktrees/wt")).unwrap();
-        std::fs::create_dir_all(tree.join("src")).unwrap();
-        std::fs::write(git.join("config"), "[core]\n").unwrap();
-        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        std::fs::write(git.join("worktrees/wt/HEAD"), "ref: refs/heads/feature\n").unwrap();
-        std::fs::write(git.join("worktrees/wt/commondir"), "../..\n").unwrap();
-        std::fs::write(
-            tree.join(".git"),
-            format!("gitdir: {}\n", git.join("worktrees/wt").display()),
-        )
-        .unwrap();
+        let (main, tree) = fake_worktree(&root);
 
         assert_eq!(
-            inspect(&main),
+            inspect(&main.join("docs")),
             Repo {
                 name: "project".into(),
-                branch: Some("main".into())
+                branch: Some("main".into()),
+                root: main.clone(),
             }
         );
         assert_eq!(
             inspect(&tree.join("src")),
             Repo {
                 name: "project".into(),
-                branch: Some("feature".into())
+                branch: Some("feature".into()),
+                root: main.canonicalize().unwrap(),
             }
         );
         std::fs::remove_dir_all(&root).unwrap();

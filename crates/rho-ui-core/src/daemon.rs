@@ -4,7 +4,7 @@
 //! ```ignore
 //! let target = DaemonTarget::rho("rho").expect("a rho home");
 //! let (daemon, mut events) = Daemon::connect(target).await?;
-//! let mut session = Session::from_setup(daemon.new_session(&cwd).await?);
+//! let mut session = Session::from_setup(daemon.new_session(&cwd, Checkout::Local).await?);
 //! session.attached(daemon.attach(session.id()).await?);
 //! session.turn_began(&daemon.prompt(session.id(), "hello").await?);
 //! while let Some(event) = events.recv().await { /* route by session id */ }
@@ -37,7 +37,7 @@ use crate::{
     background::BackgroundId,
     input::{InputChoice, InputId},
     options::{change, config_options, ConfigOption, ConfigValue},
-    session::{Attached, SessionSetup, SessionUpdate, SteerId, TurnId},
+    session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
 };
 
 /// How to reach the daemon.
@@ -540,16 +540,23 @@ impl Daemon {
         Ok(list.jobs.into_iter().filter_map(Job::from_wire).collect())
     }
 
-    /// Opens a new session in `cwd`. Nothing follows it yet: create its
-    /// [`crate::Session`], then [`Self::attach`]. Until its first prompt
-    /// the session is saved nowhere, and the daemon discards it once no
-    /// client follows it.
+    /// Opens a new session in `cwd`, or in a new worktree of the
+    /// repository `cwd` is in, as `checkout` says. Nothing follows it yet:
+    /// create its [`crate::Session`], then [`Self::attach`]. Until its
+    /// first prompt the session is saved nowhere, and the daemon discards
+    /// it once no client follows it, with its worktree when that is still
+    /// clean.
     ///
     /// # Errors
     ///
     /// Fails if the daemon cannot open the session, as when its model's
-    /// provider needs a sign-in, or the connection is gone.
-    pub async fn new_session(&self, cwd: &Path) -> Result<SessionSetup, DaemonError> {
+    /// provider needs a sign-in, `cwd` is in no git repository for a new
+    /// worktree, or the connection is gone.
+    pub async fn new_session(
+        &self,
+        cwd: &Path,
+        checkout: Checkout,
+    ) -> Result<SessionSetup, DaemonError> {
         let params = SessionNewParams {
             cwd: cwd.to_path_buf(),
             environment: ClientEnvironment::of_this_process(),
@@ -557,12 +564,16 @@ impl Daemon {
             setup: session_setup(),
             parent: None,
             grant: None,
-            worktree: false,
+            worktree: checkout == Checkout::NewWorktree,
         };
         let response = self.client.request::<methods::SessionNew>(&params).await?;
         Ok(SessionSetup {
             id: response.session.into(),
             options: response.options,
+            worktree: response.worktree.map(|worktree| Worktree {
+                branch: worktree.branch,
+                path: worktree.path,
+            }),
         })
     }
 

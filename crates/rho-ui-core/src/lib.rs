@@ -20,8 +20,8 @@ pub use options::{
     CommandInfo, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue, FAST_MODE_ID,
 };
 pub use session::{
-    Attached, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus, RunState, Session,
-    SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent, ToolKind, ToolStatus, TurnId,
-    Usage,
+    Attached, Checkout, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus, RunState,
+    Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent, ToolKind, ToolStatus,
+    TurnId, Usage, Worktree,
 };
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};

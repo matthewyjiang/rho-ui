@@ -6,7 +6,7 @@ use gpui_kit::test::TestWindowExt as _;
 use rho_ui_core::{BackgroundStatus, DaemonTarget, Entry, RunState, Session, ToolStatus};
 
 use super::{is_visible, labels, Harness};
-use crate::shelf::Shelves;
+use crate::{projects::Projects, shelf::Shelves};
 
 /// The app against a real rho daemon and model, not a pass/fail unit test:
 /// it proves the wire works end to end, and saves screenshots. It starts
@@ -24,7 +24,13 @@ fn live_daemon() {
 
     let rho = std::env::var("RHO_UI_LIVE_RHO").expect("RHO_UI_LIVE_RHO names a rho 3 program");
     let target = DaemonTarget::rho(rho).expect("RHO_HOME or HOME names the rho home");
-    let mut ui = Harness::open("live", target, None, Shelves::default());
+    let mut ui = Harness::open(
+        "live",
+        target,
+        None,
+        Shelves::default(),
+        Projects::default(),
+    );
     ui.wait_within(TURN, "the daemon", |window, _, _| {
         is_visible(window, "new-session")
     });
@@ -124,7 +130,13 @@ const BACKGROUND_TURN: Duration = Duration::from_secs(240);
 fn live_background() {
     let rho = std::env::var("RHO_UI_LIVE_RHO").expect("RHO_UI_LIVE_RHO names a rho 3 program");
     let target = DaemonTarget::rho(rho).expect("RHO_HOME or HOME names the rho home");
-    let mut ui = Harness::open("live-bg", target, None, Shelves::default());
+    let mut ui = Harness::open(
+        "live-bg",
+        target,
+        None,
+        Shelves::default(),
+        Projects::default(),
+    );
     let long = start_two_processes(&mut ui);
     stop_and_follow_the_daemons_turn(&mut ui, long);
     follow_the_exit(&mut ui);

@@ -19,14 +19,15 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    BackgroundStatus, ConfigKind, Daemon, DaemonTarget, Entry, RunState, Session, SessionId,
-    ToolStatus,
+    BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget, Entry, RunState, Session,
+    SessionId, ToolStatus,
 };
 
 use gpui_kit::component::ActiveTheme as _;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    projects::Projects,
     settings::{Settings, UiScale},
     shelf::Shelves,
     turn_times::TurnTimes,
@@ -60,7 +61,13 @@ impl Harness {
     /// [`Self::start`] with the given settled and snoozed state.
     fn start_with(name: &'static str, script: Script, shelves: Shelves) -> Self {
         let daemon = FakeDaemon::start(script);
-        Self::open(name, daemon.target(), Some(daemon), shelves)
+        Self::open(
+            name,
+            daemon.target(),
+            Some(daemon),
+            shelves,
+            Projects::default(),
+        )
     }
 
     /// Opens the app at 1200x800, reaching its daemon as `target` says.
@@ -69,6 +76,7 @@ impl Harness {
         target: DaemonTarget,
         daemon: Option<FakeDaemon>,
         shelves: Shelves,
+        projects: Projects,
     ) -> Self {
         let mut cx = HeadlessAppContext::with_platform(
             gpui_kit::platform::current_platform(true).text_system(),
@@ -96,8 +104,9 @@ impl Harness {
                         ..Default::default()
                     },
                     cx,
-                    // In-memory marks: tests never touch the user's state file.
-                    |window, cx| cx.new(|cx| RhoApp::new(launch, shelves, window, cx)),
+                    // In-memory marks and projects: tests never touch the
+                    // user's state files.
+                    |window, cx| cx.new(|cx| RhoApp::new(launch, shelves, projects, window, cx)),
                 )
             })
             .expect("open the app window");
@@ -1039,7 +1048,13 @@ fn a_missing_rho_shows_an_error_and_retry() {
         home: PathBuf::from("/nonexistent/rho-home"),
         rho: PathBuf::from("/nonexistent/rho"),
     };
-    let mut ui = Harness::open("missing", target, None, Shelves::default());
+    let mut ui = Harness::open(
+        "missing",
+        target,
+        None,
+        Shelves::default(),
+        Projects::default(),
+    );
     ui.wait_until("the retry button", |window, _, _| {
         is_visible(window, "retry-daemon")
     });
@@ -1496,25 +1511,28 @@ fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
     assert_eq!((typed.as_str(), held), ("deleting", None));
 }
 
-/// The draft lists the projects it can start in, the most recently used
-/// first; search filters them, and choosing one opens the draft's session in
-/// that directory. A new session follows the session on screen, and a typed
-/// folder that exists is offered too.
+/// The draft lists the user's projects, not every folder rho has sessions
+/// in, the most recently used first. Search filters them, and choosing one
+/// opens the draft's session there. The draft's project is checked and the
+/// keyboard's row shows only while the search has the keyboard.
 #[test]
-fn a_new_session_starts_in_the_project_chosen() {
-    let mut ui = Harness::start("project", Script::default());
+fn a_new_session_starts_in_one_of_the_users_projects() {
+    let launch_row: &'static str = format!("project-{}", std::env::temp_dir().display()).leak();
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open(
+        "project",
+        daemon.target(),
+        Some(daemon),
+        Shelves::owning(["s1", "old"]),
+        // Added in this order; /w/a has the newer session.
+        Projects::of(["/w/b", "/w/a"]),
+    );
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-s1")
     });
-    let draft_in = |dir: &Path| {
-        let dir = dir.to_path_buf();
-        move |_: &Window, cx: &App, app: &RhoApp| {
-            app.draft().is_some_and(|draft| draft.read(cx).cwd() == dir)
-        }
-    };
 
-    // Nothing on screen: the draft starts in the launch directory, and
-    // lists every project under the composer's eye.
+    // Nothing on screen: the draft starts in the launch directory, which
+    // is no project, so the list checks none and offers only the two.
     ui.click("new-session");
     ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
     ui.wait_until("the project list", |window, _, _| {
@@ -1529,62 +1547,258 @@ fn a_new_session_starts_in_the_project_chosen() {
             a.unwrap().origin.y < b.unwrap().origin.y,
             "/w/a has the newest session, so it comes first"
         );
+        assert!(!is_visible(window, launch_row), "rho-ui adds no project");
+        assert_eq!(checked(window, "project-/w/a"), Some(false));
+    });
+    ui.cx.update(|cx| {
+        let selected = selected_project(cx, ui.app.read(cx));
+        assert_eq!(selected, None, "the keyboard is elsewhere");
     });
     ui.shot("list");
 
-    // Ctrl+Shift+N in the draft goes to the search. A path that names a
-    // known project, however spelled, shows that project.
-    let launch = std::env::temp_dir();
-    let launch_row: &'static str = format!("project-{}", launch.display()).leak();
-    let spelled = format!("{}/.", launch.display());
+    // Hovering a row offers Remove in place of its age, and selects
+    // nothing.
+    ui.act(|window, cx| window.hover("project-/w/b", cx));
+    ui.wait_until("Remove on the hovered row", |window, _, _| {
+        is_visible(window, "project-remove")
+    });
+    ui.cx
+        .update(|cx| assert_eq!(selected_project(cx, ui.app.read(cx)), None));
+    ui.shot("hover");
+
+    // Ctrl+Shift+N in the draft goes to the search, which filters.
     ui.act(|window, cx| {
         window.press("ctrl-shift-n", cx);
-        window.input(&spelled, cx);
-    });
-    ui.wait_until("the launch project for its path", |window, _, _| {
-        is_visible(window, launch_row) && !is_visible(window, "project-typed")
-    });
-    ui.act(|window, cx| {
-        window.press("ctrl-a", cx);
         window.input("/w/b", cx);
     });
-    ui.wait_until("the search to filter", |window, _, _| {
-        !is_visible(window, "project-/w/a") && is_visible(window, "project-/w/b")
+    ui.wait_until("the search to filter", |window, cx, app| {
+        !is_visible(window, "project-/w/a")
+            && is_visible(window, "project-/w/b")
+            && selected_project(cx, app).as_deref() == Some("project-/w/b")
     });
     ui.act(|window, cx| window.press("enter", cx));
     ui.wait_until("the draft in /w/b", draft_in(Path::new("/w/b")));
     ui.wait_until("the search to clear", |window, _, _| {
         is_visible(window, "project-/w/a")
     });
+    // Back in the composer: /w/b is checked, and no row looks chosen
+    // besides it.
+    ui.act(|window, _| {
+        assert_eq!(checked(window, "project-/w/b"), Some(true));
+        assert_eq!(checked(window, "project-/w/a"), Some(false));
+    });
+    ui.cx
+        .update(|cx| assert_eq!(selected_project(cx, ui.app.read(cx)), None));
     ui.shot("moved");
 
-    // The keyboard is back in the composer, and the session runs in /w/b.
+    // The session runs in /w/b.
     ui.send("list files");
     ui.wait_until("the session in /w/b", |_, cx, app| {
         app.active_session()
             .is_some_and(|view| view.read(cx).live().cwd == Path::new("/w/b"))
     });
 
-    // From that session, a new one starts in its project, and a typed
-    // folder is offered.
-    let folder = std::env::temp_dir().join(format!("rho-ui-project-{}", std::process::id()));
-    std::fs::create_dir_all(&folder).expect("make a folder to type");
+    // From that session, a new one starts in its project, with the search
+    // on the checked row.
     ui.act(|window, cx| window.press("ctrl-shift-n", cx));
     ui.wait_until("a draft in /w/b", draft_in(Path::new("/w/b")));
-    // Typed a key at a time, the path names nothing until its last key;
-    // then the folder is offered, selected, and Enter takes it.
-    let typed = folder.display().to_string();
+    ui.wait_until("the keyboard on /w/b", |_, cx, app| {
+        selected_project(cx, app).as_deref() == Some("project-/w/b")
+    });
+}
+
+/// A typed path to a worktree adds its repository's project, not the
+/// worktree, and Remove takes a project off the list without picking it.
+#[test]
+fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
+    let dir = std::env::temp_dir().join(format!("rho-ui-projects-{}", std::process::id()));
+    let (main, tree) = crate::repo::fake_worktree(&dir);
+    let main = main.canonicalize().expect("the checkout exists");
+    let main_row: &'static str = format!("project-{}", main.display()).leak();
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open(
+        "project-add",
+        daemon.target(),
+        Some(daemon),
+        Shelves::owning(["s1", "old"]),
+        Projects::of(["/w/b", "/w/a"]),
+    );
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.act(|window, cx| window.press("ctrl-shift-n", cx));
+    ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
+
+    // A worktree's path offers its repository's project. Typed a key at a
+    // time, the path names nothing until its last key; then the project is
+    // offered, selected, and Enter adds it and moves there.
+    let typed = tree.join("src").display().to_string();
     let (head, last) = typed.split_at(typed.len() - 1);
     ui.act(|window, cx| window.input(head, cx));
     ui.wait_until("nothing to match the partial path", |window, _, _| {
         !is_visible(window, "project-typed") && !is_visible(window, "project-/w/b")
     });
     ui.act(|window, cx| window.input(last, cx));
-    ui.wait_until("the typed folder", |window, _, _| {
+    ui.wait_until("the worktree's project, selected", |window, cx, app| {
         is_visible(window, "project-typed")
+            && selected_project(cx, app).as_deref() == Some("project-typed")
     });
     ui.shot("typed");
     ui.act(|window, cx| window.press("enter", cx));
-    ui.wait_until("the draft in the typed folder", draft_in(&folder));
-    let _ = std::fs::remove_dir(&folder);
+    ui.wait_until("the draft in the checkout", draft_in(&main));
+    ui.wait_until("the checkout listed and checked", |window, _, _| {
+        checked(window, main_row) == Some(true)
+    });
+    ui.cx.update(|cx| {
+        let roots = ui.app.read(cx).projects(cx).to_vec();
+        assert_eq!(roots, [PathBuf::from("/w/b"), "/w/a".into(), main.clone()]);
+    });
+
+    // Remove takes /w/a off the list without picking it.
+    ui.act(|window, cx| window.hover("project-/w/a", cx));
+    ui.wait_until("Remove on /w/a", |window, _, _| {
+        is_visible(window, "project-remove")
+    });
+    ui.click("project-remove");
+    ui.wait_until("/w/a gone", |window, _, _| {
+        !is_visible(window, "project-/w/a")
+    });
+    ui.wait_until("the draft still in the checkout", draft_in(&main));
+    ui.cx.update(|cx| {
+        let roots = ui.app.read(cx).projects(cx).to_vec();
+        assert_eq!(roots, [PathBuf::from("/w/b"), main.clone()]);
+    });
+    ui.shot("removed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// In a git project, the project list offers a new worktree: choosing it
+/// opens the draft's session in a worktree the daemon adds, which the
+/// list names by its branch, and the session then runs there. Back to
+/// Local, or moved to a folder git doesn't track, the session works in the
+/// checkout again.
+#[test]
+fn a_new_session_can_work_in_a_new_worktree() {
+    let dir = std::env::temp_dir().join(format!("rho-ui-worktree-{}", std::process::id()));
+    let (main, _) = crate::repo::fake_worktree(&dir);
+    let main_row: &'static str = format!("project-{}", main.display()).leak();
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open(
+        "worktree",
+        daemon.target(),
+        Some(daemon),
+        Shelves::default(),
+        Projects::of([main.clone(), "/w/a".into()]),
+    );
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    ui.click("new-session");
+    ui.wait_until("the project", |window, _, _| is_visible(window, main_row));
+    ui.click(main_row);
+    ui.wait_until("the draft in the project", draft_in(&main));
+    let branch = |cx: &App, app: &RhoApp| {
+        app.draft()
+            .and_then(|draft| draft.read(cx).worktree_branch().map(str::to_owned))
+    };
+
+    ui.click("project-checkout");
+    click_label(&mut ui, "New worktree");
+    ui.wait_until("a session in a new worktree", |_, cx, app| {
+        branch(cx, app).is_some_and(|branch| branch.starts_with("rho/project-"))
+    });
+    ui.shot("chosen");
+
+    let local = |dir: &Path| {
+        let dir = dir.to_path_buf();
+        move |_: &Window, cx: &App, app: &RhoApp| {
+            app.draft().is_some_and(|draft| {
+                let draft = draft.read(cx);
+                draft.cwd() == dir
+                    && draft.session_id().is_some()
+                    && draft.worktree_branch().is_none()
+                    && draft.request(cx).1 == Checkout::Local
+            })
+        }
+    };
+    ui.click("project-checkout");
+    click_label(&mut ui, "Local");
+    ui.wait_until("a session in the checkout", local(&main));
+
+    // /w/a is no git repository, so the draft goes back to Local there.
+    ui.click("project-checkout");
+    click_label(&mut ui, "New worktree");
+    ui.wait_until("the worktree", |_, cx, app| branch(cx, app).is_some());
+    ui.click("project-/w/a");
+    ui.wait_until("a local session in /w/a", local(Path::new("/w/a")));
+    ui.click(main_row);
+    ui.wait_until("a local session in the project", local(&main));
+
+    ui.click("project-checkout");
+    click_label(&mut ui, "New worktree");
+    ui.wait_until("the worktree again", |_, cx, app| branch(cx, app).is_some());
+    ui.send("list files");
+    ui.wait_until("the session in its worktree", |_, cx, app| {
+        app.active_session().is_some_and(|view| {
+            let cwd = view.read(cx).live().cwd;
+            cwd.parent() == Some(Path::new("/rho/worktrees"))
+                && cwd.to_string_lossy().contains("/project-")
+        })
+    });
+    ui.shot("running");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether the app shows a draft for a session in `dir`.
+fn draft_in(dir: &Path) -> impl Fn(&Window, &App, &RhoApp) -> bool {
+    let dir = dir.to_path_buf();
+    move |_, cx, app| app.draft().is_some_and(|draft| draft.read(cx).cwd() == dir)
+}
+
+/// Whether project row `id` shows the draft's check.
+fn checked(window: &Window, id: &'static str) -> Option<bool> {
+    window.try_find(id).and_then(|element| element.checked())
+}
+
+/// The project row the draft's keyboard selection is on, if any.
+fn selected_project(cx: &App, app: &RhoApp) -> Option<String> {
+    app.draft()?.read(cx).selected_project(cx)
+}
+
+/// With more projects than it shows, the list ends on a whole row at any UI
+/// scale: none shows cut off at its foot.
+#[test]
+fn the_project_list_shows_whole_rows() {
+    let daemon = FakeDaemon::start(Script::default());
+    let projects = ["/w/a", "/w/b", "/w/c", "/w/d", "/w/e", "/w/f", "/w/g"];
+    let mut ui = Harness::open(
+        "project-rows",
+        daemon.target(),
+        Some(daemon),
+        Shelves::default(),
+        Projects::of(projects),
+    );
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    ui.click("new-session");
+    for scale in [100, 125] {
+        ui.cx.update(|cx| {
+            let mut settings = cx.global::<Settings>().clone();
+            settings.ui_scale = UiScale::from_percent(scale).expect("the scale is on offer");
+            settings.apply(cx);
+        });
+        ui.wait_until("the project list", |window, _, _| {
+            is_visible(window, "project-/w/a")
+        });
+        // /w/a and /w/b have sessions; the rest follow by name.
+        ui.act(|window, _| {
+            assert!(is_visible(window, "project-/w/e"), "five rows at {scale}%");
+            assert!(
+                !is_visible(window, "project-/w/f"),
+                "no sixth row peeks out at {scale}%"
+            );
+        });
+    }
+    ui.shot("scaled");
 }

@@ -1,7 +1,7 @@
 //! The fake daemon's answer to each protocol method.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
@@ -20,8 +20,8 @@ use rho_protocol::{
     SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
     SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
     SessionEvent, SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
-    SessionSteerParams, SessionSteerResponse, SettingsService, StoreSelectedBy, Subscription,
-    ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
+    SessionSteerParams, SessionSteerResponse, SessionWorktree, SettingsService, StoreSelectedBy,
+    Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
 use super::{text, user_message, FakeSession, State, Turn, BACKLOG};
@@ -109,14 +109,28 @@ impl Service for Fake {
         let mut state = self.lock();
         state.new_sessions += 1;
         let id = format!("new-{}", state.new_sessions);
-        let mut session = FakeSession::new(&params.cwd.to_string_lossy(), None, 0);
+        // A worktree as the daemon names one, for a `cwd` at the top of
+        // its repository; the fake makes nothing on disk.
+        let worktree = params.worktree.then(|| {
+            let name = params.cwd.file_name().unwrap_or_default().to_string_lossy();
+            let name = format!("{name}-{:08}", state.new_sessions);
+            SessionWorktree {
+                branch: format!("rho/{name}"),
+                path: Path::new("/rho/worktrees").join(&name),
+                origin: params.cwd.clone(),
+            }
+        });
+        let cwd = worktree
+            .as_ref()
+            .map_or(&params.cwd, |worktree| &worktree.path);
+        let mut session = FakeSession::new(&cwd.to_string_lossy(), None, 0);
         session.saved = false;
         let options = session.settings.options();
         state.sessions.insert(id.clone(), session);
         Ok(SessionNewResponse {
             session: SessionId::new(id),
             options,
-            worktree: None,
+            worktree,
         })
     }
 

@@ -11,6 +11,7 @@ mod composer;
 mod draft;
 mod kinetic;
 mod project_picker;
+mod projects;
 mod repo;
 mod session_list;
 mod session_settings;
@@ -39,6 +40,7 @@ use rho_ui_core::DaemonTarget;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    projects::Projects,
     settings::Settings,
     shelf::Shelves,
     turn_times::TurnTimes,
@@ -159,7 +161,10 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         let options = window_options(cx);
         gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| RhoApp::new(launch, Shelves::load(time::now_unix()), window, cx))
+            cx.new(|cx| {
+                let shelves = Shelves::load(time::now_unix());
+                RhoApp::new(launch, shelves, Projects::load(), window, cx)
+            })
         })
         .expect("failed to open the rho-ui window");
         cx.activate(true);
