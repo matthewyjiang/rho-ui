@@ -10,6 +10,7 @@ mod options;
 mod prompt;
 mod session;
 mod timeline;
+mod tool_card;
 
 pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
 pub use daemon::{
@@ -30,3 +31,4 @@ pub use session::{
     TurnId, Usage, UserMessage, Worktree,
 };
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};
+pub use tool_card::{ToolBody, ToolCard, ToolFact};

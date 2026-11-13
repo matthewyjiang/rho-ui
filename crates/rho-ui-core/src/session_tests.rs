@@ -9,6 +9,7 @@ use crate::{
     input::InputChoice,
     options::{ConfigCategory, ConfigChoice, ConfigKind},
     prompt::{Image, ImageFormat},
+    tool_card::{ToolBody, ToolFact},
 };
 
 fn update(value: serde_json::Value) -> SessionUpdate {
@@ -171,15 +172,17 @@ fn interleaved_messages_and_tools_keep_first_seen_order() {
     assert_eq!(tool.kind(), ToolKind::Read);
 }
 
-/// The daemon sends an edit as the old and new text; viewers read a patch.
+/// The daemon sends an edit as the old and new text; viewers read a patch,
+/// which names the file from the session's workspace.
 #[test]
 fn tool_diffs_become_git_patches() {
-    let mut session = session();
+    let mut session = Session::new(SessionId::from("s1"));
+    session.attached(attach_response(JobState::Idle, 0));
     session.apply(update(
         json!({"type": "tool_call", "id": "c1", "title": "edit",
         "content": [
             {"type": "diff", "path": "/w/a.rs", "old_text": "one\ntwo\n", "new_text": "one\n2\n"},
-            {"type": "diff", "path": "/w/new.rs", "new_text": "fresh\n"},
+            {"type": "diff", "path": "/elsewhere/new.rs", "new_text": "fresh\n"},
         ]}),
     ));
     let Entry::Tool(tool) = &session.entries()[0] else {
@@ -190,18 +193,125 @@ fn tool_diffs_become_git_patches() {
         &[
             ToolContent::Diff {
                 path: PathBuf::from("/w/a.rs"),
-                patch: "diff --git a/w/a.rs b/w/a.rs\n--- a/w/a.rs\n+++ b/w/a.rs\n\
+                patch: "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
                         @@ -1,2 +1,2 @@\n one\n-two\n+2\n"
                     .to_owned(),
             },
             ToolContent::Diff {
-                path: PathBuf::from("/w/new.rs"),
-                patch: "diff --git a/w/new.rs b/w/new.rs\n--- /dev/null\n+++ b/w/new.rs\n\
-                        @@ -0,0 +1 @@\n+fresh\n"
+                path: PathBuf::from("/elsewhere/new.rs"),
+                patch: "diff --git a/elsewhere/new.rs b/elsewhere/new.rs\n--- /dev/null\n\
+                        +++ b/elsewhere/new.rs\n@@ -0,0 +1 @@\n+fresh\n"
                     .to_owned(),
             },
         ]
     );
+}
+
+/// Calls from a real rho 3 daemon, streamed and finished: each keeps the
+/// daemon's last card, which says what to show a person, while its content
+/// stays what the model read.
+#[test]
+fn recorded_tool_cards_say_what_to_show() {
+    let workspace = "/home/matthewjiang/.t3/worktrees/rho-ui/t3-27b0095d-da83f35b4b7ad271";
+    let mut session = Session::new(SessionId::from("s1"));
+    session.attached(Attached(Box::new(SessionAttachResponse {
+        workspace: PathBuf::from(workspace),
+        ..*attach_response(JobState::Idle, 0).0
+    })));
+    for line in include_str!("../tests/fixtures/tool_cards.jsonl").lines() {
+        session.apply(update(serde_json::from_str(line).unwrap()));
+    }
+    let tool = |id: &str| {
+        session
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Tool(tool) if tool.id() == id => Some(tool),
+                _ => None,
+            })
+            .expect("the fixture has the call")
+    };
+    let card = |id: &str| tool(id).card().expect("the daemon sent a card");
+
+    // An edit: its line names the file, and its diff comes from the whole
+    // texts; the receipt the model read ("edited ...; replaced 1
+    // occurrence(s)" and the file) is not for a person.
+    let edit = tool("toolu_01RghnHvEDT7oj5H9pau361o");
+    assert_eq!(edit.label(), "str_replace(crates/rho-ui/src/main.rs)");
+    assert_eq!(
+        edit.card().map(ToolCard::facts),
+        Some(
+            &[ToolFact::Changed {
+                added: 1,
+                removed: 0
+            }][..]
+        )
+    );
+    assert_eq!(edit.card().map(ToolCard::body), Some(&ToolBody::None));
+    assert!(matches!(&edit.content()[0], ToolContent::Text(text) if text.starts_with("edited ")));
+    assert!(
+        matches!(&edit.content()[1], ToolContent::Diff { patch, .. }
+            if patch.starts_with("diff --git a/crates/rho-ui/src/main.rs b/crates/rho-ui/src/main.rs\n")),
+        "named from the workspace: {:?}",
+        edit.content()[1]
+    );
+
+    // A failed command: its line is the command, its output shows without
+    // the `stdout:` and `exit code:` wrapping, and only a nonzero exit is a
+    // fact; the timeout budget is not.
+    let command = tool("toolu_01GUrshmfQYBReaMtpbZi4yD");
+    assert_eq!(command.status(), ToolStatus::Failed);
+    assert!(command
+        .label()
+        .starts_with("cd ~/.cargo/registry/src/*/gpui-base-0.9.0/src;"));
+    let card_text = |card: &ToolCard| match card.body() {
+        ToolBody::Text(text) => text.clone(),
+        other => panic!("a text body, not {other:?}"),
+    };
+    assert_eq!(
+        card(command.id()).facts(),
+        [ToolFact::Stat("exit 1".to_owned())]
+    );
+    let output = card_text(card(command.id()));
+    assert!(output.contains("pub struct Observed<E>"), "{output}");
+    assert!(
+        !output.contains("stdout:") && !output.contains("exit code"),
+        "{output}"
+    );
+
+    // A read: one line with how much it read, and nothing to open; the
+    // file it read was for the model.
+    let read = card("toolu_01LDcGvKTsB46oLXUwq5WTfF");
+    assert_eq!(
+        read.header(),
+        "read_file(crates/rho-ui/src/ui_tests.rs:296-325)"
+    );
+    assert_eq!(read.facts(), [ToolFact::Stat("32 lines".to_owned())]);
+    assert_eq!(read.body(), &ToolBody::None);
+
+    // A search: what matched, as rho lists it.
+    let search = card("toolu_01CM4t1CVpETbujQDpJJASqx");
+    assert_eq!(
+        search.facts(),
+        [ToolFact::Stat("13 matches in 2 files".to_owned())]
+    );
+    assert!(card_text(search).starts_with("crates/rho-ui/src/transcript.rs\n3 | "));
+
+    // A failure says why once, as a fact, not again as output.
+    let failed = card("call_cad01bbb216f46d5b2abbf6b2a3f2d5d");
+    assert_eq!(
+        failed.facts(),
+        [ToolFact::Error(
+            "Firecrawl search returned malformed results".to_owned()
+        )]
+    );
+    assert_eq!(failed.body(), &ToolBody::None);
+
+    // A checklist: one note per item.
+    let todo = card("call_acfc85fafd694632a0490ea6fbb9bb97");
+    assert_eq!(todo.header(), "todo");
+    assert_eq!(todo.facts().len(), 4);
+    assert!(matches!(&todo.facts()[0], ToolFact::Note(item) if item.starts_with("▸ Audit")));
 }
 
 /// A failed turn says why in its `turn_ended`; the `state` after it must not

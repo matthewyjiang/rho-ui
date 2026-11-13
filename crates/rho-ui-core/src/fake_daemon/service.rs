@@ -24,7 +24,7 @@ use rho_protocol::{
     Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
-use super::{text, FakeSession, State, Turn, BACKLOG};
+use super::{shell_card, shell_output, FakeSession, State, Turn, BACKLOG};
 
 #[derive(Debug)]
 pub(super) struct Fake {
@@ -222,7 +222,13 @@ impl Service for Fake {
         });
         session.state(JobState::Running);
         session.publish(echo(&turn_id, &params));
-        session.tool(&tool, "ls", ToolKind::Execute, ToolStatus::Pending, None);
+        session.tool(
+            &tool,
+            ("ls", ToolKind::Execute),
+            ToolStatus::Pending,
+            Vec::new(),
+            shell_card("ls", ToolStatus::Pending, None),
+        );
         session.publish(SessionEvent::InputRequested {
             request: Box::new(request),
         });
@@ -243,7 +249,13 @@ impl Service for Fake {
                     id: request.id,
                     resolution: Resolution::Withdrawn,
                 });
-                session.tool(&tool, "ls", ToolKind::Execute, ToolStatus::Failed, None);
+                session.tool(
+                    &tool,
+                    ("ls", ToolKind::Execute),
+                    ToolStatus::Failed,
+                    Vec::new(),
+                    shell_card("ls", ToolStatus::Failed, None),
+                );
             }
             session.end_turn(TurnOutcome::Cancelled, JobState::Cancelled);
         }
@@ -318,15 +330,21 @@ impl Service for Fake {
         });
         session.state(JobState::Running);
         if matches!(params.answer, InputAnswer::Deny { .. }) {
-            session.tool(&tool, "ls", ToolKind::Execute, ToolStatus::Failed, None);
-        } else {
-            let output = Some(text("a.rs\nb.rs"));
             session.tool(
                 &tool,
-                "ls",
-                ToolKind::Execute,
+                ("ls", ToolKind::Execute),
+                ToolStatus::Failed,
+                Vec::new(),
+                shell_card("ls", ToolStatus::Failed, None),
+            );
+        } else {
+            let output = "a.rs\nb.rs";
+            session.tool(
+                &tool,
+                ("ls", ToolKind::Execute),
                 ToolStatus::Completed,
-                output,
+                vec![shell_output(output)],
+                shell_card("ls", ToolStatus::Completed, Some(output)),
             );
         }
         let reply = format!("you chose {}", chosen(&params.answer));
