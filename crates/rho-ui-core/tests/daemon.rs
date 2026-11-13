@@ -7,9 +7,9 @@ use std::{path::Path, time::Duration};
 use futures::FutureExt;
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    BackgroundKind, BackgroundStatus, Checkout, ChoiceKind, ConfigKind, ConfigValue, Daemon,
-    DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry, JobActivity, RunState, Session,
-    SessionId, Unsteered,
+    BackgroundKind, BackgroundStatus, Checkout, ChoiceKind, ConfigKind, ConfigOption, ConfigValue,
+    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry, JobActivity, RunState,
+    Session, SessionId, Unsteered,
 };
 use smol::block_on;
 
@@ -123,6 +123,39 @@ fn a_new_worktree_session_works_in_its_worktree() {
         let id = setup.id().clone();
         let attached = daemon.attach(&id).await.expect("the fake attaches");
         assert_eq!(attached.workspace(), worktree.path());
+    });
+}
+
+/// A session takes another's settings, as a draft's worktree session takes
+/// the draft's.
+#[test]
+fn a_session_takes_another_sessions_settings() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let draft = new_session(&daemon).await;
+        let mode = |config: &[ConfigOption]| {
+            config
+                .iter()
+                .find(|option| option.id() == "mode")
+                .map(ConfigOption::value)
+        };
+        let planned = daemon
+            .set_config(draft.id(), "mode", ConfigValue::Select("plan".into()))
+            .await
+            .expect("the fake takes plan mode");
+        let other = Session::from_setup(
+            daemon
+                .new_session(Path::new("/w/a"), Checkout::NewWorktree)
+                .await
+                .expect("the fake opens a session"),
+        );
+        assert_ne!(mode(other.config()), mode(&planned));
+        let matched = daemon
+            .match_config(other.id(), &planned, other.config().to_vec())
+            .await
+            .expect("the fake takes the settings");
+        assert_eq!(matched, planned);
     });
 }
 

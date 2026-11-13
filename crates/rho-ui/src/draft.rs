@@ -8,10 +8,15 @@
 //!
 //! Above the composer, a [`ProjectPicker`] lists the user's projects it can
 //! start in, and chooses whether the session works in the project's
-//! checkout or in a new git worktree that rho adds for it. A
-//! session's directory is fixed when it opens, so either change lets the
-//! open session go and opens another. The daemon removes an unused draft's
-//! worktree with its session, as long as it is clean.
+//! checkout or in a new git worktree that rho adds for it. A session's
+//! directory is fixed when it opens, so a move lets the open session go and
+//! opens another in the new directory.
+//!
+//! The draft's own session always works in the checkout: it holds the
+//! settings while the user writes. A worktree is made only when the first
+//! message goes: the app then opens a session in a new worktree, gives it
+//! the draft's settings, and sends the message there, so choosing New
+//! worktree and back leaves no worktree behind.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +33,7 @@ use gpui_kit::{
     Subscription, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, Daemon, DaemonError, Session, SessionId, SessionUpdate, Worktree,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, Session, SessionId, SessionUpdate,
 };
 
 use crate::{
@@ -43,15 +48,18 @@ use crate::{
 
 /// What the draft asks of the app.
 pub(crate) enum DraftEvent {
-    /// Show `session`, the one the draft opened, which works in `cwd`, and
-    /// send `text` as its first prompt.
-    Start {
-        session: Box<Session>,
-        cwd: PathBuf,
+    /// Show `session`, the one the draft opened, and send `text` as its first
+    /// prompt.
+    Start { session: Box<Session>, text: String },
+    /// Open a session in a new worktree of the draft's directory, give it
+    /// `config`, the draft session's settings, then show it and send `text`
+    /// as its first prompt. [`DraftView::launch_failed`] says it couldn't.
+    StartInWorktree {
+        config: Vec<ConfigOption>,
         text: String,
     },
-    /// Open a session in the draft's directory as [`DraftView::request`]
-    /// says: the first failed, or the project or checkout changed.
+    /// Open a session in the draft's directory: the first failed, or the
+    /// project changed.
     OpenSession,
 }
 
@@ -62,10 +70,6 @@ enum SessionState {
     Open {
         daemon: Daemon,
         session: Box<Session>,
-        /// The worktree the daemon added for it, in a new worktree.
-        worktree: Option<Worktree>,
-        /// The directory it works in, once its attach says.
-        workspace: Option<PathBuf>,
         settings: Entity<SessionSettings>,
         _subscription: Subscription,
     },
@@ -86,6 +90,8 @@ pub(crate) struct DraftView {
     request: u64,
     /// The user sent while the session was opening; it goes out once open.
     queued: bool,
+    /// The first message went to the app to start in a new worktree.
+    launching: bool,
     /// Why opening the session, or a settings change, failed.
     error: Option<String>,
     focus_handle: FocusHandle,
@@ -123,7 +129,6 @@ impl DraftView {
                 window,
                 |this, _, event: &PickerEvent, window, cx| match event {
                     PickerEvent::Picked(cwd) => this.move_to(cwd.clone(), window, cx),
-                    PickerEvent::Checkout => this.replace_session(cx),
                     PickerEvent::Dismissed => window.focus(&this.composer.focus_handle(cx), cx),
                 },
             ),
@@ -142,6 +147,7 @@ impl DraftView {
             state: SessionState::Opening,
             request: 0,
             queued: false,
+            launching: false,
             error: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -164,17 +170,19 @@ impl DraftView {
         }
     }
 
-    /// The branch of the worktree the daemon added for the draft's
-    /// session, for UI tests.
+    /// The draft's session once open, for UI tests.
     #[cfg(test)]
-    pub(crate) fn worktree_branch(&self) -> Option<&str> {
+    pub(crate) fn session(&self) -> Option<&Session> {
         match &self.state {
-            SessionState::Open {
-                worktree: Some(worktree),
-                ..
-            } => Some(worktree.branch()),
-            _ => None,
+            SessionState::Open { session, .. } => Some(session),
+            SessionState::Opening | SessionState::Failed | SessionState::Started => None,
         }
+    }
+
+    /// Where the session will work, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn checkout(&self, cx: &App) -> Checkout {
+        self.picker.read(cx).checkout()
     }
 
     /// The project row the keyboard is on, for UI tests.
@@ -206,14 +214,8 @@ impl DraftView {
     }
 
     /// Lets the open session go, unfollowed and unsaved, and asks the app
-    /// for one as the draft now says: its project moved, or it switched
-    /// between its checkout and a new worktree.
+    /// for one in the draft's directory.
     fn replace_session(&mut self, cx: &mut Context<'_, Self>) {
-        if matches!(self.state, SessionState::Started) {
-            return;
-        }
-        self.picker
-            .update(cx, |picker, cx| picker.set_worktree_branch(None, cx));
         let_go(
             std::mem::replace(&mut self.state, SessionState::Opening),
             cx,
@@ -223,14 +225,24 @@ impl DraftView {
         cx.notify();
     }
 
-    /// Where to open the draft's session, how, and which of its requests to
-    /// open one this is, for [`Self::awaits`].
-    pub(crate) fn request(&self, cx: &App) -> (PathBuf, Checkout, u64) {
-        (
-            self.cwd.clone(),
-            self.picker.read(cx).checkout(),
-            self.request,
-        )
+    /// The draft's directory, and which of its requests to open a session
+    /// there this is, for [`Self::awaits`].
+    pub(crate) fn request(&self) -> (PathBuf, u64) {
+        (self.cwd.clone(), self.request)
+    }
+
+    /// Whether the draft still waits for its first message to start in a
+    /// new worktree.
+    pub(crate) fn launching(&self) -> bool {
+        self.launching
+    }
+
+    /// The new worktree's session couldn't be started; the message stays in
+    /// the composer for another try.
+    pub(crate) fn launch_failed(&mut self, error: String, cx: &mut Context<'_, Self>) {
+        self.launching = false;
+        self.error = Some(error);
+        cx.notify();
     }
 
     /// Whether the draft still waits for the answer to `request`. An
@@ -247,13 +259,11 @@ impl DraftView {
         cx.emit(DraftEvent::OpenSession);
     }
 
-    /// Takes the session the app opened, in `worktree` if the daemon added
-    /// one for it, and sends a waiting message.
+    /// Takes the session the app opened, and sends a waiting message.
     pub(crate) fn open(
         &mut self,
         daemon: Daemon,
         session: Session,
-        worktree: Option<Worktree>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -267,14 +277,9 @@ impl DraftView {
             )
         });
         let subscription = cx.subscribe_in(&settings, window, Self::on_settings_event);
-        let branch = worktree.as_ref().map(|worktree| worktree.branch().into());
-        self.picker
-            .update(cx, |picker, cx| picker.set_worktree_branch(branch, cx));
         self.state = SessionState::Open {
             daemon,
             session: Box::new(session),
-            worktree,
-            workspace: None,
             settings,
             _subscription: subscription,
         };
@@ -305,13 +310,9 @@ impl DraftView {
             (
                 Ok(attached),
                 SessionState::Open {
-                    session,
-                    workspace,
-                    settings,
-                    ..
+                    session, settings, ..
                 },
             ) => {
-                *workspace = Some(attached.workspace().to_path_buf());
                 session.attached(attached);
                 settings.update(cx, |settings, cx| {
                     settings.sync(session.config(), window, cx);
@@ -360,38 +361,43 @@ impl DraftView {
     }
 
     fn send(&mut self, cx: &mut Context<'_, Self>) {
-        if self.queued {
+        if self.queued || self.launching {
             return;
         }
         let text = self.composer.read(cx).value().trim().to_owned();
         if text.is_empty() {
             return;
         }
-        match std::mem::replace(&mut self.state, SessionState::Started) {
-            SessionState::Open {
-                session,
-                worktree,
-                workspace,
-                ..
-            } => {
-                // The worktree's root until the attach says where in it;
-                // that is where a draft at the top of its project works.
-                let cwd = workspace
-                    .or_else(|| worktree.map(|worktree| worktree.path().to_path_buf()))
-                    .unwrap_or_else(|| self.cwd.clone());
-                cx.emit(DraftEvent::Start { session, cwd, text });
+        let checkout = self.picker.read(cx).checkout();
+        match (
+            std::mem::replace(&mut self.state, SessionState::Started),
+            checkout,
+        ) {
+            (SessionState::Open { session, .. }, Checkout::Local) => {
+                cx.emit(DraftEvent::Start { session, text });
             }
-            SessionState::Opening => {
+            // The draft's session stays, with its settings, until the
+            // worktree's session takes over.
+            (state @ SessionState::Open { .. }, Checkout::NewWorktree) => {
+                if let SessionState::Open { session, .. } = &state {
+                    let config = session.config().to_vec();
+                    self.launching = true;
+                    self.error = None;
+                    cx.emit(DraftEvent::StartInWorktree { config, text });
+                }
+                self.state = state;
+            }
+            (SessionState::Opening, _) => {
                 self.state = SessionState::Opening;
                 self.queued = true;
             }
-            SessionState::Failed => {
+            (SessionState::Failed, _) => {
                 self.state = SessionState::Opening;
                 self.queued = true;
                 self.error = None;
                 self.reopen(cx);
             }
-            SessionState::Started => {}
+            (SessionState::Started, _) => {}
         }
         cx.notify();
     }
@@ -414,7 +420,7 @@ fn let_go(state: SessionState, cx: &mut App) {
 impl Render for DraftView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
-        let mode = if self.queued || matches!(self.state, SessionState::Started) {
+        let mode = if self.queued || self.launching || matches!(self.state, SessionState::Started) {
             ComposerMode::Starting
         } else {
             ComposerMode::Send

@@ -111,6 +111,7 @@ impl Service for Fake {
         let id = format!("new-{}", state.new_sessions);
         // A worktree as the daemon names one, for a `cwd` at the top of
         // its repository; the fake makes nothing on disk.
+        state.worktrees += usize::from(params.worktree);
         let worktree = params.worktree.then(|| {
             let name = params.cwd.file_name().unwrap_or_default().to_string_lossy();
             let name = format!("{name}-{:08}", state.new_sessions);

@@ -36,7 +36,7 @@ use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 use crate::{
     background::BackgroundId,
     input::{InputChoice, InputId},
-    options::{change, config_options, ConfigOption, ConfigValue},
+    options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
 };
 
@@ -778,6 +778,41 @@ impl Daemon {
             .request::<methods::SessionConfigure>(&params)
             .await?;
         Ok(config_options(&response.options))
+    }
+
+    /// Sets session `id`'s settings, now `current`, to those of `wanted`,
+    /// such as another session's: the model first, since a model offers
+    /// its own reasoning levels, then the rest. A setting the session lacks
+    /// is skipped. Returns every option as the last change left them.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon rejects a value or the connection is gone; the
+    /// changes before it stay.
+    pub async fn match_config(
+        &self,
+        id: &SessionId,
+        wanted: &[ConfigOption],
+        mut current: Vec<ConfigOption>,
+    ) -> Result<Vec<ConfigOption>, DaemonError> {
+        let order = [
+            ConfigCategory::Model,
+            ConfigCategory::ThoughtLevel,
+            ConfigCategory::Other,
+            ConfigCategory::Mode,
+        ];
+        for category in order {
+            for want in wanted.iter().filter(|want| want.category() == category) {
+                let differs = current
+                    .iter()
+                    .find(|option| option.id() == want.id())
+                    .is_some_and(|option| option.value() != want.value());
+                if differs {
+                    current = self.set_config(id, want.id(), want.value()).await?;
+                }
+            }
+        }
+        Ok(current)
     }
 
     /// Deletes a saved session for good, unless a client follows it: the

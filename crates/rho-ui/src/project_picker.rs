@@ -57,9 +57,6 @@ const MIN_ROWS: u8 = 2;
 pub(crate) enum PickerEvent {
     /// The user chose this directory for the new session.
     Picked(PathBuf),
-    /// The user switched between the checkout and a new worktree; read it
-    /// from [`ProjectPicker::checkout`].
-    Checkout,
     /// The user left the search with Escape: back to the composer.
     Dismissed,
 }
@@ -69,10 +66,8 @@ pub(crate) struct ProjectPicker {
     list: Entity<ListState<ProjectList>>,
     projects: Entity<Projects>,
     /// Whether the session works in the project's checkout or in a new
-    /// worktree of it.
+    /// worktree of it, which the daemon adds only as the session starts.
     checkout: Checkout,
-    /// The branch of the worktree the daemon added for the draft's session.
-    worktree_branch: Option<SharedString>,
     _subscriptions: [Subscription; 4],
 }
 
@@ -127,7 +122,6 @@ impl ProjectPicker {
             list,
             projects: projects.clone(),
             checkout: Checkout::Local,
-            worktree_branch: None,
             _subscriptions: subscriptions,
         }
     }
@@ -137,23 +131,9 @@ impl ProjectPicker {
         self.checkout
     }
 
-    /// Names the branch of the worktree the daemon added for the draft's
-    /// session, or none while it has none.
-    pub(crate) fn set_worktree_branch(
-        &mut self,
-        branch: Option<SharedString>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.worktree_branch = branch;
-        cx.notify();
-    }
-
     fn set_checkout(&mut self, checkout: Checkout, cx: &mut Context<'_, Self>) {
-        if checkout != self.checkout {
-            self.checkout = checkout;
-            cx.emit(PickerEvent::Checkout);
-            cx.notify();
-        }
+        self.checkout = checkout;
+        cx.notify();
     }
 
     /// Whether the draft's directory is in a git repository, as far as its
@@ -167,14 +147,12 @@ impl ProjectPicker {
     }
 
     /// The button naming where the session works, with a menu to choose:
-    /// the project's checkout, or a new worktree, named by its branch once
-    /// the daemon has added it.
+    /// the project's checkout, or a new worktree.
     fn render_checkout(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let in_repository = self.in_repository(cx);
-        let label = match (self.checkout, &self.worktree_branch) {
-            (Checkout::NewWorktree, Some(branch)) => branch.clone(),
-            (Checkout::NewWorktree, None) => "New worktree".into(),
-            (Checkout::Local, _) => "Local".into(),
+        let label = match self.checkout {
+            Checkout::NewWorktree => "New worktree",
+            Checkout::Local => "Local",
         };
         let current = self.checkout;
         let view = cx.entity().downgrade();
@@ -246,8 +224,7 @@ impl ProjectPicker {
             list.set_query("", window, cx);
             cx.notify();
         });
-        // Its owner reopens the session for the move, so this emits
-        // nothing.
+        // Only a git repository has worktrees to add.
         if !self.in_repository(cx) {
             self.checkout = Checkout::Local;
         }

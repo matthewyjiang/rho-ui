@@ -1679,11 +1679,11 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// In a git project, the project list offers a new worktree: choosing it
-/// opens the draft's session in a worktree the daemon adds, which the
-/// list names by its branch, and the session then runs there. Back to
-/// Local, or moved to a folder git doesn't track, the session works in the
-/// checkout again.
+/// In a git project, the project list offers a new worktree, made only
+/// when the first message goes: switching to New worktree and back makes
+/// none and keeps the draft's session, and a folder git doesn't track goes
+/// back to Local. The message then starts a session in a new worktree with
+/// the draft's settings, and runs there.
 #[test]
 fn a_new_session_can_work_in_a_new_worktree() {
     let dir = std::env::temp_dir().join(format!("rho-ui-worktree-{}", std::process::id()));
@@ -1703,55 +1703,79 @@ fn a_new_session_can_work_in_a_new_worktree() {
     ui.click("new-session");
     ui.wait_until("the project", |window, _, _| is_visible(window, main_row));
     ui.click(main_row);
-    ui.wait_until("the draft in the project", draft_in(&main));
-    let branch = |cx: &App, app: &RhoApp| {
-        app.draft()
-            .and_then(|draft| draft.read(cx).worktree_branch().map(str::to_owned))
-    };
-
-    ui.click("project-checkout");
-    click_label(&mut ui, "New worktree");
-    ui.wait_until("a session in a new worktree", |_, cx, app| {
-        branch(cx, app).is_some_and(|branch| branch.starts_with("rho/project-"))
-    });
-    ui.shot("chosen");
-
-    let local = |dir: &Path| {
+    let in_checkout = |dir: &Path, checkout: Checkout| {
         let dir = dir.to_path_buf();
         move |_: &Window, cx: &App, app: &RhoApp| {
             app.draft().is_some_and(|draft| {
                 let draft = draft.read(cx);
-                draft.cwd() == dir
-                    && draft.session_id().is_some()
-                    && draft.worktree_branch().is_none()
-                    && draft.request(cx).1 == Checkout::Local
+                draft.cwd() == dir && draft.session_id().is_some() && draft.checkout(cx) == checkout
             })
         }
     };
+    ui.wait_until(
+        "the draft in the project",
+        in_checkout(&main, Checkout::Local),
+    );
+    let draft_session = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let draft = ui.app.read(cx).draft().expect("a draft");
+            draft.read(cx).session_id().cloned()
+        })
+    };
+    let opened = draft_session(&mut ui);
+
+    // Choosing New worktree, and back, makes no worktree and keeps the
+    // draft's session.
+    ui.click("project-checkout");
+    click_label(&mut ui, "New worktree");
+    ui.wait_until(
+        "New worktree chosen",
+        in_checkout(&main, Checkout::NewWorktree),
+    );
+    ui.shot("chosen");
     ui.click("project-checkout");
     click_label(&mut ui, "Local");
-    ui.wait_until("a session in the checkout", local(&main));
+    ui.wait_until("Local again", in_checkout(&main, Checkout::Local));
+    assert_eq!(draft_session(&mut ui), opened, "the draft kept its session");
+    assert_eq!(ui.fake().worktrees(), 0, "switching adds no worktree");
 
     // /w/a is no git repository, so the draft goes back to Local there.
     ui.click("project-checkout");
     click_label(&mut ui, "New worktree");
-    ui.wait_until("the worktree", |_, cx, app| branch(cx, app).is_some());
+    ui.wait_until("New worktree", in_checkout(&main, Checkout::NewWorktree));
     ui.click("project-/w/a");
-    ui.wait_until("a local session in /w/a", local(Path::new("/w/a")));
+    ui.wait_until(
+        "Local in /w/a",
+        in_checkout(Path::new("/w/a"), Checkout::Local),
+    );
     ui.click(main_row);
-    ui.wait_until("a local session in the project", local(&main));
+    ui.wait_until("Local in the project", in_checkout(&main, Checkout::Local));
 
+    // With Plan mode set in the draft, the first message starts a session
+    // in a new worktree, in Plan mode.
     ui.click("project-checkout");
     click_label(&mut ui, "New worktree");
-    ui.wait_until("the worktree again", |_, cx, app| branch(cx, app).is_some());
+    ui.wait_until("New worktree", in_checkout(&main, Checkout::NewWorktree));
+    ui.click("config-mode");
+    click_label(&mut ui, "Plan");
+    ui.wait_until("Plan mode in the draft", |_, cx, app| {
+        app.draft()
+            .and_then(|draft| draft.read(cx).session().and_then(|s| setting(s, "mode")))
+            .as_deref()
+            == Some("plan")
+    });
     ui.send("list files");
-    ui.wait_until("the session in its worktree", |_, cx, app| {
+    ui.wait_until("the session in its worktree, in Plan mode", |_, cx, app| {
         app.active_session().is_some_and(|view| {
-            let cwd = view.read(cx).live().cwd;
+            let view = view.read(cx);
+            let cwd = view.live().cwd;
+            let plan = setting(view.session(), "mode").as_deref() == Some("plan");
             cwd.parent() == Some(Path::new("/rho/worktrees"))
                 && cwd.to_string_lossy().contains("/project-")
+                && plan
         })
     });
+    assert_eq!(ui.fake().worktrees(), 1);
     ui.shot("running");
     let _ = std::fs::remove_dir_all(&dir);
 }

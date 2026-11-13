@@ -21,7 +21,8 @@ use gpui_kit::{
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Daemon, DaemonError, DaemonEvent, DaemonTarget, Detached, Job, Session, SessionId,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, DaemonTarget, Detached,
+    Job, Session, SessionId,
 };
 
 use crate::{
@@ -394,15 +395,19 @@ impl RhoApp {
                     &view,
                     window,
                     |this, draft, event: &DraftEvent, window, cx| match event {
-                        DraftEvent::Start { session, cwd, text } => {
+                        DraftEvent::Start { session, text } => {
+                            let cwd = draft.read(cx).cwd().to_path_buf();
                             this.start_session(
                                 draft,
                                 (**session).clone(),
-                                cwd.clone(),
+                                cwd,
                                 text.clone(),
                                 window,
                                 cx,
                             );
+                        }
+                        DraftEvent::StartInWorktree { config, text } => {
+                            this.start_in_worktree(draft, config.clone(), text.clone(), window, cx);
                         }
                         DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
                     },
@@ -447,11 +452,11 @@ impl RhoApp {
         let Some(daemon) = self.daemon().cloned() else {
             return;
         };
-        let (cwd, checkout, request) = draft.read(cx).request(cx);
+        let (cwd, request) = draft.read(cx).request();
         let draft = draft.downgrade();
         let epoch = self.epoch;
         cx.spawn_in(window, async move |this, cx| {
-            let setup = daemon.new_session(&cwd, checkout).await;
+            let setup = daemon.new_session(&cwd, Checkout::Local).await;
             let opened = this.update_in(cx, |this, window, cx| {
                 // A draft dropped meanwhile, or moved to another project,
                 // leaves the session unfollowed, and the daemon discards one
@@ -461,13 +466,10 @@ impl RhoApp {
                     .filter(|draft| this.epoch == epoch && draft.read(cx).awaits(request))?;
                 match setup {
                     Ok(setup) => {
-                        let worktree = setup.worktree().cloned();
                         let session = Session::from_setup(setup);
                         let id = session.id().clone();
                         let daemon = daemon.clone();
-                        draft.update(cx, |draft, cx| {
-                            draft.open(daemon, session, worktree, window, cx);
-                        });
+                        draft.update(cx, |draft, cx| draft.open(daemon, session, window, cx));
                         Some(id)
                     }
                     Err(error) => {
@@ -510,6 +512,79 @@ impl RhoApp {
             })
             .detach();
         }
+    }
+
+    /// Starts `draft`'s first message, `text`, in a session in a new
+    /// worktree of the draft's directory: opens it, which adds the
+    /// worktree, gives it `config`, the draft session's settings, follows
+    /// it, then shows it and sends `text`. Until then the draft stays, with
+    /// its own session, so a failure leaves it as it was, and only a
+    /// session that starts makes a worktree.
+    fn start_in_worktree(
+        &mut self,
+        draft: &Entity<DraftView>,
+        config: Vec<ConfigOption>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(daemon) = self.daemon().cloned() else {
+            return;
+        };
+        let cwd = draft.read(cx).cwd().to_path_buf();
+        let draft = draft.downgrade();
+        let epoch = self.epoch;
+        cx.spawn_in(window, async move |this, cx| {
+            let opened = async {
+                let setup = daemon.new_session(&cwd, Checkout::NewWorktree).await?;
+                let mut session = Session::from_setup(setup);
+                // Nothing follows the session yet, so its events about these
+                // changes go nowhere; the answers carry the settings.
+                let options = daemon
+                    .match_config(session.id(), &config, session.config().to_vec())
+                    .await;
+                let attached = match options {
+                    Ok(options) => {
+                        session.set_config(options);
+                        daemon.attach(session.id()).await
+                    }
+                    Err(error) => Err(error),
+                };
+                Ok::<_, DaemonError>((session, attached))
+            }
+            .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let draft = draft
+                    .upgrade()
+                    .filter(|draft| this.epoch == epoch && draft.read(cx).launching());
+                match (opened, draft) {
+                    (Ok((mut session, Ok(attached))), Some(draft)) => {
+                        let cwd = attached.workspace().to_path_buf();
+                        session.attached(attached);
+                        this.start_session(&draft, session, cwd, text, window, cx);
+                    }
+                    (Ok((session, attached)), draft) => {
+                        // Not wanted, or not set up: unfollowed and unsaved,
+                        // the daemon discards it, and its clean worktree.
+                        let id = session.id().clone();
+                        let daemon = daemon.clone();
+                        cx.spawn(async move |_, _| {
+                            let _ = daemon.detach(&id).await;
+                        })
+                        .detach();
+                        if let (Err(error), Some(draft)) = (attached, draft) {
+                            draft
+                                .update(cx, |draft, cx| draft.launch_failed(error.to_string(), cx));
+                        }
+                    }
+                    (Err(error), Some(draft)) => {
+                        draft.update(cx, |draft, cx| draft.launch_failed(error.to_string(), cx));
+                    }
+                    (Err(_), None) => {}
+                }
+            });
+        })
+        .detach();
     }
 
     /// Shows `draft`'s session, which works in `cwd`, in its own view and

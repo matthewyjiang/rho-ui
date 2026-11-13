@@ -126,6 +126,14 @@ impl ConfigOption {
         }
     }
 
+    /// What it is set to, as [`crate::Daemon::set_config`] takes it.
+    pub fn value(&self) -> ConfigValue {
+        match &self.kind {
+            ConfigKind::Select { current, .. } => ConfigValue::Select(current.clone()),
+            ConfigKind::Toggle(on) => ConfigValue::Toggle(*on),
+        }
+    }
+
     /// This option holding `value`, to show a change before the daemon
     /// confirms it. A value of the other kind changes nothing.
     #[must_use]

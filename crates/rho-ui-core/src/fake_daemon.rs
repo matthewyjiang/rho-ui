@@ -142,6 +142,11 @@ impl FakeDaemon {
         DaemonTarget::Socket(self.socket.clone())
     }
 
+    /// How many worktrees the daemon has added for new sessions.
+    pub fn worktrees(&self) -> usize {
+        self.service.lock().worktrees
+    }
+
     /// Ends `session`'s oldest running background process by itself, with
     /// exit code `code`, as `sleep` exiting does; the daemon then starts a
     /// turn of its own to tell the model.
@@ -539,6 +544,8 @@ struct State {
     sessions: BTreeMap<String, FakeSession>,
     /// How many of each the daemon has made, for their IDs.
     new_sessions: u64,
+    /// How many sessions asked for a new worktree.
+    worktrees: usize,
     turns: u64,
     steers: u64,
 }
@@ -567,6 +574,7 @@ impl State {
         let mut state = Self {
             sessions,
             new_sessions: 0,
+            worktrees: 0,
             turns: 0,
             steers: 0,
         };
