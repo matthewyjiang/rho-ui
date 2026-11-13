@@ -37,7 +37,8 @@ use std::{
 
 use rho_protocol::{
     display::{
-        DiffRow, DiffRowKind, ToolBody, ToolCard, ToolCardStatus, ToolFact, ToolFamily, ToolHeader,
+        CodeWindow, DiffRow, DiffRowKind, ToolBody, ToolCard, ToolCardStatus, ToolFact, ToolFamily,
+        ToolHeader,
     },
     methods::{
         BackgroundItem, BackgroundStatus, BackgroundWork, FastModeOptions, JobState, MessageId,
@@ -547,19 +548,19 @@ fn tool_calls(session: &mut FakeSession, n: usize) {
     .with_facts(vec![ToolFact::Count {
         label: "matches".to_owned(),
         value: 60,
-        detail: Some("in 1 file".to_owned()),
+        detail: Some("in 2 files".to_owned()),
     }])
     .with_body(ToolBody::Search {
         pattern: "pattern".to_owned(),
         literal: false,
         case_sensitive: true,
-        lines: matches,
+        lines: grep_lines(n),
     });
     session.tool(
         &ToolCallId::new(format!("t{n}-1")),
         (&format!("grep(pattern, src/{n}.rs)"), ToolKind::Search),
         ToolStatus::Completed,
-        vec![text(&found)],
+        vec![text(&grep_lines(n).join("\n"))],
         search,
     );
     // A heredoc, so the command runs over several lines.
@@ -613,6 +614,39 @@ fn tool_calls(session: &mut FakeSession, n: usize) {
         ],
         edited,
     );
+    // A script, which rho's card shows as code.
+    let script = format!("for path in glob(\"src/{n}/*.rs\"):\n    print(read_file(path)[:80])");
+    let scripted = card(
+        ToolStatus::Completed,
+        ToolFamily::Default,
+        ToolHeader::call("codemode", Some("2 calls".to_owned())),
+    )
+    .with_body(ToolBody::Code {
+        language: "python".to_owned(),
+        window: CodeWindow::Head,
+        lines: script.lines().map(str::to_owned).collect(),
+    });
+    session.tool(
+        &ToolCallId::new(format!("t{n}-script")),
+        ("codemode", ToolKind::Other),
+        ToolStatus::Completed,
+        vec![text("fn walk(tree: &Tree) -> Vec<Node> {")],
+        scripted,
+    );
+}
+
+/// What rho's grep prints for turn `n`'s search, as its card carries it: each
+/// file, then `N | text` for each line that matched, then how many.
+fn grep_lines(n: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for file in [format!("src/{n}.rs"), format!("src/{n}/walk.rs")] {
+        lines.push(file);
+        lines.extend(
+            (1..=30).map(|line| format!("{line} |     let found = pattern(tree, {line});")),
+        );
+    }
+    lines.extend([String::new(), "60 matches in 2 files".to_owned()]);
+    lines
 }
 
 /// An info card and a warning card, as background work and failing hooks
