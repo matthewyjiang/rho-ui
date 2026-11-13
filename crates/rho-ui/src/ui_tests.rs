@@ -19,7 +19,8 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    ConfigKind, Daemon, DaemonTarget, Entry, RunState, Session, SessionId, ToolStatus,
+    BackgroundStatus, ConfigKind, Daemon, DaemonTarget, Entry, RunState, Session, SessionId,
+    ToolStatus,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -45,7 +46,7 @@ struct Harness {
     name: &'static str,
     target: DaemonTarget,
     /// Stops when the test ends.
-    _daemon: Option<FakeDaemon>,
+    daemon: Option<FakeDaemon>,
 }
 
 impl Harness {
@@ -106,7 +107,7 @@ impl Harness {
             app,
             name,
             target,
-            _daemon: daemon,
+            daemon,
         };
         harness.frame();
         harness
@@ -193,6 +194,37 @@ impl Harness {
                     .expect("the daemon takes the other client's prompt");
             })
             .detach();
+        });
+    }
+
+    /// The fake daemon the app talks to.
+    fn fake(&self) -> &FakeDaemon {
+        self.daemon.as_ref().expect("the test runs a fake daemon")
+    }
+
+    /// The accessibility label of element `id`, once it is drawn.
+    fn label(&mut self, id: &'static str) -> Option<String> {
+        self.cx
+            .update_window(self.window, |_, window, _| {
+                window
+                    .try_find(id)
+                    .filter(gpui_kit::test::ElementSnapshot::visible)
+                    .and_then(|element| element.label().map(str::to_owned))
+            })
+            .expect("window is open")
+    }
+
+    /// Types `text` in the composer and presses Enter. In a session, it
+    /// first moves the keyboard to the composer, as a click in it would.
+    fn send(&mut self, text: &str) {
+        let app = self.app.clone();
+        self.act(|window, cx| {
+            if let Some(view) = app.read(cx).active_session() {
+                let composer = view.read(cx).composer_focus_handle(cx);
+                window.focus(&composer, cx);
+            }
+            window.input(text, cx);
+            window.press("enter", cx);
         });
     }
 
@@ -1259,4 +1291,181 @@ fn the_theme_setting_switches_light_and_dark() {
         is_visible(window, "close-settings")
     });
     ui.shot("settings-light");
+}
+
+/// Whether the session view shows an error: a failed turn, or a request
+/// that failed.
+fn shows_an_error(window: &Window) -> bool {
+    is_visible(window, "turn-error") || is_visible(window, "session-error")
+}
+
+/// A turn ends while the process it started runs on, which is listed above
+/// the composer. Stopping it lists it as stopped while the daemon's own turn
+/// tells the model, which shows like any turn and takes a steer; the
+/// process leaves the list as that turn ends. A process that exits by
+/// itself shows its exit status the same way.
+#[test]
+fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
+    let mut ui = Harness::start("background", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the turn to end with its process running", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+    assert_eq!(
+        ui.label("background-0").as_deref(),
+        Some("sleep 30: Running")
+    );
+    ui.shot("running");
+
+    ui.click("background-stop-0");
+    ui.wait_for_session("the daemon's turn about the stop", |session| {
+        session.state() == &RunState::Running
+            && session.background()[0].status() == BackgroundStatus::Cancelled
+    });
+    ui.act(|window, _| {
+        assert_eq!(
+            window.find("background-0").label(),
+            Some("sleep 30: Stopped"),
+            "the list says how it ended"
+        );
+        assert!(!is_visible(window, "background-stop-0"), "nothing to stop");
+        assert!(
+            is_visible(window, "composer-stop"),
+            "the turn shows as running"
+        );
+    });
+    let session = ui.session();
+    assert!(
+        matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "`sleep 30` was stopped."),
+        "the daemon's turn shows in the transcript: {:?}",
+        session.entries()
+    );
+    let wake = session
+        .entries()
+        .iter()
+        .position(|entry| matches!(entry, Entry::Wake))
+        .expect("the daemon's turn opens with a wake");
+    let wake: &'static str = Box::leak(format!("wake-{wake}").into_boxed_str());
+    ui.act(|window, _| assert!(is_visible(window, wake), "the wake row shows"));
+    ui.shot("stopped");
+
+    // A message sent during the daemon's turn steers it, which ends it.
+    ui.send("thanks");
+    ui.wait_for_session("the daemon's turn to end", |session| {
+        session.state() == &RunState::Idle && session.background().is_empty()
+    });
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "background"), "the list is gone");
+        assert!(!shows_an_error(window));
+    });
+    assert!(
+        turn_took(&mut ui, 1).is_some(),
+        "the daemon's turn is its own"
+    );
+    ui.shot("delivered");
+
+    ui.send("background");
+    ui.wait_for_session("another process", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+    ui.fake().finish_background(&SessionId::from("new-1"), 0);
+    ui.wait_for_session("the daemon's turn about the exit", |session| {
+        session.state() == &RunState::Running
+            && session.background()[0].status() == BackgroundStatus::Completed
+    });
+    assert_eq!(
+        ui.label("background-0").as_deref(),
+        Some("sleep 30: Exited 0")
+    );
+    ui.shot("exited");
+    ui.send("ok");
+    ui.wait_for_session("the list to empty", |session| {
+        session.state() == &RunState::Idle && session.background().is_empty()
+    });
+}
+
+/// A message the session's turn can't take waits above the composer and
+/// goes as a prompt once the turn ends, with no error: one sent while the
+/// turn waits on an approval, and one the daemon refused because it had
+/// just begun a turn of its own. A busy refusal with no turn behind it is
+/// an error, and the message goes back in the composer.
+#[test]
+fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
+    let mut ui = Harness::start("queued", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("list files");
+    ui.wait_until("the approval card", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    // The approval took the keyboard; `send` clicks back into the box.
+    ui.send("and then this");
+    ui.wait_until("the held message", |window, _, _| {
+        is_visible(window, "held")
+    });
+    ui.act(|window, _| assert!(!shows_an_error(window)));
+    ui.shot("held");
+
+    ui.click("approval-allow-once");
+    ui.wait_until("the held message's own turn", |window, _, _| {
+        !is_visible(window, "held") && is_visible(window, "approval-allow-once")
+    });
+    let prompts = |session: &Session| -> Vec<String> {
+        let users = session.entries().iter().filter_map(|entry| match entry {
+            Entry::User(message) => Some(message.text().to_owned()),
+            _ => None,
+        });
+        users.collect()
+    };
+    assert_eq!(prompts(&ui.session()), ["list files", "and then this"]);
+    ui.click("approval-allow-once");
+    ui.wait_for_session("that turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+
+    // The daemon refuses this one: its own turn began a moment before.
+    ui.send("busy");
+    ui.wait_until(
+        "the prompt's turn, once the daemon's ended",
+        |window, _, _| is_visible(window, "approval-allow-once"),
+    );
+    ui.act(|window, _| assert!(!shows_an_error(window)));
+    let session = ui.session();
+    assert_eq!(prompts(&session), ["list files", "and then this", "busy"]);
+    assert!(
+        session
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Agent(m) if m.text() == "Back to you.")),
+        "the daemon's own turn shows: {:?}",
+        session.entries()
+    );
+    ui.shot("after-busy");
+    ui.click("approval-allow-once");
+    ui.wait_for_session("that turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+
+    ui.send("deleting");
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "session-error")
+    });
+    let view = ui.app.clone();
+    let (typed, held) = ui.cx.update(|cx| {
+        let view = view.read(cx).active_session().expect("a session is open");
+        let view = view.read(cx);
+        (
+            view.composer_text(cx),
+            view.session().held().map(str::to_owned),
+        )
+    });
+    assert_eq!((typed.as_str(), held), ("deleting", None));
 }

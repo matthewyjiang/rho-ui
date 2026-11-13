@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt as _;
-use rho_ui_core::{DaemonTarget, Entry, RunState, ToolStatus};
+use rho_ui_core::{BackgroundStatus, DaemonTarget, Entry, RunState, Session, ToolStatus};
 
-use super::{is_visible, Harness};
+use super::{is_visible, labels, Harness};
 use crate::shelf::Shelves;
 
 /// The app against a real rho daemon and model, not a pass/fail unit test:
@@ -106,4 +106,198 @@ fn live_daemon() {
         reply.text()
     );
     ui.shot("job-done");
+}
+
+/// A real model's turn, with room for a slow provider.
+const BACKGROUND_TURN: Duration = Duration::from_secs(240);
+
+/// Background work against a real rho daemon and model, not a pass/fail
+/// unit test: a turn starts two background processes and ends while they
+/// run; the list shows them; stopping one lists it as stopped while the
+/// daemon's own turn tells the model; a message sent during that turn is
+/// taken without an error; the other process exits by itself, shows its
+/// exit status while the daemon's next turn tells the model, and leaves the
+/// list. Runs as [`live_daemon`] does, through `RHO_UI_LIVE_RHO`; it takes
+/// a few minutes.
+#[test]
+#[ignore = "needs a real rho daemon and a signed-in model; see README"]
+fn live_background() {
+    let rho = std::env::var("RHO_UI_LIVE_RHO").expect("RHO_UI_LIVE_RHO names a rho 3 program");
+    let target = DaemonTarget::rho(rho).expect("RHO_HOME or HOME names the rho home");
+    let mut ui = Harness::open("live-bg", target, None, Shelves::default());
+    let long = start_two_processes(&mut ui);
+    stop_and_follow_the_daemons_turn(&mut ui, long);
+    follow_the_exit(&mut ui);
+}
+
+fn idle(session: &Session) -> bool {
+    session.state() == &RunState::Idle
+}
+
+fn prompts(session: &Session) -> usize {
+    let users = session.entries().iter();
+    users
+        .filter(|entry| matches!(entry, Entry::User(_)))
+        .count()
+}
+
+/// Runs a turn that starts `sleep 120 && echo first-done` and `sleep 600`,
+/// approving whatever it asks. Returns the row of `sleep 600`.
+fn start_two_processes(ui: &mut Harness) -> usize {
+    ui.wait_within(BACKGROUND_TURN, "the daemon", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    ui.click("new-session");
+    ui.wait_within(BACKGROUND_TURN, "the draft's settings", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "config-panel")
+    });
+    ui.send(
+        "Use your process tool to start two background processes: `sleep 120 && echo first-done` \
+         and `sleep 600`. Don't wait for them or check on them. Then reply with one short \
+         sentence and end your turn.",
+    );
+    ui.wait_within(BACKGROUND_TURN, "the prompt's turn", |_, cx, app| {
+        app.active_session().is_some_and(|view| {
+            let session = view.read(cx).session();
+            session.state().is_busy() && !session.entries().is_empty()
+        })
+    });
+    loop {
+        ui.wait_within(
+            BACKGROUND_TURN,
+            "an approval or the turn's end",
+            |window, cx, app| {
+                is_visible(window, "approval-allow-once")
+                    || app
+                        .active_session()
+                        .is_some_and(|view| idle(view.read(cx).session()))
+            },
+        );
+        if ui.label("approval-allow-once").is_none() && idle(&ui.session()) {
+            break;
+        }
+        ui.click("approval-allow-once");
+    }
+    let session = ui.session();
+    let listed: Vec<_> = session
+        .background()
+        .iter()
+        .map(|work| (work.title().to_owned(), work.status()))
+        .collect();
+    eprintln!("after the turn: {listed:?}");
+    let running = listed
+        .iter()
+        .filter(|(_, status)| *status == BackgroundStatus::Running);
+    assert_eq!(
+        running.count(),
+        2,
+        "the turn ended with both running: {listed:?}"
+    );
+    ui.shot("turn-ended");
+    listed
+        .iter()
+        .position(|(title, _)| title.contains("600"))
+        .expect("the long process is listed")
+}
+
+/// Stops row `long`, sees it listed as stopped and the daemon's own turn
+/// begin, and sends a message during that turn.
+fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
+    let stop: &'static str = Box::leak(format!("background-stop-{long}").into_boxed_str());
+    let row: &'static str = Box::leak(format!("background-{long}").into_boxed_str());
+    let sent = prompts(&ui.session());
+    ui.click(stop);
+    ui.wait_within(BACKGROUND_TURN, "the stopped process", |window, _, _| {
+        window
+            .try_find(row)
+            .and_then(|row| row.label().map(|label| label.ends_with(": Stopped")))
+            .unwrap_or(false)
+    });
+    eprintln!("stopped: {:?}", ui.label(row));
+    ui.shot("stopped");
+    // Sent as soon as the daemon's turn begins. Its wake row comes with
+    // its first model output, which can come just before it ends.
+    ui.wait_within(BACKGROUND_TURN, "the daemon's own turn", |_, cx, app| {
+        app.active_session()
+            .is_some_and(|view| view.read(cx).session().state().is_busy())
+    });
+    assert_eq!(
+        prompts(&ui.session()),
+        sent,
+        "no prompt from here started it"
+    );
+    ui.shot("daemon-turn");
+    ui.send("Also end your next reply with the word FOLLOWED.");
+    ui.shot("sent-during-daemon-turn");
+    ui.wait_within(BACKGROUND_TURN, "the daemon's turn to end", |_, cx, app| {
+        app.active_session().is_some_and(|view| {
+            let view = view.read(cx);
+            idle(view.session()) && view.session().held().is_none()
+        })
+    });
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "turn-error"), "no failed turn");
+        assert!(!is_visible(window, "session-error"), "no error");
+    });
+    let session = ui.session();
+    let followed = session
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry, Entry::User(message) if message.text().contains("FOLLOWED")));
+    assert!(followed, "the message sent during the daemon's turn joined");
+    let wakes = session
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::Wake));
+    assert!(wakes.count() >= 1, "the daemon's turn opened with a wake");
+    let left: Vec<_> = session
+        .background()
+        .iter()
+        .map(|work| (work.title().to_owned(), work.status()))
+        .collect();
+    eprintln!("after the stop's turn: {left:?}");
+    ui.shot("stop-delivered");
+}
+
+/// Waits for `sleep 120` to exit by itself and the daemon's turn that tells
+/// the model to end, with the list empty.
+fn follow_the_exit(ui: &mut Harness) {
+    ui.wait_within(BACKGROUND_TURN, "the exited process", |window, _, _| {
+        labels(window)
+            .iter()
+            .any(|label| label.contains("first-done") && label.contains(": Exited "))
+    });
+    eprintln!("exited: {:?}", labels_of(ui, ": Exited "));
+    ui.shot("exited");
+    ui.wait_within(
+        BACKGROUND_TURN,
+        "the list to empty and the turn to end",
+        |_, cx, app| {
+            app.active_session().is_some_and(|view| {
+                let session = view.read(cx).session();
+                idle(session) && session.background().is_empty()
+            })
+        },
+    );
+    let session = ui.session();
+    let wakes = session
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::Wake));
+    eprintln!("daemon-started turns: {}", wakes.count());
+    let Some(Entry::Agent(reply)) = session.entries().last() else {
+        panic!("the daemon's turn ends in a reply: {:?}", session.entries());
+    };
+    eprintln!("the daemon's last turn replied: {}", reply.text());
+    ui.shot("done");
+}
+
+/// Every drawn accessibility label holding `part`.
+fn labels_of(ui: &mut Harness, part: &str) -> Vec<String> {
+    ui.cx
+        .update_window(ui.window, |_, window, _| labels(window))
+        .expect("window is open")
+        .into_iter()
+        .filter(|label| label.contains(part))
+        .collect()
 }

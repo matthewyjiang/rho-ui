@@ -11,6 +11,16 @@
 //!   calls, an edit, and a Markdown answer.
 //! - A prompt asks to run `ls`, then answers "you chose" and the answer. The
 //!   prompt "fail" is refused, and "slow" is taken half a second late.
+//! - The prompt "background" starts a background process, `sleep 30`, and
+//!   answers at once, leaving it running. Stopping it, or
+//!   [`FakeDaemon::finish_background`], ends it, and the daemon starts a
+//!   turn of its own that tells the model; that turn runs until a steer
+//!   ends it, and drops the work it delivered from the list as it ends.
+//! - A session's first prompt "busy" is refused as busy: the daemon has
+//!   just started a turn of its own, which answers and ends at once. The
+//!   next "busy" is taken like any prompt. The prompt "deleting" is
+//!   refused as busy with no turn under way, as a session being deleted
+//!   refuses it.
 //! - With [`Script::tui_job`], the session "tui-1" has a turn under way, as
 //!   one rho's terminal UI started: it is listed, its job runs, and a steer
 //!   is read at once, answered, and ends the turn. The steer "wait" is
@@ -27,9 +37,10 @@ use std::{
 
 use rho_protocol::{
     methods::{
-        FastModeOptions, JobState, MessageId, ModelChoice, ModelOptions, ModelRef,
-        PermissionModeOptions, ReasoningLevel, ReasoningOptions, Seq, SessionCommand, SessionId,
-        SessionOptions, SteerId, ToolCallId, ToolCallUpdate, TurnId,
+        BackgroundItem, BackgroundStatus, BackgroundWork, FastModeOptions, JobState, MessageId,
+        ModelChoice, ModelOptions, ModelRef, PermissionModeOptions, ReasoningLevel,
+        ReasoningOptions, Seq, SessionCommand, SessionId, SessionOptions, SteerId, ToolCallId,
+        ToolCallUpdate, TurnId,
     },
     serve_connection, AnswerStop, BuildId, CardTone, CommandKind, ContentBlock, DaemonInfo,
     ErrorCode, InputRequest, PermissionMode, Published, Publisher, RpcError, SessionEvent,
@@ -37,7 +48,7 @@ use rho_protocol::{
 };
 use tokio::{net::UnixListener, runtime::Runtime};
 
-use crate::DaemonTarget;
+use crate::{DaemonTarget, SessionId as UiSessionId};
 
 mod service;
 
@@ -73,6 +84,7 @@ pub enum TuiJob {
 #[derive(Debug)]
 pub struct FakeDaemon {
     socket: PathBuf,
+    service: Arc<Fake>,
     _dir: tempfile::TempDir,
     _runtime: Runtime,
 }
@@ -101,6 +113,7 @@ impl FakeDaemon {
         let service = Arc::new(Fake {
             state: Mutex::new(State::new(script)),
         });
+        let serving = Arc::clone(&service);
         runtime.spawn(async move {
             let info = DaemonInfo {
                 version: "9.9.9".to_owned(),
@@ -108,7 +121,7 @@ impl FakeDaemon {
                 build: BuildId::of_this_crate(),
             };
             while let Ok((stream, _)) = listener.accept().await {
-                let (service, info) = (Arc::clone(&service), info.clone());
+                let (service, info) = (Arc::clone(&serving), info.clone());
                 tokio::spawn(async move {
                     // Runs until the client leaves; the fake never stops
                     // a connection itself.
@@ -118,6 +131,7 @@ impl FakeDaemon {
         });
         Self {
             socket,
+            service,
             _dir: dir,
             _runtime: runtime,
         }
@@ -126,6 +140,34 @@ impl FakeDaemon {
     /// How a client reaches this daemon.
     pub fn target(&self) -> DaemonTarget {
         DaemonTarget::Socket(self.socket.clone())
+    }
+
+    /// Ends `session`'s oldest running background process by itself, with
+    /// exit code `code`, as `sleep` exiting does; the daemon then starts a
+    /// turn of its own to tell the model.
+    ///
+    /// # Panics
+    ///
+    /// If the session runs no background process: the test has a bug.
+    pub fn finish_background(&self, session: &UiSessionId, code: i32) {
+        let mut state = self.service.lock();
+        let turn = state.next_turn();
+        let session = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        let process = session
+            .background
+            .iter_mut()
+            .find(|work| work.status == BackgroundStatus::Running)
+            .unwrap_or_else(|| panic!("session runs no background process to finish"));
+        process.status = BackgroundStatus::Completed;
+        process.exit_code = Some(code);
+        let told = format!("`{}` exited with {code}.", process.title);
+        session.report_background();
+        if session.turn.is_none() {
+            session.wake(turn, &told);
+        }
     }
 }
 
@@ -243,6 +285,10 @@ struct FakeSession {
     history: Vec<SessionEvent>,
     publishers: Vec<Publisher>,
     live_seq: u64,
+    /// Background work, as the last background event listed it.
+    background: Vec<BackgroundWork>,
+    /// Whether a prompt "busy" was already refused.
+    refused_busy: bool,
 }
 
 impl FakeSession {
@@ -258,6 +304,8 @@ impl FakeSession {
             history: Vec::new(),
             publishers: Vec::new(),
             live_seq: 0,
+            background: Vec::new(),
+            refused_busy: false,
         }
     }
 
@@ -314,11 +362,48 @@ impl FakeSession {
         }));
     }
 
-    /// Ends the running turn with `outcome`.
+    /// Tells clients the session's background work as it is now.
+    fn report_background(&mut self) {
+        self.publish(SessionEvent::Background {
+            work: self.background.clone(),
+        });
+    }
+
+    /// Starts a background process `sleep 30` with ID `id`.
+    fn start_background(&mut self, id: String) {
+        self.background.push(BackgroundWork {
+            item: BackgroundItem::Process { id },
+            title: "sleep 30".to_owned(),
+            status: BackgroundStatus::Running,
+            exit_code: None,
+        });
+        self.report_background();
+    }
+
+    /// Starts `turn`, one of the daemon's own that tells the model `told`
+    /// about background work that ended. It runs until a steer ends it.
+    fn wake(&mut self, turn: Turn, told: &str) {
+        let id = turn.id.clone();
+        self.turn = Some(turn);
+        self.state(JobState::Running);
+        self.publish(SessionEvent::ThoughtChunk {
+            message: MessageId::new(format!("th-{id}")),
+            text: "Reading what ended.".to_owned(),
+        });
+        self.say(&format!("m-{id}"), told);
+    }
+
+    /// Ends the running turn with `outcome`. The model had the results of
+    /// background work that ended, which leaves the list first.
     fn end_turn(&mut self, outcome: TurnOutcome, state: JobState) {
         let Some(turn) = self.turn.take() else {
             return;
         };
+        let listed = self.background.len();
+        self.background.retain(|work| work.status.is_running());
+        if self.background.len() != listed {
+            self.report_background();
+        }
         self.publish(SessionEvent::TurnEnded {
             turn: turn.id.clone(),
             outcome,

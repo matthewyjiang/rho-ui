@@ -7,8 +7,9 @@ use std::{path::Path, time::Duration};
 use futures::FutureExt;
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    ChoiceKind, ConfigKind, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
-    DaemonTarget, Entry, JobActivity, RunState, Session, SessionId, Unsteered,
+    BackgroundKind, BackgroundStatus, ChoiceKind, ConfigKind, ConfigValue, Daemon, DaemonError,
+    DaemonEvent, DaemonEvents, DaemonTarget, Entry, JobActivity, RunState, Session, SessionId,
+    Unsteered,
 };
 use smol::block_on;
 
@@ -206,7 +207,7 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
         let refused = daemon.steer(session.id(), "too late").await.unwrap_err();
         assert_eq!(
             refused,
-            DaemonError::Refused("no model request is taking input".to_owned())
+            DaemonError::Busy("no model request is taking input".to_owned())
         );
     });
 }
@@ -239,7 +240,20 @@ fn a_refused_prompt_is_an_error_in_the_daemons_words() {
         let (daemon, _events) = connect(&fake).await;
         let session = new_session(&daemon).await;
         let error = daemon.prompt(session.id(), "fail").await.unwrap_err();
-        assert_eq!(error.to_string(), "the session is busy");
+        assert_eq!(error.to_string(), "the fake daemon refuses this prompt");
+    });
+}
+
+/// A prompt that finds a turn under way, as one the daemon started itself,
+/// is told apart from other refusals, so the UI can hold it for later.
+#[test]
+fn a_prompt_during_a_turn_is_refused_as_busy() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let session = new_session(&daemon).await;
+        let error = daemon.prompt(session.id(), "busy").await.unwrap_err();
+        assert!(matches!(error, DaemonError::Busy(_)), "{error:?}");
     });
 }
 
@@ -299,5 +313,55 @@ fn the_stream_ends_when_the_connection_does() {
             never = timeout.fuse() => never,
         };
         assert!(ended.is_none(), "{ended:?}");
+    });
+}
+
+/// A turn ends while the process it started runs on, which the session
+/// lists, as does the answer to a later attach. A stopped process is
+/// listed as stopped while the daemon's own turn tells the model, and
+/// leaves the list as that turn ends.
+#[test]
+fn background_work_is_listed_until_the_model_has_its_result() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut session = new_session(&daemon).await;
+        daemon.prompt(session.id(), "background").await.unwrap();
+        until(&mut events, &mut session, |session| {
+            session.state() == &RunState::Idle && !session.background().is_empty()
+        })
+        .await;
+        let work = session.background()[0].clone();
+        assert_eq!(
+            (work.kind(), work.title(), work.status()),
+            (
+                BackgroundKind::Process,
+                "sleep 30",
+                BackgroundStatus::Running
+            )
+        );
+
+        let (other, _other_events) = connect(&fake).await;
+        let mut theirs = Session::new(session.id().clone());
+        theirs.attached(other.attach(session.id()).await.unwrap());
+        assert_eq!(theirs.background(), session.background());
+
+        daemon
+            .stop_background(session.id(), work.id())
+            .await
+            .unwrap();
+        until(&mut events, &mut session, |session| {
+            session.state() == &RunState::Running
+                && session.background()[0].status() == BackgroundStatus::Cancelled
+        })
+        .await;
+        let again = daemon.stop_background(session.id(), work.id()).await;
+        assert!(matches!(again, Err(DaemonError::Refused(_))), "{again:?}");
+
+        daemon.steer(session.id(), "thanks").await.unwrap();
+        until(&mut events, &mut session, |session| {
+            session.state() == &RunState::Idle && session.background().is_empty()
+        })
+        .await;
     });
 }

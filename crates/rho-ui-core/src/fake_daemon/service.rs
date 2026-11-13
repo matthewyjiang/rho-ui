@@ -13,28 +13,37 @@ use rho_protocol::{
         SessionDeleteResponse, SessionId, SessionListParams, SessionListResponse, SessionSummary,
         SessionUnsteerParams, SessionUnsteerResponse, SteerId, StreamId,
     },
-    subscription, ApprovalAsk, ApprovalSource, Ask, BuildId, ClientInfo, ContentBlock,
-    CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason, ErrorCode, InputAnswer,
-    InputAsker, InputRequest, InputRequestId, Operation, ProtocolVersion, RestartCost, RpcError,
-    Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
-    SessionAttachResponse, SessionCancelParams, SessionCancelResponse, SessionChange, SessionEvent,
-    SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
+    subscription, ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo,
+    ContentBlock, CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason,
+    ErrorCode, InputAnswer, InputAsker, InputRequest, InputRequestId, Operation, ProtocolVersion,
+    RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
+    SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
+    SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
+    SessionEvent, SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
     SessionSteerParams, SessionSteerResponse, SettingsService, StoreSelectedBy, Subscription,
     ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
 use super::{text, user_message, FakeSession, State, Turn, BACKLOG};
 
+#[derive(Debug)]
 pub(super) struct Fake {
     pub(super) state: Mutex<State>,
 }
 
 impl Fake {
-    fn lock(&self) -> MutexGuard<'_, State> {
+    pub(super) fn lock(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
             .expect("no test panics holding the fake daemon's state")
     }
+}
+
+fn busy() -> RpcError {
+    RpcError::new(
+        ErrorCode::SessionBusy,
+        "session already has a turn in progress",
+    )
 }
 
 fn not_steerable() -> RpcError {
@@ -120,7 +129,16 @@ impl Service for Fake {
             _ => String::new(),
         };
         if prompt == "fail" {
-            return Err(RpcError::new(ErrorCode::SessionBusy, "the session is busy"));
+            return Err(RpcError::new(
+                ErrorCode::InvalidParams,
+                "the fake daemon refuses this prompt",
+            ));
+        }
+        if prompt == "deleting" {
+            return Err(RpcError::new(
+                ErrorCode::SessionBusy,
+                "the session is being deleted",
+            ));
         }
         if prompt == "slow" {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -136,10 +154,24 @@ impl Service for Fake {
         let turn_id = turn.id.clone();
         let session = state.session(&params.session)?;
         if session.turn.is_some() {
-            return Err(RpcError::new(ErrorCode::SessionBusy, "the session is busy"));
+            return Err(busy());
         }
         session.saved = true;
         session.updated_at = newest + 1;
+        if prompt == "busy" && !session.refused_busy {
+            session.refused_busy = true;
+            session.wake(turn, "Nothing new from the background.");
+            session.answer(&format!("m-{turn_id}-done"), "Back to you.");
+            return Err(busy());
+        }
+        if prompt == "background" {
+            session.turn = Some(turn);
+            session.state(JobState::Running);
+            session.publish(user_message(&format!("u-{turn_id}"), &prompt));
+            session.start_background(format!("p-{turn_id}"));
+            session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
+            return Ok(SessionPromptResponse { turn: turn_id });
+        }
         let request = InputRequest {
             id: InputRequestId(turn.number),
             ask: Ask::Approval(ApprovalAsk {
@@ -329,10 +361,37 @@ impl Service for Fake {
                 .collect(),
             title: session.title.clone(),
             options: session.settings.options(),
+            background: session.background.clone(),
         };
         let (publisher, subscription) = subscription(BACKLOG, replay);
         session.publishers.push(publisher);
         Ok((response, subscription))
+    }
+
+    async fn session_background_stop(
+        &self,
+        params: SessionBackgroundStopParams,
+    ) -> Result<SessionBackgroundStopResponse, RpcError> {
+        let mut state = self.lock();
+        let turn = state.next_turn();
+        let session = state.session(&params.session)?;
+        let Some(work) = session
+            .background
+            .iter_mut()
+            .find(|work| work.item == params.work && work.status.is_running())
+        else {
+            return Err(RpcError::new(
+                ErrorCode::InvalidParams,
+                "could not stop background work: it is not running",
+            ));
+        };
+        work.status = BackgroundStatus::Cancelled;
+        let told = format!("`{}` was stopped.", work.title);
+        session.report_background();
+        if session.turn.is_none() {
+            session.wake(turn, &told);
+        }
+        Ok(SessionBackgroundStopResponse {})
     }
 
     async fn list_sessions(

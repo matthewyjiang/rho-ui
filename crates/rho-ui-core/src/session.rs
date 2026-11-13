@@ -18,6 +18,7 @@ use rho_protocol::{
 };
 
 use crate::{
+    background::BackgroundWork,
     daemon::SessionId,
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
@@ -251,6 +252,11 @@ pub enum Entry {
     Tool(ToolCall),
     /// A notice from the agent.
     Notice(Notice),
+    /// The daemon began a turn of its own, as it does when the session's
+    /// background work finishes or a subagent asks its parent to act, to
+    /// give the model the result. It opens that turn, as a prompt opens one. Only a turn followed live has
+    /// one: the daemon's replay of a conversation does not mark them.
+    Wake,
 }
 
 /// Progress on one [`PlanItem`].
@@ -290,6 +296,15 @@ struct Steer {
     text: String,
 }
 
+/// A message held until the turn that could not take it ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    text: String,
+    /// The turn that had ended last when it was sent. Once a later one
+    /// ended and none runs, it is due.
+    after: Option<TurnId>,
+}
+
 /// A session's transcript and status.
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -307,6 +322,10 @@ pub struct Session {
     inputs: Vec<InputRequest>,
     /// Steers waiting to apply, oldest first.
     steers: Vec<Steer>,
+    /// Background work, as the daemon last listed it.
+    background: Vec<BackgroundWork>,
+    /// A message the turn could not take; see [`Self::hold`].
+    held: Option<Held>,
     /// Steers a turn dropped when it ended; see [`Self::take_dropped_steers`].
     dropped_steers: Vec<String>,
     /// IDs of steers that reached the conversation and that
@@ -318,6 +337,9 @@ pub struct Session {
     /// The turn that last ended, so [`Self::turn_began`] can tell an answer
     /// that arrives after its whole turn.
     ended_turn: Option<TurnId>,
+    /// A turn began live and nothing of it that [`opening`] reads has
+    /// arrived yet: its prompt opens it, or else an [`Entry::Wake`] does.
+    unopened_turn: bool,
     sync: Sync,
 }
 
@@ -350,9 +372,12 @@ impl Session {
             plan: Vec::new(),
             inputs: Vec::new(),
             steers: Vec::new(),
+            background: Vec::new(),
+            held: None,
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
             ended_turn: None,
+            unopened_turn: false,
             sync: Sync::Attaching(Vec::new()),
         }
     }
@@ -378,6 +403,7 @@ impl Session {
         for request in response.inputs {
             self.open_input(InputRequest::from_wire(request));
         }
+        self.set_background(response.background);
         let replay = match response.replay_events {
             0 => Sync::Live,
             events => Sync::Replaying(events),
@@ -463,6 +489,67 @@ impl Session {
         &self.plan
     }
 
+    /// The session's background work: what still runs, and what ended
+    /// whose result the model has yet to be given, with how it ended.
+    pub fn background(&self) -> &[BackgroundWork] {
+        &self.background
+    }
+
+    /// The turn that ended last, as far as this session has heard. Take it
+    /// when sending a message, for [`Self::hold`].
+    pub fn ended_turn(&self) -> Option<&TurnId> {
+        self.ended_turn.as_ref()
+    }
+
+    /// Whether a turn runs now, or one ended after `ended`, an earlier
+    /// [`Self::ended_turn`].
+    pub fn has_turn_since(&self, ended: Option<&TurnId>) -> bool {
+        self.state.is_busy() || self.ended_turn.as_ref() != ended
+    }
+
+    /// Holds `text`, a message refused because a turn was under way, to
+    /// send as a prompt once that turn ends; see [`Self::take_due`].
+    /// `sent_after` is [`Self::ended_turn`] as it was when `text` was sent:
+    /// the refusing turn is a later one, which may have ended already, or
+    /// whose events may not have arrived yet. A second message joins the
+    /// first.
+    pub fn hold(&mut self, text: String, sent_after: Option<TurnId>) {
+        self.held = Some(match self.held.take() {
+            Some(held) => Held {
+                text: format!("{}\n{text}", held.text),
+                after: held.after,
+            },
+            None => Held {
+                text,
+                after: sent_after,
+            },
+        });
+    }
+
+    /// The held message, if any.
+    pub fn held(&self) -> Option<&str> {
+        self.held.as_ref().map(|held| held.text.as_str())
+    }
+
+    /// Takes the held message back, as when the user withdraws it.
+    pub fn take_held(&mut self) -> Option<String> {
+        self.held.take().map(|held| held.text)
+    }
+
+    /// Takes the held message once it is due: a turn ended after it was
+    /// sent, and none runs.
+    pub fn take_due(&mut self) -> Option<String> {
+        let due = self
+            .held
+            .as_ref()
+            .is_some_and(|held| !self.state.is_busy() && self.ended_turn != held.after);
+        if due {
+            self.take_held()
+        } else {
+            None
+        }
+    }
+
     /// What the session waits on a person for, oldest first.
     pub fn inputs(&self) -> &[InputRequest] {
         &self.inputs
@@ -545,6 +632,7 @@ impl Session {
                 self.sync = Sync::Live;
             }
         }
+        self.open_turn(&event);
         match event {
             SessionEvent::UserMessage {
                 message,
@@ -632,10 +720,28 @@ impl Session {
                 self.close_input(InputId(id.0));
                 None
             }
+            SessionEvent::Background { work } => {
+                self.set_background(work);
+                None
+            }
             // Compaction and provider progress, held timeouts, and cache
             // warming are not shown yet.
             _ => None,
         }
+    }
+
+    /// Opens the turn that began live, if `event` is the first of it that
+    /// [`opening`] reads: with an [`Entry::Wake`], unless it is the prompt.
+    fn open_turn(&mut self, event: &SessionEvent) {
+        if let Some(opening) = opening(event) {
+            if std::mem::take(&mut self.unopened_turn) && opening == Opening::Wake {
+                self.entries.push(Entry::Wake);
+            }
+        }
+    }
+
+    fn set_background(&mut self, work: Vec<rho_protocol::BackgroundWork>) {
+        self.background = work.into_iter().map(BackgroundWork::from_wire).collect();
     }
 
     fn set_options(&mut self, options: SessionOptions) {
@@ -652,6 +758,9 @@ impl Session {
             JobState::Running | JobState::Queued => {
                 if !self.state.is_busy() {
                     self.early_steers.clear();
+                    // A turn of the past, as an attach catches up, opens
+                    // nothing here.
+                    self.unopened_turn = matches!(self.sync, Sync::Live);
                 }
                 self.state = RunState::Running;
             }
@@ -665,6 +774,7 @@ impl Session {
                 if self.state.is_busy() =>
             {
                 self.state = RunState::Idle;
+                self.unopened_turn = false;
             }
             // Already settled, or a state a newer daemon added.
             _ => {}
@@ -672,6 +782,7 @@ impl Session {
     }
 
     fn end_turn(&mut self, outcome: TurnOutcome) {
+        self.unopened_turn = false;
         self.state = match outcome {
             TurnOutcome::Answered { stop, .. } => match stop {
                 AnswerStop::Refusal => RunState::Failed("the model refused".to_owned()),
@@ -787,6 +898,30 @@ impl Session {
         let mut session = Self::new(id);
         session.sync = Sync::Live;
         session
+    }
+}
+
+/// What opens a turn that began live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opening {
+    /// Its prompt, which the daemon echoes as the turn's user message.
+    Prompt,
+    /// Model output or a steer before any prompt: the daemon began the turn
+    /// itself.
+    Wake,
+}
+
+/// Whether `event` opens the turn under way, and how. A notice or card does
+/// not: the daemon may send one before a prompt's echo, as a settings
+/// change does.
+fn opening(event: &SessionEvent) -> Option<Opening> {
+    match event {
+        SessionEvent::UserMessage { steer: None, .. } => Some(Opening::Prompt),
+        SessionEvent::UserMessage { steer: Some(_), .. }
+        | SessionEvent::AgentMessageChunk { .. }
+        | SessionEvent::ThoughtChunk { .. }
+        | SessionEvent::ToolCall(_) => Some(Opening::Wake),
+        _ => None,
     }
 }
 
