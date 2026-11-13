@@ -409,6 +409,27 @@ impl SessionList {
     pub(crate) fn row(&self, id: &SessionId) -> Option<&Row> {
         self.rows.iter().find(|row| row.id == *id)
     }
+
+    /// How many sessions wait for a person and how many are working,
+    /// whatever the search shows.
+    pub(crate) fn busy(&self) -> Busy {
+        let mut busy = Busy::default();
+        for row in &self.rows {
+            match row.activity {
+                Activity::Waiting(_) => busy.waiting += 1,
+                Activity::Working(_) => busy.working += 1,
+                Activity::Idle => {}
+            }
+        }
+        busy
+    }
+}
+
+/// How many sessions are busy, by what they do; see [`SessionList::busy`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Busy {
+    pub(crate) waiting: usize,
+    pub(crate) working: usize,
 }
 
 /// Whether `haystack` contains `needle`, ignoring ASCII case. Allocates
@@ -659,5 +680,25 @@ mod tests {
         list.set_query("atl");
         rebuild(&mut list, &shelves, 5);
         assert_eq!(list.items.len(), 5, "the workspace name matches too");
+    }
+
+    #[test]
+    fn busy_counts_every_session_whatever_the_search_shows() {
+        let mut list = SessionList::default();
+        let now = Instant::now();
+        list.set_live(live("a", None, Activity::Working(now)), 0, 1);
+        list.set_live(live("b", None, Activity::Waiting(now)), 0, 1);
+        list.set_live(live("c", None, Activity::Working(now)), 0, 1);
+        list.set_live(live("d", None, Activity::Idle), 0, 1);
+        list.set_query("matches nothing");
+        rebuild(&mut list, &owned(), 1);
+        assert!(list.is_empty());
+        assert_eq!(
+            list.busy(),
+            Busy {
+                waiting: 1,
+                working: 2
+            }
+        );
     }
 }

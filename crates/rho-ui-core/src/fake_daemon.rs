@@ -4,8 +4,8 @@
 //!
 //! - `rho/session/new` returns "new-1", "new-2", ...
 //! - `rho/session/list` returns pages of two: new sessions that have had a
-//!   prompt, newest first, then "s1" (titled "first") and "old" (untitled),
-//!   then [`Script::sessions`] more. `rho/session/delete` drops one.
+//!   prompt, newest first, then "s1" (titled "first") and "old" (untitled).
+//!   `rho/session/delete` drops one.
 //! - Attaching to "old" replays one agent message, "replayed", then
 //!   [`Script::replay_turns`] turns, each a question, a thought, three tool
 //!   calls, an edit, and a Markdown answer.
@@ -66,8 +66,6 @@ pub const TUI_SESSION: &str = "tui-1";
 pub struct Script {
     /// Turns that attaching to "old" replays after its one message.
     pub replay_turns: usize,
-    /// More saved sessions, "bulk-0" onwards, listed after "old".
-    pub sessions: usize,
     /// Whether [`TUI_SESSION`] exists, with a turn under way.
     pub tui_job: TuiJob,
     /// Whether "old"'s replay ends with an info card and a warning card.
@@ -698,14 +696,6 @@ impl State {
             cards(&mut old);
         }
         sessions.insert("old".to_owned(), old);
-        for n in 0..script.sessions {
-            let title = format!("Bulk session {n} with a longer title that truncates");
-            let cwd = format!("/w/project-{}", n % 7);
-            sessions.insert(
-                format!("bulk-{n}"),
-                FakeSession::new(&cwd, Some(&title), 1_764_547_200),
-            );
-        }
         let mut state = Self {
             sessions,
             new_sessions: 0,

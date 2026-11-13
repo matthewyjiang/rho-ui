@@ -31,6 +31,8 @@ use crate::{
     projects::Projects,
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
+    sidebar::SidebarLayout,
+    store::{Key, StateDb},
     turn_times::TurnTimes,
 };
 
@@ -49,6 +51,8 @@ struct Harness {
     target: DaemonTarget,
     /// Stops when the test ends.
     daemon: Option<FakeDaemon>,
+    /// The state database the app's sidebar layout saves to, in memory.
+    state: StateDb,
 }
 
 impl Harness {
@@ -100,6 +104,8 @@ impl Harness {
             workspace: std::env::temp_dir(),
             daemon: target.clone(),
         };
+        let state = StateDb::in_memory();
+        let layout = SidebarLayout::load(&state);
         let (window, app) = cx
             .update(|cx| {
                 gpui_kit::open_window(
@@ -113,9 +119,11 @@ impl Harness {
                         ..Default::default()
                     },
                     cx,
-                    // In-memory marks and projects: tests never touch the
-                    // user's state files.
-                    |window, cx| cx.new(|cx| RhoApp::new(launch, shelves, projects, window, cx)),
+                    // In-memory marks, projects and layout: tests never
+                    // touch the user's state database.
+                    |window, cx| {
+                        cx.new(|cx| RhoApp::new(launch, shelves, projects, layout, window, cx))
+                    },
                 )
             })
             .expect("open the app window");
@@ -126,6 +134,7 @@ impl Harness {
             name,
             target,
             daemon,
+            state,
         };
         harness.frame();
         harness
@@ -1353,115 +1362,114 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
     ui.shot("steered");
 }
 
-/// Frame-time probe, not a pass/fail test: 300 saved sessions and a long
-/// resumed transcript, then hovering sidebar rows and wheel-scrolling the
-/// transcript. Run with
-/// `cargo test -p rho-ui --release frame_times -- --ignored --nocapture`.
+/// The sidebar collapses to a rail and opens again, with Ctrl+B or its
+/// toggle, and the state database remembers which. The toggle and Settings
+/// stay where they were at any UI scale, the pane takes the width, the
+/// keyboard leaves the search it hides, and the rail still starts a session
+/// and shows one at work.
 #[test]
-#[ignore = "measurement; run on demand"]
-fn frame_times() {
-    use gpui_kit::{
-        point, InputEvent as _, MouseMoveEvent, Pixels, Point, ScrollDelta, ScrollEvent,
-    };
-
-    // `TestEventExt::pointer_move` forces two full redraws around the
-    // event; the probe wants only the work the event itself causes.
-    fn move_pointer(window: &mut Window, position: Point<Pixels>, cx: &mut App) {
-        window.dispatch_event(
-            MouseMoveEvent {
-                position,
-                pressed_button: None,
-                modifiers: window.modifiers(),
-            }
-            .to_platform_input(),
-            cx,
-        );
-    }
-
-    let sessions: usize = std::env::var("PERF_SESSIONS")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(300);
+fn the_sidebar_collapses_to_a_rail_and_back() {
     let script = Script {
-        sessions,
-        replay_turns: std::env::var("PERF_REPLAY")
-            .ok()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(100),
+        tui_job: TuiJob::Running,
         ..Script::default()
     };
-    let owned = std::iter::once("old".to_owned()).chain((0..sessions).map(|n| format!("bulk-{n}")));
-    let mut ui = Harness::start_with("perf", script, Shelves::owning(owned));
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+    let mut ui = Harness::start("rail", script);
+    ui.wait_until("sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-s1") && is_visible(window, "session-tui-1")
     });
-    ui.click("session-old");
-    ui.wait_for_session("the replayed history", |session| {
-        session.state() == &RunState::Idle && !session.entries().is_empty()
+    ui.click("session-s1");
+    ui.wait_for_session("the open session", |session| {
+        session.title() == Some("first")
     });
-    ui.shot("loaded");
-
-    let report = |name: &str, mut samples: Vec<Duration>| {
-        samples.sort();
-        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        println!(
-            "{name:>14}: p50 {:6.2} ms  p90 {:6.2} ms  max {:6.2} ms  (n={})",
-            ms(samples[samples.len() / 2]),
-            ms(samples[samples.len() * 9 / 10]),
-            ms(samples[samples.len() - 1]),
-            samples.len()
-        );
-    };
-    let measure = |ui: &mut Harness, step: &dyn Fn(usize, &mut Window, &mut App)| {
-        (0..60)
-            .map(|n| {
-                ui.cx
-                    .update_window(ui.window, |_, window, cx| {
-                        let start = Instant::now();
-                        step(n, window, cx);
-                        // A plain draw, as the platform does: clean cached
-                        // views are reused. `render_frame` would force every
-                        // view to rebuild.
-                        window.draw(cx).clear(cx);
-                        start.elapsed()
-                    })
-                    .expect("window is open")
+    // Where the toggle, Settings and the pane's title are drawn.
+    let places = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                ["toggle-sidebar", "open-settings", "session-title"]
+                    .map(|id| bounds(window, id).unwrap_or_else(|| panic!("{id} is drawn")))
             })
-            .collect::<Vec<_>>()
+            .expect("window is open")
     };
+    let [toggle, settings, title] = places(&mut ui);
+    assert_eq!(
+        ui.label("toggle-sidebar").as_deref(),
+        Some("Collapse sidebar")
+    );
 
-    report(
-        "full redraw",
-        measure(&mut ui, &|_, window, _| window.refresh()),
+    // From the sidebar's search, which the rail doesn't show.
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        let search = app.read(cx).sidebar_search(cx);
+        window.focus(&search, cx);
+        window.press("ctrl-b", cx);
+    });
+    ui.wait_until("the rail", |window, _, _| {
+        is_visible(window, "sidebar-rail") && !is_visible(window, "session-s1")
+    });
+    ui.act(|window, cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        assert!(
+            view.read(cx).composer_focus_handle(cx).is_focused(window),
+            "the keyboard goes to the composer"
+        );
+    });
+    assert_eq!(
+        ui.state.get(Key::SidebarLayout).as_deref(),
+        Some("collapsed")
     );
-    report("idle frame", measure(&mut ui, &|_, _, _| {}));
-    report(
-        "sidebar hover",
-        measure(&mut ui, &|n, window, cx| {
-            let row = f32::from(u8::try_from(n % 7).expect("under 7"));
-            // One row per step across the seven on screen, so every step
-            // moves the hover.
-            let y = 120.0 + row * crate::sidebar::ROW_REMS * 16.0;
-            move_pointer(window, point(px(100.), px(y)), cx);
-        }),
+    let [rail_toggle, rail_settings, rail_title] = places(&mut ui);
+    assert_eq!(rail_toggle, toggle, "the toggle stays put");
+    assert_eq!(rail_settings, settings, "Settings stays put");
+    assert!(
+        rail_title.left() < title.left() - px(200.),
+        "the pane takes the sidebar's width: {title:?} became {rail_title:?}"
     );
-    report(
-        "transcript wheel",
-        measure(&mut ui, &|n, window, cx| {
-            let dy = if n < 30 { 40.0 } else { -40.0 };
-            let position = point(px(700.), px(400.));
-            move_pointer(window, position, cx);
-            window.dispatch_event(
-                ScrollEvent {
-                    position,
-                    delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
-                    ..Default::default()
-                }
-                .to_platform_input(),
-                cx,
-            );
-        }),
+    assert_eq!(
+        ui.label("toggle-sidebar").as_deref(),
+        Some("Expand sidebar")
     );
+    // The terminal UI's turn runs on, so the rail shows it.
+    assert_eq!(
+        ui.label("rail-working").as_deref(),
+        Some("1 session working")
+    );
+    ui.shot("collapsed");
+
+    ui.click("new-session");
+    ui.wait_until("a draft beside the rail", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "sidebar-rail")
+    });
+
+    // At another scale and theme the rail and the open sidebar still line
+    // up, as both place their buttons in rems.
+    ui.cx.update(|cx| {
+        let mut settings = cx.global::<Settings>().clone();
+        settings.appearance = Appearance::Light;
+        settings.ui_scale = UiScale::from_percent(125).expect("125% is on offer");
+        settings.apply(cx);
+    });
+    ui.frame();
+    let [scaled_rail_toggle, scaled_rail_settings, _] = places(&mut ui);
+    ui.shot("collapsed-light");
+    ui.click("toggle-sidebar");
+    ui.wait_until("the open sidebar", |window, _, _| {
+        is_visible(window, "session-s1") && !is_visible(window, "sidebar-rail")
+    });
+    assert_eq!(ui.state.get(Key::SidebarLayout).as_deref(), Some("open"));
+    let [scaled_toggle, scaled_settings, _] = places(&mut ui);
+    assert_eq!(
+        scaled_toggle, scaled_rail_toggle,
+        "the toggle stays put at 125%"
+    );
+    assert_eq!(
+        scaled_settings, scaled_rail_settings,
+        "Settings stays put at 125%"
+    );
+    assert_eq!(
+        ui.label("toggle-sidebar").as_deref(),
+        Some("Collapse sidebar")
+    );
+    ui.shot("open-light");
 }
 
 /// The theme setting switches between rho-ui's light and dark themes,
