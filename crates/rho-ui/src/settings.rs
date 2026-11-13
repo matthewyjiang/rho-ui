@@ -56,18 +56,23 @@ impl Default for UiScale {
 }
 
 /// Whether rho-ui shows its light or dark theme.
+///
+/// Dark by default, not [`Appearance::System`]: on Linux the app starts
+/// before the desktop portal says light or dark, so a dark desktop would
+/// see a light first frame, and with no portal (bare sway or i3) stay
+/// light.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Appearance {
     /// The one the desktop asks for, changing when it does.
-    #[default]
     System,
     Light,
+    #[default]
     Dark,
 }
 
 impl Appearance {
     pub(crate) const CHOICES: [Appearance; 3] =
-        [Appearance::System, Appearance::Light, Appearance::Dark];
+        [Appearance::Dark, Appearance::Light, Appearance::System];
 
     /// What the settings file calls it.
     pub(crate) fn name(self) -> &'static str {
@@ -232,6 +237,6 @@ mod tests {
         assert_eq!(settings.code_font, "Fira Code");
         assert_eq!(settings.ui_font, DEFAULT_UI_FONT);
         assert_eq!(parse("ui_scale = 133").ui_scale, UiScale::default());
-        assert_eq!(parse("appearance = sepia").appearance, Appearance::System);
+        assert_eq!(parse("appearance = sepia").appearance, Appearance::Dark);
     }
 }

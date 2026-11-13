@@ -224,7 +224,7 @@ impl Render for SettingsView {
                         )
                         .default_value(Appearance::default().name()),
                     )
-                    .description("Light, dark, or whichever your desktop uses."),
+                    .description("Dark, light, or whichever your desktop uses."),
                     SettingItem::new(
                         "UI scale",
                         SettingField::dropdown(
