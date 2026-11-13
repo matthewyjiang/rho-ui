@@ -31,4 +31,4 @@ pub use session::{
     TurnId, Usage, UserMessage, Worktree,
 };
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};
-pub use tool_card::{ToolBody, ToolCard, ToolFact};
+pub use tool_card::{SearchLine, ToolBody, ToolCard, ToolFact};

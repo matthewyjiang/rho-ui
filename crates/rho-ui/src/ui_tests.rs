@@ -925,6 +925,7 @@ fn finished_work_folds_and_opens_in_levels() {
             "a search's label is all on its line"
         );
     });
+    ui.shot("search");
 
     // The output scrolls inside its box, and the transcript stays put.
     ui.act(|window, cx| {
@@ -1027,6 +1028,16 @@ fn a_step_shows_its_card_not_what_the_model_read() {
         );
     });
     ui.shot("edit");
+
+    // A script shows as its card's code, not what it printed for the model.
+    assert!(matches!(
+        tool(7).card().map(rho_ui_core::ToolCard::body),
+        Some(rho_ui_core::ToolBody::Code { language, .. }) if language == "python"
+    ));
+    ui.act(|window, cx| window.within("step-6").click("step-line", cx));
+    ui.act(|window, cx| window.within("step-7").click("step-line", cx));
+    ui.wait_until("the script", |window, _, _| is_visible(window, "output-7"));
+    ui.shot("script");
 }
 
 /// A sent prompt starts a new turn even before the daemon echoes it, so the
@@ -1080,7 +1091,7 @@ fn a_new_prompt_leaves_finished_turns_folded() {
     // Each turn has its own "Worked" line: opening the second opens only it.
     ui.toggle_turn("worked-1");
     ui.wait_until("the slow turn's tool call", |window, _, _| {
-        is_visible(window, "step-9")
+        is_visible(window, "step-10")
     });
     ui.act(|window, _| {
         assert!(!is_visible(window, "work-2"), "the old turn stays folded");

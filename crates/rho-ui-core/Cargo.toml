@@ -14,6 +14,8 @@ test-support = ["dep:tempfile", "tokio/time"]
 [dependencies]
 # Prompt and user-message images travel base64-encoded.
 base64 = "0.22"
+# Highlights what a search matched, with the pattern rho's grep used.
+regex = "1"
 rho-protocol.workspace = true
 similar = "2"
 tempfile = { version = "3", optional = true }

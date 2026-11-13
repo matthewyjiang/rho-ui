@@ -9,7 +9,7 @@ use crate::{
     input::InputChoice,
     options::{ConfigCategory, ConfigChoice, ConfigKind},
     prompt::{Image, ImageFormat},
-    tool_card::{ToolBody, ToolFact},
+    tool_card::{SearchLine, ToolBody, ToolFact},
 };
 
 fn update(value: serde_json::Value) -> SessionUpdate {
@@ -289,13 +289,40 @@ fn recorded_tool_cards_say_what_to_show() {
     assert_eq!(read.facts(), [ToolFact::Stat("32 lines".to_owned())]);
     assert_eq!(read.body(), &ToolBody::None);
 
-    // A search: what matched, as rho lists it.
+    // A search: what matched, file by file, with where the pattern matched
+    // each line. rho 3 counts the matches for its fact from grep's old
+    // `path:line:text` output, so the fact disagrees with the tool's own
+    // count, which stays as a note.
     let search = card("toolu_01CM4t1CVpETbujQDpJJASqx");
     assert_eq!(
         search.facts(),
         [ToolFact::Stat("13 matches in 2 files".to_owned())]
     );
-    assert!(card_text(search).starts_with("crates/rho-ui/src/transcript.rs\n3 | "));
+    let ToolBody::Search(lines) = search.body() else {
+        panic!("a search body, not {:?}", search.body());
+    };
+    assert_eq!(
+        lines[..2],
+        [
+            SearchLine::File("crates/rho-ui/src/transcript.rs".to_owned()),
+            SearchLine::Hit {
+                line: 3,
+                text:
+                    "//! [`crate::work`]. A finished turn's working folds behind one \"Worked for\""
+                        .to_owned(),
+                matches: vec![std::ops::Range { start: 65, end: 75 }],
+            },
+        ]
+    );
+    let files = lines
+        .iter()
+        .filter(|line| matches!(line, SearchLine::File(_)))
+        .count();
+    assert_eq!(files, 4);
+    assert_eq!(
+        lines.last(),
+        Some(&SearchLine::Note("8 matches in 4 files".to_owned()))
+    );
 
     // A failure says why once, as a fact, not again as output.
     let failed = card("call_cad01bbb216f46d5b2abbf6b2a3f2d5d");

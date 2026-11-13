@@ -17,16 +17,18 @@ use gpui_kit::component::{
     separator::Separator,
     shimmer::ShimmerText,
     spinner::Spinner,
-    text::TextView,
+    text::{TextView, TextViewStyle},
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, ElementId, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window,
+    div, rems, AnyElement, App, AppContext as _, ElementId, Entity, HighlightStyle,
+    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledText, Window,
 };
-use rho_ui_core::{Entry, Step, ToolBody, ToolCall, ToolContent, ToolFact, ToolKind, ToolStatus};
+use rho_ui_core::{
+    Entry, SearchLine, Step, ToolBody, ToolCall, ToolContent, ToolFact, ToolKind, ToolStatus,
+};
 
 use crate::{time, transcript::Phase};
 
@@ -43,6 +45,10 @@ const ICON_REMS: f32 = 1.5;
 
 /// The gap between a line's icon column and its label: `gap_1p5`.
 const LABEL_GAP_REMS: f32 = 0.375;
+
+/// A search hit's line-number column: five digits of `text_xs` monospace
+/// (0.75rem, a digit about 0.6em wide, so 2.25rem) and `pr_2`'s 0.5rem.
+const SEARCH_GUTTER_REMS: f32 = 2.75;
 
 /// Whether something that opens is open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -673,6 +679,8 @@ fn output(tool: &ToolCall, ix: usize, diff: Option<&DiffView>, cx: &App) -> Opti
                     .into_any_element(),
             ]
         }
+        Some(ToolBody::Code { language, text }) => vec![code(language, text, ix)],
+        Some(ToolBody::Search(lines)) => vec![search_results(lines, cx)],
         None => tool
             .content()
             .iter()
@@ -705,6 +713,84 @@ fn output(tool: &ToolCall, ix: usize, diff: Option<&DiffView>, cx: &App) -> Opti
             }),
     );
     (!parts.is_empty()).then(|| v_flex().gap_2().children(parts).into_any_element())
+}
+
+/// Source code, highlighted as `language`. Kit highlights code only in a
+/// text view's code blocks, so it is one, without the block's frame: the
+/// details are framed already.
+fn code(language: &str, text: &str, ix: usize) -> AnyElement {
+    let longest_ticks = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_ticks.max(2) + 1);
+    let style = TextViewStyle {
+        code_block: StyleRefinement::default()
+            .p_0()
+            .border_0()
+            .bg(gpui_kit::transparent_black())
+            .text_xs(),
+        ..TextViewStyle::default()
+    };
+    TextView::markdown(
+        ElementId::named_usize("tool-code", ix),
+        format!("{fence}{language}\n{text}\n{fence}"),
+    )
+    .style(style)
+    // Actions take the corner the language name would; none, so neither
+    // shows.
+    .code_block_actions(|_, _, _| div())
+    .selectable(true)
+    .into_any_element()
+}
+
+/// What a search found: each file, then its matching lines under it, each
+/// with its line number and what matched marked, cut at the edge rather than
+/// wrapped.
+fn search_results(lines: &[SearchLine], cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let mark = HighlightStyle {
+        color: Some(theme.foreground),
+        background_color: Some(theme.warning.opacity(0.25)),
+        ..HighlightStyle::default()
+    };
+    let rows = lines.iter().enumerate().map(|(n, line)| match line {
+        SearchLine::File(path) => div()
+            .when(n > 0, gpui_kit::Styled::mt_1)
+            .text_color(theme.foreground)
+            .truncate()
+            .child(path.clone())
+            .into_any_element(),
+        SearchLine::Hit {
+            line,
+            text,
+            matches,
+        } => h_flex()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(rems(SEARCH_GUTTER_REMS))
+                    .pr_2()
+                    .text_right()
+                    .opacity(0.6)
+                    .child(line.to_string()),
+            )
+            .child(
+                div().min_w_0().flex_1().truncate().child(
+                    // Raw GPUI: Kit's `Label` marks a substring, not ranges.
+                    StyledText::new(text.clone())
+                        .with_highlights(matches.iter().map(|range| (range.clone(), mark))),
+                ),
+            )
+            .into_any_element(),
+        SearchLine::Note(note) => div()
+            .when(n > 0, gpui_kit::Styled::mt_1)
+            .font_family(theme.font_family.clone())
+            .child(note.clone())
+            .into_any_element(),
+    });
+    v_flex()
+        .text_xs()
+        .font_family(theme.mono_font_family.clone())
+        .children(rows)
+        .into_any_element()
 }
 
 /// The last `MAX_OUTPUT_LINES` lines of `text`, and how many were hidden.
