@@ -18,7 +18,7 @@ pub(crate) fn install(cx: &mut App) {
     let registry = ThemeRegistry::global_mut(cx);
     registry
         .load_themes_from_str(THEMES)
-        .expect("rho-ui's theme file parses: a test checks it");
+        .expect("rho-ui's theme file parses: `kit_reads_every_key_and_color` checks it");
     let theme = |name: &str| {
         let theme = registry.themes().get(name);
         Rc::clone(theme.unwrap_or_else(|| panic!("rho-ui's theme file has {name}")))
@@ -31,26 +31,46 @@ pub(crate) fn install(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use gpui_kit::component::{try_parse_color, ThemeSet};
+    use serde_json::Value;
+
     use super::*;
 
-    /// A color GPUI Kit can't read falls back to its default without a
-    /// word, so every one is checked here.
+    /// GPUI Kit reads a theme leniently: a color key it doesn't know, or a
+    /// color it can't parse, falls back to its default without a word. Every
+    /// key must survive a round trip through Kit's own schema, and every
+    /// color must parse.
     #[test]
-    fn every_theme_color_parses() {
-        let file: serde_json::Value = serde_json::from_str(THEMES).expect("valid JSON");
-        let themes = file["themes"].as_array().expect("a list of themes");
-        let names: Vec<&str> = themes.iter().filter_map(|t| t["name"].as_str()).collect();
+    fn kit_reads_every_key_and_color() {
+        let ours: Value = serde_json::from_str(THEMES).expect("valid JSON");
+        let set: ThemeSet = serde_json::from_str(THEMES).expect("Kit's theme schema");
+        let read = serde_json::to_value(&set).expect("Kit's schema serializes");
+        let names: Vec<&str> = set.themes.iter().map(|theme| theme.name.as_ref()).collect();
         assert_eq!(names, [DARK, LIGHT]);
-        for theme in themes {
-            let colors = theme["colors"].as_object().expect("colors");
-            for (key, value) in colors {
+        let pairs = ours["themes"].as_array().into_iter().flatten();
+        for (theme, kit) in pairs.zip(read["themes"].as_array().into_iter().flatten()) {
+            let name = &theme["name"];
+            for (key, value) in theme["colors"].as_object().expect("colors") {
+                assert!(!kit["colors"][key].is_null(), "{name}: Kit ignores {key}");
                 let value = value.as_str().expect("a color string");
-                assert!(
-                    gpui_kit::component::try_parse_color(value).is_ok(),
-                    "{} {key}: {value}",
-                    theme["name"]
-                );
+                assert!(try_parse_color(value).is_ok(), "{name} {key}: {value}");
             }
+        }
+    }
+
+    /// Loading a mode's theme puts back any font, size, radius or shadow
+    /// its file sets, which would undo the user's settings at each switch;
+    /// see [`crate::settings::Settings::apply`].
+    #[test]
+    fn the_themes_leave_fonts_and_sizes_alone() {
+        let set: ThemeSet = serde_json::from_str(THEMES).expect("Kit's theme schema");
+        for theme in &set.themes {
+            let fonts = (theme.font_size, theme.mono_font_size);
+            let families = (&theme.font_family, &theme.mono_font_family);
+            assert_eq!(fonts, (None, None), "{}", theme.name);
+            assert_eq!(families, (&None, &None), "{}", theme.name);
+            let shape = (theme.radius, theme.radius_lg, theme.shadow);
+            assert_eq!(shape, (None, None, None), "{}", theme.name);
         }
     }
 }

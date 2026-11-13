@@ -1173,12 +1173,13 @@ fn frame_times() {
     );
 }
 
-/// The theme setting switches between rho-ui's light and dark themes, and
-/// saves the choice. Screenshots of the same busy screen in both modes, for
-/// a person to judge: a turn's steps, a diff, code, an approval.
+/// The theme setting switches between rho-ui's light and dark themes,
+/// keeping the UI scale. Screenshots of the same busy screen in both modes,
+/// for a person to judge: a turn's steps, a diff, code, notices, an
+/// approval.
 #[test]
 fn the_theme_setting_switches_light_and_dark() {
-    use gpui_kit::component::{Theme, ThemeMode};
+    use gpui_kit::component::Theme;
 
     use crate::settings::Appearance;
 
@@ -1205,40 +1206,51 @@ fn the_theme_setting_switches_light_and_dark() {
     ui.wait_until("the edit's diff", |window, _, _| {
         is_visible(window, "details-6")
     });
-    let mode = |ui: &mut Harness| {
-        ui.cx.update(|cx| {
-            (
-                Theme::global(cx).mode,
-                Theme::global(cx).theme_name().clone(),
-            )
-        })
-    };
+    // What each theme's file sets: its background and link colors.
+    let color = |hex: &str| gpui_kit::component::try_parse_color(hex).expect("a color");
     let show = |ui: &mut Harness, step: &str| {
-        for (appearance, want, name) in [
-            (Appearance::Dark, ThemeMode::Dark, "rho Dark"),
-            (Appearance::Light, ThemeMode::Light, "rho Light"),
+        for (appearance, background, link) in [
+            (Appearance::Dark, "#161618", "#9db4ec"),
+            (Appearance::Light, "#fcfcfd", "#3a5fc0"),
         ] {
-            ui.cx.update(|cx| {
+            let shown = ui.cx.update(|cx| {
                 let mut settings = cx.global::<Settings>().clone();
                 settings.appearance = appearance;
+                settings.ui_scale = UiScale::from_percent(125).expect("125% is on offer");
                 settings.apply(cx);
+                let theme = Theme::global(cx);
+                (theme.background, theme.link, theme.font_size)
             });
             ui.frame();
-            assert_eq!(mode(ui), (want, name.into()));
+            let want = (color(background), color(link), px(20.));
+            assert_eq!(shown, want, "{appearance:?} keeps the scale");
+            // Shots at the default scale, to compare with the other tests'.
+            ui.cx.update(|cx| {
+                let mut settings = cx.global::<Settings>().clone();
+                settings.ui_scale = UiScale::default();
+                settings.apply(cx);
+            });
             ui.shot(&format!("{step}-{}", appearance.name()));
         }
     };
     // The diff sits above the fold: bring its row to the top.
     let app = ui.app.clone();
-    ui.cx.update(|cx| {
+    let scroller = ui.cx.update(|cx| {
         let view = app.read(cx).active_session().expect("a session is open");
-        let scroller = view.read(cx).transcript().scroller().clone();
-        scroller.update(cx, |scroller, cx| scroller.scroll_to_item(2, cx));
+        view.read(cx).transcript().scroller().clone()
     });
+    ui.cx
+        .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(2, cx)));
     show(&mut ui, "diff");
     ui.prompt_from_elsewhere("old", "list files");
     ui.wait_until("the approval", |window, _, _| {
         is_visible(window, "approval-allow-once")
+    });
+    ui.cx.update(|cx| {
+        scroller.update(
+            cx,
+            gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end,
+        );
     });
     show(&mut ui, "approval");
 

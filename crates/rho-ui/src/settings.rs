@@ -66,23 +66,31 @@ pub(crate) enum Appearance {
 }
 
 impl Appearance {
-    /// Every choice, with the name the settings file and screen use.
-    pub(crate) const CHOICES: [(Appearance, &'static str); 3] = [
-        (Appearance::System, "system"),
-        (Appearance::Light, "light"),
-        (Appearance::Dark, "dark"),
-    ];
+    pub(crate) const CHOICES: [Appearance; 3] =
+        [Appearance::System, Appearance::Light, Appearance::Dark];
 
+    /// What the settings file calls it.
     pub(crate) fn name(self) -> &'static str {
-        let named = Self::CHOICES
-            .into_iter()
-            .find(|(choice, _)| *choice == self);
-        named.map_or("system", |(_, name)| name)
+        match self {
+            Appearance::System => "system",
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+        }
+    }
+
+    /// What the settings screen calls it.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Appearance::System => "System",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        }
     }
 
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        let named = Self::CHOICES.into_iter().find(|(_, known)| *known == name);
-        named.map(|(choice, _)| choice)
+        Self::CHOICES
+            .into_iter()
+            .find(|choice| choice.name() == name)
     }
 
     /// The theme mode to show while the desktop asks for `system`.

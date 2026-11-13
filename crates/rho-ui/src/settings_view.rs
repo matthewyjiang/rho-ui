@@ -203,11 +203,7 @@ impl Render for SettingsView {
             .collect();
         let themes: Vec<(SharedString, SharedString)> = Appearance::CHOICES
             .into_iter()
-            .map(|(_, name)| {
-                let mut title = name.to_owned();
-                title[..1].make_ascii_uppercase();
-                (name.into(), title.into())
-            })
+            .map(|choice| (choice.name().into(), choice.label().into()))
             .collect();
         let appearance = SettingPage::new("Appearance")
             .icon(IconName::Palette)
