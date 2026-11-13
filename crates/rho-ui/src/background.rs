@@ -2,7 +2,8 @@
 //! composer: the processes, workflow runs and subagents its turns left
 //! running, each with a button to stop it. Work leaves that list as it ends;
 //! a button in the header opens what ended and how, as the daemon's turn
-//! that tells the model can be missed or scroll away.
+//! that tells the model can be missed or scroll away. A subagent's row, in
+//! either list, opens the subagent's own session once it has one.
 
 use std::rc::Rc;
 
@@ -19,10 +20,13 @@ use gpui_kit::{
     div, rems, Anchor, App, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window,
 };
-use rho_ui_core::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
+use rho_ui_core::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork, SessionId};
 
 /// Asks the daemon to stop one piece of work.
 type StopHandler = Rc<dyn Fn(&BackgroundId, &mut Window, &mut App)>;
+
+/// Opens a subagent's session, given its ID and the subagent's task.
+pub(crate) type OpenHandler = Rc<dyn Fn(&SessionId, &SharedString, &mut Window, &mut App)>;
 
 /// What a row shows of one piece of work.
 struct Row {
@@ -31,6 +35,8 @@ struct Row {
     status: SharedString,
     /// Whether it ended badly, which the status also says in words.
     failed: bool,
+    /// A subagent's session, which a click on the row opens.
+    session: Option<SessionId>,
 }
 
 impl Row {
@@ -40,24 +46,39 @@ impl Row {
             title: work.title().to_owned().into(),
             status: status_label(work, stop).into(),
             failed: failed(work),
+            session: work.session(),
         }
     }
 
-    /// Icon, title and status, labelled "title: status" for UI tests.
-    fn render(&self, id: SharedString, cx: &App) -> ObservedElement<Stateful<Div>> {
+    /// Icon, title and status, labelled "title: status" for UI tests. A
+    /// subagent's row opens its session with `open`.
+    fn render(
+        &self,
+        id: SharedString,
+        open: &OpenHandler,
+        cx: &App,
+    ) -> ObservedElement<Stateful<Div>> {
         let muted = cx.theme().muted_foreground;
         let status_color: Hsla = if self.failed {
             cx.theme().danger
         } else {
             muted
         };
+        let hover = cx.theme().secondary;
         h_flex()
             .id(id)
             .test_support()
             .aria_label(format!("{}: {}", self.title, self.status))
             .gap_2()
+            .rounded(cx.theme().radius)
             .text_sm()
             .text_color(muted)
+            .when_some(self.session.clone(), |this, session| {
+                let (open, title) = (Rc::clone(open), self.title.clone());
+                this.cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(move |_, window, cx| open(&session, &title, window, cx))
+            })
             .child(kind_icon(self.kind).xsmall())
             .child(
                 div()
@@ -93,70 +114,78 @@ enum Stop {
 /// as the daemon lists it.
 #[derive(IntoElement)]
 pub(crate) struct BackgroundList {
-    items: Vec<(BackgroundId, Row, Stop)>,
-    on_stop: StopHandler,
+    running: Vec<BackgroundWork>,
+    /// The work the user asked to stop, and how to ask; `None` where
+    /// nothing can be stopped from here.
+    stop: Option<(Vec<BackgroundId>, StopHandler)>,
+    on_open: OpenHandler,
 }
 
 impl BackgroundList {
-    /// `stopping` holds the work the user asked to stop. `None` when
-    /// nothing runs.
-    pub(crate) fn new(
-        work: &[BackgroundWork],
-        stopping: &[BackgroundId],
-        on_stop: impl Fn(&BackgroundId, &mut Window, &mut App) + 'static,
-    ) -> Option<Self> {
-        let items: Vec<_> = work
+    /// The running work in `work`, each subagent opening its session with
+    /// `on_open`; `None` when nothing runs. Nothing offers to stop until
+    /// [`Self::stoppable`].
+    pub(crate) fn new(work: &[BackgroundWork], on_open: OpenHandler) -> Option<Self> {
+        let running: Vec<_> = work
             .iter()
             .filter(|work| work.status() == BackgroundStatus::Running)
-            .map(|work| {
-                let stop = match (work.can_stop(), stopping.contains(work.id())) {
-                    (false, _) => Stop::Never,
-                    (true, false) => Stop::Offered,
-                    (true, true) => Stop::Asked,
-                };
-                (work.id().clone(), Row::new(work, stop), stop)
-            })
+            .cloned()
             .collect();
-        (!items.is_empty()).then(|| Self {
-            items,
-            on_stop: Rc::new(on_stop),
+        (!running.is_empty()).then_some(Self {
+            running,
+            stop: None,
+            on_open,
         })
+    }
+
+    /// Offers to stop each piece of work that can be, with `on_stop`.
+    /// `stopping` holds the work the user asked to stop.
+    pub(crate) fn stoppable(
+        mut self,
+        stopping: &[BackgroundId],
+        on_stop: impl Fn(&BackgroundId, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.stop = Some((stopping.to_vec(), Rc::new(on_stop)));
+        self
     }
 }
 
 impl RenderOnce for BackgroundList {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (stop, on_open) = (self.stop, self.on_open);
         v_flex()
             .id("background")
             .test_support()
             .w_full()
             .gap_1()
-            .children(
-                self.items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, (id, row, stop))| {
-                        let on_stop = Rc::clone(&self.on_stop);
-                        row.render(format!("background-{ix}").into(), cx)
-                            .px_3()
-                            .map(|this| match stop {
-                                Stop::Offered | Stop::Asked => this.child(
-                                    Button::new(SharedString::from(format!(
-                                        "background-stop-{ix}"
-                                    )))
+            .children(self.running.iter().enumerate().map(|(ix, work)| {
+                let offer = stop.as_ref().filter(|_| work.can_stop());
+                let state = match offer {
+                    None => Stop::Never,
+                    Some((asked, _)) if asked.contains(work.id()) => Stop::Asked,
+                    Some(_) => Stop::Offered,
+                };
+                let row = Row::new(work, state);
+                row.render(format!("background-{ix}").into(), &on_open, cx)
+                    .px_3()
+                    .map(|this| match offer {
+                        Some((_, on_stop)) => {
+                            let (on_stop, id) = (Rc::clone(on_stop), work.id().clone());
+                            this.child(
+                                Button::new(SharedString::from(format!("background-stop-{ix}")))
                                     .ghost()
                                     .xsmall()
                                     .icon(Lucide::Square)
                                     .tooltip("Stop")
-                                    .disabled(stop == Stop::Asked)
+                                    .disabled(state == Stop::Asked)
                                     .on_click(move |_, window, cx| on_stop(&id, window, cx)),
-                                ),
-                                // Keeps the status in the lane of the rows that can
-                                // stop: the size of an xsmall icon button.
-                                Stop::Never => this.child(div().flex_shrink_0().size_5()),
-                            })
-                    }),
-            )
+                            )
+                        }
+                        // Keeps the status in the lane of the rows that can
+                        // stop: the size of an xsmall icon button.
+                        None => this.child(div().flex_shrink_0().size_5()),
+                    })
+            }))
     }
 }
 
@@ -165,11 +194,13 @@ impl RenderOnce for BackgroundList {
 #[derive(IntoElement)]
 pub(crate) struct BackgroundHistory {
     rows: Rc<[Row]>,
+    on_open: OpenHandler,
 }
 
 impl BackgroundHistory {
-    /// `None` when nothing ended yet.
-    pub(crate) fn new(ended: &[BackgroundWork]) -> Option<Self> {
+    /// Each subagent opens its session with `on_open`. `None` when
+    /// nothing ended yet.
+    pub(crate) fn new(ended: &[BackgroundWork], on_open: OpenHandler) -> Option<Self> {
         if ended.is_empty() {
             return None;
         }
@@ -178,13 +209,13 @@ impl BackgroundHistory {
             .rev()
             .map(|work| Row::new(work, Stop::Never))
             .collect();
-        Some(Self { rows })
+        Some(Self { rows, on_open })
     }
 }
 
 impl RenderOnce for BackgroundHistory {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        let rows = self.rows;
+        let (rows, on_open) = (self.rows, self.on_open);
         Popover::new("background-history")
             .anchor(Anchor::TopRight)
             .trigger(
@@ -213,7 +244,7 @@ impl RenderOnce for BackgroundHistory {
                             .overflow_y_scroll()
                             .gap_1()
                             .children(rows.iter().enumerate().map(|(ix, row)| {
-                                row.render(format!("background-ended-{ix}").into(), cx)
+                                row.render(format!("background-ended-{ix}").into(), &on_open, cx)
                             })),
                     )
             })

@@ -1,6 +1,12 @@
-//! One session: a header with its title and workspace, the transcript,
-//! approvals, and the composer with the session settings. Owns the session's
-//! [`Session`] state and every request the user makes in it.
+//! One session: a title bar naming its project and the sessions above it,
+//! the transcript, approvals, and the composer with the session settings.
+//! Owns the session's [`Session`] state and every request the user makes in
+//! it.
+//!
+//! A subagent's session opens from its row in the background work, nested
+//! under the session that started it. Only the subagent writes to it, so
+//! its view only watches: no composer, no approvals (the subagent's
+//! questions go to its parent), and no stopping its work.
 //!
 //! While a turn runs, whoever started it, the composer steers it: Enter adds
 //! the text to the turn's next model request, and it waits above the box
@@ -11,7 +17,8 @@
 //! message after one waiting, which would otherwise overtake it.
 //!
 //! The session's running background work is listed above the box, with a
-//! button to stop each piece; what ended is behind a button in the header.
+//! button to stop each piece; what ended is behind a button in the title
+//! bar.
 
 use std::{
     path::PathBuf,
@@ -29,13 +36,14 @@ use gpui_kit::component::{
     input::InputEvent,
     message_scroller::MessageScroller,
     spinner::Spinner,
-    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
+    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
+    div, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, WeakEntity,
+    Window,
 };
 use rho_ui_core::{
     Attached, Attachment, BackgroundId, Daemon, DaemonError, Entry, Prompt, RunState, Session,
@@ -44,12 +52,13 @@ use rho_ui_core::{
 
 use crate::{
     approval::ApprovalCard,
-    background::{BackgroundHistory, BackgroundList},
+    background::{BackgroundHistory, BackgroundList, OpenHandler},
     composer::{Composer, ComposerMode, ComposerState},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
+    title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
-    workspaces::{Workspace, WorkspaceRef},
+    workspaces::WorkspaceRef,
     StopTurn,
 };
 
@@ -66,6 +75,14 @@ pub(crate) enum SessionEvent {
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
     Saved,
+    /// Open the session of a subagent this one started, nested under it.
+    OpenSubagent {
+        session: SessionId,
+        /// The subagent's task, its title until its session says.
+        title: SharedString,
+    },
+    /// Show a session above this one, from the title bar.
+    Show(WeakEntity<SessionView>),
 }
 
 /// Whether the session is usable yet.
@@ -82,8 +99,15 @@ pub(crate) struct SessionView {
     daemon: Daemon,
     session: Session,
     cwd: PathBuf,
-    /// The workspace and branch, for the header.
+    /// The workspace, whose project the title bar names.
     workspace: WorkspaceRef,
+    /// For a subagent's session, the session that started it: the view
+    /// then only watches.
+    parent: Option<WeakEntity<SessionView>>,
+    /// The daemon stopped sending an observed session's events, as when a
+    /// subagent's run ends: what it shows is all there is until it is
+    /// observed again.
+    unloaded: bool,
     loading: Loading,
     transcript: Transcript,
     composer: Entity<ComposerState>,
@@ -108,6 +132,9 @@ pub(crate) struct SessionView {
     error: Option<String>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    /// For a subagent's session, redraws the title bar as the sessions
+    /// above it are renamed.
+    _above: Vec<Subscription>,
     /// Redraws "Working for" while a turn runs.
     _tick: Task<()>,
 }
@@ -143,7 +170,7 @@ impl SessionView {
                 cx.subscribe_in(&settings, window, Self::on_settings_event),
                 // The jump-to-latest button follows the scroll position.
                 cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
-                // The header shows the branch, which can change.
+                // The title bar shows the project, which can change.
                 cx.observe(workspace.table(), |_, _, cx| cx.notify()),
                 cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                     match event {
@@ -160,6 +187,8 @@ impl SessionView {
             session,
             cwd,
             workspace,
+            parent: None,
+            unloaded: false,
             // A resumed session is already saved.
             prompted: matches!(loading, Loading::Attaching),
             loading,
@@ -176,6 +205,7 @@ impl SessionView {
             error: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
+            _above: Vec::new(),
             _tick: cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(TICK).await;
                 let tick = this.update(cx, |this, cx| {
@@ -194,8 +224,88 @@ impl SessionView {
         view
     }
 
+    /// The session of a subagent that `parent` started, whose observe has
+    /// not answered yet. It works where its parent does.
+    pub(crate) fn subagent(
+        daemon: Daemon,
+        session: Session,
+        parent: &Entity<SessionView>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let (cwd, workspace) = {
+            let parent = parent.read(cx);
+            (parent.cwd.clone(), parent.workspace.clone())
+        };
+        // The title bar names every session above this one.
+        let mut renamed = Vec::new();
+        let mut above = Some(parent.clone());
+        while let Some(session) = above {
+            renamed.push(cx.subscribe(&session, |_, _, event: &SessionEvent, cx| {
+                if matches!(event, SessionEvent::LiveChanged) {
+                    cx.notify();
+                }
+            }));
+            above = session.read(cx).parent();
+        }
+        let view = Self::new(
+            daemon,
+            session,
+            cwd,
+            workspace,
+            Loading::Attaching,
+            window,
+            cx,
+        );
+        Self {
+            parent: Some(parent.downgrade()),
+            _above: renamed,
+            ..view
+        }
+    }
+
     pub(crate) fn id(&self) -> &SessionId {
         self.session.id()
+    }
+
+    /// The session that started this one, for a subagent's session whose
+    /// parent is still open.
+    pub(crate) fn parent(&self) -> Option<Entity<SessionView>> {
+        self.parent.as_ref().and_then(WeakEntity::upgrade)
+    }
+
+    /// Whether this is a subagent's session, which the view only watches.
+    pub(crate) fn is_subagent(&self) -> bool {
+        self.parent.is_some()
+    }
+
+    /// The session at the top of this one's nesting: itself, unless it is
+    /// a subagent's.
+    pub(crate) fn root_id(&self, cx: &App) -> SessionId {
+        match self.parent() {
+            Some(parent) => parent.read(cx).root_id(cx),
+            None => self.session.id().clone(),
+        }
+    }
+
+    /// Whether `ancestor` started this session, or one above it.
+    pub(crate) fn descends_from(&self, ancestor: &Entity<SessionView>, cx: &App) -> bool {
+        self.parent().is_some_and(|parent| {
+            parent == *ancestor || parent.read(cx).descends_from(ancestor, cx)
+        })
+    }
+
+    /// The daemon stopped sending the session's events; see
+    /// [`Self::is_unloaded`].
+    pub(crate) fn unload(&mut self) {
+        self.unloaded = true;
+    }
+
+    /// Whether the daemon stopped sending this observed session's events,
+    /// so what it shows may be out of date: observe it again to read it
+    /// afresh.
+    pub(crate) fn is_unloaded(&self) -> bool {
+        self.unloaded
     }
 
     /// Whether the attach failed, so the view shows only why.
@@ -236,8 +346,14 @@ impl SessionView {
         }
     }
 
-    pub(crate) fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
-        self.composer.focus_handle(cx)
+    /// Where the keyboard goes when the session is shown: its composer, or
+    /// for a subagent's, which has none, the view.
+    pub(crate) fn focus_target(&self, cx: &App) -> FocusHandle {
+        if self.is_subagent() {
+            self.focus_handle.clone()
+        } else {
+            self.composer.focus_handle(cx)
+        }
     }
 
     fn is_busy(&self) -> bool {
@@ -269,7 +385,13 @@ impl SessionView {
         // being typed, whose Enter would then approve instead of send.
         let asks = !self.session.inputs().is_empty();
         let typing = !self.composer.read(cx).is_empty(cx);
-        if asks && !asked && !typing && self.focus_handle.contains_focused(window, cx) {
+        let shows_approvals = !self.is_subagent();
+        if asks
+            && !asked
+            && !typing
+            && shows_approvals
+            && self.focus_handle.contains_focused(window, cx)
+        {
             window.focus(&self.approval_focus, cx);
         }
         // A turn that ended before reading a steer dropped it.
@@ -595,7 +717,8 @@ impl SessionView {
     }
 
     fn stop(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if !self.is_busy() {
+        // Only its parent stops a subagent's run.
+        if !self.is_busy() || self.is_subagent() {
             return;
         }
         // The turn withdraws its open requests as it ends.
@@ -756,17 +879,15 @@ impl SessionView {
             .into_any_element()
     }
 
-    /// Errors, approvals and the composer, under the transcript.
-    fn render_footer(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    /// Errors, approvals and the composer, under the transcript. A
+    /// subagent's session shows only how its run failed and its own
+    /// running work.
+    fn render_footer(&self, cx: &mut Context<'_, Self>) -> AnyElement {
         let failure = match self.session.state() {
             RunState::Failed(message) => Some(message.clone()),
             _ => None,
         };
-        let busy = self.is_busy();
-        let view = cx.entity().downgrade();
-        let stop_view = view.clone();
-        let send_view = view.clone();
-        v_flex()
+        let footer = v_flex()
             .flex_shrink_0()
             .w_full()
             .max_w(rems(48.))
@@ -784,7 +905,17 @@ impl SessionView {
                             .small(),
                     ),
                 )
-            })
+            });
+        if self.is_subagent() {
+            return footer
+                .children(self.render_background(cx))
+                .into_any_element();
+        }
+        let busy = self.is_busy();
+        let view = cx.entity().downgrade();
+        let stop_view = view.clone();
+        let send_view = view.clone();
+        footer
             .when_some(self.error.clone(), |this, message| {
                 this.child(
                     div().id("session-error").test_support().child(
@@ -830,6 +961,7 @@ impl SessionView {
                 .trailing(SessionSettings::render_panel_button(&self.settings, cx))
                 .meta(self.usage_label()),
             )
+            .into_any_element()
     }
 
     /// The steers the turn has taken that the model has not read yet,
@@ -864,17 +996,55 @@ impl SessionView {
             .collect()
     }
 
+    /// The running background work; a subagent's session can't stop its
+    /// own.
     fn render_background(&self, cx: &mut Context<'_, Self>) -> Option<BackgroundList> {
+        let list = BackgroundList::new(self.session.background(), Self::open_handler(cx))?;
+        if self.is_subagent() {
+            return Some(list);
+        }
         let view = cx.entity().downgrade();
-        BackgroundList::new(
-            self.session.background(),
-            &self.stopping,
-            move |work, window, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    this.stop_background(work.clone(), window, cx);
+        Some(list.stoppable(&self.stopping, move |work, window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.stop_background(work.clone(), window, cx);
+            });
+        }))
+    }
+
+    /// Opens a subagent's session from its row in the background work.
+    fn open_handler(cx: &mut Context<'_, Self>) -> OpenHandler {
+        let view = cx.entity().downgrade();
+        Rc::new(move |session, title, _, cx| {
+            let _ = view.update(cx, |_, cx| {
+                cx.emit(SessionEvent::OpenSubagent {
+                    session: session.clone(),
+                    title: title.clone(),
                 });
-            },
-        )
+            });
+        })
+    }
+
+    /// The project, the sessions above this one, each a link to it, and
+    /// this one's title, with its ended background work at the right.
+    fn render_title_bar(&self, cx: &mut Context<'_, Self>) -> TitleBar {
+        let mut above = Vec::new();
+        let mut next = self.parent();
+        while let Some(view) = next {
+            next = view.read(cx).parent();
+            above.push(view);
+        }
+        let mut bar = TitleBar::new(self.workspace.read(cx), self.title());
+        let this = cx.entity().downgrade();
+        for view in above.into_iter().rev() {
+            let (this, target) = (this.clone(), view.downgrade());
+            bar = bar.parent(view.read(cx).title(), move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Show(target.clone())));
+            });
+        }
+        bar.trailing(BackgroundHistory::new(
+            self.session.ended_background(),
+            Self::open_handler(cx),
+        ))
     }
 
     /// The message held for when the turn ends, with a button to take it
@@ -920,6 +1090,11 @@ impl SessionView {
 
 #[cfg(test)]
 impl SessionView {
+    /// The composer's focus, for UI tests.
+    pub(crate) fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.composer.focus_handle(cx)
+    }
+
     /// The session state behind this view, for UI tests.
     pub(crate) fn session(&self) -> &Session {
         &self.session
@@ -956,59 +1131,10 @@ impl Render for SessionView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
             .size_full()
-            .child(header(
-                self.title(),
-                self.workspace.read(cx),
-                BackgroundHistory::new(self.session.ended_background()),
-                cx,
-            ))
+            .child(self.render_title_bar(cx))
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }
-}
-
-/// A session's title, with its workspace and branch under it, and
-/// `trailing` controls at the right. Shared with the new-session draft.
-pub(crate) fn header(
-    title: String,
-    workspace: &Workspace,
-    trailing: Option<impl IntoElement>,
-    cx: &App,
-) -> impl IntoElement {
-    let details = h_flex()
-        .gap_1()
-        .min_w_0()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(div().truncate().child(workspace.name.clone()))
-        .when_some(workspace.branch.clone(), |this, branch| {
-            this.child(Icon::new(Lucide::GitBranch).xsmall().ml_2())
-                .child(div().truncate().child(branch))
-        });
-    h_flex()
-        .flex_shrink_0()
-        .min_h(px(44.))
-        .gap_2()
-        .px_4()
-        .py_1()
-        .border_b_1()
-        .border_color(cx.theme().border)
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    div()
-                        .id("session-title")
-                        .test_support()
-                        .aria_label(title.clone())
-                        .truncate()
-                        .font_medium()
-                        .child(title),
-                )
-                .child(details),
-        )
-        .children(trailing)
 }
 
 /// A held message on one line: its text, and what is attached to it, such

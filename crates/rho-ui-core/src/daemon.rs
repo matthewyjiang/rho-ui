@@ -28,8 +28,8 @@ use rho_protocol::{
     DetachReason, ErrorCode, FrameError, IdleWake, JobKind, JobListParams, JobState, JobSummary,
     LocalDaemon, LocalDaemonError, Notifications, SessionAnswerParams, SessionAttachParams,
     SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
-    SessionDetachParams, SessionListParams, SessionNewParams, SessionPart, SessionPromptParams,
-    SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
+    SessionDetachParams, SessionListParams, SessionNewParams, SessionObserveParams, SessionPart,
+    SessionPromptParams, SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 
@@ -321,6 +321,10 @@ pub enum Detached {
     Behind,
     /// The session was deleted.
     Deleted,
+    /// An observed session is not loaded: its replay was all of it, or the
+    /// subagent run that wrote it ended. Nothing more follows; observe it
+    /// again to read it afresh.
+    Unloaded,
     /// The daemon is restarting in place, as it does to upgrade. The
     /// connection closes next; connect again.
     Restarting,
@@ -372,10 +376,10 @@ impl DaemonEvents {
                         DetachReason::Lagged => Detached::Behind,
                         DetachReason::Deleted => Detached::Deleted,
                         DetachReason::Restarting => Detached::Restarting,
+                        DetachReason::NotLoaded => Detached::Unloaded,
                         // `daemon_stopping` is followed by the connection
-                        // closing, which says as much; `not_loaded` ends an
-                        // observe, which this client never sends; the rest
-                        // a newer daemon added.
+                        // closing, which says as much; the rest a newer
+                        // daemon added.
                         _ => continue,
                     };
                     return Some(DaemonEvent::Detached {
@@ -598,6 +602,29 @@ impl Daemon {
         let response = self
             .client
             .request::<methods::SessionAttach>(&params)
+            .await?;
+        Ok(Attached(Box::new(response)))
+    }
+
+    /// Follows session `id` without taking part in it, as for a subagent's
+    /// session, which only the subagent writes and which can't be attached
+    /// to. A loaded session is followed as [`Self::attach`] follows it; an
+    /// unloaded one replays as saved, then [`Detached::Unloaded`] ends it,
+    /// as it ends a subagent's run. Events arrive as for an attach, so
+    /// create the session's [`crate::Session`] first.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the session does not exist, a subagent's run has not opened
+    /// it yet, or the connection is gone.
+    pub async fn observe(&self, id: &SessionId) -> Result<Attached, DaemonError> {
+        let params = SessionObserveParams {
+            session: id.to_wire(),
+            after: None,
+        };
+        let response = self
+            .client
+            .request::<methods::SessionObserve>(&params)
             .await?;
         Ok(Attached(Box::new(response)))
     }

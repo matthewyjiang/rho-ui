@@ -22,6 +22,8 @@ pub(crate) struct Workspace {
     cwd: PathBuf,
     repo: Repo,
     pub(crate) name: SharedString,
+    /// The name without its owner, as the title bar shows the project.
+    pub(crate) short_name: SharedString,
     pub(crate) initials: SharedString,
     pub(crate) branch: Option<SharedString>,
     /// The directory, with the home directory shown as `~`.
@@ -36,6 +38,7 @@ impl Workspace {
             path: tilde(&cwd, home().as_deref()).into(),
             cwd,
             name: repo.name.clone().into(),
+            short_name: repo.short_name().to_owned().into(),
             initials: repo.initials().into(),
             branch: repo.branch.clone().map(SharedString::from),
             repo,
@@ -56,6 +59,7 @@ impl Workspace {
     /// Takes what a fresh read of its repository says.
     fn set_repo(&mut self, repo: Repo) {
         self.name = repo.name.clone().into();
+        self.short_name = repo.short_name().to_owned().into();
         self.initials = repo.initials().into();
         self.branch = repo.branch.clone().map(SharedString::from);
         self.repo = repo;

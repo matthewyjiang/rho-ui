@@ -19,7 +19,7 @@ use gpui_kit::{
     WindowBounds, WindowOptions,
 };
 use rho_ui_core::{
-    fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
+    fake_daemon::{subagent_result, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION},
     Attachment, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget, Entry, RunState,
     Session, SessionId, ToolStatus,
 };
@@ -1685,6 +1685,168 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
     ui.send("ok");
     ui.wait_for_session("the list to empty", |session| {
         session.state() == &RunState::Idle && session.background().is_empty()
+    });
+}
+
+/// A subagent's row in the background work opens its session, nested under
+/// its parent in the title bar: the subagent's messages as they come, and
+/// no composer, as only the subagent writes there. The parent's step in the
+/// title bar leads back. Once the run ends, its row in the ended work opens
+/// the session as saved.
+#[test]
+fn a_subagents_session_opens_nested_under_its_parent() {
+    let mut ui = Harness::start("subagent", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("subagent");
+    ui.wait_for_session("the turn to end with its subagent running", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+    let parent = ui.session().id().clone();
+    assert_eq!(
+        ui.label("background-0").as_deref(),
+        Some(format!("{SUBAGENT_TASK}: Running").as_str())
+    );
+
+    ui.click("background-0");
+    ui.wait_for_session("the subagent's session", |session| {
+        session.id().as_str() == "sub-1"
+            && session
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Entry::Agent(m) if m.text() == "Reading the parser."))
+    });
+    assert_eq!(ui.label("title-parent-0").as_deref(), Some("subagent"));
+    assert_eq!(ui.label("session-title").as_deref(), Some(SUBAGENT_TASK));
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "composer-attach"),
+            "only the subagent writes"
+        );
+        assert!(
+            !is_visible(window, "session-sub-1"),
+            "the sidebar lists only the parent"
+        );
+    });
+    // The running turn's header springs open.
+    ui.frame();
+    ui.cx.advance_clock(Duration::from_secs(1));
+    let header = ui.label("worked-0");
+    assert!(
+        header
+            .as_deref()
+            .is_some_and(|header| header.starts_with("Working for ")),
+        "the subagent's run shows as running: {header:?}"
+    );
+    ui.shot("running");
+
+    ui.fake().finish_subagent(&parent);
+    ui.wait_for_session("the subagent's answer", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "Found the parser.")
+    });
+    let app = ui.app.clone();
+    ui.wait_until("the end of the observe", |_, cx, _| {
+        app.read(cx)
+            .active_session()
+            .is_some_and(|view| view.read(cx).is_unloaded())
+    });
+    ui.shot("ended");
+
+    ui.click("title-parent-0");
+    ui.wait_for_session("the parent, told by the daemon's turn", |session| {
+        *session.id() == parent && session.state() == &RunState::Running
+    });
+    ui.act(|window, _| {
+        assert!(is_visible(window, "composer-attach"));
+        assert!(
+            !is_visible(window, "title-parent-0"),
+            "the parent is on top"
+        );
+    });
+    ui.click("background-history-button");
+    assert_eq!(
+        ui.label("background-ended-0").as_deref(),
+        Some(format!("{SUBAGENT_TASK}: Done").as_str())
+    );
+    ui.click("background-ended-0");
+    ui.wait_for_session("the subagent's session as saved", |session| {
+        session.id().as_str() == "sub-1"
+            && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "Found the parser.")
+    });
+    ui.shot("reopened");
+}
+
+/// A card's body is Markdown, and a subagent's holds its whole result, so
+/// a long one shows its first lines, with a button to show the rest and
+/// fold it again.
+#[test]
+fn a_long_card_shows_its_first_lines_until_opened() {
+    let mut ui = Harness::start("card", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("subagent");
+    ui.wait_for_session("the subagent running", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+    let parent = ui.session().id().clone();
+    ui.fake().finish_subagent(&parent);
+    ui.wait_for_session("the subagent's result", |session| {
+        session
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Notice(_)))
+    });
+    let card = ui
+        .session()
+        .entries()
+        .iter()
+        .position(|entry| matches!(entry, Entry::Notice(n) if n.description() == Some(subagent_result().as_str())))
+        .expect("the parent shows the subagent's result");
+    let card: &'static str = format!("notice-{card}").leak();
+    let toggle: &'static str = format!("{card}-toggle").leak();
+    ui.wait_until("the result cut short", |window, _, _| {
+        is_visible(window, toggle)
+    });
+    let height = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                bounds(window, card).expect("the card is drawn")
+            })
+            .expect("window is open")
+            .size
+            .height
+    };
+    let short = height(&mut ui);
+    assert!(short < px(400.), "{short:?} tall, cut short");
+    assert_eq!(ui.label(toggle).as_deref(), Some("Show more"));
+    ui.shot("result-short");
+    ui.click(toggle);
+    ui.wait_until("the whole result", |window, _, _| {
+        window
+            .try_find(toggle)
+            .and_then(|toggle| toggle.label().map(str::to_owned))
+            .as_deref()
+            == Some("Show less")
+    });
+    assert!(
+        height(&mut ui) > short + px(100.),
+        "the whole result is taller"
+    );
+    ui.shot("result-whole");
+    ui.click(toggle);
+    ui.wait_until("the result cut short again", |window, _, _| {
+        window
+            .try_find(toggle)
+            .and_then(|toggle| toggle.label().map(str::to_owned))
+            .as_deref()
+            == Some("Show more")
     });
 }
 

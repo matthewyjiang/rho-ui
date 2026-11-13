@@ -314,6 +314,21 @@ pub struct Notice {
 }
 
 impl Notice {
+    /// The notice a card shows, titled `title`. Its detail is the first of
+    /// `bodies` that isn't empty: the card's Markdown body, then its plain
+    /// one.
+    fn card(title: String, tone: CardTone, bodies: [String; 2]) -> Self {
+        Self {
+            level: match tone {
+                CardTone::Warning => NoticeLevel::Warning,
+                CardTone::Error => NoticeLevel::Error,
+                _ => NoticeLevel::Info,
+            },
+            title,
+            description: bodies.into_iter().find(|body| !body.is_empty()),
+        }
+    }
+
     /// How loud it is.
     pub fn level(&self) -> NoticeLevel {
         self.level
@@ -324,7 +339,8 @@ impl Notice {
         &self.title
     }
 
-    /// More detail, if any.
+    /// More detail, if any, in Markdown: a card's body, such as the whole
+    /// result a subagent returned, which can run long.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
@@ -774,16 +790,12 @@ impl Session {
                 description: None,
             })),
             SessionEvent::Card {
-                title, plain, tone, ..
-            } => Some(self.push_notice(Notice {
-                level: match tone {
-                    CardTone::Warning => NoticeLevel::Warning,
-                    CardTone::Error => NoticeLevel::Error,
-                    _ => NoticeLevel::Info,
-                },
                 title,
-                description: Some(plain).filter(|text| !text.is_empty()),
-            })),
+                markdown,
+                plain,
+                tone,
+                ..
+            } => Some(self.push_notice(Notice::card(title, tone, [markdown, plain]))),
             SessionEvent::State { state, turn } => {
                 if !state.in_progress() {
                     // A turn the daemon's restart cut short ends here,

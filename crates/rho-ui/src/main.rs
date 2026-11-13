@@ -25,6 +25,7 @@ mod sidebar;
 mod store;
 mod themes;
 mod time;
+mod title_bar;
 mod transcript;
 mod turn_times;
 #[cfg(test)]

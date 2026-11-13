@@ -3,6 +3,8 @@
 //! each time it changes; work that ended stays listed, with how it ended,
 //! until the session's model has been given its result.
 
+use crate::SessionId;
+
 /// What a piece of background work is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundKind {
@@ -93,6 +95,18 @@ impl BackgroundWork {
         self.id
             .key()
             .map_or(BackgroundKind::Other, |(kind, _)| kind)
+    }
+
+    /// A subagent's own session, once it opened one. Follow it with
+    /// [`crate::Daemon::observe`]; only the subagent writes to it.
+    pub fn session(&self) -> Option<SessionId> {
+        match &self.id.0 {
+            rho_protocol::BackgroundItem::Subagent {
+                session: Some(session),
+                ..
+            } => Some(session.clone().into()),
+            _ => None,
+        }
     }
 
     /// What it shows as: a process's command line, a workflow's name, a

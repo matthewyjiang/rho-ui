@@ -5,6 +5,10 @@
 //! and the turn's working folds behind it. This owns what the user opened
 //! and folded, the turns' lengths, and the user messages' attachments,
 //! ready to draw.
+//!
+//! A notice's detail is Markdown, and can be long: a subagent's card holds
+//! its whole result. It shows its first [`NOTICE_LINES`] lines, with a
+//! button to show the rest.
 
 use std::{
     ops::Range,
@@ -18,19 +22,20 @@ use gpui_kit::component::{
     alert::{Alert, AlertVariant},
     attachment::Attachment as Card,
     bubble::{Bubble, BubbleVariant},
+    button::{Button, ButtonVariants as _},
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
-    text::{TextView, TextViewStyle},
-    ActiveTheme as _, Icon, Sizable as _,
+    text::{TextView, TextViewState, TextViewStyle},
+    v_flex, ActiveTheme as _, Icon, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, rems, AnyElement, App, AppContext as _, ElementId, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Window,
+    StyleRefinement, Styled as _, Subscription, Window,
 };
-use rho_ui_core::{Entry, NoticeLevel, Row, Timeline};
+use rho_ui_core::{Entry, Notice, NoticeLevel, Row, Timeline};
 
 use crate::{
     attachments::Preview,
@@ -55,6 +60,14 @@ const CODE_BLOCK_PAD_TOP: f32 = 19.;
 /// far from both edges.
 const CODE_BLOCK_PAD_BOTTOM: f32 = 21.;
 
+/// How many lines of a notice's detail show until it is opened. Kit counts
+/// body lines, so headings and code blocks take more room: a subagent's
+/// result cut at 12 lines, with two headings and a code block, measured
+/// 340px tall card and all in the UI test's 800px window, leaving most of
+/// the window to the conversation, while a short card, such as a finished
+/// command's, shows whole.
+const NOTICE_LINES: usize = 12;
+
 /// How messages draw their Markdown.
 fn message_style() -> TextViewStyle {
     TextViewStyle {
@@ -72,6 +85,8 @@ pub(crate) enum Action {
     Fold { row: usize, fold: Fold },
     /// Open or fold a finished turn's working.
     Worked { turn: usize },
+    /// Show all of notice `entry`'s detail, or only its first lines.
+    Notice { entry: usize },
 }
 
 /// Carries out an [`Action`]; the session view owns the transcript.
@@ -90,6 +105,15 @@ struct Running {
     /// the daemon began itself opens with its first entry ([`Entry::Wake`]).
     turn: usize,
     since: Instant,
+}
+
+/// A notice's detail, laid out, and whether it shows whole.
+struct NoticeDetail {
+    text: Entity<TextViewState>,
+    shows: Disclosure,
+    /// Remeasures the notice's row when the text starts or stops being
+    /// cut short, which adds or drops its button.
+    _clamped: Subscription,
 }
 
 /// A session's transcript state. Flat arrays indexed by row, entry or turn.
@@ -111,6 +135,8 @@ pub(crate) struct Transcript {
     diffs: Vec<DiffView>,
     /// Per entry: a user message's attachments, ready to draw.
     attachments: Vec<Vec<Preview>>,
+    /// Per entry: a notice's detail; `None` for any other entry.
+    notices: Vec<Option<NoticeDetail>>,
 }
 
 impl Transcript {
@@ -125,6 +151,7 @@ impl Transcript {
             running: None,
             diffs: Vec::new(),
             attachments: Vec::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -147,6 +174,10 @@ impl Transcript {
         let seen = self.attachments.len();
         self.attachments
             .extend(entries.iter().skip(seen).map(previews));
+        for (ix, entry) in entries.iter().enumerate().skip(self.notices.len()) {
+            let detail = self.notice_detail(ix, entry, cx);
+            self.notices.push(detail);
+        }
         self.steps
             .resize(self.timeline.rows().len(), Disclosure::Folded);
         self.details.resize(entries.len(), Disclosure::Folded);
@@ -184,6 +215,28 @@ impl Transcript {
         if let Some(row) = self.timeline.row_of(ix) {
             self.remeasure(row..row + 1, cx);
         }
+    }
+
+    /// Notice `ix`'s detail, laid out as Markdown, if `entry` is a notice
+    /// with one. Notices never change once added.
+    fn notice_detail(&self, ix: usize, entry: &Entry, cx: &mut App) -> Option<NoticeDetail> {
+        let Entry::Notice(notice) = entry else {
+            return None;
+        };
+        let text = notice.description()?;
+        let row = self.timeline.row_of(ix)?;
+        let text = cx.new(|cx| TextViewState::markdown(text, cx));
+        let scroller = self.scroller.clone();
+        let clamped = cx.observe(&text, move |_, cx| {
+            scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(row..row + 1, cx)
+            });
+        });
+        Some(NoticeDetail {
+            text,
+            shows: Disclosure::Folded,
+            _clamped: clamped,
+        })
     }
 
     /// A turn began `since`, here or in another client: it is the next
@@ -261,6 +314,16 @@ impl Transcript {
             Action::Worked { turn } => {
                 self.worked[turn].toggle();
                 self.timeline.turn_rows(turn)
+            }
+            Action::Notice { entry } => {
+                let Some(detail) = self.notices.get_mut(entry).and_then(Option::as_mut) else {
+                    return;
+                };
+                detail.shows.toggle();
+                let Some(row) = self.timeline.row_of(entry) else {
+                    return;
+                };
+                row..row + 1
             }
         };
         self.remeasure(rows, cx);
@@ -392,10 +455,13 @@ impl Transcript {
             Phase::Settled
         };
         match row {
-            Row::Message(entry) => {
-                let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
-                render_message(&entries[*entry], *entry, attachments, phase, cx)
-            }
+            Row::Message(entry) => match &entries[*entry] {
+                Entry::Notice(notice) => self.render_notice(*entry, notice, act, cx),
+                message => {
+                    let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
+                    render_message(message, *entry, attachments, phase, cx)
+                }
+            },
             Row::Work(run) => {
                 let act = Rc::clone(act);
                 let on_fold: FoldHandler = Rc::new(move |fold, window, cx| {
@@ -415,6 +481,66 @@ impl Transcript {
                 )
             }
         }
+    }
+}
+
+impl Transcript {
+    /// Notice `ix`: its title, and its detail in Markdown, cut to
+    /// [`NOTICE_LINES`] lines until opened with the button under it.
+    fn render_notice(
+        &self,
+        ix: usize,
+        notice: &Notice,
+        act: &ActionHandler,
+        cx: &App,
+    ) -> AnyElement {
+        let key = ElementId::named_usize("row", ix);
+        let variant = match notice.level() {
+            NoticeLevel::Info => AlertVariant::Info,
+            NoticeLevel::Warning => AlertVariant::Warning,
+            NoticeLevel::Error => AlertVariant::Error,
+        };
+        let detail = self.notices.get(ix).and_then(Option::as_ref);
+        let Some(detail) = detail else {
+            return Alert::new(key, SharedString::from(notice.title().to_owned()))
+                .with_variant(variant)
+                .small()
+                .into_any_element();
+        };
+        let open = detail.shows.is_open();
+        let mut text = TextView::new(&detail.text).selectable(true);
+        if !open {
+            text = text.max_lines(NOTICE_LINES);
+        }
+        // Kit's text view says whether the last frame cut it short.
+        let toggle = (open || detail.text.read(cx).is_clamped()).then(|| {
+            let act = Rc::clone(act);
+            let (label, icon) = if open {
+                ("Show less", Lucide::ChevronUp)
+            } else {
+                ("Show more", Lucide::ChevronDown)
+            };
+            Button::new(SharedString::from(format!("notice-{ix}-toggle")))
+                .ghost()
+                .xsmall()
+                .icon(icon)
+                .label(label)
+                .on_click(move |_, window, cx| act(Action::Notice { entry: ix }, window, cx))
+        });
+        v_flex()
+            .id(SharedString::from(format!("notice-{ix}")))
+            .test_support()
+            .aria_label(notice.title().to_owned())
+            .w_full()
+            .gap_1()
+            .child(
+                Alert::new(key, text)
+                    .title(notice.title().to_owned())
+                    .with_variant(variant)
+                    .small(),
+            )
+            .children(toggle)
+            .into_any_element()
     }
 }
 
@@ -465,7 +591,7 @@ fn attachment_cell(ix: usize, n: usize, preview: &Preview, card: Card) -> AnyEle
         .into_any_element()
 }
 
-/// Builds the row for a user message, a reply or a notice: entry `ix`.
+/// Builds the row for a user message or a reply: entry `ix`.
 /// `attachments` are a user message's. Tool calls and thoughts are drawn
 /// by [`crate::work`].
 fn render_message(
@@ -529,19 +655,6 @@ fn render_message(
                 .stream_fade(phase == Phase::Live),
             )
             .into_any_element(),
-        Entry::Notice(notice) => {
-            let variant = match notice.level() {
-                NoticeLevel::Info => AlertVariant::Info,
-                NoticeLevel::Warning => AlertVariant::Warning,
-                NoticeLevel::Error => AlertVariant::Error,
-            };
-            let alert = match notice.description() {
-                Some(description) => Alert::new(key, SharedString::from(description.to_owned()))
-                    .title(notice.title().to_owned()),
-                None => Alert::new(key, SharedString::from(notice.title().to_owned())),
-            };
-            alert.with_variant(variant).small().into_any_element()
-        }
         Entry::Wake => h_flex()
             .id(SharedString::from(format!("wake-{ix}")))
             .test_support()
@@ -551,7 +664,8 @@ fn render_message(
             .child(Icon::new(Lucide::Bell).xsmall())
             .child("rho continued on its own")
             .into_any_element(),
-        // The timeline puts these in work rows, never message rows.
-        Entry::Thought(_) | Entry::Tool(_) => div().into_any_element(),
+        // The timeline puts these in work rows, never message rows, and
+        // the transcript draws notices itself.
+        Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) => div().into_any_element(),
     }
 }

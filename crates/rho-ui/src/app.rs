@@ -1,6 +1,8 @@
 //! The root view: owns the daemon connection, the event pump, and the open
 //! sessions. Everything the daemon pushes enters here and is routed to the
-//! [`SessionView`] of its session.
+//! [`SessionView`] of its session. The open sessions include subagents'
+//! sessions opened from their parent, which the sidebar does not list: they
+//! show nested under the parent, and go when it goes.
 //!
 //! The sidebar and the session view are drawn as cached views: each redraws
 //! only when it changes, so a hover in one never rebuilds the other.
@@ -310,6 +312,11 @@ impl RhoApp {
                 Detached::Behind => self.reopen_session(&session, window, cx),
                 Detached::Deleted => self.session_deleted(&session, window, cx),
                 Detached::Restarting => self.restarting = true,
+                Detached::Unloaded => {
+                    if let Some(open) = self.opened(&session) {
+                        open.view.update(cx, |view, _| view.unload());
+                    }
+                }
             },
         }
     }
@@ -328,20 +335,31 @@ impl RhoApp {
     }
 
     /// Reads session `id` afresh after the daemon stopped sending its
-    /// events: a new view replaces the one that fell behind.
+    /// events: a new view replaces the one that fell behind, and its
+    /// subagents' sessions go with it.
     fn reopen_session(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(open) = self.opened(id) else {
+        let Some(view) = self.opened(id).map(|open| open.view.clone()) else {
             return;
         };
-        let live = open.view.read(cx).live();
-        let shown = matches!(&self.pane, Pane::Session(view) if *view == open.view);
+        let shown = matches!(&self.pane, Pane::Session(shown)
+            if *shown == view || shown.read(cx).descends_from(&view, cx));
+        let (live, parent) = {
+            let view = view.read(cx);
+            (view.live(), view.parent())
+        };
         self.forget_session(id, window, cx);
-        if shown {
-            self.open_session(live.id, live.cwd, live.title, window, cx);
-        } else {
+        match parent {
+            Some(parent) if shown => {
+                let title = live.title.unwrap_or_default();
+                self.open_subagent(&parent, live.id, title, window, cx);
+            }
+            // Opened again from its parent when wanted.
+            Some(_) => {}
+            None if shown => self.open_session(live.id, live.cwd, live.title, window, cx),
             // Its row follows the daemon's jobs again until it is reopened.
-            self.sidebar
-                .update(cx, |sidebar, cx| sidebar.close_live(id, cx));
+            None => self
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.close_live(id, cx)),
         }
     }
 
@@ -667,14 +685,19 @@ impl RhoApp {
         .detach();
     }
 
-    /// Drops the open session `id`, if any, and empties the pane if it
-    /// showed it.
+    /// Drops the open session `id`, if any, with the subagents' sessions
+    /// opened under it, and empties the pane if it showed one of them.
     fn forget_session(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(ix) = self.sessions.iter().position(|open| open.id == *id) else {
+        let Some(closed) = self.opened(id).map(|open| open.view.clone()) else {
             return;
         };
-        let closed = self.sessions.remove(ix);
-        if matches!(&self.pane, Pane::Session(view) if *view == closed.view) {
+        self.sessions
+            .retain(|open| open.view != closed && !open.view.read(cx).descends_from(&closed, cx));
+        let gone = match &self.pane {
+            Pane::Session(view) => !self.sessions.iter().any(|open| open.view == *view),
+            Pane::Empty | Pane::Draft { .. } => false,
+        };
+        if gone {
             self.show(Pane::Empty, window, cx);
         }
         cx.notify();
@@ -689,8 +712,9 @@ impl RhoApp {
     /// Puts `pane` in the main area and marks its row in the sidebar,
     /// leaving the keyboard where it is.
     fn set_pane(&mut self, pane: Pane, cx: &mut Context<'_, Self>) {
+        // A subagent's session marks the row of the session it is nested in.
         let active = match &pane {
-            Pane::Session(view) => Some(view.read(cx).id().clone()),
+            Pane::Session(view) => Some(view.read(cx).root_id(cx)),
             Pane::Empty | Pane::Draft { .. } => None,
         };
         self.pane = pane;
@@ -707,7 +731,7 @@ impl RhoApp {
         }
         let handle = match &self.pane {
             Pane::Draft { view, .. } => view.read(cx).composer_focus_handle(cx),
-            Pane::Session(view) => view.read(cx).composer_focus_handle(cx),
+            Pane::Session(view) => view.read(cx).focus_target(cx),
             Pane::Empty => self.focus_handle.clone(),
         };
         window.focus(&handle, cx);
@@ -788,7 +812,51 @@ impl RhoApp {
         .detach();
     }
 
-    /// Adds `view` to the open sessions.
+    /// Opens the session of a subagent that `parent` started, nested under
+    /// it, or switches to it if it is open. `title` is the subagent's task,
+    /// shown until the daemon answers. Only the subagent writes to its
+    /// session, so the view observes it rather than attaching.
+    fn open_subagent(
+        &mut self,
+        parent: &Entity<SessionView>,
+        id: SessionId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match self.opened(&id).map(|open| open.view.clone()) {
+            // One that couldn't be observed, or whose events stopped as its
+            // run ended, is read afresh.
+            Some(view) if view.read(cx).failed_to_attach() || view.read(cx).is_unloaded() => {
+                self.forget_session(&id, window, cx);
+            }
+            Some(view) => {
+                self.show(Pane::Session(view), window, cx);
+                return;
+            }
+            None => {}
+        }
+        let Some(daemon) = self.daemon().cloned() else {
+            return;
+        };
+        // As for an attach, the session must exist before the observe.
+        let mut session = Session::new(id.clone());
+        session.set_title(Some(title.into()));
+        let view = cx.new(|cx| SessionView::subagent(daemon.clone(), session, parent, window, cx));
+        self.insert_session(id.clone(), view.clone(), window, cx);
+        self.show(Pane::Session(view), window, cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let observed = daemon.observe(&id).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.attached(&daemon, &id, observed, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Adds `view` to the open sessions. The sidebar lists it, unless it is
+    /// a subagent's.
     fn insert_session(
         &mut self,
         id: SessionId,
@@ -799,22 +867,37 @@ impl RhoApp {
         let subscription = cx.subscribe_in(
             &view,
             window,
-            |this, view, event: &SessionEvent, _, cx| match event {
+            |this, view, event: &SessionEvent, window, cx| match event {
                 SessionEvent::LiveChanged => {
-                    let live = view.read(cx).live();
-                    this.sidebar
-                        .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
+                    if !view.read(cx).is_subagent() {
+                        let live = view.read(cx).live();
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
+                    }
                 }
                 SessionEvent::Prompted => {
                     let id = view.read(cx).id().clone();
                     this.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
                 }
                 SessionEvent::Saved => this.refresh_sessions(cx),
+                SessionEvent::OpenSubagent { session, title } => {
+                    this.open_subagent(view, session.clone(), title.clone(), window, cx);
+                }
+                SessionEvent::Show(target) => {
+                    let open = target
+                        .upgrade()
+                        .filter(|target| this.sessions.iter().any(|open| open.view == *target));
+                    if let Some(target) = open {
+                        this.show(Pane::Session(target), window, cx);
+                    }
+                }
             },
         );
-        let live = view.read(cx).live();
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
+        if !view.read(cx).is_subagent() {
+            let live = view.read(cx).live();
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
+        }
         self.sessions.push(OpenSession {
             id,
             view,

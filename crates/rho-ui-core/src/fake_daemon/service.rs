@@ -8,23 +8,24 @@ use std::{
 
 use rho_protocol::{
     methods::{
-        JobId, JobKind, JobListResponse, JobLive, JobState, JobSummary, MessageId, Replay,
-        Resolution, Seq, SessionConfigureParams, SessionConfigureResponse, SessionDeleteParams,
-        SessionDeleteResponse, SessionId, SessionListParams, SessionListResponse, SessionSummary,
-        SessionUnsteerParams, SessionUnsteerResponse, SteerId, StreamId,
+        JobId, JobKind, JobListResponse, JobLive, JobState, JobSummary, MessageId, Resolution,
+        SessionConfigureParams, SessionConfigureResponse, SessionDeleteParams,
+        SessionDeleteResponse, SessionId, SessionListParams, SessionListResponse,
+        SessionObserveParams, SessionSummary, SessionUnsteerParams, SessionUnsteerResponse,
+        SteerId,
     },
-    subscription, ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo,
-    ContentBlock, CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason,
-    ErrorCode, InputAnswer, InputAsker, InputRequest, InputRequestId, Operation, ProtocolVersion,
-    RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
-    SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
-    SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
-    SessionEvent, SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
-    SessionSteerParams, SessionSteerResponse, SessionWorktree, SettingsService, StoreSelectedBy,
-    Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
+    ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo, ContentBlock,
+    CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason, ErrorCode, InputAnswer,
+    InputAsker, InputRequest, InputRequestId, Operation, ProtocolVersion, RestartCost, RpcError,
+    Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
+    SessionAttachResponse, SessionBackgroundStopParams, SessionBackgroundStopResponse,
+    SessionCancelParams, SessionCancelResponse, SessionChange, SessionEvent, SessionNewParams,
+    SessionNewResponse, SessionPromptParams, SessionPromptResponse, SessionSteerParams,
+    SessionSteerResponse, SessionWorktree, SettingsService, StoreSelectedBy, Subscription,
+    ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
-use super::{shell_card, shell_output, FakeSession, State, Turn, BACKLOG};
+use super::{shell_card, shell_output, FakeSession, State, Turn};
 
 #[derive(Debug)]
 pub(super) struct Fake {
@@ -58,6 +59,29 @@ fn echo(turn: &rho_protocol::TurnId, prompt: &SessionPromptParams) -> SessionEve
         content: prompt.content.clone(),
         steer: None,
     }
+}
+
+/// Runs `turn` for the prompt "subagent": it starts a subagent in a
+/// session of its own, then ends while the subagent runs on.
+fn subagent_turn(
+    state: &mut State,
+    params: &SessionPromptParams,
+    turn: Turn,
+) -> Result<SessionPromptResponse, RpcError> {
+    let turn_id = turn.id.clone();
+    let child = format!("sub-{}", turn.number);
+    let run = state.next_turn();
+    let session = state.session(&params.session)?;
+    let cwd = session.cwd.clone();
+    session.turn = Some(turn);
+    session.state(JobState::Running);
+    session.publish(echo(&turn_id, params));
+    session.start_subagent(format!("run-{turn_id}"), &child);
+    session.answer(&format!("m-{turn_id}"), "Started a subagent.");
+    state
+        .sessions
+        .insert(child, FakeSession::subagent(&cwd, run));
+    Ok(SessionPromptResponse { turn: turn_id })
 }
 
 /// How an approval's answer reads in the turn's reply.
@@ -188,6 +212,9 @@ impl Service for Fake {
             session.wake(turn, "Nothing new from the background.");
             session.answer(&format!("m-{turn_id}-done"), "Back to you.");
             return Err(busy());
+        }
+        if prompt == "subagent" {
+            return subagent_turn(&mut state, &params, turn);
         }
         if prompt == "background" {
             session.turn = Some(turn);
@@ -383,31 +410,32 @@ impl Service for Fake {
     ) -> Result<(SessionAttachResponse, Subscription), RpcError> {
         let mut state = self.lock();
         let session = state.session(&params.session)?;
-        // As the daemon numbers a reset's replay: 0 for all but the last.
-        let last = session.history.len().saturating_sub(1);
-        let replay = session.history.iter().cloned().enumerate();
-        let replay: Vec<(Seq, SessionEvent)> = replay
-            .map(|(ix, event)| (Seq(if ix == last { session.live_seq } else { 0 }), event))
-            .collect();
-        let response = SessionAttachResponse {
-            stream: StreamId::new("stream"),
-            workspace: session.cwd.clone(),
-            replay: Replay::Reset,
-            replay_events: u64::try_from(replay.len()).unwrap_or(u64::MAX),
-            state: session.state,
-            turn: session.turn.as_ref().map(|turn| turn.id.clone()),
-            turn_elapsed_ms: session.turn.as_ref().map(Turn::elapsed_ms),
-            inputs: session
-                .turn
-                .iter()
-                .filter_map(|turn| turn.input.clone())
-                .collect(),
-            title: session.title.clone(),
-            options: session.settings.options(),
-            background: session.background.clone(),
-        };
-        let (publisher, subscription) = subscription(BACKLOG, replay);
+        if session.subagent {
+            return Err(RpcError::new(
+                ErrorCode::SessionOpenFailed,
+                "a subagent's session is continued only by its parent",
+            ));
+        }
+        let (response, publisher, subscription) = session.follow();
         session.publishers.push(publisher);
+        Ok((response, subscription))
+    }
+
+    /// Follows a subagent's session while its run is under way; any other
+    /// session, and one whose run ended, counts as unloaded: it replays,
+    /// then the observe ends.
+    async fn observe_session(
+        &self,
+        params: SessionObserveParams,
+    ) -> Result<(SessionAttachResponse, Subscription), RpcError> {
+        let mut state = self.lock();
+        let session = state.session(&params.session)?;
+        let (response, publisher, subscription) = session.follow();
+        if session.subagent && session.turn.is_some() {
+            session.publishers.push(publisher);
+        } else {
+            publisher.close(DetachReason::NotLoaded);
+        }
         Ok((response, subscription))
     }
 
@@ -501,7 +529,11 @@ impl Service for Fake {
         let state = self.lock();
         let jobs = state.sessions.iter().map(|(id, session)| JobSummary {
             id: JobId::new(format!("job-{id}")),
-            kind: JobKind::Session,
+            kind: if session.subagent {
+                JobKind::Subagent
+            } else {
+                JobKind::Session
+            },
             state: session.state,
             workspace: session.cwd.clone(),
             parent: None,

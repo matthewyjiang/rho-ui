@@ -1,5 +1,5 @@
-//! A new session before its first message: a header, and a composer with the
-//! session's settings. The app opens the session as soon as the draft
+//! A new session before its first message: a title bar, and a composer with
+//! the session's settings. The app opens the session as soon as the draft
 //! appears, so the model, reasoning and mode can be set before the first
 //! message. rho writes no file for a session until its first prompt, and a
 //! draft stops following its session when it goes away unused, which lets
@@ -24,9 +24,9 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{alert::Alert, input::InputEvent, v_flex, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, Window,
+    rems, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Window,
 };
 use rho_ui_core::{
     Attached, Checkout, ConfigOption, Daemon, DaemonError, Prompt, Session, SessionId,
@@ -39,7 +39,7 @@ use crate::{
     projects::Projects,
     session_list::NEW_SESSION,
     session_settings::{SessionSettings, SettingsEvent},
-    session_view::header,
+    title_bar::TitleBar,
     workspaces::{WorkspaceRef, Workspaces},
 };
 
@@ -464,12 +464,7 @@ impl Render for DraftView {
             .test_support()
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(header(
-                NEW_SESSION.to_owned(),
-                self.workspace.read(cx),
-                None::<AnyElement>,
-                cx,
-            ))
+            .child(TitleBar::new(self.workspace.read(cx), NEW_SESSION))
             .child(
                 // The project list, centered in the space above the
                 // composer, at its width.

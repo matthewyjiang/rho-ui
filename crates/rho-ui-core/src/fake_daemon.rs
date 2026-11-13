@@ -16,6 +16,12 @@
 //!   [`FakeDaemon::finish_background`], ends it, and the daemon starts a
 //!   turn of its own that tells the model; that turn runs until a steer
 //!   ends it, and drops the work it delivered from the list as it ends.
+//! - The prompt "subagent" starts a subagent, [`SUBAGENT_TASK`], and
+//!   answers at once, leaving it running in a session of its own,
+//!   "sub-N", which can be observed but not attached to.
+//!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
+//!   whole result as a card, [`subagent_result`], and the parent's daemon
+//!   turn tells the model, as for a process.
 //! - A session's first prompt "busy" is refused as busy: the daemon has
 //!   just started a turn of its own, which answers and ends at once. The
 //!   next "busy" is taken like any prompt. The prompt "deleting" is
@@ -32,7 +38,7 @@
 
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -45,12 +51,13 @@ use rho_protocol::{
     methods::{
         BackgroundItem, BackgroundStatus, BackgroundWork, FastModeOptions, JobState, MessageId,
         ModelChoice, ModelOptions, ModelRef, PermissionModeOptions, ReasoningLevel,
-        ReasoningOptions, Seq, SessionCommand, SessionId, SessionOptions, SteerId, ToolCallId,
-        ToolCallUpdate, TurnId,
+        ReasoningOptions, Replay, Seq, SessionCommand, SessionId, SessionOptions, SteerId,
+        StreamId, ToolCallId, ToolCallUpdate, TurnId,
     },
-    serve_connection, AnswerStop, BuildId, CardTone, CommandKind, ContentBlock, DaemonInfo,
-    ErrorCode, InputRequest, PermissionMode, Published, Publisher, RpcError, SessionEvent,
-    ToolContent, ToolKind, ToolStatus, TurnOutcome,
+    serve_connection, subscription, AnswerStop, BuildId, CardTone, CommandKind, ContentBlock,
+    DaemonInfo, DetachReason, ErrorCode, InputRequest, PermissionMode, Published, Publisher,
+    RpcError, SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
+    TurnOutcome,
 };
 use tokio::{net::UnixListener, runtime::Runtime};
 
@@ -62,6 +69,21 @@ use service::Fake;
 
 /// The session [`Script::tui_job`] runs.
 pub const TUI_SESSION: &str = "tui-1";
+
+/// The task of the subagent the prompt "subagent" starts: its title in
+/// the parent's background work, and its session's first message.
+pub const SUBAGENT_TASK: &str = "Read the parser";
+
+/// The whole result the subagent [`SUBAGENT_TASK`] returns, in Markdown:
+/// as long as an explorer's report, with headings, a list and code.
+pub fn subagent_result() -> String {
+    let parts = (1..=6).map(|n| {
+        format!("\n## {n}. Part {n}\n\n- `src/parse.rs:{n}0`\n\n```rust\nfn part_{n}() {{}}\n```\n")
+    });
+    std::iter::once("Conclusion: the parser lives in `src/parse.rs`.\n".to_owned())
+        .chain(parts)
+        .collect()
+}
 
 /// What the fake daemon holds when it starts.
 #[derive(Clone, Copy, Debug, Default)]
@@ -176,6 +198,57 @@ impl FakeDaemon {
         session.report_background();
         if session.turn.is_none() {
             session.wake(turn, &told);
+        }
+    }
+
+    /// Ends `session`'s oldest running subagent: its own session answers
+    /// and ends its run, which detaches whoever observes it, and the
+    /// daemon starts a turn of its own in `session` to tell the model.
+    ///
+    /// # Panics
+    ///
+    /// If the session runs no subagent: the test has a bug.
+    pub fn finish_subagent(&self, session: &UiSessionId) {
+        let mut state = self.service.lock();
+        let turn = state.next_turn();
+        let parent = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        let work = parent
+            .background
+            .iter_mut()
+            .find(|work| {
+                work.status == BackgroundStatus::Running
+                    && matches!(work.item, BackgroundItem::Subagent { .. })
+            })
+            .unwrap_or_else(|| panic!("session runs no subagent to finish"));
+        work.status = BackgroundStatus::Completed;
+        let BackgroundItem::Subagent {
+            session: Some(child),
+            ..
+        } = work.item.clone()
+        else {
+            panic!("the fake's subagents open their session as they start");
+        };
+        parent.report_background();
+        parent.publish(SessionEvent::Card {
+            title: format!("Completed · {SUBAGENT_TASK}"),
+            markdown: subagent_result(),
+            plain: subagent_result(),
+            tone: CardTone::Neutral,
+            display: None,
+        });
+        if parent.turn.is_none() {
+            parent.wake(turn, "The subagent found the parser.");
+        }
+        let child = state
+            .sessions
+            .get_mut(child.as_str())
+            .expect("a subagent's session outlives its run");
+        child.answer("sub-m2", "Found the parser.");
+        for publisher in child.publishers.drain(..) {
+            publisher.close(DetachReason::NotLoaded);
         }
     }
 }
@@ -318,6 +391,9 @@ struct FakeSession {
     background: Vec<BackgroundWork>,
     /// Whether a prompt "busy" was already refused.
     refused_busy: bool,
+    /// A subagent's session, which only its run writes: observed, never
+    /// attached to.
+    subagent: bool,
 }
 
 impl FakeSession {
@@ -335,7 +411,51 @@ impl FakeSession {
             live_seq: 0,
             background: Vec::new(),
             refused_busy: false,
+            subagent: false,
         }
+    }
+
+    /// The session of a subagent in `cwd` whose run, `turn`, is under way
+    /// on [`SUBAGENT_TASK`].
+    fn subagent(cwd: &Path, turn: Turn) -> Self {
+        let mut session = Self::new(&cwd.to_string_lossy(), None, 0);
+        session.saved = false;
+        session.subagent = true;
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(user_message("sub-u1", SUBAGENT_TASK));
+        session.say("sub-m1", "Reading the parser.");
+        session
+    }
+
+    /// Follows the session from here: what it holds now, then what it
+    /// publishes until the client leaves.
+    fn follow(&mut self) -> (SessionAttachResponse, Publisher, Subscription) {
+        // As the daemon numbers a reset's replay: 0 for all but the last.
+        let last = self.history.len().saturating_sub(1);
+        let replay = self.history.iter().cloned().enumerate();
+        let replay: Vec<(Seq, SessionEvent)> = replay
+            .map(|(ix, event)| (Seq(if ix == last { self.live_seq } else { 0 }), event))
+            .collect();
+        let response = SessionAttachResponse {
+            stream: StreamId::new("stream"),
+            workspace: self.cwd.clone(),
+            replay: Replay::Reset,
+            replay_events: u64::try_from(replay.len()).unwrap_or(u64::MAX),
+            state: self.state,
+            turn: self.turn.as_ref().map(|turn| turn.id.clone()),
+            turn_elapsed_ms: self.turn.as_ref().map(Turn::elapsed_ms),
+            inputs: self
+                .turn
+                .iter()
+                .filter_map(|turn| turn.input.clone())
+                .collect(),
+            title: self.title.clone(),
+            options: self.settings.options(),
+            background: self.background.clone(),
+        };
+        let (publisher, subscription) = subscription(BACKLOG, replay);
+        (response, publisher, subscription)
     }
 
     /// Records `event` and sends it to every attached client.
@@ -406,6 +526,20 @@ impl FakeSession {
         self.background.push(BackgroundWork {
             item: BackgroundItem::Process { id },
             title: "sleep 30".to_owned(),
+            status: BackgroundStatus::Running,
+            exit_code: None,
+        });
+        self.report_background();
+    }
+
+    /// Starts subagent run `run`, [`SUBAGENT_TASK`], writing session `child`.
+    fn start_subagent(&mut self, run: String, child: &str) {
+        self.background.push(BackgroundWork {
+            item: BackgroundItem::Subagent {
+                run,
+                session: Some(SessionId::new(child)),
+            },
+            title: SUBAGENT_TASK.to_owned(),
             status: BackgroundStatus::Running,
             exit_code: None,
         });

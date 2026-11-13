@@ -39,8 +39,9 @@ impl Repo {
         initials.to_uppercase()
     }
 
-    /// The repository name without its owner: what the badge shows.
-    fn short_name(&self) -> &str {
+    /// The repository name without its owner: what the badge and the title
+    /// bar show.
+    pub(crate) fn short_name(&self) -> &str {
         self.name.rsplit('/').next().unwrap_or(&self.name)
     }
 }
