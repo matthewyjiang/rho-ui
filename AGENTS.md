@@ -24,6 +24,7 @@ Use GPUI Kit's components (`gpui_kit::component`, `gpui_kit::base`); don't build
 - Nothing here is published to crates.io (`publish = false`).
 - rho-ui has no release yet. Change its files, formats and settings freely: write no migrations and keep no compatibility code for old ones.
 - rho-ui keeps the settings the user chooses in a text file (`settings.rs`, in the config directory), and everything it remembers between runs in one SQLite database (`store::StateDb`, schema in `store.rs`). New state gets a table there, or a `store::Key` in its `kv` table; never a file of its own. After any schema change, bump `SCHEMA_VERSION`: a database of another version starts over empty.
+- Don't commit probes: measurement tests, timing scripts, one-off checks. Run them locally, put the numbers they give in the comment or commit message that needs them, and delete them before you hand back.
 - Check UI changes with the headless UI tests in `crates/rho-ui/src/ui_tests.rs`, and look at the screenshots in `target/ui-shots/`. Don't drive the user's live desktop with `wtype` or screenshots of their screen: they may be using it.
 - A UI test finds elements by `ElementId` (GPUI Kit controls register themselves; custom elements need `.test_support()`). Assert both what the user sees and the session state.
 
