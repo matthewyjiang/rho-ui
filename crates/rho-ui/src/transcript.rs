@@ -21,14 +21,14 @@ use gpui_kit::component::{
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
-    text::TextView,
+    text::{TextView, TextViewStyle},
     ActiveTheme as _, Icon, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, ElementId, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window,
+    div, px, rems, AnyElement, App, AppContext as _, ElementId, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, Window,
 };
 use rho_ui_core::{Entry, NoticeLevel, Row, Timeline};
 
@@ -43,6 +43,20 @@ use crate::{
 /// screenshot's layout reads at this size, and two side by side fit the
 /// transcript's measure.
 const IMAGE_HEIGHT: f32 = 10.;
+
+/// A code block's top padding: the 14px Kit pads its bottom with. Kit pads
+/// a block with a language name 28px at the top, so the code starts under
+/// the name; the name sits in the corner instead, in the padding, as it is
+/// not part of the code.
+const CODE_BLOCK_TOP: f32 = 14.;
+
+/// How messages draw their Markdown.
+fn message_style() -> TextViewStyle {
+    TextViewStyle {
+        code_block: StyleRefinement::default().pt(px(CODE_BLOCK_TOP)),
+        ..TextViewStyle::default()
+    }
+}
 
 /// What a click in the transcript asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +494,7 @@ fn render_message(
                                 ElementId::named_usize("user-markdown", ix),
                                 message.text().to_owned(),
                             )
+                            .style(message_style())
                             .selectable(true),
                         ),
                 )
@@ -502,6 +517,7 @@ fn render_message(
                     ElementId::named_usize("markdown", ix),
                     message.text().to_owned(),
                 )
+                .style(message_style())
                 .selectable(true)
                 .stream_fade(phase == Phase::Live),
             )
