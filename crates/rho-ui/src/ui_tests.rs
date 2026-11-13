@@ -851,6 +851,8 @@ fn turn_took(ui: &mut Harness, turn: usize) -> Option<Duration> {
 /// step, each of which opens into its details; an edit shows Kit's diff.
 #[test]
 fn finished_work_folds_and_opens_in_levels() {
+    use gpui_kit::{point, ScrollDelta};
+
     let script = Script {
         replay_turns: 1,
         ..Script::default()
@@ -885,12 +887,77 @@ fn finished_work_folds_and_opens_in_levels() {
             && !is_visible(window, "details-3")
     });
     ui.shot("steps");
+    // A heredoc's line shows its first line, as tall as any other step's.
+    ui.act(|window, _| {
+        let height =
+            |window: &mut Window, step| window.within(step).find("step-line").bounds().size.height;
+        assert_eq!(height(window, "step-5"), height(window, "step-4"));
+    });
+
+    ui.act(|window, cx| window.within("step-5").click("step-line", cx));
+    ui.wait_until("the command's details", |window, _, _| {
+        is_visible(window, "details-5")
+    });
+    // It opens above the pinned bottom, so scroll up to it, over the edit's
+    // line just below.
+    ui.act(|window, cx| {
+        // Pixels, as a touchpad scrolls: a wheel's lines glide over frames.
+        let up = ScrollDelta::Pixels(point(px(0.), px(400.)));
+        window.within("step-6").scroll("step-line", up, cx);
+    });
+    ui.wait_until("the whole command above its output", |window, _, _| {
+        bounds(window, "command-5")
+            .zip(bounds(window, "output-5"))
+            .is_some_and(|(command, output)| command.bottom() <= output.top())
+    });
+    ui.shot("command");
+    ui.act(|window, cx| window.within("step-5").click("step-line", cx));
 
     ui.act(|window, cx| window.within("step-3").click("step-line", cx));
     ui.wait_until("the read's output", |window, _, _| {
         is_visible(window, "details-3")
     });
+    ui.act(|window, _| {
+        assert!(
+            window.try_find("command-3").is_none(),
+            "a read's title is all on its line"
+        );
+    });
+
+    // The output scrolls inside its box, and the transcript stays put.
+    ui.act(|window, cx| {
+        let up = ScrollDelta::Pixels(point(px(0.), px(400.)));
+        window.within("step-4").scroll("step-line", up, cx);
+    });
+    let top = |ui: &mut Harness| {
+        let app = ui.app.clone();
+        ui.cx.update(|cx| {
+            app.read(cx)
+                .active_session()
+                .expect("a session is open")
+                .read(cx)
+                .scroll_top(cx)
+        })
+    };
+    let text_y = |ui: &mut Harness| {
+        let text = ui.cx.update_window(ui.window, |_, window, _| {
+            window.find("output-text-3").bounds().top()
+        });
+        text.expect("window is open")
+    };
+    let (transcript, text) = (top(&mut ui), text_y(&mut ui));
+    ui.act(|window, cx| {
+        let down = ScrollDelta::Pixels(point(px(0.), px(-100.)));
+        window.scroll("output-3", down, cx);
+    });
+    assert_eq!(text_y(&mut ui), text - px(100.), "the output scrolled");
+    assert_eq!(top(&mut ui), transcript, "the transcript did not");
     ui.act(|window, cx| window.within("step-6").click("step-line", cx));
+    // It opens under the fold, as the transcript was scrolled up.
+    ui.act(|window, cx| {
+        let down = ScrollDelta::Pixels(point(px(0.), px(-2000.)));
+        window.within("step-6").scroll("step-line", down, cx);
+    });
     ui.wait_until("the edit's diff", |window, _, _| {
         is_visible(window, "details-6")
     });
