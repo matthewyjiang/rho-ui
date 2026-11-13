@@ -24,9 +24,9 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{alert::Alert, input::InputEvent, v_flex, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    rems, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, Window,
+    rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
+    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
     Attached, Checkout, ConfigOption, Daemon, DaemonError, Prompt, Session, SessionId,
@@ -458,7 +458,12 @@ impl Render for DraftView {
             .test_support()
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(header(NEW_SESSION.to_owned(), self.workspace.read(cx), cx))
+            .child(header(
+                NEW_SESSION.to_owned(),
+                self.workspace.read(cx),
+                None::<AnyElement>,
+                cx,
+            ))
             .child(
                 // The project list, centered in the space above the
                 // composer, at its width.
