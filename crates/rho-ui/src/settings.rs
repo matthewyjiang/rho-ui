@@ -83,7 +83,7 @@ impl Appearance {
         }
     }
 
-    /// What the settings screen calls it.
+    /// What settings call it.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Appearance::System => "System",

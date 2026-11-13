@@ -53,10 +53,8 @@ gpui_kit::actions!(
         NewSessionIn,
         /// Stop the running turn in the focused session.
         StopTurn,
-        /// Open the settings screen.
+        /// Open settings.
         OpenSettings,
-        /// Close the settings screen.
-        CloseSettings,
         /// Quit the app.
         Quit
     ]
@@ -181,7 +179,6 @@ fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-n", NewSessionIn, Some("RhoApp")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
-        KeyBinding::new("escape", CloseSettings, Some("SettingsView")),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
 }
