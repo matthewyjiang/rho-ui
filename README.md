@@ -4,7 +4,7 @@
 
 The desktop app for [rho](https://github.com/matthewyjiang/rho), built with [GPUI Kit](https://gpui-kit.com).
 
-rho-ui is a frontend of the rho daemon, like rho's terminal UI. It connects to the daemon's socket and speaks rho's own protocol through the [`rho-protocol`](https://github.com/matthewyjiang/rho/tree/daemon-v3/crates/rho-protocol) crate. It needs rho 3 or later: rho 2 has no daemon.
+rho-ui is a frontend of the rho daemon, like rho's terminal UI. It connects to the daemon's socket and speaks rho's own protocol through the [`rho-protocol`](https://crates.io/crates/rho-protocol) crate. It needs rho 3 or later: rho 2 has no daemon.
 
 Sessions and their turns run in the daemon, so they outlive the app. A turn that rho-ui starts keeps running after the window closes, and a turn that the terminal UI started shows in rho-ui's sidebar, where you can open it, answer its approvals, and steer it.
 
@@ -35,7 +35,7 @@ flowchart TD
 | `rho-ui-core` | The connection to the daemon, its requests, the event stream, `Session`, which turns session events into transcript entries, open requests and settings, and `Timeline`, which groups each run of tool calls and thoughts into one row and splits rows into turns, so the UI can fold a finished turn's working behind one line. It has no GUI code. It keeps one small Tokio runtime for the socket, because `rho-protocol`'s client needs one; every method returns a plain future that any executor can await. |
 | `rho-ui` | Windows, views, and input. |
 
-`rho-protocol` is not on crates.io while the protocol is 0.1. The workspace pins it to a commit of rho's `daemon-v3` branch. Two builds of protocol 0.1 can differ on the wire, so run a daemon built from the same commit. A daemon of another build still connects, and rho-ui shows the daemon's notice that requests may fail.
+The workspace uses `rho-protocol` 1.0.0 from crates.io, the release that ships with rho 3.0.0. At the handshake the client names its wire schema; a daemon built against another schema still connects, and rho-ui shows the daemon's notice that requests may fail, so run a rho whose `rho-protocol` matches.
 
 The composer's footer holds the session's settings: the permission mode (which tool calls run without asking) on the left, and on the right one button naming the model and reasoning, which opens the model list with search beside the reasoning levels and fast mode. New session opens the session right away, so these can be set before the first message; rho writes no file for a session until its first prompt, and the daemon discards an unused draft's session, so nothing is left behind. A setting changed while a turn runs applies when the turn ends.
 
@@ -62,7 +62,7 @@ cargo test
 
 To measure frame times with 300 saved sessions and a 100-turn transcript, run `cargo test -p rho-ui --release frame_times -- --ignored --nocapture`.
 
-To check rho-ui against a real daemon and model, build `rho` from the commit `Cargo.toml` pins, sign it in, and run the `live_daemon` test. It starts the daemon, runs a turn through an approval, and saves screenshots. A new rho home starts in `bypass`, which asks for no approvals, so set `permission_mode = "supervised"` under `[behavior]` in its `config.toml`:
+To check rho-ui against a real daemon and model, install rho 3, sign it in, and run the `live_daemon` test. It starts the daemon, runs a turn through an approval, and saves screenshots. A new rho home starts in `bypass`, which asks for no approvals, so set `permission_mode = "supervised"` under `[behavior]` in its `config.toml`:
 
 ```bash
 RHO_UI_LIVE_RHO=/path/to/rho cargo test -p rho-ui live_daemon -- --ignored --nocapture

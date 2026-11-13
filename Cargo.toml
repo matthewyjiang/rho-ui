@@ -11,11 +11,8 @@ publish = false
 rust-version = "1.93"
 
 [workspace.dependencies]
-# rho's daemon protocol: wire types and the client. Unpublished while it is
-# 0.1, so pinned to a commit of rho's `daemon-v3` branch; a daemon built from
-# another commit may speak a different wire, which `rho/hello` reports. Move
-# to the crates.io release once there is one.
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "bc47bd773a8431638aac618dc558c8b3bfb201fa" }
+# rho's daemon protocol: wire types and the client, released with rho 3.
+rho-protocol = "1.0.0"
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.0" }
 

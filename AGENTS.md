@@ -19,7 +19,7 @@ Use GPUI Kit's components (`gpui_kit::component`, `gpui_kit::base`); don't build
 ## Rules
 
 - `rho-ui-core` has no GUI code. It talks to the rho daemon through `rho-protocol` and nothing else of rho's: never depend on `rho-sdk`. Its one Tokio runtime is for the daemon socket only, because `rho-protocol`'s client needs it. Keep everything else off it: the public API is plain futures that the UI awaits on GPUI's executors.
-- `rho-protocol` is a git dependency pinned to a commit of rho's `daemon-v3` branch until it is published. Don't work around something it lacks: say what is missing, so it can be added in rho.
+- `rho-protocol` comes from crates.io, released with rho. Don't work around something it lacks: say what is missing, so it can be added in rho.
 - Lints are set once in the root `Cargo.toml` (`[workspace.lints]`, from BeautifulRust's `lints.toml`) and `clippy.toml`. Every crate opts in with `[lints] workspace = true`. Fix a lint rather than silencing it. When one is wrong for an item, use `#[expect(clippy::name, reason = "...")]` on that item.
 - Nothing here is published to crates.io (`publish = false`).
 - Check UI changes with the headless UI tests in `crates/rho-ui/src/ui_tests.rs`, and look at the screenshots in `target/ui-shots/`. Don't drive the user's live desktop with `wtype` or screenshots of their screen: they may be using it.

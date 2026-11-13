@@ -10,8 +10,8 @@ use crate::shelf::Shelves;
 
 /// The app against a real rho daemon and model, not a pass/fail unit test:
 /// it proves the wire works end to end, and saves screenshots. It starts
-/// the daemon through `RHO_UI_LIVE_RHO` (a rho built from the pinned
-/// `daemon-v3` commit) in the `RHO_HOME` it inherits, runs a turn of its
+/// the daemon through `RHO_UI_LIVE_RHO` (a rho 3 binary) in the
+/// `RHO_HOME` it inherits, runs a turn of its
 /// own through an approval, then attaches to the session
 /// `RHO_UI_LIVE_ATTACH` names, one whose turn rho's terminal UI started
 /// and left waiting on an approval, answers it, and steers the turn.
