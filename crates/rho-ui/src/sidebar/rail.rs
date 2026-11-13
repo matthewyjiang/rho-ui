@@ -13,7 +13,7 @@ use gpui_kit::{
     div, rems, Context, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Styled as _,
 };
 
-use super::{new_session_button, settings_button, SidebarEvent, SidebarView, TOP_ROW};
+use super::{new_session_button, settings_button, SidebarEvent, SidebarView};
 use crate::{
     session_list::Busy,
     store::{Key, StateDb},
@@ -99,7 +99,7 @@ impl SidebarView {
             .child(
                 h_flex()
                     .flex_shrink_0()
-                    .h(TOP_ROW)
+                    .h(super::top_row())
                     .child(toggle_button(Layout::Rail, cx)),
             )
             .child(

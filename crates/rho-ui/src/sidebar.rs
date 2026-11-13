@@ -48,6 +48,7 @@ use crate::{
     session_list::{Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList},
     shelf::{Shelf, Shelves},
     time,
+    title_bar::TOP_ROW_REMS,
     workspaces::{Workspace, Workspaces},
 };
 
@@ -78,8 +79,10 @@ const SHELVED_ROW_REMS: f32 = TITLE_REMS + 2. * SHELVED_PAD_REMS + 2. * GUTTER_R
 const HEADER_REMS: f32 = 2.5;
 
 /// The sidebar's top row, open or collapsed, so the toggle sits at the same
-/// height in both.
-const TOP_ROW: Pixels = px(44.);
+/// height in both, and as tall as the main pane's title bar.
+fn top_row() -> Rems {
+    rems(TOP_ROW_REMS)
+}
 
 mod rail;
 
@@ -782,7 +785,7 @@ impl SidebarView {
     fn render_header(cx: &Context<'_, Self>) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
-            .h(TOP_ROW)
+            .h(top_row())
             .px_3()
             .gap_1()
             .child(toggle_button(Layout::Open, cx))

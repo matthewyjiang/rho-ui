@@ -8,13 +8,30 @@
 //! no way to find them; this bar uses slashes, and tests find each step.
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{h_flex, ActiveTheme as _, StyledExt as _};
+use gpui_kit::component::{h_flex, ActiveTheme as _, Sizable as _, StyledExt as _};
 use gpui_kit::{
-    div, px, rems, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
+    div, rems, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
 };
 
 use crate::{sidebar::badge, workspaces::Workspace};
+
+/// The height of the window's top row, in rems: this bar, and the
+/// sidebar's top row beside it, so the two line up and grow with the UI
+/// scale. 44px at the default scale.
+pub(crate) const TOP_ROW_REMS: f32 = 2.75;
+
+/// The project badge's side, in rems: the height of a line of the bar's
+/// text, so the badge reads as part of the line, where the sidebar's is
+/// sized to its smaller text.
+const BADGE_REMS: f32 = 1.375;
+
+/// The longest a step above the title runs, in characters, before it is cut
+/// with an ellipsis: four or five words of a title, which rho keeps to 80
+/// characters, leaving the bar's width to the title on screen. Cut here
+/// rather than by a box's width, as GPUI's ellipsis leaves the box's slack
+/// as a gap before the next slash.
+const PARENT_CHARS: usize = 32;
 
 /// Shows what a step links to.
 type Go = Box<dyn Fn(&mut Window, &mut App)>;
@@ -69,7 +86,7 @@ impl RenderOnce for TitleBar {
         let slash = || {
             div()
                 .flex_shrink_0()
-                .text_color(muted.opacity(0.6))
+                .text_color(muted.opacity(0.5))
                 .child("/")
         };
         let parents = self
@@ -82,31 +99,39 @@ impl RenderOnce for TitleBar {
                     .test_support()
                     .aria_label(label.clone())
                     .min_w_0()
-                    .max_w(rems(16.))
                     .truncate()
                     .text_color(muted)
                     .cursor_pointer()
                     .hover(move |style| style.text_color(foreground))
                     .on_click(move |_, window, cx| go(window, cx))
-                    .child(label);
+                    .child(shorten(&label));
                 [step.into_any_element(), slash().into_any_element()]
             });
         h_flex()
             .id("title-bar")
             .flex_shrink_0()
-            .min_h(px(44.))
+            .h(rems(TOP_ROW_REMS))
             .gap_2()
             .px_4()
-            .py_1()
             .border_b_1()
             .border_color(theme.border)
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_2()
-                    .child(badge(self.initials))
-                    .child(div().flex_shrink_0().text_color(muted).child(self.project))
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_2()
+                            .child(
+                                badge(self.initials)
+                                    .small()
+                                    .size(rems(BADGE_REMS))
+                                    .rounded(rems(0.3125)),
+                            )
+                            .child(div().text_color(muted).child(self.project)),
+                    )
                     .child(slash())
                     .children(parents)
                     .child(
@@ -121,5 +146,35 @@ impl RenderOnce for TitleBar {
                     ),
             )
             .children(self.trailing)
+    }
+}
+
+/// `label` cut to [`PARENT_CHARS`] characters, the last an ellipsis, at a
+/// word's end when one is near.
+fn shorten(label: &SharedString) -> SharedString {
+    if label.chars().count() <= PARENT_CHARS {
+        return label.clone();
+    }
+    let cut: String = label.chars().take(PARENT_CHARS - 1).collect();
+    let cut = match cut.rfind(' ') {
+        Some(space) if space > cut.len() * 2 / 3 => &cut[..space],
+        _ => cut.as_str(),
+    };
+    format!("{}…", cut.trim_end()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shorten, PARENT_CHARS};
+
+    #[test]
+    fn long_steps_are_cut_at_a_word() {
+        let short = "Fix the parser".into();
+        assert_eq!(shorten(&short), short);
+        let cut = shorten(&"Add SSH Remote Daemon Support for Many Machines".into());
+        assert_eq!(cut.as_ref(), "Add SSH Remote Daemon Support…");
+        assert!(cut.chars().count() <= PARENT_CHARS);
+        let word = shorten(&"Supercalifragilisticexpialidocious-and-then-some".into());
+        assert_eq!(word.chars().count(), PARENT_CHARS);
     }
 }
