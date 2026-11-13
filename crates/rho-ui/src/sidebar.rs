@@ -255,7 +255,7 @@ impl SidebarView {
     /// Replaces the saved sessions with a fresh `list_sessions` result.
     pub(crate) fn set_saved(&mut self, sessions: Vec<SessionSummary>, cx: &mut Context<'_, Self>) {
         let saved = self.workspaces.update(cx, |workspaces, cx| {
-            sessions
+            let saved: Vec<SavedSession> = sessions
                 .into_iter()
                 .map(|session| SavedSession {
                     workspace: workspaces.index(session.cwd(), cx),
@@ -264,7 +264,14 @@ impl SidebarView {
                     title: session.title().map(|title| title.to_owned().into()),
                     updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
                 })
-                .collect()
+                .collect();
+            workspaces.set_history(
+                saved
+                    .iter()
+                    .map(|session| (session.workspace, session.updated)),
+                cx,
+            );
+            saved
         });
         self.list.set_saved(saved);
         self.error = None;
@@ -899,7 +906,7 @@ fn workspace_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
 }
 
 /// A workspace's initials, in colors Kit picks from them.
-fn badge(initials: SharedString) -> Avatar {
+pub(crate) fn badge(initials: SharedString) -> Avatar {
     Avatar::new()
         .name(initials)
         .xsmall()

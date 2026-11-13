@@ -5,13 +5,16 @@
 //! draft stops following its session when it goes away unused, which lets
 //! the daemon discard it, so an unused New session leaves nothing behind in
 //! the sidebar or in rho.
+//!
+//! Above the composer, a [`ProjectPicker`] lists the projects it can start
+//! in. A session's directory is fixed when it opens, so a move
+//! lets the open session go and opens another in the new directory.
 
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::Alert,
-    empty::{Empty, EmptyDescription, EmptyHeader},
     input::{InputEvent, TextareaState},
     v_flex, Sizable as _,
 };
@@ -25,10 +28,11 @@ use rho_ui_core::{Attached, Daemon, DaemonError, Session, SessionId, SessionUpda
 
 use crate::{
     composer::{self, Composer, ComposerMode},
+    project_picker::{PickerEvent, ProjectPicker},
     session_list::NEW_SESSION,
     session_settings::{SessionSettings, SettingsEvent},
     session_view::header,
-    workspaces::WorkspaceRef,
+    workspaces::{WorkspaceRef, Workspaces},
 };
 
 /// What the draft asks of the app.
@@ -36,8 +40,9 @@ pub(crate) enum DraftEvent {
     /// Show `session`, the one the draft opened, and send `text` as its first
     /// prompt.
     Start { session: Box<Session>, text: String },
-    /// The session couldn't be opened; try again.
-    Retry,
+    /// Open a session in the draft's directory: the first failed, or the
+    /// project changed.
+    OpenSession,
 }
 
 /// The draft's session.
@@ -59,8 +64,12 @@ enum SessionState {
 pub(crate) struct DraftView {
     cwd: PathBuf,
     workspace: WorkspaceRef,
+    picker: Entity<ProjectPicker>,
     composer: Entity<TextareaState>,
     state: SessionState,
+    /// Counts the sessions the draft asked the app to open; only the
+    /// latest is wanted.
+    request: u64,
     /// The user sent while the session was opening; it goes out once open.
     queued: bool,
     /// Why opening the session, or a settings change, failed.
@@ -72,13 +81,17 @@ pub(crate) struct DraftView {
 impl EventEmitter<DraftEvent> for DraftView {}
 
 impl DraftView {
+    /// A draft for a session in `cwd`, which the user can move to any of
+    /// `workspaces`.
     pub(crate) fn new(
         cwd: PathBuf,
-        workspace: WorkspaceRef,
+        workspaces: &Entity<Workspaces>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let composer = composer::new_state(window, cx);
+        let workspace = WorkspaceRef::new(workspaces, &cwd, cx);
+        let picker = cx.new(|cx| ProjectPicker::new(workspaces, cwd.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &composer,
@@ -90,26 +103,28 @@ impl DraftView {
                 },
             ),
             cx.observe(workspace.table(), |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &picker,
+                window,
+                |this, _, event: &PickerEvent, window, cx| match event {
+                    PickerEvent::Picked(cwd) => this.move_to(cwd.clone(), window, cx),
+                    PickerEvent::Dismissed => window.focus(&this.composer.focus_handle(cx), cx),
+                },
+            ),
             // An unused session goes with its draft: unfollowed and
             // unsaved, the daemon discards it.
             cx.on_release(|this, cx| {
-                if let SessionState::Open {
-                    daemon, session, ..
-                } = &this.state
-                {
-                    let (daemon, id) = (daemon.clone(), session.id().clone());
-                    cx.spawn(async move |_| {
-                        let _ = daemon.detach(&id).await;
-                    })
-                    .detach();
-                }
+                let state = std::mem::replace(&mut this.state, SessionState::Started);
+                let_go(state, cx);
             }),
         ];
         Self {
             cwd,
             workspace,
+            picker,
             composer,
             state: SessionState::Opening,
+            request: 0,
             queued: false,
             error: None,
             focus_handle: cx.focus_handle(),
@@ -131,6 +146,54 @@ impl DraftView {
             SessionState::Open { session, .. } => Some(session.id()),
             SessionState::Opening | SessionState::Failed | SessionState::Started => None,
         }
+    }
+
+    /// Puts the keyboard in the project search, as Ctrl+Shift+N does.
+    pub(crate) fn choose_project(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.picker
+            .update(cx, |picker, cx| picker.focus(window, cx));
+    }
+
+    /// Moves the draft to `cwd`. The session opened for the old directory
+    /// goes, unfollowed and unsaved, and the app opens one in the new; the
+    /// text in the composer stays.
+    fn move_to(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if cwd == self.cwd || matches!(self.state, SessionState::Started) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+            return;
+        }
+        self.workspace = WorkspaceRef::new(self.workspace.table(), &cwd, cx);
+        self.picker
+            .update(cx, |picker, cx| picker.set_current(cwd.clone(), window, cx));
+        self.cwd = cwd;
+        let_go(
+            std::mem::replace(&mut self.state, SessionState::Opening),
+            cx,
+        );
+        self.error = None;
+        self.reopen(cx);
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// The draft's directory, and which of its requests to open a session
+    /// there this is, for [`Self::awaits`].
+    pub(crate) fn request(&self) -> (PathBuf, u64) {
+        (self.cwd.clone(), self.request)
+    }
+
+    /// Whether the draft still waits for the answer to `request`. An
+    /// earlier request's session, such as one opened before the project
+    /// changed, is not wanted: the app leaves it unfollowed, and the daemon
+    /// discards it.
+    pub(crate) fn awaits(&self, request: u64) -> bool {
+        request == self.request && matches!(self.state, SessionState::Opening)
+    }
+
+    /// Asks the app for a session in the draft's directory.
+    fn reopen(&mut self, cx: &mut Context<'_, Self>) {
+        self.request += 1;
+        cx.emit(DraftEvent::OpenSession);
     }
 
     /// Takes the session the app opened, and sends a waiting message.
@@ -252,11 +315,25 @@ impl DraftView {
                 self.state = SessionState::Opening;
                 self.queued = true;
                 self.error = None;
-                cx.emit(DraftEvent::Retry);
+                self.reopen(cx);
             }
             SessionState::Started => {}
         }
         cx.notify();
+    }
+}
+
+/// Lets an unused draft's session go: unfollowed and unsaved, the daemon
+/// discards it.
+fn let_go(state: SessionState, cx: &mut App) {
+    if let SessionState::Open {
+        daemon, session, ..
+    } = state
+    {
+        cx.spawn(async move |_| {
+            let _ = daemon.detach(session.id()).await;
+        })
+        .detach();
     }
 }
 
@@ -292,10 +369,19 @@ impl Render for DraftView {
             .size_full()
             .child(header(NEW_SESSION.to_owned(), self.workspace.read(cx), cx))
             .child(
-                Empty::new().header(
-                    EmptyHeader::new()
-                        .description(EmptyDescription::new().child("Send a message to start.")),
-                ),
+                // The project list, centered in the space above the
+                // composer, at its width.
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .justify_center()
+                    .w_full()
+                    .max_w(rems(48.))
+                    .mx_auto()
+                    .px_4()
+                    .pt_4()
+                    .pb_4()
+                    .child(self.picker.clone()),
             )
             .child(
                 v_flex()
