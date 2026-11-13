@@ -698,7 +698,8 @@ fn click_label(ui: &mut Harness, label: &str) {
     });
 }
 
-/// The gear opens settings; a new scale reaches the theme; Escape closes.
+/// The gear opens settings in a dialog over the sessions; a new scale
+/// reaches the theme; Escape closes.
 #[test]
 fn settings_open_apply_and_close() {
     let mut ui = Harness::start("settings", Script::default());
@@ -706,10 +707,32 @@ fn settings_open_apply_and_close() {
         is_visible(window, "open-settings")
     });
     ui.click("open-settings");
-    ui.wait_until("the settings screen", |window, _, _| {
-        is_visible(window, "close-settings") && is_visible(window, "setting-ui-font")
+    ui.wait_until("the settings dialog", |window, _, _| {
+        is_visible(window, "setting-ui-font")
     });
+    // Past the dialog's entrance transition.
+    ui.cx.advance_clock(Duration::from_secs(1));
     ui.shot("open");
+    ui.act(|window, _| {
+        let panel = bounds(window, "settings-view").expect("settings are shown");
+        let viewport = window.viewport_size();
+        assert!(
+            panel.size.width < viewport.width && panel.size.height < viewport.height,
+            "settings {panel:?} fill the {viewport:?} window"
+        );
+        assert!(
+            is_visible(window, "new-session"),
+            "the sidebar shows behind settings"
+        );
+        // Kit's dialog surface: the panel plus the dialog's title and padding.
+        let dialog = bounds(window, "surface").expect("the settings dialog");
+        let above = dialog.top();
+        let below = viewport.height - dialog.bottom();
+        assert!(
+            (above - below).abs() <= px(1.),
+            "settings sit {above:?} from the top and {below:?} from the bottom"
+        );
+    });
 
     ui.cx.update(|cx| {
         let mut settings = cx.global::<Settings>().clone();
@@ -727,8 +750,10 @@ fn settings_open_apply_and_close() {
     ui.shot("scaled");
 
     ui.act(|window, cx| window.press("escape", cx));
-    ui.wait_until("the sessions again", |window, _, _| {
-        !is_visible(window, "close-settings") && is_visible(window, "new-session")
+    // Past the dialog's exit transition.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("settings closed", |window, _, _| {
+        !is_visible(window, "setting-ui-font")
     });
 }
 
@@ -1287,9 +1312,10 @@ fn the_theme_setting_switches_light_and_dark() {
     show(&mut ui, "approval");
 
     ui.click("open-settings");
-    ui.wait_until("the settings screen", |window, _, _| {
-        is_visible(window, "close-settings")
+    ui.wait_until("the settings dialog", |window, _, _| {
+        is_visible(window, "setting-ui-font")
     });
+    ui.cx.advance_clock(Duration::from_secs(1));
     ui.shot("settings-light");
 }
 

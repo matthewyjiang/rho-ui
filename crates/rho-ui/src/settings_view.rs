@@ -1,25 +1,49 @@
-//! The settings screen, opened from the gear at the bottom of the sidebar.
-//! Built from GPUI Kit's `Settings` component: pages on the left with a
-//! search, groups of items on the right. Each change applies at once and is
-//! saved.
+//! Settings, opened with Ctrl+, or the gear at the bottom of the sidebar, in a
+//! dialog over the window. Built from GPUI Kit's `Settings` component: pages
+//! on the left with a search, groups of items on the right. Each change
+//! applies at once and is saved.
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    h_flex,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPanel},
-    v_flex, ActiveTheme as _, IconName, Sizable as _, StyledExt as _,
+    IconName, Sizable as _, WindowExt as _,
 };
 use gpui_kit::{
-    div, px, rems, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, Window,
+    div, rems, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
 };
 
-use crate::{
-    settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
-    CloseSettings,
-};
+use crate::settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT};
+
+/// The dialog's width and the panel's height, in rems so they follow the UI
+/// scale: 832 x 480 px at 100%, inside the default 1200 x 800 window with
+/// the sidebar still in view. The dialog shrinks to fit a smaller window.
+/// GPUI Kit gives an item's label up to 3/5 of its row, so the width also
+/// has to leave the font pickers ([`FONT_PICKER_REMS`]) their 2/5.
+const WIDTH_REMS: f32 = 52.;
+const HEIGHT_REMS: f32 = 30.;
+/// The page list on the panel's left.
+const PAGES_REMS: f32 = 11.;
+const FONT_PICKER_REMS: f32 = 14.;
+
+/// Opens settings in a dialog, unless a dialog is already open. The dialog
+/// owns the view: Escape, its close button, or a click outside drops it, and
+/// the keyboard goes back where it was.
+pub(crate) fn open(window: &mut Window, cx: &mut App) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    let view = cx.new(|cx| SettingsView::new(window, cx));
+    window.open_dialog(cx, move |dialog, window, _| {
+        let view = view.clone();
+        dialog
+            .title("Settings")
+            .centered()
+            .w(window.rem_size() * WIDTH_REMS)
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
+    });
+}
 
 /// One choice in a font Select.
 #[derive(Clone)]
@@ -47,9 +71,6 @@ impl SelectItem for Choice {
 }
 
 type FontSelect = Entity<SelectState<SearchableVec<Choice>>>;
-
-/// Asks the app to close the settings screen.
-pub(crate) struct Closed;
 
 /// Which font a picker sets.
 #[derive(Clone, Copy)]
@@ -82,17 +103,15 @@ impl FontRole {
     }
 }
 
-pub(crate) struct SettingsView {
+/// The settings panel inside the dialog [`open`] shows.
+struct SettingsView {
     ui_font: FontSelect,
     code_font: FontSelect,
-    focus_handle: FocusHandle,
     _subscriptions: [Subscription; 2],
 }
 
-impl EventEmitter<Closed> for SettingsView {}
-
 impl SettingsView {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let fonts: Vec<Choice> = cx
             .text_system()
             .all_font_names()
@@ -104,12 +123,9 @@ impl SettingsView {
             .collect();
         let (ui_font, ui_subscription) = font_select(FontRole::Ui, fonts.clone(), window, cx);
         let (code_font, code_subscription) = font_select(FontRole::Code, fonts, window, cx);
-        let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
         Self {
             ui_font,
             code_font,
-            focus_handle,
             _subscriptions: [ui_subscription, code_subscription],
         }
     }
@@ -132,7 +148,7 @@ impl SettingsView {
                     .id(role.element_id())
                     .with_size(options.size())
                     .accessibility_label(title)
-                    .w(rems(16.))
+                    .w(rems(FONT_PICKER_REMS))
                     .menu_width(rems(20.))
             })
             .on_reset(
@@ -193,7 +209,7 @@ fn set_font(role: FontRole, family: SharedString, cx: &mut App) {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
         let scales: Vec<(SharedString, SharedString)> = UiScale::CHOICES
             .into_iter()
             .map(|scale| {
@@ -255,36 +271,15 @@ impl Render for SettingsView {
                     ),
                 ]),
             );
-        v_flex()
+        div()
             .id("settings-view")
-            .key_context("SettingsView")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &CloseSettings, _, cx| cx.emit(Closed)))
-            .size_full()
-            .bg(cx.theme().background)
+            .test_support()
+            .h(rems(HEIGHT_REMS))
+            .min_h_0()
             .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h(px(44.))
-                    .px_3()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(div().font_semibold().child("Settings"))
-                    .child(
-                        Button::new("close-settings")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .tooltip("Close (Esc)")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Closed))),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(SettingsPanel::new("settings").page(appearance)),
+                SettingsPanel::new("settings")
+                    .sidebar_width(window.rem_size() * PAGES_REMS)
+                    .page(appearance),
             )
     }
 }

@@ -29,7 +29,7 @@ use crate::{
     kinetic::Kinetic,
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
-    settings_view::{Closed, SettingsView},
+    settings_view,
     shelf::Shelves,
     sidebar::{SidebarEvent, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
@@ -75,12 +75,6 @@ enum Pane {
     Session(Entity<SessionView>),
 }
 
-/// The settings screen, while open.
-struct SettingsScreen {
-    view: Entity<SettingsView>,
-    _subscription: Subscription,
-}
-
 /// A session the user opened in this run, with the subscription that keeps
 /// the sidebar in step with it.
 struct OpenSession {
@@ -105,7 +99,6 @@ pub(crate) struct RhoApp {
     /// Sessions opened in this run. A handful at most, so lookups by ID scan.
     sessions: Vec<OpenSession>,
     pane: Pane,
-    settings: Option<SettingsScreen>,
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
@@ -143,7 +136,7 @@ impl RhoApp {
                 }
                 SidebarEvent::NewSession => this.new_session(window, cx),
                 SidebarEvent::Delete { id } => this.delete_session(id.clone(), window, cx),
-                SidebarEvent::OpenSettings => this.open_settings(window, cx),
+                SidebarEvent::OpenSettings => settings_view::open(window, cx),
             },
         );
         let mut app = Self {
@@ -156,7 +149,6 @@ impl RhoApp {
             sidebar,
             sessions: Vec::new(),
             pane: Pane::Empty,
-            settings: None,
             kinetic: Rc::default(),
             focus_handle,
             daemon_task: Task::ready(()),
@@ -526,10 +518,7 @@ impl RhoApp {
         self.last_project = Some(cwd.clone());
         let view = self.open_new_session(daemon, cwd, session, text, window, cx);
         self.set_pane(Pane::Session(view), cx);
-        // Behind the settings screen, the keyboard stays there.
-        if self.settings.is_none() {
-            self.focus_pane(window, cx);
-        }
+        self.focus_pane(window, cx);
     }
 
     /// Deletes a saved session in the daemon, then drops it here.
@@ -573,27 +562,8 @@ impl RhoApp {
         cx.notify();
     }
 
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.settings.is_some() {
-            return;
-        }
-        let view = cx.new(|cx| SettingsView::new(window, cx));
-        let subscription = cx.subscribe_in(&view, window, |this, _, _: &Closed, window, cx| {
-            this.settings = None;
-            this.focus_pane(window, cx);
-            cx.notify();
-        });
-        self.settings = Some(SettingsScreen {
-            view,
-            _subscription: subscription,
-        });
-        cx.notify();
-    }
-
-    /// Shows `pane` in the main area, closing settings, and puts the
-    /// keyboard in it.
+    /// Shows `pane` in the main area and puts the keyboard in it.
     fn show(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.settings = None;
         self.set_pane(pane, cx);
         self.focus_pane(window, cx);
     }
@@ -611,8 +581,12 @@ impl RhoApp {
         cx.notify();
     }
 
-    /// Puts the keyboard in the main pane's composer.
+    /// Puts the keyboard in the main pane's composer, unless a dialog such
+    /// as settings is open: it keeps the keyboard until it closes.
     fn focus_pane(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
         let handle = match &self.pane {
             Pane::Draft { view, .. } => view.read(cx).composer_focus_handle(cx),
             Pane::Session(view) => view.read(cx).composer_focus_handle(cx),
@@ -837,9 +811,7 @@ impl Render for RhoApp {
             .on_action(cx.listener(|this, _: &NewSessionIn, window, cx| {
                 this.new_session_in(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                this.open_settings(window, cx);
-            }))
+            .on_action(|_: &OpenSettings, window, cx| settings_view::open(window, cx))
             .relative()
             .size_full()
             .bg(cx.theme().background)
@@ -860,9 +832,6 @@ impl Render for RhoApp {
             DaemonStatus::Ready(_) => {}
         }
 
-        if let Some(settings) = &self.settings {
-            return root.child(settings.view.clone()).into_any_element();
-        }
         let pane_style = || StyleRefinement::default().flex_1().min_w_0().h_full();
         let main = match &self.pane {
             Pane::Session(view) => view.clone().cached(pane_style()).into_any_element(),
