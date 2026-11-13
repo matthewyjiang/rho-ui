@@ -11,6 +11,7 @@ gpui-kit.workspace = true
 # builds this version with these decoders.
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 rho-ui-core = { path = "../rho-ui-core" }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [lints]
 workspace = true

@@ -4,41 +4,53 @@
 //! main checkout: adding a linked worktree or a subfolder adds the
 //! repository it belongs to (see [`crate::repo::Repo::root`]).
 //!
-//! The list lives in one small text file, one absolute path per line, in
-//! the order the projects were added.
+//! The list lives in the state database's `projects` table (see
+//! [`StateDb`]), in the order the projects were added.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
+    path::{Path, PathBuf},
+};
 
-use crate::store;
+use crate::store::StateDb;
 
 /// The user's projects.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Projects {
     roots: Vec<PathBuf>,
-    /// Where to save; `None` keeps changes in memory only (tests).
-    file: Option<PathBuf>,
+    db: StateDb,
+}
+
+/// For tests: no projects, kept in memory.
+#[cfg(test)]
+impl Default for Projects {
+    fn default() -> Self {
+        Self::load(&StateDb::in_memory())
+    }
 }
 
 impl Projects {
-    /// Loads `$XDG_STATE_HOME/rho-ui/projects`, or `~/.local/state/...`. A
-    /// missing or unreadable file starts empty.
-    pub(crate) fn load() -> Self {
-        let file = store::xdg_dir("XDG_STATE_HOME", ".local/state").map(|dir| dir.join("projects"));
-        let roots = file
-            .as_ref()
-            .and_then(|file| std::fs::read_to_string(file).ok())
-            .map(|text| parse(&text))
-            .unwrap_or_default();
-        Self { roots, file }
+    /// Loads the saved projects. Rows keep their insertion order in
+    /// `rowid`, as SQLite gives a new row one past the largest.
+    pub(crate) fn load(db: &StateDb) -> Self {
+        let roots = db.query("SELECT path FROM projects ORDER BY rowid", [], |row| {
+            Ok(PathBuf::from(OsString::from_vec(row.get(0)?)))
+        });
+        Self {
+            roots,
+            db: db.clone(),
+        }
     }
 
     /// For tests: these projects, kept in memory.
     #[cfg(test)]
     pub(crate) fn of<P: Into<PathBuf>>(roots: impl IntoIterator<Item = P>) -> Self {
-        Self {
-            roots: roots.into_iter().map(Into::into).collect(),
-            file: None,
+        let mut projects = Self::default();
+        for root in roots {
+            projects.add(root.into());
         }
+        projects
     }
 
     /// Every project, in the order added.
@@ -52,8 +64,11 @@ impl Projects {
         if self.roots.contains(&root) {
             return false;
         }
+        self.db.execute(
+            "INSERT OR IGNORE INTO projects (path) VALUES (?1)",
+            [bytes(&root)],
+        );
         self.roots.push(root);
-        self.save();
         true
     }
 
@@ -64,38 +79,16 @@ impl Projects {
         self.roots.retain(|known| known != root);
         let changed = self.roots.len() != before;
         if changed {
-            self.save();
+            self.db
+                .execute("DELETE FROM projects WHERE path = ?1", [bytes(root)]);
         }
         changed
     }
-
-    fn save(&self) {
-        if let Some(file) = &self.file {
-            store::write_atomic(file, &render(&self.roots));
-        }
-    }
 }
 
-/// The absolute paths in `text`, one per line, without repeats.
-fn parse(text: &str) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for line in text.lines().map(str::trim) {
-        let root = PathBuf::from(line);
-        if root.is_absolute() && !roots.contains(&root) {
-            roots.push(root);
-        }
-    }
-    roots
-}
-
-/// One path per line. A path that isn't UTF-8 can't be written in a text
-/// file, so it lasts until rho-ui quits.
-fn render(roots: &[PathBuf]) -> String {
-    roots
-        .iter()
-        .filter_map(|root| root.to_str())
-        .flat_map(|root| [root, "\n"])
-        .collect()
+/// A path as the database keeps it: its bytes, which needn't be UTF-8.
+fn bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
 }
 
 #[cfg(test)]
@@ -103,10 +96,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_file_round_trips_and_skips_what_is_no_project() {
-        let roots = parse("/w/a\n\n  /w/b  \nrelative\n/w/a\n");
-        assert_eq!(roots, [PathBuf::from("/w/a"), PathBuf::from("/w/b")]);
-        assert_eq!(parse(&render(&roots)), roots);
+    fn projects_survive_a_reload_in_the_order_added() {
+        let db = StateDb::in_memory();
+        let mut projects = Projects::load(&db);
+        for root in ["/w/c", "/w/a", "/w/b"] {
+            projects.add(root.into());
+        }
+        projects.remove(Path::new("/w/a"));
+        // Not UTF-8: a path is bytes.
+        projects.add(PathBuf::from(OsString::from_vec(b"/w/\xff".to_vec())));
+        assert_eq!(Projects::load(&db).roots(), projects.roots());
     }
 
     #[test]

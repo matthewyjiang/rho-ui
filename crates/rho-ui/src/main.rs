@@ -44,6 +44,8 @@ use crate::{
     projects::Projects,
     settings::Settings,
     shelf::Shelves,
+    sidebar::SidebarLayout,
+    store::StateDb,
     turn_times::TurnTimes,
 };
 
@@ -58,6 +60,8 @@ gpui_kit::actions!(
         StopTurn,
         /// Open settings.
         OpenSettings,
+        /// Collapse the sidebar to its rail, or open it again.
+        ToggleSidebar,
         /// Quit the app.
         Quit
     ]
@@ -165,13 +169,16 @@ fn main() {
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         init(cx);
         Settings::load().apply(cx);
-        cx.set_global(TurnTimes::load());
+        let db = StateDb::open();
+        cx.set_global(TurnTimes::load(&db));
         cx.on_action(|_: &Quit, cx| cx.quit());
         let options = window_options(cx);
         gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
-                let shelves = Shelves::load(time::now_unix());
-                RhoApp::new(launch, shelves, Projects::load(), window, cx)
+                let shelves = Shelves::load(&db, time::now_unix());
+                let projects = Projects::load(&db);
+                let layout = SidebarLayout::load(&db);
+                RhoApp::new(launch, shelves, projects, layout, window, cx)
             })
         })
         .expect("failed to open the rho-ui window");
@@ -186,11 +193,12 @@ fn init(cx: &mut App) {
     themes::install(cx);
     Settings::default().apply(cx);
     // In memory until `main` loads the saved times; tests keep it so.
-    cx.set_global(TurnTimes::default());
+    cx.set_global(TurnTimes::load(&StateDb::in_memory()));
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewSession, Some("RhoApp")),
         KeyBinding::new("ctrl-shift-n", NewSessionIn, Some("RhoApp")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
+        KeyBinding::new("ctrl-b", ToggleSidebar, Some("RhoApp")),
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);

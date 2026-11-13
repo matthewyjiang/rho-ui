@@ -30,14 +30,14 @@ The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 | Ctrl+N | New session |
 | Ctrl+Shift+N | New session, picking the project from the keyboard |
 | Ctrl+, | Settings |
+| Ctrl+B | Collapse or open the sidebar |
 | Enter (while a turn runs) | Steer the turn |
 | Ctrl+V | Paste text, an image, or a copied file |
 
 ## Files
 
 - `~/.config/rho-ui/settings`: theme, scale, fonts
-- `~/.local/state/rho-ui/projects`: your project list
-- `~/.local/state/rho-ui/shelves`: settled and snoozed sessions
+- `~/.local/state/rho-ui/state.sqlite3`: your projects, settled and snoozed sessions, turn times, and whether the sidebar is collapsed
 
 These follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set.
 

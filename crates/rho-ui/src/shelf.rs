@@ -8,17 +8,10 @@
 //! activity; a snoozed session comes back when its time is up. Neither needs a
 //! timer: the sidebar asks [`Shelves::shelf`] whenever it rebuilds.
 //!
-//! The state lives in one small text file, one line per fact:
-//!
-//! ```text
-//! owned <session id>
-//! settled <session id> <unix seconds when settled>
-//! snoozed <session id> <unix seconds when it wakes>
-//! ```
+//! The state lives in the state database's `shelves` table (see
+//! [`StateDb`]), a row per session rho-ui knows something about.
 
-use std::{fmt::Write as _, path::PathBuf};
-
-use crate::store;
+use crate::store::StateDb;
 
 /// Which list a session shows in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -57,25 +50,46 @@ struct Entry {
 
 /// Every session rho-ui knows about, in one flat list sorted by session ID so
 /// a lookup is a binary search.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Shelves {
     entries: Vec<(String, Entry)>,
-    /// Where to save; `None` keeps changes in memory only (tests).
-    path: Option<PathBuf>,
+    db: StateDb,
+}
+
+/// For tests: no marks, kept in memory.
+#[cfg(test)]
+impl Default for Shelves {
+    fn default() -> Self {
+        Self::load(&StateDb::in_memory(), 0)
+    }
 }
 
 impl Shelves {
-    /// Loads `$XDG_STATE_HOME/rho-ui/shelves`, or `~/.local/state/...`,
-    /// dropping snoozes that have run out. A missing or unreadable file
-    /// starts empty.
-    pub(crate) fn load(now: i64) -> Self {
-        let path = store::xdg_dir("XDG_STATE_HOME", ".local/state").map(|dir| dir.join("shelves"));
-        let entries = path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| parse(&text, now))
-            .unwrap_or_default();
-        Self { entries, path }
+    /// Loads the saved shelves, sorted by ID, dropping snoozes that have
+    /// run out.
+    pub(crate) fn load(db: &StateDb, now: i64) -> Self {
+        // SQLite's default collation compares bytes, as `str` does.
+        let entries = db.query(
+            "SELECT session_id, owned, settled_at, snoozed_until FROM shelves \
+             ORDER BY session_id",
+            [],
+            |row| {
+                let mark = match (row.get(2)?, row.get(3)?) {
+                    (Some(at), _) => Some(Mark::Settled(at)),
+                    (None, Some(until)) if until > now => Some(Mark::Snoozed(until)),
+                    (None, _) => None,
+                };
+                let entry = Entry {
+                    owned: row.get(1)?,
+                    mark,
+                };
+                Ok((row.get(0)?, entry))
+            },
+        );
+        Self {
+            entries,
+            db: db.clone(),
+        }
     }
 
     /// For tests: shelves that own `ids`, so they list as active.
@@ -167,71 +181,28 @@ impl Shelves {
             (Err(at), false) => self.entries.insert(at, (id.to_owned(), entry)),
             (Err(_), true) => {}
         }
-        self.save();
+        self.save(id, entry);
     }
 
-    /// Best effort: losing a line only moves a session between lists. Writes
-    /// a temporary file and renames it, so a crash never leaves half a file.
-    fn save(&self) {
-        let Some(path) = &self.path else { return };
-        let mut text = String::new();
-        for (id, entry) in &self.entries {
-            // Writing to a String can't fail.
-            if entry.owned {
-                let _ = writeln!(text, "owned {id}");
-            }
-            let _ = match entry.mark {
-                Some(Mark::Settled(at)) => writeln!(text, "settled {id} {at}"),
-                Some(Mark::Snoozed(until)) => writeln!(text, "snoozed {id} {until}"),
-                None => Ok(()),
-            };
+    /// Writes `id`'s entry, or deletes an empty one. Best effort: losing a
+    /// write only moves a session between lists.
+    fn save(&self, id: &str, entry: Entry) {
+        let db = &self.db;
+        if entry == Entry::default() {
+            db.execute("DELETE FROM shelves WHERE session_id = ?1", [id]);
+            return;
         }
-        store::write_atomic(path, &text);
+        let (settled, snoozed) = match entry.mark {
+            Some(Mark::Settled(at)) => (Some(at), None),
+            Some(Mark::Snoozed(until)) => (None, Some(until)),
+            None => (None, None),
+        };
+        db.execute(
+            "INSERT OR REPLACE INTO shelves (session_id, owned, settled_at, snoozed_until) \
+             VALUES (?1, ?2, ?3, ?4)",
+            (id, entry.owned, settled, snoozed),
+        );
     }
-}
-
-/// Reads entries, sorted by ID. Skips lines it cannot read, so one bad line
-/// costs one fact. A snooze that ended before `now` leaves the session owned
-/// and active.
-fn parse(text: &str, now: i64) -> Vec<(String, Entry)> {
-    let mut facts: Vec<(&str, Entry)> = text
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split(' ');
-            let (kind, id) = (fields.next()?, fields.next()?);
-            let time = fields.next().and_then(|time| time.parse().ok());
-            let entry = match (kind, time) {
-                ("owned", _) => Entry {
-                    owned: true,
-                    mark: None,
-                },
-                ("settled", Some(at)) => Entry {
-                    owned: false,
-                    mark: Some(Mark::Settled(at)),
-                },
-                // Snoozing makes a session rho-ui's, and files from before
-                // `owned` lines existed only say so this way.
-                ("snoozed", Some(until)) => Entry {
-                    owned: true,
-                    mark: (until > now).then_some(Mark::Snoozed(until)),
-                },
-                _ => return None,
-            };
-            Some((id, entry))
-        })
-        .collect();
-    facts.sort_by(|a, b| a.0.cmp(b.0));
-    let mut entries: Vec<(String, Entry)> = Vec::with_capacity(facts.len());
-    for (id, fact) in facts {
-        match entries.last_mut() {
-            Some((last, entry)) if last == id => {
-                entry.owned |= fact.owned;
-                entry.mark = entry.mark.or(fact.mark);
-            }
-            _ => entries.push((id.to_owned(), fact)),
-        }
-    }
-    entries
 }
 
 #[cfg(test)]
@@ -289,33 +260,25 @@ mod tests {
     }
 
     #[test]
-    fn parsing_merges_facts_skips_bad_lines_and_ended_snoozes_still_own() {
-        let text = "snoozed z 300\nnonsense\nsettled a 100\nowned a\nsnoozed old 50\nsettled c x\n";
+    fn shelves_survive_a_reload_and_ended_snoozes_wake_owned() {
+        let db = StateDb::in_memory();
+        let mut shelves = Shelves::load(&db, 0);
+        shelves.own("a");
+        shelves.settle("a", 100);
+        shelves.snooze("z", 300);
+        shelves.snooze("old", 50);
+        shelves.restore("b");
+        shelves.forget("b");
+
+        let entry = |owned, mark| Entry { owned, mark };
         assert_eq!(
-            parse(text, 200),
+            Shelves::load(&db, 200).entries,
             vec![
-                (
-                    "a".to_owned(),
-                    Entry {
-                        owned: true,
-                        mark: Some(Mark::Settled(100))
-                    }
-                ),
-                (
-                    "old".to_owned(),
-                    Entry {
-                        owned: true,
-                        mark: None
-                    }
-                ),
-                (
-                    "z".to_owned(),
-                    Entry {
-                        owned: true,
-                        mark: Some(Mark::Snoozed(300))
-                    }
-                ),
-            ]
+                ("a".to_owned(), entry(true, Some(Mark::Settled(100)))),
+                ("old".to_owned(), entry(true, None)),
+                ("z".to_owned(), entry(true, Some(Mark::Snoozed(300)))),
+            ],
+            "a forgotten session leaves no row"
         );
     }
 }
