@@ -1106,9 +1106,10 @@ fn settings_open_apply_and_close() {
     ui.act(|window, _| {
         let panel = bounds(window, "settings-view").expect("settings are shown");
         let viewport = window.viewport_size();
-        assert!(
-            panel.size.width < viewport.width && panel.size.height < viewport.height,
-            "settings {panel:?} fill the {viewport:?} window"
+        assert_eq!(
+            panel.size.height,
+            viewport.height * 0.75,
+            "settings take three quarters of the window's height"
         );
         assert!(
             is_visible(window, "new-session"),
@@ -1116,6 +1117,11 @@ fn settings_open_apply_and_close() {
         );
         // Kit's dialog surface, which the panel fills.
         let dialog = bounds(window, "surface").expect("the settings dialog");
+        assert_eq!(
+            dialog.size.width,
+            viewport.width * 0.75,
+            "and three quarters of its width"
+        );
         let above = dialog.top();
         let below = viewport.height - dialog.bottom();
         assert!(

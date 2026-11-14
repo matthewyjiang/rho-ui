@@ -14,21 +14,26 @@ use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
 };
 use gpui_kit::{
-    div, rems, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StyleRefinement, Styled as _,
-    Subscription, Window,
+    div, rems, size, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size, StyleRefinement,
+    Styled as _, Subscription, Window,
 };
 
 use crate::settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT};
 use machines::MachineFields;
 
-/// The dialog's width and height, in rems so they follow the UI scale:
-/// 832 x 384 px at 100%, inside the default 1200 x 800 window with the
-/// sidebar still in view. The dialog shrinks to fit a smaller window.
-/// GPUI Kit gives an item's label up to 3/5 of its row, so the width also
-/// has to leave the controls ([`CONTROL_REMS`]) their 2/5.
-const WIDTH_REMS: f32 = 52.;
-const HEIGHT_REMS: f32 = 24.;
+/// How much of the window the dialog takes in each direction, so a large
+/// window gets a large dialog: 900 x 600 px in the default 1200 x 800 window.
+const VIEWPORT_SHARE: f32 = 0.75;
+/// The smallest dialog, in rems so it follows the UI scale: 832 x 384 px at
+/// 100%. GPUI Kit gives an item's label up to 3/5 of its row, so the width
+/// also has to leave the controls ([`CONTROL_REMS`]) their 2/5. Kit's dialog
+/// still shrinks below this to fit a smaller window.
+const MIN_WIDTH_REMS: f32 = 52.;
+const MIN_HEIGHT_REMS: f32 = 24.;
+/// The widest dialog, 1024 px at 100%: wider only spreads each label further
+/// from its control.
+const MAX_WIDTH_REMS: f32 = 64.;
 /// The page list on the panel's left.
 const PAGES_REMS: f32 = 11.;
 /// Every control's width, so they line up in one column.
@@ -50,10 +55,21 @@ pub(crate) fn open(window: &mut Window, cx: &mut App) {
         dialog
             .entrance(DialogEntrance::Fade)
             .centered()
-            .w(window.rem_size() * WIDTH_REMS)
+            .w(dialog_size(window).width)
             .p_0()
             .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
+}
+
+/// The dialog's size in `window`: [`VIEWPORT_SHARE`] of it, within the rem
+/// bounds above. Kit rebuilds the dialog every frame, so it follows a resize.
+fn dialog_size(window: &Window) -> Size<Pixels> {
+    let rem = window.rem_size();
+    let viewport = window.viewport_size();
+    size(
+        (viewport.width * VIEWPORT_SHARE).clamp(rem * MIN_WIDTH_REMS, rem * MAX_WIDTH_REMS),
+        (viewport.height * VIEWPORT_SHARE).max(rem * MIN_HEIGHT_REMS),
+    )
 }
 
 /// One choice in a font Select.
@@ -313,7 +329,7 @@ impl Render for SettingsView {
         div()
             .id("settings-view")
             .test_support()
-            .h(rems(HEIGHT_REMS))
+            .h(dialog_size(window).height)
             .min_h_0()
             .child(
                 SettingsPanel::new("settings")
