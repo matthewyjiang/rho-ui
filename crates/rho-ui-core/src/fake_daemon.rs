@@ -521,12 +521,23 @@ impl FakeSession {
     }
 
     /// Follows the session from here: what it holds now, then what it
-    /// publishes until the client leaves.
+    /// publishes until the client leaves. The replay leaves out background
+    /// events, as rho's saved transcripts hold none (rho replays them only
+    /// for a turn in progress, which the fake doesn't keep apart): the
+    /// attach response lists the work as it is now, without work whose
+    /// result the model has.
     fn follow(&mut self) -> (SessionAttachResponse, Publisher, Subscription) {
+        let replay: Vec<SessionEvent> = self
+            .history
+            .iter()
+            .filter(|event| !matches!(event, SessionEvent::Background { .. }))
+            .cloned()
+            .collect();
         // As the daemon numbers a reset's replay: 0 for all but the last.
-        let last = self.history.len().saturating_sub(1);
-        let replay = self.history.iter().cloned().enumerate();
+        let last = replay.len().saturating_sub(1);
         let replay: Vec<(Seq, SessionEvent)> = replay
+            .into_iter()
+            .enumerate()
             .map(|(ix, event)| (Seq(if ix == last { self.live_seq } else { 0 }), event))
             .collect();
         let response = SessionAttachResponse {

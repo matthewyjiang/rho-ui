@@ -30,6 +30,10 @@ pub enum BackgroundStatus {
     Failed,
     /// Someone stopped it.
     Cancelled,
+    /// It ended while this client did not follow the session, and the
+    /// daemon dropped it once the model had its result, so how it ended is
+    /// unknown. Only [`crate::Session::remember_background`] leads here.
+    Ended,
 }
 
 /// Names one piece of background work to [`crate::Daemon::stop_background`].
@@ -39,9 +43,28 @@ pub enum BackgroundStatus {
 pub struct BackgroundId(pub(crate) rho_protocol::BackgroundItem);
 
 impl BackgroundId {
-    /// What names the work for its whole life. `None` for a kind this
-    /// client does not know, which equals nothing.
-    fn key(&self) -> Option<(BackgroundKind, &str)> {
+    /// A process, by the ID the session's `process` tool gave it.
+    pub fn process(id: String) -> Self {
+        Self(rho_protocol::BackgroundItem::Process { id })
+    }
+
+    /// A workflow run, by its run ID.
+    pub fn workflow(run: String) -> Self {
+        Self(rho_protocol::BackgroundItem::Workflow { run })
+    }
+
+    /// A subagent, by its run ID, with its own session once it opened one.
+    pub fn subagent(run: String, session: Option<&SessionId>) -> Self {
+        Self(rho_protocol::BackgroundItem::Subagent {
+            run,
+            session: session.map(|session| rho_protocol::SessionId::new(session.as_str())),
+        })
+    }
+
+    /// What names the work for its whole life: its kind, and the ID the
+    /// daemon gave it within that kind. `None` for a kind this client does
+    /// not know, which equals nothing.
+    pub fn key(&self) -> Option<(BackgroundKind, &str)> {
         use rho_protocol::BackgroundItem as Item;
 
         match &self.0 {
@@ -69,6 +92,22 @@ pub struct BackgroundWork {
 }
 
 impl BackgroundWork {
+    /// Work as a client saw it, such as one it kept between runs to give
+    /// [`crate::Session::remember_background`].
+    pub fn new(
+        id: BackgroundId,
+        title: String,
+        status: BackgroundStatus,
+        exit_code: Option<i32>,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            status,
+            exit_code,
+        }
+    }
+
     pub(crate) fn from_wire(work: rho_protocol::BackgroundWork) -> Self {
         use rho_protocol::BackgroundStatus as Status;
 
@@ -82,6 +121,15 @@ impl BackgroundWork {
                 _ => BackgroundStatus::Running,
             },
             exit_code: work.exit_code,
+        }
+    }
+
+    /// The same work, ended in a way nobody saw.
+    pub(crate) fn ended_unseen(&self) -> Self {
+        Self {
+            status: BackgroundStatus::Ended,
+            exit_code: None,
+            ..self.clone()
         }
     }
 

@@ -21,8 +21,8 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     fake_daemon::{subagent_result, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION},
-    Attachment, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget, Entry, RunState,
-    Session, SessionId, ToolStatus,
+    Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
+    Entry, RunState, Session, SessionId, ToolStatus,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -53,7 +53,7 @@ struct Harness {
     target: DaemonTarget,
     /// Stops when the test ends.
     daemon: Option<FakeDaemon>,
-    /// The state database the app's sidebar layout saves to, in memory.
+    /// The state database the app saves to, in memory.
     state: StateDb,
 }
 
@@ -65,12 +65,19 @@ impl Harness {
         Self::start_with(name, script, Shelves::owning(["s1", "old"]))
     }
 
-    /// Closes the app and opens it again on the same daemon, as a restart
-    /// does, with `shelves` as its settled and snoozed state.
+    /// Closes the app and opens it again on the same daemon and state
+    /// database, as a restart does, with `shelves` as its settled and
+    /// snoozed state.
     fn reopen(mut self, name: &'static str, shelves: Shelves) -> Self {
-        let (target, daemon) = (self.target.clone(), self.daemon.take());
+        let (target, daemon, state) = (self.target.clone(), self.daemon.take(), self.state.clone());
         drop(self);
-        Self::open(name, target, daemon, shelves, Projects::default())
+        let machines = Machines {
+            shelves,
+            projects: Projects::default(),
+            settings: Settings::default(),
+            remote_sockets: Vec::new(),
+        };
+        Self::open_on(name, target, daemon, machines, state)
     }
 
     /// [`Self::start`] with the given settled and snoozed state.
@@ -114,6 +121,17 @@ impl Harness {
         daemon: Option<FakeDaemon>,
         machines: Machines,
     ) -> Self {
+        Self::open_on(name, target, daemon, machines, StateDb::in_memory())
+    }
+
+    /// [`Self::open_with`] on the state database `state`.
+    fn open_on(
+        name: &'static str,
+        target: DaemonTarget,
+        daemon: Option<FakeDaemon>,
+        machines: Machines,
+        state: StateDb,
+    ) -> Self {
         let Machines {
             shelves,
             projects,
@@ -128,7 +146,7 @@ impl Harness {
         // The daemon's answers arrive on a socket: its I/O thread wakes
         // tasks, which the deterministic scheduler only accepts this way.
         cx.allow_parking();
-        cx.update(crate::init);
+        cx.update(|cx| crate::init(cx, &state));
         cx.update(|cx| settings.apply(cx));
         // A remote machine reaches its fake daemon, never ssh: a host
         // without one gets a socket that isn't there.
@@ -146,7 +164,6 @@ impl Harness {
                 DaemonTarget::Socket(socket)
             }),
         };
-        let state = StateDb::in_memory();
         let sidebar = SidebarState {
             shelves,
             layout: SidebarLayout::load(&state),
@@ -1909,7 +1926,8 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
 /// its parent in the title bar: the subagent's messages as they come, and
 /// no composer, as only the subagent writes there. The parent's step in the
 /// title bar leads back. Once the run ends, its row in the ended work opens
-/// the session as saved.
+/// the session as saved, and still does after a restart, when neither the
+/// daemon's list nor its replay of the parent holds the run.
 #[test]
 fn a_subagents_session_opens_nested_under_its_parent() {
     let mut ui = Harness::start("subagent", Script::default());
@@ -1990,11 +2008,68 @@ fn a_subagents_session_opens_nested_under_its_parent() {
         );
     });
     ui.click("background-ended-0");
-    ui.wait_for_session("the subagent's session as saved", |session| {
-        session.id().as_str() == "sub-1"
-            && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "Found the parser.")
-    });
+    ui.wait_for_session("the subagent's session as saved", subagent_saved);
     ui.shot("reopened");
+    restart_and_open_the_ended_run(ui, &parent);
+}
+
+/// Whether `session` is the subagent's of
+/// [`a_subagents_session_opens_nested_under_its_parent`], as saved once its
+/// run ended.
+fn subagent_saved(session: &Session) -> bool {
+    session.id().as_str() == "sub-1"
+        && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "Found the parser.")
+}
+
+/// Ends the daemon's turn in `parent`, whose subagent's run ended, so the
+/// daemon drops the run; restarts the app, and opens the run from the
+/// parent's ended work.
+fn restart_and_open_the_ended_run(mut ui: Harness, parent: &SessionId) {
+    ui.click("title-parent-0");
+    ui.wait_for_session("the parent", |session| session.id() == parent);
+    ui.send("thanks");
+    ui.wait_for_session("the daemon's turn to end", |session| {
+        session.state() == &RunState::Idle && session.background().is_empty()
+    });
+
+    let mut ui = ui.reopen(
+        "subagent-restarted",
+        Shelves::owning(["s1", "old", parent.as_str()]),
+    );
+    let row: &'static str =
+        Box::leak(format!("session-local-{}", parent.as_str()).into_boxed_str());
+    ui.wait_until("the parent in the sidebar", |window, _, _| {
+        is_visible(window, row)
+    });
+    ui.click(row);
+    ui.wait_for_session("the parent's replay", |session| {
+        session.id() == parent && !session.is_replaying()
+    });
+    let ended: Vec<_> = ui
+        .session()
+        .ended_background()
+        .iter()
+        .map(|work| (work.kind(), work.status(), work.session()))
+        .collect();
+    assert_eq!(
+        ended,
+        [(
+            BackgroundKind::Subagent,
+            BackgroundStatus::Completed,
+            Some(SessionId::from("sub-1"))
+        )],
+        "the run ended as the app saw it"
+    );
+    ui.click("background-history-button");
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "background-ended-0"),
+            "the run is in the ended work"
+        );
+    });
+    ui.shot("restarted");
+    ui.click("background-ended-0");
+    ui.wait_for_session("the subagent's session after the restart", subagent_saved);
 }
 
 /// A card's body is Markdown, and a subagent's holds its whole result, so

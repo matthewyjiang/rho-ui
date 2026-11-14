@@ -7,6 +7,7 @@
 mod app;
 mod attachments;
 mod background;
+mod background_log;
 mod composer;
 mod draft;
 mod figures;
@@ -46,6 +47,7 @@ use rho_ui_core::DaemonTarget;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    background_log::BackgroundLog,
     machines::RemoteMachine,
     projects::Projects,
     settings::Settings,
@@ -181,14 +183,13 @@ fn main() {
     };
 
     gpui_kit::application().with_assets(Assets).run(move |cx| {
-        init(cx);
+        let db = StateDb::open();
+        init(cx, &db);
         // pele takes about 100 ms to load: started now, it's ready for the
         // first diagram. Tests load it when they draw one, so the load
         // doesn't slow the tests that time animations.
         pele::start();
         Settings::load().apply(cx);
-        let db = StateDb::open();
-        cx.set_global(TurnTimes::load(&db));
         cx.on_action(|_: &Quit, cx| cx.quit());
         let options = window_options(cx);
         gpui_kit::open_window(options, cx, |window, cx| {
@@ -204,13 +205,14 @@ fn main() {
 }
 
 /// App-wide setup shared by `main` and the UI tests: GPUI Kit, the theme
-/// with default settings, and key bindings.
-fn init(cx: &mut App) {
+/// with default settings, key bindings, and the globals that remember
+/// things between runs in `db`.
+fn init(cx: &mut App, db: &StateDb) {
     gpui_kit::init(cx);
     themes::install(cx);
     Settings::default().apply(cx);
-    // In memory until `main` loads the saved times; tests keep it so.
-    cx.set_global(TurnTimes::load(&StateDb::in_memory()));
+    cx.set_global(TurnTimes::load(db));
+    cx.set_global(BackgroundLog::new(db));
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewSession, Some("RhoApp")),
         KeyBinding::new("ctrl-shift-n", NewSessionIn, Some("RhoApp")),

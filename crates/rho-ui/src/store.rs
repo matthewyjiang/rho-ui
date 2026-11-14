@@ -36,7 +36,7 @@ pub(crate) fn write_atomic(path: &Path, text: &str) {
 
 /// Bump on any change to [`SCHEMA`]. A database of another version starts
 /// over empty: rho-ui has no release, so there is nothing to migrate.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Every table. Each belongs to the module that reads and writes it.
 /// Tables keyed by text are `WITHOUT ROWID`, so the key is stored once
@@ -65,6 +65,24 @@ const SCHEMA: &str = "
     -- How long each turn took, by a hash of its prompt's message ID, which
     -- is the rowid; see crate::turn_times.
     CREATE TABLE turn_times (prompt INTEGER PRIMARY KEY, ms INTEGER NOT NULL) STRICT;
+    -- The background work rho-ui saw each session run, by machine and
+    -- session; see crate::background_log. kind and work_id name the work
+    -- as the daemon does, and subagent_session is a subagent's own
+    -- session. ended orders the session's ended work as rho-ui saw it
+    -- end, and is NULL while the work runs.
+    CREATE TABLE background (
+        machine TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        work_id TEXT NOT NULL,
+        subagent_session TEXT,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        exit_code INTEGER,
+        ended INTEGER,
+        PRIMARY KEY (machine, session_id, kind, work_id),
+        CHECK ((status = 'running') = (ended IS NULL))
+    ) STRICT, WITHOUT ROWID;
     -- One-off values, by Key.
     CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT, WITHOUT ROWID;
 ";

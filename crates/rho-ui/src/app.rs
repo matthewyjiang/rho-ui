@@ -27,6 +27,7 @@ use rho_ui_core::{
 };
 
 use crate::{
+    background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
     machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
@@ -585,7 +586,8 @@ impl RhoApp {
         }
     }
 
-    /// Drops a session that is gone from its daemon.
+    /// Drops a session that is gone from its daemon, with its record of
+    /// background work.
     fn session_deleted(
         &mut self,
         id: &SessionKey,
@@ -593,6 +595,7 @@ impl RhoApp {
         cx: &mut Context<'_, Self>,
     ) {
         self.forget_session(id, window, cx);
+        cx.global::<BackgroundLog>().forget(id);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.remove(id, cx));
         self.refresh_sessions(&id.machine, cx);

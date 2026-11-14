@@ -6,6 +6,7 @@ use serde_json::json;
 
 use super::*;
 use crate::{
+    background::BackgroundId,
     input::{Form, InputChoice},
     options::{ConfigCategory, ConfigChoice, ConfigKind},
     tool_card::{SearchLine, ToolBody, ToolFact},
@@ -695,5 +696,74 @@ fn ended_background_work_outlives_the_daemons_list() {
             ("b", BackgroundStatus::Cancelled),
             ("a", BackgroundStatus::Completed)
         ]
+    );
+}
+
+/// A session opened again in a later run starts its ended work with what
+/// that run saw end. Work it saw running that the daemon no longer lists
+/// once the attachment caught up ended while it was away, unless the
+/// replay showed how; work still running is followed as any other, and
+/// ends unseen too if a live list drops it while it runs.
+#[test]
+fn remembered_background_work_settles_once_the_attach_catches_up() {
+    let remembered = |id: &str, status| {
+        BackgroundWork::new(
+            BackgroundId::process(id.to_owned()),
+            id.to_owned(),
+            status,
+            None,
+        )
+    };
+    let listed = |work: &[(&str, &str)]| {
+        json!(work
+            .iter()
+            .map(|(id, status)| json!({"item": {"kind": "process", "id": id}, "title": id, "status": status}))
+            .collect::<Vec<_>>())
+    };
+    let ended = |session: &Session| -> Vec<(String, BackgroundStatus)> {
+        session
+            .ended_background()
+            .iter()
+            .map(|work| (work.title().to_owned(), work.status()))
+            .collect()
+    };
+    let mut session = Session::new(SessionId::from("s1"));
+    session.remember_background([
+        remembered("seen", BackgroundStatus::Completed),
+        remembered("away", BackgroundStatus::Running),
+        remembered("replayed", BackgroundStatus::Running),
+        remembered("still", BackgroundStatus::Running),
+    ]);
+    let mut response = attach_response(JobState::Idle, 2);
+    response.0.background =
+        serde_json::from_value(listed(&[("still", "running")])).expect("a valid list");
+    session.attached(response);
+    session.apply(update(json!({"type": "background",
+        "work": listed(&[("replayed", "completed"), ("still", "running")])})));
+    assert_eq!(
+        ended(&session),
+        [
+            ("seen".to_owned(), BackgroundStatus::Completed),
+            ("replayed".to_owned(), BackgroundStatus::Completed)
+        ],
+        "nothing ended unseen while the replay runs"
+    );
+    session.apply(update(
+        json!({"type": "background", "work": listed(&[("still", "running")])}),
+    ));
+    assert_eq!(
+        ended(&session),
+        [
+            ("seen".to_owned(), BackgroundStatus::Completed),
+            ("replayed".to_owned(), BackgroundStatus::Completed),
+            ("away".to_owned(), BackgroundStatus::Ended)
+        ]
+    );
+    assert_eq!(session.background()[0].status(), BackgroundStatus::Running);
+
+    session.apply(update(json!({"type": "background", "work": listed(&[])})));
+    assert_eq!(
+        ended(&session).last(),
+        Some(&("still".to_owned(), BackgroundStatus::Ended))
     );
 }

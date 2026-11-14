@@ -431,9 +431,12 @@ pub struct Session {
     steers: Vec<Steer>,
     /// Background work, as the daemon last listed it.
     background: Vec<BackgroundWork>,
-    /// Background work seen to end since this session was created, in the
-    /// order it ended; see [`Self::ended_background`].
+    /// Background work seen to end, in the order it ended; only ever
+    /// appended to. See [`Self::ended_background`].
     ended_background: Vec<BackgroundWork>,
+    /// Background work an earlier run of the client saw running, until the
+    /// attachment catches up; see [`Self::remember_background`].
+    remembered_running: Vec<BackgroundWork>,
     /// A message the turn could not take; see [`Self::hold`].
     held: Option<Held>,
     /// Steers a turn dropped when it ended; see [`Self::take_dropped_steers`].
@@ -487,6 +490,7 @@ impl Session {
             steers: Vec::new(),
             background: Vec::new(),
             ended_background: Vec::new(),
+            remembered_running: Vec::new(),
             held: None,
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
@@ -524,9 +528,35 @@ impl Session {
             0 => Sync::Live,
             events => Sync::Replaying(events),
         };
-        if let Sync::Attaching(held) = std::mem::replace(&mut self.sync, replay) {
+        let caught_up = matches!(replay, Sync::Live);
+        let held = std::mem::replace(&mut self.sync, replay);
+        // The events held so far all came after the response.
+        if caught_up {
+            self.settle_remembered();
+        }
+        if let Sync::Attaching(held) = held {
             for event in held {
                 self.apply_event(event);
+            }
+        }
+    }
+
+    /// Background work an earlier run of the client saw, given before the
+    /// attach: what had ended, in the order it ended, as
+    /// [`Self::ended_background`] listed it, and what still ran. What ended
+    /// starts [`Self::ended_background`]. What still ran and the daemon no
+    /// longer lists once the attachment caught up ended while the client was
+    /// away, and joins it as [`BackgroundStatus::Ended`].
+    pub fn remember_background(&mut self, seen: impl IntoIterator<Item = BackgroundWork>) {
+        debug_assert!(
+            matches!(self.sync, Sync::Attaching(_)),
+            "background work is remembered before the attach"
+        );
+        for work in seen {
+            if work.status() == BackgroundStatus::Running {
+                self.remembered_running.push(work);
+            } else {
+                self.ended_background.push(work);
             }
         }
     }
@@ -612,10 +642,14 @@ impl Session {
     }
 
     /// Background work this session has seen end, with how it ended, in
-    /// the order it ended. Unlike [`Self::background`], it keeps work the
-    /// daemon stopped listing once the model had its result, so how each
-    /// piece ended can still be looked up. Work the daemon dropped without
-    /// listing it ended, as before an attach, is not here.
+    /// the order it ended, after what [`Self::remember_background`] gave.
+    /// Unlike [`Self::background`], it keeps work the daemon stopped
+    /// listing once the model had its result, so how each piece ended can
+    /// still be looked up. Work seen running that the daemon stopped
+    /// listing without saying how it ended is here as
+    /// [`BackgroundStatus::Ended`]; work nobody here saw run, as work
+    /// started and ended between two attaches, is not. Only ever appended
+    /// to.
     pub fn ended_background(&self) -> &[BackgroundWork] {
         &self.ended_background
     }
@@ -752,12 +786,46 @@ impl Session {
     }
 
     fn apply_event(&mut self, event: SessionEvent) -> Option<usize> {
+        let mut caught_up = false;
         if let Sync::Replaying(left) = &mut self.sync {
             *left -= 1;
             if *left == 0 {
                 self.sync = Sync::Live;
+                caught_up = true;
             }
         }
+        let changed = self.apply_change(event);
+        if caught_up {
+            self.settle_remembered();
+        }
+        changed
+    }
+
+    /// Settles the background work an earlier run saw running, once the
+    /// attachment caught up: what the daemon no longer lists, and the
+    /// replay did not show end, ended unseen.
+    fn settle_remembered(&mut self) {
+        for work in std::mem::take(&mut self.remembered_running) {
+            self.lose(&work);
+        }
+    }
+
+    /// Adds `work`, seen running and no longer listed, to the ended work as
+    /// [`BackgroundStatus::Ended`], unless how it ended is known.
+    fn lose(&mut self, work: &BackgroundWork) {
+        let known = self
+            .background
+            .iter()
+            .chain(&self.ended_background)
+            .any(|seen| seen.id() == work.id());
+        if !known {
+            self.ended_background.push(work.ended_unseen());
+        }
+    }
+
+    /// [`Self::apply_event`] once the attachment's place in the replay is
+    /// counted.
+    fn apply_change(&mut self, event: SessionEvent) -> Option<usize> {
         self.open_turn(&event);
         match event {
             SessionEvent::UserMessage {
@@ -896,7 +964,8 @@ impl Session {
     }
 
     fn set_background(&mut self, work: Vec<rho_protocol::BackgroundWork>) {
-        self.background = work.into_iter().map(BackgroundWork::from_wire).collect();
+        let listed = work.into_iter().map(BackgroundWork::from_wire).collect();
+        let before = std::mem::replace(&mut self.background, listed);
         // A kind this client doesn't know has no ID to tell it apart from
         // the same work in the next list, so it is left out.
         let ended = self.background.iter().filter(|work| {
@@ -909,6 +978,17 @@ impl Session {
                 .any(|seen| seen.id() == work.id())
             {
                 self.ended_background.push(work.clone());
+            }
+        }
+        // Work a list drops while it ran ended, and the model had its
+        // result, between two lists. A replay's lists are of the past, and
+        // replace the attach's newer one, so only live lists say so.
+        if matches!(self.sync, Sync::Live) {
+            let dropped = before.iter().filter(|work| {
+                work.status() == BackgroundStatus::Running && work.kind() != BackgroundKind::Other
+            });
+            for work in dropped {
+                self.lose(work);
             }
         }
     }

@@ -262,6 +262,7 @@ fn status_label(work: &BackgroundWork, stop: Stop) -> String {
         (BackgroundStatus::Completed, None) => "Done".to_owned(),
         (BackgroundStatus::Failed, None) => "Failed".to_owned(),
         (BackgroundStatus::Cancelled, _) => "Stopped".to_owned(),
+        (BackgroundStatus::Ended, _) => "Ended".to_owned(),
     }
 }
 
@@ -270,7 +271,7 @@ fn failed(work: &BackgroundWork) -> bool {
     match work.status() {
         BackgroundStatus::Failed => true,
         BackgroundStatus::Completed => work.exit_code().is_some_and(|code| code != 0),
-        BackgroundStatus::Running | BackgroundStatus::Cancelled => false,
+        BackgroundStatus::Running | BackgroundStatus::Cancelled | BackgroundStatus::Ended => false,
     }
 }
 

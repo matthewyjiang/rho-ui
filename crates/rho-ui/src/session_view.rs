@@ -19,7 +19,9 @@
 //!
 //! The session's running background work is listed above the box, with a
 //! button to stop each piece; what ended is behind a button in the title
-//! bar.
+//! bar. The view records the work as it starts and ends, and a session
+//! opened again after a restart lists what ended from that record (see
+//! [`crate::background_log`]).
 
 use std::{
     rc::Rc,
@@ -52,6 +54,7 @@ use rho_ui_core::{
 
 use crate::{
     background::{BackgroundHistory, BackgroundList, OpenHandler},
+    background_log::{BackgroundLog, Recorded},
     composer::{Composer, ComposerMode, ComposerState},
     input_card::{InputCard, InputCardEvent, Queue},
     machines::{Place, SessionKey},
@@ -120,6 +123,8 @@ pub(crate) struct SessionView {
     sending: bool,
     /// Background work the user asked to stop that still runs.
     stopping: Vec<BackgroundId>,
+    /// What the background log holds of the session's work.
+    recorded: Recorded,
     /// The first prompt was accepted, so the session is saved.
     prompted: bool,
     /// When the running turn started.
@@ -149,7 +154,7 @@ impl SessionView {
     /// [`Self::attached`].
     pub(crate) fn new(
         daemon: Daemon,
-        session: Session,
+        mut session: Session,
         workspace: WorkspaceRef,
         remote: Option<SharedString>,
         loading: Loading,
@@ -158,6 +163,14 @@ impl SessionView {
     ) -> Self {
         let transcript = Transcript::new(cx);
         let cwd = workspace.read(cx).place().clone();
+        // A session about to attach may have run background work in an
+        // earlier run of the app, which the daemon may no longer list.
+        let recorded = if matches!(loading, Loading::Attaching) {
+            let key = SessionKey::new(cwd.machine.clone(), session.id().clone());
+            cx.global::<BackgroundLog>().remember(&key, &mut session)
+        } else {
+            Recorded::default()
+        };
         let composer = cx.new(|cx| ComposerState::new(remote, window, cx));
         let input = composer.read(cx).input().clone();
         let settings = cx.new(|cx| {
@@ -202,6 +215,7 @@ impl SessionView {
             card: None,
             sending: false,
             stopping: Vec::new(),
+            recorded,
             busy_since: None,
             turn_began: None,
             waiting_since: None,
@@ -483,6 +497,9 @@ impl SessionView {
         let work = self.session.background();
         self.stopping
             .retain(|id| work.iter().any(|work| work.id() == id && work.can_stop()));
+        let key = self.key();
+        cx.global::<BackgroundLog>()
+            .record(&key, &self.session, &mut self.recorded);
         let activity = self.activity();
         let title = self.title();
         if self.reported.0 != title || self.reported.1 != activity {
