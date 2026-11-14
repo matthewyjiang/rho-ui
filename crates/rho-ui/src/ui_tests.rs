@@ -3,8 +3,8 @@
 //! (`fake_daemon`: rho-protocol's real server side over a real socket).
 //!
 //! Each test saves screenshots to `target/ui-shots/` for a person to review.
-//! Rendering needs a working Vulkan driver (WGPU); a software one such as
-//! Mesa lavapipe works.
+//! Rendering runs on Mesa lavapipe, Vulkan in software: see
+//! [`SELECT_LAVAPIPE`].
 
 use std::{
     path::{Path, PathBuf},
@@ -39,6 +39,30 @@ use crate::{
 };
 
 mod live;
+
+/// Points the Vulkan loader at lavapipe before `main`, while the process has
+/// one thread and setting a variable races no one; a variable already set
+/// wins.
+///
+/// GPUI's headless renderer keeps its device for the life of the process and
+/// never drops it. On NVIDIA's driver (seen with 550), the device's "[vkps]"
+/// thread runs on during `exit`, while `libEGL_nvidia`'s exit handler unloads
+/// the code under it: about one run in five ended in SIGSEGV after every test
+/// passed. Lavapipe has no such thread, and draws the same screenshots on any
+/// machine. The cost is speed: the suite took 4.9 to 7.7s here, against 2.2s
+/// on an RTX 3060.
+#[cfg(target_os = "linux")]
+#[used]
+#[link_section = ".init_array"]
+static SELECT_LAVAPIPE: extern "C" fn() = {
+    extern "C" fn select_lavapipe() {
+        const VAR: &str = "VK_LOADER_DRIVERS_SELECT";
+        if std::env::var_os(VAR).is_none() {
+            std::env::set_var(VAR, "*lvp*");
+        }
+    }
+    select_lavapipe
+};
 
 /// Far longer than the fake daemon takes: it answers at once, and its
 /// slowest script waits half a second.
@@ -367,7 +391,7 @@ impl Harness {
         let image = self
             .cx
             .capture_screenshot(self.window)
-            .expect("offscreen rendering needs a working Vulkan driver");
+            .expect("offscreen rendering needs Mesa lavapipe (Vulkan in software)");
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-shots");
         std::fs::create_dir_all(&dir).expect("create the screenshot directory");
         let path = dir.join(format!("{}-{step}.png", self.name));
