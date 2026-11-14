@@ -15,7 +15,14 @@ ratex-layout = "0.1.15"
 ratex-parser = "0.1.15"
 ratex-svg = { version = "0.1.15", features = ["embed-fonts"] }
 ratex-types = "0.1.15"
+# The terminal surface's emulator: Ghostty's libghostty-vt 1.0.1, built
+# with Zig (see mise.toml). From git until a release with vt-1.0.1 is out.
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", default-features = false }
+# The terminal surface's pseudo-terminal.
+portable-pty = "0.9"
 rho-ui-core = { path = "../rho-ui-core" }
+# The channel from the terminal's reader thread to the UI.
+futures = "0.3"
 # Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
 rquickjs = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }

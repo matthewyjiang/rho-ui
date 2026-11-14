@@ -11,9 +11,9 @@
 
 use std::{
     collections::HashMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io,
-    os::unix::ffi::OsStrExt as _,
+    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, OnceLock},
@@ -232,6 +232,31 @@ impl SshLink {
                 or_status(stderr.trim(), output.status)
             )))
         }
+    }
+
+    /// The program and arguments of an `ssh` that runs the user's login
+    /// shell in `dir` on the machine, in a terminal of its own (`-tt`), for
+    /// a terminal emulator to run under a pseudo-terminal here. Like
+    /// [`Self::run_script`], it rides the master the daemon connection
+    /// opened, and fails rather than connect again.
+    pub fn terminal_command(&self, dir: &Path) -> (PathBuf, Vec<OsString>) {
+        let mut remote = b"cd -- ".to_vec();
+        remote.extend(quote_bytes(dir.as_os_str().as_bytes()));
+        remote.extend(br#" && exec "$SHELL" -l"#);
+        let args = [
+            format!("ControlPath={}", self.control.display()),
+            "BatchMode=yes".to_owned(),
+            "ControlMaster=no".to_owned(),
+            "ProxyCommand=false".to_owned(),
+            "ForwardAgent=no".to_owned(),
+            "ForwardX11=no".to_owned(),
+        ]
+        .into_iter()
+        .flat_map(|option| [OsString::from("-o"), option.into()])
+        .chain(["-tt".into(), self.target.host.clone().into()])
+        .chain([OsString::from_vec(remote)])
+        .collect();
+        (self.target.ssh.clone(), args)
     }
 
     /// `ssh` with the options every call takes. `BatchMode`: the app has

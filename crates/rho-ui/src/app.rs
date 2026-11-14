@@ -35,7 +35,7 @@ use crate::{
     machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
     projects::Projects,
     rho_settings::RhoSettings,
-    right_panel::{PanelLayout, ResizeRightPanel, RightPanel},
+    right_panel::{PanelLayout, ResizeRightPanel, RightPanel, TerminalShell},
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
@@ -65,6 +65,8 @@ pub(crate) struct LaunchConfig {
     /// How to reach a remote machine's: [`RemoteMachine::ssh_target`],
     /// except in tests, which reach fake daemons.
     pub(crate) remote: Rc<dyn Fn(&RemoteMachine) -> DaemonTarget>,
+    /// What the right panel's terminal runs on this machine.
+    pub(crate) shell: TerminalShell,
 }
 
 impl LaunchConfig {
@@ -215,7 +217,8 @@ impl RhoApp {
                 SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
             },
         );
-        let panel = cx.new(|_| RightPanel::new(workspaces.clone()));
+        let shell = launch.shell.clone();
+        let panel = cx.new(|_| RightPanel::new(workspaces.clone(), shell));
         let mut app = Self {
             launch,
             machines,
@@ -1273,6 +1276,11 @@ impl RhoApp {
     /// The right panel's tabs, in order, for UI tests.
     pub(crate) fn panel_tabs(&self, cx: &App) -> Vec<crate::right_panel::Surface> {
         self.panel.read(cx).tab_order()
+    }
+    /// The screen of the right panel's terminal, for UI tests.
+    pub(crate) fn terminal_text(this: &Entity<Self>, cx: &mut App) -> Option<Vec<String>> {
+        let panel = this.read(cx).panel.clone();
+        panel.update(cx, |panel, cx| panel.terminal_text(cx))
     }
     /// The sidebar's search, for UI tests.
     pub(crate) fn sidebar_search(&self, cx: &App) -> FocusHandle {

@@ -6,20 +6,18 @@
 //!
 //! Each surface opens as a tab in the panel's header; hovering a tab swaps
 //! its icon for × to close it, and dragging one onto another moves it
-//! there. With none open, the panel lists the
-//! surfaces to open, and dimmed under them those still to come
-//! ([`PLANNED`]); while another isn't open, + in the header opens a menu
-//! of the same. The panel is the window's, not a
-//! session's: its tabs stay as sessions change, and each surface shows
-//! the session on screen.
+//! there. With none open, the panel lists the surfaces to open; while
+//! another isn't open, + in the header opens a menu of them. The panel is
+//! the window's, not a session's: its tabs stay as sessions change, and
+//! each surface shows the session on screen.
 //!
-//! To add a surface: add a [`Surface`] variant with its name and icon, draw
-//! it in [`RightPanel::render_surface`], and take it off [`PLANNED`]. A
-//! surface that keeps state, such as [`diff::DiffSurface`], is a view of
-//! its own, made when its tab opens ([`Tab`]) and told which session is on
-//! screen.
+//! To add a surface: add a [`Surface`] variant with its name and icon, and
+//! draw it in [`RightPanel::render_surface`]. A surface that keeps state,
+//! such as [`diff::DiffSurface`], is a view of its own, made when its tab
+//! opens ([`Tab`]) and told which session is on screen.
 
 mod diff;
+mod terminal;
 
 use std::cmp::Ordering;
 
@@ -42,6 +40,8 @@ use gpui_kit::{
 };
 
 use self::diff::DiffSurface;
+pub(crate) use self::terminal::TerminalShell;
+use self::terminal::TerminalSurface;
 use crate::{
     session_view::SessionView,
     store::{Key, StateDb},
@@ -71,17 +71,20 @@ pub(crate) enum Surface {
     Background,
     /// The uncommitted changes where the session works.
     Diff,
+    /// A shell in the session's folder.
+    Terminal,
 }
 
 impl Surface {
     /// Every surface, in the order the panel lists them.
-    const ALL: [Surface; 2] = [Surface::Diff, Surface::Background];
+    const ALL: [Surface; 3] = [Surface::Terminal, Surface::Diff, Surface::Background];
 
     /// The surface's part of its elements' IDs.
     fn id(self) -> &'static str {
         match self {
             Surface::Background => "background",
             Surface::Diff => "diff",
+            Surface::Terminal => "terminal",
         }
     }
 
@@ -89,6 +92,7 @@ impl Surface {
         match self {
             Surface::Background => "Background work",
             Surface::Diff => "Diff",
+            Surface::Terminal => "Terminal",
         }
     }
 
@@ -96,6 +100,7 @@ impl Surface {
         match self {
             Surface::Background => Lucide::ListChecks,
             Surface::Diff => Lucide::FileDiff,
+            Surface::Terminal => Lucide::SquareTerminal,
         }
     }
 }
@@ -104,6 +109,7 @@ impl Surface {
 enum Tab {
     Background,
     Diff(Entity<DiffSurface>),
+    Terminal(Entity<TerminalSurface>),
 }
 
 impl Tab {
@@ -111,20 +117,10 @@ impl Tab {
         match self {
             Tab::Background => Surface::Background,
             Tab::Diff(_) => Surface::Diff,
+            Tab::Terminal(_) => Surface::Terminal,
         }
     }
 }
-
-/// A surface still to come, listed dimmed under the ones there are.
-struct Planned {
-    label: &'static str,
-    icon: Lucide,
-}
-
-const PLANNED: [Planned; 1] = [Planned {
-    label: "Terminal",
-    icon: Lucide::SquareTerminal,
-}];
 
 /// Whether the panel shows, and how wide, remembered across runs under
 /// [`Key::RightPanel`] and [`Key::RightPanelWidth`]. A global, as the title
@@ -267,6 +263,8 @@ pub(crate) fn toggle_button(cx: &App) -> Button {
 pub(crate) struct RightPanel {
     /// Where surfaces read the session's machine.
     workspaces: Entity<Workspaces>,
+    /// What a terminal on this machine runs.
+    shell: TerminalShell,
     /// The open surfaces, in the order opened.
     tabs: Vec<Tab>,
     /// One of `tabs`, or `None` for the list of surfaces when none is open.
@@ -279,9 +277,10 @@ pub(crate) struct RightPanel {
 }
 
 impl RightPanel {
-    pub(crate) fn new(workspaces: Entity<Workspaces>) -> Self {
+    pub(crate) fn new(workspaces: Entity<Workspaces>, shell: TerminalShell) -> Self {
         Self {
             workspaces,
+            shell,
             tabs: Vec::new(),
             active: None,
             hovered: None,
@@ -304,6 +303,11 @@ impl RightPanel {
                 Tab::Diff(diff) => {
                     diff.update(cx, |diff, cx| diff.set_session(session.as_ref(), cx));
                 }
+                Tab::Terminal(terminal) => {
+                    terminal.update(cx, |terminal, cx| {
+                        terminal.set_session(session.as_ref(), cx);
+                    });
+                }
             }
         }
         self.session = session.map(|view| {
@@ -322,6 +326,10 @@ impl RightPanel {
                 Surface::Diff => {
                     let workspaces = self.workspaces.clone();
                     Tab::Diff(cx.new(|cx| DiffSurface::new(workspaces, session, cx)))
+                }
+                Surface::Terminal => {
+                    let (workspaces, shell) = (self.workspaces.clone(), self.shell.clone());
+                    Tab::Terminal(cx.new(|cx| TerminalSurface::new(workspaces, shell, session, cx)))
                 }
             };
             self.tabs.push(tab);
@@ -359,8 +367,19 @@ impl RightPanel {
     pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
         self.tabs.iter().find_map(|tab| match tab {
             Tab::Diff(diff) => Some(diff.read(cx).paths(cx)),
-            Tab::Background => None,
+            Tab::Background | Tab::Terminal(_) => None,
         })
+    }
+
+    /// The screen of the session's terminal, if the Terminal surface is
+    /// open and it runs, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn terminal_text(&self, cx: &mut App) -> Option<Vec<String>> {
+        let terminal = self.tabs.iter().find_map(|tab| match tab {
+            Tab::Terminal(terminal) => terminal.read(cx).current(),
+            Tab::Background | Tab::Diff(_) => None,
+        })?;
+        Some(terminal.update(cx, |terminal, _| terminal.text()))
     }
 
     /// Whether + has anything to offer: a surface shows, so the list
@@ -399,7 +418,7 @@ impl RightPanel {
         }
     }
 
-    /// +'s menu: the surfaces without a tab, then those to come, dimmed.
+    /// +'s menu: the surfaces without a tab.
     fn surface_menu(
         mut menu: PopupMenu,
         view: &WeakEntity<Self>,
@@ -413,13 +432,6 @@ impl RightPanel {
                     .on_click(move |_, _, cx| {
                         let _ = view.update(cx, |this, cx| this.open(surface, cx));
                     }),
-            );
-        }
-        for planned in &PLANNED {
-            menu = menu.item(
-                PopupMenuItem::new(planned.label)
-                    .icon(Icon::new(planned.icon))
-                    .disabled(true),
             );
         }
         menu
@@ -547,7 +559,7 @@ impl RightPanel {
             .child(toggle_button(cx))
     }
 
-    /// The surfaces to open, centered, and those to come, dimmed.
+    /// The surfaces to open, centered.
     fn render_list(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
         let row = |id: SharedString, icon: Lucide, label: &'static str| {
@@ -571,17 +583,6 @@ impl RightPanel {
             )
             .on_click(cx.listener(move |this, _, _, cx| this.open(surface, cx)))
         });
-        let muted = theme.muted_foreground;
-        let planned = PLANNED.iter().map(|planned| {
-            row(
-                format!("planned-surface-{}", planned.label.to_lowercase()).into(),
-                planned.icon,
-                planned.label,
-            )
-            .disabled(true)
-            .text_color(muted.opacity(0.6))
-            .suffix(move |_, _| div().text_xs().child("Soon"))
-        });
         v_flex()
             .id("panel-surface-list")
             .test_support()
@@ -591,14 +592,7 @@ impl RightPanel {
             .gap_3()
             .px_4()
             .child(div().font_medium().child("Open a surface"))
-            .child(
-                v_flex()
-                    .w_full()
-                    .max_w(rems(18.))
-                    .gap_0p5()
-                    .children(open)
-                    .children(planned),
-            )
+            .child(v_flex().w_full().max_w(rems(18.)).gap_0p5().children(open))
     }
 
     /// What `tab`'s surface shows of the session on screen.
@@ -609,6 +603,7 @@ impl RightPanel {
                 None => no_session("Open a session to see its background work."),
             },
             Tab::Diff(diff) => diff.clone().into_any_element(),
+            Tab::Terminal(terminal) => terminal.clone().into_any_element(),
         }
     }
 }

@@ -1,3 +1,6 @@
 [tools]
 # Rust 1.92 can't build gpui-pre-util (it uses slice::as_array, stable in 1.93).
 rust = "1.98.0"
+# libghostty-vt has no prebuilt library for Linux: its build script builds
+# Ghostty's vt-1.0.1 with Zig 0.17.
+zig = "0.17.1"

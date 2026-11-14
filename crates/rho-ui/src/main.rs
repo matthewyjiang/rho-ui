@@ -46,8 +46,8 @@ use std::{borrow::Cow, path::PathBuf, rc::Rc};
 
 use gpui_kit::component::input::{Enter, Paste};
 use gpui_kit::{
-    px, size, App, AppContext as _, AssetSource, KeyBinding, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions,
+    px, size, App, AppContext as _, AssetSource, KeyBinding, NoAction, SharedString,
+    TitlebarOptions, WindowBounds, WindowOptions,
 };
 use rho_ui_core::DaemonTarget;
 
@@ -56,7 +56,7 @@ use crate::{
     background_log::BackgroundLog,
     machines::RemoteMachine,
     projects::Projects,
-    right_panel::PanelLayout,
+    right_panel::{PanelLayout, TerminalShell},
     settings::Settings,
     sidebar::SidebarState,
     store::StateDb,
@@ -177,6 +177,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
         workspace,
         daemon,
         remote: Rc::new(RemoteMachine::ssh_target),
+        shell: TerminalShell::from_env(),
     })
 }
 
@@ -233,6 +234,14 @@ fn init(cx: &mut App, db: &StateDb) {
         KeyBinding::new("ctrl-alt-b", ToggleRightPanel, Some("RhoApp")),
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
         KeyBinding::new("ctrl-q", Quit, None),
+        // The terminal takes these keys for the program in it: Tab moves the
+        // keyboard elsewhere, and the app's own shortcuts here are the
+        // shell's (Ctrl+B and Ctrl+N move the cursor in readline).
+        KeyBinding::new("tab", NoAction, Some("Terminal")),
+        KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+        KeyBinding::new("ctrl-b", NoAction, Some("Terminal")),
+        KeyBinding::new("ctrl-n", NoAction, Some("Terminal")),
+        KeyBinding::new("ctrl-shift-n", NoAction, Some("Terminal")),
         // "Input" is the key context of Kit's text fields. Kit binds only
         // Ctrl+V to paste; dictation apps set to paste for terminals, such
         // as Hex, send Ctrl+Shift+V.

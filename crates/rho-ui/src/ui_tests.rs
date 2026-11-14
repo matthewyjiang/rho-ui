@@ -32,7 +32,7 @@ use crate::{
     app::{LaunchConfig, RhoApp},
     machines::{MachineId, Place, RemoteMachine, SessionKey},
     projects::Projects,
-    right_panel::Surface,
+    right_panel::{Surface, TerminalShell},
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
@@ -192,6 +192,8 @@ impl Harness {
                     );
                 DaemonTarget::Socket(socket)
             }),
+            // Not the user's shell, whose files may print or ask things.
+            shell: TerminalShell(PathBuf::from("/bin/sh")),
         };
         let sidebar = SidebarState {
             shelves,
@@ -277,6 +279,27 @@ impl Harness {
                 let shot = self.shot("timeout");
                 panic!(
                     "timed out waiting for {what}; labelled elements: {seen:?}; screenshot: {}",
+                    shot.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Waits for the right panel's terminal to show `ready` lines.
+    fn wait_for_terminal(&mut self, what: &str, ready: impl Fn(&[String]) -> bool) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            self.frame();
+            let app = self.app.clone();
+            let lines = self.cx.update(|cx| RhoApp::terminal_text(&app, cx));
+            if lines.as_deref().is_some_and(&ready) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let shot = self.shot("timeout");
+                panic!(
+                    "timed out waiting for {what}; the terminal shows {lines:?}; screenshot: {}",
                     shot.display()
                 );
             }
@@ -2013,7 +2036,7 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
             is_visible(window, "panel-surface-list"),
             "the list of surfaces"
         );
-        assert!(is_visible(window, "planned-surface-terminal"));
+        assert!(is_visible(window, "open-surface-terminal"));
         assert!(
             !is_visible(window, "panel-surfaces"),
             "no + while the list is on screen"
@@ -2088,7 +2111,10 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     ui.act(|window, _| {
         assert!(is_visible(window, "panel-tab-diff"), "Diff opens as a tab");
         assert!(!is_visible(window, "panel-surface-list"));
-        assert!(!is_visible(window, "panel-surfaces"), "nothing left to add");
+        assert!(
+            is_visible(window, "panel-surfaces"),
+            "Terminal is left to add"
+        );
     });
     // Dragging Diff onto Background work puts it first.
     let (from, to) = ui
@@ -2175,6 +2201,40 @@ fn the_diff_surface_follows_the_sessions_changes() {
     ui.wait_until("the file the turn added", |_, cx, app| {
         app.diff_paths(cx) == Some(vec!["a.txt".to_owned(), "new.txt".to_owned()])
     });
+}
+
+/// The Terminal surface runs a shell in the session's folder: what the
+/// keyboard types reaches it, what it prints shows, and the app's own
+/// shortcuts that the shell uses go to the shell.
+#[test]
+fn the_terminal_surface_runs_a_shell() {
+    let mut ui = Harness::start("terminal", Script::default());
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the session", |session| session.state() == &RunState::Idle);
+    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.click("open-surface-terminal");
+    ui.wait_for_terminal("the shell's prompt", |lines| {
+        lines.iter().any(|line| line.starts_with('$'))
+    });
+    ui.click("terminal");
+    ui.act(|window, cx| {
+        for key in ["e", "c", "h", "o", "space", "r", "h", "o", "enter"] {
+            window.press(key, cx);
+        }
+        // Readline's back-a-character, not the sidebar.
+        window.press("ctrl-b", cx);
+    });
+    ui.wait_for_terminal("the shell's echo", |lines| {
+        lines.iter().any(|line| line == "rho")
+    });
+    assert_ne!(
+        ui.state.get(Key::SidebarLayout).as_deref(),
+        Some("collapsed"),
+        "Ctrl+B went to the shell"
+    );
+    ui.shot("echo");
 }
 
 /// Dragging the right panel's edge resizes it, as far as leaves the pane
