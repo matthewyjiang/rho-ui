@@ -391,12 +391,8 @@ impl SessionView {
             self.give_back(dropped.join("\n").into(), window, cx);
         }
         self.after_change(window, cx);
-        // Move the keyboard into the card if the user is in this session;
-        // never steal focus from another one, nor from a message being
-        // typed, whose Enter would then answer instead of send.
-        let typing = !self.composer.read(cx).is_empty(cx);
-        if !asked && !typing && self.focus_handle.contains_focused(window, cx) {
-            self.focus_card(window, cx);
+        if !asked {
+            self.focus_new_card(window, cx);
         }
     }
 
@@ -407,6 +403,7 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let asked = !self.session.inputs().is_empty();
         match result {
             Ok(attached) => {
                 self.turn_began = attached
@@ -418,6 +415,24 @@ impl SessionView {
             Err(error) => self.loading = Loading::Failed(error.to_string()),
         }
         self.after_change(window, cx);
+        // A question asked before the attach answered arrives with it.
+        if !asked {
+            self.focus_new_card(window, cx);
+        }
+    }
+
+    /// Moves the keyboard into a card that just opened if the user is in
+    /// this session; never steals focus from another one, nor from a
+    /// message being typed, whose Enter would then answer instead of send.
+    fn focus_new_card(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let typing = !self.composer.read(cx).is_empty(cx);
+        // `contains_focused` reads the last painted frame, which a session
+        // opened this frame isn't in yet, so its focused composer counts too.
+        let here = self.focus_handle.contains_focused(window, cx)
+            || self.focus_target(cx).is_focused(window);
+        if !typing && here {
+            self.focus_card(window, cx);
+        }
     }
 
     /// Puts `prompt` back in the composer, before anything typed or pasted
