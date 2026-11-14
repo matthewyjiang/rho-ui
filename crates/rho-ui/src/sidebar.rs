@@ -1051,9 +1051,10 @@ impl Render for SidebarView {
         frame
             .child(Self::render_header(cx))
             .child(
+                // The header's padding, so the filter lines up under New session.
                 h_flex()
                     .flex_shrink_0()
-                    .px_2()
+                    .px_3()
                     .pb_2()
                     .gap_1()
                     .child(
