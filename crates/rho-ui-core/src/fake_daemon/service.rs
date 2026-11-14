@@ -85,6 +85,35 @@ fn subagent_turn(
     Ok(SessionPromptResponse { turn: turn_id })
 }
 
+/// The reply to the prompt "figures": a diagram, one wider than the
+/// transcript, a display formula, an inline one, and prices that stay prose.
+const FIGURES: &str = r"Here is the connection:
+
+```mermaid
+sequenceDiagram
+    participant UI as rho-ui
+    participant D as daemon
+    UI->>D: handshake
+    D-->>UI: session events
+    Note over UI: draws the transcript
+```
+
+A turn, end to end:
+
+```mermaid
+flowchart LR
+    Prompt --> Daemon --> Model --> Tools --> Approval --> Model2[Model again] --> Reply --> Transcript
+```
+
+The roots of $ax^2 + bx + c$ are
+
+$$
+x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}
+$$
+
+It cost $5 and $10 to run.
+";
+
 /// The turn's reply to `answer`.
 fn reply(answer: &InputAnswer) -> String {
     let chose = |name: &str, text: &Option<String>| match text {
@@ -329,6 +358,13 @@ impl Service for Fake {
             session.publish(echo(&turn_id, &params));
             session.start_background(format!("p-{turn_id}"));
             session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
+            return Ok(SessionPromptResponse { turn: turn_id });
+        }
+        if prompt == "figures" {
+            session.turn = Some(turn);
+            session.state(JobState::Running);
+            session.publish(echo(&turn_id, &params));
+            session.answer(&format!("m-{turn_id}"), FIGURES);
             return Ok(SessionPromptResponse { turn: turn_id });
         }
         let (ask, timeout) =

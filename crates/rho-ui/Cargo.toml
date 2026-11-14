@@ -10,7 +10,14 @@ gpui-kit.workspace = true
 # Reads a pasted image's format and size from its header. GPUI already
 # builds this version with these decoders.
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+# LaTeX formulas in messages; see src/figures.rs.
+ratex-layout = "0.1.15"
+ratex-parser = "0.1.15"
+ratex-svg = { version = "0.1.15", features = ["embed-fonts"] }
+ratex-types = "0.1.15"
 rho-ui-core = { path = "../rho-ui-core" }
+# Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
+rquickjs = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }
 
 [lints]

@@ -39,4 +39,10 @@ The daemon's socket is a Unix socket, so rho-ui does not build on Windows yet.
 
 Neither crate is published to crates.io.
 
+<<<<<<< HEAD
 `Cargo.lock` follows GPUI Kit 0.9.1's own lock file; its `test-support` feature does not resolve against newer versions of some shared crates. The one exception is `gpui-fast`: the published 0.9.1 asks for 0.1.15, newer than its lock file's 0.1.14.
+=======
+`crates/rho-ui/vendor/pele` holds [pele](https://github.com/obsidianmd/pele) 1.9.0's browser build (`dist/pele.global.js` from npm, MIT), which draws Mermaid diagrams in an embedded QuickJS. Update it by copying that file again; `pele`'s tests fail if the new build draws with a color the theme doesn't set.
+
+`Cargo.lock` follows GPUI Kit 0.9.0's own lock file; its `test-support` feature does not resolve against newer versions of some shared crates.
+>>>>>>> da742ab (Draw Mermaid diagrams and LaTeX formulas in messages)

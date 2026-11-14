@@ -1928,6 +1928,70 @@ fn the_theme_setting_switches_light_and_dark() {
     ui.shot("settings-light");
 }
 
+/// A reply's Mermaid diagram and `$$` formula draw as pictures inside the
+/// reply's measure, in the theme's colors, and redraw when it changes. The
+/// reply's text stays as the model wrote it.
+#[test]
+fn a_reply_draws_its_diagram_and_formula_in_the_theme() {
+    use crate::settings::Appearance;
+
+    let mut ui = Harness::start("figures", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("figures");
+    ui.wait_for_session("the reply", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(_)))
+    });
+    let reply = match ui.session().entries().last() {
+        Some(Entry::Agent(message)) => message.text().to_owned(),
+        other => panic!("the reply is last: {other:?}"),
+    };
+    // Each figure is named for where its source starts in the reply.
+    let id = |kind: &str, source: &str| -> &'static str {
+        let start = reply.find(source).expect("the reply holds the figure");
+        Box::leak(format!("{kind}-{start}").into_boxed_str())
+    };
+    let diagram = id("diagram", "```mermaid\nsequenceDiagram");
+    let wide = id("diagram", "```mermaid\nflowchart LR");
+    let formula = id("formula", "$$");
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        ui.cx.update(|cx| {
+            let mut settings = cx.global::<Settings>().clone();
+            settings.appearance = appearance;
+            settings.apply(cx);
+        });
+        ui.wait_until("the diagrams and the formula", |window, _, _| {
+            is_visible(window, diagram) && is_visible(window, wide) && is_visible(window, formula)
+        });
+        ui.act(|window, _| {
+            for figure in [diagram, wide, formula] {
+                let column = window.find(figure).bounds();
+                let shown = window.within(figure).find("picture").bounds();
+                assert!(
+                    shown.size.height > px(0.)
+                        && shown.left() >= column.left()
+                        && shown.right() <= column.right(),
+                    "{figure} fits the reply's column {column:?}: {shown:?}"
+                );
+            }
+            // Wider than the column, it scales down to fill it, keeping
+            // its proportions: a row of boxes stays a thin strip.
+            let column = window.find(wide).bounds();
+            let shown = window.within(wide).find("picture").bounds().size;
+            assert!(
+                (shown.width - column.size.width).abs() < px(1.),
+                "the wide diagram fills the column: {shown:?}"
+            );
+            assert!(shown.height < shown.width / 4., "{shown:?}");
+        });
+        ui.shot(appearance.name());
+    }
+}
+
 /// Whether the session view shows an error: a failed turn, or a request
 /// that failed.
 fn shows_an_error(window: &Window) -> bool {

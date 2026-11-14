@@ -9,10 +9,12 @@ mod attachments;
 mod background;
 mod composer;
 mod draft;
+mod figures;
 mod fold;
 mod input_card;
 mod kinetic;
 mod machines;
+mod pele;
 mod project_picker;
 mod projects;
 mod repo;
@@ -180,6 +182,10 @@ fn main() {
 
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         init(cx);
+        // pele takes about 100 ms to load: started now, it's ready for the
+        // first diagram. Tests load it when they draw one, so the load
+        // doesn't slow the tests that time animations.
+        pele::start();
         Settings::load().apply(cx);
         let db = StateDb::open();
         cx.set_global(TurnTimes::load(&db));

@@ -39,6 +39,7 @@ use rho_ui_core::{Entry, Notice, NoticeLevel, Row, Timeline};
 
 use crate::{
     attachments::Preview,
+    figures,
     fold::Folding,
     turn_times::TurnTimes,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
@@ -652,7 +653,12 @@ fn render_message(
                     div()
                         .id(SharedString::from(format!("user-{ix}")))
                         .test_support()
-                        .child(TextView::new(text).style(message_style()).selectable(true)),
+                        .child(
+                            TextView::new(text)
+                                .style(message_style())
+                                .markdown_extensions(figures::extensions())
+                                .selectable(true),
+                        ),
                 )
             });
             let mut content = MessageContent::new().children(images).children(files);
@@ -672,6 +678,7 @@ fn render_message(
             .children(text.map(|text| {
                 TextView::new(text)
                     .style(message_style())
+                    .markdown_extensions(figures::extensions())
                     .selectable(true)
                     .stream_fade(phase == Phase::Live)
             }))
