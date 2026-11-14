@@ -12,7 +12,7 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 # rho's daemon protocol: wire types and the client, released with rho 3.
-rho-protocol = "1.0.0"
+rho-protocol = "1.1.0"
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 

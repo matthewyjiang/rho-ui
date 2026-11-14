@@ -6274,9 +6274,9 @@ dependencies = [
 
 [[package]]
 name = "rho-protocol"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91813a910ea0929eba3bf7810dcd27bba19b8850e1b2071a8054e68d02d51ef0"
+checksum = "b242a88207ce40912dc266c253f8dda6ff19733aea576b6db0d17b965583e12e"
 dependencies = [
  "schemars",
  "serde",
@@ -7378,7 +7378,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
