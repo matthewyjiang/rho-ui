@@ -11,8 +11,8 @@ use rho_protocol::{
         JobId, JobKind, JobListResponse, JobLive, JobState, JobSummary, MessageId, Resolution,
         SessionConfigureParams, SessionConfigureResponse, SessionDeleteParams,
         SessionDeleteResponse, SessionId, SessionListParams, SessionListResponse,
-        SessionObserveParams, SessionSummary, SessionUnsteerParams, SessionUnsteerResponse,
-        SteerId,
+        SessionObserveParams, SessionRenameParams, SessionRenameResponse, SessionSummary,
+        SessionUnsteerParams, SessionUnsteerResponse, SteerId,
     },
     ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo, ConfigGetParams,
     ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock,
@@ -653,6 +653,27 @@ impl Service for Fake {
             sessions: sessions.collect(),
             next_cursor: (start + PAGE < saved.len()).then(|| (start + PAGE).to_string()),
         })
+    }
+
+    /// Refuses a blank title or one with a control character, as rho does.
+    async fn rename_session(
+        &self,
+        params: SessionRenameParams,
+    ) -> Result<SessionRenameResponse, RpcError> {
+        let title = params.title.trim();
+        if title.is_empty() || title.chars().any(char::is_control) {
+            return Err(RpcError::new(
+                ErrorCode::InvalidParams,
+                "a title must be one line of text",
+            ));
+        }
+        let mut state = self.lock();
+        let session = state.session(&params.session)?;
+        session.title = Some(title.to_owned());
+        session.publish(SessionEvent::TitleChanged {
+            title: title.to_owned(),
+        });
+        Ok(SessionRenameResponse {})
     }
 
     async fn delete_session(

@@ -214,6 +214,9 @@ impl RhoApp {
                 }
                 SidebarEvent::NewSession => this.new_session(window, cx),
                 SidebarEvent::Delete { id } => this.delete_session(id.clone(), window, cx),
+                SidebarEvent::Rename { id, title } => {
+                    this.rename_session(id.clone(), title.clone(), window, cx);
+                }
                 SidebarEvent::Retry(machine) => this.connect(machine, window, cx),
                 SidebarEvent::OpenSettings => this.open_settings(window, cx),
                 SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
@@ -982,6 +985,34 @@ impl RhoApp {
                     // Its view no longer follows it: read it afresh.
                     this.reopen_session(&id, window, cx);
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// Saves `title` as session `id`'s title in its daemon, then reads the
+    /// saved list again: it holds the new title, or on failure the old one,
+    /// which the sidebar showed before the rename.
+    fn rename_session(
+        &mut self,
+        id: SessionKey,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(daemon) = self.daemon(&id.machine).cloned() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = daemon.rename_session(&id.id, &title).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Err(error) = result {
+                    window.push_notification(
+                        Notification::error(error.to_string()).title("Couldn't rename the session"),
+                        cx,
+                    );
+                }
+                this.refresh_sessions(&id.machine, cx);
             });
         })
         .detach();

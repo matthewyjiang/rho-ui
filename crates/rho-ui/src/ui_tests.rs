@@ -483,18 +483,20 @@ impl Harness {
     }
 
     /// Sends `text` to session `id` as another client would, such as rho's
-    /// terminal UI: over a connection of its own, which it then closes.
-    fn prompt_from_elsewhere(&mut self, id: &str, text: &str) {
+    /// terminal UI: over a connection of its own, which it then closes. A
+    /// session with a turn under way takes it as a steer.
+    fn send_from_elsewhere(&mut self, id: &str, text: &str, how: Send) {
         let (target, id, text) = (self.target.clone(), SessionId::from(id), text.to_owned());
         self.cx.update(|cx| {
             cx.spawn(async move |_| {
                 let (daemon, _events) = Daemon::connect(target)
                     .await
                     .expect("a second client connects");
-                daemon
-                    .prompt(&id, &text.into())
-                    .await
-                    .expect("the daemon takes the other client's prompt");
+                match how {
+                    Send::Prompt => daemon.prompt(&id, &text.into()).await.map(drop),
+                    Send::Steer => daemon.steer(&id, &text).await.map(drop),
+                }
+                .expect("the daemon takes the other client's message");
             })
             .detach();
         });
@@ -503,6 +505,16 @@ impl Harness {
     /// The fake daemon the app talks to.
     fn fake(&self) -> &FakeDaemon {
         self.daemon.as_ref().expect("the test runs a fake daemon")
+    }
+
+    /// Waits for the fake daemon to be `ready`, as once it has a request.
+    fn wait_for_daemon(&mut self, what: &str, ready: impl Fn(&FakeDaemon) -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !ready(self.fake()) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            self.frame();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The accessibility label of element `id`, once it is drawn.
@@ -606,6 +618,13 @@ struct Machines {
     /// Where new sessions start on this machine; the temporary directory
     /// when `None`.
     workspace: Option<PathBuf>,
+}
+
+/// How [`Harness::send_from_elsewhere`] sends its message.
+#[derive(Clone, Copy)]
+enum Send {
+    Prompt,
+    Steer,
 }
 
 /// Every accessibility label in the last frame, for timeout messages.
@@ -1151,6 +1170,66 @@ fn settle_and_snooze_move_sessions_between_lists() {
     ui.shot("both-shelves");
 }
 
+/// The row menu renames a session in place and saves the title in its
+/// daemon, Escape leaving it as it was; pins a session above newer ones;
+/// and copies a session's ID.
+#[test]
+fn the_row_menu_renames_pins_and_copies_a_session() {
+    let mut ui = Harness::start("row-menu", Script::default());
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-local-s1") && is_visible(window, "session-local-old")
+    });
+
+    ui.act(|window, cx| window.right_click("session-local-s1", cx));
+    ui.shot("menu");
+    click_label(&mut ui, "Rename…");
+    ui.act(|window, cx| {
+        window.input("never saved", cx);
+        window.press("escape", cx);
+    });
+    assert_eq!(ui.label("session-local-s1").as_deref(), Some("first"));
+
+    ui.act(|window, cx| window.right_click("session-local-old", cx));
+    click_label(&mut ui, "Rename…");
+    ui.act(|window, cx| window.input("Parser work", cx));
+    ui.shot("renaming");
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_daemon("the title saved", |fake| {
+        fake.title("old").as_deref() == Some("Parser work")
+    });
+    assert_eq!(
+        ui.label("session-local-old").as_deref(),
+        Some("Parser work")
+    );
+    assert_eq!(ui.fake().title("s1").as_deref(), Some("first"));
+
+    let above = |window: &Window, top: &'static str, below: &'static str| {
+        bounds(window, top)
+            .zip(bounds(window, below))
+            .is_some_and(|(top, below)| top.origin.y < below.origin.y)
+    };
+    ui.act(|window, _| {
+        assert!(
+            above(window, "session-local-s1", "session-local-old"),
+            "newest first"
+        );
+    });
+    ui.act(|window, cx| window.right_click("session-local-old", cx));
+    click_label(&mut ui, "Pin");
+    ui.wait_until("the pinned session on top", |window, _, _| {
+        above(window, "session-local-old", "session-local-s1")
+    });
+    ui.shot("pinned");
+
+    ui.act(|window, cx| window.right_click("session-local-s1", cx));
+    click_label(&mut ui, "Copy");
+    click_label(&mut ui, "Session ID");
+    let copied = ui
+        .cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some("s1"));
+}
+
 /// Sessions from elsewhere start settled. A draft makes no session until
 /// its first message, and leaving it drops it. A session can be deleted.
 #[test]
@@ -1615,7 +1694,7 @@ fn a_turn_started_elsewhere_is_its_own_turn_and_leaves_typing_alone() {
     });
 
     ui.act(|window, cx| window.input("half a thought", cx));
-    ui.prompt_from_elsewhere("old", "list files");
+    ui.send_from_elsewhere("old", "list files", Send::Prompt);
     ui.wait_until("the other client's approval", |window, _, _| {
         is_visible(window, "approval-allow-once")
     });
@@ -1882,6 +1961,30 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
         );
     });
     ui.shot("steered");
+}
+
+/// A turn that ends while its session is off screen leaves the row Done
+/// until the session is opened.
+#[test]
+fn a_turn_finished_off_screen_is_done_until_opened() {
+    let script = Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    };
+    let shelves = Shelves::owning([TUI_SESSION, "s1", "old"]);
+    let mut ui = Harness::start_with("done", script, shelves);
+    ui.wait_until("the running job among the sessions", |window, _, _| {
+        is_visible(window, "session-local-tui-1") && is_visible(window, "session-local-s1")
+    });
+    ui.send_from_elsewhere(TUI_SESSION, "wrap up", Send::Steer);
+    // The sidebar learns of it from the daemon's jobs, which it polls.
+    ui.wait_for_label("session-local-tui-1-done", "Done");
+    ui.shot("done");
+
+    ui.click("session-local-tui-1");
+    ui.wait_until("the session open and the row seen", |window, _, app| {
+        app.active_session().is_some() && !is_visible(window, "session-local-tui-1-done")
+    });
 }
 
 /// The sidebar collapses to a rail and opens again, with Ctrl+B or its

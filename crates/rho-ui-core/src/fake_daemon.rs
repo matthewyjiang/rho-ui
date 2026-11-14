@@ -5,7 +5,7 @@
 //! - `rho/session/new` returns "new-1", "new-2", ...
 //! - `rho/session/list` returns pages of two: new sessions that have had a
 //!   prompt, newest first, then "s1" (titled "first") and "old" (untitled).
-//!   `rho/session/delete` drops one.
+//!   `rho/session/delete` drops one, and `rho/session/rename` titles one.
 //! - Attaching to "old" replays one agent message, "replayed", then
 //!   [`Script::replay_turns`] turns, each a question, a thought, three tool
 //!   calls, an edit, and a Markdown answer.
@@ -268,6 +268,11 @@ impl FakeDaemon {
     /// How many open requests clients have held ([`rho_protocol::SESSION_HOLD`]).
     pub fn holds(&self) -> usize {
         self.service.lock().holds
+    }
+
+    /// The title session `id` has saved, if it has one.
+    pub fn title(&self, id: &str) -> Option<String> {
+        self.service.lock().sessions.get(id)?.title.clone()
     }
 
     /// How many worktrees the daemon has added for new sessions.

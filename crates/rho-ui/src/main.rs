@@ -121,7 +121,10 @@ gpui_kit::assets::icon_assets!(
         FolderTree,
         Columns2,
         Rows2,
-        ClipboardPaste
+        ClipboardPaste,
+        Pencil,
+        Pin,
+        PinOff
     ]
 );
 
