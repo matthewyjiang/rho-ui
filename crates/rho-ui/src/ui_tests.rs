@@ -13,11 +13,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
+use gpui_kit::test::{
+    ClickOptions, TestEventExt as _, TestInput, TestQueryExt as _, TestWindowExt as _,
+};
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem,
-    ElementId, Entity, ExternalPaths, HeadlessAppContext, ImageFormat, MouseButton, Pixels, Window,
-    WindowBounds, WindowOptions,
+    ElementId, ElementInputHandler, Entity, ExternalPaths, HeadlessAppContext, ImageFormat,
+    MouseButton, Pixels, Window, WindowBounds, WindowOptions,
 };
 use rho_ui_core::{
     agent_settings::SettingValue,
@@ -32,7 +34,7 @@ use crate::{
     app::{LaunchConfig, RhoApp},
     machines::{MachineId, Place, RemoteMachine, SessionKey},
     projects::Projects,
-    right_panel::{Surface, TerminalShell},
+    right_panel::{Surface, TerminalShell, TerminalView},
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
@@ -292,7 +294,10 @@ impl Harness {
         loop {
             self.frame();
             let app = self.app.clone();
-            let lines = self.cx.update(|cx| RhoApp::terminal_text(&app, cx));
+            let lines = self.cx.update(|cx| {
+                let terminal = app.read(cx).terminal(cx)?;
+                Some(terminal.update(cx, |terminal, _| terminal.text()))
+            });
             if lines.as_deref().is_some_and(&ready) {
                 return;
             }
@@ -305,6 +310,61 @@ impl Harness {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// The right panel's terminal, once its shell runs.
+    fn terminal(&mut self) -> Entity<TerminalView> {
+        let app = self.app.clone();
+        self.cx
+            .update(|cx| app.read(cx).terminal(cx))
+            .expect("the terminal's shell runs")
+    }
+
+    /// The row of the terminal's line `text`, and where its cell at
+    /// `column` is drawn.
+    fn terminal_cell(&mut self, text: &str, column: u16) -> (usize, Bounds<Pixels>) {
+        let terminal = self.terminal();
+        self.cx.update(|cx| {
+            let lines = terminal.update(cx, |terminal, _| terminal.text());
+            let row = lines
+                .iter()
+                .position(|line| line == text)
+                .unwrap_or_else(|| panic!("no line {text:?} in {lines:?}"));
+            let cell = terminal
+                .read(cx)
+                .cell_bounds(column, u16::try_from(row).expect("a screen has few rows"))
+                .expect("the terminal is drawn");
+            (row, cell)
+        })
+    }
+
+    /// Clicks the terminal `count` times in a row at window position `at`.
+    fn click_terminal(&mut self, at: gpui_kit::Point<Pixels>, count: usize) {
+        self.act(|window, cx| {
+            let offset = at - window.find("terminal").bounds().origin;
+            let options = ClickOptions::new().with_offset(offset).with_count(count);
+            window.click_with_options("terminal", options, cx);
+        });
+    }
+
+    /// Presses Ctrl+Shift+C in the terminal, and returns the clipboard's text.
+    fn copy_from_terminal(&mut self) -> Option<String> {
+        self.act(|window, cx| window.press("ctrl-shift-c", cx));
+        self.cx
+            .update(|cx| cx.read_from_clipboard())
+            .and_then(|item| item.text())
+    }
+
+    /// Runs `act` as an input method on the terminal.
+    fn input_method<R>(&mut self, act: impl FnOnce(&mut TestInput<'_>, &mut App) -> R) -> R {
+        let terminal = self.terminal();
+        let mut result = None;
+        self.act(|window, cx| {
+            let bounds = window.find("terminal").bounds();
+            let handler = ElementInputHandler::new(bounds, terminal);
+            result = Some(act(&mut TestInput::new(handler, window), cx));
+        });
+        result.expect("the input method ran")
     }
 
     /// Waits for the active session to satisfy `ready`.
@@ -2206,8 +2266,11 @@ fn the_diff_surface_follows_the_sessions_changes() {
 }
 
 /// The Terminal surface runs a shell in the session's folder: what the
-/// keyboard types reaches it, what it prints shows, and the app's own
-/// shortcuts that the shell uses go to the shell.
+/// keyboard types reaches it once, what it prints shows, and the app's own
+/// shortcuts that the shell uses go to the shell. A drag or a double click
+/// selects what Ctrl+Shift+C copies; an input method's composing stays out
+/// of the shell until it commits; and a program that asks for the mouse
+/// gets a click as an escape sequence.
 #[test]
 fn the_terminal_surface_runs_a_shell() {
     let mut ui = Harness::start("terminal", Script::default());
@@ -2237,6 +2300,69 @@ fn the_terminal_surface_runs_a_shell() {
         "Ctrl+B went to the shell"
     );
     ui.shot("echo");
+
+    // Drag across the echo's output, from the left of its first cell to
+    // the right of its third.
+    let (_, first) = ui.terminal_cell("rho", 0);
+    let (_, third) = ui.terminal_cell("rho", 2);
+    let from = first.left_center() + gpui_kit::point(px(1.), px(0.));
+    let to = third.right_center() - gpui_kit::point(px(1.), px(0.));
+    ui.act(|window, cx| window.drag(from, to, cx));
+    ui.shot("selected");
+    assert_eq!(ui.copy_from_terminal().as_deref(), Some("rho"));
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        ui.cx
+            .update(|cx| cx.read_from_primary())
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("rho"),
+        "a selection goes to the primary selection"
+    );
+
+    // A double click selects the word under it.
+    let (_, echo) = ui.terminal_cell("$ echo rho", 3);
+    ui.click_terminal(echo.center(), 2);
+    assert_eq!(ui.copy_from_terminal().as_deref(), Some("echo"));
+
+    // A dead key's accent, which the platform composes without an input
+    // method, gives way to the letter a keystroke then types.
+    ui.input_method(|input, cx| input.compose_text(None, "´", None, cx));
+    ui.act(|window, cx| window.press("é", cx));
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "the method path isn't general over TestInput's lifetime"
+    )]
+    let marked = ui.input_method(|input, cx| input.marked_text_range(cx));
+    assert_eq!(marked, None, "the accent is gone");
+
+    // An input method composes, then commits a command that turns on the
+    // mouse for the program it runs, `cat`. Ctrl+U first: the line still
+    // holds the Ctrl+B and the é from above.
+    ui.act(|window, cx| window.press("ctrl-u", cx));
+    ui.input_method(|input, cx| input.compose_text(None, "pr", None, cx));
+    ui.shot("composing");
+    let command = r"printf '\033[?1000hready\n'; cat -v";
+    ui.input_method(|input, cx| input.commit_text(command, cx));
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_terminal("the command the input method committed", |lines| {
+        lines.iter().any(|line| line == "ready")
+    });
+
+    // A click reaches `cat` as a press and a release at its cell, which the
+    // terminal echoes as typed: X10's `ESC [ M`, then the button, column
+    // and row, each plus 32 and counted from 1.
+    let column = 4;
+    let (row, target) = ui.terminal_cell("ready", column);
+    ui.click_terminal(target.center(), 1);
+    let at = |n: usize| char::from(u8::try_from(33 + n).expect("a small grid"));
+    let report = format!(
+        "^[[M {x}{y}^[[M#{x}{y}",
+        x = at(usize::from(column)),
+        y = at(row)
+    );
+    ui.wait_for_terminal("the click's report", |lines| lines.contains(&report));
+    ui.shot("mouse");
 }
 
 /// Dragging the right panel's edge resizes it, as far as leaves the pane

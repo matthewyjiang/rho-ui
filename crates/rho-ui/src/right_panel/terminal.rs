@@ -9,12 +9,18 @@
 //! own terminal, started the first time it is on screen with the surface
 //! open, and kept until the surface closes.
 //!
-//! Not yet: selecting and copying text, the mouse for programs that ask for
-//! it, and input methods.
+//! The mouse goes to a program that asks for it, such as vim or htop, and
+//! otherwise selects text ([`mouse`]); Ctrl+Shift+C copies the selection,
+//! and a selection also goes to the primary selection. Text an input method
+//! commits goes to the shell as typed, and what it composes shows at the
+//! cursor until then ([`EntityInputHandler`]).
+
+mod mouse;
 
 use std::{
     cell::RefCell,
     io::{Read as _, Write},
+    ops::Range,
     path::PathBuf,
     rc::Rc,
 };
@@ -27,13 +33,16 @@ use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
 };
 use gpui_kit::{
-    canvas, div, fill, point, px, size, AnyElement, App, AppContext as _, Bounds, Context, Entity,
-    FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement as _, Pixels, Render,
-    ScrollEvent, SharedString, Styled as _, Task, TextAlign, TextRun, UnderlineStyle, Window,
+    canvas, div, fill, point, px, size, AnyElement, App, AppContext as _, Bounds, ClipboardItem,
+    Context, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Focusable, Font, FontStyle, FontWeight, Hitbox, HitboxBehavior, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement as _, Pixels, Point, Render, ScrollEvent, SharedString, Size, Styled as _, Task,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use libghostty_vt::{
     color::Rgb,
+    fmt::{Format, Formatter},
     key::{self, Key},
     mode::Mode,
     paste,
@@ -44,6 +53,7 @@ use libghostty_vt::{
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+use self::mouse::{Mouse, Released};
 use crate::{
     folders::Reader,
     machines::{Place, SessionKey},
@@ -214,8 +224,14 @@ pub(crate) struct TerminalView {
     /// Shared with the terminal's replies to the program's queries.
     writer: Rc<RefCell<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
-    /// Columns and rows, as the shell was last told.
-    grid: (u16, u16),
+    mouse: Mouse,
+    /// Where the grid was last drawn; its size is what the shell was told.
+    layout: Option<Grid>,
+    /// The cursor's column and row on screen, shown or not: where the
+    /// input method's window goes. Set by [`Self::frame`] each frame.
+    cursor: Option<(u16, u16)>,
+    /// What an input method is composing, not yet sent.
+    marked: Option<String>,
     /// The default colors last given the terminal, from the theme.
     colors: Option<(Rgb, Rgb)>,
     /// Wheel movement short of a line.
@@ -290,7 +306,10 @@ impl TerminalView {
             pty: pair.master,
             writer,
             child,
-            grid,
+            mouse: Mouse::new().map_err(ghostty)?,
+            layout: None,
+            cursor: None,
+            marked: None,
             colors: None,
             scrolled: Pixels::ZERO,
             exited: false,
@@ -326,14 +345,36 @@ impl TerminalView {
         Ok(view)
     }
 
-    /// Writes what a key or a paste sends to the program.
+    /// Writes `bytes` to the program.
+    fn write(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            let _ = self.writer.borrow_mut().write_all(bytes);
+        }
+    }
+
+    /// Writes what a key, a paste or an input method types.
     fn send(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let _ = self.writer.borrow_mut().write_all(bytes);
-        // Typing goes back to the bottom, as other terminals do.
+        self.write(bytes);
+        // Typing goes back to the bottom and drops the selection, as in
+        // Ghostty.
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        let _ = self.terminal.set_selection(None);
+    }
+
+    /// The selected text, unwrapped where the program's lines wrapped,
+    /// without trailing blanks.
+    fn selected_text(&self) -> Option<String> {
+        let mut formatter = Formatter::new_selection(&self.terminal).ok()??;
+        formatter
+            .set_format(Format::Plain)
+            .and_then(|formatter| formatter.set_unwrap(true))
+            .and_then(|formatter| formatter.set_trim(true))
+            .ok()?;
+        let text = formatter.format_alloc(None).ok()?;
+        Some(String::from_utf8_lossy(&text).into_owned()).filter(|text| !text.is_empty())
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<'_, Self>) {
@@ -343,18 +384,20 @@ impl TerminalView {
             self.paste(cx);
             return;
         }
-        let (key, unshifted) = key_of(&keystroke.key);
-        let mut mods = key::Mods::empty();
-        for (held, mod_) in [
-            (modifiers.shift, key::Mods::SHIFT),
-            (modifiers.control, key::Mods::CTRL),
-            (modifiers.alt, key::Mods::ALT),
-            (modifiers.platform, key::Mods::SUPER),
-        ] {
-            if held {
-                mods |= mod_;
+        if modifiers.control && modifiers.shift && keystroke.key == "c" {
+            if let Some(text) = self.selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
+            cx.stop_propagation();
+            return;
         }
+        if keystroke.key_char.is_some() {
+            // A dead key's accent, composed by the platform rather than an
+            // input method, ends with a keystroke typing the letter: as the
+            // platform would, that replaces the accent shown.
+            self.marked = None;
+        }
+        let (key, unshifted) = key_of(&keystroke.key);
         let text = typed(keystroke);
         let consumed = if text.is_some() && modifiers.shift {
             key::Mods::SHIFT
@@ -368,7 +411,7 @@ impl TerminalView {
                 key::Action::Press
             })
             .set_key(key)
-            .set_mods(mods)
+            .set_mods(mods(modifiers))
             .set_consumed_mods(consumed)
             .set_unshifted_codepoint(unshifted)
             .set_utf8(text.as_deref());
@@ -403,39 +446,107 @@ impl TerminalView {
         cx.stop_propagation();
     }
 
+    /// Sends the wheel to a program that tracks the mouse, or scrolls back.
     fn scroll(&mut self, event: &ScrollEvent, line: Pixels, cx: &mut Context<'_, Self>) {
         self.scrolled += event.delta.pixel_delta(line).y;
         let lines = (self.scrolled / line).trunc();
-        if lines != 0. {
-            self.scrolled -= line * lines;
-            #[expect(
-                clippy::as_conversions,
-                clippy::cast_possible_truncation,
-                reason = "a wheel moves a few lines at a time"
-            )]
-            self.terminal
-                .scroll_viewport(ScrollViewport::Delta(-(lines as isize)));
+        if lines == 0. {
+            return;
+        }
+        self.scrolled -= line * lines;
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "a wheel moves a few lines at a time"
+        )]
+        let lines = lines as i32;
+        let at = (event.position, event.modifiers);
+        let report = self
+            .layout
+            .and_then(|grid| self.mouse.wheel(&self.terminal, &grid, lines, at));
+        if let Some(bytes) = report {
+            self.write(&bytes);
+        } else {
+            self.terminal.scroll_viewport(ScrollViewport::Delta(
+                isize::try_from(-lines).unwrap_or_default(),
+            ));
             cx.notify();
         }
     }
 
-    /// Tells the terminal and the shell the grid that fits the panel.
-    fn resize(&mut self, grid: (u16, u16), cell: (Pixels, Pixels)) {
-        if grid == self.grid {
+    fn mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        let Some(grid) = self.layout else {
+            return;
+        };
+        let bytes = self.mouse.down(&self.terminal, &grid, event);
+        self.write(&bytes);
+        cx.notify();
+    }
+
+    /// Follows the pointer: the paint listener calls this over the grid,
+    /// or anywhere while a button pressed in it is down.
+    fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<'_, Self>) {
+        let Some(grid) = self.layout else {
+            return;
+        };
+        let held = self.mouse.is_held();
+        let bytes = self.mouse.moved(&self.terminal, &grid, event);
+        self.write(&bytes);
+        if held {
+            cx.notify();
+        }
+    }
+
+    /// Ends a press, wherever the button comes up: the paint listener
+    /// calls this while a button pressed in the terminal is down.
+    fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<'_, Self>) {
+        let Some(grid) = self.layout else {
+            return;
+        };
+        match self.mouse.up(&self.terminal, &grid, event) {
+            Released::Nothing => return,
+            Released::Report(bytes) => self.write(&bytes),
+            Released::Selection => self.write_primary(cx),
+        }
+        cx.notify();
+    }
+
+    /// Puts the selection in the primary selection, for a middle click
+    /// elsewhere.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn write_primary(&self, cx: &App) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_primary(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Only Linux and FreeBSD have a primary selection.
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn write_primary(&self, _: &App) {}
+
+    /// Records where the grid is drawn, and tells the terminal and the
+    /// shell when the grid that fits the panel changes.
+    fn resize(&mut self, layout: Grid) {
+        let size = |grid: &Grid| (grid.columns, grid.rows, grid.unit());
+        let resized = self.layout.is_none_or(|last| size(&last) != size(&layout));
+        self.layout = Some(layout);
+        if !resized {
             return;
         }
-        self.grid = grid;
-        let (width, height) = (f32::from(cell.0), f32::from(cell.1));
-        #[expect(
-            clippy::as_conversions,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a cell is a few dozen pixels"
-        )]
+        let (columns, rows) = (layout.columns, layout.rows);
+        // The cell size the mouse encoder counts in, so a program that asks
+        // for both sees them agree.
+        let (width, height) = layout.unit();
         let _ = self
             .terminal
-            .resize(grid.0, grid.1, width as u32, height as u32);
-        let _ = self.pty.resize(pty_size(grid));
+            .resize(columns, rows, u32::from(width), u32::from(height));
+        let _ = self.pty.resize(pty_size((columns, rows)));
     }
 
     /// Gives the terminal the theme's colors when they change.
@@ -452,7 +563,8 @@ impl TerminalView {
     }
 
     /// What the screen shows, copied out of libghostty for one frame.
-    fn frame(&mut self, font: &Font) -> Frame {
+    /// Selected cells get `selection` over their background.
+    fn frame(&mut self, font: &Font, selection: Hsla) -> Frame {
         let mut frame = Frame::default();
         let Ok(snapshot) = self.render.update(&self.terminal) else {
             return frame;
@@ -462,12 +574,24 @@ impl TerminalView {
             (to_hsla(colors.background), to_hsla(colors.foreground))
         });
         frame.background = background;
-        frame.cursor = snapshot
-            .cursor()
-            .ok()
-            .filter(|cursor| cursor.visible)
+        let cursor = snapshot.cursor().ok();
+        self.cursor = cursor
+            .as_ref()
             .and_then(|cursor| cursor.viewport)
             .map(|at| (at.x, at.y));
+        frame.cursor = self
+            .cursor
+            .filter(|_| cursor.as_ref().is_some_and(|cursor| cursor.visible));
+        frame.marked = self.marked.as_deref().zip(self.cursor).map(|(text, at)| {
+            let mut line = Line::default();
+            let underline = UnderlineStyle {
+                thickness: px(1.),
+                color: Some(foreground),
+                wavy: false,
+            };
+            line.push(text, font.clone(), foreground, Some(underline));
+            (line, at)
+        });
         let Ok(mut rows) = self.rows.update(&snapshot) else {
             return frame;
         };
@@ -490,6 +614,9 @@ impl TerminalView {
                 }
                 if let Some(bg) = bg {
                     line.backgrounds.push((column, bg));
+                }
+                if cell.is_selected().unwrap_or(false) {
+                    line.backgrounds.push((column, selection));
                 }
                 if cell.graphemes_len().unwrap_or(0) == 0 || cell.graphemes_utf8(&mut text).is_err()
                 {
@@ -521,11 +648,25 @@ impl TerminalView {
         frame
     }
 
+    /// The length of the composed text, in the UTF-16 units input
+    /// methods count in.
+    fn marked_len(&self) -> usize {
+        self.marked
+            .as_deref()
+            .map_or(0, |text| text.encode_utf16().count())
+    }
+
+    /// Where the cell at `column` and `row` is drawn, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn cell_bounds(&self, column: u16, row: u16) -> Option<Bounds<Pixels>> {
+        Some(self.layout?.cell_bounds(column, row))
+    }
+
     /// The screen as text, a line a row, for UI tests.
     #[cfg(test)]
     pub(crate) fn text(&mut self) -> Vec<String> {
         let font = gpui_kit::font("monospace");
-        self.frame(&font)
+        self.frame(&font, Hsla::default())
             .lines
             .into_iter()
             .map(|line| line.text.trim_end().to_owned())
@@ -542,6 +683,89 @@ impl Drop for TerminalView {
 impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+/// Input methods. A terminal has no text to edit, so the only text the
+/// handler knows is what is being composed; committed text goes straight to
+/// the program. Keys an input method doesn't take reach [`TerminalView::key_down`],
+/// which stops them there, so the platform doesn't type them again.
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<'_, Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<'_, Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self.marked_len();
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<'_, Self>) -> Option<Range<usize>> {
+        self.marked.is_some().then(|| 0..self.marked_len())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.marked = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.marked = None;
+        self.send(text.as_bytes());
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.marked = Some(text.to_owned()).filter(|text| !text.is_empty());
+        cx.notify();
+    }
+
+    /// The cursor's cell, where the input method's window goes.
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<'_, Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (column, row) = self.cursor?;
+        Some(self.layout?.cell_bounds(column, row))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<'_, Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -582,12 +806,16 @@ struct Frame {
     lines: Vec<Line>,
     /// The cursor's column and row, while it shows on screen.
     cursor: Option<(u16, u16)>,
+    /// What an input method is composing, and the cell it is drawn at:
+    /// the cursor's, shown or not.
+    marked: Option<(Line, (u16, u16))>,
 }
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (background, foreground, cursor) = (theme.background, theme.foreground, theme.caret);
+        let selection = theme.selection;
         self.follow_theme(background, foreground);
         let font_size = window.rem_size() * 0.875;
         let line_height = (font_size * 1.4).round();
@@ -597,10 +825,11 @@ impl Render for TerminalView {
             .text_system()
             .advance(font_id, font_size, 'm')
             .map_or(font_size * 0.6, |advance| advance.width);
-        let cell = (cell_width, line_height);
-        let frame = self.frame(&font);
-        let focused = self.focus.is_focused(window);
-        let view = cx.entity().downgrade();
+        let cell = size(cell_width, line_height);
+        let frame = self.frame(&font, selection);
+        let focus = self.focus.clone();
+        let focused = focus.is_focused(window);
+        let view = cx.entity();
         div()
             .id("terminal")
             .test_support()
@@ -610,33 +839,30 @@ impl Render for TerminalView {
             .px_2()
             .py_1()
             .bg(frame.background)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
-            )
+            .cursor_text()
+            .on_any_mouse_down(cx.listener(Self::mouse_down))
             .on_key_down(cx.listener(|this, event, _, cx| this.key_down(event, cx)))
             .on_scroll(cx.listener(move |this, event, _, cx| {
                 this.scroll(event, line_height, cx);
             }))
             .child(
                 canvas(
-                    move |bounds: Bounds<Pixels>, _, cx| {
-                        let grid = (
-                            fit(bounds.size.width / cell_width),
-                            fit(bounds.size.height / line_height),
-                        );
-                        let _ = view.update(cx, |view, _| view.resize(grid, cell));
+                    {
+                        let view = view.downgrade();
+                        move |bounds: Bounds<Pixels>, window, cx| {
+                            let grid = Grid::new(bounds, cell);
+                            let _ = view.update(cx, |view, _| view.resize(grid));
+                            (grid, window.insert_hitbox(bounds, HitboxBehavior::Normal))
+                        }
                     },
-                    move |bounds, (), window, cx| {
-                        paint(
-                            &frame,
-                            bounds,
-                            cell,
-                            font_size,
-                            (focused, cursor),
-                            window,
+                    move |bounds, (grid, hitbox), window, cx| {
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, view.clone()),
                             cx,
                         );
+                        listen_to_mouse(&view, hitbox, window);
+                        paint(&frame, &grid, font_size, (focused, cursor), window, cx);
                     },
                 )
                 .size_full(),
@@ -644,36 +870,51 @@ impl Render for TerminalView {
     }
 }
 
-/// Draws `frame` in `bounds`, each cell `cell` wide and tall.
+/// Follows the mouse over the grid, and anywhere while a button pressed in
+/// it is down, so a drag goes on past the terminal and ends wherever the
+/// button comes up. Raw GPUI: a div's listeners hear only the pointer over
+/// it.
+fn listen_to_mouse(view: &Entity<TerminalView>, hitbox: Hitbox, window: &mut Window) {
+    let moves = view.clone();
+    window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+        if phase == DispatchPhase::Bubble {
+            let hovered = hitbox.is_hovered(window);
+            moves.update(cx, |view, cx| {
+                if hovered || view.mouse.is_held() {
+                    view.mouse_move(event, cx);
+                }
+            });
+        }
+    });
+    let ups = view.clone();
+    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+        if phase == DispatchPhase::Capture {
+            ups.update(cx, |view, cx| {
+                if view.mouse.is_held() {
+                    view.mouse_up(event, cx);
+                }
+            });
+        }
+    });
+}
+
+/// Draws `frame` on `grid`.
 fn paint(
     frame: &Frame,
-    bounds: Bounds<Pixels>,
-    cell: (Pixels, Pixels),
+    grid: &Grid,
     font_size: Pixels,
     (focused, cursor_color): (bool, Hsla),
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (width, height) = cell;
-    let at = |column: u16, row: usize| {
-        #[expect(
-            clippy::as_conversions,
-            clippy::cast_precision_loss,
-            reason = "a screen has a few hundred rows"
-        )]
-        let row = row as f32;
-        bounds.origin + point(width * f32::from(column), height * row)
-    };
-    for (row, line) in frame.lines.iter().enumerate() {
+    let (width, height) = (grid.cell.width, grid.cell.height);
+    for (row, line) in (0..).zip(&frame.lines) {
         for &(column, color) in &line.backgrounds {
-            window.paint_quad(fill(
-                Bounds::new(at(column, row), size(width, height)),
-                color,
-            ));
+            window.paint_quad(fill(grid.cell_bounds(column, row), color));
         }
     }
     if let Some((column, row)) = frame.cursor {
-        let cursor = Bounds::new(at(column, usize::from(row)), size(width, height));
+        let cursor = grid.cell_bounds(column, row);
         let color = if focused {
             cursor_color.opacity(0.7)
         } else {
@@ -681,7 +922,7 @@ fn paint(
         };
         window.paint_quad(fill(cursor, color));
     }
-    for (row, line) in frame.lines.iter().enumerate() {
+    for (row, line) in (0..).zip(&frame.lines) {
         if line.text.trim_end().is_empty() {
             continue;
         }
@@ -691,8 +932,72 @@ fn paint(
             &line.runs,
             Some(width),
         );
-        let _ = shaped.paint(at(0, row), height, TextAlign::Left, None, window, cx);
+        let origin = grid.cell_bounds(0, row).origin;
+        let _ = shaped.paint(origin, height, TextAlign::Left, None, window, cx);
     }
+    if let Some((marked, (column, row))) = &frame.marked {
+        // Unforced widths, as composed text may hold wide characters.
+        let shaped = window.text_system().shape_line(
+            marked.text.clone().into(),
+            font_size,
+            &marked.runs,
+            None,
+        );
+        let origin = grid.cell_bounds(*column, *row).origin;
+        window.paint_quad(fill(
+            Bounds::new(origin, size(shaped.width, height)),
+            frame.background,
+        ));
+        let _ = shaped.paint(origin, height, TextAlign::Left, None, window, cx);
+    }
+}
+
+/// Where the grid is drawn, from the last prepaint: the canvas, a cell's
+/// size, and the columns and rows that fit. [`mouse`] adds its mapping of
+/// pointer positions to libghostty's.
+#[derive(Clone, Copy, Debug)]
+struct Grid {
+    bounds: Bounds<Pixels>,
+    cell: Size<Pixels>,
+    columns: u16,
+    rows: u16,
+}
+
+impl Grid {
+    /// The grid of `cell`s that fits `bounds`.
+    fn new(bounds: Bounds<Pixels>, cell: Size<Pixels>) -> Self {
+        Self {
+            bounds,
+            cell,
+            columns: fit(bounds.size.width / cell.width),
+            rows: fit(bounds.size.height / cell.height),
+        }
+    }
+
+    /// The cell at `column` and `row`, in window coordinates.
+    fn cell_bounds(&self, column: u16, row: u16) -> Bounds<Pixels> {
+        let offset = point(
+            self.cell.width * f32::from(column),
+            self.cell.height * f32::from(row),
+        );
+        Bounds::new(self.bounds.origin + offset, self.cell)
+    }
+}
+
+/// libghostty's modifiers for GPUI's.
+fn mods(modifiers: Modifiers) -> key::Mods {
+    let mut mods = key::Mods::empty();
+    for (held, mod_) in [
+        (modifiers.shift, key::Mods::SHIFT),
+        (modifiers.control, key::Mods::CTRL),
+        (modifiers.alt, key::Mods::ALT),
+        (modifiers.platform, key::Mods::SUPER),
+    ] {
+        if held {
+            mods |= mod_;
+        }
+    }
+    mods
 }
 
 /// How many whole cells fit, at least one.

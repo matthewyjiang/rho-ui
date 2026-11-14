@@ -1277,10 +1277,9 @@ impl RhoApp {
     pub(crate) fn panel_tabs(&self, cx: &App) -> Vec<crate::right_panel::Surface> {
         self.panel.read(cx).tab_order()
     }
-    /// The screen of the right panel's terminal, for UI tests.
-    pub(crate) fn terminal_text(this: &Entity<Self>, cx: &mut App) -> Option<Vec<String>> {
-        let panel = this.read(cx).panel.clone();
-        panel.update(cx, |panel, cx| panel.terminal_text(cx))
+    /// The right panel's terminal, for UI tests.
+    pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<crate::right_panel::TerminalView>> {
+        self.panel.read(cx).terminal(cx)
     }
     /// The sidebar's search, for UI tests.
     pub(crate) fn sidebar_search(&self, cx: &App) -> FocusHandle {

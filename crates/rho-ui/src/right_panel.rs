@@ -42,6 +42,8 @@ use gpui_kit::{
 use self::diff::DiffSurface;
 pub(crate) use self::terminal::TerminalShell;
 use self::terminal::TerminalSurface;
+#[cfg(test)]
+pub(crate) use self::terminal::TerminalView;
 use crate::{
     session_view::SessionView,
     store::{Key, StateDb},
@@ -371,15 +373,14 @@ impl RightPanel {
         })
     }
 
-    /// The screen of the session's terminal, if the Terminal surface is
-    /// open and it runs, for UI tests.
+    /// The session's terminal, if the Terminal surface is open and it
+    /// runs, for UI tests.
     #[cfg(test)]
-    pub(crate) fn terminal_text(&self, cx: &mut App) -> Option<Vec<String>> {
-        let terminal = self.tabs.iter().find_map(|tab| match tab {
+    pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<TerminalView>> {
+        self.tabs.iter().find_map(|tab| match tab {
             Tab::Terminal(terminal) => terminal.read(cx).current(),
             Tab::Background | Tab::Diff(_) => None,
-        })?;
-        Some(terminal.update(cx, |terminal, _| terminal.text()))
+        })
     }
 
     /// Whether + has anything to offer: a surface shows, so the list
