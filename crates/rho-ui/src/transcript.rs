@@ -107,13 +107,19 @@ struct Running {
     since: Instant,
 }
 
-/// A notice's detail, laid out, and whether it shows whole.
-struct NoticeDetail {
+/// An entry's Markdown, parsed once and kept while the transcript lives.
+///
+/// Kit's `TextView::markdown` keeps its parse only while it is drawn in
+/// consecutive frames. A message the list scrolled out of its drawn range
+/// was parsed anew when it came back, in the background for one over 4 KiB,
+/// so it drew empty for a frame, then at its height: a 2,884px reply drew
+/// 15px, then 2,884px, and the transcript jumped as it scrolled up.
+struct Markdown {
     text: Entity<TextViewState>,
-    shows: Disclosure,
-    /// Remeasures the notice's row when the text starts or stops being
-    /// cut short, which adds or drops its button.
-    _clamped: Subscription,
+    /// Remeasures the entry's row when the text lays out anew: its parse
+    /// arrived, or a notice's detail started or stopped being cut short,
+    /// which adds or drops its button.
+    _relayout: Subscription,
 }
 
 /// A session's transcript state. Flat arrays indexed by row, entry or turn.
@@ -122,7 +128,8 @@ pub(crate) struct Transcript {
     timeline: Timeline,
     /// Per row: whether a work row lists its steps.
     steps: Vec<Disclosure>,
-    /// Per entry: whether a step shows its details.
+    /// Per entry: whether a step shows its details, or a notice all of its
+    /// detail.
     details: Vec<Disclosure>,
     /// Per turn: whether its folded working is open.
     worked: Vec<Disclosure>,
@@ -135,8 +142,9 @@ pub(crate) struct Transcript {
     diffs: Vec<DiffView>,
     /// Per entry: a user message's attachments, ready to draw.
     attachments: Vec<Vec<Preview>>,
-    /// Per entry: a notice's detail; `None` for any other entry.
-    notices: Vec<Option<NoticeDetail>>,
+    /// Per entry: a message's text, or a notice's detail; `None` for
+    /// anything else.
+    markdown: Vec<Option<Markdown>>,
 }
 
 impl Transcript {
@@ -151,7 +159,7 @@ impl Transcript {
             running: None,
             diffs: Vec::new(),
             attachments: Vec::new(),
-            notices: Vec::new(),
+            markdown: Vec::new(),
         }
     }
 
@@ -174,9 +182,9 @@ impl Transcript {
         let seen = self.attachments.len();
         self.attachments
             .extend(entries.iter().skip(seen).map(previews));
-        for (ix, entry) in entries.iter().enumerate().skip(self.notices.len()) {
-            let detail = self.notice_detail(ix, entry, cx);
-            self.notices.push(detail);
+        for (ix, entry) in entries.iter().enumerate().skip(self.markdown.len()) {
+            let markdown = self.markdown(ix, entry, cx);
+            self.markdown.push(markdown);
         }
         self.steps
             .resize(self.timeline.rows().len(), Disclosure::Folded);
@@ -202,6 +210,15 @@ impl Transcript {
         if let (Some(attachments), Some(entry)) = (self.attachments.get_mut(ix), entries.get(ix)) {
             *attachments = previews(entry);
         }
+        // A reply streams in.
+        if let (Some(Some(markdown)), Some(text)) = (
+            self.markdown.get(ix),
+            entries.get(ix).and_then(markdown_text),
+        ) {
+            markdown
+                .text
+                .update(cx, |state, cx| state.set_text(text, cx));
+        }
         if let Some(Entry::Tool(tool)) = entries.get(ix) {
             match self.diffs.iter_mut().find(|diff| diff.entry == ix) {
                 Some(diff) => diff.update(tool, cx),
@@ -217,26 +234,27 @@ impl Transcript {
         }
     }
 
-    /// Notice `ix`'s detail, laid out as Markdown, if `entry` is a notice
-    /// with one. Notices never change once added.
-    fn notice_detail(&self, ix: usize, entry: &Entry, cx: &mut App) -> Option<NoticeDetail> {
-        let Entry::Notice(notice) = entry else {
-            return None;
-        };
-        let text = notice.description()?;
+    /// Entry `ix`'s Markdown, parsing from now, if it has any.
+    fn markdown(&self, ix: usize, entry: &Entry, cx: &mut App) -> Option<Markdown> {
+        let text = markdown_text(entry)?;
         let row = self.timeline.row_of(ix)?;
         let text = cx.new(|cx| TextViewState::markdown(text, cx));
         let scroller = self.scroller.clone();
-        let clamped = cx.observe(&text, move |_, cx| {
+        let relayout = cx.observe(&text, move |_, cx| {
             scroller.update(cx, |scroller, cx| {
                 scroller.remeasure_items(row..row + 1, cx)
             });
         });
-        Some(NoticeDetail {
+        Some(Markdown {
             text,
-            shows: Disclosure::Folded,
-            _clamped: clamped,
+            _relayout: relayout,
         })
+    }
+
+    /// Entry `ix`'s Markdown, if it has any, to draw with Kit's
+    /// `TextView::new`.
+    fn text(&self, ix: usize) -> Option<&Entity<TextViewState>> {
+        Some(&self.markdown.get(ix)?.as_ref()?.text)
     }
 
     /// A turn began `since`, here or in another client: it is the next
@@ -316,10 +334,10 @@ impl Transcript {
                 self.timeline.turn_rows(turn)
             }
             Action::Notice { entry } => {
-                let Some(detail) = self.notices.get_mut(entry).and_then(Option::as_mut) else {
+                let Some(shows) = self.details.get_mut(entry) else {
                     return;
                 };
-                detail.shows.toggle();
+                shows.toggle();
                 let Some(row) = self.timeline.row_of(entry) else {
                     return;
                 };
@@ -459,7 +477,8 @@ impl Transcript {
                 Entry::Notice(notice) => self.render_notice(*entry, notice, act, cx),
                 message => {
                     let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
-                    render_message(message, *entry, attachments, phase, cx)
+                    let text = self.text(*entry);
+                    render_message(message, *entry, text, attachments, phase, cx)
                 }
             },
             Row::Work(run) => {
@@ -500,20 +519,19 @@ impl Transcript {
             NoticeLevel::Warning => AlertVariant::Warning,
             NoticeLevel::Error => AlertVariant::Error,
         };
-        let detail = self.notices.get(ix).and_then(Option::as_ref);
-        let Some(detail) = detail else {
+        let Some(detail) = self.text(ix) else {
             return Alert::new(key, SharedString::from(notice.title().to_owned()))
                 .with_variant(variant)
                 .small()
                 .into_any_element();
         };
-        let open = detail.shows.is_open();
-        let mut text = TextView::new(&detail.text).selectable(true);
+        let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
+        let mut text = TextView::new(detail).selectable(true);
         if !open {
             text = text.max_lines(NOTICE_LINES);
         }
         // Kit's text view says whether the last frame cut it short.
-        let toggle = (open || detail.text.read(cx).is_clamped()).then(|| {
+        let toggle = (open || detail.read(cx).is_clamped()).then(|| {
             let act = Rc::clone(act);
             let (label, icon) = if open {
                 ("Show less", Lucide::ChevronUp)
@@ -591,19 +609,31 @@ fn attachment_cell(ix: usize, n: usize, preview: &Preview, card: Card) -> AnyEle
         .into_any_element()
 }
 
-/// Builds the row for a user message or a reply: entry `ix`.
+/// The Markdown `entry` shows: a message's text, or a notice's detail.
+fn markdown_text(entry: &Entry) -> Option<&str> {
+    match entry {
+        Entry::User(message) => Some(message.text()).filter(|text| !text.is_empty()),
+        Entry::Agent(message) => Some(message.text()),
+        Entry::Notice(notice) => notice.description(),
+        Entry::Thought(_) | Entry::Tool(_) | Entry::Wake => None,
+    }
+}
+
+/// Builds the row for a user message or a reply: entry `ix`, whose text
+/// `text` holds.
 /// `attachments` are a user message's. Tool calls and thoughts are drawn
 /// by [`crate::work`].
 fn render_message(
     entry: &Entry,
     ix: usize,
+    text: Option<&Entity<TextViewState>>,
     attachments: &[Preview],
     phase: Phase,
     cx: &App,
 ) -> AnyElement {
     let key = ElementId::named_usize("row", ix);
     match entry {
-        Entry::User(message) => {
+        Entry::User(_) => {
             // Above the text, the images in their own proportions on one
             // row, then the file chips on the next: one height to a row.
             // IDs number the attachments in the order they were sent.
@@ -617,19 +647,12 @@ fn render_message(
                     .filter(|(_, preview)| preview.image().is_none())
                     .map(|(n, preview)| attachment_cell(ix, n, preview, preview.card())),
             );
-            let text = (!message.text().is_empty()).then(|| {
+            let text = text.map(|text| {
                 Bubble::new().with_variant(BubbleVariant::Muted).child(
                     div()
                         .id(SharedString::from(format!("user-{ix}")))
                         .test_support()
-                        .child(
-                            TextView::markdown(
-                                ElementId::named_usize("user-markdown", ix),
-                                message.text().to_owned(),
-                            )
-                            .style(message_style())
-                            .selectable(true),
-                        ),
+                        .child(TextView::new(text).style(message_style()).selectable(true)),
                 )
             });
             let mut content = MessageContent::new().children(images).children(files);
@@ -642,18 +665,16 @@ fn render_message(
                 .content(content)
                 .into_any_element()
         }
-        Entry::Agent(message) => div()
-            .id(key)
+        Entry::Agent(_) => div()
+            .id(SharedString::from(format!("reply-{ix}")))
+            .test_support()
             .w_full()
-            .child(
-                TextView::markdown(
-                    ElementId::named_usize("markdown", ix),
-                    message.text().to_owned(),
-                )
-                .style(message_style())
-                .selectable(true)
-                .stream_fade(phase == Phase::Live),
-            )
+            .children(text.map(|text| {
+                TextView::new(text)
+                    .style(message_style())
+                    .selectable(true)
+                    .stream_fade(phase == Phase::Live)
+            }))
             .into_any_element(),
         Entry::Wake => h_flex()
             .id(SharedString::from(format!("wake-{ix}")))

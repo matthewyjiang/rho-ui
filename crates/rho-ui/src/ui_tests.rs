@@ -1482,6 +1482,65 @@ fn a_turn_started_elsewhere_is_its_own_turn_and_leaves_typing_alone() {
     assert_eq!(typed, "half a thought", "the message being typed is intact");
 }
 
+/// A long reply scrolled away and back draws whole on the first frame it
+/// shows again, so the transcript above it doesn't jump.
+#[test]
+fn a_long_reply_scrolled_back_keeps_its_height() {
+    let script = Script {
+        replay_turns: 20,
+        long_reply: true,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("long-reply", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-old")
+    });
+    ui.click("session-local-old");
+    ui.wait_for_session("the replayed history", |session| {
+        session.state() == &RunState::Idle && session.entries().len() > 20
+    });
+    let app = ui.app.clone();
+    let (view, last) = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        let last = view.read(cx).session().entries().len() - 1;
+        (view, last)
+    });
+    let reply = gpui_kit::SharedString::from(format!("reply-{last}"));
+    let height = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                window
+                    .try_find(reply.clone())
+                    .filter(gpui_kit::test::ElementSnapshot::visible)
+                    .map(|element| f32::from(element.bounds().size.height))
+            })
+            .expect("window is open")
+    };
+    ui.frame();
+    let whole = height(&mut ui).expect("the long reply shows at the end");
+    assert!(whole > 1000., "the reply is drawn whole: {whole}px");
+
+    let scroller = ui
+        .cx
+        .update(|cx| view.read(cx).transcript().scroller().clone());
+    ui.cx
+        .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(0, cx)));
+    ui.frame();
+    assert_eq!(height(&mut ui), None, "the reply is out of the drawn range");
+
+    // One frame, with no time for a parse in the background.
+    ui.cx.update(|cx| {
+        scroller.update(
+            cx,
+            gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end,
+        );
+    });
+    ui.cx
+        .update_window(ui.window, |_, window, cx| window.render_frame(cx))
+        .expect("window is open");
+    assert_eq!(height(&mut ui), Some(whole), "the reply comes back whole");
+}
+
 /// A wheel notch glides over several frames instead of jumping.
 #[test]
 fn a_wheel_notch_glides() {

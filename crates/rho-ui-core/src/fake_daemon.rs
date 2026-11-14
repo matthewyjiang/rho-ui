@@ -145,6 +145,9 @@ pub struct Script {
     pub tui_job: TuiJob,
     /// Whether "old"'s replay ends with an info card and a warning card.
     pub cards: bool,
+    /// Whether "old"'s replay ends with a reply over 4 KiB, which GPUI
+    /// Kit parses off the UI thread.
+    pub long_reply: bool,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -943,6 +946,12 @@ impl State {
         replay(&mut old, script.replay_turns);
         if script.cards {
             cards(&mut old);
+        }
+        if script.long_reply {
+            let paragraphs: Vec<String> = (0..60)
+                .map(|n| format!("Paragraph {n} of a long reply, which says a good deal about very little, and then says it again."))
+                .collect();
+            old.say("long", &paragraphs.join("\n\n"));
         }
         sessions.insert("old".to_owned(), old);
         let mut state = Self {
