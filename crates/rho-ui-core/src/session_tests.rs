@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::*;
 use crate::{
-    input::InputChoice,
+    input::{Form, InputChoice},
     options::{ConfigCategory, ConfigChoice, ConfigKind},
     prompt::{Image, ImageFormat},
     tool_card::{SearchLine, ToolBody, ToolFact},
@@ -421,13 +421,55 @@ fn requests_open_once_and_close_when_any_client_answers() {
     let request = &session.inputs()[0];
     assert_eq!(request.title(), "Run `cargo test`?");
     assert_eq!(request.description(), Some("runs a command"));
-    let ids: Vec<_> = request.choices().iter().map(InputChoice::id).collect();
+    let Form::Choices { choices, .. } = request.form() else {
+        panic!("an approval is answered by choosing");
+    };
+    let ids: Vec<_> = choices.iter().map(InputChoice::id).collect();
     assert_eq!(ids, ["allow-once", "allow-session", "deny"]);
 
     session.apply(update(
         json!({"type": "input_resolved", "id": 7, "resolution": "answered"}),
     ));
     assert!(session.inputs().is_empty());
+}
+
+/// A question with a timeout keeps it until a client holds it; one the
+/// deadline answered says what rho answered, in case the user meant to.
+#[test]
+fn a_timed_out_question_leaves_the_answer_rho_gave() {
+    let question = |id: u64| {
+        update(json!({"type": "input_requested", "request": {"id": id,
+            "ask": {"kind": "question", "title": "Which?", "questions": [{"id": "q",
+                "prompt": "Pick", "selection": "one", "allow_other": false, "required": true,
+                "choices": [{"value": "a", "label": "A"}]}]},
+            "timeout": {"deadline_ms": 1, "reason": "r",
+                "answer": {"kind": "answers", "answers": {"q": ["a"]}}}}}))
+    };
+    let mut session = session();
+    session.apply(question(1));
+    session.apply(update(json!({"type": "input_held", "id": 1})));
+    assert_eq!(session.inputs()[0].timeout(), None, "held");
+    session.apply(update(
+        json!({"type": "input_resolved", "id": 1, "resolution": "answered"}),
+    ));
+    assert!(session.entries().is_empty(), "an answer leaves no notice");
+
+    session.apply(question(2));
+    let changed = session.apply(update(
+        json!({"type": "input_resolved", "id": 2, "resolution": "timed_out"}),
+    ));
+    assert!(session.inputs().is_empty());
+    assert_eq!(changed, Some(0));
+    match session.entries() {
+        [Entry::Notice(notice)] => {
+            assert_eq!(
+                notice.title(),
+                "No answer came in time, so rho answered “A”"
+            );
+            assert_eq!(notice.level(), NoticeLevel::Warning);
+        }
+        other => panic!("the transcript holds {other:?}"),
+    }
 }
 
 /// The steer's answer and its `user_message` reach the UI on separate

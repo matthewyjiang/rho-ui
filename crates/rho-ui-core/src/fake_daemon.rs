@@ -9,8 +9,18 @@
 //! - Attaching to "old" replays one agent message, "replayed", then
 //!   [`Script::replay_turns`] turns, each a question, a thought, three tool
 //!   calls, an edit, and a Markdown answer.
-//! - A prompt asks to run `ls`, then answers "you chose" and the answer. The
-//!   prompt "fail" is refused, and "slow" is taken half a second late.
+//! - A prompt asks to run `ls`, then answers "you chose" and the answer,
+//!   with a denial's reason after a colon. The prompt "fail" is refused,
+//!   and "slow" is taken half a second late.
+//! - The prompt "questions" asks [`questions`]: a required single-choice
+//!   question that takes the user's own text, and an optional
+//!   multiple-choice one that suggests "test". It answers "you answered"
+//!   and each question's values, or "you declined"; answers that give the
+//!   text "refuse" are refused, leaving the request open. "questions timeout"
+//!   asks the same with a five-minute timeout whose fallback picks Rust;
+//!   holding it drops the timeout.
+//! - The prompt "plan" asks to carry out a plan, and answers "you chose"
+//!   and the answer, with its feedback after a colon.
 //! - The prompt "background" starts a background process, `sleep 30`, and
 //!   answers at once, leaving it running. Stopping it, or
 //!   [`FakeDaemon::finish_background`], ends it, and the daemon starts a
@@ -54,10 +64,11 @@ use rho_protocol::{
         ReasoningOptions, Replay, Seq, SessionCommand, SessionId, SessionOptions, SteerId,
         StreamId, ToolCallId, ToolCallUpdate, TurnId,
     },
-    serve_connection, subscription, AnswerStop, BuildId, CardTone, ClientEnvironment, CommandKind,
-    ContentBlock, DaemonEndpoint, DaemonInfo, DetachReason, ErrorCode, InputRequest,
-    PermissionMode, Published, Publisher, RpcError, SessionAttachResponse, SessionEvent,
-    Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
+    serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
+    CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
+    DetachReason, ErrorCode, InputRequest, PermissionMode, Published, Publisher, Question,
+    RpcError, Selection, SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind,
+    ToolStatus, TurnOutcome,
 };
 use tokio::{net::UnixListener, runtime::Runtime};
 
@@ -83,6 +94,46 @@ pub fn subagent_result() -> String {
     std::iter::once("Conclusion: the parser lives in `src/parse.rs`.\n".to_owned())
         .chain(parts)
         .collect()
+}
+
+/// The questionnaire the prompt "questions" asks.
+pub fn questions() -> Vec<Question> {
+    let choice = |value: &str, label: &str| Choice {
+        value: value.to_owned(),
+        label: label.to_owned(),
+        description: None,
+    };
+    vec![
+        Question {
+            id: "lang".to_owned(),
+            prompt: "Which language should the tool use?".to_owned(),
+            header: Some("Language".to_owned()),
+            choices: vec![choice("rust", "Rust"), choice("go", "Go")],
+            selection: Selection::One,
+            allow_other: true,
+            help: None,
+            default: None,
+            required: true,
+        },
+        Question {
+            id: "checks".to_owned(),
+            prompt: "Which checks should run?".to_owned(),
+            header: Some("Checks".to_owned()),
+            choices: vec![
+                choice("fmt", "Format"),
+                choice("clippy", "Clippy"),
+                choice("test", "Tests"),
+            ],
+            selection: Selection::Many,
+            allow_other: false,
+            help: Some("Pick any.".to_owned()),
+            default: Some(DefaultAnswer {
+                values: vec!["test".to_owned()],
+                style: DefaultStyle::Selected,
+            }),
+            required: false,
+        },
+    ]
 }
 
 /// What the fake daemon holds when it starts.
@@ -199,6 +250,11 @@ impl FakeDaemon {
             .flat_map(ClientEnvironment::iter)
             .find(|(set, _)| *set == name)?;
         Some(value.to_owned())
+    }
+
+    /// How many open requests clients have held ([`rho_protocol::SESSION_HOLD`]).
+    pub fn holds(&self) -> usize {
+        self.service.lock().holds
     }
 
     /// How many worktrees the daemon has added for new sessions.
@@ -868,6 +924,8 @@ struct State {
     new_sessions: u64,
     /// How many sessions asked for a new worktree.
     worktrees: usize,
+    /// How many requests clients held.
+    holds: usize,
     /// The environment the latest `rho/session/new` carried.
     new_session_environment: Option<ClientEnvironment>,
     turns: u64,
@@ -891,6 +949,7 @@ impl State {
             sessions,
             new_sessions: 0,
             worktrees: 0,
+            holds: 0,
             new_session_environment: None,
             turns: 0,
             steers: 0,

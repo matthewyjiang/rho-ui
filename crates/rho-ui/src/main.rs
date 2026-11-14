@@ -5,12 +5,12 @@
 //! starts the daemon when none runs (default: `rho` on `PATH`).
 
 mod app;
-mod approval;
 mod attachments;
 mod background;
 mod composer;
 mod draft;
 mod fold;
+mod input_card;
 mod kinetic;
 mod machines;
 mod project_picker;
@@ -99,7 +99,10 @@ gpui_kit::assets::icon_assets!(
         FileArchive,
         FileImage,
         ListFilter,
-        Server
+        Server,
+        Layers,
+        Timer,
+        SkipForward
     ]
 );
 
@@ -230,6 +233,57 @@ fn window_options(cx: &App) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every icon of Lucide's full catalog the source names (imported as
+    /// `Lucide`) is in the app's assets: one left out of [`ExtraIcons`]
+    /// draws nothing, without a word.
+    #[test]
+    fn every_lucide_icon_named_is_bundled() {
+        fn sources(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("the source directory reads") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(std::fs::read_to_string(&path).expect("a source file reads"));
+                }
+            }
+        }
+        let mut texts = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut texts,
+        );
+        let mut names: Vec<&str> = texts
+            .iter()
+            .flat_map(|text| text.split("Lucide::").skip(1))
+            .filter_map(|rest| {
+                let end = rest.find(|c: char| !c.is_ascii_alphanumeric())?;
+                Some(&rest[..end]).filter(|name| !name.is_empty())
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert!(
+            names.contains(&"Timer"),
+            "the scan finds the names: {names:?}"
+        );
+        let missing: Vec<&str> = names
+            .into_iter()
+            .filter(|name| {
+                let mut stem = String::new();
+                for (ix, c) in name.char_indices() {
+                    if c.is_ascii_uppercase() && ix > 0 {
+                        stem.push('-');
+                    }
+                    stem.push(c.to_ascii_lowercase());
+                }
+                let path = format!("icons/{stem}.svg");
+                !Assets.load(&path).is_ok_and(|icon| icon.is_some())
+            })
+            .collect();
+        assert_eq!(missing, Vec::<&str>::new(), "add them to `ExtraIcons`");
+    }
 
     fn parse(args: &[&str]) -> Result<LaunchConfig, String> {
         parse_args(args.iter().map(std::string::ToString::to_string))

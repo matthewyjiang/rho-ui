@@ -3,7 +3,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rho_protocol::{
@@ -16,13 +16,14 @@ use rho_protocol::{
     },
     ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo, ContentBlock,
     CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason, ErrorCode, InputAnswer,
-    InputAsker, InputRequest, InputRequestId, Operation, ProtocolVersion, RestartCost, RpcError,
-    Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
-    SessionAttachResponse, SessionBackgroundStopParams, SessionBackgroundStopResponse,
-    SessionCancelParams, SessionCancelResponse, SessionChange, SessionEvent, SessionNewParams,
-    SessionNewResponse, SessionPromptParams, SessionPromptResponse, SessionSteerParams,
-    SessionSteerResponse, SessionWorktree, SettingsService, StoreSelectedBy, Subscription,
-    ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
+    InputAsker, InputRequest, InputRequestId, InputTimeout, Operation, PermissionMode,
+    PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
+    SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
+    SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
+    SessionCancelResponse, SessionChange, SessionEvent, SessionHoldParams, SessionHoldResponse,
+    SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
+    SessionSteerParams, SessionSteerResponse, SessionWorktree, SettingsService, StoreSelectedBy,
+    Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
 use super::{shell_card, shell_output, FakeSession, State, Turn};
@@ -84,13 +85,118 @@ fn subagent_turn(
     Ok(SessionPromptResponse { turn: turn_id })
 }
 
-/// How an approval's answer reads in the turn's reply.
-fn chosen(answer: &InputAnswer) -> &'static str {
+/// The turn's reply to `answer`.
+fn reply(answer: &InputAnswer) -> String {
+    let chose = |name: &str, text: &Option<String>| match text {
+        Some(text) => format!("you chose {name}: {text}"),
+        None => format!("you chose {name}"),
+    };
     match answer {
-        InputAnswer::AllowOnce => "allow_once",
-        InputAnswer::AllowForSession => "allow_for_session",
-        InputAnswer::Deny { .. } => "deny",
-        _ => "something else",
+        InputAnswer::AllowOnce => chose("allow_once", &None),
+        InputAnswer::AllowForSession => chose("allow_for_session", &None),
+        InputAnswer::Deny { reason } => chose("deny", reason),
+        InputAnswer::ApprovePlan { feedback, .. } => chose("approve_plan", feedback),
+        InputAnswer::KeepPlanning { feedback } => chose("keep_planning", feedback),
+        InputAnswer::Answers { answers } => {
+            let answers = answers
+                .iter()
+                .map(|(id, values)| format!("{id}={}", values.join(",")));
+            format!("you answered {}", answers.collect::<Vec<_>>().join("; "))
+        }
+        InputAnswer::Decline => "you declined".to_owned(),
+        _ => "you chose something else".to_owned(),
+    }
+}
+
+/// What the prompt `prompt` asks, if it asks something other than to run
+/// `ls`: [`super::questions`], with a timeout for "questions timeout", or a
+/// plan approval.
+fn other_ask(prompt: &str) -> Option<(Ask, Option<InputTimeout>)> {
+    match prompt {
+        "questions" | "questions timeout" => {
+            let deadline = SystemTime::now() + Duration::from_secs(300);
+            let deadline_ms = deadline
+                .duration_since(UNIX_EPOCH)
+                .expect("the clock is past 1970")
+                .as_millis();
+            let timeout = (prompt == "questions timeout").then(|| InputTimeout {
+                deadline_ms: u64::try_from(deadline_ms).expect("a deadline before 2554"),
+                answer: InputAnswer::Answers {
+                    answers: [("lang".to_owned(), vec!["rust".to_owned()])].into(),
+                },
+                reason: "Rust is what the repo uses".to_owned(),
+            });
+            let ask = Ask::Question(QuestionAsk {
+                title: "Set up the tool".to_owned(),
+                questions: super::questions(),
+            });
+            Some((ask, timeout))
+        }
+        "plan" => Some((
+            Ask::PlanApproval(PlanApprovalAsk {
+                plan: "1. Read the parser\n2. Split it in two".to_owned(),
+                modes: vec![PermissionMode::AllowEdits, PermissionMode::Auto],
+            }),
+            None,
+        )),
+        _ => None,
+    }
+}
+
+/// The approval a prompt asks for: to run `ls` in `cwd`.
+fn ls_approval(cwd: &Path) -> Ask {
+    Ask::Approval(ApprovalAsk {
+        source: ApprovalSource::BuiltInTool {
+            name: "bash".to_owned(),
+        },
+        operation: Operation::RunProcess {
+            program: PathBuf::from("ls"),
+            args: Vec::new(),
+            shell_command: Some("ls".to_owned()),
+            cwd: cwd.to_owned(),
+        },
+        reason: "the fake asks before every command".to_owned(),
+    })
+}
+
+impl FakeSession {
+    /// Starts `turn` for the prompt `params`, which waits on `ask`. An
+    /// approval asks for the turn's tool call, `ls`, which shows pending.
+    fn ask(
+        &mut self,
+        params: &SessionPromptParams,
+        turn: Turn,
+        ask: Ask,
+        timeout: Option<InputTimeout>,
+    ) {
+        let (turn_id, tool) = (turn.id.clone(), turn.tool.clone());
+        let runs_ls = matches!(ask, Ask::Approval(_));
+        let request = InputRequest {
+            id: InputRequestId(turn.number),
+            ask,
+            tool_call: runs_ls.then(|| tool.clone()),
+            timeout,
+            asker: InputAsker::Turn,
+        };
+        self.turn = Some(Turn {
+            input: Some(request.clone()),
+            ..turn
+        });
+        self.state(JobState::Running);
+        self.publish(echo(&turn_id, params));
+        if runs_ls {
+            self.tool(
+                &tool,
+                ("ls", ToolKind::Execute),
+                ToolStatus::Pending,
+                Vec::new(),
+                shell_card("ls", ToolStatus::Pending, None),
+            );
+        }
+        self.publish(SessionEvent::InputRequested {
+            request: Box::new(request),
+        });
+        self.state(JobState::WaitingForInput);
     }
 }
 
@@ -225,42 +331,9 @@ impl Service for Fake {
             session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
             return Ok(SessionPromptResponse { turn: turn_id });
         }
-        let request = InputRequest {
-            id: InputRequestId(turn.number),
-            ask: Ask::Approval(ApprovalAsk {
-                source: ApprovalSource::BuiltInTool {
-                    name: "bash".to_owned(),
-                },
-                operation: Operation::RunProcess {
-                    program: PathBuf::from("ls"),
-                    args: Vec::new(),
-                    shell_command: Some("ls".to_owned()),
-                    cwd: session.cwd.clone(),
-                },
-                reason: "the fake asks before every command".to_owned(),
-            }),
-            tool_call: Some(turn.tool.clone()),
-            timeout: None,
-            asker: InputAsker::Turn,
-        };
-        let tool = turn.tool.clone();
-        session.turn = Some(Turn {
-            input: Some(request.clone()),
-            ..turn
-        });
-        session.state(JobState::Running);
-        session.publish(echo(&turn_id, &params));
-        session.tool(
-            &tool,
-            ("ls", ToolKind::Execute),
-            ToolStatus::Pending,
-            Vec::new(),
-            shell_card("ls", ToolStatus::Pending, None),
-        );
-        session.publish(SessionEvent::InputRequested {
-            request: Box::new(request),
-        });
-        session.state(JobState::WaitingForInput);
+        let (ask, timeout) =
+            other_ask(&prompt).unwrap_or_else(|| (ls_approval(&session.cwd), None));
+        session.ask(&params, turn, ask, timeout);
         Ok(SessionPromptResponse { turn: turn_id })
     }
 
@@ -272,11 +345,17 @@ impl Service for Fake {
         let session = state.session(&params.session)?;
         if let Some(turn) = &mut session.turn {
             let tool = turn.tool.clone();
+            let request_was_ls = turn
+                .input
+                .as_ref()
+                .is_some_and(|request| request.tool_call.is_some());
             if let Some(request) = turn.input.take() {
                 session.publish(SessionEvent::InputResolved {
                     id: request.id,
                     resolution: Resolution::Withdrawn,
                 });
+            }
+            if request_was_ls {
                 session.tool(
                     &tool,
                     ("ls", ToolKind::Execute),
@@ -339,6 +418,14 @@ impl Service for Fake {
         &self,
         params: SessionAnswerParams,
     ) -> Result<SessionAnswerResponse, RpcError> {
+        if let InputAnswer::Answers { answers } = &params.answer {
+            if answers.values().flatten().any(|value| value == "refuse") {
+                return Err(RpcError::new(
+                    ErrorCode::InvalidParams,
+                    "the fake daemon refuses this answer",
+                ));
+            }
+        }
         let mut state = self.lock();
         let session = state.session(&params.session)?;
         let open = session
@@ -357,27 +444,53 @@ impl Service for Fake {
             resolution: Resolution::Answered,
         });
         session.state(JobState::Running);
-        if matches!(params.answer, InputAnswer::Deny { .. }) {
-            session.tool(
-                &tool,
-                ("ls", ToolKind::Execute),
-                ToolStatus::Failed,
-                Vec::new(),
-                shell_card("ls", ToolStatus::Failed, None),
-            );
-        } else {
-            let output = "a.rs\nb.rs";
-            session.tool(
-                &tool,
-                ("ls", ToolKind::Execute),
-                ToolStatus::Completed,
-                vec![shell_output(output)],
-                shell_card("ls", ToolStatus::Completed, Some(output)),
-            );
+        // Only the approval asks for a tool call, `ls`.
+        if request.tool_call.is_some() {
+            if matches!(params.answer, InputAnswer::Deny { .. }) {
+                session.tool(
+                    &tool,
+                    ("ls", ToolKind::Execute),
+                    ToolStatus::Failed,
+                    Vec::new(),
+                    shell_card("ls", ToolStatus::Failed, None),
+                );
+            } else {
+                let output = "a.rs\nb.rs";
+                session.tool(
+                    &tool,
+                    ("ls", ToolKind::Execute),
+                    ToolStatus::Completed,
+                    vec![shell_output(output)],
+                    shell_card("ls", ToolStatus::Completed, Some(output)),
+                );
+            }
         }
-        let reply = format!("you chose {}", chosen(&params.answer));
-        session.answer(&format!("m-{turn_id}"), &reply);
+        session.answer(&format!("m-{turn_id}"), &reply(&params.answer));
         Ok(SessionAnswerResponse {})
+    }
+
+    async fn hold_session(
+        &self,
+        params: SessionHoldParams,
+    ) -> Result<SessionHoldResponse, RpcError> {
+        let mut state = self.lock();
+        state.holds += 1;
+        let session = state.session(&params.session)?;
+        let open = session
+            .turn
+            .as_mut()
+            .and_then(|turn| turn.input.as_mut())
+            .filter(|request| request.id == params.request);
+        let Some(request) = open else {
+            return Err(RpcError::new(
+                ErrorCode::InputNotOpen,
+                "the input request is not open",
+            ));
+        };
+        if request.timeout.take().is_some() {
+            session.publish(SessionEvent::InputHeld { id: params.request });
+        }
+        Ok(SessionHoldResponse {})
     }
 
     async fn configure_session(

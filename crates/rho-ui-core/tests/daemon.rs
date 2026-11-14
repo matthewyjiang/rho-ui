@@ -7,10 +7,10 @@ use std::{path::Path, time::Duration};
 use futures::FutureExt;
 use rho_ui_core::{
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    AttachedFile, Attachment, BackgroundKind, BackgroundStatus, Checkout, ChoiceKind, ConfigKind,
-    ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry,
-    Image, ImageFormat, JobActivity, Prompt, RunState, Session, SessionId, Unsteered,
-    MAX_PROMPT_ATTACHMENT_BYTES,
+    Answer, AttachedFile, Attachment, BackgroundKind, BackgroundStatus, Checkout, ChoiceKind,
+    ConfigKind, ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
+    DaemonTarget, Entry, Form, Image, ImageFormat, JobActivity, Prompt, RunState, Session,
+    SessionId, Unsteered, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -90,15 +90,19 @@ fn a_prompt_runs_a_turn_through_an_approval() {
         .await;
         let request = session.inputs()[0].clone();
         assert_eq!(request.title(), "Run `ls`?");
-        assert_eq!(request.choices()[0].kind(), ChoiceKind::Accept);
-        let allow = request.choice("allow-once").unwrap();
+        let Form::Choices { choices, .. } = request.form() else {
+            panic!("an approval is answered by choosing");
+        };
+        assert_eq!(choices[0].id(), "allow-once");
+        assert_eq!(choices[0].kind(), ChoiceKind::Accept);
+        let allow = choices[0].answer("");
         daemon
-            .answer(session.id(), request.id(), allow)
+            .answer(session.id(), request.id(), &allow)
             .await
             .unwrap();
         // A second answer finds the request closed, which is not an error.
         daemon
-            .answer(session.id(), request.id(), allow)
+            .answer(session.id(), request.id(), &allow)
             .await
             .unwrap();
 
@@ -109,6 +113,60 @@ fn a_prompt_runs_a_turn_through_an_approval() {
         let usage = session.usage().unwrap();
         assert_eq!((usage.used(), usage.size()), (2500, Some(10_000)));
         assert_eq!(usage.cost_usd(), Some(0.01));
+    });
+}
+
+/// A question with a timeout shows its fallback until a client holds it;
+/// held, it waits for the questionnaire's answer.
+#[test]
+fn a_held_question_waits_for_its_answers() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut session = new_session(&daemon).await;
+        daemon
+            .prompt(session.id(), &"questions timeout".into())
+            .await
+            .unwrap();
+        until(&mut events, &mut session, |s| !s.inputs().is_empty()).await;
+        let request = session.inputs()[0].clone();
+        let Form::Questions(questions) = request.form() else {
+            panic!("a question is a questionnaire");
+        };
+        assert_eq!(questions.questions.len(), 2);
+        let timeout = request.timeout().expect("the question times out");
+        assert_eq!(timeout.fallback(), "Language: Rust");
+
+        daemon.hold(session.id(), request.id()).await.unwrap();
+        until(&mut events, &mut session, |s| {
+            s.inputs()
+                .first()
+                .is_some_and(|open| open.timeout().is_none())
+        })
+        .await;
+        assert_eq!(fake.holds(), 1);
+
+        let answers = Answer::questions(
+            [
+                ("lang".to_owned(), vec!["Zig".to_owned()]),
+                (
+                    "checks".to_owned(),
+                    vec!["fmt".to_owned(), "test".to_owned()],
+                ),
+            ]
+            .into(),
+        );
+        daemon
+            .answer(session.id(), request.id(), &answers)
+            .await
+            .unwrap();
+        until(&mut events, &mut session, |s| !s.state().is_busy()).await;
+        assert_eq!(
+            last_reply(&session),
+            "you answered checks=fmt,test; lang=Zig"
+        );
+        // Holding a request that closed is no error.
+        daemon.hold(session.id(), request.id()).await.unwrap();
     });
 }
 

@@ -499,6 +499,185 @@ fn new_session_runs_a_turn_through_an_approval() {
     ui.shot("done");
 }
 
+/// Opens a new session and sends it `prompt`.
+fn new_session_with(ui: &mut Harness, prompt: &str) {
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.act(|window, cx| {
+        window.input(prompt, cx);
+        window.press("enter", cx);
+    });
+}
+
+/// The last thing the agent said in the active session.
+fn last_reply(ui: &mut Harness) -> String {
+    match ui.session().entries().last() {
+        Some(Entry::Agent(reply)) => reply.text().to_owned(),
+        other => panic!("the transcript ends in {other:?}"),
+    }
+}
+
+/// A questionnaire of two questions, one taking the user's own text and
+/// one taking several choices, is answered one question at a time.
+#[test]
+fn a_questionnaire_is_answered_one_question_at_a_time() {
+    let mut ui = Harness::start("questions", Script::default());
+    new_session_with(&mut ui, "questions");
+    ui.wait_until("the first question", |window, _, _| {
+        is_visible(window, "question-lang-rust") && is_visible(window, "approval-decline")
+    });
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "question-checks-fmt"),
+            "one question at a time"
+        );
+        assert!(!is_visible(window, "input-timeout"), "no timeout was set");
+    });
+    ui.shot("first");
+
+    // The user's own text answers a single-choice question.
+    ui.act(|window, cx| {
+        window.click("question-lang-other", cx);
+        window.input("Zig", cx);
+    });
+    ui.click("questions-next");
+    ui.wait_until("the second question", |window, _, _| {
+        is_visible(window, "question-checks-fmt") && is_visible(window, "questions-submit")
+    });
+    // The agent's suggestion, Tests, is picked already; Format joins it.
+    ui.click("question-checks-fmt");
+    ui.shot("second");
+    ui.click("questions-submit");
+
+    ui.wait_for_session("the answered turn", |session| {
+        session.state() == &RunState::Idle && session.inputs().is_empty()
+    });
+    assert_eq!(
+        last_reply(&mut ui),
+        "you answered checks=fmt,test; lang=Zig"
+    );
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "input-card"), "the card closes");
+    });
+}
+
+/// An answer the daemon refuses leaves the card as the user filled it in,
+/// ready to answer again.
+#[test]
+fn a_refused_answer_keeps_the_card() {
+    let mut ui = Harness::start("refused", Script::default());
+    new_session_with(&mut ui, "questions");
+    ui.wait_until("the first question", |window, _, _| {
+        is_visible(window, "question-lang-other")
+    });
+    ui.act(|window, cx| {
+        window.click("question-lang-other", cx);
+        window.input("refuse", cx);
+    });
+    ui.click("questions-next");
+    ui.wait_until("the second question", |window, _, _| {
+        is_visible(window, "questions-submit")
+    });
+    ui.click("questions-submit");
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "session-error")
+    });
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "question-checks-fmt") && is_visible(window, "questions-submit"),
+            "the card stays on the question it was on"
+        );
+    });
+    assert_eq!(ui.session().inputs().len(), 1, "the request is still open");
+    ui.shot("refused");
+
+    ui.click("approval-decline");
+    ui.wait_for_session("the declined turn", |session| {
+        session.state() == &RunState::Idle
+    });
+    assert_eq!(last_reply(&mut ui), "you declined");
+}
+
+/// A question with a timeout shows the daemon's fallback and a countdown,
+/// until the user's first key holds it.
+#[test]
+fn a_timed_question_holds_on_the_first_key() {
+    let mut ui = Harness::start("timeout", Script::default());
+    new_session_with(&mut ui, "questions timeout");
+    ui.wait_until("the countdown", |window, _, _| {
+        is_visible(window, "input-timeout")
+    });
+    let countdown = ui.label("input-timeout").unwrap_or_default();
+    assert!(
+        countdown.starts_with("rho answers “Language: Rust” in 4:")
+            || countdown.starts_with("rho answers “Language: Rust” in 5:00"),
+        "the countdown names the fallback: {countdown:?}"
+    );
+    ui.shot("countdown");
+    assert_eq!(ui.fake().holds(), 0, "showing the question holds nothing");
+
+    // The card took the keyboard as it opened, so the keys land in it;
+    // the second comes before the daemon says the first held it.
+    ui.act(|window, cx| {
+        window.press("down", cx);
+        window.press("down", cx);
+    });
+    ui.wait_until("the hold", |window, cx, app| {
+        let held = app.active_session().is_some_and(|view| {
+            let inputs = view.read(cx).session().inputs();
+            inputs.first().is_some_and(|open| open.timeout().is_none())
+        });
+        held && !is_visible(window, "input-timeout")
+    });
+    assert_eq!(ui.fake().holds(), 1, "a request is held once");
+    ui.shot("held");
+
+    ui.click("approval-decline");
+    ui.wait_for_session("the declined turn", |session| {
+        session.state() == &RunState::Idle
+    });
+    assert_eq!(last_reply(&mut ui), "you declined");
+}
+
+/// A denial carries the user's reason, and a plan approval their feedback.
+#[test]
+fn denials_and_plan_approvals_carry_text_for_the_model() {
+    let mut ui = Harness::start("feedback", Script::default());
+    new_session_with(&mut ui, "list files");
+    ui.wait_until("the approval", |window, _, _| {
+        is_visible(window, "approval-allow-once") && is_visible(window, "input-text")
+    });
+    // Enter in the text box denies, with the text as the reason.
+    ui.act(|window, cx| {
+        window.click("input-text", cx);
+        window.input("not in this repo", cx);
+    });
+    ui.shot("reason");
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_session("the denied turn", |session| {
+        session.state() == &RunState::Idle
+    });
+    assert_eq!(last_reply(&mut ui), "you chose deny: not in this repo");
+
+    ui.send("plan");
+    ui.wait_until("the plan approval", |window, _, _| {
+        is_visible(window, "approval-approve-auto") && is_visible(window, "input-text")
+    });
+    ui.act(|window, cx| {
+        window.click("input-text", cx);
+        window.input("tests first", cx);
+    });
+    ui.shot("plan");
+    ui.click("approval-approve-auto");
+    ui.wait_for_session("the approved plan", |session| {
+        session.state() == &RunState::Idle
+    });
+    assert_eq!(last_reply(&mut ui), "you chose approve_plan: tests first");
+}
+
 /// A sent message renders as markdown; dragging across it selects the
 /// text, and copy puts it on the clipboard.
 #[test]

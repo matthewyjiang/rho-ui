@@ -1,5 +1,6 @@
 //! One session: a title bar naming its project and the sessions above it,
-//! the transcript, approvals, and the composer with the session settings.
+//! the transcript, what a turn asks (approvals and questions), and the
+//! composer with the session settings.
 //! Owns the session's [`Session`] state and every request the user makes in
 //! it.
 //!
@@ -45,14 +46,14 @@ use gpui_kit::{
     Window,
 };
 use rho_ui_core::{
-    Attached, Attachment, BackgroundId, Daemon, DaemonError, Entry, Prompt, RunState, Session,
-    SessionId, SessionUpdate, SteerId, TurnId, Unsteered,
+    Answer, Attached, Attachment, BackgroundId, Daemon, DaemonError, Entry, InputId, Prompt,
+    RunState, Session, SessionId, SessionUpdate, SteerId, TurnId, Unsteered,
 };
 
 use crate::{
-    approval::ApprovalCard,
     background::{BackgroundHistory, BackgroundList, OpenHandler},
     composer::{Composer, ComposerMode, ComposerState},
+    input_card::{InputCard, InputCardEvent, Queue},
     machines::{Place, SessionKey},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
@@ -113,7 +114,8 @@ pub(crate) struct SessionView {
     transcript: Transcript,
     composer: Entity<ComposerState>,
     settings: Entity<SessionSettings>,
-    approval_focus: FocusHandle,
+    /// The oldest open request, while there is one, and its events.
+    card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt is on its way to the daemon.
     sending: bool,
     /// Background work the user asked to stop that still runs.
@@ -197,7 +199,7 @@ impl SessionView {
             transcript,
             composer,
             settings,
-            approval_focus: cx.focus_handle(),
+            card: None,
             sending: false,
             stopping: Vec::new(),
             busy_since: None,
@@ -383,26 +385,19 @@ impl SessionView {
         if let Some(ix) = self.session.apply(update) {
             self.transcript.changed(self.session.entries(), ix, cx);
         }
-        // Move the keyboard to the default answer if the user is in this
-        // session; never steal focus from another one, nor from a message
-        // being typed, whose Enter would then approve instead of send.
-        let asks = !self.session.inputs().is_empty();
-        let typing = !self.composer.read(cx).is_empty(cx);
-        let shows_approvals = !self.is_subagent();
-        if asks
-            && !asked
-            && !typing
-            && shows_approvals
-            && self.focus_handle.contains_focused(window, cx)
-        {
-            window.focus(&self.approval_focus, cx);
-        }
         // A turn that ended before reading a steer dropped it.
         let dropped = self.session.take_dropped_steers();
         if !dropped.is_empty() {
             self.give_back(dropped.join("\n").into(), window, cx);
         }
         self.after_change(window, cx);
+        // Move the keyboard into the card if the user is in this session;
+        // never steal focus from another one, nor from a message being
+        // typed, whose Enter would then answer instead of send.
+        let typing = !self.composer.read(cx).is_empty(cx);
+        if !asked && !typing && self.focus_handle.contains_focused(window, cx) {
+            self.focus_card(window, cx);
+        }
     }
 
     /// Records the answer to the attach.
@@ -437,6 +432,7 @@ impl SessionView {
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.transcript.sync(self.session.entries(), cx);
         self.sync_settings(window, cx);
+        self.sync_card(window, cx);
         // Until the attachment has caught up, the session's state is the
         // conversation's past: no turn starts or ends in it now.
         if self.session.is_replaying() {
@@ -738,38 +734,119 @@ impl SessionView {
         .detach();
     }
 
-    /// Answers the oldest open request with its choice `choice`. The
-    /// request leaves the view at once, so it can't be answered twice, and
-    /// comes back if the daemon didn't take the answer.
-    fn choose(&mut self, choice: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let answer = self.session.inputs().first().and_then(|request| {
-            let choice = request.choice(choice)?.clone();
-            Some((request.id(), choice))
-        });
-        let Some((request, choice)) = answer else {
-            return;
-        };
-        let Some(asked) = self.session.close_input(request) else {
-            return;
-        };
-        if self.session.inputs().is_empty() {
-            window.focus(&self.composer.focus_handle(cx), cx);
+    /// Shows the oldest open request in the card, keeping what the user
+    /// filled in while it is the same request. A subagent's session shows
+    /// none: its questions go to its parent.
+    fn sync_card(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let inputs = if self.is_subagent() {
+            &[]
         } else {
-            window.focus(&self.approval_focus, cx);
+            self.session.inputs()
+        };
+        let queue = Queue::of(inputs);
+        let shown = self.card.as_ref().map(|(card, _)| card.clone());
+        match (inputs.first(), &shown) {
+            (Some(request), Some(card)) if card.read(cx).id() == request.id() => {
+                card.update(cx, |card, cx| card.set_request(request, queue, cx));
+                return;
+            }
+            (None, None) => return,
+            _ => {}
         }
+        // Another request takes the card: the keyboard follows it, if it
+        // was in the card.
+        let focused = shown.is_some_and(|card| card.read(cx).contains_focus(window, cx));
+        self.card = inputs.first().cloned().map(|request| {
+            let card = cx.new(|cx| InputCard::new(request, queue, window, cx));
+            let subscription = cx.subscribe_in(&card, window, Self::on_card_event);
+            (card, subscription)
+        });
+        if focused && self.card.is_some() {
+            self.focus_card(window, cx);
+        } else if focused {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
+    }
+
+    /// Moves the keyboard into the card, if one shows.
+    fn focus_card(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some((card, _)) = &self.card {
+            card.update(cx, |card, cx| card.focus(window, cx));
+        }
+    }
+
+    fn on_card_event(
+        &mut self,
+        card: &Entity<InputCard>,
+        event: &InputCardEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let card = card.downgrade();
+        match event {
+            InputCardEvent::Answer(request, answer) => {
+                // The keyboard goes back to the composer now, not when the
+                // daemon answers, which may be after the user moved on.
+                // With more requests waiting, it stays to follow the next.
+                if self.session.inputs().len() <= 1 {
+                    window.focus(&self.composer.focus_handle(cx), cx);
+                }
+                self.answer(*request, answer.clone(), card, window, cx);
+            }
+            InputCardEvent::Hold(request) => self.hold_input(*request, card, window, cx),
+        }
+    }
+
+    /// Sends `answer` to open request `request`, whose card takes no other
+    /// answer meanwhile. Once the daemon takes it, the request closes; if
+    /// not, the card takes an answer again, filled in as it was.
+    fn answer(
+        &mut self,
+        request: InputId,
+        answer: Answer,
+        card: WeakEntity<InputCard>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let daemon = self.daemon.clone();
         let id = self.session.id().clone();
         cx.spawn_in(window, async move |this, cx| {
-            if let Err(error) = daemon.answer(&id, request, &choice).await {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.session.open_input(asked);
+            let sent = daemon.answer(&id, request, &answer).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Err(error) = sent {
+                    let _ = card.update(cx, InputCard::answer_failed);
                     this.error = Some(format!("Couldn't send the answer: {error}"));
-                    this.after_change(window, cx);
+                    cx.notify();
+                    return;
+                }
+                this.session.close_input(request);
+                this.after_change(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Stops request `request`'s timeout, as the user started on it. The
+    /// daemon's word that it is held drops the countdown.
+    fn hold_input(
+        &mut self,
+        request: InputId,
+        card: WeakEntity<InputCard>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = daemon.hold(&id, request).await {
+                let _ = card.update(cx, |card, _| card.hold_failed());
+                let _ = this.update(cx, |this, cx| {
+                    this.error = Some(format!("Couldn't stop the question's timeout: {error}"));
+                    cx.notify();
                 });
             }
         })
         .detach();
-        self.after_change(window, cx);
     }
 
     /// Shows the session's settings, changeable once the session is open,
@@ -915,9 +992,8 @@ impl SessionView {
                 .into_any_element();
         }
         let busy = self.is_busy();
-        let view = cx.entity().downgrade();
-        let stop_view = view.clone();
-        let send_view = view.clone();
+        let send_view = cx.entity().downgrade();
+        let stop_view = send_view.clone();
         footer
             .when_some(self.error.clone(), |this, message| {
                 this.child(
@@ -931,16 +1007,8 @@ impl SessionView {
                     ),
                 )
             })
-            .when_some(self.session.inputs().first(), |this, request| {
-                let view = view.clone();
-                this.child(ApprovalCard::new(
-                    request,
-                    self.session.inputs().len(),
-                    self.approval_focus.clone(),
-                    move |choice, window, cx| {
-                        let _ = view.update(cx, |this, cx| this.choose(choice, window, cx));
-                    },
-                ))
+            .when_some(self.card.as_ref(), |this, (card, _)| {
+                this.child(card.clone())
             })
             .children(self.render_background(cx))
             .children(self.render_steers(cx))

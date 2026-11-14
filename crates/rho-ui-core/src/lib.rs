@@ -20,7 +20,10 @@ pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached, Job,
     JobActivity, SessionId, SessionSummary, Unsteered,
 };
-pub use input::{ChoiceKind, InputChoice, InputId, InputRequest};
+pub use input::{
+    Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
+    Questions, Suggestion, SuggestionStyle, TextBox, Timeout,
+};
 pub use options::{
     CommandInfo, CommandKind, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue,
     FAST_MODE_ID,

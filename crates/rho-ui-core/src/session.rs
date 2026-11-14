@@ -16,8 +16,8 @@ use std::{
 };
 
 use rho_protocol::{
-    AnswerStop, CardTone, JobState, SessionAttachResponse, SessionEvent, SessionOptions,
-    ToolCallUpdate, TurnOutcome,
+    AnswerStop, CardTone, JobState, Resolution, SessionAttachResponse, SessionEvent,
+    SessionOptions, ToolCallUpdate, TurnOutcome,
 };
 
 use crate::{
@@ -682,9 +682,8 @@ impl Session {
         &self.inputs
     }
 
-    /// Takes request `id` out, as the UI does once it sends an answer, so
-    /// it can't be answered twice. The daemon's own word that it closed is
-    /// then a no-op; [`Self::open_input`] puts it back if the answer failed.
+    /// Takes request `id` out, as the UI does once the daemon took its
+    /// answer. The daemon's own word that it closed is then a no-op.
     pub fn close_input(&mut self, id: InputId) -> Option<InputRequest> {
         let at = self.inputs.iter().position(|request| request.id() == id)?;
         Some(self.inputs.remove(at))
@@ -692,7 +691,7 @@ impl Session {
 
     /// Adds an open request, replacing one of the same ID: an attach
     /// response and its replay may both carry it.
-    pub fn open_input(&mut self, request: InputRequest) {
+    fn open_input(&mut self, request: InputRequest) {
         match self
             .inputs
             .iter_mut()
@@ -836,22 +835,54 @@ impl Session {
                 });
                 None
             }
-            SessionEvent::InputRequested { request } => {
-                self.open_input(InputRequest::from_wire(*request));
-                None
-            }
-            SessionEvent::InputResolved { id, .. } => {
-                self.close_input(InputId(id.0));
-                None
-            }
+            event @ (SessionEvent::InputRequested { .. }
+            | SessionEvent::InputResolved { .. }
+            | SessionEvent::InputHeld { .. }) => self.track_input(event),
             SessionEvent::Background { work } => {
                 self.set_background(work);
                 None
             }
-            // Compaction and provider progress, held timeouts, and cache
-            // warming are not shown yet.
+            // Compaction and provider progress, and cache warming, are not
+            // shown yet.
             _ => None,
         }
+    }
+
+    /// Follows the session's open requests: one opened, closed, or held,
+    /// which drops its timeout. A request nobody answered by its deadline
+    /// leaves a notice of the answer rho gave, the entry this returns: the
+    /// user may have been about to answer it.
+    fn track_input(&mut self, event: SessionEvent) -> Option<usize> {
+        match event {
+            SessionEvent::InputRequested { request } => {
+                self.open_input(InputRequest::from_wire(*request));
+            }
+            SessionEvent::InputResolved { id, resolution } => {
+                let closed = self.close_input(InputId(id.0))?;
+                let timeout = closed
+                    .timeout()
+                    .filter(|_| resolution == Resolution::TimedOut)?;
+                return Some(self.push_notice(Notice {
+                    level: NoticeLevel::Warning,
+                    title: format!(
+                        "No answer came in time, so rho answered “{}”",
+                        timeout.fallback()
+                    ),
+                    description: Some(closed.title().to_owned()),
+                }));
+            }
+            SessionEvent::InputHeld { id } => {
+                let held = self
+                    .inputs
+                    .iter_mut()
+                    .find(|open| open.id() == InputId(id.0));
+                if let Some(request) = held {
+                    request.hold();
+                }
+            }
+            _ => {}
+        }
+        None
     }
 
     /// Opens the turn that began live, if `event` is the first of it that

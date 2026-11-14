@@ -28,14 +28,15 @@ use rho_protocol::{
     DetachReason, ErrorCode, FrameError, IdleWake, JobKind, JobListParams, JobState, JobSummary,
     LocalDaemon, LocalDaemonError, Notifications, SessionAnswerParams, SessionAttachParams,
     SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
-    SessionDetachParams, SessionListParams, SessionNewParams, SessionObserveParams, SessionPart,
-    SessionPromptParams, SessionSteerParams, SessionUnsteerParams, TurnOutcome, UnsteerOutcome,
+    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
+    SessionObserveParams, SessionPromptParams, SessionSteerParams, SessionUnsteerParams,
+    TurnOutcome, UnsteerOutcome,
 };
 use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 
 use crate::{
     background::BackgroundId,
-    input::{InputChoice, InputId},
+    input::{Answer, InputId},
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
     prompt::{mebibytes, Prompt},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
@@ -511,13 +512,11 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
     Ok((daemon, events))
 }
 
-/// What every session this client opens gets. No questionnaire tool, since
-/// this UI shows only the simplest questions. `idle_wake: turn`, as rho's
+/// What every session this client opens gets: `idle_wake: turn`, as rho's
 /// terminal UI asks: a turn ends while the background work it started runs
 /// on, and the daemon starts a turn of its own when that work finishes.
 fn session_setup() -> rho_protocol::SessionSetup {
     rho_protocol::SessionSetup {
-        without: [SessionPart::Questions].into(),
         idle_wake: IdleWake::Turn,
         ..Default::default()
     }
@@ -811,7 +810,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Answers open request `request` of session `id` with `choice`. A
+    /// Answers open request `request` of session `id` with `answer`. A
     /// request that already closed, as when another client answered first,
     /// counts as answered.
     ///
@@ -823,14 +822,34 @@ impl Daemon {
         &self,
         id: &SessionId,
         request: InputId,
-        choice: &InputChoice,
+        answer: &Answer,
     ) -> Result<(), DaemonError> {
         let params = SessionAnswerParams {
             session: id.to_wire(),
             request: rho_protocol::InputRequestId(request.0),
-            answer: choice.answer.clone(),
+            answer: answer.0.clone(),
         };
         match self.client.request::<methods::SessionAnswer>(&params).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.error_code() == Some(ErrorCode::InputNotOpen) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Stops open request `request`'s timeout, so it waits for an answer,
+    /// as once the user starts on it. The session then hears the request
+    /// was held. A request that closed meanwhile needs no holding.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon refuses or the connection is gone; the request
+    /// may then still time out.
+    pub async fn hold(&self, id: &SessionId, request: InputId) -> Result<(), DaemonError> {
+        let params = SessionHoldParams {
+            session: id.to_wire(),
+            request: rho_protocol::InputRequestId(request.0),
+        };
+        match self.client.request::<methods::SessionHold>(&params).await {
             Ok(_) => Ok(()),
             Err(error) if error.error_code() == Some(ErrorCode::InputNotOpen) => Ok(()),
             Err(error) => Err(error.into()),
