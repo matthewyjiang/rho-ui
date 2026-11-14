@@ -2523,6 +2523,64 @@ fn the_right_panel_resizes_from_its_edge() {
     );
 }
 
+/// Dragging the open sidebar's edge resizes it, but no narrower than its
+/// minimum; the width outlives a restart, and a double-click on the edge
+/// puts the default back.
+#[test]
+fn the_sidebar_resizes_from_its_edge() {
+    let mut ui = Harness::start("sidebar-resize", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    let sidebar = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                bounds(window, "sidebar").expect("the sidebar is drawn")
+            })
+            .expect("window is open")
+    };
+    let drag_edge = |ui: &mut Harness, to: Pixels| {
+        let edge = sidebar(ui);
+        let from = gpui_kit::point(edge.right() - px(2.), edge.center().y);
+        ui.act(|window, cx| window.drag(from, gpui_kit::point(to, from.y), cx));
+    };
+    let before = sidebar(&mut ui);
+    drag_edge(&mut ui, before.right() + px(40.));
+    let wider = sidebar(&mut ui);
+    assert!(
+        (wider.size.width - before.size.width - px(40.)).abs() < px(3.),
+        "the sidebar follows the pointer: {before:?} became {wider:?}"
+    );
+
+    let mut ui = ui.reopen("sidebar-resize", Shelves::owning(["s1"]));
+    ui.wait_until("saved sessions again", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    assert_eq!(
+        sidebar(&mut ui).size.width,
+        wider.size.width,
+        "the width is kept"
+    );
+
+    drag_edge(&mut ui, px(0.));
+    // 14 rem at the default scale.
+    assert_eq!(sidebar(&mut ui).size.width, px(224.), "the narrowest");
+    ui.act(|window, cx| window.hover("session-local-s1", cx));
+    ui.shot("narrowest");
+    ui.act(|window, cx| {
+        window.click_with_options(
+            "sidebar-edge",
+            gpui_kit::test::ClickOptions::new().with_count(2),
+            cx,
+        );
+    });
+    assert_eq!(
+        sidebar(&mut ui).size.width,
+        before.size.width,
+        "the default width"
+    );
+}
+
 /// A subagent's row in the background work opens its session, nested under
 /// its parent in the title bar: the subagent's messages as they come, and
 /// no composer, as only the subagent writes there. The parent's step in the

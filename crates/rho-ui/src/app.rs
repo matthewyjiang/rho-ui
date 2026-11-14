@@ -35,11 +35,11 @@ use crate::{
     machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
     projects::Projects,
     rho_settings::RhoSettings,
-    right_panel::{PanelLayout, ResizeRightPanel, RightPanel, TerminalShell},
+    right_panel::{PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, MIN_PANE_REMS},
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
-    sidebar::{SidebarEvent, SidebarState, SidebarView},
+    sidebar::{ResizeSidebar, SidebarEvent, SidebarState, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
     NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
 };
@@ -215,6 +215,8 @@ impl RhoApp {
                 SidebarEvent::Retry(machine) => this.connect(machine, window, cx),
                 SidebarEvent::OpenSettings => this.open_settings(window, cx),
                 SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
+                // The sidebar's width is laid out here.
+                SidebarEvent::Resized => cx.notify(),
             },
         );
         let shell = launch.shell.clone();
@@ -1337,6 +1339,30 @@ impl Render for RhoApp {
                     },
                 ))
                 .on_drop(|_: &ResizeRightPanel, _, cx| PanelLayout::save_width(cx))
+                // A drag of the open sidebar's edge: its width is the
+                // pointer's distance from the left, leaving the pane its
+                // room beside the right panel.
+                .on_drag_move(cx.listener(
+                    |this, event: &DragMoveEvent<ResizeSidebar>, window, cx| {
+                        let rem = f32::from(window.rem_size());
+                        let bounds = event.bounds;
+                        let width = f32::from(event.event.position.x - bounds.left()) / rem;
+                        let row = f32::from(bounds.size.width) / rem;
+                        let sidebar = this.sidebar.read(cx).width().0;
+                        let panel = if PanelLayout::get(cx) {
+                            PanelLayout::width(row, sidebar, cx).0
+                        } else {
+                            0.
+                        };
+                        let space = row - panel - MIN_PANE_REMS;
+                        this.sidebar
+                            .update(cx, |sidebar, _| sidebar.resize(width, space));
+                        cx.notify();
+                    },
+                ))
+                .on_drop(cx.listener(|this, _: &ResizeSidebar, _, cx| {
+                    this.sidebar.read(cx).save_width();
+                }))
                 .child(
                     self.sidebar.clone().cached(
                         StyleRefinement::default()

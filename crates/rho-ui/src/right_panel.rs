@@ -64,7 +64,7 @@ const MIN_WIDTH_REMS: f32 = 16.;
 /// scale. In the UI tests' screenshots the composer's footer lays out its
 /// buttons in about 400px, and the composer sits 40px in from the pane's
 /// edges.
-const MIN_PANE_REMS: f32 = 30.;
+pub(crate) const MIN_PANE_REMS: f32 = 30.;
 
 /// What the panel can show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

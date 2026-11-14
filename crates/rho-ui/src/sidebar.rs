@@ -8,7 +8,9 @@
 //! search hides machines or keeps to chosen projects, and the footer says
 //! which machines aren't connected.
 //!
-//! The sidebar collapses to a rail of buttons; see [`rail`].
+//! Drag the open sidebar's right edge to resize it, and double-click the
+//! edge for its default width. The sidebar collapses to a rail of buttons;
+//! see [`rail`].
 //!
 //! The app draws this view as a cached view, so a hover or scroll here
 //! redraws only the sidebar, and [`v_virtual_list`] builds only the rows on
@@ -34,12 +36,13 @@ use gpui_kit::component::{
     hover_card::HoverCard,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
-    v_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt, Theme,
-    VirtualListScrollHandle, WindowExt as _,
+    resizable::{resize_handle, HandleEdge},
+    v_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, InteractiveElementExt as _,
+    Sizable as _, StyledExt, Theme, VirtualListScrollHandle, WindowExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    canvas, div, px, rems, size, Anchor, AnyElement, App, AppContext as _, Context, Entity,
+    canvas, div, px, rems, size, Anchor, AnyElement, App, AppContext as _, Axis, Context, Entity,
     EventEmitter, FocusHandle, Focusable as _, Hsla, InteractiveElement as _, IntoElement,
     MouseButton, ParentElement, Pixels, Rems, Render, ScrollStrategy, SharedString,
     StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
@@ -82,7 +85,8 @@ const SHELVED_PAD_REMS: f32 = 0.5;
 const SHELVED_ROW_REMS: f32 = TITLE_REMS + 2. * SHELVED_PAD_REMS + 2. * GUTTER_REMS;
 
 /// The most a machine's label takes in a row, so a long one leaves the
-/// title and branch room: about a quarter of the open sidebar's 18 rem.
+/// title and branch room: about a quarter of the open sidebar's default
+/// 18 rem.
 const MACHINE_LABEL_REMS: f32 = 5.;
 
 /// A shelf header's height.
@@ -213,6 +217,19 @@ pub(crate) enum SidebarEvent {
     /// Collapse the sidebar to its rail, or open it again; see
     /// [`SidebarView::toggle_collapsed`].
     ToggleCollapsed,
+    /// The open sidebar went back to its default width; lay it out again.
+    Resized,
+}
+
+/// What a drag of the open sidebar's edge carries. The drag draws nothing:
+/// the sidebar itself follows the pointer.
+#[derive(Clone, Copy)]
+pub(crate) struct ResizeSidebar;
+
+impl Render for ResizeSidebar {
+    fn render(&mut self, _: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
+        gpui_kit::Empty
+    }
 }
 
 /// The row under the mouse, which shows its actions instead of its status.
@@ -438,7 +455,18 @@ impl SidebarView {
 
     /// How wide the app lays the sidebar out.
     pub(crate) fn width(&self) -> Rems {
-        self.layout.current().width()
+        self.layout.width()
+    }
+
+    /// Makes the open sidebar `width` rems wide, held to the `room` the
+    /// row leaves it, as a drag of its edge goes.
+    pub(crate) fn resize(&mut self, width: f32, room: f32) {
+        self.layout.resize(width, room);
+    }
+
+    /// Saves the width a drag of the edge left.
+    pub(crate) fn save_width(&self) {
+        self.layout.save_width();
     }
 
     /// The search's, which the collapsed sidebar doesn't show.
@@ -1040,6 +1068,9 @@ impl Render for SidebarView {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let frame = v_flex()
+            .id("sidebar")
+            .test_support()
+            .relative()
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
@@ -1069,6 +1100,20 @@ impl Render for SidebarView {
             )
             .child(self.render_list(window, cx))
             .child(self.render_footer(cx))
+            // [`crate::app::RhoApp`] follows the drag, as it lays out the
+            // row the sidebar sits in.
+            .child(
+                resize_handle::<ResizeSidebar, ResizeSidebar>("sidebar-edge", Axis::Horizontal)
+                    .inside(HandleEdge::Trailing)
+                    .on_drag(ResizeSidebar, |drag, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| *drag)
+                    })
+                    .on_double_click(cx.listener(|this, _, _, cx| {
+                        this.layout.reset_width();
+                        cx.emit(SidebarEvent::Resized);
+                    })),
+            )
     }
 }
 

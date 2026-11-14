@@ -114,6 +114,9 @@ const PRAGMAS: &str = "
 pub(crate) enum Key {
     /// `open` or `collapsed`; see [`crate::sidebar::SidebarLayout`].
     SidebarLayout,
+    /// The open sidebar's width in rems; see
+    /// [`crate::sidebar::SidebarLayout`].
+    SidebarWidth,
     /// The machines and projects the sidebar hides; see
     /// [`crate::session_list::Filter`].
     SidebarFilter,
@@ -128,6 +131,7 @@ impl Key {
     fn name(self) -> &'static str {
         match self {
             Key::SidebarLayout => "sidebar-layout",
+            Key::SidebarWidth => "sidebar-width",
             Key::SidebarFilter => "sidebar-filter",
             Key::RightPanel => "right-panel",
             Key::RightPanelWidth => "right-panel-width",
