@@ -1985,7 +1985,8 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
 /// The right panel shows and hides with Ctrl+Alt+B or its toggle, and the
 /// state database remembers which. It lists its surfaces; the Background
 /// surface opens as a tab, follows the session on screen, and stops its
-/// work. Closing the last tab goes back to the list.
+/// work. + opens a menu of the surfaces still to open. A hovered tab shows
+/// × in place of its icon, and closing the last tab goes back to the list.
 #[test]
 fn the_right_panel_opens_a_surface_that_follows_the_session() {
     let mut ui = Harness::start("right-panel", Script::default());
@@ -2057,6 +2058,27 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
         assert!(!is_visible(window, "panel-ended-0"), "s1 ran no work");
     });
 
+    // + opens a menu over the open surface, not the list in its place.
+    ui.click("panel-surfaces");
+    ui.shot("menu");
+    click_label(&mut ui, "Diff");
+    ui.act(|window, _| {
+        assert!(is_visible(window, "panel-tab-diff"), "Diff opens as a tab");
+        assert!(!is_visible(window, "panel-surface-list"));
+        assert!(!is_visible(window, "panel-surfaces"), "nothing left to add");
+    });
+    ui.act(|window, cx| window.hover("panel-tab-diff", cx));
+    ui.click("close-panel-tab-diff");
+    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-diff")));
+
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "close-panel-tab-background"),
+            "× waits for a hover"
+        );
+    });
+    ui.act(|window, cx| window.hover("panel-tab-background", cx));
+    ui.shot("hover-tab");
     ui.click("close-panel-tab-background");
     ui.act(|window, _| {
         assert!(!is_visible(window, "panel-tab-background"));

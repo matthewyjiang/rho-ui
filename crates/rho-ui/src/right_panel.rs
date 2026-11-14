@@ -4,10 +4,11 @@
 //! left edge to resize it, and double-click the edge for its default width.
 //! The state database remembers both ([`PanelLayout`]).
 //!
-//! Each surface opens as a tab in the panel's header. With none open, the
-//! panel lists the surfaces to open, and dimmed under them those still to
-//! come ([`PLANNED`]); while a surface shows and another isn't open, + in
-//! the header lists those again. The panel is the window's, not a
+//! Each surface opens as a tab in the panel's header; hovering a tab swaps
+//! its icon for × to close it. With none open, the panel lists the
+//! surfaces to open, and dimmed under them those still to come
+//! ([`PLANNED`]); while another isn't open, + in the header opens a menu
+//! of the same. The panel is the window's, not a
 //! session's: its tabs stay as sessions change, and each surface shows
 //! the session on screen.
 //!
@@ -26,6 +27,7 @@ use gpui_kit::component::{
     empty::{Empty, EmptyDescription, EmptyHeader},
     h_flex,
     list::ListItem,
+    menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
     resizable::{resize_handle, HandleEdge},
     v_flex, ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Selectable as _,
     Sizable as _, StyledExt as _,
@@ -33,7 +35,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     div, rems, AnyElement, App, AppContext as _, Axis, BorrowAppContext as _, Context, Entity,
     Global, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, SharedString,
-    Styled as _, Subscription, Window,
+    Styled as _, Subscription, WeakEntity, Window,
 };
 
 use self::diff::DiffSurface;
@@ -238,8 +240,10 @@ pub(crate) struct RightPanel {
     workspaces: Entity<Workspaces>,
     /// The open surfaces, in the order opened.
     tabs: Vec<Tab>,
-    /// One of `tabs`, or `None` for the list of surfaces.
+    /// One of `tabs`, or `None` for the list of surfaces when none is open.
     active: Option<Surface>,
+    /// The tab under the pointer, which shows × in place of its icon.
+    hovered: Option<Surface>,
     /// The session on screen, if any, with the subscription that redraws
     /// the panel as it changes.
     session: Option<(Entity<SessionView>, Subscription)>,
@@ -251,6 +255,7 @@ impl RightPanel {
             workspaces,
             tabs: Vec::new(),
             active: None,
+            hovered: None,
             session: None,
         }
     }
@@ -300,6 +305,9 @@ impl RightPanel {
     /// shows, or the list of surfaces when none is left.
     fn close(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
         self.tabs.retain(|tab| tab.surface() != surface);
+        if self.hovered == Some(surface) {
+            self.hovered = None;
+        }
         if self.active == Some(surface) {
             self.active = self.tabs.last().map(Tab::surface);
         }
@@ -332,40 +340,102 @@ impl RightPanel {
         self.active.is_some() && self.unopened().next().is_some()
     }
 
-    /// The list of surfaces, in place of the open one.
-    fn show_list(&mut self, cx: &mut Context<'_, Self>) {
-        self.active = None;
+    /// Notes the pointer over `surface`'s tab.
+    fn hover(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
+        self.hovered = Some(surface);
         cx.notify();
+    }
+
+    /// Notes the pointer leaving `surface`'s tab, unless another took it.
+    fn unhover(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
+        if self.hovered == Some(surface) {
+            self.hovered = None;
+            cx.notify();
+        }
+    }
+
+    /// +'s menu: the surfaces without a tab, then those to come, dimmed.
+    fn surface_menu(
+        mut menu: PopupMenu,
+        view: &WeakEntity<Self>,
+        unopened: &[Surface],
+    ) -> PopupMenu {
+        for &surface in unopened {
+            let view = view.clone();
+            menu = menu.item(
+                PopupMenuItem::new(surface.label())
+                    .icon(Icon::new(surface.icon()))
+                    .on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |this, cx| this.open(surface, cx));
+                    }),
+            );
+        }
+        for planned in &PLANNED {
+            menu = menu.item(
+                PopupMenuItem::new(planned.label)
+                    .icon(Icon::new(planned.icon))
+                    .disabled(true),
+            );
+        }
+        menu
     }
 
     /// The tabs, +, and the toggle at the right edge, in a row as tall as
     /// the title bar beside it.
     fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let menu_view = view.clone();
         let tabs = self.tabs.iter().map(|tab| {
             let surface = tab.surface();
-            h_flex()
+            // × replaces the icon while hovered, so the tab keeps its width.
+            let lead = if self.hovered == Some(surface) {
+                Button::new(SharedString::from(format!(
+                    "close-panel-tab-{}",
+                    surface.id()
+                )))
+                .ghost()
+                .xsmall()
+                .compact()
+                .icon(IconName::Close)
+                .accessibility_label("Close")
+                .tooltip("Close")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // Kit's Button passes the click on, and the tab's own
+                    // click would open the surface again.
+                    cx.stop_propagation();
+                    this.close(surface, cx);
+                }))
+                .into_any_element()
+            } else {
+                Icon::new(surface.icon()).small().into_any_element()
+            };
+            let view = view.clone();
+            Button::new(SharedString::from(format!("panel-tab-{}", surface.id())))
                 .flex_shrink_0()
+                .ghost()
+                .small()
+                .selected(self.active == Some(surface))
+                .accessibility_label(surface.label())
                 .child(
-                    Button::new(SharedString::from(format!("panel-tab-{}", surface.id())))
-                        .ghost()
-                        .small()
-                        .selected(self.active == Some(surface))
-                        .icon(Icon::new(surface.icon()))
-                        .label(surface.label())
-                        .on_click(cx.listener(move |this, _, _, cx| this.open(surface, cx))),
+                    h_flex()
+                        .size_4()
+                        .items_center()
+                        .justify_center()
+                        .child(lead),
                 )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "close-panel-tab-{}",
-                        surface.id()
-                    )))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Close)
-                    .tooltip("Close")
-                    .on_click(cx.listener(move |this, _, _, cx| this.close(surface, cx))),
-                )
+                .child(surface.label())
+                .on_hover(move |&hovered, _, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        if hovered {
+                            this.hover(surface, cx);
+                        } else {
+                            this.unhover(surface, cx);
+                        }
+                    });
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.open(surface, cx)))
         });
+        let unopened: Vec<Surface> = self.unopened().collect();
         h_flex()
             .flex_shrink_0()
             .h(rems(TOP_ROW_REMS))
@@ -388,7 +458,9 @@ impl RightPanel {
                             .icon(IconName::Plus)
                             .accessibility_label("Open a surface")
                             .tooltip("Open a surface")
-                            .on_click(cx.listener(|this, _, _, cx| this.show_list(cx)))
+                            .dropdown_menu(move |menu, _, _| {
+                                Self::surface_menu(menu, &menu_view, &unopened)
+                            })
                     })),
             )
             .child(toggle_button(cx))
