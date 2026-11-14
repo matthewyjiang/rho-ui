@@ -2291,6 +2291,24 @@ fn composer_attachments(window: &Window) -> Vec<u64> {
         .collect()
 }
 
+/// Ctrl+Shift+V pastes text as Ctrl+V does: dictation apps such as Hex send
+/// it when set to paste for terminals.
+#[test]
+fn ctrl_shift_v_pastes_text() {
+    let mut ui = Harness::start("paste-text", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_session("its commands", |session| !session.commands().is_empty());
+    ui.type_in("");
+    ui.act(|window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("list the files".into()));
+        window.press("ctrl-shift-v", cx);
+    });
+    assert_eq!(ui.composer_text(), "list the files");
+}
+
 /// Pasted images show as tiles above the composer's text. Each comes off
 /// with its remove
 /// control, or the last with Backspace in the empty text box; an image rho

@@ -32,7 +32,7 @@ The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 | Ctrl+, | Settings |
 | Ctrl+B | Collapse or open the sidebar |
 | Enter (while a turn runs) | Steer the turn |
-| Ctrl+V | Paste text, an image, or a copied file |
+| Ctrl+V or Ctrl+Shift+V | Paste text, an image, or a copied file |
 
 ## Files
 
