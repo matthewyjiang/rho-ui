@@ -12,7 +12,12 @@
 //! the session on screen.
 //!
 //! To add a surface: add a [`Surface`] variant with its name and icon, draw
-//! it in [`RightPanel::render_surface`], and take it off [`PLANNED`].
+//! it in [`RightPanel::render_surface`], and take it off [`PLANNED`]. A
+//! surface that keeps state, such as [`diff::DiffSurface`], is a view of
+//! its own, made when its tab opens ([`Tab`]) and told which session is on
+//! screen.
+
+mod diff;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -31,10 +36,12 @@ use gpui_kit::{
     Styled as _, Subscription, Window,
 };
 
+use self::diff::DiffSurface;
 use crate::{
     session_view::SessionView,
     store::{Key, StateDb},
     title_bar::TOP_ROW_REMS,
+    workspaces::Workspaces,
 };
 
 /// The panel's default width, in rems so it follows the UI scale: at the
@@ -57,28 +64,48 @@ const MIN_PANE_REMS: f32 = 30.;
 pub(crate) enum Surface {
     /// The session's background work, running and ended.
     Background,
+    /// The uncommitted changes where the session works.
+    Diff,
 }
 
 impl Surface {
     /// Every surface, in the order the panel lists them.
-    const ALL: [Surface; 1] = [Surface::Background];
+    const ALL: [Surface; 2] = [Surface::Diff, Surface::Background];
 
     /// The surface's part of its elements' IDs.
     fn id(self) -> &'static str {
         match self {
             Surface::Background => "background",
+            Surface::Diff => "diff",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Surface::Background => "Background work",
+            Surface::Diff => "Diff",
         }
     }
 
     fn icon(self) -> Lucide {
         match self {
             Surface::Background => Lucide::ListChecks,
+            Surface::Diff => Lucide::FileDiff,
+        }
+    }
+}
+
+/// An open surface, with its view if it keeps state.
+enum Tab {
+    Background,
+    Diff(Entity<DiffSurface>),
+}
+
+impl Tab {
+    fn surface(&self) -> Surface {
+        match self {
+            Tab::Background => Surface::Background,
+            Tab::Diff(_) => Surface::Diff,
         }
     }
 }
@@ -89,16 +116,10 @@ struct Planned {
     icon: Lucide,
 }
 
-const PLANNED: [Planned; 2] = [
-    Planned {
-        label: "Terminal",
-        icon: Lucide::SquareTerminal,
-    },
-    Planned {
-        label: "Diff",
-        icon: Lucide::FileDiff,
-    },
-];
+const PLANNED: [Planned; 1] = [Planned {
+    label: "Terminal",
+    icon: Lucide::SquareTerminal,
+}];
 
 /// Whether the panel shows, and how wide, remembered across runs under
 /// [`Key::RightPanel`] and [`Key::RightPanelWidth`]. A global, as the title
@@ -213,8 +234,10 @@ pub(crate) fn toggle_button(cx: &App) -> Button {
 /// The panel's tabs and what it shows. [`crate::app::RhoApp`] lays it out
 /// while [`PanelLayout`], and tells it which session is on screen.
 pub(crate) struct RightPanel {
+    /// Where surfaces read the session's machine.
+    workspaces: Entity<Workspaces>,
     /// The open surfaces, in the order opened.
-    tabs: Vec<Surface>,
+    tabs: Vec<Tab>,
     /// One of `tabs`, or `None` for the list of surfaces.
     active: Option<Surface>,
     /// The session on screen, if any, with the subscription that redraws
@@ -223,8 +246,9 @@ pub(crate) struct RightPanel {
 }
 
 impl RightPanel {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(workspaces: Entity<Workspaces>) -> Self {
         Self {
+            workspaces,
             tabs: Vec::new(),
             active: None,
             session: None,
@@ -240,6 +264,14 @@ impl RightPanel {
         if self.session.as_ref().map(|(view, _)| view) == session.as_ref() {
             return;
         }
+        for tab in &self.tabs {
+            match tab {
+                Tab::Background => {}
+                Tab::Diff(diff) => {
+                    diff.update(cx, |diff, cx| diff.set_session(session.as_ref(), cx));
+                }
+            }
+        }
         self.session = session.map(|view| {
             let redraw = cx.observe(&view, |_, _, cx| cx.notify());
             (view, redraw)
@@ -249,8 +281,16 @@ impl RightPanel {
 
     /// Shows `surface`, opening its tab if it has none.
     fn open(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
-        if !self.tabs.contains(&surface) {
-            self.tabs.push(surface);
+        if self.tab(surface).is_none() {
+            let session = self.session.as_ref().map(|(view, _)| view);
+            let tab = match surface {
+                Surface::Background => Tab::Background,
+                Surface::Diff => {
+                    let workspaces = self.workspaces.clone();
+                    Tab::Diff(cx.new(|cx| DiffSurface::new(workspaces, session, cx)))
+                }
+            };
+            self.tabs.push(tab);
         }
         self.active = Some(surface);
         cx.notify();
@@ -259,18 +299,31 @@ impl RightPanel {
     /// Closes `surface`'s tab. If it was showing, the last tab opened
     /// shows, or the list of surfaces when none is left.
     fn close(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
-        self.tabs.retain(|tab| *tab != surface);
+        self.tabs.retain(|tab| tab.surface() != surface);
         if self.active == Some(surface) {
-            self.active = self.tabs.last().copied();
+            self.active = self.tabs.last().map(Tab::surface);
         }
         cx.notify();
+    }
+
+    fn tab(&self, surface: Surface) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.surface() == surface)
     }
 
     /// The surfaces without a tab, which the list offers.
     fn unopened(&self) -> impl Iterator<Item = Surface> + '_ {
         Surface::ALL
             .into_iter()
-            .filter(|surface| !self.tabs.contains(surface))
+            .filter(|&surface| self.tab(surface).is_none())
+    }
+
+    /// The files the Diff surface shows, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
+        self.tabs.iter().find_map(|tab| match tab {
+            Tab::Diff(diff) => Some(diff.read(cx).paths(cx)),
+            Tab::Background => None,
+        })
     }
 
     /// Whether + has anything to offer: a surface shows, so the list
@@ -288,7 +341,8 @@ impl RightPanel {
     /// The tabs, +, and the toggle at the right edge, in a row as tall as
     /// the title bar beside it.
     fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        let tabs = self.tabs.iter().map(|&surface| {
+        let tabs = self.tabs.iter().map(|tab| {
+            let surface = tab.surface();
             h_flex()
                 .flex_shrink_0()
                 .child(
@@ -394,13 +448,14 @@ impl RightPanel {
             )
     }
 
-    /// What `surface` shows of the session on screen.
-    fn render_surface(&self, surface: Surface, cx: &App) -> AnyElement {
-        match surface {
-            Surface::Background => match &self.session {
+    /// What `tab`'s surface shows of the session on screen.
+    fn render_surface(&self, tab: &Tab, cx: &App) -> AnyElement {
+        match tab {
+            Tab::Background => match &self.session {
                 Some((view, _)) => SessionView::background_surface(view, cx).into_any_element(),
                 None => no_session("Open a session to see its background work."),
             },
+            Tab::Diff(diff) => diff.clone().into_any_element(),
         }
     }
 }
@@ -415,8 +470,8 @@ fn no_session(text: &'static str) -> AnyElement {
 
 impl Render for RightPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let body = match self.active {
-            Some(surface) => self.render_surface(surface, cx),
+        let body = match self.active.and_then(|surface| self.tab(surface)) {
+            Some(tab) => self.render_surface(tab, cx),
             None => self.render_list(cx).into_any_element(),
         };
         v_flex()

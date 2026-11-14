@@ -101,6 +101,7 @@ impl Harness {
             projects: Projects::default(),
             settings: Settings::default(),
             remote_sockets: Vec::new(),
+            workspace: None,
         };
         Self::open_on(name, target, daemon, machines, state)
     }
@@ -134,6 +135,7 @@ impl Harness {
                 projects,
                 settings: Settings::default(),
                 remote_sockets: Vec::new(),
+                workspace: None,
             },
         )
     }
@@ -162,6 +164,7 @@ impl Harness {
             projects,
             settings,
             remote_sockets,
+            workspace,
         } = machines;
         let mut cx = HeadlessAppContext::with_platform(
             gpui_kit::platform::current_platform(true).text_system(),
@@ -176,7 +179,7 @@ impl Harness {
         // A remote machine reaches its fake daemon, never ssh: a host
         // without one gets a socket that isn't there.
         let launch = LaunchConfig {
-            workspace: std::env::temp_dir(),
+            workspace: workspace.unwrap_or_else(std::env::temp_dir),
             daemon: target.clone(),
             remote: Rc::new(move |remote: &RemoteMachine| {
                 let socket = remote_sockets
@@ -421,6 +424,9 @@ struct Machines {
     settings: Settings,
     /// The socket each remote machine reaches, by host.
     remote_sockets: Vec<(String, PathBuf)>,
+    /// Where new sessions start on this machine; the temporary directory
+    /// when `None`.
+    workspace: Option<PathBuf>,
 }
 
 /// Every accessibility label in the last frame, for timeout messages.
@@ -2061,6 +2067,61 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
     assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("hidden"));
 }
 
+/// The Diff surface shows the uncommitted changes where the session on
+/// screen works, read with this machine's `git`, and reads them again when
+/// the session's turn ends.
+#[test]
+fn the_diff_surface_follows_the_sessions_changes() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo = repo.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(&repo)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "x"]);
+    std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "diff",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::owning(["s1"]),
+            projects: Projects::default(),
+            settings: Settings::default(),
+            remote_sockets: Vec::new(),
+            workspace: Some(repo.clone()),
+        },
+    );
+    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.click("open-surface-diff");
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    // The turn ends with its process running, which saves the session.
+    ui.send("background");
+    ui.wait_until("the session's change", |window, cx, app| {
+        app.diff_paths(cx) == Some(vec!["a.txt".to_owned()]) && is_visible(window, "diff-summary")
+    });
+    ui.shot("changes");
+
+    std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+    ui.send("background");
+    ui.wait_until("the file the turn added", |_, cx, app| {
+        app.diff_paths(cx) == Some(vec!["a.txt".to_owned(), "new.txt".to_owned()])
+    });
+}
+
 /// Dragging the right panel's edge resizes it, as far as leaves the pane
 /// its room; the width outlives a restart, and a double-click on the edge
 /// puts the default back.
@@ -3003,6 +3064,7 @@ fn a_typed_git_url_clones_into_the_clone_folder() {
             projects: Projects::of(["/w/a"]),
             settings,
             remote_sockets: Vec::new(),
+            workspace: None,
         },
     );
     ui.wait_until("the sidebar", |window, _, _| {
@@ -3313,6 +3375,7 @@ fn machines_list_side_by_side() {
                 ("workstation".to_owned(), remote_socket),
                 ("gone".to_owned(), PathBuf::from("/nonexistent/rho.sock")),
             ],
+            workspace: None,
         },
     );
     ui.wait_until("both machines' sessions, and Retry", |window, _, _| {
@@ -3492,6 +3555,7 @@ fn a_machine_added_in_settings_lists_its_sessions() {
             projects: Projects::default(),
             settings: Settings::default(),
             remote_sockets: vec![("box".to_owned(), remote_socket)],
+            workspace: None,
         },
     );
     ui.wait_until("this machine's sessions", |window, _, _| {

@@ -215,6 +215,7 @@ impl RhoApp {
                 SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
             },
         );
+        let panel = cx.new(|_| RightPanel::new(workspaces.clone()));
         let mut app = Self {
             launch,
             machines,
@@ -225,7 +226,7 @@ impl RhoApp {
             projects,
             last_project: None,
             sidebar,
-            panel: cx.new(|_| RightPanel::new()),
+            panel,
             sessions: Vec::new(),
             pane: Pane::Empty,
             kinetic: Rc::default(),
@@ -1263,6 +1264,11 @@ impl RhoApp {
     /// `machine`'s home directory, as its daemon said, for UI tests.
     pub(crate) fn workspaces_home(&self, machine: &MachineId, cx: &App) -> Option<PathBuf> {
         self.workspaces.read(cx).home(machine)
+    }
+    /// The files the right panel's Diff surface shows, if it is open, for
+    /// UI tests.
+    pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
+        self.panel.read(cx).diff_paths(cx)
     }
     /// The sidebar's search, for UI tests.
     pub(crate) fn sidebar_search(&self, cx: &App) -> FocusHandle {

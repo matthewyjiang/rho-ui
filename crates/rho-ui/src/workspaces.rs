@@ -16,6 +16,7 @@ use gpui_kit::{App, Context, Entity, SharedString, Task};
 use rho_ui_core::{Daemon, SshLink};
 
 use crate::{
+    folders::Reader,
     machines::{MachineId, Place},
     repo::{self, Repo},
 };
@@ -193,6 +194,16 @@ impl Workspaces {
     /// connected.
     pub(crate) fn ssh(&self, machine: &MachineId) -> Option<SshLink> {
         self.remote(machine)?.ssh.clone()
+    }
+
+    /// How to read files and run `git` on `machine`: here, or over its
+    /// ssh link while its daemon is connected.
+    pub(crate) fn reader(&self, machine: &MachineId) -> Reader {
+        if machine.is_local() {
+            Reader::Here
+        } else {
+            self.ssh(machine).map_or(Reader::Unread, Reader::There)
+        }
     }
 
     fn remote(&self, machine: &MachineId) -> Option<&Remote> {

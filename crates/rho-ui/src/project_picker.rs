@@ -762,13 +762,7 @@ impl ProjectList {
 
     /// How the draft's machine's folders are read.
     fn reader(&self, cx: &App) -> Reader {
-        let machine = &self.current.machine;
-        if machine.is_local() {
-            Reader::Here
-        } else {
-            let ssh = self.workspaces.read(cx).ssh(machine);
-            ssh.map_or(Reader::Unread, Reader::There)
-        }
+        self.workspaces.read(cx).reader(&self.current.machine)
     }
 
     /// Unix seconds of the newest session in the project at `ix`; 0 with

@@ -120,7 +120,7 @@ pub(crate) struct Lookup {
     pub(crate) next: Vec<PathBuf>,
 }
 
-/// How a machine's folders are read.
+/// How rho-ui reads a machine's files and runs scripts there.
 pub(crate) enum Reader {
     /// From this machine's files.
     Here,
