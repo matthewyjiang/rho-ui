@@ -6,10 +6,14 @@
 //!
 //! Each surface opens as a tab in the panel's header; hovering a tab swaps
 //! its icon for × to close it, and dragging one onto another moves it
-//! there. With none open, the panel lists the surfaces to open; while
-//! another isn't open, + in the header opens a menu of them. The panel is
+//! there. Terminal opens as many tabs as asked, each named for the program
+//! it runs; the others open one. With none open, the panel lists the
+//! surfaces to open; + in the header opens a menu of the rest. The panel is
 //! the window's, not a session's: its tabs stay as sessions change, and
 //! each surface shows the session on screen.
+//!
+//! Ghostty's shortcuts for tabs and splits ([`TerminalShortcut`]) act on
+//! the terminal with the keyboard, or else the one under the pointer.
 //!
 //! To add a surface: add a [`Surface`] variant with its name and icon, and
 //! draw it in [`RightPanel::render_surface`]. A surface that keeps state,
@@ -36,16 +40,16 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     div, rems, AnyElement, App, AppContext as _, Axis, BorrowAppContext as _, Context, Entity,
-    Global, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
+    Global, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
 };
 
 use self::diff::DiffSurface;
 use self::files::FilesSurface;
-pub(crate) use self::terminal::TerminalShell;
-use self::terminal::TerminalSurface;
+pub(crate) use self::terminal::{Direction, PaneCommand, TerminalShell};
+use self::terminal::{Emptied, TerminalTab};
 #[cfg(test)]
-pub(crate) use self::terminal::TerminalView;
+pub(crate) use self::terminal::{TerminalView, PROGRAM_POLL};
 use crate::{
     session_view::SessionView,
     store::{Key, StateDb},
@@ -117,6 +121,33 @@ impl Surface {
             Surface::Terminal => Lucide::SquareTerminal,
         }
     }
+
+    /// Whether the surface opens a tab each time it is asked: each terminal
+    /// runs shells of its own, where another tab of the others would show
+    /// the same thing twice.
+    fn opens_many(self) -> bool {
+        matches!(self, Surface::Terminal)
+    }
+}
+
+/// Which tab: its surface, and its number among that surface's tabs, from
+/// 1 and never reused. Only Terminal opens more than one
+/// ([`Surface::opens_many`]); the others are always 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TabKey {
+    surface: Surface,
+    number: u32,
+}
+
+impl TabKey {
+    /// The tab's part of its elements' IDs: its surface's, and its number
+    /// after the first, as in `terminal-2`.
+    fn id(self) -> String {
+        match self.number {
+            1 => self.surface.id().to_owned(),
+            number => format!("{}-{number}", self.surface.id()),
+        }
+    }
 }
 
 /// An open surface, with its view if it keeps state.
@@ -124,18 +155,54 @@ enum Tab {
     Background,
     Diff(Entity<DiffSurface>),
     Files(Entity<FilesSurface>),
-    Terminal(Entity<TerminalSurface>),
+    /// One of any number of terminal tabs, by its number, with the
+    /// subscriptions that redraw the panel as its program changes and close
+    /// the tab when its last pane closes.
+    Terminal {
+        number: u32,
+        view: Entity<TerminalTab>,
+        _subscriptions: [Subscription; 2],
+    },
 }
 
 impl Tab {
-    fn surface(&self) -> Surface {
+    fn key(&self) -> TabKey {
+        let (surface, number) = match self {
+            Tab::Background => (Surface::Background, 1),
+            Tab::Diff(_) => (Surface::Diff, 1),
+            Tab::Files(_) => (Surface::Files, 1),
+            Tab::Terminal { number, .. } => (Surface::Terminal, *number),
+        };
+        TabKey { surface, number }
+    }
+
+    /// What the tab says: a terminal's names the program it runs, as `vim`.
+    fn label(&self, cx: &App) -> SharedString {
         match self {
-            Tab::Background => Surface::Background,
-            Tab::Diff(_) => Surface::Diff,
-            Tab::Files(_) => Surface::Files,
-            Tab::Terminal(_) => Surface::Terminal,
+            Tab::Terminal { view, .. } => view
+                .read(cx)
+                .program(cx)
+                .unwrap_or_else(|| Surface::Terminal.label().into()),
+            Tab::Background | Tab::Diff(_) | Tab::Files(_) => self.key().surface.label().into(),
         }
     }
+}
+
+/// A shortcut for terminal tabs and splits, after Ghostty's on Linux, and
+/// the action its keys are bound to. It acts on the terminal with the
+/// keyboard, or else the one under the pointer; with neither, the key goes
+/// on as if unbound.
+#[derive(Clone, Copy, Debug, PartialEq, gpui_kit::Action)]
+#[action(namespace = rho_ui, no_json)]
+pub(crate) enum TerminalShortcut {
+    /// Ctrl+Shift+T: a terminal tab, next to the others.
+    NewTab,
+    /// Ctrl+Page Down: the next terminal tab, round to the first.
+    NextTab,
+    /// Ctrl+Page Up: the previous terminal tab, round to the last.
+    PreviousTab,
+    /// What a pane of the terminal does ([`PaneCommand`]).
+    Pane(PaneCommand),
 }
 
 /// Whether the panel shows, and how wide, remembered across runs under
@@ -230,11 +297,19 @@ impl Render for ResizeRightPanel {
     }
 }
 
-/// What a drag of a tab carries: its surface, and where it sat when the
-/// drag began. It draws the tab under the pointer.
+/// Which way [`RightPanel::cycle_terminals`] goes.
 #[derive(Clone, Copy)]
+enum Step {
+    Next,
+    Previous,
+}
+
+/// What a drag of a tab carries: the tab, what it says, and where it sat
+/// when the drag began. It draws the tab under the pointer.
+#[derive(Clone)]
 struct DragTab {
-    surface: Surface,
+    key: TabKey,
+    label: SharedString,
     index: usize,
 }
 
@@ -251,8 +326,8 @@ impl Render for DragTab {
             .border_color(theme.border)
             .bg(theme.secondary)
             .opacity(0.85)
-            .child(Icon::new(self.surface.icon()).small())
-            .child(self.surface.label())
+            .child(Icon::new(self.key.surface.icon()).small())
+            .child(self.label.clone())
     }
 }
 
@@ -284,9 +359,13 @@ pub(crate) struct RightPanel {
     /// The open surfaces, in the order opened.
     tabs: Vec<Tab>,
     /// One of `tabs`, or `None` for the list of surfaces when none is open.
-    active: Option<Surface>,
+    active: Option<TabKey>,
     /// The tab under the pointer, which shows × in place of its icon.
-    hovered: Option<Surface>,
+    hovered: Option<TabKey>,
+    /// Scrolls the header's tabs when more are open than fit.
+    tab_scroll: ScrollHandle,
+    /// The number the next terminal tab gets.
+    next_terminal: u32,
     /// The session on screen, if any, with the subscription that redraws
     /// the panel as it changes.
     session: Option<(Entity<SessionView>, Subscription)>,
@@ -300,6 +379,8 @@ impl RightPanel {
             tabs: Vec::new(),
             active: None,
             hovered: None,
+            tab_scroll: ScrollHandle::new(),
+            next_terminal: 1,
             session: None,
         }
     }
@@ -322,10 +403,8 @@ impl RightPanel {
                 Tab::Files(files) => {
                     files.update(cx, |files, cx| files.set_session(session.as_ref(), cx));
                 }
-                Tab::Terminal(terminal) => {
-                    terminal.update(cx, |terminal, cx| {
-                        terminal.set_session(session.as_ref(), cx);
-                    });
+                Tab::Terminal { view, .. } => {
+                    view.update(cx, |tab, cx| tab.set_session(session.as_ref(), cx));
                 }
             }
         }
@@ -336,53 +415,152 @@ impl RightPanel {
         cx.notify();
     }
 
-    /// Shows `surface`, opening its tab if it has none.
-    fn open(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
-        if self.tab(surface).is_none() {
-            let session = self.session.as_ref().map(|(view, _)| view);
-            let tab = match surface {
-                Surface::Background => Tab::Background,
-                Surface::Diff => {
-                    let workspaces = self.workspaces.clone();
-                    Tab::Diff(cx.new(|cx| DiffSurface::new(workspaces, session, cx)))
+    /// Shows `surface`: a new tab of a surface that opens many, else its
+    /// tab, opened if it has none. Returns the tab shown.
+    fn open(&mut self, surface: Surface, cx: &mut Context<'_, Self>) -> TabKey {
+        let open = self
+            .tabs
+            .iter()
+            .map(Tab::key)
+            .find(|key| key.surface == surface);
+        let key = match open {
+            Some(key) if !surface.opens_many() => key,
+            _ => {
+                let tab = self.new_tab(surface, cx);
+                let key = tab.key();
+                self.tabs.push(tab);
+                self.tab_scroll.scroll_to_item(self.tabs.len() - 1);
+                key
+            }
+        };
+        self.show(key, cx);
+        key
+    }
+
+    /// A new tab of `surface`.
+    fn new_tab(&mut self, surface: Surface, cx: &mut Context<'_, Self>) -> Tab {
+        let session = self.session.as_ref().map(|(view, _)| view);
+        match surface {
+            Surface::Background => Tab::Background,
+            Surface::Diff => {
+                let workspaces = self.workspaces.clone();
+                Tab::Diff(cx.new(|cx| DiffSurface::new(workspaces, session, cx)))
+            }
+            Surface::Files => {
+                let workspaces = self.workspaces.clone();
+                Tab::Files(cx.new(|cx| FilesSurface::new(workspaces, session, cx)))
+            }
+            Surface::Terminal => {
+                let number = self.next_terminal;
+                self.next_terminal += 1;
+                let key = TabKey { surface, number };
+                let (workspaces, shell) = (self.workspaces.clone(), self.shell.clone());
+                let view = cx.new(|cx| TerminalTab::new(workspaces, shell, session, cx));
+                let subscriptions = [
+                    cx.observe(&view, |_, _, cx| cx.notify()),
+                    cx.subscribe(&view, move |this, _, _: &Emptied, cx| this.close(key, cx)),
+                ];
+                Tab::Terminal {
+                    number,
+                    view,
+                    _subscriptions: subscriptions,
                 }
-                Surface::Files => {
-                    let workspaces = self.workspaces.clone();
-                    Tab::Files(cx.new(|cx| FilesSurface::new(workspaces, session, cx)))
-                }
-                Surface::Terminal => {
-                    let (workspaces, shell) = (self.workspaces.clone(), self.shell.clone());
-                    Tab::Terminal(cx.new(|cx| TerminalSurface::new(workspaces, shell, session, cx)))
-                }
-            };
-            self.tabs.push(tab);
+            }
         }
-        self.active = Some(surface);
+    }
+
+    /// Shows `key`'s tab.
+    fn show(&mut self, key: TabKey, cx: &mut Context<'_, Self>) {
+        self.active = Some(key);
         cx.notify();
     }
 
-    /// Closes `surface`'s tab. If it was showing, the last tab opened
-    /// shows, or the list of surfaces when none is left.
-    fn close(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
-        self.tabs.retain(|tab| tab.surface() != surface);
-        if self.hovered == Some(surface) {
+    /// Closes `key`'s tab. If it was showing, the last tab opened shows,
+    /// or the list of surfaces when none is left.
+    fn close(&mut self, key: TabKey, cx: &mut Context<'_, Self>) {
+        self.tabs.retain(|tab| tab.key() != key);
+        if self.hovered == Some(key) {
             self.hovered = None;
         }
-        if self.active == Some(surface) {
-            self.active = self.tabs.last().map(Tab::surface);
+        if self.active == Some(key) {
+            self.active = self.tabs.last().map(Tab::key);
         }
         cx.notify();
     }
 
-    fn tab(&self, surface: Surface) -> Option<&Tab> {
-        self.tabs.iter().find(|tab| tab.surface() == surface)
+    fn tab(&self, key: TabKey) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.key() == key)
     }
 
-    /// The surfaces without a tab, which the list offers.
-    fn unopened(&self) -> impl Iterator<Item = Surface> + '_ {
-        Surface::ALL
-            .into_iter()
-            .filter(|&surface| self.tab(surface).is_none())
+    /// The surfaces + and the list offer: those that open many, and those
+    /// without a tab.
+    fn openable(&self) -> impl Iterator<Item = Surface> + '_ {
+        Surface::ALL.into_iter().filter(|&surface| {
+            surface.opens_many() || !self.tabs.iter().any(|tab| tab.key().surface == surface)
+        })
+    }
+
+    /// Runs `shortcut` on the terminal with the keyboard, or else the one
+    /// under the pointer, in the tab on screen. Returns whether there was
+    /// one, so the key otherwise goes on as if unbound.
+    pub(crate) fn terminal_shortcut(
+        &mut self,
+        shortcut: TerminalShortcut,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(Tab::Terminal { view, .. }) = self.active.and_then(|key| self.tab(key)) else {
+            return false;
+        };
+        let view = view.clone();
+        let Some(pane) = view.read(cx).target(window, cx) else {
+            return false;
+        };
+        match shortcut {
+            TerminalShortcut::NewTab => {
+                let key = self.open(Surface::Terminal, cx);
+                self.focus_terminal(key, window, cx);
+            }
+            TerminalShortcut::NextTab => self.cycle_terminals(Step::Next, window, cx),
+            TerminalShortcut::PreviousTab => self.cycle_terminals(Step::Previous, window, cx),
+            TerminalShortcut::Pane(command) => {
+                view.update(cx, |tab, cx| tab.run(command, pane, window, cx));
+            }
+        }
+        true
+    }
+
+    /// Shows the terminal tab after or before the one on screen, counting
+    /// terminal tabs alone and going round, and puts the keyboard in it.
+    fn cycle_terminals(&mut self, step: Step, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let terminals: Vec<TabKey> = self
+            .tabs
+            .iter()
+            .map(Tab::key)
+            .filter(|key| key.surface == Surface::Terminal)
+            .collect();
+        let Some(at) = terminals.iter().position(|&key| Some(key) == self.active) else {
+            return;
+        };
+        let count = terminals.len();
+        let next = match step {
+            Step::Next => (at + 1) % count,
+            Step::Previous => (at + count - 1) % count,
+        };
+        let key = terminals[next];
+        if let Some(index) = self.tabs.iter().position(|tab| tab.key() == key) {
+            self.tab_scroll.scroll_to_item(index);
+        }
+        self.show(key, cx);
+        self.focus_terminal(key, window, cx);
+    }
+
+    /// Puts the keyboard in the pane that last had it in terminal tab `key`.
+    fn focus_terminal(&self, key: TabKey, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(Tab::Terminal { view, .. }) = self.tab(key) {
+            let view = view.clone();
+            view.update(cx, |tab, cx| tab.focus(window, cx));
+        }
     }
 
     /// The files the Diff surface shows, for UI tests.
@@ -390,7 +568,7 @@ impl RightPanel {
     pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
         self.tabs.iter().find_map(|tab| match tab {
             Tab::Diff(diff) => Some(diff.read(cx).paths(cx)),
-            Tab::Background | Tab::Files(_) | Tab::Terminal(_) => None,
+            Tab::Background | Tab::Files(_) | Tab::Terminal { .. } => None,
         })
     }
 
@@ -400,29 +578,38 @@ impl RightPanel {
     pub(crate) fn open_file(&self, cx: &App) -> Option<(String, String)> {
         self.tabs.iter().find_map(|tab| match tab {
             Tab::Files(files) => files.read(cx).open_file_text(cx),
-            Tab::Background | Tab::Diff(_) | Tab::Terminal(_) => None,
+            Tab::Background | Tab::Diff(_) | Tab::Terminal { .. } => None,
         })
     }
 
-    /// The session's terminal, if the Terminal surface is open and it
-    /// runs, for UI tests.
+    /// The session's terminal in the pane that last had the keyboard in
+    /// the terminal tab on screen, once its shell runs, for UI tests.
     #[cfg(test)]
     pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<TerminalView>> {
-        self.tabs.iter().find_map(|tab| match tab {
-            Tab::Terminal(terminal) => terminal.read(cx).current(),
+        match self.active.and_then(|key| self.tab(key))? {
+            Tab::Terminal { view, .. } => view.read(cx).current(cx),
             Tab::Background | Tab::Diff(_) | Tab::Files(_) => None,
-        })
+        }
+    }
+
+    /// The terminal tab on screen's panes, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn terminal_panes(&self, cx: &App) -> usize {
+        match self.active.and_then(|key| self.tab(key)) {
+            Some(Tab::Terminal { view, .. }) => view.read(cx).pane_count(),
+            _ => 0,
+        }
     }
 
     /// Whether + has anything to offer: a surface shows, so the list
-    /// doesn't, and another has no tab yet.
+    /// doesn't, and there is a surface to open.
     fn offers_more(&self) -> bool {
-        self.active.is_some() && self.unopened().next().is_some()
+        self.active.is_some() && self.openable().next().is_some()
     }
 
-    /// Moves `surface`'s tab to `index`, where a drag dropped it.
-    fn move_tab(&mut self, surface: Surface, index: usize, cx: &mut Context<'_, Self>) {
-        let Some(from) = self.tabs.iter().position(|tab| tab.surface() == surface) else {
+    /// Moves `key`'s tab to `index`, where a drag dropped it.
+    fn move_tab(&mut self, key: TabKey, index: usize, cx: &mut Context<'_, Self>) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.key() == key) else {
             return;
         };
         let tab = self.tabs.remove(from);
@@ -433,30 +620,30 @@ impl RightPanel {
     /// The tabs' surfaces, in order, for UI tests.
     #[cfg(test)]
     pub(crate) fn tab_order(&self) -> Vec<Surface> {
-        self.tabs.iter().map(Tab::surface).collect()
+        self.tabs.iter().map(|tab| tab.key().surface).collect()
     }
 
-    /// Notes the pointer over `surface`'s tab.
-    fn hover(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
-        self.hovered = Some(surface);
+    /// Notes the pointer over `key`'s tab.
+    fn hover(&mut self, key: TabKey, cx: &mut Context<'_, Self>) {
+        self.hovered = Some(key);
         cx.notify();
     }
 
-    /// Notes the pointer leaving `surface`'s tab, unless another took it.
-    fn unhover(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
-        if self.hovered == Some(surface) {
+    /// Notes the pointer leaving `key`'s tab, unless another took it.
+    fn unhover(&mut self, key: TabKey, cx: &mut Context<'_, Self>) {
+        if self.hovered == Some(key) {
             self.hovered = None;
             cx.notify();
         }
     }
 
-    /// +'s menu: the surfaces without a tab.
+    /// +'s menu: the surfaces it can open.
     fn surface_menu(
         mut menu: PopupMenu,
         view: &WeakEntity<Self>,
-        unopened: &[Surface],
+        openable: &[Surface],
     ) -> PopupMenu {
-        for &surface in unopened {
+        for &surface in openable {
             let view = view.clone();
             menu = menu.item(
                 PopupMenuItem::new(surface.label())
@@ -469,42 +656,37 @@ impl RightPanel {
         menu
     }
 
-    /// `surface`'s tab, at `index` in the header: its icon, or × while
-    /// hovered, and its label. Dragged onto another tab, it moves there.
-    fn render_tab(
-        &self,
-        index: usize,
-        surface: Surface,
-        cx: &Context<'_, Self>,
-    ) -> impl IntoElement {
+    /// `tab`'s tab, at `index` in the header: its icon, or × while hovered,
+    /// and its label. Dragged onto another tab, it moves there.
+    fn render_tab(&self, index: usize, tab: &Tab, cx: &Context<'_, Self>) -> impl IntoElement {
+        let key = tab.key();
+        let (surface, id) = (key.surface, key.id());
+        let label = tab.label(cx);
         // × replaces the icon while hovered, so the tab keeps its width.
-        let lead = if self.hovered == Some(surface) {
-            Button::new(SharedString::from(format!(
-                "close-panel-tab-{}",
-                surface.id()
-            )))
-            .ghost()
-            .xsmall()
-            .compact()
-            .icon(IconName::Close)
-            .accessibility_label("Close")
-            .tooltip("Close")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                // Kit's Button passes the click on, and the tab's own
-                // click would open the surface again.
-                cx.stop_propagation();
-                this.close(surface, cx);
-            }))
-            .into_any_element()
+        let lead = if self.hovered == Some(key) {
+            Button::new(SharedString::from(format!("close-panel-tab-{id}")))
+                .ghost()
+                .xsmall()
+                .compact()
+                .icon(IconName::Close)
+                .accessibility_label("Close")
+                .tooltip("Close")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // Kit's Button passes the click on, and the tab's own
+                    // click would open the surface again.
+                    cx.stop_propagation();
+                    this.close(key, cx);
+                }))
+                .into_any_element()
         } else {
             Icon::new(surface.icon()).small().into_any_element()
         };
         let view = cx.entity().downgrade();
-        let button = Button::new(SharedString::from(format!("panel-tab-{}", surface.id())))
+        let button = Button::new(SharedString::from(format!("panel-tab-{id}")))
             .ghost()
             .small()
-            .selected(self.active == Some(surface))
-            .accessibility_label(surface.label())
+            .selected(self.active == Some(key))
+            .accessibility_label(label.clone())
             .child(
                 h_flex()
                     .size_4()
@@ -512,30 +694,28 @@ impl RightPanel {
                     .justify_center()
                     .child(lead),
             )
-            .child(surface.label())
+            // A remote shell's title can run long.
+            .child(div().max_w(rems(10.)).truncate().child(label.clone()))
             .on_hover(move |&hovered, _, cx| {
                 let _ = view.update(cx, |this, cx| {
                     if hovered {
-                        this.hover(surface, cx);
+                        this.hover(key, cx);
                     } else {
-                        this.unhover(surface, cx);
+                        this.unhover(key, cx);
                     }
                 });
             })
-            .on_click(cx.listener(move |this, _, _, cx| this.open(surface, cx)));
+            .on_click(cx.listener(move |this, _, _, cx| this.show(key, cx)));
         // Kit's Button takes no drag, so a div around it carries one.
         div()
-            .id(SharedString::from(format!(
-                "panel-tab-slot-{}",
-                surface.id()
-            )))
+            .id(SharedString::from(format!("panel-tab-slot-{id}")))
             .flex_shrink_0()
             .border_x_2()
             .border_color(gpui_kit::transparent_black())
             .child(button)
-            .on_drag(DragTab { surface, index }, |drag, _, _, cx| {
+            .on_drag(DragTab { key, label, index }, |drag, _, _, cx| {
                 cx.stop_propagation();
-                cx.new(|_| *drag)
+                cx.new(|_| drag.clone())
             })
             // The border marks the side the dragged tab lands on.
             .drag_over::<DragTab>(move |style, drag, _, cx| {
@@ -547,20 +727,20 @@ impl RightPanel {
                 }
             })
             .on_drop(cx.listener(move |this, drag: &DragTab, _, cx| {
-                this.move_tab(drag.surface, index, cx);
+                this.move_tab(drag.key, index, cx);
             }))
     }
 
     /// The tabs, +, and the toggle at the right edge, in a row as tall as
-    /// the title bar beside it.
+    /// the title bar beside it. Tabs that don't fit scroll, + staying put.
     fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let menu_view = cx.entity().downgrade();
         let tabs = self
             .tabs
             .iter()
             .enumerate()
-            .map(|(index, tab)| self.render_tab(index, tab.surface(), cx));
-        let unopened: Vec<Surface> = self.unopened().collect();
+            .map(|(index, tab)| self.render_tab(index, tab, cx));
+        let openable: Vec<Surface> = self.openable().collect();
         h_flex()
             .flex_shrink_0()
             .h(rems(TOP_ROW_REMS))
@@ -573,9 +753,16 @@ impl RightPanel {
                 h_flex()
                     .flex_1()
                     .min_w_0()
-                    .overflow_x_hidden()
                     .gap_1()
-                    .children(tabs)
+                    .child(
+                        h_flex()
+                            .id("panel-tabs")
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.tab_scroll)
+                            .gap_1()
+                            .children(tabs),
+                    )
                     .children(self.offers_more().then(|| {
                         Button::new("panel-surfaces")
                             .ghost()
@@ -584,7 +771,7 @@ impl RightPanel {
                             .accessibility_label("Open a surface")
                             .tooltip("Open a surface")
                             .dropdown_menu(move |menu, _, _| {
-                                Self::surface_menu(menu, &menu_view, &unopened)
+                                Self::surface_menu(menu, &menu_view, &openable)
                             })
                     })),
             )
@@ -607,13 +794,15 @@ impl RightPanel {
                         .child(div().flex_1().child(label)),
                 )
         };
-        let open = self.unopened().map(|surface| {
+        let open = self.openable().map(|surface| {
             row(
                 format!("open-surface-{}", surface.id()).into(),
                 surface.icon(),
                 surface.label(),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.open(surface, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open(surface, cx);
+            }))
         });
         v_flex()
             .id("panel-surface-list")
@@ -636,7 +825,7 @@ impl RightPanel {
             },
             Tab::Diff(diff) => diff.clone().into_any_element(),
             Tab::Files(files) => files.clone().into_any_element(),
-            Tab::Terminal(terminal) => terminal.clone().into_any_element(),
+            Tab::Terminal { view, .. } => view.clone().into_any_element(),
         }
     }
 }
@@ -651,7 +840,7 @@ fn no_session(text: &'static str) -> AnyElement {
 
 impl Render for RightPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let body = match self.active.and_then(|surface| self.tab(surface)) {
+        let body = match self.active.and_then(|key| self.tab(key)) {
             Some(tab) => self.render_surface(tab, cx),
             None => self.render_list(cx).into_any_element(),
         };

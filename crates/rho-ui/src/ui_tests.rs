@@ -9,7 +9,7 @@
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -19,7 +19,8 @@ use gpui_kit::test::{
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem,
     ElementId, ElementInputHandler, Entity, ExternalPaths, HeadlessAppContext, ImageFormat,
-    MouseButton, Pixels, Window, WindowBounds, WindowOptions,
+    Modifiers, MouseButton, MouseExitEvent, Pixels, PlatformInput, Window, WindowBounds,
+    WindowOptions,
 };
 use rho_ui_core::{
     agent_settings::SettingValue,
@@ -34,7 +35,7 @@ use crate::{
     app::{LaunchConfig, RhoApp},
     machines::{MachineId, Place, RemoteMachine, SessionKey},
     projects::Projects,
-    right_panel::{Surface, TerminalShell, TerminalView},
+    right_panel::{Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
@@ -71,6 +72,27 @@ static SELECT_LAVAPIPE: extern "C" fn() = {
 /// Far longer than the fake daemon takes: it answers at once, and its
 /// slowest script waits half a second.
 const WAIT: Duration = Duration::from_secs(10);
+
+/// `/bin/sh` as dash runs it, whatever shell it is: prompting `$ `, where
+/// bash, as on Arch, prompts `sh-5.3$ `, and without line editing, so the
+/// terminal echoes a control key such as Ctrl+B as `^B`. A script named
+/// `sh`, so the shell it runs keeps the name the terminal tab shows. Kept
+/// in `target/`, beside the screenshots, as a static is never dropped to
+/// clean up a temporary folder.
+static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell");
+    std::fs::create_dir_all(&dir).expect("make the test shell's folder");
+    let path = dir.join("sh");
+    let script = "#!/bin/sh\n\
+        export PS1='$ '\n\
+        if [ -n \"$BASH_VERSION\" ]; then exec /bin/sh --noediting; fi\n\
+        exec /bin/sh\n";
+    std::fs::write(&path, script).expect("write the test shell");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the test shell executable");
+    path
+});
 
 /// One app window and its context.
 struct Harness {
@@ -195,7 +217,7 @@ impl Harness {
                 DaemonTarget::Socket(socket)
             }),
             // Not the user's shell, whose files may print or ask things.
-            shell: TerminalShell(PathBuf::from("/bin/sh")),
+            shell: TerminalShell(TEST_SHELL.clone()),
         };
         let sidebar = SidebarState {
             shelves,
@@ -327,6 +349,56 @@ impl Harness {
         });
         ui.click("terminal");
         ui
+    }
+
+    /// Waits for element `id` to be labelled `want`, moving the clock on
+    /// for timers that poll, such as a terminal tab's program.
+    fn wait_for_label(&mut self, id: &'static str, want: &str) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            self.cx.advance_clock(PROGRAM_POLL);
+            self.frame();
+            let label = self.label(id);
+            if label.as_deref() == Some(want) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let shot = self.shot("timeout");
+                panic!(
+                    "timed out waiting for {id} to say {want:?}; it says {label:?}; screenshot: {}",
+                    shot.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The number of panes in the right panel's terminal tab on screen.
+    fn terminal_panes(&mut self) -> usize {
+        let app = self.app.clone();
+        self.cx.update(|cx| app.read(cx).terminal_panes(cx))
+    }
+
+    /// Moves the pointer to the middle of terminal pane `pane`.
+    fn hover_pane(&mut self, pane: usize) {
+        self.act(|window, cx| {
+            let center = window
+                .within(("terminal-pane", pane))
+                .find("terminal")
+                .bounds()
+                .center();
+            window.pointer_move(center, None, cx);
+        });
+    }
+
+    /// Puts the keyboard in the active session's composer.
+    fn focus_composer(&mut self) {
+        let app = self.app.clone();
+        self.act(|window, cx| {
+            let view = app.read(cx).active_session().expect("a session shows");
+            let composer = view.read(cx).composer_focus_handle(cx);
+            window.focus(&composer, cx);
+        });
     }
 
     /// The right panel's terminal, once its shell runs.
@@ -2539,6 +2611,124 @@ fn a_terminal_selection_scrolls_past_its_edges() {
         scrolled <= 10,
         "the hidden terminal scrolled {scrolled} rows"
     );
+}
+
+/// The Terminal surface opens as many tabs as asked, each named for the
+/// program its shell runs, and splits into panes from a pane's menu or
+/// Ghostty's keys. The keys act on the terminal with the keyboard, or
+/// else, with the keyboard elsewhere, the one under the pointer, and on
+/// nothing with neither, as when the pointer has left the window.
+#[test]
+fn terminal_tabs_split_and_name_their_programs() {
+    let mut ui = Harness::with_terminal("terminal-tabs");
+    ui.wait_for_label("panel-tab-terminal", "sh");
+    ui.input_method(|input, cx| input.commit_text("sleep 30", cx));
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_label("panel-tab-terminal", "sleep");
+    ui.shot("program");
+    ui.act(|window, cx| window.press("ctrl-c", cx));
+    ui.wait_for_label("panel-tab-terminal", "sh");
+
+    // The pane's menu splits it; the new pane runs a shell of its own and
+    // takes the keyboard.
+    ui.act(|window, cx| window.right_click("terminal", cx));
+    ui.shot("pane-menu");
+    click_label(&mut ui, "Split right");
+    assert_eq!(ui.terminal_panes(), 2);
+    ui.wait_for_terminal("the new pane's prompt", |lines| {
+        lines.iter().any(|line| line.starts_with('$'))
+    });
+    // Typed, not composed: the input method helper finds the terminal by
+    // an ID each pane's has.
+    ui.act(|window, cx| {
+        window.input("echo right", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_for_terminal("the new pane's echo", |lines| {
+        lines.iter().any(|line| line == "right")
+    });
+
+    // The keyboard outranks the pointer: over the left pane, Ctrl+Shift+E
+    // splits the right one, where the keyboard is, and the new pane below
+    // it takes the keyboard.
+    ui.hover_pane(0);
+    ui.act(|window, cx| window.press("ctrl-shift-e", cx));
+    assert_eq!(ui.terminal_panes(), 3);
+    let pane_bounds = |ui: &mut Harness, pane: usize| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                window
+                    .within(("terminal-pane", pane))
+                    .find("terminal")
+                    .bounds()
+            })
+            .expect("window is open")
+    };
+    let (right, below) = (pane_bounds(&mut ui, 1), pane_bounds(&mut ui, 2));
+    assert!(
+        below.left() == right.left() && below.top() > right.top(),
+        "the new pane, at {below:?}, is below the right one, at {right:?}"
+    );
+    ui.wait_for_terminal("the bottom pane's prompt", |lines| {
+        lines.iter().any(|line| line.starts_with('$'))
+    });
+    ui.shot("split");
+
+    // With the keyboard in the composer, the pointer chooses: Ctrl+Shift+W
+    // over the left pane closes it, and the keyboard stays in the composer.
+    ui.focus_composer();
+    ui.hover_pane(0);
+    ui.act(|window, cx| window.press("ctrl-shift-w", cx));
+    assert_eq!(ui.terminal_panes(), 2);
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        let view = app.read(cx).active_session().expect("a session shows");
+        assert!(
+            view.read(cx).composer_focus_handle(cx).is_focused(window),
+            "the keyboard stays in the composer"
+        );
+    });
+
+    // Ctrl+Alt+Up goes from the bottom pane to the one above.
+    ui.act(|window, cx| {
+        window
+            .within(("terminal-pane", 2_usize))
+            .click("terminal", cx);
+    });
+    ui.act(|window, cx| window.press("ctrl-alt-up", cx));
+    ui.wait_for_terminal("the pane above", |lines| {
+        lines.iter().any(|line| line == "right")
+    });
+
+    // Ctrl+Shift+T opens a second tab, with a shell of its own;
+    // Ctrl+Shift+W closes its only pane, and so the tab.
+    ui.act(|window, cx| window.press("ctrl-shift-t", cx));
+    ui.act(|window, _| assert!(is_visible(window, "panel-tab-terminal-2")));
+    assert_eq!(ui.terminal_panes(), 1);
+    ui.wait_for_terminal("the second tab's prompt", |lines| {
+        lines.iter().any(|line| line.starts_with('$'))
+    });
+    ui.act(|window, cx| window.press("ctrl-shift-w", cx));
+    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-terminal-2")));
+    assert_eq!(ui.terminal_panes(), 2, "the first tab shows again");
+
+    // With neither the pointer nor the keyboard on a terminal, the keys do
+    // nothing to it: here the pointer left the window over a pane.
+    ui.focus_composer();
+    ui.hover_pane(1);
+    ui.act(|window, cx| {
+        let position = window.mouse_position();
+        window.dispatch_event(
+            PlatformInput::MouseExited(MouseExitEvent {
+                position,
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            }),
+            cx,
+        );
+        window.press("ctrl-shift-w", cx);
+    });
+    assert_eq!(ui.terminal_panes(), 2);
 }
 
 /// Dragging the right panel's edge resizes it, as far as leaves the pane

@@ -46,7 +46,7 @@ use std::{borrow::Cow, path::PathBuf, rc::Rc};
 
 use gpui_kit::component::input::{Enter, Paste};
 use gpui_kit::{
-    px, size, App, AppContext as _, AssetSource, KeyBinding, NoAction, SharedString,
+    px, size, App, AppContext as _, AssetSource, Axis, KeyBinding, NoAction, SharedString,
     TitlebarOptions, WindowBounds, WindowOptions,
 };
 use rho_ui_core::DaemonTarget;
@@ -56,7 +56,7 @@ use crate::{
     background_log::BackgroundLog,
     machines::RemoteMachine,
     projects::Projects,
-    right_panel::{PanelLayout, TerminalShell},
+    right_panel::{Direction, PaneCommand, PanelLayout, TerminalShell, TerminalShortcut},
     settings::Settings,
     sidebar::SidebarState,
     store::StateDb,
@@ -118,7 +118,10 @@ gpui_kit::assets::icon_assets!(
         Timer,
         SkipForward,
         FileDiff,
-        FolderTree
+        FolderTree,
+        Columns2,
+        Rows2,
+        ClipboardPaste
     ]
 );
 
@@ -257,6 +260,36 @@ fn init(cx: &mut App, db: &StateDb) {
             Some("Input"),
         ),
     ]);
+    let pane = TerminalShortcut::Pane;
+    cx.bind_keys(
+        [
+            ("ctrl-shift-t", TerminalShortcut::NewTab),
+            ("ctrl-pagedown", TerminalShortcut::NextTab),
+            ("ctrl-pageup", TerminalShortcut::PreviousTab),
+            ("ctrl-shift-o", pane(PaneCommand::Split(Axis::Horizontal))),
+            ("ctrl-shift-e", pane(PaneCommand::Split(Axis::Vertical))),
+            ("ctrl-shift-w", pane(PaneCommand::Close)),
+            ("ctrl-alt-left", pane(PaneCommand::Focus(Direction::Left))),
+            ("ctrl-alt-right", pane(PaneCommand::Focus(Direction::Right))),
+            ("ctrl-alt-up", pane(PaneCommand::Focus(Direction::Up))),
+            ("ctrl-alt-down", pane(PaneCommand::Focus(Direction::Down))),
+        ]
+        .into_iter()
+        .flat_map(|(keys, shortcut)| terminal_keys(keys, shortcut)),
+    );
+}
+
+/// Binds `keys`, one of Ghostty's keys for tabs and splits on Linux, to
+/// `shortcut`, which acts on the terminal with the keyboard, else the one
+/// under the pointer, and otherwise lets the key go on
+/// (`RightPanel::terminal_shortcut`). Bound in "Input" too, the key context
+/// of Kit's text fields, ahead of Kit's own bindings there (Ctrl+Shift+E
+/// selects to the end of the line), which get the key when no terminal does.
+fn terminal_keys(keys: &'static str, shortcut: TerminalShortcut) -> [KeyBinding; 2] {
+    [
+        KeyBinding::new(keys, shortcut, Some("RhoApp")),
+        KeyBinding::new(keys, shortcut, Some("Input")),
+    ]
 }
 
 /// The main window: centered, large enough for the sidebar and a readable
@@ -315,12 +348,17 @@ mod tests {
         let missing: Vec<&str> = names
             .into_iter()
             .filter(|name| {
+                // Lucide's file names: `Columns2` is `columns-2.svg`.
                 let mut stem = String::new();
-                for (ix, c) in name.char_indices() {
-                    if c.is_ascii_uppercase() && ix > 0 {
+                let mut last: Option<char> = None;
+                for c in name.chars() {
+                    let starts_word = c.is_ascii_uppercase()
+                        || (c.is_ascii_digit() && !last.is_some_and(|l| l.is_ascii_digit()));
+                    if starts_word && last.is_some() {
                         stem.push('-');
                     }
                     stem.push(c.to_ascii_lowercase());
+                    last = Some(c);
                 }
                 let path = format!("icons/{stem}.svg");
                 !Assets.load(&path).is_ok_and(|icon| icon.is_some())

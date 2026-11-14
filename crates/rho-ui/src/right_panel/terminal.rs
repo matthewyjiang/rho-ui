@@ -1,13 +1,20 @@
-//! The Terminal surface: a shell in the folder of the session on screen,
+//! The Terminal surface: shells in the folder of the session on screen,
 //! on the session's machine. Ghostty's libghostty-vt keeps the screen: it
 //! parses what the shell prints and encodes keys the way the program in it
 //! asked. rho-ui runs the pseudo-terminal and draws the cells with GPUI.
 //!
 //! On this machine the shell is [`TerminalShell`]; on a remote one it is the
 //! login shell there, through `ssh -tt` over the master the daemon
-//! connection opened ([`SshLink::terminal_command`]). Each session gets its
-//! own terminal, started the first time it is on screen with the surface
-//! open, and kept until the surface closes.
+//! connection opened ([`SshLink::terminal_command`]).
+//!
+//! Each Terminal tab ([`TerminalTab`]) splits into panes ([`TerminalPane`]),
+//! side by side or one above another. In each pane, each session gets its
+//! own terminal, started the first time it is on screen there, and kept
+//! until the pane closes.
+//!
+//! A tab is named for the program its shell runs now ([`TerminalView::program`]):
+//! the pseudo-terminal's foreground process on this machine, or the title
+//! the program sets on a remote one, where that process is ssh.
 //!
 //! The mouse goes to a program that asks for it, such as vim or htop, and
 //! otherwise selects text ([`mouse`]), scrolling while a drag is past the
@@ -17,6 +24,7 @@
 //! cursor until then ([`EntityInputHandler`]).
 
 mod mouse;
+mod tab;
 
 use std::{
     cell::RefCell,
@@ -24,6 +32,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     rc::Rc,
+    time::Duration,
 };
 
 use futures::{channel::mpsc, StreamExt as _};
@@ -55,6 +64,8 @@ use libghostty_vt::{
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use self::mouse::{Mouse, Pressed, Released};
+pub(crate) use self::tab::{Direction, PaneCommand};
+pub(super) use self::tab::{Emptied, TerminalTab};
 use crate::{
     folders::Reader,
     machines::{Place, SessionKey},
@@ -87,50 +98,96 @@ const HIDDEN_AFTER_TICKS: u8 = 8;
 /// Lines kept above the screen.
 const SCROLLBACK_LINES: usize = 10_000;
 
-/// The Terminal surface of [`super::RightPanel`]: the terminal of the
-/// session on screen.
-pub(super) struct TerminalSurface {
+/// How often a pane reads the program its terminal runs, as a new one
+/// may start without printing, as `sleep` does. A read of
+/// `/proc/<pid>/comm` takes about 11 µs, so a tab costs a few thousandths
+/// of a percent of a core; a tab's name lags the program by up to this.
+pub(crate) const PROGRAM_POLL: Duration = Duration::from_millis(500);
+
+/// A pane of a [`TerminalTab`]: the terminal of the session on screen.
+struct TerminalPane {
     workspaces: Entity<Workspaces>,
     shell: TerminalShell,
     /// The session on screen.
     session: Option<(SessionKey, Place)>,
     /// Each session's terminal, or why it couldn't start.
     terminals: Vec<(SessionKey, Result<Entity<TerminalView>, SharedString>)>,
+    /// The program the on-screen session's terminal runs, as last read.
+    program: Option<SharedString>,
+    /// Reads `program` every [`PROGRAM_POLL`]; dropped with the pane.
+    _poll: Task<()>,
 }
 
-impl TerminalSurface {
-    pub(super) fn new(
+impl TerminalPane {
+    fn new(
         workspaces: Entity<Workspaces>,
         shell: TerminalShell,
         session: Option<&Entity<SessionView>>,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        let poll = cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(PROGRAM_POLL).await;
+            if this.update(cx, Self::follow_program).is_err() {
+                break;
+            }
+        });
         let mut this = Self {
             workspaces,
             shell,
             session: None,
             terminals: Vec::new(),
+            program: None,
+            _poll: poll,
         };
         this.set_session(session, cx);
         this
     }
 
-    /// Shows `session`'s terminal, starting it if it has none.
-    pub(super) fn set_session(
-        &mut self,
-        session: Option<&Entity<SessionView>>,
-        cx: &mut Context<'_, Self>,
-    ) {
+    /// Shows `session`'s terminal, which the pane's next frame starts if it
+    /// has none.
+    fn set_session(&mut self, session: Option<&Entity<SessionView>>, cx: &mut Context<'_, Self>) {
         self.session = session.map(|view| {
             let live = view.read(cx).live();
             (live.id.clone(), Place::new(live.id.machine, live.cwd))
         });
+        self.follow_program(cx);
+        cx.notify();
+    }
+
+    /// The program the on-screen session's terminal runs, if it runs one
+    /// this can name.
+    fn program(&self) -> Option<&SharedString> {
+        self.program.as_ref()
+    }
+
+    /// Reads the program the on-screen session's terminal runs, and
+    /// redraws if it changed.
+    fn follow_program(&mut self, cx: &mut Context<'_, Self>) {
+        let program = self.terminal().and_then(|view| view.read(cx).program());
+        if program != self.program {
+            self.program = program;
+            cx.notify();
+        }
+    }
+
+    /// The on-screen session's terminal, if it started.
+    fn terminal(&self) -> Option<&Entity<TerminalView>> {
+        let (key, _) = self.session.as_ref()?;
+        self.terminals
+            .iter()
+            .find(|(known, _)| known == key)
+            .and_then(|(_, terminal)| terminal.as_ref().ok())
+    }
+
+    /// Starts the shell of the session on screen if it has none: when the
+    /// pane shows or takes the keyboard, not for every pane of every tab a
+    /// session switch reaches.
+    fn start_if_new(&mut self, cx: &mut Context<'_, Self>) {
         if let Some((key, _)) = &self.session {
             if !self.terminals.iter().any(|(known, _)| known == key) {
                 self.start(cx);
             }
         }
-        cx.notify();
     }
 
     /// Starts the shell of the session on screen, in place of any it had.
@@ -143,36 +200,38 @@ impl TerminalSurface {
             Reader::Here => {
                 let mut command = CommandBuilder::new(&self.shell.0);
                 command.cwd(&place.path);
-                Ok(command)
+                Ok((command, ProgramSource::Foreground))
             }
             Reader::There(ssh) => {
                 let (program, args) = ssh.terminal_command(&place.path);
                 let mut command = CommandBuilder::new(program);
                 command.args(args);
-                Ok(command)
+                Ok((command, ProgramSource::Title))
             }
             Reader::Unread => Err("The session's machine isn't connected.".into()),
         };
-        let terminal = command.and_then(|command| {
-            TerminalView::spawn(command, cx).map_err(|why| format!("Couldn't start: {why}").into())
+        let terminal = command.and_then(|(command, source)| {
+            TerminalView::spawn(command, source, cx)
+                .map_err(|why| format!("Couldn't start: {why}").into())
         });
         self.terminals.retain(|(known, _)| *known != key);
         self.terminals.push((key, terminal));
     }
+}
 
-    /// The terminal of the session on screen, for UI tests.
-    #[cfg(test)]
-    pub(super) fn current(&self) -> Option<Entity<TerminalView>> {
-        let (key, _) = self.session.as_ref()?;
-        self.terminals
-            .iter()
-            .find(|(known, _)| known == key)
-            .and_then(|(_, terminal)| terminal.as_ref().ok().cloned())
-    }
+/// Where a terminal reads the name of the program it runs.
+#[derive(Clone, Copy, Debug)]
+enum ProgramSource {
+    /// The pseudo-terminal's foreground process, for a shell on this
+    /// machine; the title the program sets where the system can't say.
+    Foreground,
+    /// The title the program sets, for a shell on a remote machine: the
+    /// foreground process here is ssh.
+    Title,
 }
 
 /// A message, with a button to start the shell again.
-fn restart(text: SharedString, cx: &Context<'_, TerminalSurface>) -> AnyElement {
+fn restart(text: SharedString, cx: &Context<'_, TerminalPane>) -> AnyElement {
     Empty::new()
         .h_full()
         .header(EmptyHeader::new().description(EmptyDescription::new().child(text)))
@@ -192,8 +251,9 @@ fn restart(text: SharedString, cx: &Context<'_, TerminalSurface>) -> AnyElement 
         .into_any_element()
 }
 
-impl Render for TerminalSurface {
+impl Render for TerminalPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.start_if_new(cx);
         let Some((key, _)) = &self.session else {
             return Empty::new()
                 .h_full()
@@ -230,6 +290,8 @@ pub(crate) struct TerminalView {
     /// Shared with the terminal's replies to the program's queries.
     writer: Rc<RefCell<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
+    /// Where [`Self::program`] reads the program's name.
+    program_source: ProgramSource,
     mouse: Mouse,
     /// Where the grid was last drawn; its size is what the shell was told.
     layout: Option<Grid>,
@@ -257,7 +319,8 @@ impl TerminalView {
     /// first frame sizes to the panel.
     fn spawn(
         mut command: CommandBuilder,
-        cx: &mut Context<'_, TerminalSurface>,
+        program_source: ProgramSource,
+        cx: &mut Context<'_, TerminalPane>,
     ) -> Result<Entity<Self>, String> {
         let grid = (80, 24);
         let pair = native_pty_system()
@@ -316,6 +379,7 @@ impl TerminalView {
             pty: pair.master,
             writer,
             child,
+            program_source,
             mouse: Mouse::new().map_err(ghostty)?,
             layout: None,
             cursor: None,
@@ -331,7 +395,7 @@ impl TerminalView {
         let view = cx.new(|_| view);
         let read = cx.spawn({
             let view = view.downgrade();
-            async move |surface, cx| {
+            async move |pane, cx| {
                 while let Some(mut bytes) = output.next().await {
                     // Everything already read, in one write and one frame.
                     while let Ok(more) = output.try_recv() {
@@ -350,11 +414,32 @@ impl TerminalView {
                     let _ = view.child.try_wait();
                     cx.notify();
                 });
-                let _ = surface.update(cx, |_, cx| cx.notify());
+                let _ = pane.update(cx, |pane, cx| {
+                    pane.follow_program(cx);
+                    cx.notify();
+                });
             }
         });
         view.update(cx, |view, _| view.reader = read);
         Ok(view)
+    }
+
+    /// The name of the program the shell runs now, or of the shell when it
+    /// runs none; `None` once it exits, or when there is no name to read.
+    fn program(&self) -> Option<SharedString> {
+        if self.exited {
+            return None;
+        }
+        let foreground = match self.program_source {
+            ProgramSource::Foreground => foreground_program(&*self.pty),
+            ProgramSource::Title => None,
+        };
+        let title = || {
+            let title = self.terminal.title().ok()?;
+            let title = String::from_utf8_lossy(title).trim().to_owned();
+            Some(title).filter(|title| !title.is_empty())
+        };
+        foreground.or_else(title).map(SharedString::from)
     }
 
     /// Writes `bytes` to the program.
@@ -393,16 +478,12 @@ impl TerminalView {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
         if modifiers.control && modifiers.shift && keystroke.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.paste(text);
-            }
+            self.paste_clipboard(cx);
             cx.stop_propagation();
             return;
         }
         if modifiers.control && modifiers.shift && keystroke.key == "c" {
-            if let Some(text) = self.selected_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+            self.copy(cx);
             cx.stop_propagation();
             return;
         }
@@ -444,6 +525,20 @@ impl TerminalView {
         self.send(&bytes);
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Copies the selection to the clipboard, as Ctrl+Shift+C does.
+    fn copy(&self, cx: &mut App) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Pastes the clipboard's text, as Ctrl+Shift+V does.
+    fn paste_clipboard(&mut self, cx: &mut App) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.paste(text);
+        }
     }
 
     /// Pastes `text`, bracketed if the program asked.
@@ -497,7 +592,11 @@ impl TerminalView {
         };
         match self.mouse.down(&self.terminal, &grid, event) {
             Pressed::Nothing => {}
-            Pressed::Report(bytes) => self.write(&bytes),
+            Pressed::Report(bytes) => {
+                self.write(&bytes);
+                // The program's, not the pane's menu.
+                cx.stop_propagation();
+            }
             Pressed::PastePrimary => {
                 if let Some(text) = read_primary(cx) {
                     self.paste(text);
@@ -1044,6 +1143,21 @@ fn mods(modifiers: Modifiers) -> key::Mods {
         }
     }
     mods
+}
+
+/// The name the system gives the foreground process of `pty`, such as
+/// `vim`, or the shell's while it waits for a command. Linux keeps it in
+/// `/proc`; elsewhere this reads nothing.
+#[cfg(target_os = "linux")]
+fn foreground_program(pty: &(dyn MasterPty + Send)) -> Option<String> {
+    let pid = pty.process_group_leader()?;
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(name.trim_end().to_owned()).filter(|name| !name.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn foreground_program(_: &(dyn MasterPty + Send)) -> Option<String> {
+    None
 }
 
 // The primary selection: what a selection puts there, and a middle click

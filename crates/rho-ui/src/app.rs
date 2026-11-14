@@ -35,7 +35,9 @@ use crate::{
     machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
     projects::Projects,
     rho_settings::RhoSettings,
-    right_panel::{PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, MIN_PANE_REMS},
+    right_panel::{
+        PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, TerminalShortcut, MIN_PANE_REMS,
+    },
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
@@ -1009,6 +1011,24 @@ impl RhoApp {
         self.focus_pane(window, cx);
     }
 
+    /// Runs `shortcut` on the right panel's terminal with the keyboard or
+    /// under the pointer. With none, the key goes on as if unbound, so a
+    /// text field still gets it.
+    fn terminal_shortcut(
+        &mut self,
+        shortcut: TerminalShortcut,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let ran = PanelLayout::get(cx)
+            && self.panel.update(cx, |panel, cx| {
+                panel.terminal_shortcut(shortcut, window, cx)
+            });
+        if !ran {
+            cx.propagate();
+        }
+    }
+
     /// Puts `pane` in the main area, marks its row in the sidebar, and
     /// shows its session in the right panel, leaving the keyboard where it
     /// is.
@@ -1288,6 +1308,10 @@ impl RhoApp {
     pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<crate::right_panel::TerminalView>> {
         self.panel.read(cx).terminal(cx)
     }
+    /// The panes of the right panel's terminal tab on screen, for UI tests.
+    pub(crate) fn terminal_panes(&self, cx: &App) -> usize {
+        self.panel.read(cx).terminal_panes(cx)
+    }
     /// The sidebar's search, for UI tests.
     pub(crate) fn sidebar_search(&self, cx: &App) -> FocusHandle {
         self.sidebar.read(cx).search_focus_handle(cx)
@@ -1311,6 +1335,11 @@ impl Render for RhoApp {
                 this.toggle_sidebar(window, cx);
             }))
             .on_action(|_: &ToggleRightPanel, _, cx| PanelLayout::toggle(cx))
+            .on_action(
+                cx.listener(|this, shortcut: &TerminalShortcut, window, cx| {
+                    this.terminal_shortcut(*shortcut, window, cx);
+                }),
+            )
             .relative()
             .size_full()
             .bg(cx.theme().background)

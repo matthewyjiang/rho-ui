@@ -2,8 +2,8 @@
 //! presses, releases, motion and wheel as escape sequences, from
 //! libghostty's encoder. Otherwise, or with Shift held, the left button
 //! selects text through libghostty's selection gestures, scrolling while a
-//! drag is past the top or bottom, and the middle button pastes the
-//! primary selection.
+//! drag is past the top or bottom, the middle button pastes the primary
+//! selection, and the right button opens the pane's menu.
 
 use std::time::{Duration, Instant};
 
@@ -202,6 +202,8 @@ impl Mouse {
                 return Pressed::Nothing;
             }
             MouseButton::Middle if selecting => return Pressed::PastePrimary,
+            // The pane's menu.
+            MouseButton::Right if selecting => return Pressed::Nothing,
             _ if !tracking => return Pressed::Nothing,
             button => match button_of(button) {
                 Some(button) => button,
