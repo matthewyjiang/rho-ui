@@ -130,6 +130,81 @@ pub(crate) enum Reader {
     Unread,
 }
 
+impl Reader {
+    /// Runs the POSIX `sh` script `script` on the machine, with `args` as
+    /// its positional parameters, and returns what it wrote to stdout:
+    /// here with `sh` on `executor`, there over ssh within
+    /// [`SshLink::run_script`]'s deadline.
+    ///
+    /// # Errors
+    ///
+    /// Says why, in the script's or ssh's words, if the machine isn't
+    /// connected or the script failed.
+    pub(crate) async fn run_script(
+        self,
+        script: &'static str,
+        args: Vec<OsString>,
+        executor: &BackgroundExecutor,
+    ) -> Result<Vec<u8>, String> {
+        match self {
+            Reader::Here => executor.spawn(async move { run_here(script, &args) }).await,
+            Reader::There(ssh) => ssh
+                .run_script(script, &args)
+                .await
+                .map_err(|error| error.to_string()),
+            Reader::Unread => Err(UNREAD.to_owned()),
+        }
+    }
+
+    /// [`Self::run_script`] with no deadline, for a script whose time the
+    /// network and the work set, such as a `git clone`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_script`].
+    pub(crate) async fn run_long_script(
+        self,
+        script: &'static str,
+        args: Vec<OsString>,
+        executor: &BackgroundExecutor,
+    ) -> Result<Vec<u8>, String> {
+        match self {
+            Reader::Here => executor.spawn(async move { run_here(script, &args) }).await,
+            Reader::There(ssh) => ssh
+                .run_long_script(script, &args)
+                .await
+                .map_err(|error| error.to_string()),
+            Reader::Unread => Err(UNREAD.to_owned()),
+        }
+    }
+}
+
+/// Why a script can't run on a machine that isn't connected.
+const UNREAD: &str = "The machine isn't connected.";
+
+/// Runs the POSIX `sh` script `script` on this machine with `args`, and
+/// returns its stdout, or its stderr as the error if it fails. Blocks
+/// until it ends; call it off the UI thread.
+pub(crate) fn run_here(script: &str, args: &[impl AsRef<OsStr>]) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("Couldn't run sh: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(match stderr.trim() {
+            "" => format!("The script ended with {}.", output.status),
+            why => why.to_owned(),
+        })
+    }
+}
+
 /// Looks `typed` up with `reader`, doing file I/O on `executor`.
 ///
 /// # Errors

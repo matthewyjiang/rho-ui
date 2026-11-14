@@ -4,10 +4,7 @@
 //! them when it opens, when another session comes on screen, when the
 //! session's turn ends, and on Refresh.
 
-use std::{
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
+use std::path::PathBuf;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
@@ -321,37 +318,10 @@ async fn read(
     cwd: PathBuf,
     executor: BackgroundExecutor,
 ) -> Result<Option<String>, String> {
-    let output = match reader {
-        Reader::Here => executor.spawn(async move { run_here(&cwd) }).await?,
-        Reader::There(ssh) => ssh
-            .run_script(SCRIPT, &[&cwd])
-            .await
-            .map_err(|error| error.to_string())?,
-        Reader::Unread => return Err("The session's machine isn't connected.".to_owned()),
-    };
+    let output = reader
+        .run_script(SCRIPT, vec![cwd.into_os_string()], &executor)
+        .await?;
     parse(&output)
-}
-
-/// Runs [`SCRIPT`] on this machine for `cwd`. Blocks until git is done;
-/// call it off the UI thread.
-fn run_here(cwd: &Path) -> Result<Vec<u8>, String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(SCRIPT)
-        .arg("sh")
-        .arg(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("Couldn't run sh: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(match stderr.trim() {
-            "" => format!("git ended with {}", output.status),
-            why => why.to_owned(),
-        })
-    }
 }
 
 /// The patch [`SCRIPT`] printed, or `None` if it found no repository.
@@ -373,6 +343,10 @@ fn parse(output: &[u8]) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
+
+    use crate::folders::run_here;
+
     use super::*;
 
     /// [`SCRIPT`] finds every kind of uncommitted change from any folder of
@@ -402,7 +376,7 @@ mod tests {
         };
         let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
         let changes = |folder: &PathBuf| {
-            let patch = parse(&run_here(folder).unwrap()).unwrap();
+            let patch = parse(&run_here(SCRIPT, &[folder]).unwrap()).unwrap();
             let files = DiffFile::parse(&patch.expect("a repository")).unwrap();
             let mut paths: Vec<String> = files.iter().map(|f| f.path().to_string()).collect();
             paths.sort();
@@ -432,7 +406,7 @@ mod tests {
         assert_eq!(changes(&dir.join("src")), expected, "from a subfolder");
 
         let plain = tempfile::tempdir().unwrap();
-        assert_eq!(parse(&run_here(plain.path()).unwrap()), Ok(None));
+        assert_eq!(parse(&run_here(SCRIPT, &[plain.path()]).unwrap()), Ok(None));
     }
 
     #[test]

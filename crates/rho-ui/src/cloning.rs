@@ -5,12 +5,7 @@
 //! the ssh connection to its daemon, on a remote one, so both find the
 //! folder by the same rules.
 
-use std::{
-    ffi::OsString,
-    os::unix::ffi::OsStringExt as _,
-    path::PathBuf,
-    process::{Command, Stdio},
-};
+use std::{ffi::OsString, os::unix::ffi::OsStringExt as _, path::PathBuf};
 
 use gpui_kit::BackgroundExecutor;
 
@@ -103,14 +98,8 @@ pub(crate) async fn clone(
     executor: BackgroundExecutor,
 ) -> Result<PathBuf, String> {
     let args = [source.url.clone(), folder, source.folder().to_owned()];
-    let output = match reader {
-        Reader::Here => executor.spawn(async move { run_here(&args) }).await?,
-        Reader::There(ssh) => ssh
-            .run_long_script(SCRIPT, &args)
-            .await
-            .map_err(|error| error.to_string())?,
-        Reader::Unread => return Err("it isn't connected".to_owned()),
-    };
+    let args = args.into_iter().map(OsString::from).collect();
+    let output = reader.run_long_script(SCRIPT, args, &executor).await?;
     // The last field is the path, after whatever a login file printed.
     let mut fields = output.split(|&byte| byte == 0).filter(|f| !f.is_empty());
     fields
@@ -119,30 +108,10 @@ pub(crate) async fn clone(
         .ok_or_else(|| "the clone script printed no path".to_owned())
 }
 
-/// Runs [`SCRIPT`] on this machine with `args`. Blocks until git is done;
-/// call it off the UI thread.
-fn run_here(args: &[String]) -> Result<Vec<u8>, String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(SCRIPT)
-        .arg("sh")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("couldn't run sh: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(match stderr.trim() {
-            "" => format!("the clone ended with {}", output.status),
-            why => why.to_owned(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
+
     use super::*;
 
     #[test]
