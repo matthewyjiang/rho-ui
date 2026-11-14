@@ -117,7 +117,8 @@ gpui_kit::assets::icon_assets!(
         Layers,
         Timer,
         SkipForward,
-        FileDiff
+        FileDiff,
+        FolderTree
     ]
 );
 

@@ -2288,6 +2288,80 @@ fn the_diff_surface_follows_the_sessions_changes() {
     });
 }
 
+/// The Files surface lists the session's folder as a tree: a click opens a
+/// folder, and a click on a file shows its text. A turn that ends reads the
+/// open file again, and Back returns to the tree with its folder still
+/// open.
+#[test]
+fn the_files_surface_opens_the_sessions_files() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo = repo.path().canonicalize().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::create_dir(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(repo.join("README.md"), "# Hi\n").unwrap();
+
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "files",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::owning(["s1"]),
+            projects: Projects::default(),
+            settings: Settings::default(),
+            remote_sockets: Vec::new(),
+            workspace: Some(repo.clone()),
+        },
+    );
+    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.click("open-surface-files");
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_until("the folder's files", |window, _, _| {
+        is_visible(window, "files-entry-src") && is_visible(window, "files-entry-README.md")
+    });
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "files-entry-src/main.rs"),
+            "folders start shut"
+        );
+    });
+    ui.click("files-entry-src");
+    ui.wait_until("the folder open", |window, _, _| {
+        is_visible(window, "files-entry-src/main.rs")
+    });
+    ui.shot("tree");
+
+    ui.click("files-entry-src/main.rs");
+    ui.wait_until("the file's text", |_, cx, app| {
+        app.open_file(cx) == Some(("src/main.rs".to_owned(), "fn main() {}\n".to_owned()))
+    });
+    ui.shot("file");
+
+    let edited = "fn main() {\n    println!(\"hi\");\n}\n";
+    std::fs::write(repo.join("src/main.rs"), edited).unwrap();
+    // The turn ends with its process running, which saves the session.
+    ui.send("background");
+    ui.wait_until("the file as the turn left it", |_, cx, app| {
+        app.open_file(cx) == Some(("src/main.rs".to_owned(), edited.to_owned()))
+    });
+
+    ui.click("files-back");
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "files-entry-src/main.rs"),
+            "the folder stays open"
+        );
+    });
+}
+
 /// The Terminal surface runs a shell in the session's folder: what the
 /// keyboard types reaches it once, what it prints shows, and the app's own
 /// shortcuts that the shell uses go to the shell. A drag or a double click

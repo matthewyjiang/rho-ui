@@ -17,6 +17,7 @@
 //! opens ([`Tab`]) and told which session is on screen.
 
 mod diff;
+mod files;
 mod terminal;
 
 use std::cmp::Ordering;
@@ -40,6 +41,7 @@ use gpui_kit::{
 };
 
 use self::diff::DiffSurface;
+use self::files::FilesSurface;
 pub(crate) use self::terminal::TerminalShell;
 use self::terminal::TerminalSurface;
 #[cfg(test)]
@@ -73,19 +75,27 @@ pub(crate) enum Surface {
     Background,
     /// The uncommitted changes where the session works.
     Diff,
+    /// The files where the session works, and one opened to read.
+    Files,
     /// A shell in the session's folder.
     Terminal,
 }
 
 impl Surface {
     /// Every surface, in the order the panel lists them.
-    const ALL: [Surface; 3] = [Surface::Terminal, Surface::Diff, Surface::Background];
+    const ALL: [Surface; 4] = [
+        Surface::Files,
+        Surface::Terminal,
+        Surface::Diff,
+        Surface::Background,
+    ];
 
     /// The surface's part of its elements' IDs.
     fn id(self) -> &'static str {
         match self {
             Surface::Background => "background",
             Surface::Diff => "diff",
+            Surface::Files => "files",
             Surface::Terminal => "terminal",
         }
     }
@@ -94,6 +104,7 @@ impl Surface {
         match self {
             Surface::Background => "Background work",
             Surface::Diff => "Diff",
+            Surface::Files => "Files",
             Surface::Terminal => "Terminal",
         }
     }
@@ -102,6 +113,7 @@ impl Surface {
         match self {
             Surface::Background => Lucide::ListChecks,
             Surface::Diff => Lucide::FileDiff,
+            Surface::Files => Lucide::FolderTree,
             Surface::Terminal => Lucide::SquareTerminal,
         }
     }
@@ -111,6 +123,7 @@ impl Surface {
 enum Tab {
     Background,
     Diff(Entity<DiffSurface>),
+    Files(Entity<FilesSurface>),
     Terminal(Entity<TerminalSurface>),
 }
 
@@ -119,6 +132,7 @@ impl Tab {
         match self {
             Tab::Background => Surface::Background,
             Tab::Diff(_) => Surface::Diff,
+            Tab::Files(_) => Surface::Files,
             Tab::Terminal(_) => Surface::Terminal,
         }
     }
@@ -305,6 +319,9 @@ impl RightPanel {
                 Tab::Diff(diff) => {
                     diff.update(cx, |diff, cx| diff.set_session(session.as_ref(), cx));
                 }
+                Tab::Files(files) => {
+                    files.update(cx, |files, cx| files.set_session(session.as_ref(), cx));
+                }
                 Tab::Terminal(terminal) => {
                     terminal.update(cx, |terminal, cx| {
                         terminal.set_session(session.as_ref(), cx);
@@ -328,6 +345,10 @@ impl RightPanel {
                 Surface::Diff => {
                     let workspaces = self.workspaces.clone();
                     Tab::Diff(cx.new(|cx| DiffSurface::new(workspaces, session, cx)))
+                }
+                Surface::Files => {
+                    let workspaces = self.workspaces.clone();
+                    Tab::Files(cx.new(|cx| FilesSurface::new(workspaces, session, cx)))
                 }
                 Surface::Terminal => {
                     let (workspaces, shell) = (self.workspaces.clone(), self.shell.clone());
@@ -369,7 +390,17 @@ impl RightPanel {
     pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
         self.tabs.iter().find_map(|tab| match tab {
             Tab::Diff(diff) => Some(diff.read(cx).paths(cx)),
-            Tab::Background | Tab::Terminal(_) => None,
+            Tab::Background | Tab::Files(_) | Tab::Terminal(_) => None,
+        })
+    }
+
+    /// The file the Files surface has open, and the text it shows, for UI
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn open_file(&self, cx: &App) -> Option<(String, String)> {
+        self.tabs.iter().find_map(|tab| match tab {
+            Tab::Files(files) => files.read(cx).open_file_text(cx),
+            Tab::Background | Tab::Diff(_) | Tab::Terminal(_) => None,
         })
     }
 
@@ -379,7 +410,7 @@ impl RightPanel {
     pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<TerminalView>> {
         self.tabs.iter().find_map(|tab| match tab {
             Tab::Terminal(terminal) => terminal.read(cx).current(),
-            Tab::Background | Tab::Diff(_) => None,
+            Tab::Background | Tab::Diff(_) | Tab::Files(_) => None,
         })
     }
 
@@ -604,6 +635,7 @@ impl RightPanel {
                 None => no_session("Open a session to see its background work."),
             },
             Tab::Diff(diff) => diff.clone().into_any_element(),
+            Tab::Files(files) => files.clone().into_any_element(),
             Tab::Terminal(terminal) => terminal.clone().into_any_element(),
         }
     }

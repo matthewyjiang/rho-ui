@@ -1275,6 +1275,11 @@ impl RhoApp {
     pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
         self.panel.read(cx).diff_paths(cx)
     }
+    /// The file the right panel's Files surface has open, and the text it
+    /// shows, for UI tests.
+    pub(crate) fn open_file(&self, cx: &App) -> Option<(String, String)> {
+        self.panel.read(cx).open_file(cx)
+    }
     /// The right panel's tabs, in order, for UI tests.
     pub(crate) fn panel_tabs(&self, cx: &App) -> Vec<crate::right_panel::Surface> {
         self.panel.read(cx).tab_order()
