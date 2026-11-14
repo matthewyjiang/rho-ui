@@ -27,13 +27,13 @@ use gpui_kit::component::{
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
     text::{TextView, TextViewState, TextViewStyle},
-    v_flex, ActiveTheme as _, Icon, Sizable as _,
+    v_flex, ActiveTheme as _, Colorize as _, Icon, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, AnyElement, App, AppContext as _, ElementId, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Window,
+    div, px, rems, transparent_white, AnyElement, App, AppContext as _, ElementId, Entity,
+    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{Entry, Notice, NoticeLevel, Row, Timeline};
 
@@ -69,7 +69,11 @@ const CODE_BLOCK_PAD_BOTTOM: f32 = 21.;
 /// command's, shows whole.
 const NOTICE_LINES: usize = 12;
 
-/// How messages draw their Markdown.
+/// The gap between a notice's paragraphs, in rems: Kit's alerts' own, so a
+/// detail sets as tight as the card it is in.
+const NOTICE_PARAGRAPH_GAP: f32 = 0.2;
+
+/// How messages and notices draw their Markdown.
 fn message_style() -> TextViewStyle {
     TextViewStyle {
         code_block: StyleRefinement::default()
@@ -527,7 +531,9 @@ impl Transcript {
                 .into_any_element();
         };
         let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
-        let mut text = TextView::new(detail).selectable(true);
+        let mut text = TextView::new(detail)
+            .style(message_style().paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)))
+            .selectable(true);
         if !open {
             text = text.max_lines(NOTICE_LINES);
         }
@@ -552,15 +558,49 @@ impl Transcript {
             .aria_label(notice.title().to_owned())
             .w_full()
             .gap_1()
-            .child(
-                Alert::new(key, text)
-                    .title(notice.title().to_owned())
-                    .with_variant(variant)
-                    .small(),
-            )
+            .child(notice_card(key, notice, text, cx))
             .children(toggle)
             .into_any_element()
     }
+}
+
+/// A notice with a detail: Kit's small [`Alert`], drawn here because Kit's
+/// sets its own style on its message, which drops the code-block padding
+/// [`message_style`] gives `text`. Sizes and colors are Kit 0.9.1's.
+fn notice_card(key: ElementId, notice: &Notice, text: TextView, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let color = match notice.level() {
+        NoticeLevel::Info => theme.info,
+        NoticeLevel::Warning => theme.warning,
+        NoticeLevel::Error => theme.danger,
+    };
+    h_flex()
+        .id(key)
+        .w_full()
+        .items_start()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(8.))
+        .text_sm()
+        .text_color(color)
+        .bg(color.mix_oklab(transparent_white(), 0.04))
+        .border_1()
+        .border_color(color.mix_oklab(transparent_white(), 0.3))
+        .rounded(theme.radius)
+        .child(div().mt(px(5.)).child(Icon::new(Lucide::Info)))
+        .child(
+            v_flex()
+                .flex_1()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .font_semibold()
+                        .child(notice.title().to_owned()),
+                )
+                .child(text),
+        )
 }
 
 /// Whether a row is still being written.
