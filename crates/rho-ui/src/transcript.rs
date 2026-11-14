@@ -35,7 +35,7 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
-use rho_ui_core::{Entry, Notice, NoticeLevel, Row, Timeline};
+use rho_ui_core::{Delay, Entry, Notice, NoticeLevel, Row, Timeline};
 
 use crate::{
     attachments::Preview,
@@ -143,6 +143,8 @@ pub(crate) struct Transcript {
     /// [`TurnTimes`].
     took: Vec<Option<Duration>>,
     running: Option<Running>,
+    /// What holds up the running turn, which its header says.
+    delay: Option<Delay>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
     /// Per entry: a user message's attachments, ready to draw.
@@ -162,6 +164,7 @@ impl Transcript {
             worked: Vec::new(),
             took: Vec::new(),
             running: None,
+            delay: None,
             diffs: Vec::new(),
             attachments: Vec::new(),
             markdown: Vec::new(),
@@ -205,6 +208,30 @@ impl Transcript {
             if (synced.added > 0 || synced.grew.is_some()) && self.is_finished(newest) {
                 self.remeasure(self.timeline.turn_rows(newest), cx);
             }
+        }
+    }
+
+    /// Forgets what it built for entries from `from` on, which went or
+    /// moved, as a discarded response's do; [`Self::sync`] builds what is
+    /// there now.
+    pub(crate) fn truncate(&mut self, from: usize, cx: &mut App) {
+        let before = self.timeline.rows().len();
+        let rows = self.timeline.truncate(from);
+        let turns = self.timeline.turns().len();
+        self.steps.truncate(rows);
+        self.details.truncate(from);
+        self.attachments.truncate(from);
+        self.markdown.truncate(from);
+        self.diffs.retain(|diff| diff.entry < from);
+        self.worked.truncate(turns);
+        self.took.truncate(turns);
+        if rows < before {
+            self.scroller
+                .update(cx, |scroller, cx| scroller.splice(rows..before, 0, cx));
+        }
+        // A run of work may have lost steps.
+        if let Some(last) = rows.checked_sub(1) {
+            self.remeasure(last..rows, cx);
         }
     }
 
@@ -260,6 +287,11 @@ impl Transcript {
     /// `TextView::new`.
     fn text(&self, ix: usize) -> Option<&Entity<TextViewState>> {
         Some(&self.markdown.get(ix)?.as_ref()?.text)
+    }
+
+    /// What holds up the running turn, if anything: its header says so.
+    pub(crate) fn set_delay(&mut self, delay: Option<Delay>) {
+        self.delay = delay;
     }
 
     /// A turn began `since`, here or in another client: it is the next
@@ -425,7 +457,10 @@ impl Transcript {
         let finished = self.is_finished(turn);
         let has_working = self.timeline.working(turn).is_some();
         let header = match self.running {
-            Some(running) if !finished => Header::Working(running.since.elapsed()),
+            Some(running) if !finished => Header::Working {
+                running: running.since.elapsed(),
+                delay: self.delay,
+            },
             _ => Header::Worked {
                 took: self.took[turn],
                 fold: has_working.then_some(self.worked[turn]),
