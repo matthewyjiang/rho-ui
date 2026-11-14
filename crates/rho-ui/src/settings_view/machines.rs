@@ -1,7 +1,8 @@
-//! The Machines page: what the sidebar calls this machine, and the remote
-//! machines rho-ui reaches over SSH, each with its label and the `rho` it
-//! runs there. Adding a machine connects to it at once; removing one drops
-//! its sessions from the sidebar, and they stay on the machine.
+//! The Machines page: this machine's name, then each remote machine rho-ui
+//! reaches over SSH, with its name, the `rho` it runs there, and Remove,
+//! then a field to add one. Adding a machine connects to it at once;
+//! removing one drops its sessions from the sidebar, and they stay on the
+//! machine.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -23,21 +24,24 @@ use crate::{
     settings::Settings,
 };
 
-/// The page's own state: the host being typed, and each machine's `rho`
-/// program field, which applies on Enter or when it loses the keyboard, as
-/// a change reconnects to the machine.
+/// The page's own state: the host being typed, and each remote machine's
+/// fields.
 pub(super) struct MachineFields {
     new_host: Entity<InputState>,
     /// Why the typed host can't be added, once Add was pressed.
     problem: Option<SharedString>,
-    rho: Vec<RhoField>,
+    remote: Vec<RemoteFields>,
     _subscriptions: [Subscription; 2],
 }
 
-struct RhoField {
+/// One remote machine's fields. Its name shows the host while empty and
+/// applies as typed; its `rho` program applies on Enter or when it loses
+/// the keyboard, as a change reconnects to the machine.
+struct RemoteFields {
     host: String,
-    input: Entity<InputState>,
-    _subscription: Subscription,
+    name: Entity<InputState>,
+    rho: Entity<InputState>,
+    _subscriptions: [Subscription; 2],
 }
 
 impl MachineFields {
@@ -59,12 +63,12 @@ impl MachineFields {
         );
         // Machines come and go from this page, or from another window's.
         let machines = cx.observe_global_in::<Settings>(window, |this, window, cx| {
-            this.sync_rho_fields(window, cx);
+            this.sync_machine_fields(window, cx);
         });
         Self {
             new_host,
             problem: None,
-            rho: Vec::new(),
+            remote: Vec::new(),
             _subscriptions: [subscription, machines],
         }
     }
@@ -91,54 +95,63 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Gives each machine its `rho` program field, and drops the fields of
+    /// Gives each remote machine its fields, and drops the fields of
     /// machines that are gone.
-    pub(super) fn sync_rho_fields(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(super) fn sync_machine_fields(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let machines = cx.global::<Settings>().machines.clone();
         self.machines
-            .rho
-            .retain(|field| machines.iter().any(|machine| machine.host == field.host));
+            .remote
+            .retain(|fields| machines.iter().any(|machine| machine.host == fields.host));
         for machine in machines {
             if self
                 .machines
-                .rho
+                .remote
                 .iter()
-                .any(|field| field.host == machine.host)
+                .any(|fields| fields.host == machine.host)
             {
                 continue;
             }
-            let input = cx.new(|cx| {
+            let name = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(machine.host.clone())
+                    .default_value(machine.label.clone())
+            });
+            let rho = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(DEFAULT_REMOTE_RHO)
                     .default_value(machine.rho.clone())
             });
-            let host = machine.host.clone();
-            let subscription = cx.subscribe_in(
-                &input,
-                window,
-                move |_, input, event: &InputEvent, _, cx| {
+            let name_host = machine.host.clone();
+            let rho_host = machine.host.clone();
+            let subscriptions = [
+                cx.subscribe_in(&name, window, move |_, input, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let label = input.read(cx).value().trim().to_owned();
+                        set_label(&name_host, label, cx);
+                    }
+                }),
+                cx.subscribe_in(&rho, window, move |_, input, event: &InputEvent, _, cx| {
                     if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                         let rho = input.read(cx).value().trim().to_owned();
-                        set_rho(&host, rho, cx);
+                        set_rho(&rho_host, rho, cx);
                     }
-                },
-            );
-            self.machines.rho.push(RhoField {
+                }),
+            ];
+            self.machines.remote.push(RemoteFields {
                 host: machine.host,
-                input,
-                _subscription: subscription,
+                name,
+                rho,
+                _subscriptions: subscriptions,
             });
         }
     }
 
     /// The Machines page.
     pub(super) fn machines_page(&self, cx: &mut Context<'_, Self>) -> SettingPage {
-        let control =
-            |field: SettingField<SharedString>| field.w(rems(CONTROL_REMS)).justify_between();
         let this_machine = SettingGroup::new().title("This machine").item(
             SettingItem::new(
-                "Label",
-                control(SettingField::input(
+                "Name",
+                SettingField::input(
                     |cx: &App| cx.global::<Settings>().local_label.clone(),
                     |label: SharedString, cx: &mut App| {
                         let label = if label.trim().is_empty() {
@@ -148,15 +161,16 @@ impl SettingsView {
                         };
                         update(cx, |settings| settings.local_label = label);
                     },
-                )),
+                )
+                .w(rems(CONTROL_REMS)),
             )
-            .description("What the sidebar calls this machine."),
+            .description("Shown in the sidebar."),
         );
-        let remote = cx
-            .global::<Settings>()
+        let remote = self
             .machines
+            .remote
             .iter()
-            .map(|machine| self.machine_group(machine, cx))
+            .map(machine_group)
             .collect::<Vec<_>>();
         SettingPage::new("Machines")
             .icon(Lucide::Server)
@@ -166,88 +180,8 @@ impl SettingsView {
             .group(self.add_group(cx))
     }
 
-    /// One remote machine: its host with Remove, its label, and its `rho`
-    /// program.
-    fn machine_group(&self, machine: &RemoteMachine, cx: &App) -> SettingGroup {
-        let control =
-            |field: SettingField<SharedString>| field.w(rems(CONTROL_REMS)).justify_between();
-        let host = machine.host.clone();
-        let label_host = host.clone();
-        let read_host = host.clone();
-        let rho = self
-            .machines
-            .rho
-            .iter()
-            .find(|field| field.host == host)
-            .map(|field| field.input.clone());
-        let remove_host = host.clone();
-        let danger = cx.theme().danger;
-        SettingGroup::new()
-            .title(host.clone())
-            .item(
-                SettingItem::new(
-                    "SSH host",
-                    SettingField::render(move |options, _, _| {
-                        let host = remove_host.clone();
-                        h_flex()
-                            .w(rems(CONTROL_REMS))
-                            .justify_between()
-                            .gap_2()
-                            .child(div().truncate().child(host.clone()))
-                            .child(
-                                Button::new(SharedString::from(format!("remove-machine-{host}")))
-                                    .ghost()
-                                    .with_size(options.size())
-                                    .text_color(danger)
-                                    .label("Remove")
-                                    .on_click(move |_, _, cx| {
-                                        let host = host.clone();
-                                        update(cx, |settings| {
-                                            settings.machines.retain(|machine| machine.host != host);
-                                        });
-                                    }),
-                            )
-                    }),
-                )
-                .description("To reach it at another host, remove it and add that one."),
-            )
-            .item(
-                SettingItem::new(
-                    "Label",
-                    control(SettingField::input(
-                        move |cx: &App| {
-                            cx.global::<Settings>()
-                                .machine(&read_host)
-                                .map(|machine| machine.label.clone().into())
-                                .unwrap_or_default()
-                        },
-                        move |label: SharedString, cx: &mut App| {
-                            update(cx, |settings| {
-                                if let Some(machine) = settings.machine_mut(&label_host) {
-                                    label.trim().clone_into(&mut machine.label);
-                                }
-                            });
-                        },
-                    )),
-                )
-                .description("What the sidebar calls it. Empty shows the host."),
-            )
-            .item(
-                SettingItem::new(
-                    "rho program",
-                    SettingField::render(move |options, _, _| {
-                        div().w(rems(CONTROL_REMS)).children(rho.clone().map(|input| {
-                            Input::new(&input).with_size(options.size())
-                        }))
-                    }),
-                )
-                .description(format!(
-                    "The rho on {host}. An SSH command may not see your shell's PATH, so give an absolute or ~/ path if rho isn't found."
-                )),
-            )
-    }
-
-    /// The field to add a machine by its SSH host.
+    /// The field to add a machine by its SSH host, with a note that says
+    /// which hosts work, or why the typed one can't be added.
     fn add_group(&self, cx: &mut Context<'_, Self>) -> SettingGroup {
         let input = self.machines.new_host.clone();
         let problem = self.machines.problem.clone();
@@ -255,9 +189,12 @@ impl SettingsView {
         let muted = cx.theme().muted_foreground;
         let danger = cx.theme().danger;
         SettingGroup::new()
-            .title("Add a machine")
+            .title("Add machine")
             .item(SettingItem::render(move |options, _, _| {
                 let view = view.clone();
+                let note: SharedString = problem
+                    .clone()
+                    .unwrap_or_else(|| "Any host ssh reaches without a password prompt.".into());
                 v_flex()
                     .w_full()
                     .gap_1()
@@ -274,7 +211,7 @@ impl SettingsView {
                             .child(
                                 Button::new("add-machine")
                                     .primary()
-                                    .small()
+                                    .with_size(options.size())
                                     .label("Add")
                                     .on_click(move |_, window, cx| {
                                         let _ = view
@@ -282,22 +219,77 @@ impl SettingsView {
                                     }),
                             ),
                     )
-                    .child({
-                        let note: SharedString = problem.clone().unwrap_or_else(|| {
-                            "Any host ssh reaches, such as one in ~/.ssh/config. Its key must \
-                             work without a password prompt, as from an SSH agent."
-                                .into()
-                        });
+                    .child(
                         div()
                             .id("new-machine-note")
                             .test_support()
                             .aria_label(note.clone())
                             .text_xs()
                             .text_color(if problem.is_some() { danger } else { muted })
-                            .child(note)
-                    })
+                            .child(note),
+                    )
             }))
     }
+}
+
+/// One remote machine, titled by its host: its name, its `rho` program,
+/// and Remove.
+fn machine_group(fields: &RemoteFields) -> SettingGroup {
+    let input = |state: &Entity<InputState>| {
+        let state = state.clone();
+        SettingField::render(move |options, _, _| {
+            Input::new(&state)
+                .with_size(options.size())
+                .w(rems(CONTROL_REMS))
+        })
+    };
+    let host = fields.host.clone();
+    let remove_host = host.clone();
+    SettingGroup::new()
+        .title(host.clone())
+        .item(
+            SettingItem::new("Name", input(&fields.name))
+                .description("Shown in the sidebar. Empty uses the host."),
+        )
+        .item(
+            SettingItem::new("rho path", input(&fields.rho))
+                .description("Use an absolute path if ssh can't find rho."),
+        )
+        .item(
+            SettingItem::new(
+                "Remove machine",
+                SettingField::render(move |options, _, _| {
+                    let host = remove_host.clone();
+                    Button::new(SharedString::from(format!("remove-machine-{host}")))
+                        .outline()
+                        .with_size(options.size())
+                        .label("Remove")
+                        .on_click(move |_, _, cx| {
+                            let host = host.clone();
+                            update(cx, |settings| {
+                                settings.machines.retain(|machine| machine.host != host);
+                            });
+                        })
+                }),
+            )
+            .description(format!("Its sessions stay on {host}.")),
+        )
+}
+
+/// Sets the label of the machine at `host`; empty shows the host.
+fn set_label(host: &str, label: String, cx: &mut App) {
+    let unchanged = cx
+        .global::<Settings>()
+        .machine(host)
+        .is_some_and(|machine| machine.label == label);
+    if unchanged {
+        return;
+    }
+    update(cx, |settings| {
+        if let Some(machine) = settings.machine_mut(host) {
+            machine.label = label;
+        }
+    });
 }
 
 /// Sets the `rho` program of the machine at `host`; empty means

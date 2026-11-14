@@ -157,7 +157,7 @@ impl SettingsView {
             machines: MachineFields::new(window, cx),
             _subscriptions: [ui_subscription, code_subscription],
         };
-        view.sync_rho_fields(window, cx);
+        view.sync_machine_fields(window, cx);
         view
     }
 

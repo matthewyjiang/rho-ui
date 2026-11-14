@@ -475,7 +475,7 @@ fn setup_script(rho: &str) -> String {
         r#"rho={rho}
 case $rho in "~/"*) rho="$HOME/${{rho#??}}" ;; esac
 if ! command -v "$rho" >/dev/null 2>&1; then
-  echo "there is no program $rho; a non-interactive ssh command's PATH may lack it, so set this machine's rho program to its absolute path" >&2
+  echo "there is no program $rho; a non-interactive ssh command's PATH may lack it, so set this machine's rho path in Settings to an absolute path" >&2
   exit 127
 fi
 "$rho" daemon start </dev/null >/dev/null || exit
