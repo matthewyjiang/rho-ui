@@ -2,10 +2,10 @@
 //! repositories say: one table shared by the sidebar rows and the session
 //! header, so both show the same workspace and branch. Read from `.git`
 //! files on the background executor, then re-read every [`REREAD`] to pick
-//! up branch switches. rho-ui reads only this machine's files, so a remote
-//! workspace shows its folder's name and no branch. The saved sessions say
-//! how recently each was used, which dates the projects in the new-session
-//! picker.
+//! up branch switches. A remote machine's are read with `git` there, over
+//! the ssh connection to its daemon, and show their folder's name until
+//! then. The saved sessions say how recently each was used, which dates the
+//! projects in the new-session picker.
 
 use std::{
     path::{Path, PathBuf},
@@ -13,6 +13,7 @@ use std::{
 };
 
 use gpui_kit::{App, Context, Entity, SharedString, Task};
+use rho_ui_core::{Daemon, SshLink};
 
 use crate::{
     machines::{MachineId, Place},
@@ -140,12 +141,20 @@ impl WorkspaceRef {
     }
 }
 
+/// A remote machine whose daemon has answered.
+struct Remote {
+    machine: MachineId,
+    /// Its home directory, as its daemon said.
+    home: Option<PathBuf>,
+    /// While its daemon is connected: how to read its repositories.
+    ssh: Option<SshLink>,
+}
+
 /// Every workspace seen so far. Only ever appended to, so callers hold
 /// indices instead of paths.
 pub(crate) struct Workspaces {
     list: Vec<Workspace>,
-    /// Each remote machine's home directory, once its daemon said.
-    homes: Vec<(MachineId, PathBuf)>,
+    remotes: Vec<Remote>,
     _reread: Task<()>,
 }
 
@@ -153,17 +162,14 @@ impl Workspaces {
     pub(crate) fn new(cx: &mut Context<'_, Self>) -> Self {
         let reread = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(REREAD).await;
-            let all = this.update(cx, |this, cx| {
-                let local = (0..this.list.len()).filter(|&ix| this.list[ix].machine().is_local());
-                this.read(local.collect(), cx);
-            });
+            let all = this.update(cx, |this, cx| this.read((0..this.list.len()).collect(), cx));
             if all.is_err() {
                 break;
             }
         });
         Self {
             list: Vec::new(),
-            homes: Vec::new(),
+            remotes: Vec::new(),
             _reread: reread,
         }
     }
@@ -173,30 +179,53 @@ impl Workspaces {
         if machine.is_local() {
             return home();
         }
-        self.homes
-            .iter()
-            .find_map(|(known, home)| (known == machine).then(|| home.clone()))
+        self.remote(machine)?.home.clone()
     }
 
-    /// Records the home directory of remote `machine`, as its daemon says,
-    /// and shows its workspaces' paths from it.
-    pub(crate) fn set_home(
+    fn remote(&self, machine: &MachineId) -> Option<&Remote> {
+        self.remotes
+            .iter()
+            .find(|remote| remote.machine == *machine)
+    }
+
+    /// Takes what remote `machine`'s newly connected `daemon` says: shows
+    /// its workspaces' paths from its home directory, and reads their
+    /// repositories over its ssh link.
+    pub(crate) fn connected(
         &mut self,
         machine: &MachineId,
-        home: PathBuf,
+        daemon: &Daemon,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.home(machine).as_ref() == Some(&home) {
-            return;
-        }
-        self.homes.retain(|(known, _)| known != machine);
-        for workspace in &mut self.list {
-            if workspace.machine() == machine {
-                workspace.path = tilde(workspace.cwd(), Some(&home)).into();
+        let home = daemon.info().home().map(Path::to_path_buf);
+        if home.is_some() && self.home(machine) != home {
+            for workspace in &mut self.list {
+                if workspace.machine() == machine {
+                    workspace.path = tilde(workspace.cwd(), home.as_deref()).into();
+                }
             }
+            cx.notify();
         }
-        self.homes.push((machine.clone(), home));
-        cx.notify();
+        self.remotes.retain(|remote| remote.machine != *machine);
+        self.remotes.push(Remote {
+            machine: machine.clone(),
+            home,
+            ssh: daemon.ssh().cloned(),
+        });
+        let theirs = (0..self.list.len()).filter(|&ix| self.list[ix].machine() == machine);
+        self.read(theirs.collect(), cx);
+    }
+
+    /// Stops reading remote `machine`'s repositories, as its daemon's
+    /// connection is gone. Its workspaces keep what was last read.
+    pub(crate) fn disconnected(&mut self, machine: &MachineId) {
+        if let Some(remote) = self
+            .remotes
+            .iter_mut()
+            .find(|remote| remote.machine == *machine)
+        {
+            remote.ssh = None;
+        }
     }
 
     /// The index for `cwd`. A new one shows its folder name until its
@@ -216,9 +245,7 @@ impl Workspaces {
             home.as_deref(),
         ));
         let ix = self.list.len() - 1;
-        if cwd.machine.is_local() {
-            self.read(vec![ix], cx);
-        }
+        self.read(vec![ix], cx);
         ix
     }
 
@@ -275,38 +302,85 @@ impl Workspaces {
         }
     }
 
-    /// Reads the repositories of `indices` in the background, and notifies
-    /// only if one changed.
+    /// Reads the repositories of `indices` in the background: this
+    /// machine's from their files, each connected remote machine's with one
+    /// script over ssh. A remote machine not connected waits for
+    /// [`Self::connected`].
     fn read(&self, indices: Vec<usize>, cx: &mut Context<'_, Self>) {
-        let jobs: Vec<(usize, PathBuf)> = indices
-            .into_iter()
-            .map(|ix| (ix, self.list[ix].cwd().to_path_buf()))
-            .collect();
-        cx.spawn(async move |this, cx| {
-            let repos = cx
-                .background_executor()
-                .spawn(async move {
-                    jobs.into_iter()
-                        .map(|(ix, cwd)| (ix, repo::inspect(&cwd)))
-                        .collect::<Vec<_>>()
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                let mut changed = false;
-                for (ix, repo) in repos {
-                    let workspace = &mut this.list[ix];
-                    if workspace.repo != repo {
-                        workspace.set_repo(repo);
-                        changed = true;
+        let mut local = Vec::new();
+        let mut by_link: Vec<(SshLink, Vec<usize>)> = Vec::new();
+        for ix in indices {
+            let machine = self.list[ix].machine();
+            if machine.is_local() {
+                local.push(ix);
+            } else if let Some(ssh) = self.remote(machine).and_then(|remote| remote.ssh.as_ref()) {
+                match by_link.iter_mut().find(|(known, _)| known == ssh) {
+                    Some((_, theirs)) => theirs.push(ix),
+                    None => by_link.push((ssh.clone(), vec![ix])),
+                }
+            }
+        }
+        if !local.is_empty() {
+            let dirs = self.dirs(&local);
+            cx.spawn(async move |this, cx| {
+                let repos = cx
+                    .background_executor()
+                    .spawn(async move { dirs.iter().map(|dir| repo::inspect(dir)).collect() })
+                    .await;
+                let _ = this.update(cx, |this, cx| this.set_repos(&local, repos, cx));
+            })
+            .detach();
+        }
+        for (ssh, indices) in by_link {
+            let dirs = self.dirs(&indices);
+            cx.spawn(async move |this, cx| {
+                let repos = match ssh.run_script(repo::REMOTE_SCRIPT, &dirs).await {
+                    Ok(output) => repo::parse_remote(&dirs, &output),
+                    Err(error) => {
+                        say_unread(&error.to_string());
+                        return;
                     }
-                }
-                if changed {
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+                };
+                let Some(repos) = repos else {
+                    say_unread("the script printed something else");
+                    return;
+                };
+                let _ = this.update(cx, |this, cx| this.set_repos(&indices, repos, cx));
+            })
+            .detach();
+        }
     }
+
+    fn dirs(&self, indices: &[usize]) -> Vec<PathBuf> {
+        indices
+            .iter()
+            .map(|&ix| self.list[ix].cwd().to_path_buf())
+            .collect()
+    }
+
+    /// Takes the repositories read for `indices`, and notifies only if one
+    /// changed.
+    fn set_repos(&mut self, indices: &[usize], repos: Vec<Repo>, cx: &mut Context<'_, Self>) {
+        let mut changed = false;
+        for (&ix, repo) in indices.iter().zip(repos) {
+            let workspace = &mut self.list[ix];
+            if workspace.repo != repo {
+                workspace.set_repo(repo);
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "rho-ui has no log; stderr reaches the terminal or the journal"
+)]
+fn say_unread(why: &str) {
+    eprintln!("rho-ui couldn't read a remote machine's repositories: {why}");
 }
 
 #[cfg(test)]

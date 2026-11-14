@@ -27,9 +27,9 @@ while data := daemon.recv(65536):
     os.write(1, data)
 ";
 
-/// A fake `ssh`: no master runs, starting one succeeds, `sh -s` runs
-/// locally in a clean environment whose home is `home`, and `-W` bridges
-/// to the socket with Python.
+/// A fake `ssh`: a master runs once one was started (a file beside `home`
+/// says so), `sh -s` runs locally in a clean environment whose home is
+/// `home`, and `-W` bridges to the socket with Python.
 fn fake_ssh(bin: &Path, home: &Path, bridge: &Path) -> String {
     format!(
         r#"#!/bin/sh
@@ -46,8 +46,8 @@ while [ $# -gt 0 ]; do
 done
 shift
 case $mode in
-  check) exit 255 ;;
-  master) exit 0 ;;
+  check) [ -e '{home}.master' ]; exit $? ;;
+  master) touch '{home}.master'; exit 0 ;;
   bridge) exec python3 '{bridge}' "$socket" ;;
 esac
 [ "$*" = "sh -s" ] || {{ echo "fake ssh runs only sh -s, not $*" >&2; exit 2; }}
@@ -114,6 +114,15 @@ fn a_daemon_over_ssh_runs_sessions_in_the_machines_login_environment() {
             .await
             .expect("the fake daemon answers over the fake ssh");
         assert_eq!(daemon.info().home(), Some(home.as_path()));
+        let ssh = daemon.ssh().expect("a remote daemon's ssh link");
+        let printed = ssh
+            .run_script(r#"printf '%s %s' "$1" "$HOME""#, &["on"])
+            .await
+            .expect("a script runs on the machine");
+        assert_eq!(
+            String::from_utf8_lossy(&printed),
+            format!("on {}", home.display())
+        );
 
         let sessions = daemon.list_sessions().await.expect("a session list");
         let titles: Vec<_> = sessions.iter().map(|session| session.title()).collect();
