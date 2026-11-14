@@ -2007,6 +2007,10 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
             "the list of surfaces"
         );
         assert!(is_visible(window, "planned-surface-terminal"));
+        assert!(
+            !is_visible(window, "panel-surfaces"),
+            "no + while the list is on screen"
+        );
     });
     assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("shown"));
     ui.shot("list");

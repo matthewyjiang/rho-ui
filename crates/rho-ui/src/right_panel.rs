@@ -4,9 +4,10 @@
 //! left edge to resize it, and double-click the edge for its default width.
 //! The state database remembers both ([`PanelLayout`]).
 //!
-//! Each surface opens as a tab in the panel's header. With none open, or
-//! after +, the panel lists the surfaces to open, and dimmed under them
-//! those still to come ([`PLANNED`]). The panel is the window's, not a
+//! Each surface opens as a tab in the panel's header. With none open, the
+//! panel lists the surfaces to open, and dimmed under them those still to
+//! come ([`PLANNED`]); while a surface shows and another isn't open, + in
+//! the header lists those again. The panel is the window's, not a
 //! session's: its tabs stay as sessions change, and each surface shows
 //! the session on screen.
 //!
@@ -265,6 +266,19 @@ impl RightPanel {
         cx.notify();
     }
 
+    /// The surfaces without a tab, which the list offers.
+    fn unopened(&self) -> impl Iterator<Item = Surface> + '_ {
+        Surface::ALL
+            .into_iter()
+            .filter(|surface| !self.tabs.contains(surface))
+    }
+
+    /// Whether + has anything to offer: a surface shows, so the list
+    /// doesn't, and another has no tab yet.
+    fn offers_more(&self) -> bool {
+        self.active.is_some() && self.unopened().next().is_some()
+    }
+
     /// The list of surfaces, in place of the open one.
     fn show_list(&mut self, cx: &mut Context<'_, Self>) {
         self.active = None;
@@ -313,22 +327,21 @@ impl RightPanel {
                     .overflow_x_hidden()
                     .gap_1()
                     .children(tabs)
-                    .child(
+                    .children(self.offers_more().then(|| {
                         Button::new("panel-surfaces")
                             .ghost()
                             .small()
-                            .selected(self.active.is_none())
                             .icon(IconName::Plus)
                             .accessibility_label("Open a surface")
                             .tooltip("Open a surface")
-                            .on_click(cx.listener(|this, _, _, cx| this.show_list(cx))),
-                    ),
+                            .on_click(cx.listener(|this, _, _, cx| this.show_list(cx)))
+                    })),
             )
             .child(toggle_button(cx))
     }
 
     /// The surfaces to open, centered, and those to come, dimmed.
-    fn render_list(cx: &Context<'_, Self>) -> impl IntoElement {
+    fn render_list(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
         let row = |id: SharedString, icon: Lucide, label: &'static str| {
             ListItem::new(id)
@@ -343,7 +356,7 @@ impl RightPanel {
                         .child(div().flex_1().child(label)),
                 )
         };
-        let open = Surface::ALL.into_iter().map(|surface| {
+        let open = self.unopened().map(|surface| {
             row(
                 format!("open-surface-{}", surface.id()).into(),
                 surface.icon(),
@@ -404,7 +417,7 @@ impl Render for RightPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let body = match self.active {
             Some(surface) => self.render_surface(surface, cx),
-            None => Self::render_list(cx).into_any_element(),
+            None => self.render_list(cx).into_any_element(),
         };
         v_flex()
             .id("right-panel")
