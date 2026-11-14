@@ -10,6 +10,7 @@ mod input;
 mod options;
 mod prompt;
 mod session;
+mod ssh;
 mod timeline;
 mod tool_card;
 
@@ -33,5 +34,6 @@ pub use session::{
     Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent, ToolKind, ToolStatus,
     TurnId, Usage, UserMessage, Worktree,
 };
+pub use ssh::SshTarget;
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};
 pub use tool_card::{SearchLine, ToolBody, ToolCard, ToolFact};

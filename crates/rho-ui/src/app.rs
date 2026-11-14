@@ -1,8 +1,8 @@
-//! The root view: owns the daemon connection, the event pump, and the open
-//! sessions. Everything the daemon pushes enters here and is routed to the
-//! [`SessionView`] of its session. The open sessions include subagents'
-//! sessions opened from their parent, which the sidebar does not list: they
-//! show nested under the parent, and go when it goes.
+//! The root view: owns a connection to each machine's daemon, their event
+//! pumps, and the open sessions. Everything a daemon pushes enters here and
+//! is routed to the [`SessionView`] of its session. The open sessions
+//! include subagents' sessions opened from their parent, which the sidebar
+//! does not list: they show nested under the parent, and go when it goes.
 //!
 //! The sidebar and the session view are drawn as cached views: each redraws
 //! only when it changes, so a hover in one never rebuilds the other.
@@ -10,17 +10,16 @@
 use std::{path::PathBuf, rc::Rc, time::Duration};
 
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle},
+    button::Button,
+    empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader},
     h_flex,
     notification::Notification,
-    spinner::Spinner,
     ActiveTheme as _, IconName, WindowExt as _,
 };
 use gpui_kit::{
-    div, rems, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, Subscription, Task, Window,
+    div, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StyleRefinement, Styled as _, Subscription, Task,
+    Window,
 };
 use rho_ui_core::{
     Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, DaemonTarget, Detached,
@@ -30,17 +29,17 @@ use rho_ui_core::{
 use crate::{
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
+    machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
     projects::Projects,
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
-    shelf::Shelves,
-    sidebar::{SidebarEvent, SidebarLayout, SidebarView},
+    sidebar::{SidebarEvent, SidebarState, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
     NewSession, NewSessionIn, OpenSettings, ToggleSidebar,
 };
 
-/// How often the sidebar asks the daemon which sessions have work under
+/// How often the sidebar asks each daemon which sessions have work under
 /// way. The daemon pushes no such list, so rho's terminal UI polls too, at
 /// 500 ms while it shows jobs. Against a daemon built from rho's
 /// `daemon-v3` (bf3af5b) holding one job, a `rho/job/list` round trip
@@ -53,18 +52,70 @@ const JOB_POLL: Duration = Duration::from_secs(1);
 
 /// What the command line asked for.
 pub(crate) struct LaunchConfig {
-    /// Where new sessions start. Resumed sessions keep their own directory.
+    /// Where new sessions start on this machine. Resumed sessions keep
+    /// their own directory.
     pub(crate) workspace: PathBuf,
+    /// How to reach this machine's daemon.
     pub(crate) daemon: DaemonTarget,
+    /// How to reach a remote machine's: [`RemoteMachine::ssh_target`],
+    /// except in tests, which reach fake daemons.
+    pub(crate) remote: Rc<dyn Fn(&RemoteMachine) -> DaemonTarget>,
 }
 
-/// The daemon connection's lifecycle.
-enum DaemonStatus {
-    Connecting,
-    Ready(Daemon),
-    /// The daemon couldn't be reached, or the connection closed; the
-    /// message is shown full-window.
-    Failed(String),
+impl LaunchConfig {
+    /// Every machine `settings` asks for, this one first.
+    fn machines(&self, settings: &Settings) -> Vec<Machine> {
+        let local = Machine {
+            id: MachineId::local(),
+            label: settings.local_label.clone(),
+            target: self.daemon.clone(),
+        };
+        let remote = settings.machines.iter().map(|remote| Machine {
+            id: remote.id(),
+            label: remote.shown_label().to_owned().into(),
+            target: (self.remote)(remote),
+        });
+        std::iter::once(local).chain(remote).collect()
+    }
+}
+
+/// The connection to one machine's daemon. How it is doing, as the views
+/// show it, is in [`Machines`].
+struct Connection {
+    machine: MachineId,
+    /// While connected.
+    daemon: Option<Daemon>,
+    /// Which connection this is, out of every one this run made. Replies
+    /// to requests made on an earlier one belong to sessions that are no
+    /// longer open, and are dropped.
+    epoch: u64,
+    /// The daemon said it is restarting in place, so the connection's end
+    /// is expected, and answered by connecting again.
+    restarting: bool,
+    /// Connects to the daemon, then pumps its events. Dropping or replacing
+    /// it stops both.
+    task: Task<()>,
+    /// Polls the daemon's jobs while connected; see [`JOB_POLL`].
+    jobs_task: Task<()>,
+    /// The jobs as last polled, to tell when they change.
+    jobs: Vec<Job>,
+    /// The latest `list_sessions`; a newer refresh replaces it.
+    sessions_task: Task<()>,
+}
+
+impl Connection {
+    fn new(machine: MachineId) -> Self {
+        Self {
+            machine,
+            daemon: None,
+            epoch: 0,
+            restarting: false,
+            task: Task::ready(()),
+            jobs_task: Task::ready(()),
+            jobs: Vec::new(),
+            sessions_task: Task::ready(()),
+        }
+    }
 }
 
 /// What the main pane shows.
@@ -82,25 +133,25 @@ enum Pane {
 /// A session the user opened in this run, with the subscription that keeps
 /// the sidebar in step with it.
 struct OpenSession {
-    id: SessionId,
+    id: SessionKey,
     view: Entity<SessionView>,
     _subscription: Subscription,
 }
 
 pub(crate) struct RhoApp {
     launch: LaunchConfig,
-    status: DaemonStatus,
-    /// Counts connections. Replies to requests made on an earlier one
-    /// belong to sessions that are no longer open, and are dropped.
-    epoch: u64,
-    /// The daemon said it is restarting in place, so the connection's end
-    /// is expected, and answered by connecting again.
-    restarting: bool,
+    /// The machines the settings ask for, shared with the views that label
+    /// things with them.
+    machines: Entity<Machines>,
+    /// One per machine, in the machines' order.
+    connections: Vec<Connection>,
+    /// The epoch the next connection gets; see [`Connection::epoch`].
+    next_epoch: u64,
     workspaces: Entity<Workspaces>,
     /// The projects a new session can start in.
     projects: Entity<Projects>,
     /// Where the last new session started, for the next one.
-    last_project: Option<PathBuf>,
+    last_project: Option<Place>,
     sidebar: Entity<SidebarView>,
     /// Sessions opened in this run. A handful at most, so lookups by ID scan.
     sessions: Vec<OpenSession>,
@@ -108,28 +159,18 @@ pub(crate) struct RhoApp {
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
-    /// Connects to the daemon, then pumps its events. Dropping or replacing
-    /// it stops both.
-    daemon_task: Task<()>,
-    /// Polls the daemon's jobs while connected; see [`JOB_POLL`].
-    jobs_task: Task<()>,
-    /// The jobs as last polled, to tell when they change.
-    jobs: Vec<Job>,
-    /// The latest `list_sessions`; a newer refresh replaces it.
-    sessions_task: Task<()>,
-    _sidebar_subscription: Subscription,
-    _appearance_subscription: Subscription,
+    _subscriptions: [Subscription; 3],
 }
 
 impl RhoApp {
-    /// `shelves` holds the settled and snoozed marks, `projects` the user's
-    /// projects, and `layout` whether the sidebar is collapsed; see
-    /// [`Shelves::load`], [`Projects::load`] and [`SidebarLayout::load`].
+    /// `sidebar` holds what the sidebar remembers, and `projects` the
+    /// user's projects; see [`SidebarState::load`] and [`Projects::load`].
+    /// The machines come from the [`Settings`], and follow them as they
+    /// change.
     pub(crate) fn new(
         launch: LaunchConfig,
-        shelves: Shelves,
+        sidebar: SidebarState,
         projects: Projects,
-        layout: SidebarLayout,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -137,8 +178,18 @@ impl RhoApp {
         window.focus(&focus_handle, cx);
         let workspaces = cx.new(Workspaces::new);
         let projects = cx.new(|_| projects);
-        let sidebar =
-            cx.new(|cx| SidebarView::new(workspaces.clone(), shelves, layout, window, cx));
+        // Empty until `sync_machines` connects to each.
+        let machines = cx.new(|_| Machines::default());
+        let sidebar = cx.new(|cx| {
+            SidebarView::new(
+                workspaces.clone(),
+                machines.clone(),
+                projects.clone(),
+                sidebar,
+                window,
+                cx,
+            )
+        });
         let sidebar_subscription = cx.subscribe_in(
             &sidebar,
             window,
@@ -148,15 +199,16 @@ impl RhoApp {
                 }
                 SidebarEvent::NewSession => this.new_session(window, cx),
                 SidebarEvent::Delete { id } => this.delete_session(id.clone(), window, cx),
+                SidebarEvent::Retry(machine) => this.connect(machine, window, cx),
                 SidebarEvent::OpenSettings => settings_view::open(window, cx),
                 SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
             },
         );
         let mut app = Self {
             launch,
-            status: DaemonStatus::Connecting,
-            epoch: 0,
-            restarting: false,
+            machines,
+            connections: Vec::new(),
+            next_epoch: 0,
             workspaces,
             projects,
             last_project: None,
@@ -165,83 +217,196 @@ impl RhoApp {
             pane: Pane::Empty,
             kinetic: Rc::default(),
             focus_handle,
-            daemon_task: Task::ready(()),
-            jobs_task: Task::ready(()),
-            jobs: Vec::new(),
-            sessions_task: Task::ready(()),
-            _sidebar_subscription: sidebar_subscription,
-            // With the system appearance, follow the desktop from light to
-            // dark and back.
-            _appearance_subscription: cx.observe_window_appearance(window, |_, _, cx| {
-                let settings = cx.global::<Settings>().clone();
-                if settings.appearance == Appearance::System {
-                    settings.apply(cx);
-                }
-            }),
+            _subscriptions: [
+                sidebar_subscription,
+                // With the system appearance, follow the desktop from light
+                // to dark and back.
+                cx.observe_window_appearance(window, |_, _, cx| {
+                    let settings = cx.global::<Settings>().clone();
+                    if settings.appearance == Appearance::System {
+                        settings.apply(cx);
+                    }
+                }),
+                // Machines added, removed or changed in the settings.
+                cx.observe_global_in::<Settings>(window, |this, window, cx| {
+                    this.sync_machines(window, cx);
+                }),
+            ],
         };
-        app.connect(window, cx);
+        app.sync_machines(window, cx);
         app
     }
 
-    /// Connects to the daemon, starting it if none runs. Views of sessions
-    /// followed on an earlier connection are dropped; the sessions
-    /// themselves, and their turns, stay in the daemon.
-    fn connect(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.forget_sessions(cx);
-        self.epoch += 1;
-        self.restarting = false;
-        self.jobs_task = Task::ready(());
-        self.status = DaemonStatus::Connecting;
+    /// Follows the machines the settings ask for: connects to new ones and
+    /// to ones whose address changed, and drops the sessions of ones that
+    /// are gone.
+    fn sync_machines(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let wanted = self.launch.machines(cx.global::<Settings>());
+        let known = self.machines.read(cx);
+        if known.iter().eq(wanted.iter()) {
+            return;
+        }
+        let stale: Vec<MachineId> = wanted
+            .iter()
+            .filter(|machine| {
+                known
+                    .get(&machine.id)
+                    .is_none_or(|known| known.target != machine.target)
+            })
+            .map(|machine| machine.id.clone())
+            .collect();
+        // In the settings' order; what is left over is gone.
+        let mut old = std::mem::take(&mut self.connections);
+        for machine in &wanted {
+            let kept = old
+                .iter()
+                .position(|connection| connection.machine == machine.id)
+                .map(|ix| old.remove(ix));
+            self.connections
+                .push(kept.unwrap_or_else(|| Connection::new(machine.id.clone())));
+        }
+        for gone in old {
+            self.forget_sessions(&gone.machine, window, cx);
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.remove_machine(&gone.machine, cx));
+        }
+        self.machines.update(cx, |machines, cx| {
+            machines.set(wanted);
+            cx.notify();
+        });
+        for machine in stale {
+            self.connect(&machine, window, cx);
+        }
         cx.notify();
+    }
 
-        let target = self.launch.daemon.clone();
-        self.daemon_task = cx.spawn_in(window, async move |this, cx| {
+    fn connection(&self, machine: &MachineId) -> Option<&Connection> {
+        self.connections
+            .iter()
+            .find(|connection| connection.machine == *machine)
+    }
+
+    fn connection_mut(&mut self, machine: &MachineId) -> Option<&mut Connection> {
+        self.connections
+            .iter_mut()
+            .find(|connection| connection.machine == *machine)
+    }
+
+    /// Whether `epoch` is still `machine`'s connection.
+    fn is_current(&self, machine: &MachineId, epoch: u64) -> bool {
+        self.connection(machine)
+            .is_some_and(|connection| connection.epoch == epoch)
+    }
+
+    /// The daemon of `machine`, while connected.
+    fn daemon(&self, machine: &MachineId) -> Option<&Daemon> {
+        self.connection(machine)
+            .and_then(|connection| connection.daemon.as_ref())
+    }
+
+    /// The daemon of `machine` and its connection's epoch, while connected.
+    fn ready(&self, machine: &MachineId) -> Option<(Daemon, u64)> {
+        let connection = self.connection(machine)?;
+        Some((connection.daemon.clone()?, connection.epoch))
+    }
+
+    /// Records how `machine`'s connection is doing, for the views.
+    fn set_status(&self, machine: &MachineId, status: MachineStatus, cx: &mut App) {
+        self.machines.update(cx, |machines, cx| {
+            if machines.set_status(machine, status) {
+                cx.notify();
+            }
+        });
+    }
+
+    /// Connects to `machine`'s daemon, starting it if none runs. Views of
+    /// its sessions followed on an earlier connection are dropped; the
+    /// sessions themselves, and their turns, stay in the daemon.
+    fn connect(&mut self, machine: &MachineId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.forget_sessions(machine, window, cx);
+        self.next_epoch += 1;
+        let epoch = self.next_epoch;
+        let Some(target) = self
+            .machines
+            .read(cx)
+            .get(machine)
+            .map(|known| known.target.clone())
+        else {
+            return;
+        };
+        let Some(connection) = self.connection_mut(machine) else {
+            return;
+        };
+        connection.epoch = epoch;
+        connection.restarting = false;
+        connection.jobs_task = Task::ready(());
+        connection.daemon = None;
+        let id = machine.clone();
+        connection.task = cx.spawn_in(window, async move |this, cx| {
             let mut events = match Daemon::connect(target).await {
                 Ok((daemon, events)) => {
-                    let stored =
-                        this.update_in(cx, |this, window, cx| this.connected(daemon, window, cx));
+                    let stored = this.update_in(cx, |this, window, cx| {
+                        this.connected(&id, daemon, window, cx);
+                    });
                     if stored.is_err() {
                         return;
                     }
                     events
                 }
                 Err(error) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.status = DaemonStatus::Failed(error.to_string());
-                        cx.notify();
-                    });
+                    let _ = this.update(cx, |this, cx| this.failed(&id, &error, cx));
                     return;
                 }
             };
-            // The one event pump: every daemon push is routed from here.
+            // The machine's one event pump: every push from its daemon is
+            // routed from here.
             while let Some(event) = events.recv().await {
-                let routed =
-                    this.update_in(cx, |this, window, cx| this.route_event(event, window, cx));
+                let routed = this.update_in(cx, |this, window, cx| {
+                    this.route_event(&id, event, window, cx);
+                });
                 if routed.is_err() {
                     return;
                 }
             }
-            let _ = this.update_in(cx, RhoApp::disconnected);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.disconnected(&id, epoch, window, cx);
+            });
         });
+        self.set_status(machine, MachineStatus::Connecting, cx);
+        cx.notify();
     }
 
-    fn connected(&mut self, daemon: Daemon, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn connected(
+        &mut self,
+        machine: &MachineId,
+        daemon: Daemon,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let info = daemon.info();
-        let label = format!("rho {}", info.version());
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_version(label, cx));
         if let Some(notice) = info.notice() {
-            window.push_notification(
-                Notification::warning(notice.to_owned()).title("rho daemon is another build"),
-                cx,
-            );
+            let title = match self.machines.read(cx).tag(machine) {
+                Some(label) => format!("rho on {label} is another build"),
+                None => "rho daemon is another build".to_owned(),
+            };
+            window.push_notification(Notification::warning(notice.to_owned()).title(title), cx);
         }
-        self.jobs_task = cx.spawn({
-            let daemon = daemon.clone();
+        if let (false, Some(home)) = (machine.is_local(), info.home()) {
+            let home = home.to_path_buf();
+            self.workspaces
+                .update(cx, |workspaces, cx| workspaces.set_home(machine, home, cx));
+        }
+        let status = MachineStatus::Ready {
+            version: format!("rho {}", info.version()).into(),
+        };
+        self.set_status(machine, status, cx);
+        let jobs_task = cx.spawn({
+            let (daemon, machine) = (daemon.clone(), machine.clone());
             async move |this, cx| loop {
                 match daemon.active_jobs().await {
                     Ok(jobs) => {
-                        if this.update(cx, |this, cx| this.set_jobs(jobs, cx)).is_err() {
+                        let set = this.update(cx, |this, cx| this.set_jobs(&machine, &jobs, cx));
+                        if set.is_err() {
                             return;
                         }
                     }
@@ -253,54 +418,93 @@ impl RhoApp {
                 cx.background_executor().timer(JOB_POLL).await;
             }
         });
-        self.status = DaemonStatus::Ready(daemon);
-        self.refresh_sessions(cx);
+        if let Some(connection) = self.connection_mut(machine) {
+            connection.jobs_task = jobs_task;
+            connection.daemon = Some(daemon);
+        }
+        self.refresh_sessions(machine, cx);
+        // A draft opened while this machine connected waits for it.
+        if let Pane::Draft { view, .. } = &self.pane {
+            let draft = view.read(cx);
+            if draft.cwd().machine == *machine && draft.awaits(draft.request().1) {
+                let view = view.clone();
+                self.open_draft_session(&view, window, cx);
+            }
+        }
         cx.notify();
     }
 
-    /// Shows which sessions have work under way in the daemon. A change is
-    /// also when the saved list goes stale: a session another client
-    /// started appears, or one's turn ended.
-    fn set_jobs(&mut self, jobs: Vec<Job>, cx: &mut Context<'_, Self>) {
-        let same = self.jobs.len() == jobs.len()
-            && self
+    /// `machine`'s daemon couldn't be reached, because of `error`.
+    fn failed(&mut self, machine: &MachineId, error: &DaemonError, cx: &mut Context<'_, Self>) {
+        if let Some(connection) = self.connection_mut(machine) {
+            connection.daemon = None;
+        }
+        self.set_status(machine, MachineStatus::Failed(error.to_string().into()), cx);
+        cx.notify();
+    }
+
+    /// Shows which sessions have work under way in `machine`'s daemon. A
+    /// change is also when the saved list goes stale: a session another
+    /// client started appears, or one's turn ended.
+    fn set_jobs(&mut self, machine: &MachineId, jobs: &[Job], cx: &mut Context<'_, Self>) {
+        let Some(connection) = self.connection_mut(machine) else {
+            return;
+        };
+        let same = connection.jobs.len() == jobs.len()
+            && connection
                 .jobs
                 .iter()
-                .zip(&jobs)
+                .zip(jobs)
                 .all(|(was, now)| was.is_same_work(now));
         if same {
             return;
         }
+        jobs.clone_into(&mut connection.jobs);
         self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_jobs(&jobs, cx));
-        self.jobs = jobs;
-        self.refresh_sessions(cx);
+            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, jobs, cx));
+        self.refresh_sessions(machine, cx);
     }
 
-    /// Drops every open session's view, as the connection that followed
-    /// them is gone.
-    fn forget_sessions(&mut self, cx: &mut Context<'_, Self>) {
-        self.sessions.clear();
-        self.jobs.clear();
-        self.set_pane(Pane::Empty, cx);
-        self.sidebar.update(cx, SidebarView::clear_live);
+    /// Drops the views of `machine`'s open sessions, and a draft there, as
+    /// the connection that followed them is gone.
+    fn forget_sessions(
+        &mut self,
+        machine: &MachineId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let shown = match &self.pane {
+            Pane::Session(view) => view.read(cx).key().machine == *machine,
+            Pane::Draft { view, .. } => view.read(cx).cwd().machine == *machine,
+            Pane::Empty => false,
+        };
+        if shown {
+            self.show(Pane::Empty, window, cx);
+        }
+        self.sessions.retain(|open| open.id.machine != *machine);
+        if let Some(connection) = self.connection_mut(machine) {
+            connection.jobs.clear();
+        }
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.clear_live(machine, cx));
     }
 
     /// The session `id`, if it was opened in this run.
-    fn opened(&self, id: &SessionId) -> Option<&OpenSession> {
+    fn opened(&self, id: &SessionKey) -> Option<&OpenSession> {
         self.sessions.iter().find(|open| open.id == *id)
     }
 
-    fn daemon(&self) -> Option<&Daemon> {
-        match &self.status {
-            DaemonStatus::Ready(daemon) => Some(daemon),
-            _ => None,
-        }
-    }
-
-    fn route_event(&mut self, event: DaemonEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn route_event(
+        &mut self,
+        machine: &MachineId,
+        event: DaemonEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let key = |session: SessionId| SessionKey::new(machine.clone(), session);
         match event {
             DaemonEvent::Update { session, update } => {
+                let session = key(session);
                 if let Some(open) = self.opened(&session) {
                     open.view
                         .update(cx, |view, cx| view.apply(update, window, cx));
@@ -309,11 +513,15 @@ impl RhoApp {
                 }
             }
             DaemonEvent::Detached { session, reason } => match reason {
-                Detached::Behind => self.reopen_session(&session, window, cx),
-                Detached::Deleted => self.session_deleted(&session, window, cx),
-                Detached::Restarting => self.restarting = true,
+                Detached::Behind => self.reopen_session(&key(session), window, cx),
+                Detached::Deleted => self.session_deleted(&key(session), window, cx),
+                Detached::Restarting => {
+                    if let Some(connection) = self.connection_mut(machine) {
+                        connection.restarting = true;
+                    }
+                }
                 Detached::Unloaded => {
-                    if let Some(open) = self.opened(&session) {
+                    if let Some(open) = self.opened(&key(session)) {
                         open.view.update(cx, |view, _| view.unload());
                     }
                 }
@@ -321,23 +529,35 @@ impl RhoApp {
         }
     }
 
-    /// The connection ended. After the daemon said it was restarting, that
-    /// is expected, and answered by connecting again: the daemon restarts in
-    /// place on the same socket, and the handshake waits until it answers.
-    fn disconnected(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.restarting {
-            self.connect(window, cx);
+    /// `machine`'s connection `epoch` ended. After the daemon said it was
+    /// restarting, that is expected, and answered by connecting again: the
+    /// daemon restarts in place on the same socket, and the handshake waits
+    /// until it answers.
+    fn disconnected(
+        &mut self,
+        machine: &MachineId,
+        epoch: u64,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.is_current(machine, epoch) {
+            return;
+        }
+        let restarting = self
+            .connection(machine)
+            .is_some_and(|connection| connection.restarting);
+        if restarting {
+            self.connect(machine, window, cx);
         } else {
-            self.forget_sessions(cx);
-            self.status = DaemonStatus::Failed(DaemonError::Closed.to_string());
-            cx.notify();
+            self.forget_sessions(machine, window, cx);
+            self.failed(machine, &DaemonError::Closed, cx);
         }
     }
 
     /// Reads session `id` afresh after the daemon stopped sending its
     /// events: a new view replaces the one that fell behind, and its
     /// subagents' sessions go with it.
-    fn reopen_session(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn reopen_session(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(view) = self.opened(id).map(|open| open.view.clone()) else {
             return;
         };
@@ -351,7 +571,7 @@ impl RhoApp {
         match parent {
             Some(parent) if shown => {
                 let title = live.title.unwrap_or_default();
-                self.open_subagent(&parent, live.id, title, window, cx);
+                self.open_subagent(&parent, live.id.id, title, window, cx);
             }
             // Opened again from its parent when wanted.
             Some(_) => {}
@@ -363,66 +583,88 @@ impl RhoApp {
         }
     }
 
-    /// Drops a session that is gone from the daemon.
-    fn session_deleted(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Drops a session that is gone from its daemon.
+    fn session_deleted(
+        &mut self,
+        id: &SessionKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         self.forget_session(id, window, cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.remove(id, cx));
-        self.refresh_sessions(cx);
+        self.refresh_sessions(&id.machine, cx);
     }
 
-    /// Reloads the saved-session list in the background.
-    fn refresh_sessions(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(daemon) = self.daemon().cloned() else {
+    /// Reloads `machine`'s saved-session list in the background.
+    fn refresh_sessions(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        let Some(daemon) = self.daemon(machine).cloned() else {
             return;
         };
-        self.sessions_task = cx.spawn(async move |this, cx| {
+        let id = machine.clone();
+        let task = cx.spawn(async move |this, cx| {
             let result = daemon.list_sessions().await;
             let _ = this.update(cx, |this, cx| {
-                this.sidebar.update(cx, |sidebar, cx| match result {
-                    Ok(sessions) => sidebar.set_saved(sessions, cx),
-                    Err(error) => sidebar.set_error(error.to_string(), cx),
+                let error = match result {
+                    Ok(sessions) => {
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.set_saved(&id, sessions, cx));
+                        None
+                    }
+                    Err(error) => Some(error.to_string().into()),
+                };
+                this.machines.update(cx, |machines, cx| {
+                    if machines.set_error(&id, error) {
+                        cx.notify();
+                    }
                 });
             });
         });
+        if let Some(connection) = self.connection_mut(machine) {
+            connection.sessions_task = task;
+        }
     }
 
     /// Where a new session starts: in the project of the session on screen,
     /// else where the last new session started, else the launch directory.
-    fn new_session_cwd(&self, cx: &App) -> PathBuf {
+    fn new_session_cwd(&self, cx: &App) -> Place {
         match &self.pane {
-            Pane::Session(view) => view.read(cx).live().cwd,
+            Pane::Session(view) => {
+                let live = view.read(cx).live();
+                Place::new(live.id.machine, live.cwd)
+            }
+            // Not on a machine since taken off the settings.
             Pane::Empty | Pane::Draft { .. } => self
                 .last_project
                 .clone()
-                .unwrap_or_else(|| self.launch.workspace.clone()),
+                .filter(|project| self.machines.read(cx).get(&project.machine).is_some())
+                .unwrap_or_else(|| Place::new(MachineId::local(), self.launch.workspace.clone())),
         }
     }
 
     /// Shows a draft for a new session and opens the session right away; see
     /// [`DraftView`].
     pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.daemon().is_none() {
-            return;
-        }
         let cwd = self.new_session_cwd(cx);
         // An open draft is reused, so its text and settings survive.
         let pane = std::mem::replace(&mut self.pane, Pane::Empty);
         let pane = match pane {
             Pane::Draft { .. } => pane,
             Pane::Empty | Pane::Session(_) => {
-                let (workspaces, projects) = (&self.workspaces, &self.projects);
-                let view = cx.new(|cx| DraftView::new(cwd, workspaces, projects, window, cx));
+                let (workspaces, projects, machines) =
+                    (&self.workspaces, &self.projects, &self.machines);
+                let view =
+                    cx.new(|cx| DraftView::new(cwd, workspaces, projects, machines, window, cx));
                 let subscription = cx.subscribe_in(
                     &view,
                     window,
                     |this, draft, event: &DraftEvent, window, cx| match event {
                         DraftEvent::Start { session, prompt } => {
-                            let cwd = draft.read(cx).cwd().to_path_buf();
+                            let cwd = draft.read(cx).cwd().clone();
                             this.start_session(
                                 draft,
                                 (**session).clone(),
-                                cwd,
+                                &cwd,
                                 prompt.clone(),
                                 window,
                                 cx,
@@ -454,10 +696,6 @@ impl RhoApp {
     /// stays where it is, unless it was in the sidebar's search, which
     /// collapsing hides: then it goes to the main pane.
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        // Until the daemon answers, the window shows no sidebar.
-        if self.daemon().is_none() {
-            return;
-        }
         let searching = self
             .sidebar
             .read(cx)
@@ -480,9 +718,9 @@ impl RhoApp {
     }
 
     /// The shown draft, if its session is `id`.
-    fn draft_with(&self, id: &SessionId, cx: &App) -> Option<Entity<DraftView>> {
+    fn draft_with(&self, id: &SessionKey, cx: &App) -> Option<Entity<DraftView>> {
         match &self.pane {
-            Pane::Draft { view, .. } if view.read(cx).session_id() == Some(id) => {
+            Pane::Draft { view, .. } if view.read(cx).session_key().as_ref() == Some(id) => {
                 Some(view.clone())
             }
             _ => None,
@@ -491,32 +729,41 @@ impl RhoApp {
 
     /// Opens the session for `draft` and follows it. The draft takes the
     /// session before the attach is sent, so the events that follow the
-    /// attach always have somewhere to go.
+    /// attach always have somewhere to go. While its machine connects, the
+    /// draft waits, and [`Self::connected`] opens it.
     fn open_draft_session(
         &mut self,
         draft: &Entity<DraftView>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(daemon) = self.daemon().cloned() else {
+        let (cwd, request) = draft.read(cx).request();
+        let machine = cwd.machine.clone();
+        let Some((daemon, epoch)) = self.ready(&machine) else {
+            let machines = self.machines.read(cx);
+            if machines.status(&machine) == Some(&MachineStatus::Connecting) {
+                return;
+            }
+            let label = machines.label(&machine);
+            draft.update(cx, |draft, cx| {
+                draft.fail(format!("Not connected to {label}"), cx);
+            });
             return;
         };
-        let (cwd, request) = draft.read(cx).request();
         let draft = draft.downgrade();
-        let epoch = self.epoch;
         cx.spawn_in(window, async move |this, cx| {
-            let setup = daemon.new_session(&cwd, Checkout::Local).await;
+            let setup = daemon.new_session(&cwd.path, Checkout::Local).await;
             let opened = this.update_in(cx, |this, window, cx| {
                 // A draft dropped meanwhile, or moved to another project,
                 // leaves the session unfollowed, and the daemon discards one
                 // that saved nothing.
-                let draft = draft
-                    .upgrade()
-                    .filter(|draft| this.epoch == epoch && draft.read(cx).awaits(request))?;
+                let draft = draft.upgrade().filter(|draft| {
+                    this.is_current(&machine, epoch) && draft.read(cx).awaits(request)
+                })?;
                 match setup {
                     Ok(setup) => {
                         let session = Session::from_setup(setup);
-                        let id = session.id().clone();
+                        let id = SessionKey::new(machine.clone(), session.id().clone());
                         let daemon = daemon.clone();
                         draft.update(cx, |draft, cx| draft.open(daemon, session, window, cx));
                         Some(id)
@@ -530,7 +777,7 @@ impl RhoApp {
             let Ok(Some(id)) = opened else {
                 return;
             };
-            let attached = daemon.attach(&id).await;
+            let attached = daemon.attach(&id.id).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attached(&daemon, &id, attached, window, cx);
             });
@@ -544,7 +791,7 @@ impl RhoApp {
     fn attached(
         &mut self,
         daemon: &Daemon,
-        id: &SessionId,
+        id: &SessionKey,
         attached: Result<Attached, DaemonError>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -555,7 +802,7 @@ impl RhoApp {
             open.view
                 .update(cx, |view, cx| view.attached(attached, window, cx));
         } else if attached.is_ok() {
-            let (daemon, id) = (daemon.clone(), id.clone());
+            let (daemon, id) = (daemon.clone(), id.id.clone());
             cx.spawn(async move |_, _| {
                 let _ = daemon.detach(&id).await;
             })
@@ -577,15 +824,15 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(daemon) = self.daemon().cloned() else {
+        let cwd = draft.read(cx).cwd().clone();
+        let machine = cwd.machine.clone();
+        let Some((daemon, epoch)) = self.ready(&machine) else {
             return;
         };
-        let cwd = draft.read(cx).cwd().to_path_buf();
         let draft = draft.downgrade();
-        let epoch = self.epoch;
         cx.spawn_in(window, async move |this, cx| {
             let opened = async {
-                let setup = daemon.new_session(&cwd, Checkout::NewWorktree).await?;
+                let setup = daemon.new_session(&cwd.path, Checkout::NewWorktree).await?;
                 let mut session = Session::from_setup(setup);
                 // Nothing follows the session yet, so its events about these
                 // changes go nowhere; the answers carry the settings.
@@ -605,12 +852,12 @@ impl RhoApp {
             let _ = this.update_in(cx, |this, window, cx| {
                 let draft = draft
                     .upgrade()
-                    .filter(|draft| this.epoch == epoch && draft.read(cx).launching());
+                    .filter(|draft| this.is_current(&machine, epoch) && draft.read(cx).launching());
                 match (opened, draft) {
                     (Ok((mut session, Ok(attached))), Some(draft)) => {
-                        let cwd = attached.workspace().to_path_buf();
+                        let cwd = Place::new(machine.clone(), attached.workspace());
                         session.attached(attached);
-                        this.start_session(&draft, session, cwd, prompt, window, cx);
+                        this.start_session(&draft, session, &cwd, prompt, window, cx);
                     }
                     (Ok((session, attached)), draft) => {
                         // Not wanted, or not set up: unfollowed and unsaved,
@@ -642,24 +889,24 @@ impl RhoApp {
         &mut self,
         draft: &Entity<DraftView>,
         session: Session,
-        cwd: PathBuf,
+        cwd: &Place,
         prompt: Prompt,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(daemon) = self.daemon().cloned() else {
+        let Some(daemon) = self.daemon(&cwd.machine).cloned() else {
             return;
         };
         // The project, not a worktree the daemon added in it.
-        self.last_project = Some(draft.read(cx).cwd().to_path_buf());
+        self.last_project = Some(draft.read(cx).cwd().clone());
         let view = self.open_new_session(daemon, cwd, session, prompt, window, cx);
         self.set_pane(Pane::Session(view), cx);
         self.focus_pane(window, cx);
     }
 
-    /// Deletes a saved session in the daemon, then drops it here.
-    fn delete_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(daemon) = self.daemon().cloned() else {
+    /// Deletes a saved session in its daemon, then drops it here.
+    fn delete_session(&mut self, id: SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(daemon) = self.daemon(&id.machine).cloned() else {
             return;
         };
         // The daemon refuses to delete a session a client follows, so that
@@ -667,9 +914,9 @@ impl RhoApp {
         let open = self.opened(&id).is_some();
         cx.spawn_in(window, async move |this, cx| {
             if open {
-                let _ = daemon.detach(&id).await;
+                let _ = daemon.detach(&id.id).await;
             }
-            let result = daemon.delete_session(&id).await;
+            let result = daemon.delete_session(&id.id).await;
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(()) => this.session_deleted(&id, window, cx),
                 Err(error) => {
@@ -687,7 +934,7 @@ impl RhoApp {
 
     /// Drops the open session `id`, if any, with the subagents' sessions
     /// opened under it, and empties the pane if it showed one of them.
-    fn forget_session(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn forget_session(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(closed) = self.opened(id).map(|open| open.view.clone()) else {
             return;
         };
@@ -742,18 +989,27 @@ impl RhoApp {
     fn open_new_session(
         &mut self,
         daemon: Daemon,
-        cwd: PathBuf,
+        cwd: &Place,
         session: Session,
         prompt: Prompt,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Entity<SessionView> {
-        let id = session.id().clone();
+        let id = SessionKey::new(cwd.machine.clone(), session.id().clone());
         // Made here, so rho-ui's own from the start, even if the prompt fails.
         self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
-        let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
+        let workspace = WorkspaceRef::new(&self.workspaces, cwd, cx);
+        let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let view = cx.new(|cx| {
-            SessionView::new(daemon, session, cwd, workspace, Loading::Ready, window, cx)
+            SessionView::new(
+                daemon,
+                session,
+                workspace,
+                remote,
+                Loading::Ready,
+                window,
+                cx,
+            )
         });
         self.insert_session(id, view.clone(), window, cx);
         view.update(cx, |view, cx| view.submit(prompt, window, cx));
@@ -764,7 +1020,7 @@ impl RhoApp {
     /// `title` is the listed title, shown until the daemon answers.
     pub(crate) fn open_session(
         &mut self,
-        id: SessionId,
+        id: SessionKey,
         cwd: PathBuf,
         title: Option<SharedString>,
         window: &mut Window,
@@ -781,20 +1037,22 @@ impl RhoApp {
             }
             None => {}
         }
-        let Some(daemon) = self.daemon().cloned() else {
+        let Some(daemon) = self.daemon(&id.machine).cloned() else {
             return;
         };
         // The session must exist before the attach: the conversation
         // replays as events that may arrive before the attach's answer.
-        let mut session = Session::new(id.clone());
+        let mut session = Session::new(id.id.clone());
         session.set_title(title.map(String::from));
+        let cwd = Place::new(id.machine.clone(), cwd);
+        let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon.clone(),
                 session,
-                cwd,
                 workspace,
+                remote,
                 Loading::Attaching,
                 window,
                 cx,
@@ -804,7 +1062,7 @@ impl RhoApp {
         self.show(Pane::Session(view), window, cx);
 
         cx.spawn_in(window, async move |this, cx| {
-            let attached = daemon.attach(&id).await;
+            let attached = daemon.attach(&id.id).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attached(&daemon, &id, attached, window, cx);
             });
@@ -812,8 +1070,8 @@ impl RhoApp {
         .detach();
     }
 
-    /// Opens the session of a subagent that `parent` started, nested under
-    /// it, or switches to it if it is open. `title` is the subagent's task,
+    /// Opens the session of a subagent that `parent` started, on its
+    /// machine, nested under it, or switches to it if it is open. `title` is the subagent's task,
     /// shown until the daemon answers. Only the subagent writes to its
     /// session, so the view observes it rather than attaching.
     fn open_subagent(
@@ -824,6 +1082,7 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let id = SessionKey::new(parent.read(cx).key().machine, id);
         match self.opened(&id).map(|open| open.view.clone()) {
             // One that couldn't be observed, or whose events stopped as its
             // run ended, is read afresh.
@@ -836,18 +1095,18 @@ impl RhoApp {
             }
             None => {}
         }
-        let Some(daemon) = self.daemon().cloned() else {
+        let Some(daemon) = self.daemon(&id.machine).cloned() else {
             return;
         };
         // As for an attach, the session must exist before the observe.
-        let mut session = Session::new(id.clone());
+        let mut session = Session::new(id.id.clone());
         session.set_title(Some(title.into()));
         let view = cx.new(|cx| SessionView::subagent(daemon.clone(), session, parent, window, cx));
         self.insert_session(id.clone(), view.clone(), window, cx);
         self.show(Pane::Session(view), window, cx);
 
         cx.spawn_in(window, async move |this, cx| {
-            let observed = daemon.observe(&id).await;
+            let observed = daemon.observe(&id.id).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attached(&daemon, &id, observed, window, cx);
             });
@@ -859,7 +1118,7 @@ impl RhoApp {
     /// a subagent's.
     fn insert_session(
         &mut self,
-        id: SessionId,
+        id: SessionKey,
         view: Entity<SessionView>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -876,10 +1135,13 @@ impl RhoApp {
                     }
                 }
                 SessionEvent::Prompted => {
-                    let id = view.read(cx).id().clone();
+                    let id = view.read(cx).key();
                     this.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
                 }
-                SessionEvent::Saved => this.refresh_sessions(cx),
+                SessionEvent::Saved => {
+                    let machine = view.read(cx).key().machine;
+                    this.refresh_sessions(&machine, cx);
+                }
                 SessionEvent::OpenSubagent { session, title } => {
                     this.open_subagent(view, session.clone(), title.clone(), window, cx);
                 }
@@ -903,62 +1165,6 @@ impl RhoApp {
             view,
             _subscription: subscription,
         });
-    }
-
-    fn render_connecting() -> impl IntoElement {
-        Empty::new().size_full().header(
-            EmptyHeader::new()
-                .media(EmptyMedia::new().child(Spinner::new()))
-                .description(EmptyDescription::new().child("Connecting to the rho daemon…")),
-        )
-    }
-
-    fn render_failed(&self, message: &str, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let reached = match &self.launch.daemon {
-            DaemonTarget::Home { home, rho } => format!(
-                "Rho home: {}, started with: {} daemon start",
-                home.display(),
-                rho.display()
-            ),
-            DaemonTarget::Socket(socket) => format!("Socket: {}", socket.display()),
-        };
-        Empty::new()
-            .size_full()
-            .header(
-                EmptyHeader::new()
-                    .title(
-                        EmptyTitle::new()
-                            .text_lg()
-                            .child("Can't reach the rho daemon"),
-                    )
-                    .description(EmptyDescription::new().child(reached)),
-            )
-            .content(
-                EmptyContent::new()
-                    .max_w(rems(36.))
-                    .child(
-                        // rho's own words: sometimes long, so monospace and
-                        // scrollable.
-                        div()
-                            .id("daemon-error")
-                            .w_full()
-                            .max_h(rems(16.))
-                            .overflow_y_scroll()
-                            .p_3()
-                            .rounded(cx.theme().radius)
-                            .bg(cx.theme().secondary)
-                            .text_left()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(message.to_owned()),
-                    )
-                    .child(
-                        Button::new("retry-daemon")
-                            .primary()
-                            .icon(IconName::RotateCw)
-                            .label("Retry")
-                            .on_click(cx.listener(|this, _, window, cx| this.connect(window, cx))),
-                    ),
-            )
     }
 
     /// The main pane when no session is open.
@@ -1000,7 +1206,7 @@ impl RhoApp {
         }
     }
     /// The user's projects, for UI tests.
-    pub(crate) fn projects<'a>(&self, cx: &'a App) -> &'a [PathBuf] {
+    pub(crate) fn projects<'a>(&self, cx: &'a App) -> &'a [Place] {
         self.projects.read(cx).roots()
     }
     /// The sidebar's search, for UI tests.
@@ -1030,19 +1236,6 @@ impl Render for RhoApp {
             .text_color(cx.theme().foreground)
             // First, so it sees scroll events before any scroll area.
             .child(Kinetic::hook(&self.kinetic));
-
-        match &self.status {
-            DaemonStatus::Connecting => {
-                return root.child(Self::render_connecting()).into_any_element();
-            }
-            DaemonStatus::Failed(message) => {
-                let message = message.clone();
-                return root
-                    .child(self.render_failed(&message, cx))
-                    .into_any_element();
-            }
-            DaemonStatus::Ready(_) => {}
-        }
 
         let pane_style = || StyleRefinement::default().flex_1().min_w_0().h_full();
         let sidebar_width = self.sidebar.read(cx).width();

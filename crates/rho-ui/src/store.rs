@@ -36,25 +36,32 @@ pub(crate) fn write_atomic(path: &Path, text: &str) {
 
 /// Bump on any change to [`SCHEMA`]. A database of another version starts
 /// over empty: rho-ui has no release, so there is nothing to migrate.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Every table. Each belongs to the module that reads and writes it.
 /// Tables keyed by text are `WITHOUT ROWID`, so the key is stored once
 /// rather than in the table and again in its index, which halved the file
 /// with text-keyed turn times.
 const SCHEMA: &str = "
-    -- Settled and snoozed sessions; see crate::shelf. A row with neither
-    -- mark nor ownership is deleted.
+    -- Settled and snoozed sessions, by machine (crate::machines::MachineId)
+    -- and session; see crate::shelf. A row with neither mark nor ownership
+    -- is deleted.
     CREATE TABLE shelves (
-        session_id TEXT PRIMARY KEY,
+        machine TEXT NOT NULL,
+        session_id TEXT NOT NULL,
         owned INTEGER NOT NULL,
         settled_at INTEGER,
         snoozed_until INTEGER,
+        PRIMARY KEY (machine, session_id),
         CHECK (settled_at IS NULL OR snoozed_until IS NULL)
     ) STRICT, WITHOUT ROWID;
     -- The user's projects, in the order added (rowid); see crate::projects.
     -- The path's bytes, as a path needn't be UTF-8.
-    CREATE TABLE projects (path BLOB PRIMARY KEY) STRICT;
+    CREATE TABLE projects (
+        machine TEXT NOT NULL,
+        path BLOB NOT NULL,
+        UNIQUE (machine, path)
+    ) STRICT;
     -- How long each turn took, by a hash of its prompt's message ID, which
     -- is the rowid; see crate::turn_times.
     CREATE TABLE turn_times (prompt INTEGER PRIMARY KEY, ms INTEGER NOT NULL) STRICT;
@@ -89,12 +96,16 @@ const PRAGMAS: &str = "
 pub(crate) enum Key {
     /// `open` or `collapsed`; see [`crate::sidebar::SidebarLayout`].
     SidebarLayout,
+    /// The machines and projects the sidebar hides; see
+    /// [`crate::session_list::Filter`].
+    SidebarFilter,
 }
 
 impl Key {
     fn name(self) -> &'static str {
         match self {
             Key::SidebarLayout => "sidebar-layout",
+            Key::SidebarFilter => "sidebar-filter",
         }
     }
 }

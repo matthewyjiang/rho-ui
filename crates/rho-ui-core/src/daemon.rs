@@ -39,6 +39,7 @@ use crate::{
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
     prompt::{mebibytes, Prompt},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
+    ssh::{self, SshTarget},
 };
 
 /// How to reach the daemon.
@@ -55,6 +56,10 @@ pub enum DaemonTarget {
     },
     /// A daemon already listening on this socket.
     Socket(PathBuf),
+    /// The daemon of the default rho home on another machine, reached over
+    /// ssh and started there when none runs. Its sessions run in that
+    /// machine's login environment.
+    Ssh(SshTarget),
 }
 
 impl DaemonTarget {
@@ -169,6 +174,7 @@ impl std::fmt::Display for SessionId {
 pub struct DaemonInfo {
     version: String,
     notice: Option<String>,
+    home: Option<PathBuf>,
 }
 
 impl DaemonInfo {
@@ -182,6 +188,13 @@ impl DaemonInfo {
     /// daemon's words.
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    /// The home directory of the user the daemon runs as, on its machine:
+    /// what `~` means in that machine's paths. `None` when this process has
+    /// no `HOME`, for a daemon on this machine.
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
     }
 }
 
@@ -400,6 +413,30 @@ impl DaemonEvents {
 pub struct Daemon {
     client: Arc<Client>,
     info: Arc<DaemonInfo>,
+    /// What every request that carries an environment sends, which rho
+    /// makes the session's whole process environment.
+    environment: Arc<ClientEnvironment>,
+}
+
+/// The machine the daemon runs on, as the sessions this client opens see it.
+#[derive(Debug)]
+pub(crate) struct Machine {
+    /// The environment sessions run in.
+    pub(crate) environment: ClientEnvironment,
+    /// The home directory there.
+    pub(crate) home: Option<PathBuf>,
+}
+
+impl Machine {
+    /// This machine, as this process sees it.
+    fn this_process() -> Self {
+        Self {
+            environment: ClientEnvironment::of_this_process(),
+            home: std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from),
+        }
+    }
 }
 
 impl std::fmt::Debug for Daemon {
@@ -420,7 +457,8 @@ const _: () = {
 
 /// The runtime the connection's socket I/O runs on, made on first use and
 /// kept for the life of the process. One worker: the work is one socket's
-/// reads and writes, and `LocalDaemon` waiting on `rho daemon start`.
+/// reads and writes, and `LocalDaemon` waiting on `rho daemon start`, or
+/// the ssh commands that reach a daemon on another machine.
 fn io() -> &'static Runtime {
     static IO: OnceLock<Runtime> = OnceLock::new();
     IO.get_or_init(|| {
@@ -428,6 +466,8 @@ fn io() -> &'static Runtime {
             .worker_threads(1)
             .thread_name("rho-ui-daemon-io")
             .enable_io()
+            // The deadline on a remote machine's setup; see `ssh.rs`.
+            .enable_time()
             .build()
             .expect("the OS lets this process start a thread and an I/O driver")
     })
@@ -438,11 +478,12 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         name: "rho-ui".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
     });
-    let (client, notifications, hello) = match target {
+    let (client, notifications, hello, machine) = match target {
         DaemonTarget::Home { home, rho } => {
-            LocalDaemon::new(home)
+            let (client, notifications, hello) = LocalDaemon::new(home)
                 .connect_or_start(Command::new(rho), hello)
-                .await?
+                .await?;
+            (client, notifications, hello, Machine::this_process())
         }
         DaemonTarget::Socket(socket) => {
             let stream = UnixStream::connect(&socket).await.map_err(|error| {
@@ -451,16 +492,20 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
                     socket.display()
                 ))
             })?;
-            Client::handshake(stream, hello).await?
+            let (client, notifications, hello) = Client::handshake(stream, hello).await?;
+            (client, notifications, hello, Machine::this_process())
         }
+        DaemonTarget::Ssh(target) => ssh::connect(&target, hello).await?,
     };
     let info = DaemonInfo {
         version: hello.daemon.version,
         notice: hello.skew.map(|skew| skew.to_string()),
+        home: machine.home,
     };
     let daemon = Daemon {
         client: Arc::new(client),
         info: Arc::new(info),
+        environment: Arc::new(machine.environment),
     };
     let events = DaemonEvents { notifications };
     Ok((daemon, events))
@@ -484,9 +529,9 @@ impl Daemon {
     /// # Errors
     ///
     /// Fails if no daemon runs and rho cannot be run or its daemon does not
-    /// start, the socket refuses the connection, or the daemon speaks
-    /// another protocol version; the message then says which side to
-    /// update.
+    /// start, the socket refuses the connection, ssh cannot reach the
+    /// machine, or the daemon speaks another protocol version; the message
+    /// then says which side to update.
     pub async fn connect(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonError> {
         let (reply, opened) = oneshot::channel();
         io().spawn(async move {
@@ -564,7 +609,7 @@ impl Daemon {
     ) -> Result<SessionSetup, DaemonError> {
         let params = SessionNewParams {
             cwd: cwd.to_path_buf(),
-            environment: ClientEnvironment::of_this_process(),
+            environment: ClientEnvironment::clone(&self.environment),
             agent: None,
             setup: session_setup(),
             parent: None,
@@ -596,7 +641,7 @@ impl Daemon {
         let params = SessionAttachParams {
             session: id.to_wire(),
             after: None,
-            environment: ClientEnvironment::of_this_process(),
+            environment: ClientEnvironment::clone(&self.environment),
             setup: session_setup(),
         };
         let response = self
@@ -660,7 +705,7 @@ impl Daemon {
             session: id.to_wire(),
             content: prompt.to_wire(),
             timeout_ms: None,
-            environment: ClientEnvironment::of_this_process(),
+            environment: ClientEnvironment::clone(&self.environment),
             grant: None,
             idempotency_key: None,
             author: rho_protocol::PromptAuthor::Person,

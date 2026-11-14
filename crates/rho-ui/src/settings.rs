@@ -1,13 +1,17 @@
-//! rho-ui's own settings: light or dark, UI scale and fonts. They live in
-//! `$XDG_CONFIG_HOME/rho-ui/settings` (by default `~/.config/rho-ui/settings`),
-//! one `key = value` per line, and apply to GPUI Kit's theme.
+//! rho-ui's own settings: light or dark, UI scale, fonts, and the machines
+//! it connects to. They live in `$XDG_CONFIG_HOME/rho-ui/settings` (by
+//! default `~/.config/rho-ui/settings`), one `key = value` per line. The
+//! look applies to GPUI Kit's theme; the app follows the machines.
 
-use std::path::PathBuf;
+use std::{fmt::Write as _, path::PathBuf};
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{px, App, Global, SharedString, WindowAppearance};
 
-use crate::store;
+use crate::{
+    machines::{RemoteMachine, LOCAL},
+    store,
+};
 
 /// The UI font when none is set.
 pub(crate) const DEFAULT_UI_FONT: &str = "Noto Sans";
@@ -114,6 +118,10 @@ pub(crate) struct Settings {
     pub(crate) ui_scale: UiScale,
     pub(crate) ui_font: SharedString,
     pub(crate) code_font: SharedString,
+    /// What the sidebar calls this machine.
+    pub(crate) local_label: SharedString,
+    /// The remote machines, in the order added.
+    pub(crate) machines: Vec<RemoteMachine>,
     /// Where [`Self::save`] writes; `None` keeps changes in memory (tests).
     file: Option<PathBuf>,
 }
@@ -125,6 +133,8 @@ impl Default for Settings {
             ui_scale: UiScale::default(),
             ui_font: DEFAULT_UI_FONT.into(),
             code_font: DEFAULT_CODE_FONT.into(),
+            local_label: LOCAL.into(),
+            machines: Vec::new(),
             file: None,
         }
     }
@@ -150,14 +160,41 @@ impl Settings {
     /// change at the next start.
     pub(crate) fn save(&self) {
         let Some(path) = &self.file else { return };
-        let text = format!(
-            "appearance = {}\nui_scale = {}\nui_font = {}\ncode_font = {}\n",
+        store::write_atomic(path, &self.to_text());
+    }
+
+    /// The remote machine at `host`, if it is on the list.
+    pub(crate) fn machine(&self, host: &str) -> Option<&RemoteMachine> {
+        self.machines.iter().find(|machine| machine.host == host)
+    }
+
+    pub(crate) fn machine_mut(&mut self, host: &str) -> Option<&mut RemoteMachine> {
+        self.machines
+            .iter_mut()
+            .find(|machine| machine.host == host)
+    }
+
+    /// The settings file's text: `key = value` lines, and for each remote
+    /// machine `machine.<host>.label` and `machine.<host>.rho`.
+    fn to_text(&self) -> String {
+        let mut text = format!(
+            "appearance = {}\nui_scale = {}\nui_font = {}\ncode_font = {}\nlocal.label = {}\n",
             self.appearance.name(),
             self.ui_scale.percent(),
             self.ui_font,
-            self.code_font
+            self.code_font,
+            self.local_label,
         );
-        store::write_atomic(path, &text);
+        for machine in &self.machines {
+            let host = &machine.host;
+            let (label, rho) = (&machine.label, &machine.rho);
+            // Writing to a String can't fail.
+            let _ = write!(
+                text,
+                "machine.{host}.label = {label}\nmachine.{host}.rho = {rho}\n"
+            );
+        }
+        text
     }
 
     /// Makes `self` the current settings and applies them to the theme and
@@ -196,7 +233,8 @@ impl Settings {
     }
 }
 
-/// Reads `key = value` lines. Unknown keys and bad values are skipped.
+/// Reads `key = value` lines. Unknown keys and bad values are skipped. A
+/// remote machine is listed where its first line is.
 fn parse(text: &str) -> Settings {
     let mut settings = Settings::default();
     for line in text.lines() {
@@ -217,10 +255,37 @@ fn parse(text: &str) -> Settings {
             }
             "ui_font" if !value.is_empty() => settings.ui_font = value.to_owned().into(),
             "code_font" if !value.is_empty() => settings.code_font = value.to_owned().into(),
-            _ => {}
+            "local.label" if !value.is_empty() => settings.local_label = value.to_owned().into(),
+            key => {
+                if let Some((host, field)) = key
+                    .strip_prefix("machine.")
+                    .and_then(|rest| rest.rsplit_once('.'))
+                {
+                    machine_field(&mut settings.machines, host, field, value);
+                }
+            }
         }
     }
     settings
+}
+
+/// Sets `field` of the remote machine at `host`, listing it if new. A host
+/// that can't name a machine is skipped.
+fn machine_field(machines: &mut Vec<RemoteMachine>, host: &str, field: &str, value: &str) {
+    if crate::machines::host_problem(host).is_some() {
+        return;
+    }
+    let ix = machines.iter().position(|machine| machine.host == host);
+    let ix = ix.unwrap_or_else(|| {
+        machines.push(RemoteMachine::new(host));
+        machines.len() - 1
+    });
+    let machine = &mut machines[ix];
+    match field {
+        "label" => value.clone_into(&mut machine.label),
+        "rho" if !value.is_empty() => value.clone_into(&mut machine.rho),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +303,27 @@ mod tests {
         assert_eq!(settings.ui_font, DEFAULT_UI_FONT);
         assert_eq!(parse("ui_scale = 133").ui_scale, UiScale::default());
         assert_eq!(parse("appearance = sepia").appearance, Appearance::Dark);
+    }
+
+    #[test]
+    fn machines_survive_a_save_in_the_order_added() {
+        let mut settings = Settings {
+            local_label: "laptop".into(),
+            ..Settings::default()
+        };
+        let mut workstation = RemoteMachine::new("workstation");
+        workstation.label = "Workstation".to_owned();
+        workstation.rho = "~/.cargo/bin/rho".to_owned();
+        settings.machines = vec![workstation, RemoteMachine::new("me@node0.example.edu")];
+        let read = parse(&settings.to_text());
+        assert_eq!(read.machines, settings.machines);
+        assert_eq!(read.local_label, "laptop");
+        assert_eq!(read.machines[1].shown_label(), "me@node0.example.edu");
+        assert!(
+            parse("machine.local.label = x\nmachine.-x.rho = y\n")
+                .machines
+                .is_empty(),
+            "hosts that can't name a machine are skipped"
+        );
     }
 }

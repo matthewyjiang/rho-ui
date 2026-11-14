@@ -1,9 +1,11 @@
-//! Workspace directories and what their git repositories say: one table
-//! shared by the sidebar rows and the session header, so both show the same
-//! workspace and branch. Read from `.git` files on the background executor,
-//! then re-read every [`REREAD`] to pick up branch switches. The saved
-//! sessions say how recently each was used, which dates the projects in the
-//! new-session picker.
+//! Workspace directories, each on one machine, and what their git
+//! repositories say: one table shared by the sidebar rows and the session
+//! header, so both show the same workspace and branch. Read from `.git`
+//! files on the background executor, then re-read every [`REREAD`] to pick
+//! up branch switches. rho-ui reads only this machine's files, so a remote
+//! workspace shows its folder's name and no branch. The saved sessions say
+//! how recently each was used, which dates the projects in the new-session
+//! picker.
 
 use std::{
     path::{Path, PathBuf},
@@ -12,31 +14,34 @@ use std::{
 
 use gpui_kit::{App, Context, Entity, SharedString, Task};
 
-use crate::repo::{self, Repo};
+use crate::{
+    machines::{MachineId, Place},
+    repo::{self, Repo},
+};
 
 /// How often branches are re-read. A branch switch shows within this long.
 const REREAD: Duration = Duration::from_secs(30);
 
 /// One workspace directory, with its display strings made once.
 pub(crate) struct Workspace {
-    cwd: PathBuf,
+    place: Place,
     repo: Repo,
     pub(crate) name: SharedString,
     /// The name without its owner, as the title bar shows the project.
     pub(crate) short_name: SharedString,
     pub(crate) initials: SharedString,
     pub(crate) branch: Option<SharedString>,
-    /// The directory, with the home directory shown as `~`.
+    /// The directory, with its machine's home directory shown as `~`.
     pub(crate) path: SharedString,
     /// Unix seconds of its newest saved session; 0 with none.
     pub(crate) last_used: i64,
 }
 
 impl Workspace {
-    fn new(cwd: PathBuf, repo: Repo) -> Self {
+    fn new(place: Place, repo: Repo, home: Option<&Path>) -> Self {
         Self {
-            path: tilde(&cwd, home().as_deref()).into(),
-            cwd,
+            path: tilde(&place.path, home).into(),
+            place,
             name: repo.name.clone().into(),
             short_name: repo.short_name().to_owned().into(),
             initials: repo.initials().into(),
@@ -47,13 +52,27 @@ impl Workspace {
     }
 
     pub(crate) fn cwd(&self) -> &Path {
-        &self.cwd
+        &self.place.path
+    }
+
+    pub(crate) fn machine(&self) -> &MachineId {
+        &self.place.machine
+    }
+
+    pub(crate) fn place(&self) -> &Place {
+        &self.place
+    }
+
+    /// The folder of the project it belongs to, on its machine; see
+    /// [`Self::root`].
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.repo.root
     }
 
     /// The project it belongs to; see [`Repo::root`]. Its own directory
-    /// until its repository has been read.
-    pub(crate) fn root(&self) -> &Path {
-        &self.repo.root
+    /// until its repository has been read, and on another machine.
+    pub(crate) fn root(&self) -> Place {
+        Place::new(self.place.machine.clone(), self.repo.root.clone())
     }
 
     /// Takes what a fresh read of its repository says.
@@ -66,7 +85,7 @@ impl Workspace {
     }
 }
 
-/// The user's home directory, which paths show as `~`.
+/// This machine's home directory, which its paths show as `~`.
 pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -103,7 +122,7 @@ pub(crate) struct WorkspaceRef {
 
 impl WorkspaceRef {
     /// The workspace for `cwd`, adding it to `workspaces` if new.
-    pub(crate) fn new(workspaces: &Entity<Workspaces>, cwd: &Path, cx: &mut App) -> Self {
+    pub(crate) fn new(workspaces: &Entity<Workspaces>, cwd: &Place, cx: &mut App) -> Self {
         let ix = workspaces.update(cx, |workspaces, cx| workspaces.index(cwd, cx));
         Self {
             workspaces: workspaces.clone(),
@@ -125,6 +144,8 @@ impl WorkspaceRef {
 /// indices instead of paths.
 pub(crate) struct Workspaces {
     list: Vec<Workspace>,
+    /// Each remote machine's home directory, once its daemon said.
+    homes: Vec<(MachineId, PathBuf)>,
     _reread: Task<()>,
 }
 
@@ -132,27 +153,72 @@ impl Workspaces {
     pub(crate) fn new(cx: &mut Context<'_, Self>) -> Self {
         let reread = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(REREAD).await;
-            let all = this.update(cx, |this, cx| this.read((0..this.list.len()).collect(), cx));
+            let all = this.update(cx, |this, cx| {
+                let local = (0..this.list.len()).filter(|&ix| this.list[ix].machine().is_local());
+                this.read(local.collect(), cx);
+            });
             if all.is_err() {
                 break;
             }
         });
         Self {
             list: Vec::new(),
+            homes: Vec::new(),
             _reread: reread,
         }
     }
 
+    /// The home directory of `machine`, which its paths show as `~`.
+    pub(crate) fn home(&self, machine: &MachineId) -> Option<PathBuf> {
+        if machine.is_local() {
+            return home();
+        }
+        self.homes
+            .iter()
+            .find_map(|(known, home)| (known == machine).then(|| home.clone()))
+    }
+
+    /// Records the home directory of remote `machine`, as its daemon says,
+    /// and shows its workspaces' paths from it.
+    pub(crate) fn set_home(
+        &mut self,
+        machine: &MachineId,
+        home: PathBuf,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.home(machine).as_ref() == Some(&home) {
+            return;
+        }
+        self.homes.retain(|(known, _)| known != machine);
+        for workspace in &mut self.list {
+            if workspace.machine() == machine {
+                workspace.path = tilde(workspace.cwd(), Some(&home)).into();
+            }
+        }
+        self.homes.push((machine.clone(), home));
+        cx.notify();
+    }
+
     /// The index for `cwd`. A new one shows its folder name until its
     /// repository has been read in the background.
-    pub(crate) fn index(&mut self, cwd: &Path, cx: &mut Context<'_, Self>) -> usize {
-        if let Some(ix) = self.list.iter().position(|workspace| workspace.cwd == cwd) {
+    pub(crate) fn index(&mut self, cwd: &Place, cx: &mut Context<'_, Self>) -> usize {
+        if let Some(ix) = self
+            .list
+            .iter()
+            .position(|workspace| workspace.place == *cwd)
+        {
             return ix;
         }
-        self.list
-            .push(Workspace::new(cwd.to_path_buf(), repo::folder(cwd)));
+        let home = self.home(&cwd.machine);
+        self.list.push(Workspace::new(
+            cwd.clone(),
+            repo::folder(&cwd.path),
+            home.as_deref(),
+        ));
         let ix = self.list.len() - 1;
-        self.read(vec![ix], cx);
+        if cwd.machine.is_local() {
+            self.read(vec![ix], cx);
+        }
         ix
     }
 
@@ -163,26 +229,28 @@ impl Workspaces {
 
     /// Unix seconds of the newest saved session in project `root`, in any
     /// of its folders or worktrees; 0 with none.
-    pub(crate) fn last_used_in(&self, root: &Path) -> i64 {
+    pub(crate) fn last_used_in(&self, root: &Place) -> i64 {
         self.list
             .iter()
-            .filter(|workspace| workspace.root() == root)
+            .filter(|workspace| workspace.root() == *root)
             .map(|workspace| workspace.last_used)
             .max()
             .unwrap_or(0)
     }
 
-    /// The workspace whose directory is one of `paths`, if any.
-    pub(crate) fn find(&self, paths: &[&Path]) -> Option<usize> {
+    /// The workspace whose directory is one of `places`, if any.
+    pub(crate) fn find(&self, places: &[&Place]) -> Option<usize> {
         self.list
             .iter()
-            .position(|workspace| paths.contains(&workspace.cwd.as_path()))
+            .position(|workspace| places.contains(&&workspace.place))
     }
 
-    /// Dates each workspace by its newest saved session, given as
-    /// `(workspace, updated)`, and notifies if that changed any.
+    /// Dates each of `machine`'s workspaces by its newest saved session,
+    /// given as `(workspace, updated)`, and notifies if that changed any.
+    /// Other machines' workspaces keep their dates.
     pub(crate) fn set_history(
         &mut self,
+        machine: &MachineId,
         sessions: impl IntoIterator<Item = (usize, i64)>,
         cx: &mut Context<'_, Self>,
     ) {
@@ -191,7 +259,12 @@ impl Workspaces {
             newest[ix] = newest[ix].max(updated);
         }
         let mut changed = false;
-        for (workspace, last_used) in self.list.iter_mut().zip(newest) {
+        let theirs = self
+            .list
+            .iter_mut()
+            .zip(newest)
+            .filter(|(workspace, _)| workspace.machine() == machine);
+        for (workspace, last_used) in theirs {
             if workspace.last_used != last_used {
                 workspace.last_used = last_used;
                 changed = true;
@@ -207,7 +280,7 @@ impl Workspaces {
     fn read(&self, indices: Vec<usize>, cx: &mut Context<'_, Self>) {
         let jobs: Vec<(usize, PathBuf)> = indices
             .into_iter()
-            .map(|ix| (ix, self.list[ix].cwd.clone()))
+            .map(|ix| (ix, self.list[ix].cwd().to_path_buf()))
             .collect();
         cx.spawn(async move |this, cx| {
             let repos = cx

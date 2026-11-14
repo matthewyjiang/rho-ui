@@ -65,6 +65,9 @@ pub(crate) struct ComposerState {
     /// The name Escape closed the menu on; typing on opens it again.
     dismissed: Option<Completion>,
     _subscription: Subscription,
+    /// The label of the remote machine the message goes to, whose agent
+    /// can't read a file that would go by its path here.
+    remote: Option<SharedString>,
 }
 
 /// An attachment in the composer.
@@ -97,7 +100,13 @@ enum MenuKey {
 }
 
 impl ComposerState {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+    /// An empty composer for a message to this machine, or with `remote`,
+    /// to the remote machine of that label; see [`Self::set_remote`].
+    pub(crate) fn new(
+        remote: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, MAX_ROWS)
@@ -116,6 +125,7 @@ impl ComposerState {
             menu: None,
             dismissed: None,
             _subscription: subscription,
+            remote,
         }
     }
 
@@ -211,6 +221,28 @@ impl ComposerState {
             input.replace(edit.text, window, cx);
             input.set_selected_range(edit.cursor..edit.cursor, cx);
         });
+        cx.notify();
+    }
+
+    /// The label of the remote machine the message goes to; see
+    /// [`Self::set_remote`].
+    pub(crate) fn remote(&self) -> Option<SharedString> {
+        self.remote.clone()
+    }
+
+    /// Says the message goes to the remote machine labelled `remote`, or
+    /// to this one with `None`. Files that would go by their path are
+    /// refused there, and taken off when the message moves there.
+    pub(crate) fn set_remote(&mut self, remote: Option<SharedString>, cx: &mut Context<'_, Self>) {
+        self.remote = remote;
+        let Some(machine) = self.remote.clone() else {
+            return;
+        };
+        let before = self.attachments.len();
+        self.attachments.retain(|item| !by_path(&item.attachment));
+        if self.attachments.len() != before {
+            self.refusal = Some(format!("Took off the files that go by path: rho on {machine} can't read this machine's files.").into());
+        }
         cx.notify();
     }
 
@@ -361,6 +393,11 @@ impl ComposerState {
     /// Adds `attachment` after the others, if one message can carry it with
     /// them.
     fn add(&mut self, attachment: Attachment) -> Result<(), String> {
+        if let (Some(machine), true) = (&self.remote, by_path(&attachment)) {
+            return Err(format!(
+                "it would go by its path, and rho on {machine} can't read this machine's files"
+            ));
+        }
         let held = self.attachments.iter().map(|item| &item.attachment);
         check_attachment_total(held.chain([&attachment])).map_err(|error| error.to_string())?;
         let item = self
@@ -755,4 +792,9 @@ impl RenderOnce for Composer {
             );
         v_flex().w_full().gap_2().children(refusal).child(input_box)
     }
+}
+
+/// Whether `attachment` goes as its path, for the agent to read itself.
+fn by_path(attachment: &Attachment) -> bool {
+    matches!(attachment, Attachment::File(file) if file.text().is_none())
 }

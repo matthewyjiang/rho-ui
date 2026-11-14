@@ -4,7 +4,7 @@
 
 The desktop app for [rho](https://github.com/matthewyjiang/rho).
 
-Sessions run in the rho daemon, so they keep running after you close the window, and sessions started in rho's terminal UI show up here too.
+Sessions run in the rho daemon, so they keep running after you close the window, and sessions started in rho's terminal UI show up here too. Add remote machines in Settings to see their sessions beside this machine's, reached over ssh.
 
 ## Requirements
 
@@ -36,8 +36,8 @@ The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 
 ## Files
 
-- `~/.config/rho-ui/settings`: theme, scale, fonts
-- `~/.local/state/rho-ui/state.sqlite3`: your projects, settled and snoozed sessions, turn times, and whether the sidebar is collapsed
+- `~/.config/rho-ui/settings`: theme, scale, fonts, machines
+- `~/.local/state/rho-ui/state.sqlite3`: your projects, settled and snoozed sessions, turn times, and the sidebar's layout and filter
 
 These follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set.
 

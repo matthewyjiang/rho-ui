@@ -54,10 +54,10 @@ use rho_protocol::{
         ReasoningOptions, Replay, Seq, SessionCommand, SessionId, SessionOptions, SteerId,
         StreamId, ToolCallId, ToolCallUpdate, TurnId,
     },
-    serve_connection, subscription, AnswerStop, BuildId, CardTone, CommandKind, ContentBlock,
-    DaemonInfo, DetachReason, ErrorCode, InputRequest, PermissionMode, Published, Publisher,
-    RpcError, SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
-    TurnOutcome,
+    serve_connection, subscription, AnswerStop, BuildId, CardTone, ClientEnvironment, CommandKind,
+    ContentBlock, DaemonEndpoint, DaemonInfo, DetachReason, ErrorCode, InputRequest,
+    PermissionMode, Published, Publisher, RpcError, SessionAttachResponse, SessionEvent,
+    Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
 };
 use tokio::{net::UnixListener, runtime::Runtime};
 
@@ -111,7 +111,8 @@ pub enum TuiJob {
 pub struct FakeDaemon {
     socket: PathBuf,
     service: Arc<Fake>,
-    _dir: tempfile::TempDir,
+    /// The directory of its socket, when the fake made it.
+    _dir: Option<tempfile::TempDir>,
     _runtime: Runtime,
 }
 
@@ -126,6 +127,25 @@ impl FakeDaemon {
     pub fn start(script: Script) -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory for the fake daemon");
         let socket = dir.path().join("daemon.sock");
+        Self::serve(script, socket, Some(dir))
+    }
+
+    /// Starts a daemon holding `script` where rho's daemon of the rho home
+    /// `rho_home` listens when `XDG_RUNTIME_DIR` is unset, making the home
+    /// if missing. The caller keeps the home.
+    ///
+    /// # Panics
+    ///
+    /// If the OS refuses the home, a socket in it, or a thread.
+    pub fn start_in_home(script: Script, rho_home: &Path) -> Self {
+        std::fs::create_dir_all(rho_home).expect("the fake daemon makes its rho home");
+        let canonical = std::fs::canonicalize(rho_home).expect("the rho home resolves");
+        let endpoint = DaemonEndpoint::locate(&canonical, None).expect("a short rho home");
+        std::fs::create_dir_all(&endpoint.runtime_dir).expect("the daemon's runtime directory");
+        Self::serve(script, endpoint.socket, None)
+    }
+
+    fn serve(script: Script, socket: PathBuf, dir: Option<tempfile::TempDir>) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_io()
@@ -166,6 +186,19 @@ impl FakeDaemon {
     /// How a client reaches this daemon.
     pub fn target(&self) -> DaemonTarget {
         DaemonTarget::Socket(self.socket.clone())
+    }
+
+    /// The value of variable `name` in the environment the latest
+    /// `rho/session/new` carried, which rho makes the session's whole
+    /// process environment.
+    pub fn new_session_var(&self, name: &str) -> Option<String> {
+        let state = self.service.lock();
+        let (_, value) = state
+            .new_session_environment
+            .iter()
+            .flat_map(ClientEnvironment::iter)
+            .find(|(set, _)| *set == name)?;
+        Some(value.to_owned())
     }
 
     /// How many worktrees the daemon has added for new sessions.
@@ -835,6 +868,8 @@ struct State {
     new_sessions: u64,
     /// How many sessions asked for a new worktree.
     worktrees: usize,
+    /// The environment the latest `rho/session/new` carried.
+    new_session_environment: Option<ClientEnvironment>,
     turns: u64,
     steers: u64,
 }
@@ -856,6 +891,7 @@ impl State {
             sessions,
             new_sessions: 0,
             worktrees: 0,
+            new_session_environment: None,
             turns: 0,
             steers: 0,
         };

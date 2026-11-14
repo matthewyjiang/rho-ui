@@ -1,7 +1,9 @@
 //! Settings, opened with Ctrl+, or the gear at the bottom of the sidebar, in a
 //! dialog over the window. Built from GPUI Kit's `Settings` component: pages
 //! on the left with a search, groups of items on the right. Each change
-//! applies at once and is saved.
+//! applies at once and is saved. The Machines page is in [`machines`].
+
+mod machines;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
@@ -18,6 +20,7 @@ use gpui_kit::{
 };
 
 use crate::settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT};
+use machines::MachineFields;
 
 /// The dialog's width and height, in rems so they follow the UI scale:
 /// 832 x 384 px at 100%, inside the default 1200 x 800 window with the
@@ -115,6 +118,7 @@ impl FontRole {
 struct SettingsView {
     ui_font: FontSelect,
     code_font: FontSelect,
+    machines: MachineFields,
     _subscriptions: [Subscription; 2],
 }
 
@@ -131,11 +135,14 @@ impl SettingsView {
             .collect();
         let (ui_font, ui_subscription) = font_select(FontRole::Ui, fonts.clone(), window, cx);
         let (code_font, code_subscription) = font_select(FontRole::Code, fonts, window, cx);
-        Self {
+        let mut view = Self {
             ui_font,
             code_font,
+            machines: MachineFields::new(window, cx),
             _subscriptions: [ui_subscription, code_subscription],
-        }
+        };
+        view.sync_rho_fields(window, cx);
+        view
     }
 
     fn select(&self, role: FontRole) -> &FontSelect {
@@ -201,6 +208,15 @@ fn font_select(
     (state, subscription)
 }
 
+/// Every page's title: large, with room for the dialog's close button.
+fn page_header() -> StyleRefinement {
+    StyleRefinement::default()
+        .border_b_0()
+        .pr(rems(CLOSE_ROOM_REMS))
+        .text_lg()
+        .font_weight(FontWeight::SEMIBOLD)
+}
+
 /// Applies and saves a change to the current settings.
 fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
     let mut settings = cx.global::<Settings>().clone();
@@ -235,13 +251,7 @@ impl Render for SettingsView {
             .icon(IconName::Palette)
             .default_open(true)
             .resettable(true)
-            .header_style(
-                &StyleRefinement::default()
-                    .border_b_0()
-                    .pr(rems(CLOSE_ROOM_REMS))
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD),
-            )
+            .header_style(&page_header())
             .group(
                 // One group: a title would only repeat the page's.
                 SettingGroup::new().items([
@@ -293,6 +303,7 @@ impl Render for SettingsView {
                     ),
                 ]),
             );
+        let machines = self.machines_page(cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
         // corners, since the dialog has no padding to keep it inside.
@@ -309,7 +320,8 @@ impl Render for SettingsView {
                     .sidebar_width(window.rem_size() * PAGES_REMS)
                     .sidebar_style(&pages)
                     .with_group_variant(GroupBoxVariant::Fill)
-                    .page(appearance),
+                    .page(appearance)
+                    .page(machines),
             )
     }
 }

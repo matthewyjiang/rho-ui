@@ -1,9 +1,12 @@
-//! The session list, drawn: one scrolling list of active sessions, newest
-//! first, then the Snoozed and Settled shelves, held at the bottom until
-//! opened shelves fill the list. An active row shows the
-//! workspace, the session's status or age, its title, and its branch; hovering
-//! it swaps the status for Snooze and Settle. A shelf opens from its header
-//! into one-line rows, and hovering one shows its details in a card.
+//! The session list, drawn: one scrolling list of every machine's active
+//! sessions, newest first, then the Snoozed and Settled shelves, held at the
+//! bottom until opened shelves fill the list. An active row shows the
+//! workspace, the session's status or age, its title, its branch, and with
+//! more than one machine, the machine's label; hovering it swaps the status
+//! for Snooze and Settle. A shelf opens from its header into one-line rows,
+//! and hovering one shows its details in a card. The filter beside the
+//! search hides machines or keeps to chosen projects, and the footer says
+//! which machines aren't connected.
 //!
 //! The sidebar collapses to a rail of buttons; see [`rail`].
 //!
@@ -42,11 +45,14 @@ use gpui_kit::{
     MouseButton, ParentElement, Pixels, Rems, Render, ScrollStrategy, SharedString,
     StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
 };
-use rho_ui_core::{Job, SessionId, SessionSummary};
+use rho_ui_core::{Job, SessionSummary};
 
 use crate::{
+    machines::{MachineId, MachineStatus, Machines, Place, SessionKey},
+    projects::Projects,
     session_list::{Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList},
     shelf::{Shelf, Shelves},
+    store::StateDb,
     time,
     title_bar::TOP_ROW_REMS,
     workspaces::{Workspace, Workspaces},
@@ -75,6 +81,10 @@ const SHELVED_PAD_REMS: f32 = 0.5;
 /// A snoozed or settled row's height.
 const SHELVED_ROW_REMS: f32 = TITLE_REMS + 2. * SHELVED_PAD_REMS + 2. * GUTTER_REMS;
 
+/// The most a machine's label takes in a row, so a long one leaves the
+/// title and branch room: about a quarter of the open sidebar's 18 rem.
+const MACHINE_LABEL_REMS: f32 = 5.;
+
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
 
@@ -84,8 +94,10 @@ fn top_row() -> Rems {
     rems(TOP_ROW_REMS)
 }
 
+mod filter;
 mod rail;
 
+pub(crate) use filter::SavedFilter;
 pub(crate) use rail::SidebarLayout;
 use rail::{toggle_button, Layout};
 
@@ -186,15 +198,17 @@ impl ShelfAction {
 pub(crate) enum SidebarEvent {
     /// Open a session. `title` is the saved one, if any.
     Open {
-        id: SessionId,
+        id: SessionKey,
         cwd: PathBuf,
         title: Option<SharedString>,
     },
     NewSession,
     /// Delete a saved session; the user has confirmed.
     Delete {
-        id: SessionId,
+        id: SessionKey,
     },
+    /// Connect to a machine whose connection failed.
+    Retry(MachineId),
     OpenSettings,
     /// Collapse the sidebar to its rail, or open it again; see
     /// [`SidebarView::toggle_collapsed`].
@@ -203,37 +217,59 @@ pub(crate) enum SidebarEvent {
 
 /// The row under the mouse, which shows its actions instead of its status.
 struct Hover {
-    id: SessionId,
+    id: SessionKey,
     /// The snooze button was pressed: show the durations.
     snoozing: bool,
+}
+
+/// What the sidebar remembers between runs, each part loaded from the
+/// state database: settled and snoozed sessions, whether it is collapsed,
+/// and its filter.
+pub(crate) struct SidebarState {
+    pub(crate) shelves: Shelves,
+    pub(crate) layout: SidebarLayout,
+    pub(crate) filter: SavedFilter,
+}
+
+impl SidebarState {
+    pub(crate) fn load(db: &StateDb, now: i64) -> Self {
+        Self {
+            shelves: Shelves::load(db, now),
+            layout: SidebarLayout::load(db),
+            filter: SavedFilter::load(db),
+        }
+    }
 }
 
 pub(crate) struct SidebarView {
     list: SessionList,
     workspaces: Entity<Workspaces>,
+    machines: Entity<Machines>,
+    projects: Entity<Projects>,
     shelves: Shelves,
     layout: SidebarLayout,
-    active: Option<SessionId>,
+    saved_filter: SavedFilter,
+    active: Option<SessionKey>,
     hover: Option<Hover>,
-    error: Option<SharedString>,
-    /// rho's name and version, for the footer.
-    version: Option<SharedString>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
     /// The list's height in the last frame, which the gap above the
     /// shelves fills up to.
     viewport: Pixels,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
     _tick: Task<()>,
 }
 
 impl EventEmitter<SidebarEvent> for SidebarView {}
 
 impl SidebarView {
+    /// The sidebar over `workspaces`, labelling rows from `machines` and
+    /// offering `projects` to filter by, as `state` last left it.
     pub(crate) fn new(
         workspaces: Entity<Workspaces>,
-        shelves: Shelves,
-        layout: SidebarLayout,
+        machines: Entity<Machines>,
+        projects: Entity<Projects>,
+        state: SidebarState,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -248,6 +284,8 @@ impl SidebarView {
             }),
             // Workspace names are searchable.
             cx.observe(&workspaces, |this, _, cx| this.rebuild(cx)),
+            // Labels changed, or a machine came or went.
+            cx.observe(&machines, |_, _, cx| cx.notify()),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -255,15 +293,18 @@ impl SidebarView {
                 break;
             }
         });
+        let mut list = SessionList::default();
+        list.set_filter(state.filter.filter().clone());
         Self {
-            list: SessionList::default(),
+            list,
             workspaces,
-            shelves,
-            layout,
+            machines,
+            projects,
+            shelves: state.shelves,
+            layout: state.layout,
+            saved_filter: state.filter,
             active: None,
             hover: None,
-            error: None,
-            version: None,
             search,
             scroll: VirtualListScrollHandle::new(),
             viewport: Pixels::ZERO,
@@ -272,20 +313,27 @@ impl SidebarView {
         }
     }
 
-    /// Replaces the saved sessions with a fresh `list_sessions` result.
-    pub(crate) fn set_saved(&mut self, sessions: Vec<SessionSummary>, cx: &mut Context<'_, Self>) {
+    /// Replaces `machine`'s saved sessions with a fresh `list_sessions`
+    /// result.
+    pub(crate) fn set_saved(
+        &mut self,
+        machine: &MachineId,
+        sessions: Vec<SessionSummary>,
+        cx: &mut Context<'_, Self>,
+    ) {
         let saved = self.workspaces.update(cx, |workspaces, cx| {
             let saved: Vec<SavedSession> = sessions
                 .into_iter()
                 .map(|session| SavedSession {
-                    workspace: workspaces.index(session.cwd(), cx),
-                    id: session.id().clone(),
+                    workspace: workspaces.index(&Place::new(machine.clone(), session.cwd()), cx),
+                    id: SessionKey::new(machine.clone(), session.id().clone()),
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(|title| title.to_owned().into()),
                     updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
                 })
                 .collect();
             workspaces.set_history(
+                machine,
                 saved
                     .iter()
                     .map(|session| (session.workspace, session.updated)),
@@ -293,23 +341,35 @@ impl SidebarView {
             );
             saved
         });
-        self.list.set_saved(saved);
-        self.error = None;
+        self.list.set_saved(machine, saved);
         self.rebuild(cx);
     }
 
-    pub(crate) fn set_error(&mut self, error: String, cx: &mut Context<'_, Self>) {
-        self.error = Some(error.into());
-        cx.notify();
+    /// Drops everything of `machine`, gone from the settings.
+    pub(crate) fn remove_machine(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        self.list.remove_machine(machine);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.machine == *machine)
+        {
+            self.active = None;
+        }
+        self.rebuild(cx);
     }
 
-    /// Replaces the sessions with work under way in the daemon.
-    pub(crate) fn set_jobs(&mut self, jobs: &[Job], cx: &mut Context<'_, Self>) {
+    /// Replaces the sessions with work under way in `machine`'s daemon.
+    pub(crate) fn set_jobs(
+        &mut self,
+        machine: &MachineId,
+        jobs: &[Job],
+        cx: &mut Context<'_, Self>,
+    ) {
         let jobs = self.workspaces.update(cx, |workspaces, cx| {
             jobs.iter()
                 .map(|job| JobSession {
-                    workspace: workspaces.index(job.cwd(), cx),
-                    id: job.session().clone(),
+                    workspace: workspaces.index(&Place::new(machine.clone(), job.cwd()), cx),
+                    id: SessionKey::new(machine.clone(), job.session().clone()),
                     cwd: job.cwd().to_path_buf(),
                     title: job.title().map(|title| title.to_owned().into()),
                     activity: job.activity(),
@@ -317,59 +377,63 @@ impl SidebarView {
                 })
                 .collect()
         });
-        self.list.set_jobs(jobs, Instant::now(), time::now_unix());
+        self.list
+            .set_jobs(machine, jobs, Instant::now(), time::now_unix());
         self.rebuild(cx);
     }
 
     /// Records an open session's title and activity.
     pub(crate) fn set_live(&mut self, live: LiveSession, cx: &mut Context<'_, Self>) {
+        let place = Place::new(live.id.machine.clone(), live.cwd.clone());
         let workspace = self
             .workspaces
-            .update(cx, |workspaces, cx| workspaces.index(&live.cwd, cx));
+            .update(cx, |workspaces, cx| workspaces.index(&place, cx));
         if self.list.set_live(live, workspace, time::now_unix()) {
             self.rebuild(cx);
         }
     }
 
     /// Forgets an open session's own state, once its view is gone.
-    pub(crate) fn close_live(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+    pub(crate) fn close_live(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         self.list.close_live(id);
         self.rebuild(cx);
     }
 
     /// Marks a session as started or continued here, so it stays active.
-    pub(crate) fn own(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
-        self.shelves.own(id.as_str());
+    pub(crate) fn own(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
+        self.shelves.own(id);
         self.rebuild(cx);
     }
 
     /// Drops a session that was deleted.
-    pub(crate) fn remove(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+    pub(crate) fn remove(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         self.list.remove(id);
-        self.shelves.forget(id.as_str());
+        self.shelves.forget(id);
         if self.active.as_ref() == Some(id) {
             self.active = None;
         }
         self.rebuild(cx);
     }
 
-    /// Forgets every open session and job, once the connection is gone.
-    pub(crate) fn clear_live(&mut self, cx: &mut Context<'_, Self>) {
-        self.list.clear_live();
-        self.active = None;
+    /// Forgets every open session and job of `machine`, once its
+    /// connection is gone.
+    pub(crate) fn clear_live(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        self.list.clear_live(machine);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.machine == *machine)
+        {
+            self.active = None;
+        }
         self.rebuild(cx);
     }
 
-    pub(crate) fn set_active(&mut self, id: Option<SessionId>, cx: &mut Context<'_, Self>) {
+    pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.active != id {
             self.active = id;
             cx.notify();
         }
-    }
-
-    pub(crate) fn set_version(&mut self, version: String, cx: &mut Context<'_, Self>) {
-        self.version = Some(version.into());
-        cx.notify();
     }
 
     /// How wide the app lays the sidebar out.
@@ -396,7 +460,8 @@ impl SidebarView {
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
         let workspaces = self.workspaces.read(cx);
         self.list.rebuild(&self.shelves, time::now_unix(), |ix| {
-            workspaces.get(ix).name.as_ref()
+            let workspace = workspaces.get(ix);
+            (workspace.name.as_ref(), workspace.root_path())
         });
         cx.notify();
     }
@@ -406,7 +471,7 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    fn open(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+    fn open(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         if let Some(row) = self.list.row(id) {
             cx.emit(SidebarEvent::Open {
                 id: row.id.clone(),
@@ -416,19 +481,19 @@ impl SidebarView {
         }
     }
 
-    fn shelve(&mut self, id: &SessionId, action: ShelfAction, cx: &mut Context<'_, Self>) {
+    fn shelve(&mut self, id: &SessionKey, action: ShelfAction, cx: &mut Context<'_, Self>) {
         let now = time::now_unix();
         match action {
-            ShelfAction::Settle => self.shelves.settle(id.as_str(), now),
-            ShelfAction::Snooze(snooze) => self.shelves.snooze(id.as_str(), now + snooze.seconds),
-            ShelfAction::Restore => self.shelves.restore(id.as_str()),
+            ShelfAction::Settle => self.shelves.settle(id, now),
+            ShelfAction::Snooze(snooze) => self.shelves.snooze(id, now + snooze.seconds),
+            ShelfAction::Restore => self.shelves.restore(id),
         }
         // The row moves away from the pointer.
         self.hover = None;
         self.rebuild(cx);
     }
 
-    fn hover(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+    fn hover(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         if self.hover.as_ref().is_none_or(|hover| hover.id != *id) {
             self.hover = Some(Hover {
                 id: id.clone(),
@@ -439,7 +504,7 @@ impl SidebarView {
     }
 
     /// Clears the hover unless another row already took it.
-    fn unhover(&mut self, id: &SessionId, cx: &mut Context<'_, Self>) {
+    fn unhover(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         if self.hover.as_ref().is_some_and(|hover| hover.id == *id) {
             self.hover = None;
             cx.notify();
@@ -529,16 +594,21 @@ impl SidebarView {
         let view = cx.entity().downgrade();
         let cx: &Context<'_, Self> = cx;
         let workspaces = self.workspaces.read(cx);
+        let machines = self.machines.read(cx);
+        // With one machine, a label says nothing.
+        let label = |row: &Row| machines.tag(&row.id.machine);
         self.list.items()[range]
             .iter()
             .map(|&item| match item {
                 Item::Session(row) => {
                     let row = self.list.row_at(row);
-                    self.render_row(row, workspaces.get(row.workspace), clock, &view, cx)
+                    let workspace = workspaces.get(row.workspace);
+                    self.render_row(row, workspace, label(row), clock, &view, cx)
                 }
                 Item::Shelved(row) => {
                     let row = self.list.row_at(row);
-                    self.render_shelved(row, workspaces.get(row.workspace), clock, &view, cx)
+                    let workspace = workspaces.get(row.workspace);
+                    self.render_shelved(row, workspace, label(row), clock, &view, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
                 Item::Gap => div().into_any_element(),
@@ -550,6 +620,7 @@ impl SidebarView {
         &self,
         row: &Row,
         workspace: &Workspace,
+        machine: Option<SharedString>,
         clock: Clock,
         view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
@@ -575,7 +646,11 @@ impl SidebarView {
                     .when(state.active, StyledExt::font_medium)
                     .child(row.title()),
             )
-            .child(branch_line(workspace, theme));
+            .child(branch_line(
+                workspace,
+                machine.map(|label| (format!("{}-machine", row.element_id).into(), label)),
+                theme,
+            ));
         Self::row_frame(rems(ROW_REMS), row, state, inner, view, cx).into_any_element()
     }
 
@@ -645,13 +720,14 @@ impl SidebarView {
         &self,
         row: &Row,
         workspace: &Workspace,
+        machine: Option<SharedString>,
         clock: Clock,
         view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let theme = cx.theme();
         let state = self.row_state(row);
-        let wakes = self.shelves.wakes(row.id.as_str());
+        let wakes = self.shelves.wakes(&row.id);
         let offered = ShelfAction::offered(row.shelf, row.activity);
         let right = if state.hovered && !offered.is_empty() {
             // Icon-only: the row is one line.
@@ -692,6 +768,7 @@ impl SidebarView {
             workspace: workspace.name.clone(),
             initials: workspace.initials.clone(),
             branch: workspace.branch.clone(),
+            machine: machine.clone(),
             wakes: wakes
                 .filter(|_| row.shelf == Shelf::Snoozed)
                 .map(|wakes| format!("Wakes in {}", time::relative_age(wakes - clock.now))),
@@ -716,6 +793,16 @@ impl SidebarView {
                     .text_sm()
                     .child(card.title.clone()),
             )
+            .when_some(machine, |this, machine| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .max_w(rems(MACHINE_LABEL_REMS))
+                        .truncate()
+                        .text_color(theme.muted_foreground)
+                        .child(machine),
+                )
+            })
             .child(
                 div()
                     .flex_shrink_0()
@@ -795,10 +882,17 @@ impl SidebarView {
 
     fn render_list(&self, window: &Window, cx: &mut Context<'_, Self>) -> AnyElement {
         if self.list.is_empty() {
-            let message = if self.list.query().is_empty() {
-                "No sessions yet"
-            } else {
+            let connecting = self
+                .machines
+                .read(cx)
+                .troubles()
+                .any(|(_, status, _)| *status == MachineStatus::Connecting);
+            let message = if !self.list.query().is_empty() || !self.list.filter().is_empty() {
                 "No matching sessions"
+            } else if connecting {
+                "Connecting…"
+            } else {
+                "No sessions yet"
             };
             return Empty::new()
                 .header(EmptyHeader::new().description(EmptyDescription::new().child(message)))
@@ -852,30 +946,90 @@ impl SidebarView {
             .into_any_element()
     }
 
+    /// What isn't right with each machine, then Settings and the local
+    /// rho's version.
     fn render_footer(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let machines = self.machines.read(cx);
+        let version = match machines.status(&MachineId::local()) {
+            Some(MachineStatus::Ready { version }) => Some(version.clone()),
+            _ => None,
+        };
+        let mut troubles: Vec<AnyElement> = Vec::new();
+        for (machine, status, error) in machines.troubles() {
+            let label = machines.label(machine);
+            let on = machines
+                .tag(machine)
+                .map(|_| format!(" on {label}"))
+                .unwrap_or_default();
+            if let Some(error) = error {
+                troubles.push(
+                    div()
+                        .px_2()
+                        .child(
+                            Alert::error(
+                                SharedString::from(format!("sessions-error-{machine}")),
+                                error.clone(),
+                            )
+                            .title(format!("Couldn't load sessions{on}"))
+                            .small(),
+                        )
+                        .into_any_element(),
+                );
+            }
+            match status {
+                MachineStatus::Ready { .. } => {}
+                MachineStatus::Connecting => troubles.push(
+                    h_flex()
+                        .px_3()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(Icon::new(Lucide::CircleDashed).xsmall())
+                        .child(format!("Connecting to {label}…"))
+                        .into_any_element(),
+                ),
+                MachineStatus::Failed(why) => {
+                    let retry = machine.clone();
+                    troubles.push(
+                        v_flex()
+                            .px_2()
+                            .gap_1()
+                            .child(
+                                Alert::error(
+                                    SharedString::from(format!("machine-error-{machine}")),
+                                    why.clone(),
+                                )
+                                .title(format!("Can't reach {label}"))
+                                .small(),
+                            )
+                            .child(
+                                h_flex().justify_end().child(
+                                    Button::new(SharedString::from(format!("retry-{machine}")))
+                                        .outline()
+                                        .xsmall()
+                                        .icon(IconName::RotateCw)
+                                        .label("Retry")
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.emit(SidebarEvent::Retry(retry.clone()));
+                                        })),
+                                ),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
         v_flex()
             .flex_shrink_0()
             .py_2()
             .gap_1()
-            .when_some(self.error.clone(), |this, error| {
-                this.child(
-                    div().px_2().child(
-                        Alert::error("sessions-error", error)
-                            .title("Couldn't load sessions")
-                            .small(),
-                    ),
-                )
-            })
+            .children(troubles)
             .child(
                 // The toggle's inset, so Settings stays put in the rail.
                 h_flex().px_3().gap_2().child(settings_button(cx)).children(
-                    self.version.clone().map(|version| {
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(version)
-                    }),
+                    version.map(|version| div().text_xs().text_color(muted).child(version)),
                 ),
             )
     }
@@ -897,12 +1051,20 @@ impl Render for SidebarView {
         frame
             .child(Self::render_header(cx))
             .child(
-                div().flex_shrink_0().px_2().pb_2().child(
-                    Input::new(&self.search)
-                        .small()
-                        .prefix(Icon::new(IconName::Search).small().text_color(muted))
-                        .cleanable(true),
-                ),
+                h_flex()
+                    .flex_shrink_0()
+                    .px_2()
+                    .pb_2()
+                    .gap_1()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.search)
+                                .small()
+                                .prefix(Icon::new(IconName::Search).small().text_color(muted))
+                                .cleanable(true),
+                        ),
+                    )
+                    .child(filter::button(self, cx)),
             )
             .child(self.render_list(window, cx))
             .child(self.render_footer(cx))
@@ -979,6 +1141,7 @@ struct Card {
     workspace: SharedString,
     initials: SharedString,
     branch: Option<SharedString>,
+    machine: Option<SharedString>,
     wakes: Option<String>,
 }
 
@@ -1004,6 +1167,9 @@ impl Card {
         if let Some(branch) = &self.branch {
             details = details.item(muted(Lucide::GitBranch), branch.clone(), 1);
         }
+        if let Some(machine) = &self.machine {
+            details = details.item(muted(Lucide::Server), machine.clone(), 1);
+        }
         if let Some(wakes) = &self.wakes {
             details = details.item(muted(Lucide::AlarmClock), wakes.clone(), 1);
         }
@@ -1018,8 +1184,14 @@ impl Card {
     }
 }
 
-/// The branch, when the workspace is a git repository.
-fn branch_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
+/// The branch, when the workspace is a git repository, and at the right the
+/// machine's label, when there is more than one machine, as its element ID
+/// and the label.
+fn branch_line(
+    workspace: &Workspace,
+    machine: Option<(SharedString, SharedString)>,
+    theme: &Theme,
+) -> gpui_kit::Div {
     h_flex()
         .h(rems(LINE_REMS))
         .gap_1()
@@ -1029,6 +1201,20 @@ fn branch_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
         .when_some(workspace.branch.clone(), |this, branch| {
             this.child(Icon::new(Lucide::GitBranch).xsmall())
                 .child(div().truncate().child(branch))
+        })
+        .child(div().flex_1())
+        .when_some(machine, |this, (id, label)| {
+            this.child(Icon::new(Lucide::Server).xsmall().flex_shrink_0())
+                .child(
+                    div()
+                        .id(id)
+                        .test_support()
+                        .aria_label(label.clone())
+                        .flex_shrink_0()
+                        .max_w(rems(MACHINE_LABEL_REMS))
+                        .truncate()
+                        .child(label),
+                )
         })
 }
 
@@ -1115,7 +1301,7 @@ fn row_menu(menu: PopupMenu, view: &WeakEntity<SidebarView>, row: &MenuRow) -> P
 
 /// What a row's menu needs, captured when the row is drawn.
 struct MenuRow {
-    id: SessionId,
+    id: SessionKey,
     title: SharedString,
     offered: &'static [ShelfAction],
     /// Busy sessions can't be deleted.

@@ -1,16 +1,19 @@
 //! The project a new session starts in, chosen in the middle of the draft:
-//! a searchable list of the user's [`Projects`], the one used most recently
-//! first, with the draft's project checked. Typing an absolute or `~/` path
-//! offers to add that folder's project, and Add project… asks the desktop
-//! for one. Remove takes a project off the list. Beside Add project…, a
-//! git project offers a new worktree for the session instead of its
-//! checkout; see [`Checkout`].
+//! a searchable list of the user's [`Projects`] on every machine, the one
+//! used most recently first, with the draft's project checked. Typing an
+//! absolute or `~/` path offers to add that folder's project on the machine
+//! the footer names, and on this machine Add project… asks the desktop for
+//! one. A remote machine's folders can't be read from here, so a typed
+//! remote path is added as typed, and the daemon says if it isn't there
+//! when a session opens in it. Remove takes a project off the list. In the
+//! footer, a git project offers a new worktree for the session instead of
+//! its checkout; see [`Checkout`].
 //!
 //! A project's age and the check read [`Workspaces`]: the saved sessions
 //! date each folder, and its repository says which project it is in, so a
 //! session in a worktree counts for its project.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -35,11 +38,12 @@ use gpui_kit::{
 use rho_ui_core::Checkout;
 
 use crate::{
+    machines::{MachineId, Machines, Place},
     projects::Projects,
     repo,
     sidebar::badge,
     time,
-    workspaces::{self, Workspaces},
+    workspaces::{self, Workspace, Workspaces},
 };
 
 /// The search field's height: Kit's medium input is `h_8`, 2 rem, over a
@@ -56,7 +60,7 @@ const MIN_ROWS: u8 = 2;
 /// What the picker tells its draft.
 pub(crate) enum PickerEvent {
     /// The user chose this directory for the new session.
-    Picked(PathBuf),
+    Picked(Place),
     /// The user left the search with Escape: back to the composer.
     Dismissed,
 }
@@ -68,21 +72,29 @@ pub(crate) struct ProjectPicker {
     /// Whether the session works in the project's checkout or in a new
     /// worktree of it, which the daemon adds only as the session starts.
     checkout: Checkout,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 5],
 }
 
 impl EventEmitter<PickerEvent> for ProjectPicker {}
 
 impl ProjectPicker {
-    /// A picker over `projects` with the project of `current` checked.
+    /// A picker over `projects` on `machines` with the project of
+    /// `current` checked.
     pub(crate) fn new(
         workspaces: &Entity<Workspaces>,
         projects: &Entity<Projects>,
-        current: PathBuf,
+        machines: &Entity<Machines>,
+        current: Place,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let delegate = ProjectList::new(workspaces.clone(), projects.clone(), current, cx);
+        let delegate = ProjectList::new(
+            workspaces.clone(),
+            projects.clone(),
+            machines.clone(),
+            current,
+            cx,
+        );
         let list = cx.new(|cx| ListState::new(delegate, window, cx).searchable(true));
         let search = list.read(cx).focus_handle(cx);
         let subscriptions = [
@@ -105,6 +117,10 @@ impl ProjectPicker {
             // Another draft, or this one, added or removed a project.
             cx.observe_in(projects, window, |this, _, window, cx| {
                 this.relist(window, cx, |list, cx| list.sync(cx));
+            }),
+            // A machine came, went or was renamed.
+            cx.observe_in(machines, window, |this, _, window, cx| {
+                this.relist(window, cx, |list, cx| list.refilter(cx));
             }),
             // The keyboard's row shows only while the keyboard is here, so
             // it never looks like a second choice next to the check: Escape
@@ -142,7 +158,7 @@ impl ProjectPicker {
         let list = self.list.read(cx).delegate();
         let workspaces = list.workspaces.read(cx);
         workspaces
-            .find(&[list.current.as_path()])
+            .find(&[&list.current])
             .is_some_and(|ix| workspaces.get(ix).branch.is_some())
     }
 
@@ -189,6 +205,54 @@ impl ProjectPicker {
             })
     }
 
+    /// With more than one machine, the button naming the machine a typed
+    /// path is added on, with a menu to choose another.
+    fn render_machine(&self, cx: &mut Context<'_, Self>) -> Option<impl IntoElement> {
+        let list = self.list.read(cx).delegate();
+        let machines = list.machines.read(cx);
+        if !machines.several() {
+            return None;
+        }
+        let current = list.adding_on.clone();
+        let choices: Vec<(MachineId, SharedString)> = machines
+            .iter()
+            .map(|machine| (machine.id.clone(), machine.label.clone()))
+            .collect();
+        let view = self.list.downgrade();
+        Some(
+            Button::new("project-machine")
+                .ghost()
+                .small()
+                .flex_shrink_0()
+                .icon(
+                    Icon::new(gpui_kit::assets::IconName::Server)
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .label(machines.label(&current))
+                .accessibility_label("Machine")
+                .tooltip("The machine a typed path is on")
+                .dropdown_caret(true)
+                .dropdown_menu(move |menu, _, _| {
+                    choices.iter().fold(menu, |menu, (machine, label)| {
+                        let (view, machine) = (view.clone(), machine.clone());
+                        menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .checked(machine == current)
+                                .on_click(move |_, window, cx| {
+                                    let _ = view.update(cx, |list, cx| {
+                                        list.delegate_mut().adding_on = machine.clone();
+                                        let query = list.delegate().query.clone();
+                                        // Look the typed path up again there.
+                                        list.set_query(&query, window, cx);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    })
+                }),
+        )
+    }
+
     /// Lists the projects again with `change`, keeping the keyboard on the
     /// project it was on: `ListState` keeps the selection as a row number,
     /// which a new order would hand to another project.
@@ -212,15 +276,17 @@ impl ProjectPicker {
     }
 
     /// Checks the project of `cwd`, as the draft moved there, and clears
-    /// the search.
+    /// the search. Typed paths now go to its machine.
     pub(crate) fn set_current(
         &mut self,
-        cwd: PathBuf,
+        cwd: Place,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         self.list.update(cx, |list, cx| {
-            list.delegate_mut().current = cwd;
+            let delegate = list.delegate_mut();
+            delegate.adding_on = cwd.machine.clone();
+            delegate.current = cwd;
             list.set_query("", window, cx);
             cx.notify();
         });
@@ -248,7 +314,7 @@ impl ProjectPicker {
     fn pick(&mut self, ix: IndexPath, cx: &mut Context<'_, Self>) {
         let list = self.list.read(cx).delegate();
         let root = match list.rows.get(ix.row) {
-            Some(Row::Project(ix)) => list.workspaces.read(cx).get(*ix).cwd().to_path_buf(),
+            Some(Row::Project(ix)) => list.workspaces.read(cx).get(*ix).place().clone(),
             Some(Row::Add(folder)) => {
                 let root = folder.root.clone();
                 add(&self.projects, root.clone(), cx);
@@ -286,7 +352,7 @@ impl ProjectPicker {
             let Some(folder) = folder else { return };
             let root = cx
                 .background_executor()
-                .spawn(async move { repo::inspect(&folder).root })
+                .spawn(async move { Place::new(MachineId::local(), repo::inspect(&folder).root) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 add(&this.projects, root.clone(), cx);
@@ -306,16 +372,20 @@ impl ProjectPicker {
         let delegate = list.delegate();
         Some(match delegate.rows.get(list.selected_index()?.row)? {
             Row::Project(ix) => {
-                let cwd = delegate.workspaces.read(cx).get(*ix).cwd().display();
-                format!("project-{cwd}")
+                element_id(delegate.workspaces.read(cx).get(*ix).place()).to_string()
             }
             Row::Add(_) => "project-typed".to_owned(),
         })
     }
 }
 
+/// A project row's element ID: `project-<machine>:<path>`.
+fn element_id(place: &Place) -> SharedString {
+    format!("project-{}:{}", place.machine, place.path.display()).into()
+}
+
 /// Adds `root` to the user's projects.
-fn add(projects: &Entity<Projects>, root: PathBuf, cx: &mut App) {
+fn add(projects: &Entity<Projects>, root: Place, cx: &mut App) {
     projects.update(cx, |projects, cx| {
         if projects.add(root) {
             cx.notify();
@@ -324,7 +394,7 @@ fn add(projects: &Entity<Projects>, root: PathBuf, cx: &mut App) {
 }
 
 /// Takes `root` off the user's projects.
-fn remove(projects: &Entity<Projects>, root: &Path, cx: &mut App) {
+fn remove(projects: &Entity<Projects>, root: &Place, cx: &mut App) {
     projects.update(cx, |projects, cx| {
         if projects.remove(root) {
             cx.notify();
@@ -339,6 +409,8 @@ impl Render for ProjectPicker {
         // Sized by every project, not the matches, so it holds still while
         // the search narrows it.
         let total = self.list.read(cx).delegate().known.len();
+        // The desktop's folder chooser shows this machine's folders.
+        let adding_locally = self.list.read(cx).delegate().adding_on.is_local();
         let rows = f32::from(
             u8::try_from(total)
                 .unwrap_or(u8::MAX)
@@ -373,12 +445,24 @@ impl Render for ProjectPicker {
                     .justify_between()
                     .gap_1()
                     .child(
-                        Button::new("project-add")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Plus).text_color(muted))
-                            .label("Add project…")
-                            .on_click(cx.listener(|_, _, window, cx| Self::browse(window, cx))),
+                        h_flex()
+                            .gap_1()
+                            .min_w_0()
+                            .children(self.render_machine(cx))
+                            .child(
+                                Button::new("project-add")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(IconName::Plus).text_color(muted))
+                                    .label("Add project…")
+                                    .disabled(!adding_locally)
+                                    .when(!adding_locally, |this| {
+                                        this.tooltip("Type the folder's path on the remote machine")
+                                    })
+                                    .on_click(
+                                        cx.listener(|_, _, window, cx| Self::browse(window, cx)),
+                                    ),
+                            ),
                     )
                     .child(self.render_checkout(cx)),
             )
@@ -389,7 +473,7 @@ impl Render for ProjectPicker {
 #[derive(Clone, PartialEq)]
 struct Folder {
     /// Its project's folder; see [`repo::Repo::root`].
-    root: PathBuf,
+    root: Place,
     /// The project's path, with the home directory as `~`.
     shown: SharedString,
 }
@@ -408,10 +492,13 @@ enum Row {
 struct ProjectList {
     workspaces: Entity<Workspaces>,
     projects: Entity<Projects>,
+    machines: Entity<Machines>,
     /// Each project's index in the workspaces, in the order added.
     known: Vec<usize>,
     /// The draft's directory, whose project is checked.
-    current: PathBuf,
+    current: Place,
+    /// The machine a typed path names a folder on.
+    adding_on: MachineId,
     /// The draft's project, if it is on the list.
     checked: Option<usize>,
     /// The project under the mouse, which shows Remove instead of its age.
@@ -431,13 +518,16 @@ impl ProjectList {
     fn new(
         workspaces: Entity<Workspaces>,
         projects: Entity<Projects>,
-        current: PathBuf,
+        machines: Entity<Machines>,
+        current: Place,
         cx: &mut App,
     ) -> Self {
         let mut list = Self {
             workspaces,
             projects,
+            machines,
             known: Vec::new(),
+            adding_on: current.machine.clone(),
             current,
             checked: None,
             hovered: None,
@@ -475,18 +565,19 @@ impl ProjectList {
     fn refilter(&mut self, cx: &App) {
         let workspaces = self.workspaces.read(cx);
         let current = workspaces
-            .find(&[self.current.as_path()])
-            .map_or(self.current.as_path(), |ix| workspaces.get(ix).root());
+            .find(&[&self.current])
+            .map_or_else(|| self.current.clone(), |ix| workspaces.get(ix).root());
         self.checked = self
             .known
             .iter()
             .copied()
-            .find(|&ix| workspaces.get(ix).cwd() == current);
+            .find(|&ix| *workspaces.get(ix).place() == current);
         self.last_used = self
             .known
             .iter()
-            .map(|&ix| (ix, workspaces.last_used_in(workspaces.get(ix).cwd())))
+            .map(|&ix| (ix, workspaces.last_used_in(workspaces.get(ix).place())))
             .collect();
+        let machines = self.machines.read(cx);
         let mut order = self.last_used.clone();
         order.sort_by(|&(a, a_used), &(b, b_used)| {
             let (a, b) = (workspaces.get(a), workspaces.get(b));
@@ -512,7 +603,10 @@ impl ProjectList {
                         let workspace = workspaces.get(ix);
                         Some(ix) != found_ix
                             && (workspace.name.to_lowercase().contains(&query)
-                                || workspace.path.to_lowercase().contains(&query))
+                                || workspace.path.to_lowercase().contains(&query)
+                                || machines
+                                    .tag(workspace.machine())
+                                    .is_some_and(|tag| tag.to_lowercase().contains(&query)))
                     })
                     .map(Row::Project),
             )
@@ -533,20 +627,9 @@ impl ProjectList {
     fn project_item(&self, ix: usize, cx: &mut Context<'_, ListState<Self>>) -> ListItem {
         let workspace = self.workspaces.read(cx).get(ix);
         let checked = self.checked == Some(ix);
-        let path = h_flex()
-            .gap_1()
-            .min_w_0()
-            .child(div().truncate().child(workspace.path.clone()))
-            .when_some(workspace.branch.clone(), |this, branch| {
-                this.child(
-                    Icon::new(gpui_kit::assets::IconName::GitBranch)
-                        .xsmall()
-                        .ml_1()
-                        .flex_shrink_0(),
-                )
-                .child(div().truncate().child(branch))
-            });
-        let root = workspace.cwd().to_path_buf();
+        let machines = self.machines.read(cx);
+        let path = path_line(workspace, machines.tag(workspace.machine()));
+        let root = workspace.place().clone();
         let trailing = if self.hovered == Some(ix) {
             let (projects, root) = (self.projects.clone(), root.clone());
             div()
@@ -583,7 +666,7 @@ impl ProjectList {
                     .text_color(cx.theme().muted_foreground),
             )
         });
-        ListItem::new(SharedString::from(format!("project-{}", root.display())))
+        ListItem::new(element_id(&root))
             .accessibility_label(workspace.name.clone())
             .aria_toggled(if checked {
                 Toggled::True
@@ -650,10 +733,14 @@ impl ListDelegate for ProjectList {
         query.clone_into(&mut self.query);
         self.found = None;
         self.refilter(cx);
-        let path = workspaces::typed_path(query, workspaces::home().as_deref());
+        let machine = self.adding_on.clone();
+        let home = self.workspaces.read(cx).home(&machine);
+        let path = workspaces::typed_path(query, home.as_deref());
         cx.spawn_in(window, async move |list, cx| {
             let checked = match path {
-                Some(path) => {
+                // This machine's folders are read: the folder must exist,
+                // and a git repository's project is its main checkout.
+                Some(path) if machine.is_local() => {
                     cx.background_executor()
                         .spawn(async move {
                             // The project file may hold the typed or the
@@ -663,21 +750,24 @@ impl ListDelegate for ProjectList {
                         })
                         .await
                 }
+                // Another machine's can't be: the path is taken as typed.
+                Some(path) => Some((path.clone(), path)),
                 None => None,
             };
             let _ = list.update_in(cx, |list, window, cx| {
                 if let Some((typed, resolved)) = checked {
                     let this = list.delegate_mut();
                     let workspaces = this.workspaces.read(cx);
+                    let typed = Place::new(machine.clone(), typed);
+                    let resolved = Place::new(machine.clone(), resolved);
                     let known = this.known.iter().copied().find(|&ix| {
-                        let cwd = workspaces.get(ix).cwd();
-                        cwd == typed || cwd == resolved
+                        let place = workspaces.get(ix).place();
+                        *place == typed || *place == resolved
                     });
                     this.found = Some(match known {
                         Some(ix) => Row::Project(ix),
                         None => Row::Add(Folder {
-                            shown: workspaces::tilde(&resolved, workspaces::home().as_deref())
-                                .into(),
+                            shown: workspaces::tilde(&resolved.path, home.as_deref()).into(),
                             root: resolved,
                         }),
                     });
@@ -710,7 +800,7 @@ impl ListDelegate for ProjectList {
                 .accessibility_label(folder.shown.clone())
                 .child(row(
                     folder_tile(cx).into_any_element(),
-                    format!("Add {}", folder_name(&folder.root)).into(),
+                    format!("Add {}", folder_name(&folder.root.path)).into(),
                     div().child(folder.shown.clone()),
                     cx,
                 )),
@@ -754,6 +844,34 @@ impl ListDelegate for ProjectList {
     ) {
         // ListState keeps the selection; rows read it when it renders them.
     }
+}
+
+/// Under a project's name: its machine, with more than one, its path, and
+/// its branch.
+fn path_line(workspace: &Workspace, machine: Option<SharedString>) -> Div {
+    let server = || {
+        Icon::new(gpui_kit::assets::IconName::Server)
+            .xsmall()
+            .flex_shrink_0()
+    };
+    h_flex()
+        .gap_1()
+        .min_w_0()
+        .when_some(machine, |this, machine| {
+            this.child(server())
+                .child(div().flex_shrink_0().child(machine))
+                .child(div().flex_shrink_0().child("·"))
+        })
+        .child(div().truncate().child(workspace.path.clone()))
+        .when_some(workspace.branch.clone(), |this, branch| {
+            this.child(
+                Icon::new(gpui_kit::assets::IconName::GitBranch)
+                    .xsmall()
+                    .ml_1()
+                    .flex_shrink_0(),
+            )
+            .child(div().truncate().child(branch))
+        })
 }
 
 /// One two-line row: a tile, the name, and under it the path. Callers add
