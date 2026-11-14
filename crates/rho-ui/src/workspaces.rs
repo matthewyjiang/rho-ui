@@ -155,6 +155,11 @@ struct Remote {
 pub(crate) struct Workspaces {
     list: Vec<Workspace>,
     remotes: Vec<Remote>,
+    /// Workspaces [`Self::index`] added this effect cycle, read together
+    /// at its end: a session list of a remote machine names many at once,
+    /// and reading each alone would open an ssh session per workspace,
+    /// past the 10 that sshd's default `MaxSessions` allows on a master.
+    unread: Vec<usize>,
     _reread: Task<()>,
 }
 
@@ -170,6 +175,7 @@ impl Workspaces {
         Self {
             list: Vec::new(),
             remotes: Vec::new(),
+            unread: Vec::new(),
             _reread: reread,
         }
     }
@@ -229,7 +235,8 @@ impl Workspaces {
     }
 
     /// The index for `cwd`. A new one shows its folder name until its
-    /// repository has been read in the background.
+    /// repository has been read in the background, with the others new
+    /// this effect cycle.
     pub(crate) fn index(&mut self, cwd: &Place, cx: &mut Context<'_, Self>) -> usize {
         if let Some(ix) = self
             .list
@@ -245,7 +252,16 @@ impl Workspaces {
             home.as_deref(),
         ));
         let ix = self.list.len() - 1;
-        self.read(vec![ix], cx);
+        if self.unread.is_empty() {
+            let this = cx.weak_entity();
+            cx.defer(move |cx| {
+                let _ = this.update(cx, |this, cx| {
+                    let unread = std::mem::take(&mut this.unread);
+                    this.read(unread, cx);
+                });
+            });
+        }
+        self.unread.push(ix);
         ix
     }
 

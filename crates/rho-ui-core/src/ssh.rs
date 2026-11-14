@@ -214,10 +214,16 @@ impl SshLink {
         command
     }
 
-    /// `ssh` that rides the master and never becomes one.
+    /// `ssh` that rides the master and never becomes one, nor connects on
+    /// its own. When the master refuses a session, as at sshd's
+    /// `MaxSessions` (10 by default), ssh would otherwise make a connection
+    /// of its own, which may ask the user's key agent for an approval and
+    /// counts against sshd's `MaxStartups`. `ProxyCommand=false` makes that
+    /// connection fail at once, before it reaches the network; the master
+    /// ignores it.
     fn multiplexed(&self) -> Command {
         let mut command = self.command();
-        command.args(["-o", "ControlMaster=no"]);
+        command.args(["-o", "ControlMaster=no", "-o", "ProxyCommand=false"]);
         command
     }
 
