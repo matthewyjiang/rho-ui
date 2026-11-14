@@ -9,6 +9,7 @@ mod attachments;
 mod background;
 mod background_log;
 mod badge;
+mod cloning;
 mod composer;
 mod draft;
 mod figures;
@@ -83,6 +84,7 @@ gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
         GitBranch,
+        Download,
         AlarmClock,
         Archive,
         SquarePen,

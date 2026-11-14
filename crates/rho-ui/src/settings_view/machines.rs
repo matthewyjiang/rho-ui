@@ -1,6 +1,6 @@
-//! The Machines page: this machine's name, then each remote machine rho-ui
-//! reaches over SSH, with its name, the `rho` it runs there, and Remove,
-//! then a field to add one. Adding a machine connects to it at once;
+//! The Machines page: this machine's name and clone folder, then each
+//! remote machine rho-ui reaches over SSH, with its name, the `rho` it runs
+//! there, its clone folder, and Remove, then a field to add one. Adding a machine connects to it at once;
 //! removing one drops its sessions from the sidebar, and they stay on the
 //! machine.
 
@@ -35,14 +35,19 @@ pub(super) struct MachineFields {
 }
 
 /// One remote machine's fields. Its name shows the host while empty and
-/// applies as typed; its `rho` program applies on Enter or when it loses
-/// the keyboard, as a change reconnects to the machine.
+/// applies as typed, as does its clone folder; its `rho` program applies
+/// on Enter or when it loses the keyboard, as a change reconnects to the
+/// machine.
 struct RemoteFields {
     host: String,
     name: Entity<InputState>,
     rho: Entity<InputState>,
-    _subscriptions: [Subscription; 2],
+    clone_folder: Entity<InputState>,
+    _subscriptions: [Subscription; 3],
 }
+
+/// What an empty clone folder means, on any machine.
+const DEFAULT_CLONE_FOLDER: &str = "$RHO_HOME/projects";
 
 impl MachineFields {
     pub(super) fn new(window: &mut Window, cx: &mut Context<'_, SettingsView>) -> Self {
@@ -121,8 +126,14 @@ impl SettingsView {
                     .placeholder(DEFAULT_REMOTE_RHO)
                     .default_value(machine.rho.clone())
             });
+            let clone_folder = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(DEFAULT_CLONE_FOLDER)
+                    .default_value(machine.clone_folder.clone())
+            });
             let name_host = machine.host.clone();
             let rho_host = machine.host.clone();
+            let folder_host = machine.host.clone();
             let subscriptions = [
                 cx.subscribe_in(&name, window, move |_, input, event: &InputEvent, _, cx| {
                     if matches!(event, InputEvent::Change) {
@@ -136,11 +147,22 @@ impl SettingsView {
                         set_rho(&rho_host, rho, cx);
                     }
                 }),
+                cx.subscribe_in(
+                    &clone_folder,
+                    window,
+                    move |_, input, event: &InputEvent, _, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            let folder = input.read(cx).value().trim().to_owned();
+                            set_clone_folder(&folder_host, folder, cx);
+                        }
+                    },
+                ),
             ];
             self.machines.remote.push(RemoteFields {
                 host: machine.host,
                 name,
                 rho,
+                clone_folder,
                 _subscriptions: subscriptions,
             });
         }
@@ -148,24 +170,40 @@ impl SettingsView {
 
     /// The Machines page.
     pub(super) fn machines_page(&self, cx: &mut Context<'_, Self>) -> SettingPage {
-        let this_machine = SettingGroup::new().title("This machine").item(
-            SettingItem::new(
-                "Name",
-                SettingField::input(
-                    |cx: &App| cx.global::<Settings>().local_label.clone(),
-                    |label: SharedString, cx: &mut App| {
-                        let label = if label.trim().is_empty() {
-                            crate::machines::LOCAL.into()
-                        } else {
-                            label
-                        };
-                        update(cx, |settings| settings.local_label = label);
-                    },
+        let this_machine = SettingGroup::new()
+            .title("This machine")
+            .item(
+                SettingItem::new(
+                    "Name",
+                    SettingField::input(
+                        |cx: &App| cx.global::<Settings>().local_label.clone(),
+                        |label: SharedString, cx: &mut App| {
+                            let label = if label.trim().is_empty() {
+                                crate::machines::LOCAL.into()
+                            } else {
+                                label
+                            };
+                            update(cx, |settings| settings.local_label = label);
+                        },
+                    )
+                    .w(rems(CONTROL_REMS)),
                 )
-                .w(rems(CONTROL_REMS)),
+                .description("Shown in the sidebar."),
             )
-            .description("Shown in the sidebar."),
-        );
+            .item(
+                SettingItem::new(
+                    "Clone folder",
+                    SettingField::input(
+                        |cx: &App| cx.global::<Settings>().local_clone_folder.clone().into(),
+                        |folder: SharedString, cx: &mut App| {
+                            let folder = folder.trim().to_owned();
+                            update(cx, |settings| settings.local_clone_folder = folder);
+                        },
+                    )
+                    .w(rems(CONTROL_REMS)),
+                )
+                .description(CLONE_FOLDER_NOTE),
+            );
         let remote = self
             .machines
             .remote
@@ -256,6 +294,10 @@ fn machine_group(fields: &RemoteFields) -> SettingGroup {
                 .description("Use an absolute path if ssh can't find rho."),
         )
         .item(
+            SettingItem::new("Clone folder", input(&fields.clone_folder))
+                .description(CLONE_FOLDER_NOTE),
+        )
+        .item(
             SettingItem::new(
                 "Remove machine",
                 SettingField::render(move |options, _, _| {
@@ -274,6 +316,26 @@ fn machine_group(fields: &RemoteFields) -> SettingGroup {
             )
             .description(format!("Its sessions stay on {host}.")),
         )
+}
+
+/// What a clone folder field says under it.
+const CLONE_FOLDER_NOTE: &str =
+    "Where the project list clones repositories. Empty uses $RHO_HOME/projects.";
+
+/// Sets the clone folder of the machine at `host`.
+fn set_clone_folder(host: &str, folder: String, cx: &mut App) {
+    let unchanged = cx
+        .global::<Settings>()
+        .machine(host)
+        .is_some_and(|machine| machine.clone_folder == folder);
+    if unchanged {
+        return;
+    }
+    update(cx, |settings| {
+        if let Some(machine) = settings.machine_mut(host) {
+            machine.clone_folder = folder;
+        }
+    });
 }
 
 /// Sets the label of the machine at `host`; empty shows the host.

@@ -2821,6 +2821,72 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A git URL in the project search offers to clone it: the footer's Add
+/// project… turns into Clone, and Enter clones the repository into this
+/// machine's clone folder, adds the clone to the projects, and starts the
+/// draft there.
+#[test]
+fn a_typed_git_url_clones_into_the_clone_folder() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let dir = dir.path().canonicalize().expect("it resolves");
+    for args in [
+        &["init", "-q", "-b", "main", "thing"][..],
+        &["-C", "thing", "commit", "-q", "--allow-empty", "-m", "x"],
+    ] {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+    let folder = dir.join("clones");
+    let mut settings = Settings::default();
+    settings.local_clone_folder = folder.display().to_string();
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "clone",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::default(),
+            projects: Projects::of(["/w/a"]),
+            settings,
+            remote_sockets: Vec::new(),
+        },
+    );
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    ui.act(|window, cx| window.press("ctrl-shift-n", cx));
+    ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
+    let url = format!("file://{}/thing", dir.display());
+    ui.act(|window, cx| window.input(&url, cx));
+    ui.wait_until("Clone, selected, in the footer too", |window, cx, app| {
+        is_visible(window, "project-clone")
+            && !is_visible(window, "project-add")
+            && selected_project(cx, app).as_deref() == Some("project-clone-url")
+    });
+    ui.shot("offered");
+    ui.act(|window, cx| window.press("enter", cx));
+    let clone = folder.join("thing");
+    ui.wait_until("the draft in the clone", draft_in(&clone));
+    assert!(clone.join(".git").is_dir(), "git cloned it");
+    ui.cx.update(|cx| {
+        let projects = ui.app.read(cx).projects(cx).to_vec();
+        assert_eq!(projects, [Place::local("/w/a"), Place::local(&clone)]);
+    });
+}
+
 /// In a git project, the project list offers a new worktree, made only
 /// when the first message goes: switching to New worktree and back makes
 /// none and keeps the draft's session, and a folder git doesn't track goes

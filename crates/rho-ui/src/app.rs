@@ -71,11 +71,13 @@ impl LaunchConfig {
             id: MachineId::local(),
             label: settings.local_label.clone(),
             target: self.daemon.clone(),
+            clone_folder: settings.local_clone_folder.clone().into(),
         };
         let remote = settings.machines.iter().map(|remote| Machine {
             id: remote.id(),
             label: remote.shown_label().to_owned().into(),
             target: (self.remote)(remote),
+            clone_folder: remote.clone_folder.clone().into(),
         });
         std::iter::once(local).chain(remote).collect()
     }

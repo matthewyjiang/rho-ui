@@ -4,13 +4,16 @@
 //! footer chooses the machine the session runs on, and the list shows each
 //! project's checkout there: a project is one repository, whichever
 //! machines hold a checkout of it and whatever branch each is on. A project
-//! with no checkout on that machine shows dimmed; choosing it looks for its
-//! folder there. Switching machines moves the draft to its project's
+//! with no checkout on that machine offers to clone it there, from its
+//! origin remote, into that machine's clone folder (see [`cloning`]); one
+//! outside git shows dimmed, and choosing it looks for its folder there. Switching machines moves the draft to its project's
 //! checkout on the new one, else to that machine's home folder, so the
 //! footer always names where the session runs. Which checkouts are one
 //! project is [`crate::workspaces::Workspace::project_key`]'s to say.
 //!
-//! Typing an absolute or `~/` path browses that machine's folders: the
+//! A git URL typed in the search offers to clone that repository, unless
+//! the machine holds it already. Typing an absolute or `~/` path browses
+//! that machine's folders: the
 //! subfolders the path can go on to are listed, and a folder that is there
 //! offers to add its project. Add project… asks the desktop for a folder on
 //! this machine, and starts the search at `~/` on a remote one, whose
@@ -33,6 +36,8 @@ use gpui_kit::component::{
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     separator::Separator,
+    spinner::Spinner,
+    tag::Tag,
     v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _,
     WindowExt as _,
 };
@@ -48,6 +53,7 @@ use rho_ui_core::Checkout;
 
 use crate::{
     badge::Badge,
+    cloning::{self, Source},
     folders::{self, Reader, Typed},
     machines::{MachineId, MachineStatus, Machines, Place},
     projects::Projects,
@@ -362,13 +368,109 @@ impl ProjectPicker {
                 return;
             }
             Some(Row::Elsewhere(ix)) => {
-                let path = list.workspaces.read(cx).get(ix).path.clone();
-                self.search(&path, window, cx);
+                let workspace = list.workspaces.read(cx).get(ix);
+                if let Some(source) = workspace.origin().and_then(Source::new) {
+                    self.clone_repo(source, window, cx);
+                } else {
+                    let path = workspace.path.clone();
+                    self.search(&path, window, cx);
+                }
+                return;
+            }
+            Some(Row::Clone(source)) => {
+                self.clone_repo(source, window, cx);
                 return;
             }
             Some(Row::Unread(_)) | None => return,
         };
         cx.emit(PickerEvent::Picked(root));
+    }
+
+    /// Clones `source` into the draft's machine's clone folder, then adds
+    /// the clone to the projects and starts the session there. One clone
+    /// at a time; a failure says git's or ssh's words.
+    fn clone_repo(&mut self, source: Source, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let list = self.list.read(cx).delegate();
+        if list.cloning.is_some() {
+            return;
+        }
+        let machine = list.current.machine.clone();
+        let reader = list.reader(cx);
+        let folder = list.machines.read(cx).clone_folder(&machine).to_string();
+        let executor = cx.background_executor().clone();
+        self.set_cloning(Some(source.url.clone()), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let cloned = cloning::clone(reader, source.clone(), folder, executor).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.set_cloning(None, cx);
+                match cloned {
+                    Ok(path) => {
+                        let root = Place::new(machine, path);
+                        add(&this.projects, root.clone(), cx);
+                        cx.emit(PickerEvent::Picked(root));
+                    }
+                    Err(why) => window.push_notification(
+                        Notification::error(why).title(format!("Couldn't clone {}", source.name)),
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_cloning(&mut self, url: Option<String>, cx: &mut Context<'_, Self>) {
+        self.list.update(cx, |list, cx| {
+            list.delegate_mut().cloning = url;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// The repository a URL in the search names, if the list offers to
+    /// clone it.
+    fn typed_source(&self, cx: &App) -> Option<Source> {
+        self.list
+            .read(cx)
+            .delegate()
+            .found
+            .iter()
+            .find_map(|row| match row {
+                Row::Clone(source) => Some(source.clone()),
+                _ => None,
+            })
+    }
+
+    /// The footer's button: Clone while the search holds a git URL to
+    /// clone, else Add project….
+    fn render_add(&self, cx: &mut Context<'_, Self>) -> Button {
+        let muted = cx.theme().muted_foreground;
+        let Some(source) = self.typed_source(cx) else {
+            return Button::new("project-add")
+                .ghost()
+                .small()
+                .icon(Icon::new(IconName::Plus).text_color(muted))
+                .label("Add project…")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.add_project(window, cx);
+                }));
+        };
+        let cloning = self.list.read(cx).delegate().cloning.is_some();
+        let label = if cloning {
+            format!("Cloning {}…", source.folder())
+        } else {
+            format!("Clone {}", source.folder())
+        };
+        Button::new("project-clone")
+            .primary()
+            .small()
+            .icon(Icon::new(gpui_kit::assets::IconName::Download))
+            .label(label)
+            .loading(cloning)
+            .disabled(cloning)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.clone_repo(source.clone(), window, cx);
+            }))
     }
 
     /// Adds a project on the chosen machine: from the desktop's folder
@@ -436,6 +538,7 @@ impl ProjectPicker {
             Row::Add(_) => "project-typed".to_owned(),
             Row::Next(folder) => next_id(&folder.root).to_string(),
             Row::Unread(_) => "project-unread".to_owned(),
+            Row::Clone(_) => "project-clone-url".to_owned(),
         })
     }
 }
@@ -481,7 +584,6 @@ fn remove(projects: &Entity<Projects>, root: &Place, cx: &mut App) {
 
 impl Render for ProjectPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
         let rem = window.rem_size();
         // Sized by every project, not the matches, so it holds still while
         // the search narrows it; browsing folders can grow it.
@@ -525,16 +627,7 @@ impl Render for ProjectPicker {
                             .gap_1()
                             .min_w_0()
                             .children(self.render_machine(cx))
-                            .child(
-                                Button::new("project-add")
-                                    .ghost()
-                                    .small()
-                                    .icon(Icon::new(IconName::Plus).text_color(muted))
-                                    .label("Add project…")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_project(window, cx);
-                                    })),
-                            ),
+                            .child(self.render_add(cx)),
                     )
                     .child(self.render_checkout(cx)),
             )
@@ -566,6 +659,8 @@ enum Row {
     Next(Folder),
     /// Why the draft's machine's folders couldn't be read.
     Unread(SharedString),
+    /// A repository a git URL in the search names, to clone.
+    Clone(Source),
 }
 
 /// The projects for a searchable [`List`]: what a typed path names, if
@@ -592,6 +687,8 @@ struct ProjectList {
     rows: Vec<Row>,
     /// How many rows an empty search lists.
     listed: usize,
+    /// The URL of the repository being cloned.
+    cloning: Option<String>,
     /// Unix seconds of each listed project's newest session, by workspace
     /// index; 0 with none.
     last_used: Vec<(usize, i64)>,
@@ -619,6 +716,7 @@ impl ProjectList {
             found: Vec::new(),
             rows: Vec::new(),
             listed: 0,
+            cloning: None,
             last_used: Vec::new(),
             now: 0,
         };
@@ -641,6 +739,36 @@ impl ProjectList {
         self.found
             .retain(|row| !matches!(row, Row::Project(ix) if !known.contains(ix)));
         self.refilter(cx);
+    }
+
+    /// What a row that clones `url` shows on its right: Clone to the
+    /// draft's machine, or while it clones, a spinner.
+    fn clone_tag(&self, url: &str, cx: &App) -> Tag {
+        let tag = Tag::secondary().small().flex_shrink_0();
+        let content = if self.cloning.as_deref() == Some(url) {
+            h_flex()
+                .gap_1()
+                .child(Spinner::new().xsmall())
+                .child("Cloning…")
+        } else {
+            let machine = self.machines.read(cx).label(&self.current.machine);
+            h_flex()
+                .gap_1()
+                .child(Icon::new(gpui_kit::assets::IconName::Download).xsmall())
+                .child(format!("Clone to {machine}"))
+        };
+        tag.child(content)
+    }
+
+    /// How the draft's machine's folders are read.
+    fn reader(&self, cx: &App) -> Reader {
+        let machine = &self.current.machine;
+        if machine.is_local() {
+            Reader::Here
+        } else {
+            let ssh = self.workspaces.read(cx).ssh(machine);
+            ssh.map_or(Reader::Unread, Reader::There)
+        }
     }
 
     /// Unix seconds of the newest session in the project at `ix`; 0 with
@@ -826,11 +954,22 @@ impl ProjectList {
             )
     }
 
-    /// A project with no checkout on the chosen machine, dimmed, under its
-    /// name the machine and path of its checkout `ix`.
+    /// A project with no checkout on the draft's machine, under its name
+    /// the machine and path of its checkout `ix`: with Clone to its machine
+    /// for a repository with an origin, else dimmed.
     fn elsewhere_item(&self, ix: usize, cx: &App) -> ListItem {
         let workspace = self.workspaces.read(cx).get(ix);
         let machines = self.machines.read(cx);
+        let here = machines.label(&self.current.machine);
+        let trailing = match workspace.origin() {
+            Some(origin) => self.clone_tag(origin, cx).into_any_element(),
+            None => div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("Not on {here}"))
+                .into_any_element(),
+        };
         let (projects, root) = (self.projects.clone(), workspace.place().clone());
         let path = h_flex()
             .gap_1()
@@ -856,14 +995,8 @@ impl ProjectList {
                     path,
                     cx,
                 )
-                .opacity(0.6)
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("Not on {}", machines.label(&self.current.machine))),
-                )
+                .when(workspace.origin().is_none(), |this| this.opacity(0.6))
+                .child(trailing)
                 // Its machine may be gone from the settings, so it can be
                 // removed from here.
                 .context_menu(move |menu, _, _| {
@@ -904,16 +1037,18 @@ impl ListDelegate for ProjectList {
         let machine = self.current.machine.clone();
         let workspaces = self.workspaces.read(cx);
         let home = workspaces.home(&machine);
-        let reader = if machine.is_local() {
-            Reader::Here
-        } else {
-            workspaces
-                .ssh(&machine)
-                .map_or(Reader::Unread, Reader::There)
-        };
         let typed = Typed::parse(query, home.as_deref());
         self.found
             .retain(|row| matches!((row, &typed), (Row::Next(folder), Some(typed)) if typed.leads_to(&folder.root.path)));
+        // A git URL: the machine's checkout of it, else a clone of it.
+        if let Some(source) = Source::typed(query) {
+            let held = self.known.iter().copied().find(|&ix| {
+                let workspace = workspaces.get(ix);
+                *workspace.machine() == machine && workspace.project_key() == source.folder()
+            });
+            self.found = vec![held.map_or(Row::Clone(source), Row::Project)];
+        }
+        let reader = self.reader(cx);
         self.refilter(cx);
         let label = self.machines.read(cx).label(&machine);
         let executor = cx.background_executor().clone();
@@ -932,8 +1067,9 @@ impl ListDelegate for ProjectList {
                     shown: shown(path),
                     root: Place::new(machine.clone(), path),
                 };
-                this.found = match lookup {
-                    None => Vec::new(),
+                match lookup {
+                    // Not a path: the rows found for it stay.
+                    None => {}
                     Some(Ok(lookup)) => {
                         let typed_row = lookup.found.map(|found| {
                             let known = this.known.iter().copied().find(|&ix| {
@@ -944,12 +1080,13 @@ impl ListDelegate for ProjectList {
                             known.map_or_else(|| Row::Add(folder(&found.root)), Row::Project)
                         });
                         let next = lookup.next.iter().map(|path| Row::Next(folder(path)));
-                        typed_row.into_iter().chain(next).collect()
+                        this.found = typed_row.into_iter().chain(next).collect();
                     }
-                    Some(Err(why)) => vec![Row::Unread(
-                        format!("Couldn't read {label}'s folders: {why}").into(),
-                    )],
-                };
+                    Some(Err(why)) => {
+                        let why = format!("Couldn't read {label}'s folders: {why}");
+                        this.found = vec![Row::Unread(why.into())];
+                    }
+                }
                 this.refilter(cx);
                 let focused = list.focus_handle(cx).is_focused(window);
                 if !focused {
@@ -977,7 +1114,7 @@ impl ListDelegate for ProjectList {
             Row::Add(folder) => ListItem::new("project-typed")
                 .accessibility_label(folder.shown.clone())
                 .child(row(
-                    folder_tile(IconName::Plus, cx).into_any_element(),
+                    folder_tile(Icon::new(IconName::Plus), cx).into_any_element(),
                     format!("Add {}", folder_name(&folder.root.path)).into(),
                     div().child(folder.shown.clone()),
                     cx,
@@ -985,13 +1122,28 @@ impl ListDelegate for ProjectList {
             Row::Next(folder) => ListItem::new(next_id(&folder.root))
                 .accessibility_label(folder.shown.clone())
                 .child(row(
-                    folder_tile(IconName::Folder, cx).into_any_element(),
+                    folder_tile(Icon::new(IconName::Folder), cx).into_any_element(),
                     format!("{}/", folder_name(&folder.root.path)).into(),
                     div().child(folder.shown.clone()),
                     cx,
                 )),
             Row::Project(project) => self.project_item(*project, cx),
             Row::Elsewhere(project) => self.elsewhere_item(*project, cx),
+            Row::Clone(source) => {
+                let tag = self.clone_tag(&source.url, cx);
+                ListItem::new("project-clone-url")
+                    .accessibility_label(format!("Clone {}", source.name))
+                    .child(
+                        row(
+                            folder_tile(Icon::new(gpui_kit::assets::IconName::Download), cx)
+                                .into_any_element(),
+                            format!("Clone {}", source.name).into(),
+                            div().truncate().child(source.url.clone()),
+                            cx,
+                        )
+                        .child(tag),
+                    )
+            }
             Row::Unread(why) => ListItem::new("project-unread")
                 .disabled(true)
                 .accessibility_label(why.clone())
@@ -1057,14 +1209,14 @@ fn row(tile: gpui_kit::AnyElement, name: SharedString, path: impl IntoElement, c
 }
 
 /// `icon` in a tile the size of a project badge.
-fn folder_tile(icon: IconName, cx: &App) -> impl IntoElement {
+fn folder_tile(icon: Icon, cx: &App) -> impl IntoElement {
     h_flex()
         .flex_shrink_0()
         .size(rems(1.75))
         .justify_center()
         .rounded(rems(0.25))
         .bg(cx.theme().secondary)
-        .child(Icon::new(icon).small())
+        .child(icon.small())
 }
 
 fn folder_name(cwd: &Path) -> String {

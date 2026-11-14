@@ -65,6 +65,11 @@ impl Workspace {
         &self.place
     }
 
+    /// Its repository's origin remote URL, which clones it elsewhere.
+    pub(crate) fn origin(&self) -> Option<&str> {
+        self.repo.origin.as_deref()
+    }
+
     /// The folder of the project it belongs to, on its machine; see
     /// [`Self::root`].
     pub(crate) fn root_path(&self) -> &Path {

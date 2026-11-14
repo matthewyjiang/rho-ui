@@ -120,6 +120,9 @@ pub(crate) struct Settings {
     pub(crate) code_font: SharedString,
     /// What the sidebar calls this machine.
     pub(crate) local_label: SharedString,
+    /// Where this machine clones projects; see
+    /// [`crate::machines::Machine::clone_folder`].
+    pub(crate) local_clone_folder: String,
     /// The remote machines, in the order added.
     pub(crate) machines: Vec<RemoteMachine>,
     /// Where [`Self::save`] writes; `None` keeps changes in memory (tests).
@@ -134,6 +137,7 @@ impl Default for Settings {
             ui_font: DEFAULT_UI_FONT.into(),
             code_font: DEFAULT_CODE_FONT.into(),
             local_label: LOCAL.into(),
+            local_clone_folder: String::new(),
             machines: Vec::new(),
             file: None,
         }
@@ -175,23 +179,24 @@ impl Settings {
     }
 
     /// The settings file's text: `key = value` lines, and for each remote
-    /// machine `machine.<host>.label` and `machine.<host>.rho`.
+    /// machine `machine.<host>.label`, `.rho` and `.clone_folder`.
     fn to_text(&self) -> String {
         let mut text = format!(
-            "appearance = {}\nui_scale = {}\nui_font = {}\ncode_font = {}\nlocal.label = {}\n",
+            "appearance = {}\nui_scale = {}\nui_font = {}\ncode_font = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
             self.appearance.name(),
             self.ui_scale.percent(),
             self.ui_font,
             self.code_font,
             self.local_label,
+            self.local_clone_folder,
         );
         for machine in &self.machines {
             let host = &machine.host;
-            let (label, rho) = (&machine.label, &machine.rho);
+            let (label, rho, folder) = (&machine.label, &machine.rho, &machine.clone_folder);
             // Writing to a String can't fail.
             let _ = write!(
                 text,
-                "machine.{host}.label = {label}\nmachine.{host}.rho = {rho}\n"
+                "machine.{host}.label = {label}\nmachine.{host}.rho = {rho}\nmachine.{host}.clone_folder = {folder}\n"
             );
         }
         text
@@ -256,6 +261,7 @@ fn parse(text: &str) -> Settings {
             "ui_font" if !value.is_empty() => settings.ui_font = value.to_owned().into(),
             "code_font" if !value.is_empty() => settings.code_font = value.to_owned().into(),
             "local.label" if !value.is_empty() => settings.local_label = value.to_owned().into(),
+            "local.clone_folder" => value.clone_into(&mut settings.local_clone_folder),
             key => {
                 if let Some((host, field)) = key
                     .strip_prefix("machine.")
@@ -284,6 +290,7 @@ fn machine_field(machines: &mut Vec<RemoteMachine>, host: &str, field: &str, val
     match field {
         "label" => value.clone_into(&mut machine.label),
         "rho" if !value.is_empty() => value.clone_into(&mut machine.rho),
+        "clone_folder" => value.clone_into(&mut machine.clone_folder),
         _ => {}
     }
 }
@@ -309,15 +316,18 @@ mod tests {
     fn machines_survive_a_save_in_the_order_added() {
         let mut settings = Settings {
             local_label: "laptop".into(),
+            local_clone_folder: "~/code".to_owned(),
             ..Settings::default()
         };
         let mut workstation = RemoteMachine::new("workstation");
         workstation.label = "Workstation".to_owned();
         workstation.rho = "~/.cargo/bin/rho".to_owned();
+        workstation.clone_folder = "/scratch/me".to_owned();
         settings.machines = vec![workstation, RemoteMachine::new("me@node0.example.edu")];
         let read = parse(&settings.to_text());
         assert_eq!(read.machines, settings.machines);
         assert_eq!(read.local_label, "laptop");
+        assert_eq!(read.local_clone_folder, "~/code");
         assert_eq!(read.machines[1].shown_label(), "me@node0.example.edu");
         assert!(
             parse("machine.local.label = x\nmachine.-x.rho = y\n")

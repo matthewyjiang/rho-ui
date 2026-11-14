@@ -13,6 +13,8 @@ use std::{
 pub(crate) struct Repo {
     /// `owner/name` from the origin remote, else the folder name.
     pub(crate) name: String,
+    /// The origin remote's URL, which clones it on another machine.
+    pub(crate) origin: Option<String>,
     /// The checked-out branch, or a short commit hash when detached.
     /// `None` outside a git repository.
     pub(crate) branch: Option<String>,
@@ -55,6 +57,7 @@ impl Repo {
 pub(crate) fn folder(cwd: &Path) -> Repo {
     Repo {
         name: folder_name(cwd),
+        origin: None,
         branch: None,
         root: cwd.to_path_buf(),
     }
@@ -80,16 +83,16 @@ pub(crate) fn inspect(cwd: &Path) -> Repo {
         .unwrap_or_else(|| git_dir.clone());
     let origin = std::fs::read_to_string(common_dir.join("config"))
         .ok()
-        .and_then(|config| origin_name(&config));
+        .and_then(|config| origin_url(&config));
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok();
     checkout(work_tree, &common_dir, origin, head.as_deref())
 }
 
 /// The project of a checkout at `work_tree`, whose repository keeps what
-/// all its worktrees share in `common_dir`. `origin` names the repository;
-/// without it, the project is named after its main checkout's folder, so a
-/// linked worktree is not named after its own. `head` is what its `HEAD`
-/// file holds.
+/// all its worktrees share in `common_dir`. `origin`, the origin remote's
+/// URL, names the repository; without it, the project is named after its
+/// main checkout's folder, so a linked worktree is not named after its own.
+/// `head` is what its `HEAD` file holds.
 fn checkout(
     work_tree: PathBuf,
     common_dir: &Path,
@@ -98,7 +101,11 @@ fn checkout(
 ) -> Repo {
     let root = project_root(work_tree, common_dir);
     Repo {
-        name: origin.unwrap_or_else(|| folder_name(&root)),
+        name: origin
+            .as_deref()
+            .and_then(url_name)
+            .unwrap_or_else(|| folder_name(&root)),
+        origin,
         branch: head.and_then(branch_name),
         root,
     }
@@ -157,12 +164,7 @@ pub(crate) fn parse_remote(dirs: &[PathBuf], output: &[u8]) -> Option<Vec<Repo>>
             if top.is_empty() || common.is_empty() {
                 return folder(dir);
             }
-            checkout(
-                path(top),
-                &path(common),
-                text(url).as_deref().and_then(url_name),
-                text(head).as_deref(),
-            )
+            checkout(path(top), &path(common), text(url), text(head).as_deref())
         })
         .collect();
     Some(repos)
@@ -209,16 +211,15 @@ fn branch_name(head: &str) -> Option<String> {
     }
 }
 
-/// `owner/name` from the `origin` remote's URL in a git config file.
-fn origin_name(config: &str) -> Option<String> {
+/// The `origin` remote's URL in a git config file.
+fn origin_url(config: &str) -> Option<String> {
     let mut in_origin = false;
     for line in config.lines().map(str::trim) {
         if line.starts_with('[') {
             in_origin = line == r#"[remote "origin"]"#;
         } else if in_origin {
             if let Some(url) = line.strip_prefix("url").map(str::trim_start) {
-                let url = url.strip_prefix('=')?.trim();
-                return url_name(url);
+                return Some(url.strip_prefix('=')?.trim().to_owned());
             }
         }
     }
@@ -228,7 +229,7 @@ fn origin_name(config: &str) -> Option<String> {
 /// The last two path segments of a remote URL, without `.git`:
 /// `git@github.com:owner/name.git` and `https://host/owner/name` both give
 /// `owner/name`.
-fn url_name(url: &str) -> Option<String> {
+pub(crate) fn url_name(url: &str) -> Option<String> {
     let path = url.trim_end_matches('/').trim_end_matches(".git");
     let mut segments = path
         .rsplit(['/', ':'])
@@ -270,6 +271,7 @@ mod tests {
     fn repo(name: &str) -> Repo {
         Repo {
             name: name.to_owned(),
+            origin: None,
             branch: None,
             root: PathBuf::from("/"),
         }
@@ -298,7 +300,10 @@ mod tests {
             Some("git/project")
         );
         let config = "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = git@x.com:a/b.git\n[remote \"origin\"]\n\turl = git@github.com:me/thing.git\n";
-        assert_eq!(origin_name(config).as_deref(), Some("me/thing"));
+        assert_eq!(
+            origin_url(config).as_deref(),
+            Some("git@github.com:me/thing.git")
+        );
     }
 
     #[test]
@@ -324,6 +329,7 @@ mod tests {
             inspect(&main.join("docs")),
             Repo {
                 name: "project".into(),
+                origin: None,
                 branch: Some("main".into()),
                 root: main.clone(),
             }
@@ -332,6 +338,7 @@ mod tests {
             inspect(&tree.join("src")),
             Repo {
                 name: "project".into(),
+                origin: None,
                 branch: Some("feature".into()),
                 root: main.canonicalize().unwrap(),
             }
@@ -349,7 +356,14 @@ mod tests {
         let dir = dir.path().canonicalize().unwrap();
         let git = |args: &[&str]| {
             let status = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
                 .args(args)
                 .current_dir(&dir)
                 .stdout(std::process::Stdio::null())

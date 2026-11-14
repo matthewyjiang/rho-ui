@@ -135,6 +135,31 @@ impl SshLink {
         script: &str,
         args: &[impl AsRef<OsStr>],
     ) -> Result<Vec<u8>, DaemonError> {
+        self.spawn_script(script, args, Some(SCRIPT_DEADLINE)).await
+    }
+
+    /// [`Self::run_script`] with no deadline, for a script whose time the
+    /// network and the work set, such as a `git clone`: it ends when the
+    /// script does, or the connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no master runs, ssh cannot run, or the script exits with
+    /// an error.
+    pub async fn run_long_script(
+        &self,
+        script: &str,
+        args: &[impl AsRef<OsStr>],
+    ) -> Result<Vec<u8>, DaemonError> {
+        self.spawn_script(script, args, None).await
+    }
+
+    async fn spawn_script(
+        &self,
+        script: &str,
+        args: &[impl AsRef<OsStr>],
+        deadline: Option<Duration>,
+    ) -> Result<Vec<u8>, DaemonError> {
         let mut input = b"set --".to_vec();
         for arg in args {
             input.push(b' ');
@@ -145,12 +170,16 @@ impl SshLink {
         let (reply, ran) = oneshot::channel();
         let link = self.clone();
         io().spawn(async move {
-            let _ = reply.send(link.run(input).await);
+            let _ = reply.send(link.run(input, deadline).await);
         });
         ran.await.map_err(|_| DaemonError::Closed)?
     }
 
-    async fn run(&self, input: Vec<u8>) -> Result<Vec<u8>, DaemonError> {
+    async fn run(
+        &self,
+        input: Vec<u8>,
+        deadline: Option<Duration>,
+    ) -> Result<Vec<u8>, DaemonError> {
         let host = &self.target.host;
         let alive = self
             .command()
@@ -181,15 +210,19 @@ impl SshLink {
         // A failed write means ssh exited, and its stderr says why.
         let _ = stdin.write_all(&input).await;
         drop(stdin);
-        let output = tokio::time::timeout(SCRIPT_DEADLINE, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                DaemonError::Unreachable(format!(
-                    "a script on {host} ran past {} s",
-                    SCRIPT_DEADLINE.as_secs()
-                ))
-            })?
-            .map_err(|error| self.cannot_run(&error))?;
+        let finished = child.wait_with_output();
+        let output = match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, finished)
+                .await
+                .map_err(|_| {
+                    DaemonError::Unreachable(format!(
+                        "a script on {host} ran past {} s",
+                        deadline.as_secs()
+                    ))
+                })?,
+            None => finished.await,
+        }
+        .map_err(|error| self.cannot_run(&error))?;
         if output.status.success() {
             Ok(output.stdout)
         } else {

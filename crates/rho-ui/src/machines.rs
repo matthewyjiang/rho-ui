@@ -59,6 +59,10 @@ pub(crate) struct Machine {
     /// What the sidebar calls it, as set in the settings.
     pub(crate) label: SharedString,
     pub(crate) target: DaemonTarget,
+    /// Where projects are cloned on it, as set in the settings: absolute,
+    /// or from its home directory. Empty means `$RHO_HOME/projects`, as
+    /// that machine sees it; see [`crate::cloning`].
+    pub(crate) clone_folder: SharedString,
 }
 
 /// A remote machine as the settings file lists it.
@@ -73,6 +77,8 @@ pub(crate) struct RemoteMachine {
     /// session may lack the `PATH` a terminal has, so this can be an
     /// absolute or `~/` path.
     pub(crate) rho: String,
+    /// See [`Machine::clone_folder`].
+    pub(crate) clone_folder: String,
 }
 
 /// The program a remote machine runs when none is set.
@@ -84,6 +90,7 @@ impl RemoteMachine {
             host: host.to_owned(),
             label: String::new(),
             rho: DEFAULT_REMOTE_RHO.to_owned(),
+            clone_folder: String::new(),
         }
     }
 
@@ -200,6 +207,13 @@ impl Machines {
     /// apart.
     pub(crate) fn several(&self) -> bool {
         self.list.len() > 1
+    }
+
+    /// Where projects are cloned on `id`; see [`Machine::clone_folder`].
+    pub(crate) fn clone_folder(&self, id: &MachineId) -> SharedString {
+        self.get(id)
+            .map(|machine| machine.clone_folder.clone())
+            .unwrap_or_default()
     }
 
     /// The label to show beside something on `id`: none with one machine,
