@@ -2170,7 +2170,9 @@ fn the_diff_surface_follows_the_sessions_changes() {
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "x"]);
-    std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+    // A line longer than the panel, which wraps in the screenshot.
+    let long = "two words a line, ".repeat(8);
+    std::fs::write(repo.join("a.txt"), format!("one\n{long}\n")).unwrap();
 
     let daemon = FakeDaemon::start(Script::default());
     let mut ui = Harness::open_with(

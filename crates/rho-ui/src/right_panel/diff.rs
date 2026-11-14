@@ -12,16 +12,17 @@ use std::{
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    diff::{Diff, DiffFile, DiffState},
+    diff::{Diff, DiffFile, DiffFileStatus, DiffState},
     empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
     spinner::Spinner,
-    v_flex, ActiveTheme as _, IconName, Sizable as _,
+    v_flex, ActiveTheme as _, IconName, Sizable as _, StyledExt as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, AnyElement, AppContext as _, BackgroundExecutor, Context, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window,
+    div, AnyElement, App, AppContext as _, BackgroundExecutor, Context, Entity,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
 };
 
 use crate::{
@@ -211,6 +212,63 @@ fn refresh_button(cx: &Context<'_, DiffSurface>) -> Button {
         .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
 }
 
+/// A file's header: its path (old → new for a rename), lines added in
+/// green and removed in red, as the summary above shows them, and how the
+/// file changed when it was added, deleted or renamed.
+fn file_header(file: &DiffFile, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    let theme = cx.theme();
+    let name: SharedString = match (file.original_path(), file.modified_path()) {
+        (Some(old), Some(new)) if old != new => format!("{old} → {new}").into(),
+        _ => file.path().clone(),
+    };
+    let status = match file.status() {
+        DiffFileStatus::Added => Some("Added"),
+        DiffFileStatus::Deleted => Some("Deleted"),
+        DiffFileStatus::Renamed => Some("Renamed"),
+        DiffFileStatus::Copied => Some("Copied"),
+        _ if file.is_binary() => Some("Binary"),
+        _ => None,
+    };
+    let counted = file.additions() + file.deletions() > 0;
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_medium()
+                .child(name),
+        )
+        .when(counted, |this| {
+            this.child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(theme.green)
+                            .child(format!("+{}", file.additions())),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.red)
+                            .child(format!("−{}", file.deletions())),
+                    ),
+            )
+        })
+        .children(status.map(|status| {
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status)
+        }))
+}
+
 /// A message in place of the changes.
 fn message(text: impl Into<SharedString>, media: Option<AnyElement>) -> AnyElement {
     let mut header = EmptyHeader::new().description(EmptyDescription::new().child(text.into()));
@@ -244,7 +302,13 @@ impl Render for DiffSurface {
             Status::Ready => v_flex()
                 .size_full()
                 .child(self.render_summary(cx))
-                .child(Diff::new(&self.state).flex_1().min_h_0())
+                .child(
+                    Diff::new(&self.state)
+                        .soft_wrap(true)
+                        .render_header(file_header)
+                        .flex_1()
+                        .min_h_0(),
+                )
                 .into_any_element(),
         }
     }
