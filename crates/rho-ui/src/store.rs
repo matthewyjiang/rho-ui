@@ -117,6 +117,11 @@ pub(crate) enum Key {
     /// The machines and projects the sidebar hides; see
     /// [`crate::session_list::Filter`].
     SidebarFilter,
+    /// `shown` or `hidden`; see [`crate::right_panel::PanelLayout`].
+    RightPanel,
+    /// The right panel's width in rems; see
+    /// [`crate::right_panel::PanelLayout`].
+    RightPanelWidth,
 }
 
 impl Key {
@@ -124,6 +129,8 @@ impl Key {
         match self {
             Key::SidebarLayout => "sidebar-layout",
             Key::SidebarFilter => "sidebar-filter",
+            Key::RightPanel => "right-panel",
+            Key::RightPanelWidth => "right-panel-width",
         }
     }
 }

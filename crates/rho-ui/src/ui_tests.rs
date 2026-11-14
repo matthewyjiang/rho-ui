@@ -1976,6 +1976,143 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
     ui.shot("exited");
 }
 
+/// The right panel shows and hides with Ctrl+Alt+B or its toggle, and the
+/// state database remembers which. It lists its surfaces; the Background
+/// surface opens as a tab, follows the session on screen, and stops its
+/// work. Closing the last tab goes back to the list.
+#[test]
+fn the_right_panel_opens_a_surface_that_follows_the_session() {
+    let mut ui = Harness::start("right-panel", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "right-panel"), "hidden until shown");
+        assert!(
+            is_visible(window, "toggle-right-panel"),
+            "the title bar offers it"
+        );
+    });
+    ui.send("background");
+    ui.wait_for_session("the turn to end with its process running", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+
+    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "panel-surface-list"),
+            "the list of surfaces"
+        );
+        assert!(is_visible(window, "planned-surface-terminal"));
+    });
+    assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("shown"));
+    ui.shot("list");
+
+    ui.click("open-surface-background");
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "panel-tab-background"),
+            "it opens as a tab"
+        );
+        assert!(
+            is_visible(window, "panel-background-0"),
+            "the running process is listed"
+        );
+    });
+    ui.shot("background");
+    ui.click("panel-background-stop-0");
+    ui.wait_until(
+        "the stopped process in the panel's ended work",
+        |window, cx, app| {
+            let stopped = app.active_session().is_some_and(|view| {
+                view.read(cx).session().background()[0].status() == BackgroundStatus::Cancelled
+            });
+            stopped
+                && is_visible(window, "panel-ended-0")
+                && !is_visible(window, "panel-background")
+        },
+    );
+    ui.shot("stopped");
+
+    // Another session shows its own work: none.
+    ui.click("session-local-s1");
+    ui.wait_for_session("the saved session", |session| {
+        session.title() == Some("first")
+    });
+    ui.act(|window, _| {
+        assert!(is_visible(window, "panel-tab-background"), "the tab stays");
+        assert!(!is_visible(window, "panel-ended-0"), "s1 ran no work");
+    });
+
+    ui.click("close-panel-tab-background");
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "panel-tab-background"));
+        assert!(is_visible(window, "panel-surface-list"));
+    });
+    ui.click("toggle-right-panel");
+    ui.act(|window, _| assert!(!is_visible(window, "right-panel")));
+    assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("hidden"));
+}
+
+/// Dragging the right panel's edge resizes it, as far as leaves the pane
+/// its room; the width outlives a restart, and a double-click on the edge
+/// puts the default back.
+#[test]
+fn the_right_panel_resizes_from_its_edge() {
+    let mut ui = Harness::start("right-panel-resize", Script::default());
+    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    let panel = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                bounds(window, "right-panel").expect("the panel is drawn")
+            })
+            .expect("window is open")
+    };
+    let drag_edge = |ui: &mut Harness, to: Pixels| {
+        let edge = panel(ui);
+        let from = gpui_kit::point(edge.left() + px(2.), edge.center().y);
+        ui.act(|window, cx| window.drag(from, gpui_kit::point(to, from.y), cx));
+    };
+    let before = panel(&mut ui);
+    drag_edge(&mut ui, before.left() - px(40.));
+    let wider = panel(&mut ui);
+    assert!(
+        (wider.size.width - before.size.width - px(40.)).abs() < px(3.),
+        "the panel follows the pointer: {before:?} became {wider:?}"
+    );
+
+    let mut ui = ui.reopen("right-panel-resize", Shelves::owning(["s1"]));
+    assert_eq!(
+        panel(&mut ui).size.width,
+        wider.size.width,
+        "the width is kept"
+    );
+
+    drag_edge(&mut ui, px(0.));
+    let widest = panel(&mut ui);
+    // The open sidebar is 288px wide, and the pane keeps 480px.
+    assert!(
+        widest.left() >= px(288. + 479.),
+        "the pane keeps its room: {widest:?}"
+    );
+    ui.shot("widest");
+    ui.act(|window, cx| {
+        window.click_with_options(
+            "right-panel-edge",
+            gpui_kit::test::ClickOptions::new().with_count(2),
+            cx,
+        );
+    });
+    assert_eq!(
+        panel(&mut ui).size.width,
+        before.size.width,
+        "the default width"
+    );
+}
+
 /// A subagent's row in the background work opens its session, nested under
 /// its parent in the title bar: the subagent's messages as they come, and
 /// no composer, as only the subagent writes there. The parent's step in the

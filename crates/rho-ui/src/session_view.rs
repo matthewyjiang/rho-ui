@@ -53,7 +53,7 @@ use rho_ui_core::{
 };
 
 use crate::{
-    background::{BackgroundHistory, BackgroundList, OpenHandler},
+    background::{BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler},
     background_log::{BackgroundLog, Recorded},
     composer::{Composer, ComposerMode, ComposerState},
     input_card::{InputCard, InputCardEvent, Queue},
@@ -1102,7 +1102,10 @@ impl SessionView {
     /// The running background work; a subagent's session can't stop its
     /// own.
     fn render_background(&self, cx: &mut Context<'_, Self>) -> Option<BackgroundList> {
-        let list = BackgroundList::new(self.session.background(), Self::open_handler(cx))?;
+        let list = BackgroundList::new(
+            self.session.background(),
+            Self::open_handler(cx.entity().downgrade()),
+        )?;
         if self.is_subagent() {
             return Some(list);
         }
@@ -1114,9 +1117,28 @@ impl SessionView {
         }))
     }
 
+    /// The session's background work, running and ended, for the right
+    /// panel's Background surface. A subagent's session can't stop its own.
+    pub(crate) fn background_surface(view: &Entity<Self>, cx: &App) -> BackgroundSurface {
+        let this = view.read(cx);
+        let surface = BackgroundSurface::new(
+            this.session.background(),
+            this.session.ended_background(),
+            Self::open_handler(view.downgrade()),
+        );
+        if this.is_subagent() {
+            return surface;
+        }
+        let view = view.downgrade();
+        surface.stoppable(&this.stopping, move |work, window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.stop_background(work.clone(), window, cx);
+            });
+        })
+    }
+
     /// Opens a subagent's session from its row in the background work.
-    fn open_handler(cx: &mut Context<'_, Self>) -> OpenHandler {
-        let view = cx.entity().downgrade();
+    fn open_handler(view: WeakEntity<Self>) -> OpenHandler {
         Rc::new(move |session, title, _, cx| {
             let _ = view.update(cx, |_, cx| {
                 cx.emit(SessionEvent::OpenSubagent {
@@ -1146,7 +1168,7 @@ impl SessionView {
         }
         bar.trailing(BackgroundHistory::new(
             self.session.ended_background(),
-            Self::open_handler(cx),
+            Self::open_handler(cx.entity().downgrade()),
         ))
     }
 

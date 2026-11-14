@@ -2,8 +2,10 @@
 //! composer: the processes, workflow runs and subagents its turns left
 //! running, each with a button to stop it. Work leaves that list as it ends;
 //! a button in the header opens what ended and how, as the daemon's turn
-//! that tells the model can be missed or scroll away. A subagent's row, in
-//! either list, opens the subagent's own session once it has one.
+//! that tells the model can be missed or scroll away. The right panel's
+//! Background surface ([`BackgroundSurface`]) shows both lists at once. A
+//! subagent's row, in any of them, opens the subagent's own session once it
+//! has one.
 
 use std::rc::Rc;
 
@@ -11,6 +13,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{ObservedElement, TestSupportExt as _};
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
+    empty::{Empty, EmptyDescription, EmptyHeader},
     h_flex,
     popover::Popover,
     v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _,
@@ -119,6 +122,8 @@ pub(crate) struct BackgroundList {
     /// nothing can be stopped from here.
     stop: Option<(Vec<BackgroundId>, StopHandler)>,
     on_open: OpenHandler,
+    /// The list's element ID, and the start of its rows'.
+    ids: &'static str,
 }
 
 impl BackgroundList {
@@ -135,7 +140,15 @@ impl BackgroundList {
             running,
             stop: None,
             on_open,
+            ids: "background",
         })
+    }
+
+    /// Names the list `ids` and its rows `ids-N`, in place of
+    /// `background`, so a second list on screen has IDs of its own.
+    fn ids(mut self, ids: &'static str) -> Self {
+        self.ids = ids;
+        self
     }
 
     /// Offers to stop each piece of work that can be, with `on_stop`.
@@ -152,13 +165,9 @@ impl BackgroundList {
 
 impl RenderOnce for BackgroundList {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let (stop, on_open) = (self.stop, self.on_open);
-        v_flex()
-            .id("background")
-            .test_support()
-            .w_full()
-            .gap_1()
-            .children(self.running.iter().enumerate().map(|(ix, work)| {
+        let (stop, on_open, ids) = (self.stop, self.on_open, self.ids);
+        v_flex().id(ids).test_support().w_full().gap_1().children(
+            self.running.iter().enumerate().map(|(ix, work)| {
                 let offer = stop.as_ref().filter(|_| work.can_stop());
                 let state = match offer {
                     None => Stop::Never,
@@ -166,13 +175,13 @@ impl RenderOnce for BackgroundList {
                     Some(_) => Stop::Offered,
                 };
                 let row = Row::new(work, state);
-                row.render(format!("background-{ix}").into(), &on_open, cx)
+                row.render(format!("{ids}-{ix}").into(), &on_open, cx)
                     .px_3()
                     .map(|this| match offer {
                         Some((_, on_stop)) => {
                             let (on_stop, id) = (Rc::clone(on_stop), work.id().clone());
                             this.child(
-                                Button::new(SharedString::from(format!("background-stop-{ix}")))
+                                Button::new(SharedString::from(format!("{ids}-stop-{ix}")))
                                     .ghost()
                                     .xsmall()
                                     .icon(Lucide::Square)
@@ -185,7 +194,8 @@ impl RenderOnce for BackgroundList {
                         // stop: the size of an xsmall icon button.
                         None => this.child(div().flex_shrink_0().size_5()),
                     })
-            }))
+            }),
+        )
     }
 }
 
@@ -204,13 +214,20 @@ impl BackgroundHistory {
         if ended.is_empty() {
             return None;
         }
-        let rows = ended
-            .iter()
-            .rev()
-            .map(|work| Row::new(work, Stop::Never))
-            .collect();
-        Some(Self { rows, on_open })
+        Some(Self {
+            rows: ended_rows(ended),
+            on_open,
+        })
     }
+}
+
+/// The rows of `ended` work, newest first.
+fn ended_rows(ended: &[BackgroundWork]) -> Rc<[Row]> {
+    ended
+        .iter()
+        .rev()
+        .map(|work| Row::new(work, Stop::Never))
+        .collect()
 }
 
 impl RenderOnce for BackgroundHistory {
@@ -248,6 +265,90 @@ impl RenderOnce for BackgroundHistory {
                             })),
                     )
             })
+    }
+}
+
+/// The session's background work as a surface of the right panel: what
+/// runs, each with a button to stop it once [`Self::stoppable`], then what
+/// ended, newest first, with how it ended.
+#[derive(IntoElement)]
+pub(crate) struct BackgroundSurface {
+    running: Option<BackgroundList>,
+    ended: Rc<[Row]>,
+    on_open: OpenHandler,
+}
+
+impl BackgroundSurface {
+    /// `work` is the daemon's list, of which the running work shows, and
+    /// `ended` the work seen to end, oldest first. Each subagent opens its
+    /// session with `on_open`.
+    pub(crate) fn new(
+        work: &[BackgroundWork],
+        ended: &[BackgroundWork],
+        on_open: OpenHandler,
+    ) -> Self {
+        Self {
+            running: BackgroundList::new(work, Rc::clone(&on_open))
+                .map(|list| list.ids("panel-background")),
+            ended: ended_rows(ended),
+            on_open,
+        }
+    }
+
+    /// Offers to stop the running work; see [`BackgroundList::stoppable`].
+    pub(crate) fn stoppable(
+        mut self,
+        stopping: &[BackgroundId],
+        on_stop: impl Fn(&BackgroundId, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.running = self.running.map(|list| list.stoppable(stopping, on_stop));
+        self
+    }
+}
+
+impl RenderOnce for BackgroundSurface {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        if self.running.is_none() && self.ended.is_empty() {
+            return Empty::new()
+                .h_full()
+                .header(EmptyHeader::new().description(
+                    EmptyDescription::new().child("No background work in this session yet."),
+                ))
+                .into_any_element();
+        }
+        let muted = cx.theme().muted_foreground;
+        let heading = move |text: &'static str| {
+            div()
+                .px_3()
+                .text_xs()
+                .font_semibold()
+                .text_color(muted)
+                .child(text)
+        };
+        let (ended, on_open) = (self.ended, self.on_open);
+        v_flex()
+            .id("panel-background-surface")
+            .size_full()
+            .overflow_y_scroll()
+            .py_3()
+            .gap_4()
+            .when_some(self.running, |this, running| {
+                this.child(v_flex().gap_2().child(heading("Running")).child(running))
+            })
+            .when(!ended.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .gap_2()
+                        .child(heading("Ended"))
+                        .child(v_flex().gap_1().children(ended.iter().enumerate().map(
+                            |(ix, row)| {
+                                row.render(format!("panel-ended-{ix}").into(), &on_open, cx)
+                                    .px_3()
+                            },
+                        ))),
+                )
+            })
+            .into_any_element()
     }
 }
 

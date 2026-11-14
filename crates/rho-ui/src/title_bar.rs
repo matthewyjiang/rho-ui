@@ -2,7 +2,8 @@
 //! what the pane shows, each step nested under the one before it, as
 //! `rho-ui / Fix the parser / Read the parser` for a subagent's session
 //! under the session that started it. Every step but the last links back to
-//! it; controls for what the pane shows sit at the right.
+//! it; controls for what the pane shows sit at the right, and at the right
+//! edge, while the right panel is hidden, the toggle that shows it.
 //!
 //! Kit's `Breadcrumb` separates its items with chevrons and gives UI tests
 //! no way to find them; this bar uses slashes, and tests find each step.
@@ -14,7 +15,11 @@ use gpui_kit::{
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
 };
 
-use crate::{badge::Badge, workspaces::Workspace};
+use crate::{
+    badge::Badge,
+    right_panel::{self, PanelLayout},
+    workspaces::Workspace,
+};
 
 /// The height of the window's top row, in rems: this bar, and the
 /// sidebar's top row beside it, so the two line up and grow with the UI
@@ -141,6 +146,7 @@ impl RenderOnce for TitleBar {
                     ),
             )
             .children(self.trailing)
+            .children((!PanelLayout::get(cx)).then(|| right_panel::toggle_button(cx)))
     }
 }
 

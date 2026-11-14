@@ -23,6 +23,7 @@ mod project_picker;
 mod projects;
 mod repo;
 mod rho_settings;
+mod right_panel;
 mod session_list;
 mod session_settings;
 mod session_view;
@@ -55,6 +56,7 @@ use crate::{
     background_log::BackgroundLog,
     machines::RemoteMachine,
     projects::Projects,
+    right_panel::PanelLayout,
     settings::Settings,
     sidebar::SidebarState,
     store::StateDb,
@@ -74,6 +76,8 @@ gpui_kit::actions!(
         OpenSettings,
         /// Collapse the sidebar to its rail, or open it again.
         ToggleSidebar,
+        /// Show the right panel, or hide it.
+        ToggleRightPanel,
         /// Quit the app.
         Quit
     ]
@@ -112,7 +116,8 @@ gpui_kit::assets::icon_assets!(
         Server,
         Layers,
         Timer,
-        SkipForward
+        SkipForward,
+        FileDiff
     ]
 );
 
@@ -219,11 +224,13 @@ fn init(cx: &mut App, db: &StateDb) {
     Settings::default().apply(cx);
     cx.set_global(TurnTimes::load(db));
     cx.set_global(BackgroundLog::new(db));
+    cx.set_global(PanelLayout::load(db));
     cx.bind_keys([
         KeyBinding::new("ctrl-n", NewSession, Some("RhoApp")),
         KeyBinding::new("ctrl-shift-n", NewSessionIn, Some("RhoApp")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
         KeyBinding::new("ctrl-b", ToggleSidebar, Some("RhoApp")),
+        KeyBinding::new("ctrl-alt-b", ToggleRightPanel, Some("RhoApp")),
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
         KeyBinding::new("ctrl-q", Quit, None),
         // "Input" is the key context of Kit's text fields. Kit binds only

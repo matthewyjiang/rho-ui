@@ -4,8 +4,9 @@
 //! include subagents' sessions opened from their parent, which the sidebar
 //! does not list: they show nested under the parent, and go when it goes.
 //!
-//! The sidebar and the session view are drawn as cached views: each redraws
-//! only when it changes, so a hover in one never rebuilds the other.
+//! The sidebar, the session view and the right panel are drawn as cached
+//! views: each redraws only when it changes, so a hover in one never
+//! rebuilds the others.
 
 use std::{path::PathBuf, rc::Rc, time::Duration};
 
@@ -16,10 +17,11 @@ use gpui_kit::component::{
     notification::Notification,
     ActiveTheme as _, IconName, WindowExt as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StyleRefinement, Styled as _, Subscription, Task,
-    Window,
+    div, App, AppContext as _, Context, DragMoveEvent, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
     Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, DaemonTarget, Detached,
@@ -33,12 +35,13 @@ use crate::{
     machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
     projects::Projects,
     rho_settings::RhoSettings,
+    right_panel::{PanelLayout, ResizeRightPanel, RightPanel},
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
     sidebar::{SidebarEvent, SidebarState, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
-    NewSession, NewSessionIn, OpenSettings, ToggleSidebar,
+    NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
 };
 
 /// How often the sidebar asks each daemon which sessions have work under
@@ -159,13 +162,15 @@ pub(crate) struct RhoApp {
     /// Where the last new session started, for the next one.
     last_project: Option<Place>,
     sidebar: Entity<SidebarView>,
+    /// The panel at the right, laid out while [`PanelLayout`].
+    panel: Entity<RightPanel>,
     /// Sessions opened in this run. A handful at most, so lookups by ID scan.
     sessions: Vec<OpenSession>,
     pane: Pane,
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 4],
 }
 
 impl RhoApp {
@@ -220,6 +225,7 @@ impl RhoApp {
             projects,
             last_project: None,
             sidebar,
+            panel: cx.new(|_| RightPanel::new()),
             sessions: Vec::new(),
             pane: Pane::Empty,
             kinetic: Rc::default(),
@@ -237,6 +243,17 @@ impl RhoApp {
                 // Machines added, removed or changed in the settings.
                 cx.observe_global_in::<Settings>(window, |this, window, cx| {
                     this.sync_machines(window, cx);
+                }),
+                // The right panel shown or hidden: lay it out, and redraw
+                // the pane's title bar, which offers the toggle while it
+                // is hidden.
+                cx.observe_global_in::<PanelLayout>(window, |this, _, cx| {
+                    match &this.pane {
+                        Pane::Session(view) => view.update(cx, |_, cx| cx.notify()),
+                        Pane::Draft { view, .. } => view.update(cx, |_, cx| cx.notify()),
+                        Pane::Empty => {}
+                    }
+                    cx.notify();
                 }),
             ],
         };
@@ -986,17 +1003,21 @@ impl RhoApp {
         self.focus_pane(window, cx);
     }
 
-    /// Puts `pane` in the main area and marks its row in the sidebar,
-    /// leaving the keyboard where it is.
+    /// Puts `pane` in the main area, marks its row in the sidebar, and
+    /// shows its session in the right panel, leaving the keyboard where it
+    /// is.
     fn set_pane(&mut self, pane: Pane, cx: &mut Context<'_, Self>) {
-        // A subagent's session marks the row of the session it is nested in.
-        let active = match &pane {
-            Pane::Session(view) => Some(view.read(cx).root_id(cx)),
+        let session = match &pane {
+            Pane::Session(view) => Some(view.clone()),
             Pane::Empty | Pane::Draft { .. } => None,
         };
+        // A subagent's session marks the row of the session it is nested in.
+        let active = session.as_ref().map(|view| view.read(cx).root_id(cx));
         self.pane = pane;
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_active(active, cx));
+        self.panel
+            .update(cx, |panel, cx| panel.set_session(session, cx));
         cx.notify();
     }
 
@@ -1251,7 +1272,6 @@ impl RhoApp {
 
 impl Render for RhoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let _ = window;
         let root = div()
             .id("rho-app")
             .key_context("RhoApp")
@@ -1266,6 +1286,7 @@ impl Render for RhoApp {
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_sidebar(window, cx);
             }))
+            .on_action(|_: &ToggleRightPanel, _, cx| PanelLayout::toggle(cx))
             .relative()
             .size_full()
             .bg(cx.theme().background)
@@ -1275,6 +1296,8 @@ impl Render for RhoApp {
 
         let pane_style = || StyleRefinement::default().flex_1().min_w_0().h_full();
         let sidebar_width = self.sidebar.read(cx).width();
+        let rem = f32::from(window.rem_size());
+        let row = f32::from(window.viewport_size().width) / rem;
         let main = match &self.pane {
             Pane::Session(view) => view.clone().cached(pane_style()).into_any_element(),
             Pane::Draft { view, .. } => view.clone().cached(pane_style()).into_any_element(),
@@ -1284,6 +1307,19 @@ impl Render for RhoApp {
             h_flex()
                 .size_full()
                 .items_stretch()
+                // A drag of the right panel's edge, wherever the pointer
+                // goes; the panel's width is its distance from the right.
+                .on_drag_move(cx.listener(
+                    |this, event: &DragMoveEvent<ResizeRightPanel>, window, cx| {
+                        let rem = f32::from(window.rem_size());
+                        let bounds = event.bounds;
+                        let width = f32::from(bounds.right() - event.event.position.x) / rem;
+                        let row = f32::from(bounds.size.width) / rem;
+                        let sidebar = this.sidebar.read(cx).width().0;
+                        PanelLayout::resize(width, row, sidebar, cx);
+                    },
+                ))
+                .on_drop(|_: &ResizeRightPanel, _, cx| PanelLayout::save_width(cx))
                 .child(
                     self.sidebar.clone().cached(
                         StyleRefinement::default()
@@ -1292,7 +1328,17 @@ impl Render for RhoApp {
                             .flex_shrink_0(),
                     ),
                 )
-                .child(main),
+                .child(main)
+                .when(PanelLayout::get(cx), |this| {
+                    this.child(
+                        self.panel.clone().cached(
+                            StyleRefinement::default()
+                                .w(PanelLayout::width(row, sidebar_width.0, cx))
+                                .h_full()
+                                .flex_shrink_0(),
+                        ),
+                    )
+                }),
         )
         .into_any_element()
     }
