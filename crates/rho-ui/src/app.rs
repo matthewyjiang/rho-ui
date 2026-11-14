@@ -1270,6 +1270,10 @@ impl RhoApp {
     pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
         self.panel.read(cx).diff_paths(cx)
     }
+    /// The right panel's tabs, in order, for UI tests.
+    pub(crate) fn panel_tabs(&self, cx: &App) -> Vec<crate::right_panel::Surface> {
+        self.panel.read(cx).tab_order()
+    }
     /// The sidebar's search, for UI tests.
     pub(crate) fn sidebar_search(&self, cx: &App) -> FocusHandle {
         self.sidebar.read(cx).search_focus_handle(cx)

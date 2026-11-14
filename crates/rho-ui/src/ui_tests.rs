@@ -32,6 +32,7 @@ use crate::{
     app::{LaunchConfig, RhoApp},
     machines::{MachineId, Place, RemoteMachine, SessionKey},
     projects::Projects,
+    right_panel::Surface,
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
@@ -1985,8 +1986,7 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
 /// The right panel shows and hides with Ctrl+Alt+B or its toggle, and the
 /// state database remembers which. It lists its surfaces; the Background
 /// surface opens as a tab, follows the session on screen, and stops its
-/// work. + opens a menu of the surfaces still to open. A hovered tab shows
-/// × in place of its icon, and closing the last tab goes back to the list.
+/// work. Closing the last tab goes back to the list.
 #[test]
 fn the_right_panel_opens_a_surface_that_follows_the_session() {
     let mut ui = Harness::start("right-panel", Script::default());
@@ -2058,6 +2058,29 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
         assert!(!is_visible(window, "panel-ended-0"), "s1 ran no work");
     });
 
+    ui.act(|window, cx| window.hover("panel-tab-background", cx));
+    ui.click("close-panel-tab-background");
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "panel-tab-background"));
+        assert!(is_visible(window, "panel-surface-list"));
+    });
+    ui.click("toggle-right-panel");
+    ui.act(|window, _| assert!(!is_visible(window, "right-panel")));
+    assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("hidden"));
+}
+
+/// The + in the right panel's header opens a menu of the surfaces without
+/// a tab. Dragging one tab onto another moves it there, and a tab shows ×,
+/// in place of its icon, only while hovered.
+#[test]
+fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
+    let mut ui = Harness::start("panel-tabs", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.click("open-surface-background");
+
     // + opens a menu over the open surface, not the list in its place.
     ui.click("panel-surfaces");
     ui.shot("menu");
@@ -2067,10 +2090,26 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
         assert!(!is_visible(window, "panel-surface-list"));
         assert!(!is_visible(window, "panel-surfaces"), "nothing left to add");
     });
+    // Dragging Diff onto Background work puts it first.
+    let (from, to) = ui
+        .cx
+        .update_window(ui.window, |_, window, _| {
+            let from = bounds(window, "panel-tab-diff").expect("the Diff tab");
+            let to = bounds(window, "panel-tab-background").expect("the Background tab");
+            (from.center(), to.center())
+        })
+        .expect("window is open");
+    ui.act(|window, cx| window.drag(from, to, cx));
+    ui.wait_until("Diff moved first", |_, cx, app| {
+        app.panel_tabs(cx) == [Surface::Diff, Surface::Background]
+    });
+    ui.shot("reordered");
     ui.act(|window, cx| window.hover("panel-tab-diff", cx));
     ui.click("close-panel-tab-diff");
     ui.act(|window, _| assert!(!is_visible(window, "panel-tab-diff")));
 
+    // Background work slid under the pointer; move it off the tabs.
+    ui.act(|window, cx| window.hover("toggle-right-panel", cx));
     ui.act(|window, _| {
         assert!(
             !is_visible(window, "close-panel-tab-background"),
@@ -2080,13 +2119,7 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
     ui.act(|window, cx| window.hover("panel-tab-background", cx));
     ui.shot("hover-tab");
     ui.click("close-panel-tab-background");
-    ui.act(|window, _| {
-        assert!(!is_visible(window, "panel-tab-background"));
-        assert!(is_visible(window, "panel-surface-list"));
-    });
-    ui.click("toggle-right-panel");
-    ui.act(|window, _| assert!(!is_visible(window, "right-panel")));
-    assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("hidden"));
+    ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
 }
 
 /// The Diff surface shows the uncommitted changes where the session on

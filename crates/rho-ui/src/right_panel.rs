@@ -5,7 +5,8 @@
 //! The state database remembers both ([`PanelLayout`]).
 //!
 //! Each surface opens as a tab in the panel's header; hovering a tab swaps
-//! its icon for × to close it. With none open, the panel lists the
+//! its icon for × to close it, and dragging one onto another moves it
+//! there. With none open, the panel lists the
 //! surfaces to open, and dimmed under them those still to come
 //! ([`PLANNED`]); while another isn't open, + in the header opens a menu
 //! of the same. The panel is the window's, not a
@@ -19,6 +20,8 @@
 //! screen.
 
 mod diff;
+
+use std::cmp::Ordering;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -35,7 +38,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     div, rems, AnyElement, App, AppContext as _, Axis, BorrowAppContext as _, Context, Entity,
     Global, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, SharedString,
-    Styled as _, Subscription, WeakEntity, Window,
+    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
 };
 
 use self::diff::DiffSurface;
@@ -215,6 +218,32 @@ impl Render for ResizeRightPanel {
     }
 }
 
+/// What a drag of a tab carries: its surface, and where it sat when the
+/// drag began. It draws the tab under the pointer.
+#[derive(Clone, Copy)]
+struct DragTab {
+    surface: Surface,
+    index: usize,
+}
+
+impl Render for DragTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .text_sm()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .opacity(0.85)
+            .child(Icon::new(self.surface.icon()).small())
+            .child(self.surface.label())
+    }
+}
+
 /// Shows the panel, or hides it. Where it sits, at the window's right edge
 /// in the title bar or in the panel's header, it stays put, so a second
 /// click undoes the first.
@@ -340,6 +369,22 @@ impl RightPanel {
         self.active.is_some() && self.unopened().next().is_some()
     }
 
+    /// Moves `surface`'s tab to `index`, where a drag dropped it.
+    fn move_tab(&mut self, surface: Surface, index: usize, cx: &mut Context<'_, Self>) {
+        let Some(from) = self.tabs.iter().position(|tab| tab.surface() == surface) else {
+            return;
+        };
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(index.min(self.tabs.len()), tab);
+        cx.notify();
+    }
+
+    /// The tabs' surfaces, in order, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn tab_order(&self) -> Vec<Surface> {
+        self.tabs.iter().map(Tab::surface).collect()
+    }
+
     /// Notes the pointer over `surface`'s tab.
     fn hover(&mut self, surface: Surface, cx: &mut Context<'_, Self>) {
         self.hovered = Some(surface);
@@ -380,61 +425,97 @@ impl RightPanel {
         menu
     }
 
+    /// `surface`'s tab, at `index` in the header: its icon, or × while
+    /// hovered, and its label. Dragged onto another tab, it moves there.
+    fn render_tab(
+        &self,
+        index: usize,
+        surface: Surface,
+        cx: &Context<'_, Self>,
+    ) -> impl IntoElement {
+        // × replaces the icon while hovered, so the tab keeps its width.
+        let lead = if self.hovered == Some(surface) {
+            Button::new(SharedString::from(format!(
+                "close-panel-tab-{}",
+                surface.id()
+            )))
+            .ghost()
+            .xsmall()
+            .compact()
+            .icon(IconName::Close)
+            .accessibility_label("Close")
+            .tooltip("Close")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Kit's Button passes the click on, and the tab's own
+                // click would open the surface again.
+                cx.stop_propagation();
+                this.close(surface, cx);
+            }))
+            .into_any_element()
+        } else {
+            Icon::new(surface.icon()).small().into_any_element()
+        };
+        let view = cx.entity().downgrade();
+        let button = Button::new(SharedString::from(format!("panel-tab-{}", surface.id())))
+            .ghost()
+            .small()
+            .selected(self.active == Some(surface))
+            .accessibility_label(surface.label())
+            .child(
+                h_flex()
+                    .size_4()
+                    .items_center()
+                    .justify_center()
+                    .child(lead),
+            )
+            .child(surface.label())
+            .on_hover(move |&hovered, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if hovered {
+                        this.hover(surface, cx);
+                    } else {
+                        this.unhover(surface, cx);
+                    }
+                });
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.open(surface, cx)));
+        // Kit's Button takes no drag, so a div around it carries one.
+        div()
+            .id(SharedString::from(format!(
+                "panel-tab-slot-{}",
+                surface.id()
+            )))
+            .flex_shrink_0()
+            .border_x_2()
+            .border_color(gpui_kit::transparent_black())
+            .child(button)
+            .on_drag(DragTab { surface, index }, |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| *drag)
+            })
+            // The border marks the side the dragged tab lands on.
+            .drag_over::<DragTab>(move |style, drag, _, cx| {
+                let color = cx.theme().drag_border;
+                match drag.index.cmp(&index) {
+                    Ordering::Greater => style.border_l_2().border_color(color),
+                    Ordering::Less => style.border_r_2().border_color(color),
+                    Ordering::Equal => style,
+                }
+            })
+            .on_drop(cx.listener(move |this, drag: &DragTab, _, cx| {
+                this.move_tab(drag.surface, index, cx);
+            }))
+    }
+
     /// The tabs, +, and the toggle at the right edge, in a row as tall as
     /// the title bar beside it.
     fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        let view = cx.entity().downgrade();
-        let menu_view = view.clone();
-        let tabs = self.tabs.iter().map(|tab| {
-            let surface = tab.surface();
-            // × replaces the icon while hovered, so the tab keeps its width.
-            let lead = if self.hovered == Some(surface) {
-                Button::new(SharedString::from(format!(
-                    "close-panel-tab-{}",
-                    surface.id()
-                )))
-                .ghost()
-                .xsmall()
-                .compact()
-                .icon(IconName::Close)
-                .accessibility_label("Close")
-                .tooltip("Close")
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    // Kit's Button passes the click on, and the tab's own
-                    // click would open the surface again.
-                    cx.stop_propagation();
-                    this.close(surface, cx);
-                }))
-                .into_any_element()
-            } else {
-                Icon::new(surface.icon()).small().into_any_element()
-            };
-            let view = view.clone();
-            Button::new(SharedString::from(format!("panel-tab-{}", surface.id())))
-                .flex_shrink_0()
-                .ghost()
-                .small()
-                .selected(self.active == Some(surface))
-                .accessibility_label(surface.label())
-                .child(
-                    h_flex()
-                        .size_4()
-                        .items_center()
-                        .justify_center()
-                        .child(lead),
-                )
-                .child(surface.label())
-                .on_hover(move |&hovered, _, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        if hovered {
-                            this.hover(surface, cx);
-                        } else {
-                            this.unhover(surface, cx);
-                        }
-                    });
-                })
-                .on_click(cx.listener(move |this, _, _, cx| this.open(surface, cx)))
-        });
+        let menu_view = cx.entity().downgrade();
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| self.render_tab(index, tab.surface(), cx));
         let unopened: Vec<Surface> = self.unopened().collect();
         h_flex()
             .flex_shrink_0()
