@@ -312,6 +312,23 @@ impl Harness {
         }
     }
 
+    /// A harness named `name` whose session's terminal runs its shell
+    /// and has the keyboard.
+    fn with_terminal(name: &'static str) -> Self {
+        let mut ui = Self::start(name, Script::default());
+        ui.click("new-session");
+        ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+        ui.send("background");
+        ui.wait_for_session("the session", |session| session.state() == &RunState::Idle);
+        ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+        ui.click("open-surface-terminal");
+        ui.wait_for_terminal("the shell's prompt", |lines| {
+            lines.iter().any(|line| line.starts_with('$'))
+        });
+        ui.click("terminal");
+        ui
+    }
+
     /// The right panel's terminal, once its shell runs.
     fn terminal(&mut self) -> Entity<TerminalView> {
         let app = self.app.clone();
@@ -320,12 +337,19 @@ impl Harness {
             .expect("the terminal's shell runs")
     }
 
+    /// The terminal's screen, a line a row.
+    fn terminal_lines(&mut self) -> Vec<String> {
+        let terminal = self.terminal();
+        self.cx
+            .update(|cx| terminal.update(cx, |terminal, _| terminal.text()))
+    }
+
     /// The row of the terminal's line `text`, and where its cell at
     /// `column` is drawn.
     fn terminal_cell(&mut self, text: &str, column: u16) -> (usize, Bounds<Pixels>) {
         let terminal = self.terminal();
+        let lines = self.terminal_lines();
         self.cx.update(|cx| {
-            let lines = terminal.update(cx, |terminal, _| terminal.text());
             let row = lines
                 .iter()
                 .position(|line| line == text)
@@ -338,12 +362,11 @@ impl Harness {
         })
     }
 
-    /// Clicks the terminal `count` times in a row at window position `at`.
-    fn click_terminal(&mut self, at: gpui_kit::Point<Pixels>, count: usize) {
+    /// Clicks the terminal as `options` say, at window position `at`.
+    fn click_terminal(&mut self, at: gpui_kit::Point<Pixels>, options: ClickOptions) {
         self.act(|window, cx| {
             let offset = at - window.find("terminal").bounds().origin;
-            let options = ClickOptions::new().with_offset(offset).with_count(count);
-            window.click_with_options("terminal", options, cx);
+            window.click_with_options("terminal", options.with_offset(offset), cx);
         });
     }
 
@@ -2268,22 +2291,12 @@ fn the_diff_surface_follows_the_sessions_changes() {
 /// The Terminal surface runs a shell in the session's folder: what the
 /// keyboard types reaches it once, what it prints shows, and the app's own
 /// shortcuts that the shell uses go to the shell. A drag or a double click
-/// selects what Ctrl+Shift+C copies; an input method's composing stays out
-/// of the shell until it commits; and a program that asks for the mouse
-/// gets a click as an escape sequence.
+/// selects what Ctrl+Shift+C copies and a middle click pastes; an input
+/// method's composing stays out of the shell until it commits; and a
+/// program that asks for the mouse gets a click as an escape sequence.
 #[test]
 fn the_terminal_surface_runs_a_shell() {
-    let mut ui = Harness::start("terminal", Script::default());
-    ui.click("new-session");
-    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
-    ui.send("background");
-    ui.wait_for_session("the session", |session| session.state() == &RunState::Idle);
-    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
-    ui.click("open-surface-terminal");
-    ui.wait_for_terminal("the shell's prompt", |lines| {
-        lines.iter().any(|line| line.starts_with('$'))
-    });
-    ui.click("terminal");
+    let mut ui = Harness::with_terminal("terminal");
     ui.act(|window, cx| {
         for key in ["e", "c", "h", "o", "space", "r", "h", "o", "enter"] {
             window.press(key, cx);
@@ -2319,10 +2332,16 @@ fn the_terminal_surface_runs_a_shell() {
         Some("rho"),
         "a selection goes to the primary selection"
     );
+    // A middle click pastes it at the prompt.
+    let middle = ClickOptions::new().with_button(MouseButton::Middle);
+    ui.click_terminal(first.center(), middle);
+    ui.wait_for_terminal("the middle click's paste", |lines| {
+        lines.iter().any(|line| line == "$ ^Brho")
+    });
 
     // A double click selects the word under it.
     let (_, echo) = ui.terminal_cell("$ echo rho", 3);
-    ui.click_terminal(echo.center(), 2);
+    ui.click_terminal(echo.center(), ClickOptions::new().with_count(2));
     assert_eq!(ui.copy_from_terminal().as_deref(), Some("echo"));
 
     // A dead key's accent, which the platform composes without an input
@@ -2338,7 +2357,7 @@ fn the_terminal_surface_runs_a_shell() {
 
     // An input method composes, then commits a command that turns on the
     // mouse for the program it runs, `cat`. Ctrl+U first: the line still
-    // holds the Ctrl+B and the é from above.
+    // holds the Ctrl+B, the pasted rho and the é from above.
     ui.act(|window, cx| window.press("ctrl-u", cx));
     ui.input_method(|input, cx| input.compose_text(None, "pr", None, cx));
     ui.shot("composing");
@@ -2354,7 +2373,7 @@ fn the_terminal_surface_runs_a_shell() {
     // and row, each plus 32 and counted from 1.
     let column = 4;
     let (row, target) = ui.terminal_cell("ready", column);
-    ui.click_terminal(target.center(), 1);
+    ui.click_terminal(target.center(), ClickOptions::new());
     let at = |n: usize| char::from(u8::try_from(33 + n).expect("a small grid"));
     let report = format!(
         "^[[M {x}{y}^[[M#{x}{y}",
@@ -2363,6 +2382,89 @@ fn the_terminal_surface_runs_a_shell() {
     );
     ui.wait_for_terminal("the click's report", |lines| lines.contains(&report));
     ui.shot("mouse");
+}
+
+/// A selection dragged past the terminal's top or bottom scrolls and
+/// selects on while the pointer rests there.
+#[test]
+fn a_terminal_selection_scrolls_past_its_edges() {
+    let mut ui = Harness::with_terminal("terminal-autoscroll");
+    ui.input_method(|input, cx| input.commit_text("seq 200", cx));
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_terminal("the numbers", |lines| {
+        lines.iter().any(|line| line == "200")
+    });
+    let numbers = |ui: &mut Harness| -> Vec<u32> {
+        let lines = ui.terminal_lines();
+        lines.iter().filter_map(|line| line.parse().ok()).collect()
+    };
+    let copied_numbers = |ui: &mut Harness| -> Vec<u32> {
+        let copied = ui.copy_from_terminal().expect("the drag selected");
+        copied
+            .lines()
+            .filter_map(|line| line.parse().ok())
+            .collect()
+    };
+    // Presses at the left of `number`'s line, drags to `to`, and holds the
+    // button there for ten ticks of the frames a shown terminal draws.
+    let drag_and_hold = |ui: &mut Harness, number: u32, to: Pixels| {
+        let (_, cell) = ui.terminal_cell(&number.to_string(), 0);
+        let from = cell.left_center() + gpui_kit::point(px(1.), px(0.));
+        let to = gpui_kit::point(from.x, to);
+        ui.act(|window, cx| {
+            window.pointer_down(from, MouseButton::Left, cx);
+            window.pointer_move(to, Some(MouseButton::Left), cx);
+        });
+        for _ in 0..10 {
+            ui.cx.advance_clock(Duration::from_millis(15));
+            ui.frame();
+        }
+        ui.act(|window, cx| window.pointer_up(to, MouseButton::Left, cx));
+    };
+
+    // Up, from the panel's tab bar above the terminal.
+    let top = numbers(&mut ui)[0];
+    drag_and_hold(&mut ui, top + 5, px(1.));
+    ui.shot("scrolled-up");
+    let first = copied_numbers(&mut ui)[0];
+    assert!(
+        first < top,
+        "the selection starts at {first}, not above {top}"
+    );
+
+    // Down, from the window's bottom edge below the terminal.
+    let shown = numbers(&mut ui);
+    let bottom = *shown.last().expect("numbers show");
+    drag_and_hold(&mut ui, shown[5], px(799.));
+    ui.shot("scrolled-down");
+    let last = *copied_numbers(&mut ui)
+        .last()
+        .expect("numbers were selected");
+    assert!(
+        last > bottom,
+        "the selection ends at {last}, not below {bottom}"
+    );
+
+    // Hidden mid-drag, the terminal stops scrolling soon after, where a
+    // second of ticks would scroll 66 rows.
+    let top = numbers(&mut ui)[0];
+    let (_, cell) = ui.terminal_cell(&(top + 5).to_string(), 0);
+    let above = gpui_kit::point(cell.center().x, px(1.));
+    ui.act(|window, cx| {
+        window.pointer_down(cell.center(), MouseButton::Left, cx);
+        window.pointer_move(above, Some(MouseButton::Left), cx);
+        window.press("ctrl-alt-b", cx);
+    });
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.act(|window, cx| {
+        window.pointer_up(above, MouseButton::Left, cx);
+        window.press("ctrl-alt-b", cx);
+    });
+    let scrolled = top - numbers(&mut ui)[0];
+    assert!(
+        scrolled <= 10,
+        "the hidden terminal scrolled {scrolled} rows"
+    );
 }
 
 /// Dragging the right panel's edge resizes it, as far as leaves the pane

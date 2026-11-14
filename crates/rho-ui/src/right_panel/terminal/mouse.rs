@@ -1,7 +1,9 @@
 //! The mouse in a terminal. A program that asked for the mouse gets its
 //! presses, releases, motion and wheel as escape sequences, from
-//! libghostty's encoder; otherwise, or with Shift held, the left button
-//! selects text through libghostty's selection gestures.
+//! libghostty's encoder. Otherwise, or with Shift held, the left button
+//! selects text through libghostty's selection gestures, scrolling while a
+//! drag is past the top or bottom, and the middle button pastes the
+//! primary selection.
 
 use std::time::{Duration, Instant};
 
@@ -12,7 +14,9 @@ use libghostty_vt::{
     error::Result,
     mouse::{self, EncoderSize},
     point::{self, Coordinate},
-    selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
+    selection::gesture::{
+        Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
+    },
     Terminal,
 };
 
@@ -21,6 +25,10 @@ use super::{fit, mods, Grid};
 /// Presses closer together than this count as a double or triple click:
 /// the default double-click time of Windows and of libghostty's example.
 const REPEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often a drag past the top or bottom scrolls a row: Ghostty's
+/// `selection_scroll_ms`.
+pub(super) const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(15);
 
 /// Pointer positions as libghostty takes them.
 impl Grid {
@@ -45,6 +53,20 @@ impl Grid {
         (
             scale(local.x, self.cell.width, width, self.columns),
             scale(local.y, self.cell.height, height, self.rows),
+        )
+    }
+
+    /// `position` as the selection gesture takes it: [`Self::surface`], but
+    /// past the bottom edge when below the grid, which is how the gesture
+    /// tells a drag to scroll down (it scrolls down only past
+    /// `screen_height - 1`; 0 already says up).
+    fn gesture_position(&self, position: Point<Pixels>) -> (f64, f64) {
+        let (x, y) = self.surface(position);
+        let bottom = self.bounds.origin.y + self.cell.height * f32::from(self.rows);
+        let below = f32::from(self.unit().1) * f32::from(self.rows);
+        (
+            f64::from(x),
+            f64::from(if position.y >= bottom { below } else { y }),
         )
     }
 
@@ -85,10 +107,13 @@ impl Grid {
 }
 
 /// What the button held down is doing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Held {
-    /// The left button, selecting text.
-    Selecting,
+    /// The left button, selecting text; `to` is where the drag last went
+    /// and the modifiers held, where autoscroll goes on selecting.
+    Selecting {
+        to: Option<(Point<Pixels>, Modifiers)>,
+    },
     /// A button whose press went to the program, as its release will.
     Reporting(MouseButton),
 }
@@ -96,10 +121,20 @@ enum Held {
 impl Held {
     fn button(self) -> MouseButton {
         match self {
-            Self::Selecting => MouseButton::Left,
+            Self::Selecting { .. } => MouseButton::Left,
             Self::Reporting(button) => button,
         }
     }
+}
+
+/// What a button's press asks of the terminal.
+#[derive(Debug)]
+pub(super) enum Pressed {
+    Nothing,
+    /// Bytes for the program.
+    Report(Vec<u8>),
+    /// Paste the primary selection, as a middle click does.
+    PastePrimary,
 }
 
 /// What a button's release did.
@@ -121,6 +156,7 @@ pub(super) struct Mouse {
     press: PressEvent<'static>,
     drag: DragEvent<'static>,
     release: ReleaseEvent<'static>,
+    tick: AutoscrollTickEvent<'static>,
     /// What press times count from, to tell double clicks.
     epoch: Instant,
     held: Option<Held>,
@@ -137,6 +173,7 @@ impl Mouse {
             press,
             drag: DragEvent::new()?,
             release: ReleaseEvent::new()?,
+            tick: AutoscrollTickEvent::new()?,
             epoch: Instant::now(),
             held: None,
         })
@@ -148,28 +185,51 @@ impl Mouse {
         self.held.is_some()
     }
 
-    /// Starts a selection, or reports the press to a program that tracks
-    /// the mouse; returns the bytes for the program.
+    /// Starts a selection or asks for a paste, or reports the press to a
+    /// program that tracks the mouse.
     pub(super) fn down(
         &mut self,
         terminal: &Terminal<'_, '_>,
         grid: &Grid,
         event: &MouseDownEvent,
-    ) -> Vec<u8> {
+    ) -> Pressed {
         let tracking = tracking(terminal);
-        if event.button == MouseButton::Left && (!tracking || event.modifiers.shift) {
-            self.held = Some(Held::Selecting);
-            let _ = self.select_press(terminal, grid, event.position);
-            return Vec::new();
-        }
-        let Some(button) = button_of(event.button).filter(|_| tracking) else {
-            return Vec::new();
+        let selecting = !tracking || event.modifiers.shift;
+        let button = match event.button {
+            MouseButton::Left if selecting => {
+                self.held = Some(Held::Selecting { to: None });
+                let _ = self.select_press(terminal, grid, event.position);
+                return Pressed::Nothing;
+            }
+            MouseButton::Middle if selecting => return Pressed::PastePrimary,
+            _ if !tracking => return Pressed::Nothing,
+            button => match button_of(button) {
+                Some(button) => button,
+                None => return Pressed::Nothing,
+            },
         };
         // The program owns the mouse now: no click sequence carries over.
         self.gesture.reset(terminal);
         self.held = Some(Held::Reporting(event.button));
         let (press, at) = (mouse::Action::Press, (event.position, event.modifiers));
-        self.report(terminal, grid, Some(button), press, at)
+        Pressed::Report(self.report(terminal, grid, Some(button), press, at))
+    }
+
+    /// Whether a selection drag is past the top or bottom, so the terminal
+    /// should scroll toward it every [`AUTOSCROLL_INTERVAL`].
+    /// The gesture knows: a release or a program's press ends it.
+    pub(super) fn autoscrolls(&self, terminal: &Terminal<'_, '_>) -> bool {
+        self.gesture
+            .autoscroll(terminal)
+            .is_ok_and(|autoscroll| autoscroll != Autoscroll::None)
+    }
+
+    /// Scrolls a row toward where the selection drag went past the grid,
+    /// and selects on to the row that brings under the pointer; returns
+    /// whether to go on.
+    pub(super) fn autoscroll(&mut self, terminal: &Terminal<'_, '_>, grid: &Grid) -> bool {
+        let _ = self.select_tick(terminal, grid);
+        self.autoscrolls(terminal)
     }
 
     /// Extends the selection, or reports motion to a program that tracks
@@ -189,7 +249,7 @@ impl Mouse {
                 // such as while it was hidden: its press ends now.
                 self.held = None;
                 match held {
-                    Held::Selecting => {
+                    Held::Selecting { .. } => {
                         let _ = self.release.apply(&mut self.gesture, terminal, None);
                         Vec::new()
                     }
@@ -199,7 +259,7 @@ impl Mouse {
                     }
                 }
             }
-            Some(Held::Selecting) => {
+            Some(Held::Selecting { .. }) => {
                 let _ = self.select_drag(terminal, grid, event);
                 Vec::new()
             }
@@ -221,7 +281,7 @@ impl Mouse {
         event: &MouseUpEvent,
     ) -> Released {
         match self.held {
-            Some(Held::Selecting) if event.button == MouseButton::Left => {
+            Some(Held::Selecting { .. }) if event.button == MouseButton::Left => {
                 self.held = None;
                 // A release past the grid still ends the gesture.
                 let at = terminal
@@ -273,15 +333,41 @@ impl Mouse {
         grid: &Grid,
         position: Point<Pixels>,
     ) -> Result<()> {
-        let (x, y) = grid.surface(position);
+        let (x, y) = grid.gesture_position(position);
         let at = terminal.grid_ref(point::Point::Viewport(grid.coordinate(position)))?;
         let selection = self
             .press
             .set_repeat_distance(f64::from(grid.unit().0))?
             .set_time(self.epoch.elapsed())?
-            .set_position(f64::from(x), f64::from(y))?
+            .set_position(x, y)?
             .apply(&mut self.gesture, terminal, at)?;
         terminal.set_selection(selection.as_ref())?;
+        Ok(())
+    }
+
+    fn select_tick(&mut self, terminal: &Terminal<'_, '_>, grid: &Grid) -> Result<()> {
+        let Some(Held::Selecting {
+            to: Some((position, modifiers)),
+        }) = self.held
+        else {
+            return Ok(());
+        };
+        let (x, y) = grid.gesture_position(position);
+        let selection = self
+            .tick
+            .set_rectangle(rectangle(modifiers))?
+            .set_position(x, y)?
+            .apply(
+                &mut self.gesture,
+                terminal,
+                grid.coordinate(position),
+                grid.geometry(),
+            )?;
+        // A gesture whose screen changed under it ends, leaving the
+        // selection be.
+        if self.gesture.click_count(terminal)? > 0 {
+            terminal.set_selection(selection.as_ref())?;
+        }
         Ok(())
     }
 
@@ -291,12 +377,15 @@ impl Mouse {
         grid: &Grid,
         event: &MouseMoveEvent,
     ) -> Result<()> {
-        let (x, y) = grid.surface(event.position);
+        if let Some(Held::Selecting { to }) = &mut self.held {
+            *to = Some((event.position, event.modifiers));
+        }
+        let (x, y) = grid.gesture_position(event.position);
         let at = terminal.grid_ref(point::Point::Viewport(grid.coordinate(event.position)))?;
         let selection = self
             .drag
             .set_rectangle(rectangle(event.modifiers))?
-            .set_position(f64::from(x), f64::from(y))?
+            .set_position(x, y)?
             .apply(&mut self.gesture, terminal, at, grid.geometry())?;
         terminal.set_selection(selection.as_ref())?;
         Ok(())
@@ -410,7 +499,9 @@ mod tests {
                 click_count: 1,
                 first_mouse: false,
             };
-            let report = mouse.down(&terminal, &grid, &press);
+            let Pressed::Report(report) = mouse.down(&terminal, &grid, &press) else {
+                panic!("a press at ({x}, {y}) went unreported");
+            };
             let release = MouseUpEvent {
                 button: MouseButton::Left,
                 position: press.position,

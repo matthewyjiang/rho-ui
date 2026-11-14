@@ -10,8 +10,9 @@
 //! open, and kept until the surface closes.
 //!
 //! The mouse goes to a program that asks for it, such as vim or htop, and
-//! otherwise selects text ([`mouse`]); Ctrl+Shift+C copies the selection,
-//! and a selection also goes to the primary selection. Text an input method
+//! otherwise selects text ([`mouse`]), scrolling while a drag is past the
+//! top or bottom. Ctrl+Shift+C copies the selection; a selection also goes
+//! to the primary selection, which a middle click pastes. Text an input method
 //! commits goes to the shell as typed, and what it composes shows at the
 //! cursor until then ([`EntityInputHandler`]).
 
@@ -53,7 +54,7 @@ use libghostty_vt::{
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-use self::mouse::{Mouse, Released};
+use self::mouse::{Mouse, Pressed, Released};
 use crate::{
     folders::Reader,
     machines::{Place, SessionKey},
@@ -77,6 +78,11 @@ impl TerminalShell {
 /// The terminal type the shell is told. Ghostty's own, `xterm-ghostty`,
 /// isn't installed on most machines, a remote one least of all.
 const TERM: &str = "xterm-256color";
+
+/// Autoscroll ticks in a row with no frame drawn, after which the terminal
+/// counts as hidden: 8 ticks of 15 ms is 120 ms, where a shown terminal,
+/// notified each tick, draws every 16.7 ms at 60 Hz.
+const HIDDEN_AFTER_TICKS: u8 = 8;
 
 /// Lines kept above the screen.
 const SCROLLBACK_LINES: usize = 10_000;
@@ -236,6 +242,10 @@ pub(crate) struct TerminalView {
     colors: Option<(Rgb, Rgb)>,
     /// Wheel movement short of a line.
     scrolled: Pixels,
+    /// Scrolls while a selection drag is past the top or bottom.
+    autoscroll: Option<Task<()>>,
+    /// Autoscroll ticks since the grid was last drawn.
+    undrawn_ticks: u8,
     exited: bool,
     focus: FocusHandle,
     /// Feeds the terminal what the reader thread reads; dropped with it.
@@ -312,6 +322,8 @@ impl TerminalView {
             marked: None,
             colors: None,
             scrolled: Pixels::ZERO,
+            autoscroll: None,
+            undrawn_ticks: 0,
             exited: false,
             focus: cx.focus_handle(),
             reader: Task::ready(()),
@@ -381,7 +393,10 @@ impl TerminalView {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
         if modifiers.control && modifiers.shift && keystroke.key == "v" {
-            self.paste(cx);
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.paste(text);
+            }
+            cx.stop_propagation();
             return;
         }
         if modifiers.control && modifiers.shift && keystroke.key == "c" {
@@ -431,11 +446,8 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Pastes the clipboard's text, bracketed if the program asked.
-    fn paste(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
-        };
+    /// Pastes `text`, bracketed if the program asked.
+    fn paste(&mut self, text: String) {
         let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
         let mut data = text.into_bytes();
         let mut buffer = vec![0; data.len() + 16];
@@ -443,7 +455,6 @@ impl TerminalView {
             buffer.truncate(written);
             self.send(&buffer);
         }
-        cx.stop_propagation();
     }
 
     /// Sends the wheel to a program that tracks the mouse, or scrolls back.
@@ -484,8 +495,15 @@ impl TerminalView {
         let Some(grid) = self.layout else {
             return;
         };
-        let bytes = self.mouse.down(&self.terminal, &grid, event);
-        self.write(&bytes);
+        match self.mouse.down(&self.terminal, &grid, event) {
+            Pressed::Nothing => {}
+            Pressed::Report(bytes) => self.write(&bytes),
+            Pressed::PastePrimary => {
+                if let Some(text) = read_primary(cx) {
+                    self.paste(text);
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -499,8 +517,44 @@ impl TerminalView {
         let bytes = self.mouse.moved(&self.terminal, &grid, event);
         self.write(&bytes);
         if held {
+            self.follow_autoscroll(cx);
             cx.notify();
         }
+    }
+
+    /// Starts scrolling a row every [`mouse::AUTOSCROLL_INTERVAL`] while a
+    /// selection drag is past the top or bottom, as the pointer may sit
+    /// still there.
+    fn follow_autoscroll(&mut self, cx: &mut Context<'_, Self>) {
+        if self.autoscroll.is_some() || !self.mouse.autoscrolls(&self.terminal) {
+            return;
+        }
+        self.autoscroll = Some(cx.spawn(async move |view, cx| loop {
+            cx.background_executor()
+                .timer(mouse::AUTOSCROLL_INTERVAL)
+                .await;
+            let more = view.update(cx, TerminalView::autoscroll_tick);
+            if !more.unwrap_or(false) {
+                break;
+            }
+        }));
+    }
+
+    /// One tick of [`Self::follow_autoscroll`]; returns whether to go on,
+    /// and drops the task when not. A terminal that stops being drawn,
+    /// hidden mid-drag, stops scrolling: its button may come up unseen.
+    fn autoscroll_tick(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        self.undrawn_ticks = self.undrawn_ticks.saturating_add(1);
+        let shown = self.undrawn_ticks <= HIDDEN_AFTER_TICKS;
+        let more = shown
+            && self
+                .layout
+                .is_some_and(|grid| self.mouse.autoscroll(&self.terminal, &grid));
+        cx.notify();
+        if !more {
+            self.autoscroll = None;
+        }
+        more
     }
 
     /// Ends a press, wherever the button comes up: the paint listener
@@ -512,27 +566,19 @@ impl TerminalView {
         match self.mouse.up(&self.terminal, &grid, event) {
             Released::Nothing => return,
             Released::Report(bytes) => self.write(&bytes),
-            Released::Selection => self.write_primary(cx),
+            Released::Selection => {
+                if let Some(text) = self.selected_text() {
+                    write_primary(text, cx);
+                }
+            }
         }
         cx.notify();
     }
 
-    /// Puts the selection in the primary selection, for a middle click
-    /// elsewhere.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    fn write_primary(&self, cx: &App) {
-        if let Some(text) = self.selected_text() {
-            cx.write_to_primary(ClipboardItem::new_string(text));
-        }
-    }
-
-    /// Only Linux and FreeBSD have a primary selection.
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    fn write_primary(&self, _: &App) {}
-
     /// Records where the grid is drawn, and tells the terminal and the
     /// shell when the grid that fits the panel changes.
     fn resize(&mut self, layout: Grid) {
+        self.undrawn_ticks = 0;
         let size = |grid: &Grid| (grid.columns, grid.rows, grid.unit());
         let resized = self.layout.is_none_or(|last| size(&last) != size(&layout));
         self.layout = Some(layout);
@@ -998,6 +1044,27 @@ fn mods(modifiers: Modifiers) -> key::Mods {
         }
     }
     mods
+}
+
+// The primary selection: what a selection puts there, and a middle click
+// pastes. Only Linux and FreeBSD have one; elsewhere these do nothing.
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn write_primary(text: String, cx: &App) {
+    cx.write_to_primary(ClipboardItem::new_string(text));
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn read_primary(cx: &App) -> Option<String> {
+    cx.read_from_primary().and_then(|item| item.text())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn write_primary(_: String, _: &App) {}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn read_primary(_: &App) -> Option<String> {
+    None
 }
 
 /// How many whole cells fit, at least one.
