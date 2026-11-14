@@ -27,7 +27,6 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::Alert,
-    avatar::Avatar,
     button::{Button, ButtonVariant, ButtonVariants as _},
     description_list::DescriptionList,
     empty::{Empty, EmptyDescription, EmptyHeader},
@@ -48,6 +47,7 @@ use gpui_kit::{
 use rho_ui_core::{Job, SessionSummary};
 
 use crate::{
+    badge::Badge,
     machines::{MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
     session_list::{Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList},
@@ -1118,14 +1118,9 @@ fn workspace_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
         )
 }
 
-/// A workspace's initials, in colors Kit picks from them.
-pub(crate) fn badge(initials: SharedString) -> Avatar {
-    Avatar::new()
-        .name(initials)
-        .xsmall()
-        // In rems, so it follows the UI scale; square like a workspace tile.
-        .size(rems(LINE_REMS))
-        .rounded(rems(0.25))
+/// A workspace's badge, a line of the sidebar's text tall.
+fn badge(initials: SharedString) -> Badge {
+    Badge::new(initials, rems(LINE_REMS))
 }
 
 /// The widest age [`time::relative_age`] gives below a year, in the rows'

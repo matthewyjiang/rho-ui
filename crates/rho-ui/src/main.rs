@@ -8,6 +8,7 @@ mod app;
 mod attachments;
 mod background;
 mod background_log;
+mod badge;
 mod composer;
 mod draft;
 mod figures;

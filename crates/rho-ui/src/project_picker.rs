@@ -38,11 +38,10 @@ use gpui_kit::{
 use rho_ui_core::Checkout;
 
 use crate::{
+    badge::Badge,
     machines::{MachineId, Machines, Place},
     projects::Projects,
-    repo,
-    sidebar::badge,
-    time,
+    repo, time,
     workspaces::{self, Workspace, Workspaces},
 };
 
@@ -684,9 +683,7 @@ impl ProjectList {
             }))
             .child(
                 row(
-                    badge(workspace.initials.clone())
-                        .size(rems(1.75))
-                        .into_any_element(),
+                    Badge::new(workspace.initials.clone(), rems(1.75)).into_any_element(),
                     workspace.name.clone(),
                     path,
                     cx,

@@ -8,13 +8,13 @@
 //! no way to find them; this bar uses slashes, and tests find each step.
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{h_flex, ActiveTheme as _, Sizable as _, StyledExt as _};
+use gpui_kit::component::{h_flex, ActiveTheme as _, StyledExt as _};
 use gpui_kit::{
     div, rems, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
 };
 
-use crate::{sidebar::badge, workspaces::Workspace};
+use crate::{badge::Badge, workspaces::Workspace};
 
 /// The height of the window's top row, in rems: this bar, and the
 /// sidebar's top row beside it, so the two line up and grow with the UI
@@ -124,12 +124,7 @@ impl RenderOnce for TitleBar {
                         h_flex()
                             .flex_shrink_0()
                             .gap_2()
-                            .child(
-                                badge(self.initials)
-                                    .small()
-                                    .size(rems(BADGE_REMS))
-                                    .rounded(rems(0.3125)),
-                            )
+                            .child(Badge::new(self.initials, rems(BADGE_REMS)))
                             .child(div().text_color(muted).child(self.project)),
                     )
                     .child(slash())
