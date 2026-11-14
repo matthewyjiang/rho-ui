@@ -391,10 +391,10 @@ impl RhoApp {
             };
             window.push_notification(Notification::warning(notice.to_owned()).title(title), cx);
         }
-        if let (false, Some(home)) = (machine.is_local(), info.home()) {
-            let home = home.to_path_buf();
-            self.workspaces
-                .update(cx, |workspaces, cx| workspaces.set_home(machine, home, cx));
+        if !machine.is_local() {
+            self.workspaces.update(cx, |workspaces, cx| {
+                workspaces.connected(machine, &daemon, cx);
+            });
         }
         let status = MachineStatus::Ready {
             version: format!("rho {}", info.version()).into(),
@@ -439,6 +439,8 @@ impl RhoApp {
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
         }
+        self.workspaces
+            .update(cx, |workspaces, _| workspaces.disconnected(machine));
         self.set_status(machine, MachineStatus::Failed(error.to_string().into()), cx);
         cx.notify();
     }

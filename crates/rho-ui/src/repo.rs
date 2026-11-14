@@ -1,7 +1,12 @@
-//! What a session's workspace is: project name and branch, read straight from
-//! `.git` files. No `git` process, no git library.
+//! What a session's workspace is: project name and branch. On this machine,
+//! read straight from `.git` files: no `git` process, no git library. On a
+//! remote machine, from [`REMOTE_SCRIPT`], which runs `git` there.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    os::unix::ffi::OsStringExt as _,
+    path::{Path, PathBuf},
+};
 
 /// A workspace's project, as the sidebar shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,29 +78,90 @@ pub(crate) fn inspect(cwd: &Path) -> Repo {
         .map(|dir| git_dir.join(dir.trim()))
         .and_then(|dir| dir.canonicalize().ok())
         .unwrap_or_else(|| git_dir.clone());
-    let name = std::fs::read_to_string(common_dir.join("config"))
+    let origin = std::fs::read_to_string(common_dir.join("config"))
         .ok()
-        .and_then(|config| origin_name(&config))
-        .or_else(|| {
-            // Name a linked worktree after its main checkout, not its folder.
-            common_dir
-                .parent()
-                .filter(|_| common_dir.file_name().is_some_and(|name| name == ".git"))
-                .or(Some(work_tree.as_path()))
-                .and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| folder_name(cwd));
-    let branch = std::fs::read_to_string(git_dir.join("HEAD"))
-        .ok()
-        .and_then(|head| branch_name(&head));
+        .and_then(|config| origin_name(&config));
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok();
+    checkout(work_tree, &common_dir, origin, head.as_deref())
+}
+
+/// The project of a checkout at `work_tree`, whose repository keeps what
+/// all its worktrees share in `common_dir`. `origin` names the repository;
+/// without it, the project is named after its main checkout's folder, so a
+/// linked worktree is not named after its own. `head` is what its `HEAD`
+/// file holds.
+fn checkout(
+    work_tree: PathBuf,
+    common_dir: &Path,
+    origin: Option<String>,
+    head: Option<&str>,
+) -> Repo {
     // The main checkout holds the common dir as its `.git`. A bare
     // repository has no main checkout, so its worktree stands alone.
     let root = common_dir
         .parent()
         .filter(|_| common_dir.file_name().is_some_and(|name| name == ".git"))
         .map_or(work_tree, Path::to_path_buf);
-    Repo { name, branch, root }
+    Repo {
+        name: origin.unwrap_or_else(|| folder_name(&root)),
+        branch: head.and_then(branch_name),
+        root,
+    }
+}
+
+/// The POSIX `sh` script that reads the repositories of the folders given
+/// as its arguments, on a remote machine with `git`. For each, it prints
+/// four fields, each ended by a NUL: the work tree root, the common git
+/// dir, what `HEAD` holds (as its file would), and the origin remote's URL.
+/// All four are empty outside a git repository. Read with [`parse_remote`].
+pub(crate) const REMOTE_SCRIPT: &str = r#"unset CDPATH
+for dir do
+  if top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+    common=$(cd "$dir" && cd "$(git rev-parse --git-common-dir)" && pwd -P)
+    if ref=$(git -C "$dir" symbolic-ref -q HEAD); then
+      head="ref: $ref"
+    else
+      head=$(git -C "$dir" rev-parse -q --verify HEAD)
+    fi
+    url=$(git -C "$dir" config --get remote.origin.url)
+  else
+    top= common= head= url=
+  fi
+  printf '%s\0%s\0%s\0%s\0' "$top" "$common" "$head" "$url"
+done
+"#;
+
+/// The projects of `dirs`, from what [`REMOTE_SCRIPT`] printed for them.
+/// `None` if it printed the wrong number of fields.
+pub(crate) fn parse_remote(dirs: &[PathBuf], output: &[u8]) -> Option<Vec<Repo>> {
+    let fields: Vec<&[u8]> = output.split(|&byte| byte == 0).collect();
+    // Each field ends with a NUL, so splitting leaves one empty piece last.
+    let (last, fields) = fields.split_last()?;
+    let (facts, []) = fields.as_chunks::<4>() else {
+        return None;
+    };
+    if !last.is_empty() || facts.len() != dirs.len() {
+        return None;
+    }
+    let path = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    let text =
+        |bytes: &[u8]| (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned());
+    let repos = dirs
+        .iter()
+        .zip(facts)
+        .map(|(dir, [top, common, head, url])| {
+            if top.is_empty() || common.is_empty() {
+                return folder(dir);
+            }
+            checkout(
+                path(top),
+                &path(common),
+                text(url).as_deref().and_then(url_name),
+                text(head).as_deref(),
+            )
+        })
+        .collect();
+    Some(repos)
 }
 
 /// The work tree root and git dir for `start`, searching upward. `.git` is a
@@ -258,5 +324,77 @@ mod tests {
             }
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// [`REMOTE_SCRIPT`], run with this machine's `git`, names each folder's
+    /// project as reading its `.git` files here does: a main checkout with
+    /// an origin, a linked worktree of it, a detached checkout, a folder
+    /// outside any repository, and one that isn't there.
+    #[test]
+    fn the_remote_script_agrees_with_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main", "main"]);
+        git(&[
+            "-C",
+            "main",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:me/thing.git",
+        ]);
+        git(&["-C", "main", "commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&[
+            "-C",
+            "main",
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            "../it's a tree",
+        ]);
+        git(&[
+            "-C",
+            "main",
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            "../detached",
+        ]);
+        std::fs::create_dir(dir.join("plain")).unwrap();
+        let dirs: Vec<PathBuf> = ["main", "it's a tree", "detached", "plain", "gone"]
+            .iter()
+            .map(|name| dir.join(name))
+            .collect();
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(REMOTE_SCRIPT)
+            .arg("sh")
+            .args(&dirs)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let remote = parse_remote(&dirs, &output.stdout).expect("four fields a folder");
+
+        let local: Vec<Repo> = dirs.iter().map(|dir| inspect(dir)).collect();
+        assert_eq!(remote, local);
+        assert_eq!(remote[1].name, "me/thing");
+        assert_eq!(remote[1].branch.as_deref(), Some("feat"));
+        assert_eq!(remote[1].root, dir.join("main"));
+        assert_eq!(remote[3], folder(&dirs[3]));
     }
 }

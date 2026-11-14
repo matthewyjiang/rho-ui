@@ -40,7 +40,7 @@ use crate::{
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
     prompt::{mebibytes, Prompt},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
-    ssh::{self, SshTarget},
+    ssh::{self, SshLink, SshTarget},
 };
 
 /// How to reach the daemon.
@@ -417,6 +417,7 @@ pub struct Daemon {
     /// What every request that carries an environment sends, which rho
     /// makes the session's whole process environment.
     environment: Arc<ClientEnvironment>,
+    ssh: Option<SshLink>,
 }
 
 /// The machine the daemon runs on, as the sessions this client opens see it.
@@ -426,6 +427,8 @@ pub(crate) struct Machine {
     pub(crate) environment: ClientEnvironment,
     /// The home directory there.
     pub(crate) home: Option<PathBuf>,
+    /// How to run commands there, for a remote machine.
+    pub(crate) ssh: Option<SshLink>,
 }
 
 impl Machine {
@@ -436,6 +439,7 @@ impl Machine {
             home: std::env::var_os("HOME")
                 .filter(|home| !home.is_empty())
                 .map(PathBuf::from),
+            ssh: None,
         }
     }
 }
@@ -460,7 +464,7 @@ const _: () = {
 /// kept for the life of the process. One worker: the work is one socket's
 /// reads and writes, and `LocalDaemon` waiting on `rho daemon start`, or
 /// the ssh commands that reach a daemon on another machine.
-fn io() -> &'static Runtime {
+pub(crate) fn io() -> &'static Runtime {
     static IO: OnceLock<Runtime> = OnceLock::new();
     IO.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -507,6 +511,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         client: Arc::new(client),
         info: Arc::new(info),
         environment: Arc::new(machine.environment),
+        ssh: machine.ssh,
     };
     let events = DaemonEvents { notifications };
     Ok((daemon, events))
@@ -544,6 +549,11 @@ impl Daemon {
     /// Who answered `rho/hello`.
     pub fn info(&self) -> &DaemonInfo {
         &self.info
+    }
+
+    /// The ssh link to the daemon's machine, for a remote one.
+    pub fn ssh(&self) -> Option<&SshLink> {
+        self.ssh.as_ref()
     }
 
     /// Saved sessions in every workspace, newest first.
