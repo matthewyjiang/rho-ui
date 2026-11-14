@@ -108,8 +108,7 @@ gpui_kit::assets::icon_assets!(
         Server,
         Layers,
         Timer,
-        SkipForward,
-        SlidersHorizontal
+        SkipForward
     ]
 );
 

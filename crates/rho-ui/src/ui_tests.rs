@@ -3223,7 +3223,7 @@ fn a_machine_added_in_settings_lists_its_sessions() {
         .update(|cx| assert!(cx.global::<Settings>().machines.is_empty()));
 }
 
-/// rho's own settings show as pages drawn from its daemon's schema. A
+/// rho's own settings show as a page drawn from its daemon's schema. A
 /// switch flipped there changes the daemon's `config.toml`, and a hand
 /// edit of the file shows up on the open page.
 #[test]
@@ -3237,7 +3237,7 @@ fn rho_settings_write_and_follow_the_daemon() {
         Projects::default(),
     );
     open_settings(&mut ui);
-    open_settings_page(&mut ui, "General");
+    open_settings_page(&mut ui, "rho");
     let compact = "setting-general.auto_compact";
     let switch_is = |on: bool| {
         move |window: &Window, _: &App, _: &RhoApp| {

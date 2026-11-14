@@ -1,5 +1,5 @@
-//! rho's own settings: a page for each category the chosen machine's daemon
-//! describes, drawn from its schema alone, so a setting rho adds shows up
+//! rho's own settings: one page with a group for each category the chosen
+//! machine's daemon describes, drawn from its schema alone, so a setting rho adds shows up
 //! with no change here. Each item is the setting's label, its help and when
 //! a change applies, and a control for its kind: a switch, a dropdown of
 //! choices, a number or text box (applied on Enter or when it loses the
@@ -8,7 +8,7 @@
 //! page's reset button.
 //!
 //! Every machine has its own `config.toml`. With more than one machine, a
-//! picker heads each page; this machine shows first. One that can't be
+//! picker heads the page; this machine shows first. One that can't be
 //! reached says so instead of showing settings.
 
 use gpui_kit::assets::IconName as Lucide;
@@ -20,13 +20,14 @@ use gpui_kit::component::{
     v_flex, ActiveTheme as _, Sizable as _,
 };
 use gpui_kit::{
-    div, rems, App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _,
-    ParentElement as _, SharedString, Styled as _, Subscription, WeakEntity, Window,
+    div, rems, App, AppContext as _, Context, Entity, Focusable as _, FontWeight,
+    InteractiveElement as _, ParentElement as _, SharedString, Styled as _, Subscription,
+    WeakEntity, Window,
 };
 use rho_ui_core::{
     agent_settings::{
-        Applies, IntegerUnit, ModelSelection, SettingChange, SettingKey, SettingKind, SettingSpec,
-        SettingValue,
+        Applies, ConfigCategory, IntegerUnit, ModelSelection, SettingChange, SettingKey,
+        SettingKind, SettingSpec, SettingValue,
     },
     AgentSettings,
 };
@@ -248,13 +249,14 @@ impl SettingsView {
         }
     }
 
-    /// rho's settings pages for the shown machine: one per category of its
-    /// schema, or until they can show, one page that says why.
-    pub(super) fn rho_pages(
+    /// rho's settings page for the shown machine: the machine picker and
+    /// notes, then a group per category of its schema, or until they can
+    /// show, what stops them.
+    pub(super) fn rho_page(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-    ) -> Vec<SettingPage> {
+    ) -> SettingPage {
         let machine = self.rho_machine(cx);
         // The boxes follow the machine picked since the last draw.
         if self.rho.inputs_for.as_ref() != Some(&machine) {
@@ -290,12 +292,11 @@ impl SettingsView {
             Ok(settings) => settings,
             Err(why) => {
                 notes.push(Note::Status(why));
-                let header = header_group(picker, notes);
-                return vec![rho_page("rho").groups(header)];
+                return rho_page().groups(header_group(picker, notes));
             }
         };
 
-        let pages: Vec<(SharedString, Vec<&SettingSpec>)> = settings
+        let categories: Vec<(&ConfigCategory, Vec<&SettingSpec>)> = settings
             .categories()
             .iter()
             .map(|category| {
@@ -303,28 +304,53 @@ impl SettingsView {
                     .settings(&category.id)
                     .filter(|spec| has_control(&spec.kind))
                     .collect();
-                (SharedString::from(category.label.clone()), shown)
+                (category, shown)
             })
             .filter(|(_, shown)| !shown.is_empty())
             .collect();
-        notes.extend(file_notes(settings, &pages));
-        let header = header_group(picker, notes);
-        pages
+        notes.extend(file_notes(settings, &categories));
+        let groups = categories
             .into_iter()
-            .map(|(title, shown)| {
-                let items = shown.into_iter().filter_map(|spec| {
-                    let setting = SettingRef {
-                        settings: self.rho.settings.clone(),
-                        machine: machine.clone(),
-                        key: spec.key.clone(),
-                    };
-                    self.setting_item(spec, settings, setting)
-                });
-                rho_page(title)
-                    .groups(header.clone())
-                    .groups(section_groups(items))
-            })
-            .collect()
+            .map(|(category, shown)| self.category_group(category, shown, settings, &machine))
+            .collect::<Vec<_>>();
+        rho_page()
+            .groups(header_group(picker, notes))
+            .groups(groups)
+    }
+
+    /// The group of `category`'s settings `shown`: those outside a section
+    /// first, then each section under its heading, in the order the schema
+    /// first names it.
+    fn category_group(
+        &self,
+        category: &ConfigCategory,
+        shown: Vec<&SettingSpec>,
+        settings: &AgentSettings,
+        machine: &MachineId,
+    ) -> SettingGroup {
+        let mut sections: Vec<(Option<&str>, Vec<&SettingSpec>)> = vec![(None, Vec::new())];
+        for spec in shown {
+            let section = spec.section.as_deref();
+            match sections.iter_mut().find(|(name, _)| *name == section) {
+                Some((_, specs)) => specs.push(spec),
+                None => sections.push((section, vec![spec])),
+            }
+        }
+        let mut group = SettingGroup::new().title(category.label.clone());
+        for (section, specs) in sections {
+            if let Some(title) = section {
+                group = group.item(section_heading(title, &specs));
+            }
+            group = group.items(specs.into_iter().filter_map(|spec| {
+                let setting = SettingRef {
+                    settings: self.rho.settings.clone(),
+                    machine: machine.clone(),
+                    key: spec.key.clone(),
+                };
+                self.setting_item(spec, settings, setting)
+            }));
+        }
+        group
     }
 
     /// The item for `spec`: its label, what it does and when a change
@@ -335,7 +361,7 @@ impl SettingsView {
         spec: &SettingSpec,
         settings: &AgentSettings,
         setting: SettingRef,
-    ) -> Option<(Option<String>, SettingItem)> {
+    ) -> Option<SettingItem> {
         let reset = setting.clone();
         let dirty = setting.clone();
         let field = match &spec.kind {
@@ -413,9 +439,7 @@ impl SettingsView {
             _ => return None,
         }
         .on_reset(move |cx| dirty.is_set(cx), move |_, cx| reset.reset(cx));
-        let item =
-            SettingItem::new(spec.label.clone(), field).description(description(spec, settings));
-        Some((spec.section.clone(), item))
+        Some(SettingItem::new(spec.label.clone(), field).description(description(spec, settings)))
     }
 
     /// The text box of setting `key`, once [`Self::sync_rho_inputs`] made
@@ -429,18 +453,21 @@ impl SettingsView {
     }
 }
 
-/// What a page says of the problems in the file that no item on `pages`
-/// names, as an item names its own.
-fn file_notes(settings: &AgentSettings, pages: &[(SharedString, Vec<&SettingSpec>)]) -> Vec<Note> {
-    let on_a_page = |key: &SettingKey| {
-        pages
+/// What the page says of the problems in the file that no item shown in
+/// `categories` names, as an item names its own.
+fn file_notes(
+    settings: &AgentSettings,
+    categories: &[(&ConfigCategory, Vec<&SettingSpec>)],
+) -> Vec<Note> {
+    let shown = |key: &SettingKey| {
+        categories
             .iter()
             .any(|(_, shown)| shown.iter().any(|spec| spec.key == *key))
     };
     settings
         .errors()
         .iter()
-        .filter(|error| !error.key.as_ref().is_some_and(on_a_page))
+        .filter(|error| !error.key.as_ref().is_some_and(shown))
         .map(|error| {
             let place = error
                 .key
@@ -455,11 +482,30 @@ fn file_notes(settings: &AgentSettings, pages: &[(SharedString, Vec<&SettingSpec
         .collect()
 }
 
-/// A rho settings page titled `title`.
-fn rho_page(title: impl Into<SharedString>) -> SettingPage {
-    SettingPage::new(title)
-        .icon(Lucide::SlidersHorizontal)
+/// The rho settings page, before its groups.
+fn rho_page() -> SettingPage {
+    SettingPage::new("rho")
+        .icon(Lucide::Bot)
+        .default_open(true)
         .header_style(&page_header())
+}
+
+/// The heading of section `title` within its category's group. It shows
+/// in a search that finds any of its settings `specs`.
+fn section_heading(title: &str, specs: &[&SettingSpec]) -> SettingItem {
+    let title = SharedString::from(title.to_owned());
+    let keywords = specs
+        .iter()
+        .flat_map(|spec| [spec.label.clone(), spec.help.clone()]);
+    SettingItem::render(move |_, _, cx| {
+        div()
+            .pt_2()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(cx.theme().muted_foreground)
+            .child(title.clone())
+    })
+    .keywords(keywords)
 }
 
 /// Whether this app has a control for settings of `kind`.
@@ -474,30 +520,7 @@ fn has_control(kind: &SettingKind) -> bool {
     )
 }
 
-/// `items` in groups by section: those without one first, untitled, then
-/// each section under its heading, in the order the schema first names it.
-fn section_groups(items: impl Iterator<Item = (Option<String>, SettingItem)>) -> Vec<SettingGroup> {
-    let mut sections: Vec<(Option<String>, Vec<SettingItem>)> = vec![(None, Vec::new())];
-    for (section, item) in items {
-        match sections.iter_mut().find(|(name, _)| *name == section) {
-            Some((_, group)) => group.push(item),
-            None => sections.push((section, vec![item])),
-        }
-    }
-    sections
-        .into_iter()
-        .filter(|(_, items)| !items.is_empty())
-        .map(|(section, items)| {
-            let group = SettingGroup::new().items(items);
-            match section {
-                Some(title) => group.title(title),
-                None => group,
-            }
-        })
-        .collect()
-}
-
-/// What heads every rho page: the machine picker, and what to say about
+/// What heads the rho page: the machine picker, and what to say about
 /// the machine's settings. Nothing when there is neither.
 fn header_group(picker: Option<SettingItem>, notes: Vec<Note>) -> Option<SettingGroup> {
     if picker.is_none() && notes.is_empty() {

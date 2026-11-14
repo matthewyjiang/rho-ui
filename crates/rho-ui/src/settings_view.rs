@@ -344,7 +344,7 @@ impl Render for SettingsView {
                 ]),
             );
         let machines = self.machines_page(cx);
-        let rho_pages = self.rho_pages(window, cx);
+        let rho = self.rho_page(window, cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
         // corners, since the dialog has no padding to keep it inside.
@@ -363,7 +363,7 @@ impl Render for SettingsView {
                     .with_group_variant(GroupBoxVariant::Fill)
                     .page(appearance)
                     .page(machines)
-                    .pages(rho_pages),
+                    .page(rho),
             )
     }
 }
