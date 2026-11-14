@@ -3,7 +3,6 @@
 //! where that machine's rho home puts it. The live test runs the real `ssh`.
 
 use std::{
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
 };
@@ -60,9 +59,22 @@ cd '{home}' && exec env -i HOME='{home}' PATH='{bin}:/usr/bin:/bin' SHELL=/bin/s
     )
 }
 
+/// Writes the program `text` to `path`, runnable, from a child process. A
+/// handle written through here would leak into the processes other tests
+/// spawn meanwhile, until they exec, and running the file then fails with
+/// "Text file busy" (ETXTBSY).
 fn write_program(path: &Path, text: &str) {
-    std::fs::write(path, text).expect("the program is written");
-    std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).expect("chmod");
+    let status = Command::new("sh")
+        .args([
+            "-c",
+            r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#,
+            "sh",
+            text,
+        ])
+        .arg(path)
+        .status()
+        .expect("sh runs");
+    assert!(status.success(), "writing {} failed", path.display());
 }
 
 fn have_python() -> bool {

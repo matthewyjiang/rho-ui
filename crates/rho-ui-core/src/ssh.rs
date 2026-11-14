@@ -571,9 +571,27 @@ fn is_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, process::Command};
+    use std::process::Command;
 
     use super::*;
+
+    /// Writes the program `text` to `path`, runnable, from a child process. A
+    /// handle written through here would leak into the processes other tests
+    /// spawn meanwhile, until they exec, and running the file then fails with
+    /// "Text file busy" (ETXTBSY).
+    fn write_program(path: &Path, text: &str) {
+        let status = Command::new("sh")
+            .args([
+                "-c",
+                r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#,
+                "sh",
+                text,
+            ])
+            .arg(path)
+            .status()
+            .expect("sh runs");
+        assert!(status.success(), "writing {} failed", path.display());
+    }
 
     fn vars(environment: ClientEnvironment) -> Vec<(String, String)> {
         environment.into_iter().collect()
@@ -598,13 +616,10 @@ mod tests {
             ),
         ] {
             let program = dir.path().join(format!("ssh-{name}"));
-            std::fs::write(
+            write_program(
                 &program,
-                format!("#!/bin/sh\ncase \"$*\" in *-O*) exit 255 ;; esac\n{master}\n"),
-            )
-            .expect("write the fake ssh");
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-                .expect("make it runnable");
+                &format!("#!/bin/sh\ncase \"$*\" in *-O*) exit 255 ;; esac\n{master}\n"),
+            );
             let target = SshTarget::new("box").with_ssh(&program);
             let ssh = Ssh {
                 target: &target,
@@ -636,8 +651,7 @@ mod tests {
         let odd = "it's rho";
         for path in [home.join(odd), home.join("bin/rho")] {
             std::fs::create_dir_all(path.parent().expect("a parent")).expect("the parent");
-            std::fs::write(&path, "#!/bin/sh\necho \"ran $0\" >&2\nexit 3\n").expect("a stub");
-            std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).expect("chmod");
+            write_program(&path, "#!/bin/sh\necho \"ran $0\" >&2\nexit 3\n");
         }
         for (rho, ran) in [
             (home.join(odd).display().to_string(), home.join(odd)),
