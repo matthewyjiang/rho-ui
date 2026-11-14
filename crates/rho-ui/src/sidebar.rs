@@ -586,7 +586,12 @@ impl SidebarView {
 
     /// The items in `range`. Called by [`v_virtual_list`] with only what is
     /// on screen.
-    fn render_items(&self, range: Range<usize>, cx: &mut Context<'_, Self>) -> Vec<AnyElement> {
+    fn render_items(
+        &self,
+        range: Range<usize>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Vec<AnyElement> {
         let clock = Clock {
             now: time::now_unix(),
             instant: Instant::now(),
@@ -597,6 +602,7 @@ impl SidebarView {
         let machines = self.machines.read(cx);
         // With one machine, a label says nothing.
         let label = |row: &Row| machines.tag(&row.id.machine);
+        let age_width = age_width(window);
         self.list.items()[range]
             .iter()
             .map(|&item| match item {
@@ -608,7 +614,7 @@ impl SidebarView {
                 Item::Shelved(row) => {
                     let row = self.list.row_at(row);
                     let workspace = workspaces.get(row.workspace);
-                    self.render_shelved(row, workspace, label(row), clock, &view, cx)
+                    self.render_shelved(row, workspace, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
                 Item::Gap => div().into_any_element(),
@@ -714,15 +720,16 @@ impl SidebarView {
     }
 
     /// A snoozed or settled session on one line: badge, title, and when it
-    /// wakes or how old it is. Hovering it swaps that for Restore and, after
-    /// a moment, shows the session's details beside the sidebar.
+    /// wakes or how old it is, in a column `age_width` wide so titles end
+    /// together. Hovering it swaps that for Restore and, after a moment,
+    /// shows the session's details, machine included, beside the sidebar.
     fn render_shelved(
         &self,
         row: &Row,
         workspace: &Workspace,
         machine: Option<SharedString>,
+        age_width: Pixels,
         clock: Clock,
-        view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -768,7 +775,7 @@ impl SidebarView {
             workspace: workspace.name.clone(),
             initials: workspace.initials.clone(),
             branch: workspace.branch.clone(),
-            machine: machine.clone(),
+            machine,
             wakes: wakes
                 .filter(|_| row.shelf == Shelf::Snoozed)
                 .map(|wakes| format!("Wakes in {}", time::relative_age(wakes - clock.now))),
@@ -793,19 +800,11 @@ impl SidebarView {
                     .text_sm()
                     .child(card.title.clone()),
             )
-            .when_some(machine, |this, machine| {
-                this.child(
-                    div()
-                        .flex_shrink_0()
-                        .max_w(rems(MACHINE_LABEL_REMS))
-                        .truncate()
-                        .text_color(theme.muted_foreground)
-                        .child(machine),
-                )
-            })
             .child(
-                div()
+                h_flex()
                     .flex_shrink_0()
+                    .min_w(age_width)
+                    .justify_end()
                     .text_color(theme.muted_foreground)
                     .child(right),
             );
@@ -814,7 +813,8 @@ impl SidebarView {
             .trigger_style(StyleRefinement::default().size_full())
             .ml_3()
             .content(move |_, _, cx| card.render(cx));
-        let line = Self::row_frame(rems(SHELVED_ROW_REMS), row, state, line, view, cx);
+        let view = cx.weak_entity();
+        let line = Self::row_frame(rems(SHELVED_ROW_REMS), row, state, line, &view, cx);
         div()
             .w_full()
             .h(rems(SHELVED_ROW_REMS))
@@ -938,7 +938,7 @@ impl SidebarView {
                     cx.entity(),
                     "sessions",
                     Rc::new(sizes),
-                    |this, range, _, cx| this.render_items(range, cx),
+                    |this, range, window, cx| this.render_items(range, window, cx),
                 )
                 .track_scroll(&self.scroll)
                 .size_full(),
@@ -1126,6 +1126,28 @@ pub(crate) fn badge(initials: SharedString) -> Avatar {
         // In rems, so it follows the UI scale; square like a workspace tile.
         .size(rems(LINE_REMS))
         .rounded(rems(0.25))
+}
+
+/// The widest age [`time::relative_age`] gives below a year, in the rows'
+/// font at `text_xs`: a shelved row's age column, so every title ends at
+/// one place. Wider content, such as a snooze's alarm, widens its own row.
+/// Measured, not a constant: the font is the user's choice.
+fn age_width(window: &Window) -> Pixels {
+    let style = window.text_style();
+    let size = rems(0.75).to_pixels(window.rem_size());
+    ["now", "00m", "00w"]
+        .into_iter()
+        .map(|age| {
+            let run = style.to_run(age.len());
+            window
+                .text_system()
+                .shape_line(SharedString::new_static(age), size, &[run], None)
+                .width
+                // Rounded up, so the widest age fits.
+                .ceil()
+        })
+        .max()
+        .unwrap_or_default()
 }
 
 /// How a row is lit: open in the pane, under the pointer, or both.
