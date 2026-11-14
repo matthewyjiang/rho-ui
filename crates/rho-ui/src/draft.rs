@@ -18,8 +18,6 @@
 //! the draft's settings, and sends the message there, so choosing New
 //! worktree and back leaves no worktree behind.
 
-use std::path::{Path, PathBuf};
-
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{alert::Alert, input::InputEvent, v_flex, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -29,12 +27,12 @@ use gpui_kit::{
     Subscription, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, Prompt, Session, SessionId,
-    SessionUpdate,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, Prompt, Session, SessionUpdate,
 };
 
 use crate::{
     composer::{Composer, ComposerMode, ComposerState},
+    machines::{Machines, Place, SessionKey},
     project_picker::{PickerEvent, ProjectPicker},
     projects::Projects,
     session_list::NEW_SESSION,
@@ -80,7 +78,9 @@ enum SessionState {
 }
 
 pub(crate) struct DraftView {
-    cwd: PathBuf,
+    /// Where the session will work.
+    cwd: Place,
+    machines: Entity<Machines>,
     workspace: WorkspaceRef,
     picker: Entity<ProjectPicker>,
     composer: Entity<ComposerState>,
@@ -102,18 +102,21 @@ impl EventEmitter<DraftEvent> for DraftView {}
 
 impl DraftView {
     /// A draft for a session in `cwd`, which the user can move to any of
-    /// `projects`.
+    /// `projects`, on any of `machines`.
     pub(crate) fn new(
-        cwd: PathBuf,
+        cwd: Place,
         workspaces: &Entity<Workspaces>,
         projects: &Entity<Projects>,
+        machines: &Entity<Machines>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let composer = cx.new(|cx| ComposerState::new(window, cx));
+        let remote = machines.read(cx).remote_label(&cwd.machine);
+        let composer = cx.new(|cx| ComposerState::new(remote, window, cx));
         let input = composer.read(cx).input().clone();
         let workspace = WorkspaceRef::new(workspaces, &cwd, cx);
-        let picker = cx.new(|cx| ProjectPicker::new(workspaces, projects, cwd.clone(), window, cx));
+        let picker = cx
+            .new(|cx| ProjectPicker::new(workspaces, projects, machines, cwd.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &input,
@@ -144,6 +147,7 @@ impl DraftView {
         ];
         Self {
             cwd,
+            machines: machines.clone(),
             workspace,
             picker,
             composer,
@@ -157,7 +161,7 @@ impl DraftView {
         }
     }
 
-    pub(crate) fn cwd(&self) -> &Path {
+    pub(crate) fn cwd(&self) -> &Place {
         &self.cwd
     }
 
@@ -165,10 +169,13 @@ impl DraftView {
         self.composer.focus_handle(cx)
     }
 
-    /// The open session's ID, for routing its events here.
-    pub(crate) fn session_id(&self) -> Option<&SessionId> {
+    /// The open session, for routing its events here.
+    pub(crate) fn session_key(&self) -> Option<SessionKey> {
         match &self.state {
-            SessionState::Open { session, .. } => Some(session.id()),
+            SessionState::Open { session, .. } => Some(SessionKey::new(
+                self.cwd.machine.clone(),
+                session.id().clone(),
+            )),
             SessionState::Opening | SessionState::Failed | SessionState::Started => None,
         }
     }
@@ -203,12 +210,15 @@ impl DraftView {
     /// Moves the draft to `cwd`. The session opened for the old directory
     /// goes, unfollowed and unsaved, and the app opens one in the new; the
     /// text in the composer stays.
-    fn move_to(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn move_to(&mut self, cwd: Place, window: &mut Window, cx: &mut Context<'_, Self>) {
         if cwd == self.cwd || matches!(self.state, SessionState::Started) {
             window.focus(&self.composer.focus_handle(cx), cx);
             return;
         }
         self.workspace = WorkspaceRef::new(self.workspace.table(), &cwd, cx);
+        let remote = self.machines.read(cx).remote_label(&cwd.machine);
+        self.composer
+            .update(cx, |composer, cx| composer.set_remote(remote, cx));
         self.picker
             .update(cx, |picker, cx| picker.set_current(cwd.clone(), window, cx));
         self.cwd = cwd;
@@ -230,7 +240,7 @@ impl DraftView {
 
     /// The draft's directory, and which of its requests to open a session
     /// there this is, for [`Self::awaits`].
-    pub(crate) fn request(&self) -> (PathBuf, u64) {
+    pub(crate) fn request(&self) -> (Place, u64) {
         (self.cwd.clone(), self.request)
     }
 

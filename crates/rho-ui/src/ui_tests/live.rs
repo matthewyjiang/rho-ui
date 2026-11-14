@@ -71,7 +71,7 @@ fn live_daemon() {
     let Ok(attach) = std::env::var("RHO_UI_LIVE_ATTACH") else {
         return;
     };
-    let row: &'static str = Box::leak(format!("session-{attach}").into_boxed_str());
+    let row: &'static str = Box::leak(format!("session-local-{attach}").into_boxed_str());
     ui.wait_within(
         TURN,
         "the terminal UI's job in the sidebar",
@@ -248,7 +248,7 @@ fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
     });
     ui.act(|window, _| {
         assert!(!is_visible(window, "turn-error"), "no failed turn");
-        assert!(!is_visible(window, "session-error"), "no error");
+        assert!(!is_visible(window, "session-local-error"), "no error");
     });
     let session = ui.session();
     let followed = session

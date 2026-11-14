@@ -21,7 +21,6 @@
 //! bar.
 
 use std::{
-    path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -54,6 +53,7 @@ use crate::{
     approval::ApprovalCard,
     background::{BackgroundHistory, BackgroundList, OpenHandler},
     composer::{Composer, ComposerMode, ComposerState},
+    machines::{Place, SessionKey},
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
     title_bar::TitleBar,
@@ -98,8 +98,9 @@ pub(crate) enum Loading {
 pub(crate) struct SessionView {
     daemon: Daemon,
     session: Session,
-    cwd: PathBuf,
-    /// The workspace, whose project the title bar names.
+    /// The session's directory, on its machine.
+    cwd: Place,
+    /// The workspace and branch, for the header.
     workspace: WorkspaceRef,
     /// For a subagent's session, the session that started it: the view
     /// then only watches.
@@ -147,14 +148,15 @@ impl SessionView {
     pub(crate) fn new(
         daemon: Daemon,
         session: Session,
-        cwd: PathBuf,
         workspace: WorkspaceRef,
+        remote: Option<SharedString>,
         loading: Loading,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let transcript = Transcript::new(cx);
-        let composer = cx.new(|cx| ComposerState::new(window, cx));
+        let cwd = workspace.read(cx).place().clone();
+        let composer = cx.new(|cx| ComposerState::new(remote, window, cx));
         let input = composer.read(cx).input().clone();
         let settings = cx.new(|cx| {
             SessionSettings::new(
@@ -233,9 +235,9 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let (cwd, workspace) = {
+        let (workspace, remote) = {
             let parent = parent.read(cx);
-            (parent.cwd.clone(), parent.workspace.clone())
+            (parent.workspace.clone(), parent.composer.read(cx).remote())
         };
         // The title bar names every session above this one.
         let mut renamed = Vec::new();
@@ -251,8 +253,8 @@ impl SessionView {
         let view = Self::new(
             daemon,
             session,
-            cwd,
             workspace,
+            remote,
             Loading::Attaching,
             window,
             cx,
@@ -264,8 +266,9 @@ impl SessionView {
         }
     }
 
-    pub(crate) fn id(&self) -> &SessionId {
-        self.session.id()
+    /// The session, and the machine it is on.
+    pub(crate) fn key(&self) -> SessionKey {
+        SessionKey::new(self.cwd.machine.clone(), self.session.id().clone())
     }
 
     /// The session that started this one, for a subagent's session whose
@@ -281,10 +284,10 @@ impl SessionView {
 
     /// The session at the top of this one's nesting: itself, unless it is
     /// a subagent's.
-    pub(crate) fn root_id(&self, cx: &App) -> SessionId {
+    pub(crate) fn root_id(&self, cx: &App) -> SessionKey {
         match self.parent() {
             Some(parent) => parent.read(cx).root_id(cx),
-            None => self.session.id().clone(),
+            None => self.key(),
         }
     }
 
@@ -316,8 +319,8 @@ impl SessionView {
     /// What the sidebar shows for this session.
     pub(crate) fn live(&self) -> LiveSession {
         LiveSession {
-            id: self.session.id().clone(),
-            cwd: self.cwd.clone(),
+            id: self.key(),
+            cwd: self.cwd.path.clone(),
             title: self.name().map(SharedString::from),
             placeholder: self.placeholder(),
             activity: self.activity(),

@@ -8,6 +8,7 @@
 
 use std::{
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -28,10 +29,11 @@ use gpui_kit::component::ActiveTheme as _;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    machines::{MachineId, Place, RemoteMachine, SessionKey},
     projects::Projects,
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
-    sidebar::SidebarLayout,
+    sidebar::{SavedFilter, SidebarLayout, SidebarState},
     store::{Key, StateDb},
     turn_times::TurnTimes,
 };
@@ -91,6 +93,33 @@ impl Harness {
         shelves: Shelves,
         projects: Projects,
     ) -> Self {
+        Self::open_with(
+            name,
+            target,
+            daemon,
+            Machines {
+                shelves,
+                projects,
+                settings: Settings::default(),
+                remote_sockets: Vec::new(),
+            },
+        )
+    }
+
+    /// [`Self::open`] with `machines`' settings, which may list remote
+    /// machines, each reaching a fake daemon's socket in place of SSH.
+    fn open_with(
+        name: &'static str,
+        target: DaemonTarget,
+        daemon: Option<FakeDaemon>,
+        machines: Machines,
+    ) -> Self {
+        let Machines {
+            shelves,
+            projects,
+            settings,
+            remote_sockets,
+        } = machines;
         let mut cx = HeadlessAppContext::with_platform(
             gpui_kit::platform::current_platform(true).text_system(),
             Arc::new(crate::Assets),
@@ -100,12 +129,29 @@ impl Harness {
         // tasks, which the deterministic scheduler only accepts this way.
         cx.allow_parking();
         cx.update(crate::init);
+        cx.update(|cx| settings.apply(cx));
+        // A remote machine reaches its fake daemon, never ssh: a host
+        // without one gets a socket that isn't there.
         let launch = LaunchConfig {
             workspace: std::env::temp_dir(),
             daemon: target.clone(),
+            remote: Rc::new(move |remote: &RemoteMachine| {
+                let socket = remote_sockets
+                    .iter()
+                    .find(|(host, _)| *host == remote.host)
+                    .map_or_else(
+                        || PathBuf::from("/nonexistent/rho.sock"),
+                        |(_, socket)| socket.clone(),
+                    );
+                DaemonTarget::Socket(socket)
+            }),
         };
         let state = StateDb::in_memory();
-        let layout = SidebarLayout::load(&state);
+        let sidebar = SidebarState {
+            shelves,
+            layout: SidebarLayout::load(&state),
+            filter: SavedFilter::load(&state),
+        };
         let (window, app) = cx
             .update(|cx| {
                 gpui_kit::open_window(
@@ -121,9 +167,7 @@ impl Harness {
                     cx,
                     // In-memory marks, projects and layout: tests never
                     // touch the user's state database.
-                    |window, cx| {
-                        cx.new(|cx| RhoApp::new(launch, shelves, projects, layout, window, cx))
-                    },
+                    |window, cx| cx.new(|cx| RhoApp::new(launch, sidebar, projects, window, cx)),
                 )
             })
             .expect("open the app window");
@@ -328,6 +372,15 @@ impl Harness {
     }
 }
 
+/// What [`Harness::open_with`] opens the app with besides its daemon.
+struct Machines {
+    shelves: Shelves,
+    projects: Projects,
+    settings: Settings,
+    /// The socket each remote machine reaches, by host.
+    remote_sockets: Vec<(String, PathBuf)>,
+}
+
 /// Every accessibility label in the last frame, for timeout messages.
 fn labels(window: &Window) -> Vec<String> {
     window
@@ -354,7 +407,7 @@ fn bounds(window: &Window, id: &'static str) -> Option<Bounds<Pixels>> {
 fn new_session_runs_a_turn_through_an_approval() {
     let mut ui = Harness::start("turn", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
-        is_visible(window, "session-s1") && is_visible(window, "session-old")
+        is_visible(window, "session-local-s1") && is_visible(window, "session-local-old")
     });
     ui.shot("sidebar");
 
@@ -373,7 +426,10 @@ fn new_session_runs_a_turn_through_an_approval() {
     assert_eq!(ui.session().title(), None);
     ui.act(|window, _| {
         assert_eq!(window.find("session-title").label(), Some("list files"));
-        assert_eq!(window.find("session-new-1").label(), Some("list files"));
+        assert_eq!(
+            window.find("session-local-new-1").label(),
+            Some("list files")
+        );
         // The turn's header counts up while it runs.
         let header = window.find("worked-0").label().map(str::to_owned);
         assert!(
@@ -410,7 +466,7 @@ fn new_session_runs_a_turn_through_an_approval() {
 
     // Saved once prompted, and listed as rho-ui's own.
     ui.wait_until("the new session in the sidebar", |window, _, _| {
-        is_visible(window, "session-new-1")
+        is_visible(window, "session-local-new-1")
     });
 
     // The same header now says how long the turn took, and its working
@@ -449,7 +505,7 @@ fn new_session_runs_a_turn_through_an_approval() {
 fn a_sent_message_can_be_selected_and_copied() {
     let mut ui = Harness::start("select", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -483,9 +539,9 @@ fn a_sent_message_can_be_selected_and_copied() {
 fn opening_a_saved_session_replays_its_history() {
     let mut ui = Harness::start("resume", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
-    ui.click("session-old");
+    ui.click("session-local-old");
     ui.wait_for_session("the replayed history", |session| {
         matches!(session.entries(), [Entry::Agent(m)] if m.text() == "replayed")
             && !session.config().is_empty()
@@ -493,7 +549,7 @@ fn opening_a_saved_session_replays_its_history() {
     ui.shot("replayed");
 
     // The attach's answer carries the title and the settings.
-    ui.click("session-s1");
+    ui.click("session-local-s1");
     ui.wait_for_session("the titled session", |session| {
         session.title() == Some("first") && !session.config().is_empty()
     });
@@ -518,9 +574,9 @@ fn setting(session: &Session, id: &str) -> Option<String> {
 fn composer_settings_change_the_session() {
     let mut ui = Harness::start("settings-panel", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
-    ui.click("session-old");
+    ui.click("session-local-old");
     ui.wait_until("the session settings", |window, _, _| {
         is_visible(window, "config-panel") && is_visible(window, "config-mode")
     });
@@ -631,6 +687,62 @@ fn a_draft_sets_the_session_before_the_first_message() {
     });
 }
 
+/// A socket that takes the app's connection but passes it on to `daemon`
+/// only once the returned sender sends or drops, so a test can act while
+/// the app connects.
+fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::mpsc::Sender<()>) {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let DaemonTarget::Socket(real) = daemon.clone() else {
+        panic!("a fake daemon listens on a socket");
+    };
+    let path = dir.join("gated.sock");
+    let listener = UnixListener::bind(&path).expect("bind the gated socket");
+    let (open, gate) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((app, _)) = listener.accept() else {
+            return;
+        };
+        let _ = gate.recv();
+        let daemon = UnixStream::connect(&real).expect("reach the fake daemon");
+        let (mut app_in, mut daemon_out) = (
+            app.try_clone().expect("clone the app's end"),
+            daemon.try_clone().expect("clone the daemon's end"),
+        );
+        std::thread::spawn(move || std::io::copy(&mut app_in, &mut daemon_out));
+        let (mut daemon_in, mut app_out) = (daemon, app);
+        let _ = std::io::copy(&mut daemon_in, &mut app_out);
+    });
+    (DaemonTarget::Socket(path), open)
+}
+
+/// A new session asked for while this machine connects waits for the
+/// daemon, then opens, rather than failing as not connected.
+#[test]
+fn a_draft_opened_while_connecting_waits_for_the_daemon() {
+    let daemon = FakeDaemon::start(Script::default());
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let (target, open) = gated_socket(dir.path(), &daemon.target());
+    let mut ui = Harness::open(
+        "draft-connecting",
+        target,
+        Some(daemon),
+        Shelves::default(),
+        Projects::default(),
+    );
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "draft-error"), "it waits, not fails");
+    });
+    drop(open);
+    ui.wait_until("the draft's session", |window, cx, app| {
+        is_visible(window, "config-panel")
+            && app
+                .draft()
+                .is_some_and(|draft| draft.read(cx).session_key().is_some())
+    });
+}
+
 /// Settle and snooze from a row's hover buttons and its context menu, and
 /// bring sessions back from the opened Settled shelf, whose rows show their
 /// details on hover.
@@ -638,23 +750,25 @@ fn a_draft_sets_the_session_before_the_first_message() {
 fn settle_and_snooze_move_sessions_between_lists() {
     let mut ui = Harness::start("shelves", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
-        is_visible(window, "session-s1") && is_visible(window, "session-old")
+        is_visible(window, "session-local-s1") && is_visible(window, "session-local-old")
     });
 
-    ui.act(|window, cx| window.hover("session-s1", cx));
+    ui.act(|window, cx| window.hover("session-local-s1", cx));
     ui.shot("hover");
     ui.click("settle");
     ui.wait_until("s1 on the settled list", |window, _, _| {
-        !is_visible(window, "session-s1") && is_visible(window, "toggle-settled")
+        !is_visible(window, "session-local-s1") && is_visible(window, "toggle-settled")
     });
     ui.shot("settled-entry");
 
     ui.click("toggle-settled");
     ui.wait_until(
         "the settled shelf under the active sessions",
-        |window, _, _| is_visible(window, "session-s1") && is_visible(window, "session-old"),
+        |window, _, _| {
+            is_visible(window, "session-local-s1") && is_visible(window, "session-local-old")
+        },
     );
-    ui.act(|window, cx| window.hover("session-s1", cx));
+    ui.act(|window, cx| window.hover("session-local-s1", cx));
     // The card opens after a short delay, on the scheduler's clock.
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.wait_until("the details card", |window, _, _| {
@@ -665,20 +779,20 @@ fn settle_and_snooze_move_sessions_between_lists() {
     // Restoring the last settled session empties and folds the shelf.
     ui.click("restore");
     ui.wait_until("s1 back on the active list", |window, _, _| {
-        is_visible(window, "session-s1")
-            && is_visible(window, "session-old")
+        is_visible(window, "session-local-s1")
+            && is_visible(window, "session-local-old")
             && !is_visible(window, "toggle-settled")
     });
 
-    ui.act(|window, cx| window.hover("session-old", cx));
+    ui.act(|window, cx| window.hover("session-local-old", cx));
     ui.click("snooze");
     ui.click("snooze-4h");
     ui.wait_until("old on the snoozed list", |window, _, _| {
-        !is_visible(window, "session-old") && is_visible(window, "toggle-snoozed")
+        !is_visible(window, "session-local-old") && is_visible(window, "toggle-snoozed")
     });
 
     // The context menu offers the same moves.
-    ui.act(|window, cx| window.right_click("session-s1", cx));
+    ui.act(|window, cx| window.right_click("session-local-s1", cx));
     ui.shot("menu");
     let settle = ui
         .cx
@@ -697,7 +811,7 @@ fn settle_and_snooze_move_sessions_between_lists() {
         window.pointer_up(settle, MouseButton::Left, cx);
     });
     ui.wait_until("s1 settled from the menu", |window, _, _| {
-        !is_visible(window, "session-s1") && is_visible(window, "toggle-settled")
+        !is_visible(window, "session-local-s1") && is_visible(window, "toggle-settled")
     });
     ui.shot("both-shelves");
 }
@@ -711,7 +825,7 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
     // Below the list, the sidebar has only its footer (about 50 px).
     ui.wait_until("the settled entry at the bottom", |window, _, _| {
         bounds(window, "toggle-settled").is_some_and(|header| header.bottom() > px(700.))
-            && !is_visible(window, "session-s1")
+            && !is_visible(window, "session-local-s1")
     });
     ui.shot("settled-by-default");
     let folded = ui
@@ -731,14 +845,14 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
     ui.wait_until("the settled shelf", |window, _, _| {
         let (Some(header), Some(last)) = (
             bounds(window, "toggle-settled"),
-            bounds(window, "session-old"),
+            bounds(window, "session-local-old"),
         ) else {
             return false;
         };
         header.top() < folded.top() && last.top() > header.bottom() && last.bottom() > px(700.)
     });
     ui.shot("settled-opened");
-    ui.click("session-s1");
+    ui.click("session-local-s1");
     ui.wait_until("the saved session", |window, _, app| {
         !is_visible(window, "draft-view") && app.active_session().is_some()
     });
@@ -760,21 +874,21 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
     );
     ui.click("approval-allow-once");
     ui.wait_until("the new session listed as active", |window, _, _| {
-        is_visible(window, "session-new-2")
+        is_visible(window, "session-local-new-2")
     });
     ui.act(|window, _| {
         assert!(
-            !is_visible(window, "session-new-1"),
+            !is_visible(window, "session-local-new-1"),
             "the unused draft's session isn't listed"
         );
     });
 
-    ui.act(|window, cx| window.right_click("session-new-2", cx));
+    ui.act(|window, cx| window.right_click("session-local-new-2", cx));
     click_label(&mut ui, "Delete…");
     ui.shot("delete-confirm");
     click_label(&mut ui, "Delete");
     ui.wait_until("the session gone", |window, _, app| {
-        !is_visible(window, "session-new-2") && app.active_session().is_none()
+        !is_visible(window, "session-local-new-2") && app.active_session().is_none()
     });
 }
 
@@ -885,13 +999,13 @@ fn finished_work_folds_and_opens_in_levels() {
     };
     let mut ui = Harness::start("work", script);
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
     // An earlier run of rho-ui timed this turn, so it shows its time.
     let took = Duration::from_secs(80);
     ui.cx
         .update(|cx| cx.global_mut::<TurnTimes>().record("u0", took));
-    ui.click("session-old");
+    ui.click("session-local-old");
     // Entries: reply, question, thought, read, search, command, edit, answer.
     ui.wait_until("the turn folded behind one line", |window, _, _| {
         is_visible(window, "worked-0") && !is_visible(window, "work-2")
@@ -1003,9 +1117,9 @@ fn a_step_shows_its_card_not_what_the_model_read() {
     };
     let mut ui = Harness::start("cards", script);
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
-    ui.click("session-old");
+    ui.click("session-local-old");
     ui.wait_until("the turn folded", |window, _, _| {
         is_visible(window, "worked-0")
     });
@@ -1074,9 +1188,9 @@ fn a_new_prompt_leaves_finished_turns_folded() {
     };
     let mut ui = Harness::start("pending", script);
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
-    ui.click("session-old");
+    ui.click("session-local-old");
     ui.wait_until("the replayed turn, folded", |window, _, _| {
         is_visible(window, "worked-0")
     });
@@ -1135,12 +1249,12 @@ fn a_turn_started_elsewhere_is_its_own_turn_and_leaves_typing_alone() {
     };
     let mut ui = Harness::start("elsewhere", script);
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
     let took = Duration::from_secs(80);
     ui.cx
         .update(|cx| cx.global_mut::<TurnTimes>().record("u0", took));
-    ui.click("session-old");
+    ui.click("session-local-old");
     ui.wait_until("the replayed turn, folded", |window, _, _| {
         is_visible(window, "worked-0")
     });
@@ -1200,9 +1314,9 @@ fn a_wheel_notch_glides() {
     };
     let mut ui = Harness::start("glide", script);
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
-    ui.click("session-old");
+    ui.click("session-local-old");
     ui.wait_for_session("the replayed history", |session| {
         session.state() == &RunState::Idle && session.entries().len() > 20
     });
@@ -1299,7 +1413,7 @@ fn a_missing_rho_shows_an_error_and_retry() {
         Projects::default(),
     );
     ui.wait_until("the retry button", |window, _, _| {
-        is_visible(window, "retry-daemon")
+        is_visible(window, "retry-local")
     });
     ui.shot("error");
 }
@@ -1316,11 +1430,11 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
     };
     let mut ui = Harness::start_with("job", script, Shelves::default());
     ui.wait_until("the running job among settled sessions", |window, _, _| {
-        is_visible(window, "session-tui-1") && !is_visible(window, "session-s1")
+        is_visible(window, "session-local-tui-1") && !is_visible(window, "session-local-s1")
     });
     ui.shot("listed");
 
-    ui.click("session-tui-1");
+    ui.click("session-local-tui-1");
     ui.wait_for_session("the turn under way", |session| {
         session.state() == &RunState::Running
             && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "Reading the parser.")
@@ -1370,7 +1484,7 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
     ui.act(|window, _| {
         assert!(!is_visible(window, "steer-0"), "nothing is left queued");
         assert!(
-            is_visible(window, "session-tui-1"),
+            is_visible(window, "session-local-tui-1"),
             "steered here, so the session is rho-ui's and stays listed"
         );
     });
@@ -1390,9 +1504,9 @@ fn the_sidebar_collapses_to_a_rail_and_back() {
     };
     let mut ui = Harness::start("rail", script);
     ui.wait_until("sessions in the sidebar", |window, _, _| {
-        is_visible(window, "session-s1") && is_visible(window, "session-tui-1")
+        is_visible(window, "session-local-s1") && is_visible(window, "session-local-tui-1")
     });
-    ui.click("session-s1");
+    ui.click("session-local-s1");
     ui.wait_for_session("the open session", |session| {
         session.title() == Some("first")
     });
@@ -1419,7 +1533,7 @@ fn the_sidebar_collapses_to_a_rail_and_back() {
         window.press("ctrl-b", cx);
     });
     ui.wait_until("the rail", |window, _, _| {
-        is_visible(window, "sidebar-rail") && !is_visible(window, "session-s1")
+        is_visible(window, "sidebar-rail") && !is_visible(window, "session-local-s1")
     });
     ui.act(|window, cx| {
         let view = app.read(cx).active_session().expect("a session is open");
@@ -1468,7 +1582,7 @@ fn the_sidebar_collapses_to_a_rail_and_back() {
     ui.shot("collapsed-light");
     ui.click("toggle-sidebar");
     ui.wait_until("the open sidebar", |window, _, _| {
-        is_visible(window, "session-s1") && !is_visible(window, "sidebar-rail")
+        is_visible(window, "session-local-s1") && !is_visible(window, "sidebar-rail")
     });
     assert_eq!(ui.state.get(Key::SidebarLayout).as_deref(), Some("open"));
     let [scaled_toggle, scaled_settings, _] = places(&mut ui);
@@ -1504,9 +1618,9 @@ fn the_theme_setting_switches_light_and_dark() {
     };
     let mut ui = Harness::start("theme", script);
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-old")
+        is_visible(window, "session-local-old")
     });
-    ui.click("session-old");
+    ui.click("session-local-old");
     ui.wait_until("the turn folded behind one line", |window, _, _| {
         is_visible(window, "worked-0")
     });
@@ -1592,7 +1706,7 @@ fn shows_an_error(window: &Window) -> bool {
 fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
     let mut ui = Harness::start("background", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -1697,7 +1811,7 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
 fn a_subagents_session_opens_nested_under_its_parent() {
     let mut ui = Harness::start("subagent", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -1727,7 +1841,7 @@ fn a_subagents_session_opens_nested_under_its_parent() {
             "only the subagent writes"
         );
         assert!(
-            !is_visible(window, "session-sub-1"),
+            !is_visible(window, "session-local-sub-1"),
             "the sidebar lists only the parent"
         );
     });
@@ -1787,7 +1901,7 @@ fn a_subagents_session_opens_nested_under_its_parent() {
 fn a_long_card_shows_its_first_lines_until_opened() {
     let mut ui = Harness::start("card", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -1859,7 +1973,7 @@ fn a_long_card_shows_its_first_lines_until_opened() {
 fn a_message_the_turn_cannot_take_waits_for_it_to_end() {
     let mut ui = Harness::start("queued", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -1970,7 +2084,7 @@ fn composer_attachments(window: &Window) -> Vec<u64> {
 fn pasted_images_show_as_removable_tiles() {
     let mut ui = Harness::start("paste", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -2054,7 +2168,7 @@ fn pasted_images_show_as_removable_tiles() {
 fn images_go_with_the_message() {
     let mut ui = Harness::start("images", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -2146,9 +2260,9 @@ fn images_go_with_the_message() {
     // Opened afresh, the session replays its messages with their images.
     let mut ui = ui.reopen("images-replayed", Shelves::owning(["s1", "old", "new-1"]));
     ui.wait_until("the session in the sidebar", |window, _, _| {
-        is_visible(window, "session-new-1")
+        is_visible(window, "session-local-new-1")
     });
-    ui.click("session-new-1");
+    ui.click("session-local-new-1");
     ui.wait_until("the newest image", |window, _, _| {
         is_visible(window, "user-3-attachment-0")
     });
@@ -2174,7 +2288,7 @@ fn attached_files_go_with_the_message() {
 
     let mut ui = Harness::start("files", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -2257,9 +2371,9 @@ fn a_message_after_a_waiting_image_waits_too() {
     };
     let mut ui = Harness::start_with("image-order", script, Shelves::default());
     ui.wait_until("the running job", |window, _, _| {
-        is_visible(window, "session-tui-1")
+        is_visible(window, "session-local-tui-1")
     });
-    ui.click("session-tui-1");
+    ui.click("session-local-tui-1");
     ui.wait_for_session("the turn under way", |session| {
         session.state() == &RunState::Running && !session.entries().is_empty()
     });
@@ -2292,7 +2406,8 @@ fn a_message_after_a_waiting_image_waits_too() {
 /// keyboard's row shows only while the search has the keyboard.
 #[test]
 fn a_new_session_starts_in_one_of_the_users_projects() {
-    let launch_row: &'static str = format!("project-{}", std::env::temp_dir().display()).leak();
+    let launch_row: &'static str =
+        format!("project-local:{}", std::env::temp_dir().display()).leak();
     let daemon = FakeDaemon::start(Script::default());
     let mut ui = Harness::open(
         "project",
@@ -2303,7 +2418,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
         Projects::of(["/w/b", "/w/a"]),
     );
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
 
     // Nothing on screen: the draft starts in the launch directory, which
@@ -2311,19 +2426,19 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
     ui.click("new-session");
     ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
     ui.wait_until("the project list", |window, _, _| {
-        is_visible(window, "project-/w/a") && is_visible(window, "project-/w/b")
+        is_visible(window, "project-local:/w/a") && is_visible(window, "project-local:/w/b")
     });
     ui.act(|window, _| {
         let (a, b) = (
-            bounds(window, "project-/w/a"),
-            bounds(window, "project-/w/b"),
+            bounds(window, "project-local:/w/a"),
+            bounds(window, "project-local:/w/b"),
         );
         assert!(
             a.unwrap().origin.y < b.unwrap().origin.y,
             "/w/a has the newest session, so it comes first"
         );
         assert!(!is_visible(window, launch_row), "rho-ui adds no project");
-        assert_eq!(checked(window, "project-/w/a"), Some(false));
+        assert_eq!(checked(window, "project-local:/w/a"), Some(false));
     });
     ui.cx.update(|cx| {
         let selected = selected_project(cx, ui.app.read(cx));
@@ -2333,7 +2448,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 
     // Hovering a row offers Remove in place of its age, and selects
     // nothing.
-    ui.act(|window, cx| window.hover("project-/w/b", cx));
+    ui.act(|window, cx| window.hover("project-local:/w/b", cx));
     ui.wait_until("Remove on the hovered row", |window, _, _| {
         is_visible(window, "project-remove")
     });
@@ -2347,20 +2462,20 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
         window.input("/w/b", cx);
     });
     ui.wait_until("the search to filter", |window, cx, app| {
-        !is_visible(window, "project-/w/a")
-            && is_visible(window, "project-/w/b")
-            && selected_project(cx, app).as_deref() == Some("project-/w/b")
+        !is_visible(window, "project-local:/w/a")
+            && is_visible(window, "project-local:/w/b")
+            && selected_project(cx, app).as_deref() == Some("project-local:/w/b")
     });
     ui.act(|window, cx| window.press("enter", cx));
     ui.wait_until("the draft in /w/b", draft_in(Path::new("/w/b")));
     ui.wait_until("the search to clear", |window, _, _| {
-        is_visible(window, "project-/w/a")
+        is_visible(window, "project-local:/w/a")
     });
     // Back in the composer: /w/b is checked, and no row looks chosen
     // besides it.
     ui.act(|window, _| {
-        assert_eq!(checked(window, "project-/w/b"), Some(true));
-        assert_eq!(checked(window, "project-/w/a"), Some(false));
+        assert_eq!(checked(window, "project-local:/w/b"), Some(true));
+        assert_eq!(checked(window, "project-local:/w/a"), Some(false));
     });
     ui.cx
         .update(|cx| assert_eq!(selected_project(cx, ui.app.read(cx)), None));
@@ -2378,7 +2493,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
     ui.act(|window, cx| window.press("ctrl-shift-n", cx));
     ui.wait_until("a draft in /w/b", draft_in(Path::new("/w/b")));
     ui.wait_until("the keyboard on /w/b", |_, cx, app| {
-        selected_project(cx, app).as_deref() == Some("project-/w/b")
+        selected_project(cx, app).as_deref() == Some("project-local:/w/b")
     });
 }
 
@@ -2389,7 +2504,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let dir = std::env::temp_dir().join(format!("rho-ui-projects-{}", std::process::id()));
     let (main, tree) = crate::repo::fake_worktree(&dir);
     let main = main.canonicalize().expect("the checkout exists");
-    let main_row: &'static str = format!("project-{}", main.display()).leak();
+    let main_row: &'static str = format!("project-local:{}", main.display()).leak();
     let daemon = FakeDaemon::start(Script::default());
     let mut ui = Harness::open(
         "project-add",
@@ -2399,7 +2514,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
         Projects::of(["/w/b", "/w/a"]),
     );
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     ui.act(|window, cx| window.press("ctrl-shift-n", cx));
     ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
@@ -2411,7 +2526,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let (head, last) = typed.split_at(typed.len() - 1);
     ui.act(|window, cx| window.input(head, cx));
     ui.wait_until("nothing to match the partial path", |window, _, _| {
-        !is_visible(window, "project-typed") && !is_visible(window, "project-/w/b")
+        !is_visible(window, "project-typed") && !is_visible(window, "project-local:/w/b")
     });
     ui.act(|window, cx| window.input(last, cx));
     ui.wait_until("the worktree's project, selected", |window, cx, app| {
@@ -2425,22 +2540,34 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
         checked(window, main_row) == Some(true)
     });
     ui.cx.update(|cx| {
-        let roots = ui.app.read(cx).projects(cx).to_vec();
+        let roots: Vec<PathBuf> = ui
+            .app
+            .read(cx)
+            .projects(cx)
+            .iter()
+            .map(|root| root.path.clone())
+            .collect();
         assert_eq!(roots, [PathBuf::from("/w/b"), "/w/a".into(), main.clone()]);
     });
 
     // Remove takes /w/a off the list without picking it.
-    ui.act(|window, cx| window.hover("project-/w/a", cx));
+    ui.act(|window, cx| window.hover("project-local:/w/a", cx));
     ui.wait_until("Remove on /w/a", |window, _, _| {
         is_visible(window, "project-remove")
     });
     ui.click("project-remove");
     ui.wait_until("/w/a gone", |window, _, _| {
-        !is_visible(window, "project-/w/a")
+        !is_visible(window, "project-local:/w/a")
     });
     ui.wait_until("the draft still in the checkout", draft_in(&main));
     ui.cx.update(|cx| {
-        let roots = ui.app.read(cx).projects(cx).to_vec();
+        let roots: Vec<PathBuf> = ui
+            .app
+            .read(cx)
+            .projects(cx)
+            .iter()
+            .map(|root| root.path.clone())
+            .collect();
         assert_eq!(roots, [PathBuf::from("/w/b"), main.clone()]);
     });
     ui.shot("removed");
@@ -2456,7 +2583,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
 fn a_new_session_can_work_in_a_new_worktree() {
     let dir = std::env::temp_dir().join(format!("rho-ui-worktree-{}", std::process::id()));
     let (main, _) = crate::repo::fake_worktree(&dir);
-    let main_row: &'static str = format!("project-{}", main.display()).leak();
+    let main_row: &'static str = format!("project-local:{}", main.display()).leak();
     let daemon = FakeDaemon::start(Script::default());
     let mut ui = Harness::open(
         "worktree",
@@ -2476,7 +2603,9 @@ fn a_new_session_can_work_in_a_new_worktree() {
         move |_: &Window, cx: &App, app: &RhoApp| {
             app.draft().is_some_and(|draft| {
                 let draft = draft.read(cx);
-                draft.cwd() == dir && draft.session_id().is_some() && draft.checkout(cx) == checkout
+                draft.cwd().path == dir
+                    && draft.session_key().is_some()
+                    && draft.checkout(cx) == checkout
             })
         }
     };
@@ -2487,7 +2616,7 @@ fn a_new_session_can_work_in_a_new_worktree() {
     let draft_session = |ui: &mut Harness| {
         ui.cx.update(|cx| {
             let draft = ui.app.read(cx).draft().expect("a draft");
-            draft.read(cx).session_id().cloned()
+            draft.read(cx).session_key()
         })
     };
     let opened = draft_session(&mut ui);
@@ -2511,7 +2640,7 @@ fn a_new_session_can_work_in_a_new_worktree() {
     ui.click("project-checkout");
     click_label(&mut ui, "New worktree");
     ui.wait_until("New worktree", in_checkout(&main, Checkout::NewWorktree));
-    ui.click("project-/w/a");
+    ui.click("project-local:/w/a");
     ui.wait_until(
         "Local in /w/a",
         in_checkout(Path::new("/w/a"), Checkout::Local),
@@ -2551,7 +2680,10 @@ fn a_new_session_can_work_in_a_new_worktree() {
 /// Whether the app shows a draft for a session in `dir`.
 fn draft_in(dir: &Path) -> impl Fn(&Window, &App, &RhoApp) -> bool {
     let dir = dir.to_path_buf();
-    move |_, cx, app| app.draft().is_some_and(|draft| draft.read(cx).cwd() == dir)
+    move |_, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).cwd().path == dir)
+    }
 }
 
 /// Whether project row `id` shows the draft's check.
@@ -2588,13 +2720,16 @@ fn the_project_list_shows_whole_rows() {
             settings.apply(cx);
         });
         ui.wait_until("the project list", |window, _, _| {
-            is_visible(window, "project-/w/a")
+            is_visible(window, "project-local:/w/a")
         });
         // /w/a and /w/b have sessions; the rest follow by name.
         ui.act(|window, _| {
-            assert!(is_visible(window, "project-/w/e"), "five rows at {scale}%");
             assert!(
-                !is_visible(window, "project-/w/f"),
+                is_visible(window, "project-local:/w/e"),
+                "five rows at {scale}%"
+            );
+            assert!(
+                !is_visible(window, "project-local:/w/f"),
                 "no sixth row peeks out at {scale}%"
             );
         });
@@ -2611,7 +2746,7 @@ fn the_project_list_shows_whole_rows() {
 fn the_composer_completes_commands_and_skills() {
     let mut ui = Harness::start("completion", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-s1")
+        is_visible(window, "session-local-s1")
     });
     // A draft offers its session's names too.
     ui.click("new-session");
@@ -2621,7 +2756,7 @@ fn the_composer_completes_commands_and_skills() {
         is_visible(window, "completion-pstack")
     });
 
-    ui.click("session-s1");
+    ui.click("session-local-s1");
     ui.wait_for_session("its commands", |session| !session.commands().is_empty());
     let sent = ui.session().entries().len();
 
@@ -2700,4 +2835,264 @@ fn the_composer_completes_commands_and_skills() {
     ui.wait_for_session("the next Escape to stop the turn", |session| {
         session.state() != &RunState::NeedsAction
     });
+}
+
+/// Clicks the menu item labelled `label`, not a sidebar row's part that
+/// shares it, such as a machine's label.
+fn click_menu_item(ui: &mut Harness, label: &str) {
+    let center = ui
+        .cx
+        .update_window(ui.window, |_, window, _| {
+            window
+                .find_all_by_label(label)
+                .into_iter()
+                .find(|item| !format!("{:?}", item.path()).contains("sessions"))
+                .map(|item| item.bounds().center())
+        })
+        .expect("window is open")
+        .unwrap_or_else(|| panic!("no menu item labelled {label:?}"));
+    ui.act(|window, cx| {
+        window.pointer_down(center, MouseButton::Left, cx);
+        window.pointer_up(center, MouseButton::Left, cx);
+    });
+}
+
+/// Two machines list their sessions side by side, though their daemons
+/// issue the same session IDs, and each row names its machine. A session
+/// opens from the daemon it is on, a new session starts on the machine its
+/// project is on, and the filter hides a machine. A machine that can't be
+/// reached says so with Retry while the others work on.
+#[test]
+fn machines_list_side_by_side() {
+    let local = FakeDaemon::start(Script::default());
+    let remote = FakeDaemon::start(Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    });
+    let DaemonTarget::Socket(remote_socket) = remote.target() else {
+        panic!("a fake daemon listens on a socket");
+    };
+    let mut workstation = RemoteMachine::new("workstation");
+    workstation.label = "Workstation".to_owned();
+    let mut settings = Settings::default();
+    settings.machines = vec![workstation, RemoteMachine::new("gone")];
+    let there = MachineId::remote("workstation");
+    let mut shelves = Shelves::owning(["s1", "old"]);
+    for id in ["s1", "old"] {
+        shelves.own(&SessionKey::new(there.clone(), SessionId::from(id)));
+    }
+    let mut projects = Projects::default();
+    projects.add(Place::new(there.clone(), "/srv/app"));
+    let mut ui = Harness::open_with(
+        "machines",
+        local.target(),
+        Some(local),
+        Machines {
+            shelves,
+            projects,
+            settings,
+            remote_sockets: vec![
+                ("workstation".to_owned(), remote_socket),
+                ("gone".to_owned(), PathBuf::from("/nonexistent/rho.sock")),
+            ],
+        },
+    );
+    ui.wait_until("both machines' sessions, and Retry", |window, _, _| {
+        is_visible(window, "session-local-s1")
+            && is_visible(window, "session-workstation-s1")
+            && is_visible(window, "session-workstation-tui-1")
+            && is_visible(window, "retry-gone")
+    });
+    ui.act(|window, _| {
+        let label = |id| window.find(id).label().map(str::to_owned);
+        assert_eq!(
+            label("session-workstation-s1-machine").as_deref(),
+            Some("Workstation")
+        );
+        assert_eq!(label("session-local-s1-machine").as_deref(), Some("local"));
+        assert!(
+            !is_visible(window, "session-local-tui-1"),
+            "only the workstation runs it"
+        );
+    });
+    ui.shot("listed");
+
+    // The workstation's running session replays from its own daemon.
+    ui.click("session-workstation-tui-1");
+    ui.wait_for_session("the workstation's turn under way", |session| {
+        matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "Reading the parser.")
+    });
+    ui.cx.update(|cx| {
+        let view = ui.app.read(cx).active_session().expect("a session is open");
+        assert_eq!(view.read(cx).key().machine, there);
+    });
+
+    // A new session from there starts there, and moves to the
+    // workstation's project.
+    let draft_at = |path| draft_at(there.clone(), path);
+    ui.click("new-session");
+    ui.wait_until("the draft's session on the workstation", draft_at("/w/a"));
+    assert!(
+        remote.new_session_var("HOME").is_some(),
+        "the workstation opened it"
+    );
+
+    // rho there can't read a file here, so one that would go by its path
+    // is refused, from the draft's start.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let (notes, report) = notes_and_report(dir.path());
+    ui.paste_entry(ClipboardEntry::ExternalPaths(ExternalPaths(
+        std::iter::once(report.clone()).collect(),
+    )));
+    ui.wait_until("the refusal, in the first draft", |window, _, _| {
+        composer_attachments(window).is_empty() && is_visible(window, "composer-refusal")
+    });
+
+    ui.click("project-workstation:/srv/app");
+    ui.wait_until(
+        "the draft in the workstation's project",
+        draft_at("/srv/app"),
+    );
+    ui.shot("draft-there");
+
+    // Still refused after the move, while a text file goes whole.
+    ui.paste_entry(ClipboardEntry::ExternalPaths(ExternalPaths(
+        [notes, report].into_iter().collect(),
+    )));
+    ui.wait_until("the text file, and the refusal", |window, _, _| {
+        composer_attachments(window).len() == 1 && is_visible(window, "composer-refusal")
+    });
+
+    // The filter hides the workstation's sessions.
+    ui.click("sidebar-filter");
+    click_menu_item(&mut ui, "Workstation");
+    ui.wait_until("only this machine's sessions", |window, _, _| {
+        is_visible(window, "session-local-s1") && !is_visible(window, "session-workstation-s1")
+    });
+    ui.shot("filtered");
+}
+
+/// Whether the draft is open at `path`, with its session made on `machine`.
+fn draft_at(
+    machine: MachineId,
+    path: &'static str,
+) -> impl Fn(&Window, &App, &RhoApp) -> bool + 'static {
+    move |_, cx, app| {
+        app.draft().is_some_and(|draft| {
+            let draft = draft.read(cx);
+            draft.cwd().path == Path::new(path)
+                && draft
+                    .session_key()
+                    .is_some_and(|key| key.machine == machine)
+        })
+    }
+}
+
+/// Writes a text file, which a message carries whole, and a PDF, which
+/// goes by its path, in `dir`.
+fn notes_and_report(dir: &Path) -> (PathBuf, PathBuf) {
+    let notes = dir.join("notes.md");
+    let report = dir.join("report.pdf");
+    std::fs::write(&notes, "# Notes\n").expect("write the notes");
+    std::fs::write(&report, b"%PDF-1.7\n\x00\xff binary").expect("write the report");
+    (notes, report)
+}
+
+/// A machine added on the Machines page connects at once, and its sessions
+/// list beside this machine's under its host until it has a label; removing
+/// it takes them off the list.
+#[test]
+fn a_machine_added_in_settings_lists_its_sessions() {
+    let local = FakeDaemon::start(Script::default());
+    let remote = FakeDaemon::start(Script::default());
+    let DaemonTarget::Socket(remote_socket) = remote.target() else {
+        panic!("a fake daemon listens on a socket");
+    };
+    let mut shelves = Shelves::owning(["s1", "old"]);
+    shelves.own(&SessionKey::new(
+        MachineId::remote("box"),
+        SessionId::from("s1"),
+    ));
+    let mut ui = Harness::open_with(
+        "add-machine",
+        local.target(),
+        Some(local),
+        Machines {
+            shelves,
+            projects: Projects::default(),
+            settings: Settings::default(),
+            remote_sockets: vec![("box".to_owned(), remote_socket)],
+        },
+    );
+    ui.wait_until("this machine's sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "session-local-s1-machine"),
+            "with one machine, rows name none"
+        );
+    });
+
+    ui.click("open-settings");
+    ui.wait_until("the settings dialog", |window, _, _| {
+        is_visible(window, "setting-ui-font")
+    });
+    // The dialog fades in.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    // Kit's page rows aren't labelled for tests; the page's submenu
+    // toggle is, at the row's right end, so click the row left of it.
+    let center = ui
+        .cx
+        .update_window(ui.window, |_, window, _| {
+            window
+                .try_find_by_label("Toggle Machines submenu")
+                .map(|toggle| toggle.bounds().center() - gpui_kit::point(px(60.), px(0.)))
+        })
+        .expect("window is open")
+        .expect("the Machines page");
+    ui.act(|window, cx| {
+        window.pointer_down(center, MouseButton::Left, cx);
+        window.pointer_up(center, MouseButton::Left, cx);
+    });
+    ui.wait_until("the Machines page", |window, _, _| {
+        is_visible(window, "new-machine-host")
+    });
+    ui.click("add-machine");
+    ui.wait_until("an empty host refused", |window, _, _| {
+        window
+            .try_find("new-machine-note")
+            .and_then(|note| note.label().map(str::to_owned))
+            == Some("Enter the SSH host".to_owned())
+    });
+    ui.click("new-machine-host");
+    ui.act(|window, cx| window.input("box", cx));
+    ui.click("add-machine");
+    ui.wait_until("the box's sessions", |window, _, _| {
+        is_visible(window, "session-box-s1") && is_visible(window, "remove-machine-box")
+    });
+    ui.cx.update(|cx| {
+        let hosts: Vec<String> = cx
+            .global::<Settings>()
+            .machines
+            .iter()
+            .map(|machine| machine.host.clone())
+            .collect();
+        assert_eq!(hosts, ["box"]);
+    });
+    ui.act(|window, _| {
+        assert_eq!(
+            window.find("session-box-s1-machine").label(),
+            Some("box"),
+            "a machine without a label shows its host"
+        );
+    });
+    ui.shot("added");
+
+    ui.click("remove-machine-box");
+    ui.wait_until("the box's sessions gone", |window, _, _| {
+        !is_visible(window, "session-box-s1") && is_visible(window, "session-local-s1")
+    });
+    ui.cx
+        .update(|cx| assert!(cx.global::<Settings>().machines.is_empty()));
 }

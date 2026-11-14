@@ -142,6 +142,7 @@ impl Service for Fake {
     async fn new_session(&self, params: SessionNewParams) -> Result<SessionNewResponse, RpcError> {
         let mut state = self.lock();
         state.new_sessions += 1;
+        state.new_session_environment = Some(params.environment.clone());
         let id = format!("new-{}", state.new_sessions);
         // A worktree as the daemon names one, for a `cwd` at the top of
         // its repository; the fake makes nothing on disk.

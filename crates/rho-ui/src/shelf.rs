@@ -11,7 +11,12 @@
 //! The state lives in the state database's `shelves` table (see
 //! [`StateDb`]), a row per session rho-ui knows something about.
 
-use crate::store::StateDb;
+use rho_ui_core::SessionId;
+
+use crate::{
+    machines::{MachineId, SessionKey},
+    store::StateDb,
+};
 
 /// Which list a session shows in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,11 +53,11 @@ struct Entry {
     mark: Option<Mark>,
 }
 
-/// Every session rho-ui knows about, in one flat list sorted by session ID so
-/// a lookup is a binary search.
+/// Every session rho-ui knows about, in one flat list sorted by machine and
+/// session ID so a lookup is a binary search.
 #[derive(Debug)]
 pub(crate) struct Shelves {
-    entries: Vec<(String, Entry)>,
+    entries: Vec<(SessionKey, Entry)>,
     db: StateDb,
 }
 
@@ -70,20 +75,22 @@ impl Shelves {
     pub(crate) fn load(db: &StateDb, now: i64) -> Self {
         // SQLite's default collation compares bytes, as `str` does.
         let entries = db.query(
-            "SELECT session_id, owned, settled_at, snoozed_until FROM shelves \
-             ORDER BY session_id",
+            "SELECT machine, session_id, owned, settled_at, snoozed_until FROM shelves \
+             ORDER BY machine, session_id",
             [],
             |row| {
-                let mark = match (row.get(2)?, row.get(3)?) {
+                let mark = match (row.get(3)?, row.get(4)?) {
                     (Some(at), _) => Some(Mark::Settled(at)),
                     (None, Some(until)) if until > now => Some(Mark::Snoozed(until)),
                     (None, _) => None,
                 };
                 let entry = Entry {
-                    owned: row.get(1)?,
+                    owned: row.get(2)?,
                     mark,
                 };
-                Ok((row.get(0)?, entry))
+                let machine = MachineId::from(row.get::<_, String>(0)?.as_str());
+                let id = SessionId::from(row.get::<_, String>(1)?.as_str());
+                Ok((SessionKey::new(machine, id), entry))
             },
         );
         Self {
@@ -92,18 +99,19 @@ impl Shelves {
         }
     }
 
-    /// For tests: shelves that own `ids`, so they list as active.
+    /// For tests: shelves that own `ids`, sessions on this machine, so they
+    /// list as active.
     #[cfg(test)]
     pub(crate) fn owning<S: AsRef<str>>(ids: impl IntoIterator<Item = S>) -> Self {
         let mut shelves = Self::default();
         for id in ids {
-            shelves.own(id.as_ref());
+            shelves.own(&SessionKey::local(id.as_ref()));
         }
         shelves
     }
 
     /// Where `id` shows, given its last activity and the current time.
-    pub(crate) fn shelf(&self, id: &str, updated: i64, now: i64) -> Shelf {
+    pub(crate) fn shelf(&self, id: &SessionKey, updated: i64, now: i64) -> Shelf {
         let entry = self.entry(id);
         match entry.mark {
             Some(Mark::Settled(at)) if updated <= at => Shelf::Settled,
@@ -114,7 +122,7 @@ impl Shelves {
     }
 
     /// When a snoozed session wakes, in Unix seconds.
-    pub(crate) fn wakes(&self, id: &str) -> Option<i64> {
+    pub(crate) fn wakes(&self, id: &SessionKey) -> Option<i64> {
         match self.entry(id).mark {
             Some(Mark::Snoozed(until)) => Some(until),
             _ => None,
@@ -122,16 +130,16 @@ impl Shelves {
     }
 
     /// Marks `id` as started or continued in rho-ui.
-    pub(crate) fn own(&mut self, id: &str) {
+    pub(crate) fn own(&mut self, id: &SessionKey) {
         self.change(id, |entry| entry.owned = true);
     }
 
-    pub(crate) fn settle(&mut self, id: &str, now: i64) {
+    pub(crate) fn settle(&mut self, id: &SessionKey, now: i64) {
         self.change(id, |entry| entry.mark = Some(Mark::Settled(now)));
     }
 
     /// Snoozing a session makes it rho-ui's, so it wakes up active.
-    pub(crate) fn snooze(&mut self, id: &str, until: i64) {
+    pub(crate) fn snooze(&mut self, id: &SessionKey, until: i64) {
         self.change(id, |entry| {
             entry.owned = true;
             entry.mark = Some(Mark::Snoozed(until));
@@ -139,7 +147,7 @@ impl Shelves {
     }
 
     /// Moves `id` to the active list, and makes it rho-ui's.
-    pub(crate) fn restore(&mut self, id: &str) {
+    pub(crate) fn restore(&mut self, id: &SessionKey) {
         self.change(id, |entry| {
             *entry = Entry {
                 owned: true,
@@ -149,16 +157,15 @@ impl Shelves {
     }
 
     /// Forgets a deleted session.
-    pub(crate) fn forget(&mut self, id: &str) {
+    pub(crate) fn forget(&mut self, id: &SessionKey) {
         self.change(id, |entry| *entry = Entry::default());
     }
 
-    fn find(&self, id: &str) -> Result<usize, usize> {
-        self.entries
-            .binary_search_by(|(known, _)| known.as_str().cmp(id))
+    fn find(&self, id: &SessionKey) -> Result<usize, usize> {
+        self.entries.binary_search_by(|(known, _)| known.cmp(id))
     }
 
-    fn entry(&self, id: &str) -> Entry {
+    fn entry(&self, id: &SessionKey) -> Entry {
         self.find(id)
             .map(|at| self.entries[at].1)
             .unwrap_or_default()
@@ -166,7 +173,7 @@ impl Shelves {
 
     /// Applies `change` to `id`'s entry and saves if anything changed. An
     /// entry that ends up empty is removed.
-    fn change(&mut self, id: &str, change: impl FnOnce(&mut Entry)) {
+    fn change(&mut self, id: &SessionKey, change: impl FnOnce(&mut Entry)) {
         let mut entry = self.entry(id);
         let before = entry;
         change(&mut entry);
@@ -178,7 +185,7 @@ impl Shelves {
                 self.entries.remove(at);
             }
             (Ok(at), false) => self.entries[at].1 = entry,
-            (Err(at), false) => self.entries.insert(at, (id.to_owned(), entry)),
+            (Err(at), false) => self.entries.insert(at, (id.clone(), entry)),
             (Err(_), true) => {}
         }
         self.save(id, entry);
@@ -186,10 +193,14 @@ impl Shelves {
 
     /// Writes `id`'s entry, or deletes an empty one. Best effort: losing a
     /// write only moves a session between lists.
-    fn save(&self, id: &str, entry: Entry) {
+    fn save(&self, id: &SessionKey, entry: Entry) {
+        let key = (id.machine.as_str(), id.id.as_str());
         let db = &self.db;
         if entry == Entry::default() {
-            db.execute("DELETE FROM shelves WHERE session_id = ?1", [id]);
+            db.execute(
+                "DELETE FROM shelves WHERE machine = ?1 AND session_id = ?2",
+                key,
+            );
             return;
         }
         let (settled, snoozed) = match entry.mark {
@@ -198,9 +209,10 @@ impl Shelves {
             None => (None, None),
         };
         db.execute(
-            "INSERT OR REPLACE INTO shelves (session_id, owned, settled_at, snoozed_until) \
-             VALUES (?1, ?2, ?3, ?4)",
-            (id, entry.owned, settled, snoozed),
+            "INSERT OR REPLACE INTO shelves \
+             (machine, session_id, owned, settled_at, snoozed_until) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (key.0, key.1, entry.owned, settled, snoozed),
         );
     }
 }
@@ -209,17 +221,21 @@ impl Shelves {
 mod tests {
     use super::*;
 
+    fn k(id: &str) -> SessionKey {
+        SessionKey::local(id)
+    }
+
     #[test]
     fn sessions_from_elsewhere_start_settled_until_rho_ui_takes_them() {
         let mut shelves = Shelves::default();
-        assert_eq!(shelves.shelf("tui", 500, 600), Shelf::Settled);
-        shelves.restore("tui");
-        assert_eq!(shelves.shelf("tui", 500, 600), Shelf::Active);
+        assert_eq!(shelves.shelf(&k("tui"), 500, 600), Shelf::Settled);
+        shelves.restore(&k("tui"));
+        assert_eq!(shelves.shelf(&k("tui"), 500, 600), Shelf::Active);
 
-        shelves.snooze("other", 700);
-        assert_eq!(shelves.shelf("other", 0, 650), Shelf::Snoozed);
+        shelves.snooze(&k("other"), 700);
+        assert_eq!(shelves.shelf(&k("other"), 0, 650), Shelf::Snoozed);
         assert_eq!(
-            shelves.shelf("other", 0, 700),
+            shelves.shelf(&k("other"), 0, 700),
             Shelf::Active,
             "a snooze takes it"
         );
@@ -228,13 +244,13 @@ mod tests {
     #[test]
     fn owned_settled_sessions_return_on_new_activity() {
         let mut shelves = Shelves::default();
-        shelves.own("a");
-        shelves.settle("a", 100);
-        assert_eq!(shelves.shelf("a", 100, 200), Shelf::Settled);
-        assert_eq!(shelves.shelf("a", 101, 200), Shelf::Active);
-        shelves.forget("a");
+        shelves.own(&k("a"));
+        shelves.settle(&k("a"), 100);
+        assert_eq!(shelves.shelf(&k("a"), 100, 200), Shelf::Settled);
+        assert_eq!(shelves.shelf(&k("a"), 101, 200), Shelf::Active);
+        shelves.forget(&k("a"));
         assert_eq!(
-            shelves.shelf("a", 101, 200),
+            shelves.shelf(&k("a"), 101, 200),
             Shelf::Settled,
             "forgotten is unowned"
         );
@@ -244,39 +260,50 @@ mod tests {
     fn marks_replace_each_other_and_stay_findable() {
         let mut shelves = Shelves::default();
         for id in ["c", "a", "b"] {
-            shelves.own(id);
+            shelves.own(&k(id));
         }
-        shelves.snooze("a", 500);
-        shelves.settle("a", 10);
+        shelves.snooze(&k("a"), 500);
+        shelves.settle(&k("a"), 10);
         assert_eq!(
-            shelves.shelf("a", 5, 0),
+            shelves.shelf(&k("a"), 5, 0),
             Shelf::Settled,
             "settle replaces snooze"
         );
-        shelves.restore("a");
-        assert_eq!(shelves.shelf("a", 5, 0), Shelf::Active);
-        assert_eq!(shelves.shelf("b", 0, 0), Shelf::Active);
-        assert_eq!(shelves.shelf("c", 0, 0), Shelf::Active);
+        shelves.restore(&k("a"));
+        assert_eq!(shelves.shelf(&k("a"), 5, 0), Shelf::Active);
+        assert_eq!(shelves.shelf(&k("b"), 0, 0), Shelf::Active);
+        assert_eq!(shelves.shelf(&k("c"), 0, 0), Shelf::Active);
+    }
+
+    #[test]
+    fn machines_keep_their_own_marks() {
+        let mut shelves = Shelves::default();
+        let there = SessionKey::new(MachineId::remote("workstation"), SessionId::from("a"));
+        shelves.settle(&k("a"), 100);
+        assert_eq!(shelves.shelf(&there, 100, 200), Shelf::Settled, "unowned");
+        shelves.restore(&there);
+        assert_eq!(shelves.shelf(&there, 100, 200), Shelf::Active);
+        assert_eq!(shelves.shelf(&k("a"), 100, 200), Shelf::Settled);
     }
 
     #[test]
     fn shelves_survive_a_reload_and_ended_snoozes_wake_owned() {
         let db = StateDb::in_memory();
         let mut shelves = Shelves::load(&db, 0);
-        shelves.own("a");
-        shelves.settle("a", 100);
-        shelves.snooze("z", 300);
-        shelves.snooze("old", 50);
-        shelves.restore("b");
-        shelves.forget("b");
+        shelves.own(&k("a"));
+        shelves.settle(&k("a"), 100);
+        shelves.snooze(&k("z"), 300);
+        shelves.snooze(&k("old"), 50);
+        shelves.restore(&k("b"));
+        shelves.forget(&k("b"));
 
         let entry = |owned, mark| Entry { owned, mark };
         assert_eq!(
             Shelves::load(&db, 200).entries,
             vec![
-                ("a".to_owned(), entry(true, Some(Mark::Settled(100)))),
-                ("old".to_owned(), entry(true, None)),
-                ("z".to_owned(), entry(true, Some(Mark::Snoozed(300)))),
+                (k("a"), entry(true, Some(Mark::Settled(100)))),
+                (k("old"), entry(true, None)),
+                (k("z"), entry(true, Some(Mark::Snoozed(300)))),
             ],
             "a forgotten session leaves no row"
         );

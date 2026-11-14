@@ -12,6 +12,7 @@ mod composer;
 mod draft;
 mod fold;
 mod kinetic;
+mod machines;
 mod project_picker;
 mod projects;
 mod repo;
@@ -33,7 +34,7 @@ mod ui_tests;
 mod work;
 mod workspaces;
 
-use std::{borrow::Cow, path::PathBuf};
+use std::{borrow::Cow, path::PathBuf, rc::Rc};
 
 use gpui_kit::{
     px, size, App, AppContext as _, AssetSource, KeyBinding, SharedString, TitlebarOptions,
@@ -43,10 +44,10 @@ use rho_ui_core::DaemonTarget;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    machines::RemoteMachine,
     projects::Projects,
     settings::Settings,
-    shelf::Shelves,
-    sidebar::SidebarLayout,
+    sidebar::SidebarState,
     store::StateDb,
     turn_times::TurnTimes,
 };
@@ -96,7 +97,9 @@ gpui_kit::assets::icon_assets!(
         FileBraces,
         FileSpreadsheet,
         FileArchive,
-        FileImage
+        FileImage,
+        ListFilter,
+        Server
     ]
 );
 
@@ -152,7 +155,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
         return Err(format!("{} is not a directory", workspace.display()));
     }
     let daemon = DaemonTarget::rho(rho).ok_or("can't find the rho home: set RHO_HOME or HOME")?;
-    Ok(LaunchConfig { workspace, daemon })
+    Ok(LaunchConfig {
+        workspace,
+        daemon,
+        remote: Rc::new(RemoteMachine::ssh_target),
+    })
 }
 
 #[expect(
@@ -177,10 +184,9 @@ fn main() {
         let options = window_options(cx);
         gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
-                let shelves = Shelves::load(&db, time::now_unix());
+                let sidebar = SidebarState::load(&db, time::now_unix());
                 let projects = Projects::load(&db);
-                let layout = SidebarLayout::load(&db);
-                RhoApp::new(launch, shelves, projects, layout, window, cx)
+                RhoApp::new(launch, sidebar, projects, window, cx)
             })
         })
         .expect("failed to open the rho-ui window");

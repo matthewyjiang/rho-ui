@@ -5,7 +5,7 @@ cargo test
 ```
 
 - `rho-ui-core` has a scripted daemon for tests (`fake_daemon`, behind the `test-support` feature): `rho-protocol`'s real server side on a real Unix socket, with no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real daemon, and `tests/fixtures/tool_cards.jsonl` holds tool calls a rho 3 daemon sent with their cards, streamed and finished.
-- `rho-ui` UI tests (`crates/rho-ui/src/ui_tests.rs`) open the real app in an offscreen window, click and type through GPUI Kit's test helpers, and talk to the same fake daemon. They need a working Vulkan driver; Mesa lavapipe works without a GPU. Each run saves screenshots to `target/ui-shots/` for review.
+- `rho-ui` UI tests (`crates/rho-ui/src/ui_tests.rs`) open the real app in an offscreen window, click and type through GPUI Kit's test helpers, and talk to the same fake daemon. A test reaches a remote machine through another fake daemon's socket in place of ssh, by giving `LaunchConfig::remote` its own resolver. `crates/rho-ui-core/tests/ssh.rs` runs the ssh path against a fake `ssh` that bridges to a fake daemon with python3. They need a working Vulkan driver; Mesa lavapipe works without a GPU. Each run saves screenshots to `target/ui-shots/` for review.
 
 To check rho-ui against a real daemon and model, install rho 3, sign it in, and run the `live_daemon` test. It starts the daemon, runs a turn through an approval, and saves screenshots. A new rho home starts in `bypass`, which asks for no approvals, so set `permission_mode = "supervised"` under `[behavior]` in its `config.toml`:
 
@@ -19,4 +19,10 @@ Set `RHO_UI_LIVE_ATTACH` to the ID of a session whose turn waits on an approval,
 
 ```bash
 RHO_UI_LIVE_RHO=/path/to/rho cargo test -p rho-ui live_background -- --ignored --nocapture
+```
+
+`a_live_daemon_over_ssh` reaches the daemon on an ssh host with your own ssh setup, twice, and prints how long each connect took; the second rides the first's master connection. The host must have rho installed and its key in `known_hosts`. Set `RHO_UI_LIVE_SSH_RHO` when rho is not on the PATH of a non-interactive ssh command there, and `RHO_UI_LIVE_SSH_PROGRAM` to run another ssh, such as a wrapper that passes its own `UserKnownHostsFile` for `localhost`:
+
+```bash
+RHO_UI_LIVE_SSH=workstation cargo test -p rho-ui-core --test ssh -- --ignored --nocapture
 ```
