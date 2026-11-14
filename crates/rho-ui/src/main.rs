@@ -20,6 +20,7 @@ mod pele;
 mod project_picker;
 mod projects;
 mod repo;
+mod rho_settings;
 mod session_list;
 mod session_settings;
 mod session_view;
@@ -107,7 +108,8 @@ gpui_kit::assets::icon_assets!(
         Server,
         Layers,
         Timer,
-        SkipForward
+        SkipForward,
+        SlidersHorizontal
     ]
 );
 

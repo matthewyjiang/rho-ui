@@ -20,6 +20,7 @@ use gpui_kit::{
     WindowBounds, WindowOptions,
 };
 use rho_ui_core::{
+    agent_settings::SettingValue,
     fake_daemon::{subagent_result, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION},
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
     Entry, RunState, Session, SessionId, ToolStatus,
@@ -1056,15 +1057,7 @@ fn click_label(ui: &mut Harness, label: &str) {
 #[test]
 fn settings_open_apply_and_close() {
     let mut ui = Harness::start("settings", Script::default());
-    ui.wait_until("the sidebar", |window, _, _| {
-        is_visible(window, "open-settings")
-    });
-    ui.click("open-settings");
-    ui.wait_until("the settings dialog", |window, _, _| {
-        is_visible(window, "setting-ui-font")
-    });
-    // Past the dialog's entrance transition.
-    ui.cx.advance_clock(Duration::from_secs(1));
+    open_settings(&mut ui);
     ui.shot("open");
     ui.act(|window, _| {
         let panel = bounds(window, "settings-view").expect("settings are shown");
@@ -1120,6 +1113,43 @@ fn settings_open_apply_and_close() {
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.wait_until("settings closed", |window, _, _| {
         !is_visible(window, "setting-ui-font")
+    });
+}
+
+/// Opens Settings from the gear, past the dialog's entrance.
+fn open_settings(ui: &mut Harness) {
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "open-settings")
+    });
+    ui.click("open-settings");
+    ui.wait_until("the settings dialog", |window, _, _| {
+        is_visible(window, "setting-ui-font")
+    });
+    // The dialog fades in.
+    ui.cx.advance_clock(Duration::from_secs(1));
+}
+
+/// Shows Settings page `page`, one with titled groups, once it is listed.
+/// Kit's page rows aren't labelled for tests; the page's submenu toggle
+/// is, at the row's right end, so this clicks the row left of it.
+fn open_settings_page(ui: &mut Harness, page: &str) {
+    let toggle = format!("Toggle {page} submenu");
+    ui.wait_until(&format!("the {page} page listed"), |window, _, _| {
+        !window.find_all_by_label(&toggle).is_empty()
+    });
+    let center = ui
+        .cx
+        .update_window(ui.window, |_, window, _| {
+            window
+                .find_all_by_label(&toggle)
+                .first()
+                .map(|toggle| toggle.bounds().center() - gpui_kit::point(px(60.), px(0.)))
+        })
+        .expect("window is open")
+        .expect("the page is listed");
+    ui.act(|window, cx| {
+        window.pointer_down(center, MouseButton::Left, cx);
+        window.pointer_up(center, MouseButton::Left, cx);
     });
 }
 
@@ -3150,27 +3180,8 @@ fn a_machine_added_in_settings_lists_its_sessions() {
         );
     });
 
-    ui.click("open-settings");
-    ui.wait_until("the settings dialog", |window, _, _| {
-        is_visible(window, "setting-ui-font")
-    });
-    // The dialog fades in.
-    ui.cx.advance_clock(Duration::from_secs(1));
-    // Kit's page rows aren't labelled for tests; the page's submenu
-    // toggle is, at the row's right end, so click the row left of it.
-    let center = ui
-        .cx
-        .update_window(ui.window, |_, window, _| {
-            window
-                .try_find_by_label("Toggle Machines submenu")
-                .map(|toggle| toggle.bounds().center() - gpui_kit::point(px(60.), px(0.)))
-        })
-        .expect("window is open")
-        .expect("the Machines page");
-    ui.act(|window, cx| {
-        window.pointer_down(center, MouseButton::Left, cx);
-        window.pointer_up(center, MouseButton::Left, cx);
-    });
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Machines");
     ui.wait_until("the Machines page", |window, _, _| {
         is_visible(window, "new-machine-host")
     });
@@ -3210,4 +3221,41 @@ fn a_machine_added_in_settings_lists_its_sessions() {
     });
     ui.cx
         .update(|cx| assert!(cx.global::<Settings>().machines.is_empty()));
+}
+
+/// rho's own settings show as pages drawn from its daemon's schema. A
+/// switch flipped there changes the daemon's `config.toml`, and a hand
+/// edit of the file shows up on the open page.
+#[test]
+fn rho_settings_write_and_follow_the_daemon() {
+    let fake = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open(
+        "rho-settings",
+        fake.target(),
+        None,
+        Shelves::owning(["s1", "old"]),
+        Projects::default(),
+    );
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "General");
+    let compact = "setting-general.auto_compact";
+    let switch_is = |on: bool| {
+        move |window: &Window, _: &App, _: &RhoApp| {
+            window
+                .try_find(compact)
+                .is_some_and(|switch| switch.visible() && switch.checked() == Some(on))
+        }
+    };
+    ui.wait_until("Auto-compact on, its default", switch_is(true));
+    ui.shot("general");
+
+    ui.click(compact);
+    ui.wait_until("the switch off", switch_is(false));
+    ui.wait_until("the daemon's file turned it off", |_, _, _| {
+        fake.agent_setting("general.auto_compact") == Some(SettingValue::Bool(false))
+    });
+
+    fake.edit_agent_setting("general.auto_compact", SettingValue::Bool(true));
+    ui.wait_until("the hand edit on the page", switch_is(true));
+    ui.shot("edited");
 }

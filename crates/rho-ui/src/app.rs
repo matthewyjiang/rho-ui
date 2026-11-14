@@ -32,6 +32,7 @@ use crate::{
     kinetic::Kinetic,
     machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
     projects::Projects,
+    rho_settings::RhoSettings,
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
@@ -146,6 +147,8 @@ pub(crate) struct RhoApp {
     machines: Entity<Machines>,
     /// One per machine, in the machines' order.
     connections: Vec<Connection>,
+    /// rho's own settings on each connected machine, for Settings.
+    rho_settings: Entity<RhoSettings>,
     /// The epoch the next connection gets; see [`Connection::epoch`].
     next_epoch: u64,
     workspaces: Entity<Workspaces>,
@@ -201,7 +204,7 @@ impl RhoApp {
                 SidebarEvent::NewSession => this.new_session(window, cx),
                 SidebarEvent::Delete { id } => this.delete_session(id.clone(), window, cx),
                 SidebarEvent::Retry(machine) => this.connect(machine, window, cx),
-                SidebarEvent::OpenSettings => settings_view::open(window, cx),
+                SidebarEvent::OpenSettings => this.open_settings(window, cx),
                 SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
             },
         );
@@ -209,6 +212,7 @@ impl RhoApp {
             launch,
             machines,
             connections: Vec::new(),
+            rho_settings: cx.new(|_| RhoSettings::default()),
             next_epoch: 0,
             workspaces,
             projects,
@@ -267,6 +271,8 @@ impl RhoApp {
                 .push(kept.unwrap_or_else(|| Connection::new(machine.id.clone())));
         }
         for gone in old {
+            self.rho_settings
+                .update(cx, |settings, cx| settings.forget(&gone.machine, cx));
             self.forget_sessions(&gone.machine, window, cx);
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.remove_machine(&gone.machine, cx));
@@ -325,6 +331,8 @@ impl RhoApp {
     /// sessions themselves, and their turns, stay in the daemon.
     fn connect(&mut self, machine: &MachineId, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.forget_sessions(machine, window, cx);
+        self.rho_settings
+            .update(cx, |settings, cx| settings.forget(machine, cx));
         self.next_epoch += 1;
         let epoch = self.next_epoch;
         let Some(target) = self
@@ -401,6 +409,9 @@ impl RhoApp {
             version: format!("rho {}", info.version()).into(),
         };
         self.set_status(machine, status, cx);
+        self.rho_settings.update(cx, |settings, cx| {
+            settings.connected(machine, daemon.clone(), cx);
+        });
         let jobs_task = cx.spawn({
             let (daemon, machine) = (daemon.clone(), machine.clone());
             async move |this, cx| loop {
@@ -440,6 +451,8 @@ impl RhoApp {
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
         }
+        self.rho_settings
+            .update(cx, |settings, cx| settings.forget(machine, cx));
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
         self.set_status(machine, MachineStatus::Failed(error.to_string().into()), cx);
@@ -529,7 +542,17 @@ impl RhoApp {
                     }
                 }
             },
+            DaemonEvent::AgentSettingsChanged(changed) => {
+                self.rho_settings
+                    .update(cx, |settings, cx| settings.changed(machine, changed, cx));
+            }
         }
+    }
+
+    /// Opens Settings over the window, with rho's own settings on each
+    /// machine.
+    fn open_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        settings_view::open(&self.machines, &self.rho_settings, window, cx);
     }
 
     /// `machine`'s connection `epoch` ended. After the daemon said it was
@@ -1231,7 +1254,9 @@ impl Render for RhoApp {
             .on_action(cx.listener(|this, _: &NewSessionIn, window, cx| {
                 this.new_session_in(window, cx);
             }))
-            .on_action(|_: &OpenSettings, window, cx| settings_view::open(window, cx))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_sidebar(window, cx);
             }))

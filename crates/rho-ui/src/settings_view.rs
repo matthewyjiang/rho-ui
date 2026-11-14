@@ -1,9 +1,13 @@
 //! Settings, opened with Ctrl+, or the gear at the bottom of the sidebar, in a
 //! dialog over the window. Built from GPUI Kit's `Settings` component: pages
 //! on the left with a search, groups of items on the right. Each change
-//! applies at once and is saved. The Machines page is in [`machines`].
+//! applies at once and is saved. rho-ui's own settings come first, kept in
+//! its settings file: Appearance, and the Machines page in [`machines`].
+//! Then come rho's own, a page per category its daemon describes, saved in
+//! that machine's `config.toml`: see [`rho`].
 
 mod machines;
+mod rho;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
@@ -19,8 +23,13 @@ use gpui_kit::{
     Styled as _, Subscription, Window,
 };
 
-use crate::settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT};
+use crate::{
+    machines::Machines,
+    rho_settings::RhoSettings,
+    settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
+};
 use machines::MachineFields;
+use rho::RhoFields;
 
 /// How much of the window the dialog takes in each direction, so a large
 /// window gets a large dialog: 900 x 600 px in the default 1200 x 800 window.
@@ -44,12 +53,19 @@ const CLOSE_ROOM_REMS: f32 = 3.;
 /// Opens settings in a dialog, unless a dialog is already open. The dialog
 /// owns the view: Escape, its close button, or a click outside drops it, and
 /// the keyboard goes back where it was. The dialog has no title or padding:
-/// the panel fills it, and the page title heads it.
-pub(crate) fn open(window: &mut Window, cx: &mut App) {
+/// the panel fills it, and the page title heads it. `machines` and
+/// `rho_settings` are the app's, for rho's own settings on each machine.
+pub(crate) fn open(
+    machines: &Entity<Machines>,
+    rho_settings: &Entity<RhoSettings>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if window.has_active_dialog(cx) {
         return;
     }
-    let view = cx.new(|cx| SettingsView::new(window, cx));
+    let (machines, rho_settings) = (machines.clone(), rho_settings.clone());
+    let view = cx.new(|cx| SettingsView::new(machines, rho_settings, window, cx));
     window.open_dialog(cx, move |dialog, window, _| {
         let view = view.clone();
         dialog
@@ -135,11 +151,17 @@ struct SettingsView {
     ui_font: FontSelect,
     code_font: FontSelect,
     machines: MachineFields,
+    rho: RhoFields,
     _subscriptions: [Subscription; 2],
 }
 
 impl SettingsView {
-    fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+    fn new(
+        machines: Entity<Machines>,
+        rho_settings: Entity<RhoSettings>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
         let fonts: Vec<Choice> = cx
             .text_system()
             .all_font_names()
@@ -155,9 +177,11 @@ impl SettingsView {
             ui_font,
             code_font,
             machines: MachineFields::new(window, cx),
+            rho: RhoFields::new(machines, rho_settings, window, cx),
             _subscriptions: [ui_subscription, code_subscription],
         };
         view.sync_machine_fields(window, cx);
+        view.sync_rho_inputs(window, cx);
         view
     }
 
@@ -320,6 +344,7 @@ impl Render for SettingsView {
                 ]),
             );
         let machines = self.machines_page(cx);
+        let rho_pages = self.rho_pages(window, cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
         // corners, since the dialog has no padding to keep it inside.
@@ -337,7 +362,8 @@ impl Render for SettingsView {
                     .sidebar_style(&pages)
                     .with_group_variant(GroupBoxVariant::Fill)
                     .page(appearance)
-                    .page(machines),
+                    .page(machines)
+                    .pages(rho_pages),
             )
     }
 }

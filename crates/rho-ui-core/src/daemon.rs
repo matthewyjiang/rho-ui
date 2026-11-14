@@ -20,21 +20,23 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rho_protocol::{
-    methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, DaemonNotification,
-    DetachReason, ErrorCode, FrameError, IdleWake, JobKind, JobListParams, JobState, JobSummary,
-    LocalDaemon, LocalDaemonError, Notifications, SessionAnswerParams, SessionAttachParams,
-    SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
-    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
-    SessionObserveParams, SessionPromptParams, SessionSteerParams, SessionUnsteerParams,
-    TurnOutcome, UnsteerOutcome,
+    methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
+    ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
+    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobKind,
+    JobListParams, JobState, JobSummary, LocalDaemon, LocalDaemonError, Notifications,
+    SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams,
+    SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionHoldParams,
+    SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
+    SessionSteerParams, SessionUnsteerParams, SettingChange, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 
 use crate::{
+    agent_settings::{AgentSettings, AgentSettingsChanged},
     background::BackgroundId,
     input::{Answer, InputId},
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
@@ -102,6 +104,11 @@ pub enum DaemonError {
     /// Holds the daemon's message.
     #[error("{0}")]
     Busy(String),
+    /// A settings write found the settings changed since they were read,
+    /// by another client or a hand edit of the file, and wrote nothing.
+    /// Holds the daemon's message.
+    #[error("{0}")]
+    Conflict(String),
     /// The connection is gone.
     #[error("the rho daemon closed the connection")]
     Closed,
@@ -117,6 +124,7 @@ impl From<ClientError> for DaemonError {
             ClientError::Closed => Self::Closed,
             ClientError::Rpc { error, .. } => match error.error_code() {
                 Some(ErrorCode::SessionBusy | ErrorCode::NotSteerable) => Self::Busy(error.message),
+                Some(ErrorCode::ConfigConflict) => Self::Conflict(error.message),
                 _ => Self::Refused(error.message),
             },
             // Each of these names the daemon and what to do, as rho's own
@@ -361,6 +369,11 @@ pub enum DaemonEvent {
         /// Why.
         reason: Detached,
     },
+    /// rho's own settings on the daemon's machine changed, by any client
+    /// or a hand edit of `config.toml`. Sent once
+    /// [`Daemon::agent_settings`] has read them; apply it with
+    /// [`AgentSettings::apply`].
+    AgentSettingsChanged(AgentSettingsChanged),
 }
 
 /// The daemon's event stream. It ends when the connection does.
@@ -401,7 +414,15 @@ impl DaemonEvents {
                         reason,
                     });
                 }
-                // Logins and settings, which this client does not use.
+                DaemonNotification::ConfigChanged(changed)
+                    if changed.namespace == ConfigNamespace::Agent =>
+                {
+                    return Some(DaemonEvent::AgentSettingsChanged(AgentSettingsChanged(
+                        changed,
+                    )));
+                }
+                // Logins, and other clients' settings, which this client
+                // does not use.
                 _ => {}
             }
         }
@@ -515,6 +536,20 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
     };
     let events = DaemonEvents { notifications };
     Ok((daemon, events))
+}
+
+/// Names this process's settings writes (see `ConfigSetParams::writer`):
+/// a revision stays good for a writer while only its own writes followed
+/// it, so two quick changes from this app never conflict with each other.
+/// Unique to this run of the app: its process ID and when it first wrote.
+fn writer() -> &'static ConfigWriter {
+    static WRITER: OnceLock<ConfigWriter> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        ConfigWriter::new(format!("rho-ui-{}-{nanos}", std::process::id()))
+    })
 }
 
 /// What every session this client opens gets: `idle_wake: turn`, as rho's
@@ -927,6 +962,55 @@ impl Daemon {
             }
         }
         Ok(current)
+    }
+
+    /// rho's own settings on the daemon's machine: every setting the daemon
+    /// describes, with its value. From then on the connection sends
+    /// [`DaemonEvent::AgentSettingsChanged`] whenever a value or the file's
+    /// problems change, whoever changed them; reading again replaces that.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon has no settings to describe, as an older rho, or
+    /// the connection is gone.
+    pub async fn agent_settings(&self) -> Result<AgentSettings, DaemonError> {
+        let schema = self
+            .client
+            .request::<methods::ConfigSchemaMethod>(&ConfigSchemaParams {})
+            .await?;
+        let params = ConfigGetParams {
+            namespace: ConfigNamespace::Agent,
+        };
+        let read = self.client.request::<methods::ConfigGet>(&params).await?;
+        Ok(AgentSettings::new(schema, read))
+    }
+
+    /// Writes `changes` to the user's own `config.toml`, all of them or
+    /// none, against `revision`, the one [`AgentSettings::revision`] held
+    /// when the user made them. Send the next write only once this
+    /// returns: writes in flight together may land in either order. The
+    /// new values arrive as [`DaemonEvent::AgentSettingsChanged`].
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Conflict`] if another client or a hand edit changed
+    /// the settings since `revision`: read them again. Also fails if the
+    /// daemon refuses a value, the file doesn't load, or the connection is
+    /// gone. Nothing was written then.
+    pub async fn set_agent_settings(
+        &self,
+        revision: ConfigRevision,
+        changes: Vec<SettingChange>,
+    ) -> Result<(), DaemonError> {
+        let params = ConfigSetParams {
+            namespace: ConfigNamespace::Agent,
+            layer: ConfigLayer::Global,
+            revision,
+            writer: Some(writer().clone()),
+            changes,
+        };
+        self.client.request::<methods::ConfigSet>(&params).await?;
+        Ok(())
     }
 
     /// Deletes a saved session for good, unless a client follows it: the

@@ -6,10 +6,12 @@ use std::{path::Path, time::Duration};
 
 use futures::FutureExt;
 use rho_ui_core::{
+    agent_settings::{SettingChange, SettingKey, SettingValue},
     fake_daemon::{FakeDaemon, Script, TuiJob, TUI_SESSION},
-    Answer, Attachment, BackgroundKind, BackgroundStatus, Checkout, ChoiceKind, ConfigOption,
-    ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry, Form, Image,
-    ImageFormat, JobActivity, Prompt, RunState, Session, Unsteered, MAX_PROMPT_ATTACHMENT_BYTES,
+    AgentSettings, Answer, Attachment, BackgroundKind, BackgroundStatus, Checkout, ChoiceKind,
+    ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Entry,
+    Form, Image, ImageFormat, JobActivity, Prompt, RunState, Session, Unsteered,
+    MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -44,9 +46,106 @@ async fn until(events: &mut DaemonEvents, session: &mut Session, done: impl Fn(&
                     session.apply(update);
                 }
             }
-            other @ DaemonEvent::Detached { .. } => panic!("unexpected event: {other:?}"),
+            other => panic!("unexpected event: {other:?}"),
         }
     }
+}
+
+/// Applies changes to the agent settings until `done` holds.
+async fn settings_until(
+    events: &mut DaemonEvents,
+    settings: &mut AgentSettings,
+    done: impl Fn(&AgentSettings) -> bool,
+) {
+    while !done(settings) {
+        match next(events).await {
+            DaemonEvent::AgentSettingsChanged(changed) => settings.apply(changed),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}
+
+/// rho's settings follow every write, this app's and a hand edit's, and a
+/// write is refused as a conflict only when someone else wrote since its
+/// read: this app's own second write, sent before it heard of its first,
+/// lands.
+#[test]
+fn agent_settings_follow_writes_and_refuse_stale_ones() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut settings = daemon
+            .agent_settings()
+            .await
+            .expect("the fake describes its settings");
+        let compact = SettingKey::new("general.auto_compact");
+        assert_eq!(settings.value(&compact), Some(&SettingValue::Bool(true)));
+        assert!(!settings.is_set(&compact), "at its default");
+
+        let read = settings.revision().clone();
+        let off = SettingChange::Set {
+            key: compact.clone(),
+            value: SettingValue::Bool(false),
+        };
+        daemon
+            .set_agent_settings(read.clone(), vec![off])
+            .await
+            .expect("a write against the current revision lands");
+        assert_eq!(
+            fake.agent_setting(compact.as_str()),
+            Some(SettingValue::Bool(false))
+        );
+        let shell = SettingKey::new("tools.shell");
+        let zsh = SettingChange::Set {
+            key: shell.clone(),
+            value: SettingValue::Text("zsh".to_owned()),
+        };
+        daemon
+            .set_agent_settings(read, vec![zsh])
+            .await
+            .expect("only this app wrote since its read");
+        settings_until(&mut events, &mut settings, |settings| {
+            settings.value(&shell) == Some(&SettingValue::Text("zsh".to_owned()))
+        })
+        .await;
+        assert_eq!(settings.value(&compact), Some(&SettingValue::Bool(false)));
+        assert!(settings.is_set(&compact), "the file sets it now");
+
+        // A hand edit reaches this client, and makes a write against the
+        // revision before it a conflict.
+        let before_edit = settings.revision().clone();
+        fake.edit_agent_setting("tools.shell", SettingValue::Text("fish".to_owned()));
+        settings_until(&mut events, &mut settings, |settings| {
+            settings.value(&shell) == Some(&SettingValue::Text("fish".to_owned()))
+        })
+        .await;
+        let reset = SettingChange::Reset {
+            key: compact.clone(),
+        };
+        let stale = daemon
+            .set_agent_settings(before_edit, vec![reset.clone()])
+            .await;
+        assert!(matches!(stale, Err(DaemonError::Conflict(_))), "{stale:?}");
+        assert_eq!(
+            fake.agent_setting(compact.as_str()),
+            Some(SettingValue::Bool(false)),
+            "a refused write changes nothing"
+        );
+
+        daemon
+            .set_agent_settings(settings.revision().clone(), vec![reset])
+            .await
+            .expect("a write against the edited revision lands");
+        settings_until(&mut events, &mut settings, |settings| {
+            !settings.is_set(&compact)
+        })
+        .await;
+        assert_eq!(
+            settings.value(&compact),
+            Some(&SettingValue::Bool(true)),
+            "its default"
+        );
+    });
 }
 
 /// Opens a new session and follows it.

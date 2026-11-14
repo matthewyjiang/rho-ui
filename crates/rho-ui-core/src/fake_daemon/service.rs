@@ -14,7 +14,8 @@ use rho_protocol::{
         SessionObserveParams, SessionSummary, SessionUnsteerParams, SessionUnsteerResponse,
         SteerId,
     },
-    ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo, ContentBlock,
+    ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo, ConfigGetParams,
+    ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock,
     CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason, ErrorCode, InputAnswer,
     InputAsker, InputRequest, InputRequestId, InputTimeout, Operation, PermissionMode,
     PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
@@ -719,4 +720,21 @@ impl Service for Fake {
 
 /// No settings: every `rho/config/*` method answers rho-protocol's default,
 /// not served.
-impl SettingsService for Fake {}
+/// rho's own settings; see `config.rs`.
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the trait's methods return futures; a scripted answer has nothing to await"
+)]
+impl SettingsService for Fake {
+    async fn config_schema(&self) -> Result<ConfigSchema, RpcError> {
+        Ok(self.lock().config.schema())
+    }
+
+    async fn get_config(&self, params: ConfigGetParams) -> Result<ConfigWatch, RpcError> {
+        self.lock().config.watch(&params.namespace)
+    }
+
+    async fn set_config(&self, params: ConfigSetParams) -> Result<ConfigSetResponse, RpcError> {
+        self.lock().config.set(params)
+    }
+}

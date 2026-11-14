@@ -1,6 +1,7 @@
 //! The desktop UI's rho layer: connect to the rho daemon, talk to it, and
 //! keep each session's state. No GUI code lives here.
 
+pub mod agent_settings;
 mod background;
 mod completion;
 mod daemon;
@@ -14,6 +15,7 @@ mod ssh;
 mod timeline;
 mod tool_card;
 
+pub use agent_settings::{AgentSettings, AgentSettingsChanged};
 pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
 pub use completion::{Completion, Edit};
 pub use daemon::{

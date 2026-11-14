@@ -45,6 +45,14 @@
 //!   three reasoning levels, and fast mode. Every session offers the slash
 //!   commands `compact` and `prompt:review` and the skills `pstack` and
 //!   `prove-it-works`.
+//! - rho's own settings are two pages. "General" holds
+//!   `general.auto_compact` (on/off, on by default), `general.permission_mode`
+//!   (a choice of auto, plan or supervised) and, under "Models",
+//!   `general.title_model` (a model). "Tools" holds `tools.shell_timeout`
+//!   (seconds, 1 to 3600) and `tools.shell` (text). Revisions count the
+//!   writes: "r0", "r1", ... A write against an older revision is refused
+//!   as a conflict, unless only its own writer wrote since.
+//!   [`FakeDaemon::edit_agent_setting`] changes one as a hand edit does.
 
 use std::{
     collections::BTreeMap,
@@ -72,10 +80,12 @@ use rho_protocol::{
 };
 use tokio::{net::UnixListener, runtime::Runtime};
 
-use crate::{DaemonTarget, SessionId as UiSessionId};
+use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
 
+mod config;
 mod service;
 
+use config::FakeConfig;
 use service::Fake;
 
 /// The session [`Script::tui_job`] runs.
@@ -263,6 +273,20 @@ impl FakeDaemon {
     /// How many worktrees the daemon has added for new sessions.
     pub fn worktrees(&self) -> usize {
         self.service.lock().worktrees
+    }
+
+    /// The value of agent setting `key` now: `None` for one that is unset
+    /// or that the fake doesn't have.
+    pub fn agent_setting(&self, key: &str) -> Option<SettingValue> {
+        self.service.lock().config.value(key)
+    }
+
+    /// Sets agent setting `key` to `value` as a hand edit of `config.toml`
+    /// does: no client wrote it, so a client's write against the revision
+    /// before it is refused, and every client that read the settings hears
+    /// of it.
+    pub fn edit_agent_setting(&self, key: &str, value: SettingValue) {
+        self.service.lock().config.edit(key, value);
     }
 
     /// Ends `session`'s oldest running background process by itself, with
@@ -944,6 +968,8 @@ struct State {
     new_session_environment: Option<ClientEnvironment>,
     turns: u64,
     steers: u64,
+    /// rho's own settings.
+    config: FakeConfig,
 }
 
 impl State {
@@ -973,6 +999,7 @@ impl State {
             new_session_environment: None,
             turns: 0,
             steers: 0,
+            config: FakeConfig::new(),
         };
         if script.tui_job == TuiJob::Running {
             let mut session = FakeSession::new("/w/a", Some("from the tui"), 1_767_398_400);
