@@ -1237,6 +1237,10 @@ impl RhoApp {
     pub(crate) fn projects<'a>(&self, cx: &'a App) -> &'a [Place] {
         self.projects.read(cx).roots()
     }
+    /// `machine`'s home directory, as its daemon said, for UI tests.
+    pub(crate) fn workspaces_home(&self, machine: &MachineId, cx: &App) -> Option<PathBuf> {
+        self.workspaces.read(cx).home(machine)
+    }
     /// The sidebar's search, for UI tests.
     pub(crate) fn sidebar_search(&self, cx: &App) -> FocusHandle {
         self.sidebar.read(cx).search_focus_handle(cx)

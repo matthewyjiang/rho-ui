@@ -96,17 +96,23 @@ fn checkout(
     origin: Option<String>,
     head: Option<&str>,
 ) -> Repo {
-    // The main checkout holds the common dir as its `.git`. A bare
-    // repository has no main checkout, so its worktree stands alone.
-    let root = common_dir
-        .parent()
-        .filter(|_| common_dir.file_name().is_some_and(|name| name == ".git"))
-        .map_or(work_tree, Path::to_path_buf);
+    let root = project_root(work_tree, common_dir);
     Repo {
         name: origin.unwrap_or_else(|| folder_name(&root)),
         branch: head.and_then(branch_name),
         root,
     }
+}
+
+/// The project folder of a checkout at `work_tree` whose repository keeps
+/// what all its worktrees share in `common_dir`: the main checkout, which
+/// holds the common dir as its `.git`. A bare repository has no main
+/// checkout, so its worktree stands alone.
+pub(crate) fn project_root(work_tree: PathBuf, common_dir: &Path) -> PathBuf {
+    common_dir
+        .parent()
+        .filter(|_| common_dir.file_name().is_some_and(|name| name == ".git"))
+        .map_or(work_tree, Path::to_path_buf)
 }
 
 /// The POSIX `sh` script that reads the repositories of the folders given
@@ -134,13 +140,11 @@ done
 /// The projects of `dirs`, from what [`REMOTE_SCRIPT`] printed for them.
 /// `None` if it printed the wrong number of fields.
 pub(crate) fn parse_remote(dirs: &[PathBuf], output: &[u8]) -> Option<Vec<Repo>> {
-    let fields: Vec<&[u8]> = output.split(|&byte| byte == 0).collect();
-    // Each field ends with a NUL, so splitting leaves one empty piece last.
-    let (last, fields) = fields.split_last()?;
+    let fields = nul_fields(output)?;
     let (facts, []) = fields.as_chunks::<4>() else {
         return None;
     };
-    if !last.is_empty() || facts.len() != dirs.len() {
+    if facts.len() != dirs.len() {
         return None;
     }
     let path = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
@@ -162,6 +166,15 @@ pub(crate) fn parse_remote(dirs: &[PathBuf], output: &[u8]) -> Option<Vec<Repo>>
         })
         .collect();
     Some(repos)
+}
+
+/// The fields of a remote script's `output`, each of which it ended with a
+/// NUL. `None` if the output doesn't end with one.
+pub(crate) fn nul_fields(output: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut fields: Vec<&[u8]> = output.split(|&byte| byte == 0).collect();
+    // Each field ends with a NUL, so splitting leaves one empty piece last.
+    fields.pop().filter(|last| last.is_empty())?;
+    Some(fields)
 }
 
 /// The work tree root and git dir for `start`, searching upward. `.git` is a

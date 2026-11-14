@@ -28,7 +28,8 @@ pub(crate) struct Workspace {
     place: Place,
     repo: Repo,
     pub(crate) name: SharedString,
-    /// The name without its owner, as the title bar shows the project.
+    /// The name without its owner, as the title bar shows the project;
+    /// see [`Self::project_key`].
     pub(crate) short_name: SharedString,
     pub(crate) initials: SharedString,
     pub(crate) branch: Option<SharedString>,
@@ -76,6 +77,15 @@ impl Workspace {
         Place::new(self.place.machine.clone(), self.repo.root.clone())
     }
 
+    /// What makes two checkouts, on any machines, the same project: the
+    /// repository's name without its owner, or outside git the folder's
+    /// name. Not the owner, as a remote checkout shows only its folder's
+    /// name until its repository is read over ssh; so forks of a
+    /// repository, and same-named folders, count as one project.
+    pub(crate) fn project_key(&self) -> &str {
+        &self.short_name
+    }
+
     /// Takes what a fresh read of its repository says.
     fn set_repo(&mut self, repo: Repo) {
         self.name = repo.name.clone().into();
@@ -98,20 +108,6 @@ pub(crate) fn tilde(cwd: &Path, home: Option<&Path>) -> String {
         Some(Ok(rest)) => format!("~/{}", rest.display()),
         _ => cwd.display().to_string(),
     }
-}
-
-/// The directory `text` names, if it is a path: absolute, `~`, or under
-/// `~/`. The reverse of [`tilde`]; whether it exists is the caller's to
-/// check, off the UI thread.
-pub(crate) fn typed_path(text: &str, home: Option<&Path>) -> Option<PathBuf> {
-    if text == "~" {
-        return home.map(Path::to_path_buf);
-    }
-    if let Some(rest) = text.strip_prefix("~/") {
-        return home.map(|home| home.join(rest));
-    }
-    let path = Path::new(text);
-    path.is_absolute().then(|| path.to_path_buf())
 }
 
 /// One workspace in a shared [`Workspaces`] table, for a view that shows it.
@@ -186,6 +182,12 @@ impl Workspaces {
             return home();
         }
         self.remote(machine)?.home.clone()
+    }
+
+    /// How to run a script on remote `machine`, while its daemon is
+    /// connected.
+    pub(crate) fn ssh(&self, machine: &MachineId) -> Option<SshLink> {
+        self.remote(machine)?.ssh.clone()
     }
 
     fn remote(&self, machine: &MachineId) -> Option<&Remote> {
@@ -402,25 +404,6 @@ fn say_unread(why: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn typed_paths_are_absolute_or_from_home() {
-        let home = Some(Path::new("/home/me"));
-        assert_eq!(typed_path("~", home), Some(PathBuf::from("/home/me")));
-        assert_eq!(
-            typed_path("~/code/rho", home),
-            Some(PathBuf::from("/home/me/code/rho"))
-        );
-        assert_eq!(typed_path("/srv/x", home), Some(PathBuf::from("/srv/x")));
-        assert_eq!(typed_path("rho-ui", home), None, "a name is a search");
-        assert_eq!(typed_path("~/code", None), None, "no home, no ~");
-        let rho = Path::new("/home/me/code/rho");
-        assert_eq!(
-            typed_path(&tilde(rho, home), home).as_deref(),
-            Some(rho),
-            "tilde and typed_path undo each other"
-        );
-    }
 
     #[test]
     fn home_shows_as_tilde() {

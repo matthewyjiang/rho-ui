@@ -2801,6 +2801,23 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
         assert_eq!(roots, [PathBuf::from("/w/b"), main.clone()]);
     });
     ui.shot("removed");
+
+    // A path ending in / browses its folder: a subfolder's row goes into
+    // it, where its project and its own subfolders show.
+    let wt_row: &'static str = format!("project-next:{}", tree.display()).leak();
+    let src_row: &'static str = format!("project-next:{}", tree.join("src").display()).leak();
+    ui.act(|window, cx| {
+        window.press("ctrl-shift-n", cx);
+        window.input(&format!("{}/", dir.display()), cx);
+    });
+    ui.wait_until("the folder's subfolders", |window, _, _| {
+        is_visible(window, wt_row)
+    });
+    ui.click(wt_row);
+    ui.wait_until("the worktree's project and subfolder", |window, _, _| {
+        is_visible(window, main_row) && is_visible(window, src_row) && !is_visible(window, wt_row)
+    });
+    ui.shot("browsed");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3047,8 +3064,11 @@ fn click_menu_item(ui: &mut Harness, label: &str) {
 /// Two machines list their sessions side by side, though their daemons
 /// issue the same session IDs, and each row names its machine. A session
 /// opens from the daemon it is on, a new session starts on the machine its
-/// project is on, and the filter hides a machine. A machine that can't be
-/// reached says so with Retry while the others work on.
+/// project is on, and the filter hides a machine. A project with a
+/// checkout on each machine lists once, at the chosen machine's checkout,
+/// and choosing the other machine moves the draft to its checkout there.
+/// A machine that can't be reached says so with Retry while the others
+/// work on.
 #[test]
 fn machines_list_side_by_side() {
     let local = FakeDaemon::start(Script::default());
@@ -3070,6 +3090,10 @@ fn machines_list_side_by_side() {
     }
     let mut projects = Projects::default();
     projects.add(Place::new(there.clone(), "/srv/app"));
+    // The same project, named for its folder, on this machine, and one
+    // only this machine holds.
+    projects.add(Place::local("/w/app"));
+    projects.add(Place::local("/w/b"));
     let mut ui = Harness::open_with(
         "machines",
         local.target(),
@@ -3134,6 +3158,7 @@ fn machines_list_side_by_side() {
         composer_attachments(window).is_empty() && is_visible(window, "composer-refusal")
     });
 
+    wait_for_the_workstations_projects(&mut ui);
     ui.click("project-workstation:/srv/app");
     ui.wait_until(
         "the draft in the workstation's project",
@@ -3149,6 +3174,8 @@ fn machines_list_side_by_side() {
         composer_attachments(window).len() == 1 && is_visible(window, "composer-refusal")
     });
 
+    choose_this_machine(&mut ui);
+
     // The filter hides the workstation's sessions.
     ui.click("sidebar-filter");
     click_menu_item(&mut ui, "Workstation");
@@ -3156,6 +3183,56 @@ fn machines_list_side_by_side() {
         is_visible(window, "session-local-s1") && !is_visible(window, "session-workstation-s1")
     });
     ui.shot("filtered");
+}
+
+/// Waits for the project list of a draft on the workstation: `app` once,
+/// at the workstation's checkout, and /w/b dimmed, as only this machine
+/// holds it.
+fn wait_for_the_workstations_projects(ui: &mut Harness) {
+    ui.wait_until(
+        "the workstation's checkout, and /w/b dimmed",
+        |window, _, _| {
+            is_visible(window, "project-workstation:/srv/app")
+                && is_visible(window, "project-elsewhere-local:/w/b")
+                && !is_visible(window, "project-local:/w/app")
+                && !is_visible(window, "project-elsewhere-local:/w/app")
+        },
+    );
+}
+
+/// Chooses this machine in the project list, which moves the draft from
+/// the workstation's checkout of `app` to this machine's. Back on the
+/// workstation from /w/b, which it doesn't hold, the draft goes to its
+/// home folder, so the footer still names where the session runs.
+fn choose_this_machine(ui: &mut Harness) {
+    ui.click("project-machine");
+    click_menu_item(ui, "local");
+    ui.wait_until(
+        "the draft in this machine's checkout",
+        draft_at(MachineId::local(), "/w/app"),
+    );
+    ui.act(|window, _| {
+        assert_eq!(checked(window, "project-local:/w/app"), Some(true));
+        assert!(!is_visible(window, "project-workstation:/srv/app"));
+    });
+
+    ui.click("project-local:/w/b");
+    ui.wait_until("the draft in /w/b", draft_at(MachineId::local(), "/w/b"));
+    ui.click("project-machine");
+    click_menu_item(ui, "Workstation");
+    let home = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        app.workspaces_home(&MachineId::remote("workstation"), cx)
+    });
+    let home = home.expect("the workstation's daemon said its home");
+    ui.wait_until("the draft in the workstation's home", move |_, cx, app| {
+        app.draft().is_some_and(|draft| {
+            let draft = draft.read(cx);
+            draft.cwd() == &Place::new(MachineId::remote("workstation"), home.clone())
+                && draft.session_key().is_some()
+        })
+    });
+    ui.act(|window, _| assert!(is_visible(window, "project-elsewhere-local:/w/b")));
 }
 
 /// Whether the draft is open at `path`, with its session made on `machine`.

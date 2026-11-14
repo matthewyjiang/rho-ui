@@ -13,6 +13,7 @@ mod composer;
 mod draft;
 mod figures;
 mod fold;
+mod folders;
 mod input_card;
 mod kinetic;
 mod machines;
