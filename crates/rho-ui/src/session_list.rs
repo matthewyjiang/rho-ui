@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn unsaved_sessions_sit_on_top_until_the_agent_lists_them() {
+    fn live_and_saved_sessions_merge_into_one_row_each() {
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -739,20 +739,16 @@ mod tests {
         );
         rebuild(&mut list, &owned(), 3);
         assert_eq!(shown(&list), ["named", "Untitled"]);
-    }
 
-    #[test]
-    fn live_titles_win_and_restarts_drop_unsaved_rows() {
-        let mut list = SessionList::default();
-        list.set_saved(&here(), vec![saved("a", Some("saved title"), 1)]);
-        list.set_live(live("a", Some("live title"), Activity::Idle), 0, 2);
-        list.set_live(live("b", None, Activity::Idle), 0, 2);
-        rebuild(&mut list, &owned(), 2);
-        assert_eq!(shown(&list), ["New session", "live title"]);
-
+        // A live title beats the saved one, and a restart drops the rows
+        // the agent never saved.
+        list.set_live(live("old", Some("live title"), Activity::Idle), 0, 4);
+        list.set_live(live("new", None, Activity::Idle), 0, 4);
+        rebuild(&mut list, &owned(), 4);
+        assert_eq!(shown(&list), ["New session", "named", "live title"]);
         list.clear_live(&here());
-        rebuild(&mut list, &owned(), 2);
-        assert_eq!(shown(&list), ["live title"]);
+        rebuild(&mut list, &owned(), 4);
+        assert_eq!(shown(&list), ["named", "live title"]);
     }
 
     #[test]
@@ -830,24 +826,19 @@ mod tests {
         list.set_query("atl");
         rebuild(&mut list, &shelves, 5);
         assert_eq!(list.items.len(), 5, "the workspace name matches too");
-    }
 
-    #[test]
-    fn busy_counts_every_session_whatever_the_search_shows() {
-        let mut list = SessionList::default();
+        // The rail's busy count ignores the search.
         let now = Instant::now();
-        list.set_live(live("a", None, Activity::Working(now)), 0, 1);
-        list.set_live(live("b", None, Activity::Waiting(now)), 0, 1);
-        list.set_live(live("c", None, Activity::Working(now)), 0, 1);
-        list.set_live(live("d", None, Activity::Idle), 0, 1);
+        list.set_live(live("a", None, Activity::Working(now)), 0, 5);
+        list.set_live(live("b", None, Activity::Waiting(now)), 0, 5);
         list.set_query("matches nothing");
-        rebuild(&mut list, &owned(), 1);
+        rebuild(&mut list, &shelves, 5);
         assert!(list.is_empty());
         assert_eq!(
             list.busy(),
             Busy {
                 waiting: 1,
-                working: 2
+                working: 1
             }
         );
     }

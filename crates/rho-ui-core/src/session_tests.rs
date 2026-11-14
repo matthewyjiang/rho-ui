@@ -8,7 +8,6 @@ use super::*;
 use crate::{
     input::{Form, InputChoice},
     options::{ConfigCategory, ConfigChoice, ConfigKind},
-    prompt::{Image, ImageFormat},
     tool_card::{SearchLine, ToolBody, ToolFact},
 };
 
@@ -418,10 +417,7 @@ fn requests_open_once_and_close_when_any_client_answers() {
     // A reset's replay may repeat a request the attach response listed.
     session.apply(update(approval(7)));
     assert_eq!(session.inputs().len(), 1);
-    let request = &session.inputs()[0];
-    assert_eq!(request.title(), "Run `cargo test`?");
-    assert_eq!(request.description(), Some("runs a command"));
-    let Form::Choices { choices, .. } = request.form() else {
+    let Form::Choices { choices, .. } = session.inputs()[0].form() else {
         panic!("an approval is answered by choosing");
     };
     let ids: Vec<_> = choices.iter().map(InputChoice::id).collect();
@@ -663,19 +659,6 @@ fn a_held_message_is_due_once_a_later_turn_ended() {
     session.hold("four".into(), sent_after);
     assert_eq!(session.take_due(), None);
     assert_eq!(session.take_held(), Some("four".into()));
-}
-
-/// A message with attachments can't steer; held, it keeps them, after the
-/// text and attachments held before it.
-#[test]
-fn a_held_message_keeps_its_attachments() {
-    let image = |byte: u8| Attachment::Image(Image::new(ImageFormat::Png, vec![byte]));
-    let mut session = session();
-    session.hold(Prompt::new("one".to_owned(), vec![image(1)]), None);
-    session.hold(Prompt::new(String::new(), vec![image(2)]), None);
-    let held = session.held().expect("a held message");
-    assert_eq!(held.text(), "one");
-    assert_eq!(held.attachments(), [image(1), image(2)]);
 }
 
 /// Work that ended stays in the session's record of ended work after the

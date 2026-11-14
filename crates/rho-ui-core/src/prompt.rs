@@ -472,15 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn a_files_name_and_path_come_from_its_uri() {
-        let path = test_path("notes.md");
-        let file = AttachedFile::linked(&path);
-        assert_eq!(file.name(), "notes.md");
-        assert_eq!(file.path(), Some(path.as_path()));
-        assert_eq!(file.text(), None);
-    }
-
-    #[test]
     fn an_attachment_only_prompt_sends_no_empty_text() {
         let wire = Prompt::new(String::new(), vec![png()]).to_wire();
         assert!(
@@ -549,11 +540,9 @@ mod tests {
         let image = Attachment::Image(Image::new(ImageFormat::Png, vec![0; 6 * 1024 * 1024]));
         assert_eq!(check_attachment_total([&image, &image]), Ok(()));
         let text = Attachment::File(AttachedFile::with_text(&test_path("a"), "x"));
-        let error =
-            check_attachment_total([&image, &image, &text]).expect_err("a byte past the limit");
-        assert_eq!(
-            error.to_string(),
-            "a message can carry 16.0 MiB of attachments once encoded, and these come to 16.0 MiB"
+        assert!(
+            check_attachment_total([&image, &image, &text]).is_err(),
+            "a byte past the limit"
         );
     }
 

@@ -9,8 +9,9 @@ Repo skills live in `.agents/skills`:
 - `rust-best-practices`: load it before writing or changing any Rust here. Follow it.
 - `rust-review`: use it to review Rust changes before you hand them back.
 - `rust-port`: for porting code from another language to Rust.
+- `rho-ui-test-selection`: load it before adding, growing, reviewing, or deleting tests. Every test needs a failure mode, one owner layer, and a gap. Ported from rho's `rho-test-selection`; edit it here.
 
-These three come from [BeautifulRust](https://github.com/morganlinton/BeautifulRust) (MIT, commit `edd3e86`). Update them by copying the skill folders again; don't edit them in place.
+The three Rust skills come from [BeautifulRust](https://github.com/morganlinton/BeautifulRust) (MIT, commit `edd3e86`). Update them by copying the skill folders again; don't edit them in place.
 
 For UI work in `crates/rho-ui`, follow GPUI Kit's own guides: https://gpui-kit.com/docs/coding-guides.md and https://gpui-kit.com/docs/design-guides.md. Never invent a GPUI or GPUI Kit API. Check the source of the exact version in `Cargo.lock`.
 

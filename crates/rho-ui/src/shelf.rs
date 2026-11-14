@@ -226,22 +226,6 @@ mod tests {
     }
 
     #[test]
-    fn sessions_from_elsewhere_start_settled_until_rho_ui_takes_them() {
-        let mut shelves = Shelves::default();
-        assert_eq!(shelves.shelf(&k("tui"), 500, 600), Shelf::Settled);
-        shelves.restore(&k("tui"));
-        assert_eq!(shelves.shelf(&k("tui"), 500, 600), Shelf::Active);
-
-        shelves.snooze(&k("other"), 700);
-        assert_eq!(shelves.shelf(&k("other"), 0, 650), Shelf::Snoozed);
-        assert_eq!(
-            shelves.shelf(&k("other"), 0, 700),
-            Shelf::Active,
-            "a snooze takes it"
-        );
-    }
-
-    #[test]
     fn owned_settled_sessions_return_on_new_activity() {
         let mut shelves = Shelves::default();
         shelves.own(&k("a"));
@@ -257,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_replace_each_other_and_stay_findable() {
+    fn marks_replace_each_other_end_and_stay_per_machine() {
         let mut shelves = Shelves::default();
         for id in ["c", "a", "b"] {
             shelves.own(&k(id));
@@ -273,11 +257,16 @@ mod tests {
         assert_eq!(shelves.shelf(&k("a"), 5, 0), Shelf::Active);
         assert_eq!(shelves.shelf(&k("b"), 0, 0), Shelf::Active);
         assert_eq!(shelves.shelf(&k("c"), 0, 0), Shelf::Active);
-    }
 
-    #[test]
-    fn machines_keep_their_own_marks() {
-        let mut shelves = Shelves::default();
+        shelves.snooze(&k("b"), 700);
+        assert_eq!(shelves.shelf(&k("b"), 0, 650), Shelf::Snoozed);
+        assert_eq!(
+            shelves.shelf(&k("b"), 0, 700),
+            Shelf::Active,
+            "the snooze ended"
+        );
+
+        // The same ID on another machine is another session.
         let there = SessionKey::new(MachineId::remote("workstation"), SessionId::from("a"));
         shelves.settle(&k("a"), 100);
         assert_eq!(shelves.shelf(&there, 100, 200), Shelf::Settled, "unowned");

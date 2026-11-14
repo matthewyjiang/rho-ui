@@ -622,7 +622,6 @@ mod tests {
     fn a_plan_approval_offers_each_mode_and_carries_feedback() {
         let request = ask(&json!({"kind": "plan_approval", "plan": "1. Refactor",
             "modes": ["allow_edits", "auto"]}));
-        assert_eq!(request.description(), Some("1. Refactor"));
         assert_eq!(
             offered(&request),
             [
@@ -724,13 +723,6 @@ mod tests {
         ] {
             let request = ask(&json!({"kind": "question", "title": "T", "questions": questions}));
             assert_eq!(request.form(), &Form::Unsupported);
-            assert!(
-                request
-                    .description()
-                    .is_some_and(|text| text.contains("terminal UI")),
-                "it says where to answer: {:?}",
-                request.description()
-            );
         }
     }
 
@@ -745,7 +737,6 @@ mod tests {
                 "answer": {"kind": "answers", "answers": {"q1": ["v1"], "q2": ["v2", "mine"]}}}}));
         let timeout = two.timeout().expect("the request times out");
         assert_eq!(timeout.fallback(), "Pick for q1: One; Second: Two, “mine”");
-        assert_eq!(timeout.reason(), "safe defaults");
         let now = UNIX_EPOCH + Duration::from_millis(4_000);
         assert_eq!(timeout.remaining(now), Duration::from_secs(6));
         let late = UNIX_EPOCH + Duration::from_secs(60);

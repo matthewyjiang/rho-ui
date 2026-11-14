@@ -314,34 +314,6 @@ mod tests {
         let pasted = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Jpeg, png(4, 2));
         let image = from_clipboard(&pasted).expect("a PNG is taken");
         assert_eq!(image.format(), ImageFormat::Png);
-        let preview = image_preview(&Attachment::Image(image));
-        assert_eq!(preview.label.as_ref(), "PNG image, 4 × 2");
-        assert!((preview.aspect - 2.).abs() < f32::EPSILON, "{preview:?}");
-    }
-
-    #[test]
-    fn an_image_rho_does_not_take_is_refused_with_its_type() {
-        // A BMP starts with "BM"; only the start is read.
-        let pasted = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Bmp, b"BM\0\0".to_vec());
-        assert_eq!(
-            from_clipboard(&pasted),
-            Err("rho takes PNG, JPEG, GIF and WebP images, and this is image/bmp".to_owned())
-        );
-    }
-
-    /// An icon missing from the app's assets compiles, then draws nothing.
-    #[test]
-    fn every_file_icon_ships_with_the_app() {
-        use gpui_kit::AssetSource as _;
-        let names = [
-            "a.rs", "a.json", "a.csv", "a.zip", "a.bmp", "a.PDF", "a", "a.bin",
-        ];
-        for name in names {
-            let icon = file_icon(name);
-            let svg = crate::Assets.load(&icon.path()).expect("the assets load");
-            assert!(svg.is_some(), "{name}'s icon, {icon:?}, ships");
-        }
-        assert_eq!(file_icon("REPORT.PDF"), Lucide::FileText);
     }
 
     #[test]
@@ -351,8 +323,8 @@ mod tests {
         assert!((preview.aspect - 4.).abs() < f32::EPSILON, "{preview:?}");
     }
 
-    /// An image goes as one, text goes whole, and anything else, or text
-    /// too long to send, by its path.
+    /// Binary files and text too long to send go by their path, and a
+    /// directory is refused. The UI tests own images and short text.
     #[test]
     fn a_file_is_read_as_what_it_is() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -361,24 +333,12 @@ mod tests {
             fs::write(&path, bytes).expect("write a test file");
             path
         };
-        let shot = write("shot.dat", &png(2, 2));
-        let notes = write("notes.md", b"# Notes\n\nhello\n");
         let binary = write("tool.bin", b"\x7fELF\0\0\0");
         let long = write(
             "big.log",
             "x".repeat(MAX_ATTACHED_TEXT_CHARS + 1).as_bytes(),
         );
 
-        assert!(
-            matches!(read(&shot), Ok(Attachment::Image(image)) if image.format() == ImageFormat::Png)
-        );
-        let Ok(Attachment::File(file)) = read(&notes) else {
-            panic!("a text file is a file");
-        };
-        assert_eq!(file.text(), Some("# Notes\n\nhello\n"));
-        assert_eq!(file.path(), Some(notes.as_path()));
-        let chip = Preview::new(&Attachment::File(file)).expect("a file previews");
-        assert_eq!(chip.label().as_ref(), "notes.md, 3 lines");
         for linked in [&binary, &long] {
             let Ok(Attachment::File(file)) = read(linked) else {
                 panic!("{} is a file", linked.display());

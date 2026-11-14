@@ -4,6 +4,8 @@
 cargo test
 ```
 
+Before adding or growing a test, load the `rho-ui-test-selection` skill (`.agents/skills`): every test needs a failure mode, one owner layer, and a gap.
+
 - `rho-ui-core` has a scripted daemon for tests (`fake_daemon`, behind the `test-support` feature): `rho-protocol`'s real server side on a real Unix socket, with no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real daemon, and `tests/fixtures/tool_cards.jsonl` holds tool calls a rho 3 daemon sent with their cards, streamed and finished.
 - `rho-ui` UI tests (`crates/rho-ui/src/ui_tests.rs`) open the real app in an offscreen window, click and type through GPUI Kit's test helpers, and talk to the same fake daemon. A test reaches a remote machine through another fake daemon's socket in place of ssh, by giving `LaunchConfig::remote` its own resolver. `crates/rho-ui-core/tests/ssh.rs` runs the ssh path against a fake `ssh` that bridges to a fake daemon with python3. They need a working Vulkan driver; Mesa lavapipe works without a GPU. Each run saves screenshots to `target/ui-shots/` for review.
 

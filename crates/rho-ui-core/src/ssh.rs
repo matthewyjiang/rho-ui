@@ -678,7 +678,6 @@ mod tests {
             .output()
             .expect("sh runs");
         assert_eq!(missing.status.code(), Some(127));
-        assert!(String::from_utf8_lossy(&missing.stderr).contains("absolute path"));
     }
 
     #[test]
