@@ -58,6 +58,7 @@ use crate::{
     composer::{Composer, ComposerMode, ComposerState},
     input_card::{InputCard, InputCardEvent, Queue},
     machines::{Place, SessionKey},
+    plan::PlanList,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
     title_bar::TitleBar,
@@ -459,7 +460,11 @@ impl SessionView {
     /// Brings the scroller, settings, timers and sidebar up to date with
     /// `session`.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(from) = self.session.take_removed() {
+            self.transcript.truncate(from, cx);
+        }
         self.transcript.sync(self.session.entries(), cx);
+        self.transcript.set_delay(self.session.delay());
         self.sync_settings(window, cx);
         self.sync_card(window, cx);
         // Until the attachment has caught up, the session's state is the
@@ -1043,6 +1048,7 @@ impl SessionView {
                 this.child(card.clone())
             })
             .children(self.render_background(cx))
+            .children(PlanList::new(self.session.plan()))
             .children(self.render_steers(cx))
             .children(self.render_held(cx))
             .child(

@@ -172,6 +172,69 @@ fn interleaved_messages_and_tools_keep_first_seen_order() {
     assert_eq!(tool.kind(), ToolKind::Read);
 }
 
+/// A response the provider discarded mid-stream leaves the transcript,
+/// thoughts and all, from where it began: the retry streams new messages.
+/// The turn says it is retrying, and why, until its next event.
+#[test]
+fn a_discarded_response_leaves_only_its_retry() {
+    let mut session = session();
+    let feed = |session: &mut Session, value| session.apply(update(value));
+    feed(
+        &mut session,
+        json!({"type": "agent_message_chunk", "message": "m0", "text": "Looking."}),
+    );
+    feed(&mut session, json!({"type": "provider_request"}));
+    feed(
+        &mut session,
+        json!({"type": "thought_chunk", "message": "t1", "text": "hmm"}),
+    );
+    feed(
+        &mut session,
+        json!({"type": "agent_message_chunk", "message": "m1", "text": "Half an ans"}),
+    );
+    feed(&mut session, json!({"type": "response_discarded"}));
+    assert_eq!(session.take_removed(), Some(1), "from the thought on");
+    assert_eq!(session.take_removed(), None, "reported once");
+    feed(
+        &mut session,
+        json!({"type": "provider_retry", "reason": "rate_limit", "retry_after_ms": 30_000}),
+    );
+    assert!(matches!(
+        session.delay(),
+        Some(Delay::Retrying {
+            reason: RetryReason::RateLimit,
+            until: Some(_)
+        })
+    ));
+    feed(&mut session, json!({"type": "provider_request"}));
+    assert_eq!(session.delay(), None, "the next event ends the wait");
+    feed(
+        &mut session,
+        json!({"type": "agent_message_chunk", "message": "m2", "text": "The whole answer"}),
+    );
+    assert_eq!(
+        texts(&session),
+        vec![
+            ("agent", "Looking.".to_owned()),
+            ("agent", "The whole answer".to_owned())
+        ]
+    );
+}
+
+/// A compaction holds the turn up from its start to its end, whatever
+/// comes between.
+#[test]
+fn a_compaction_lasts_until_it_ends() {
+    let mut session = session();
+    session.apply(update(json!({"type": "compaction", "id": "c1",
+        "status": {"type": "started"}})));
+    session.apply(update(json!({"type": "provider_request"})));
+    assert_eq!(session.delay(), Some(Delay::Compacting));
+    session.apply(update(json!({"type": "compaction", "id": "c1",
+        "status": {"type": "failed", "error": "no"}})));
+    assert_eq!(session.delay(), None);
+}
+
 /// The daemon sends an edit as the old and new text; viewers read a patch,
 /// which names the file from the session's workspace.
 #[test]

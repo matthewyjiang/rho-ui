@@ -19,6 +19,7 @@ mod input_card;
 mod kinetic;
 mod machines;
 mod pele;
+mod plan;
 mod project_picker;
 mod projects;
 mod repo;
@@ -124,7 +125,9 @@ gpui_kit::assets::icon_assets!(
         ClipboardPaste,
         Pencil,
         Pin,
-        PinOff
+        PinOff,
+        Circle,
+        CircleDot
     ]
 );
 

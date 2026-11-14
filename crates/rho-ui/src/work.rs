@@ -5,7 +5,10 @@
 //! is just that step's line. While the turn runs, the folded summary line
 //! shows the newest step instead.
 
-use std::{rc::Rc, time::Duration};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -27,7 +30,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledText, Window,
 };
 use rho_ui_core::{
-    Entry, SearchLine, Step, ToolBody, ToolCall, ToolContent, ToolFact, ToolKind, ToolStatus,
+    Delay, Entry, RetryReason, SearchLine, Step, ToolBody, ToolCall, ToolContent, ToolFact,
+    ToolKind, ToolStatus,
 };
 
 use crate::{time, transcript::Phase};
@@ -439,14 +443,49 @@ fn part(name: &str, ix: usize, content: AnyElement) -> impl IntoElement {
 /// What a turn's header, under its prompt, says.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Header {
-    /// "Working for 38s": the turn runs, and has for this long.
-    Working(Duration),
+    /// "Working for 38s": the turn runs, and has for this long, after
+    /// what holds it up, if anything does: "· compacting the context",
+    /// "· rate limited, retrying in 12s".
+    Working {
+        running: Duration,
+        delay: Option<Delay>,
+    },
     /// "Worked for 1m 20s". `took` is the turn's length, when this run saw
     /// it; `fold` is whether its working shows, if it has any to fold.
     Worked {
         took: Option<Duration>,
         fold: Option<Disclosure>,
     },
+}
+
+/// What holds a turn up, in words: "compacting the context", "rate
+/// limited, retrying in 12s", "retrying" once the wait is over.
+fn delay_text(delay: Delay, now: Instant) -> String {
+    let (reason, until) = match delay {
+        Delay::Compacting => return "compacting the context".to_owned(),
+        Delay::Retrying { reason, until } => (reason, until),
+    };
+    let why = match reason {
+        RetryReason::RateLimit => Some("rate limited"),
+        RetryReason::ProviderError => Some("provider error"),
+        RetryReason::InvalidResponse => Some("bad response"),
+        RetryReason::ContextOverflow => Some("context full"),
+        RetryReason::RequestFailed => Some("request failed"),
+        RetryReason::Other => None,
+    };
+    // Rounded up, so the count reaches 1s, not 0s, before the retry.
+    let left = until
+        .map(|until| until.saturating_duration_since(now))
+        .filter(|left| !left.is_zero())
+        .map(|left| Duration::from_secs(left.as_secs() + u64::from(left.subsec_nanos() > 0)));
+    let retrying = match left {
+        Some(left) => format!("retrying in {}", time::running(left)),
+        None => "retrying".to_owned(),
+    };
+    match why {
+        Some(why) => format!("{why}, {retrying}"),
+        None => retrying,
+    }
 }
 
 /// A turn's header: a line with a rule to its right, so it reads as a
@@ -461,7 +500,14 @@ pub(crate) fn turn_header(
     cx: &App,
 ) -> AnyElement {
     let (label, fold) = match header {
-        Header::Working(running) => (format!("Working for {}", time::running(running)), None),
+        Header::Working { running, delay } => {
+            let running = format!("Working for {}", time::running(running));
+            let label = match delay {
+                Some(delay) => format!("{running} · {}", delay_text(delay, Instant::now())),
+                None => running,
+            };
+            (label, None)
+        }
         Header::Worked {
             took: Some(took),
             fold,

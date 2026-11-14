@@ -32,6 +32,11 @@
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
 //!   whole result as a card, [`subagent_result`], and the parent's daemon
 //!   turn tells the model, as for a process.
+//! - The prompt "flaky" sets a plan of three steps, one done, one under
+//!   way and one to do, then streams half an answer that the provider
+//!   discards, and waits 30 s to retry, rate limited. The turn runs on
+//!   until [`FakeDaemon::finish_retry`], which retries: every step is done,
+//!   and the turn answers "The whole answer".
 //! - A session's first prompt "busy" is refused as busy: the daemon has
 //!   just started a turn of its own, which answers and ends at once. The
 //!   next "busy" is taken like any prompt. The prompt "deleting" is
@@ -74,9 +79,9 @@ use rho_protocol::{
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
-    DetachReason, ErrorCode, InputRequest, PermissionMode, Published, Publisher, Question,
-    RpcError, Selection, SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind,
-    ToolStatus, TurnOutcome,
+    DetachReason, ErrorCode, InputRequest, PermissionMode, PlanEntry, PlanStatus, Published,
+    Publisher, Question, RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent,
+    Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
 };
 use tokio::{net::UnixListener, runtime::Runtime};
 
@@ -320,6 +325,26 @@ impl FakeDaemon {
         if session.turn.is_none() {
             session.wake(turn, &told);
         }
+    }
+
+    /// Retries the request the prompt "flaky" left waiting, and answers.
+    ///
+    /// # Panics
+    ///
+    /// If `session` runs no turn: the test has a bug.
+    pub fn finish_retry(&self, session: &UiSessionId) {
+        let mut state = self.service.lock();
+        let session = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        let turn = session.turn.as_ref().map_or_else(
+            || panic!("session runs no turn to retry"),
+            |turn| turn.id.clone(),
+        );
+        session.publish(SessionEvent::ProviderRequest);
+        session.plan([PlanStatus::Completed; 3]);
+        session.answer(&format!("m-{turn}-2"), "The whole answer");
     }
 
     /// Ends `session`'s oldest running subagent: its own session answers
@@ -644,6 +669,42 @@ impl FakeSession {
             locations: None,
             display: Some(card.into()),
         }));
+    }
+
+    /// Sets the plan of the prompt "flaky", its steps at `statuses`.
+    fn plan(&mut self, statuses: [PlanStatus; 3]) {
+        let steps = ["Read the parser", "Split it in two", "Run the tests"];
+        self.publish(SessionEvent::Plan {
+            entries: steps
+                .iter()
+                .zip(statuses)
+                .map(|(step, status)| PlanEntry {
+                    content: (*step).to_owned(),
+                    status,
+                })
+                .collect(),
+        });
+    }
+
+    /// Starts the turn of the prompt "flaky": the provider discards what
+    /// it streamed, and the turn waits to retry.
+    fn flaky(&mut self, turn: Turn, echo: SessionEvent) {
+        let id = turn.id.clone();
+        self.turn = Some(turn);
+        self.state(JobState::Running);
+        self.publish(echo);
+        self.plan([
+            PlanStatus::Completed,
+            PlanStatus::InProgress,
+            PlanStatus::Pending,
+        ]);
+        self.publish(SessionEvent::ProviderRequest);
+        self.say(&format!("m-{id}-1"), "Half an ans");
+        self.publish(SessionEvent::ResponseDiscarded);
+        self.publish(SessionEvent::ProviderRetry {
+            reason: RetryReason::RateLimit,
+            retry_after_ms: Some(30_000),
+        });
     }
 
     /// Tells clients the session's background work as it is now.

@@ -361,6 +361,10 @@ impl Service for Fake {
             session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
             return Ok(SessionPromptResponse { turn: turn_id });
         }
+        if prompt == "flaky" {
+            session.flaky(turn, echo(&turn_id, &params));
+            return Ok(SessionPromptResponse { turn: turn_id });
+        }
         if prompt == "figures" {
             session.turn = Some(turn);
             session.state(JobState::Running);

@@ -26,7 +26,7 @@ use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{subagent_result, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION},
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
-    Entry, RunState, Session, SessionId, ToolStatus,
+    Delay, Entry, RetryReason, RunState, Session, SessionId, ToolStatus,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -752,6 +752,53 @@ fn last_reply(ui: &mut Harness) -> String {
         Some(Entry::Agent(reply)) => reply.text().to_owned(),
         other => panic!("the transcript ends in {other:?}"),
     }
+}
+
+/// While the provider makes the turn wait, the turn's header says why and
+/// for how long, and the agent's plan shows above the composer. A response
+/// the provider discarded leaves the transcript; the retry's answer shows
+/// in its place, and the finished plan goes.
+#[test]
+fn a_retried_response_replaces_the_discarded_one_and_the_plan_shows() {
+    let mut ui = Harness::start("retry", Script::default());
+    new_session_with(&mut ui, "flaky");
+    ui.wait_for_session("the turn waiting to retry", |session| {
+        matches!(
+            session.delay(),
+            Some(Delay::Retrying {
+                reason: RetryReason::RateLimit,
+                until: Some(_)
+            })
+        )
+    });
+    ui.act(|window, _| {
+        let header = window.find("worked-0").label().map(str::to_owned);
+        assert!(
+            header
+                .as_deref()
+                .is_some_and(|header| header.contains(" · rate limited, retrying in ")),
+            "the header says why the turn waits: {header:?}"
+        );
+        assert_eq!(window.find("plan").label(), Some("Plan 1 of 3"));
+    });
+    assert!(
+        ui.session()
+            .entries()
+            .iter()
+            .all(|entry| !matches!(entry, Entry::Agent(_))),
+        "the discarded answer is gone"
+    );
+    ui.shot("retrying");
+
+    ui.fake().finish_retry(&SessionId::from("new-1"));
+    ui.wait_for_session("the retried answer", |session| {
+        session.state() == &RunState::Idle && session.delay().is_none()
+    });
+    assert_eq!(last_reply(&mut ui), "The whole answer");
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "plan"), "every step is done");
+    });
+    ui.shot("answered");
 }
 
 /// A questionnaire of two questions, one taking the user's own text and

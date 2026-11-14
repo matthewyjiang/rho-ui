@@ -35,9 +35,9 @@ pub use prompt::{
     Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 pub use session::{
-    Attached, Checkout, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus, RunState,
-    Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent, ToolKind, ToolStatus,
-    TurnId, Usage, UserMessage, Worktree,
+    Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,
+    RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,
+    ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
 };
 pub use ssh::{SshLink, SshTarget};
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};

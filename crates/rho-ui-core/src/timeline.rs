@@ -66,8 +66,9 @@ pub struct Synced {
 }
 
 impl Timeline {
-    /// Places entries added since the last call. Entries are only appended
-    /// or changed in place, so only the last row can grow.
+    /// Places entries added since the last call. Entries are appended or
+    /// changed in place, so only the last row can grow; see
+    /// [`Self::truncate`] for those that go.
     pub fn sync(&mut self, entries: &[Entry]) -> Synced {
         let before = self.rows.len();
         let mut grew = None;
@@ -94,6 +95,29 @@ impl Timeline {
             grew,
             added: self.rows.len() - before,
         }
+    }
+
+    /// Forgets the rows of entries from `from` on, as when entries there
+    /// went or moved; [`Self::sync`] then places what is there now.
+    /// Returns how many rows are left. Turns opened by forgotten rows go
+    /// too.
+    pub fn truncate(&mut self, from: usize) -> usize {
+        if from < self.seen {
+            while let Some(row) = self.rows.last_mut() {
+                if row.start() >= from {
+                    self.rows.pop();
+                    continue;
+                }
+                if let Row::Work(run) = row {
+                    run.end = run.end.min(from);
+                }
+                break;
+            }
+            let rows = self.rows.len();
+            self.turns.retain(|&prompt| prompt < rows);
+            self.seen = from;
+        }
+        self.rows.len()
     }
 
     /// Every row, in order.

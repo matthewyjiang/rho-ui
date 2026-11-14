@@ -12,12 +12,12 @@
 
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rho_protocol::{
-    AnswerStop, CardTone, JobState, Resolution, SessionAttachResponse, SessionEvent,
-    SessionOptions, ToolCallUpdate, TurnOutcome,
+    AnswerStop, CardTone, CompactionStatus, JobState, Resolution, SessionAttachResponse,
+    SessionEvent, SessionOptions, ToolCallUpdate, TurnOutcome,
 };
 
 use crate::{
@@ -396,6 +396,38 @@ impl PlanItem {
     }
 }
 
+/// Why a turn asks the provider again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryReason {
+    /// The provider limited the rate of requests.
+    RateLimit,
+    /// A failure that may pass, such as a server error.
+    ProviderError,
+    /// The provider's response was malformed.
+    InvalidResponse,
+    /// The request overflowed the model's context.
+    ContextOverflow,
+    /// One request failed and goes again.
+    RequestFailed,
+    /// A reason a newer daemon sends.
+    Other,
+}
+
+/// What holds up a running turn's answer, as the daemon says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delay {
+    /// The turn compacts the context.
+    Compacting,
+    /// The turn waits to ask the provider again: until `until`, when the
+    /// provider said how long to wait.
+    Retrying {
+        /// Why the request goes again.
+        reason: RetryReason,
+        /// When it goes, if the provider said.
+        until: Option<Instant>,
+    },
+}
+
 /// A steer the turn accepted that has not reached the conversation yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Steer {
@@ -417,9 +449,16 @@ struct Held {
 pub struct Session {
     id: SessionId,
     title: Option<String>,
-    /// Only ever appended to or changed in place, so an index names one
-    /// entry for the session's lifetime.
+    /// Appended to or changed in place, so an index names one entry,
+    /// except where a discarded response leaves: see [`Self::take_removed`].
     entries: Vec<Entry>,
+    /// The first entry changed by a removal since the last
+    /// [`Self::take_removed`].
+    removed: Option<usize>,
+    /// How many entries there were when the turn's latest provider request
+    /// went: what its response streams comes after them.
+    attempt: Option<usize>,
+    delay: Option<Delay>,
     state: RunState,
     usage: Option<Usage>,
     config: Vec<ConfigOption>,
@@ -481,6 +520,9 @@ impl Session {
             id,
             title: None,
             entries: Vec::new(),
+            removed: None,
+            attempt: None,
+            delay: None,
             state: RunState::Idle,
             usage: None,
             config: Vec::new(),
@@ -633,6 +675,18 @@ impl Session {
     /// The agent's current checklist.
     pub fn plan(&self) -> &[PlanItem] {
         &self.plan
+    }
+
+    /// What holds up the running turn's answer, if anything does.
+    pub fn delay(&self) -> Option<Delay> {
+        self.delay
+    }
+
+    /// The first index whose entry went or changed since the last call,
+    /// as when the provider discarded a response it was streaming: a view
+    /// drops what it built from there on and builds it again.
+    pub fn take_removed(&mut self) -> Option<usize> {
+        self.removed.take()
     }
 
     /// The session's background work: what still runs, and what ended
@@ -827,6 +881,10 @@ impl Session {
     /// counted.
     fn apply_change(&mut self, event: SessionEvent) -> Option<usize> {
         self.open_turn(&event);
+        // A retry says what the turn does until its next event.
+        if matches!(self.delay, Some(Delay::Retrying { .. })) {
+            self.delay = None;
+        }
         match event {
             SessionEvent::UserMessage {
                 message,
@@ -910,10 +968,68 @@ impl Session {
                 self.set_background(work);
                 None
             }
-            // Compaction and provider progress, and cache warming, are not
-            // shown yet.
+            event @ (SessionEvent::ProviderRequest
+            | SessionEvent::ResponseDiscarded
+            | SessionEvent::ProviderRetry { .. }
+            | SessionEvent::Compaction { .. }) => {
+                self.track_provider(event);
+                None
+            }
+            // Cache warming, and what a newer daemon adds, is not shown.
             _ => None,
         }
+    }
+
+    /// Follows the turn's requests to the provider: where each response
+    /// begins, a response the provider discarded, and what holds the turn
+    /// up, a retry or a compaction.
+    fn track_provider(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::ProviderRequest => self.attempt = Some(self.entries.len()),
+            SessionEvent::ResponseDiscarded => self.discard_attempt(),
+            // A wait read from history has passed already.
+            SessionEvent::ProviderRetry {
+                reason,
+                retry_after_ms,
+            } if !self.is_replaying() => {
+                self.delay = Some(Delay::Retrying {
+                    reason: retry_reason(reason),
+                    until: retry_after_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+                });
+            }
+            SessionEvent::Compaction { status, .. } => {
+                self.delay = match status {
+                    CompactionStatus::Started { .. } => Some(Delay::Compacting),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Drops what the response the provider discarded had streamed: its
+    /// messages, thoughts, and tool calls that never ran. The retry
+    /// streams new ones.
+    fn discard_attempt(&mut self) {
+        let Some(start) = self.attempt.filter(|&start| start < self.entries.len()) else {
+            return;
+        };
+        let streamed = |entry: &Entry| match entry {
+            Entry::Agent(_) | Entry::Thought(_) => true,
+            Entry::Tool(tool) => tool.status == ToolStatus::Pending,
+            Entry::User(_) | Entry::Notice(_) | Entry::Wake => false,
+        };
+        let Some(first) = self.entries[start..].iter().position(streamed) else {
+            return;
+        };
+        let first = start + first;
+        let mut ix = 0;
+        self.entries.retain(|entry| {
+            let keep = ix < first || !streamed(entry);
+            ix += 1;
+            keep
+        });
+        self.removed = Some(self.removed.map_or(first, |earlier| earlier.min(first)));
     }
 
     /// Follows the session's open requests: one opened, closed, or held,
@@ -1024,6 +1140,8 @@ impl Session {
             {
                 self.state = RunState::Idle;
                 self.unopened_turn = false;
+                self.delay = None;
+                self.attempt = None;
             }
             // Already settled, or a state a newer daemon added.
             _ => {}
@@ -1032,6 +1150,8 @@ impl Session {
 
     fn end_turn(&mut self, outcome: TurnOutcome) {
         self.unopened_turn = false;
+        self.delay = None;
+        self.attempt = None;
         self.state = match outcome {
             TurnOutcome::Answered { stop, .. } => match stop {
                 AnswerStop::Refusal => RunState::Failed("the model refused".to_owned()),
@@ -1215,6 +1335,18 @@ impl TurnId {
 /// [`Session::steer_sent`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SteerId(pub(crate) String);
+
+fn retry_reason(reason: rho_protocol::RetryReason) -> RetryReason {
+    use rho_protocol::RetryReason as Wire;
+    match reason {
+        Wire::RateLimit => RetryReason::RateLimit,
+        Wire::ProviderError => RetryReason::ProviderError,
+        Wire::InvalidResponse => RetryReason::InvalidResponse,
+        Wire::ContextOverflow => RetryReason::ContextOverflow,
+        Wire::RequestFailed => RetryReason::RequestFailed,
+        _ => RetryReason::Other,
+    }
+}
 
 fn plan_item(entry: rho_protocol::PlanEntry) -> PlanItem {
     PlanItem {
