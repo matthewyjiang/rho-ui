@@ -41,7 +41,7 @@ mod workspaces;
 
 use std::{borrow::Cow, path::PathBuf, rc::Rc};
 
-use gpui_kit::component::input::Paste;
+use gpui_kit::component::input::{Enter, Paste};
 use gpui_kit::{
     px, size, App, AppContext as _, AssetSource, KeyBinding, SharedString, TitlebarOptions,
     WindowBounds, WindowOptions,
@@ -223,10 +223,19 @@ fn init(cx: &mut App, db: &StateDb) {
         KeyBinding::new("ctrl-b", ToggleSidebar, Some("RhoApp")),
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
         KeyBinding::new("ctrl-q", Quit, None),
-        // Kit binds only Ctrl+V. Dictation apps set to paste for terminals,
-        // such as Hex, send Ctrl+Shift+V. "Input" is the key context of
-        // Kit's text fields.
+        // "Input" is the key context of Kit's text fields. Kit binds only
+        // Ctrl+V to paste; dictation apps set to paste for terminals, such
+        // as Hex, send Ctrl+Shift+V.
         KeyBinding::new("ctrl-shift-v", Paste, Some("Input")),
+        // Alt+Enter starts a line, as Kit's Shift+Enter does.
+        KeyBinding::new(
+            "alt-enter",
+            Enter {
+                secondary: false,
+                shift: true,
+            },
+            Some("Input"),
+        ),
     ]);
 }
 

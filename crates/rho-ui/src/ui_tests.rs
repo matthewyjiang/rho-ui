@@ -2309,6 +2309,28 @@ fn ctrl_shift_v_pastes_text() {
     assert_eq!(ui.composer_text(), "list the files");
 }
 
+/// Shift+Enter and Alt+Enter start a line in the composer, and send
+/// nothing.
+#[test]
+fn shift_and_alt_enter_start_a_line() {
+    let mut ui = Harness::start("newline", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_session("its commands", |session| !session.commands().is_empty());
+    let sent = ui.session().entries().len();
+    ui.type_in("one");
+    ui.act(|window, cx| {
+        window.press("shift-enter", cx);
+        window.input("two", cx);
+        window.press("alt-enter", cx);
+        window.input("three", cx);
+    });
+    assert_eq!(ui.composer_text(), "one\ntwo\nthree");
+    assert_eq!(ui.session().entries().len(), sent, "nothing is sent");
+}
+
 /// Pasted images show as tiles above the composer's text. Each comes off
 /// with its remove
 /// control, or the last with Backspace in the empty text box; an image rho

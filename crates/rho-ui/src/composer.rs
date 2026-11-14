@@ -1,7 +1,8 @@
-//! The prompt box under the transcript. Enter sends, Shift+Enter starts a new
-//! line; while a turn runs Send becomes Stop, and Enter steers the turn. Its
-//! footer holds the attach button and the session settings on the left, then
-//! context use and cost, the model, and the round Send button.
+//! The prompt box under the transcript. Enter sends, Shift+Enter or
+//! Alt+Enter starts a new line; while a turn runs Send becomes Stop, and
+//! Enter steers the turn. Its footer holds the attach button and the session
+//! settings on the left, then context use and cost, the model, and the round
+//! Send button.
 //!
 //! What the user attaches shows above the text and goes with it, after it,
 //! as one message, as rho's terminal UI sends one: an image pasted, or any
@@ -595,7 +596,7 @@ impl Composer {
             .capture_action(menu_key::<IndentInline>(&self.state, MenuKey::Tab))
             .capture_action(menu_key::<Escape>(&self.state, MenuKey::Escape))
             .capture_action(move |action: &Enter, window, cx| {
-                // Shift+Enter starts a line, Ctrl+Enter sends.
+                // Shift+Enter and Alt+Enter start a line, Ctrl+Enter sends.
                 if !action.shift && !action.secondary {
                     offer_key(&enter, MenuKey::Enter, window, cx);
                 }
