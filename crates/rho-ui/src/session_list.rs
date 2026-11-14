@@ -107,6 +107,10 @@ pub(crate) struct Row {
     /// The daemon lists it as saved. Unsaved rows are sessions made in this run,
     /// and sessions the daemon runs that it doesn't list as saved.
     pub(crate) saved: bool,
+    /// When it was pinned, if it is: pinned rows lead the active list.
+    pub(crate) pinned: Option<i64>,
+    /// Its turn finished since it was last on screen: the row says Done.
+    pub(crate) done: bool,
 }
 
 impl Row {
@@ -114,6 +118,17 @@ impl Row {
         self.title
             .clone()
             .unwrap_or_else(|| self.placeholder.into())
+    }
+
+    /// Sets what the session is doing. A turn that stops working marks the
+    /// row Done; a new one clears it.
+    fn set_activity(&mut self, activity: Activity) {
+        if activity.is_idle() {
+            self.done |= matches!(self.activity, Activity::Working(_));
+        } else {
+            self.done = false;
+        }
+        self.activity = activity;
     }
 }
 
@@ -191,6 +206,8 @@ impl SessionList {
                 updated: session.updated,
                 shelf: Shelf::Active,
                 saved: true,
+                pinned: None,
+                done: false,
             });
         }
         self.rows[unsaved..].sort_by_key(|row| Reverse(row.updated));
@@ -215,7 +232,7 @@ impl SessionList {
             if !row.activity.is_idle() && live.activity.is_idle() {
                 row.updated = now;
             }
-            row.activity = live.activity;
+            row.set_activity(live.activity);
         } else {
             self.rows.insert(
                 0,
@@ -230,6 +247,8 @@ impl SessionList {
                     activity: live.activity,
                     shelf: Shelf::Active,
                     saved: false,
+                    pinned: None,
+                    done: false,
                 },
             );
         }
@@ -300,11 +319,14 @@ impl SessionList {
                     activity: Activity::Idle,
                     shelf: Shelf::Active,
                     saved: false,
+                    pinned: None,
+                    done: false,
                 },
             );
         }
         for ix in 0..self.rows.len() {
-            self.rows[ix].activity = self.activity(&self.rows[ix].id);
+            let activity = self.activity(&self.rows[ix].id);
+            self.rows[ix].set_activity(activity);
         }
     }
 
@@ -313,8 +335,29 @@ impl SessionList {
     pub(crate) fn close_live(&mut self, id: &SessionKey) {
         self.live.retain(|live| live.id != *id);
         if let Some(ix) = self.rows.iter().position(|row| row.id == *id) {
-            self.rows[ix].activity = self.activity(id);
+            let activity = self.activity(id);
+            self.rows[ix].set_activity(activity);
         }
+    }
+
+    /// Shows `title` for session `id` until the daemon's list or the open
+    /// session says otherwise, as it will once it has the rename.
+    pub(crate) fn rename(&mut self, id: &SessionKey, title: SharedString) {
+        if let Some(live) = self.live.iter_mut().find(|live| live.id == *id) {
+            live.title = Some(title.clone());
+        }
+        if let Some(row) = self.rows.iter_mut().find(|row| row.id == *id) {
+            row.title = Some(title);
+        }
+    }
+
+    /// Clears session `id`'s Done, as it is on screen. Returns whether it
+    /// had one.
+    pub(crate) fn mark_seen(&mut self, id: &SessionKey) -> bool {
+        self.rows
+            .iter_mut()
+            .find(|row| row.id == *id)
+            .is_some_and(|row| std::mem::take(&mut row.done))
     }
 
     /// Drops a deleted session.
@@ -369,6 +412,7 @@ impl SessionList {
     /// Puts every row on its shelf and rebuilds the items and counts.
     /// `workspace` gives a workspace's name, for the search, and its
     /// project's folder, for the filter. A busy session is always active.
+    /// Pinned sessions lead the active list, the latest pinned first.
     pub(crate) fn rebuild<'a>(
         &mut self,
         shelves: &Shelves,
@@ -381,6 +425,7 @@ impl SessionList {
             } else {
                 Shelf::Active
             };
+            row.pinned = shelves.pinned(&row.id);
         }
         let matches = |row: &Row| {
             let (name, root) = workspace(row.workspace);
@@ -402,6 +447,13 @@ impl SessionList {
                         Shelf::Snoozed | Shelf::Settled => Item::Shelved(ix),
                     });
                 }
+            }
+            if shelf == Shelf::Active {
+                // Stable, so the rest keep their order.
+                items.sort_by_key(|&item| match item {
+                    Item::Session(ix) => Reverse(self.rows[ix].pinned),
+                    _ => Reverse(None),
+                });
             }
             let count = counts[slot(shelf)];
             // An emptied shelf folds, so it comes back folded.
@@ -768,6 +820,57 @@ mod tests {
         list.set_live(live("a", None, Activity::Idle), 0, 50);
         rebuild(&mut list, &shelves, 50);
         assert_eq!(list.count(Shelf::Active), 1, "the turn is new activity");
+    }
+
+    /// Pinned sessions lead the active list, the latest pinned first,
+    /// whatever their age; the rest keep newest first.
+    #[test]
+    fn pinned_sessions_lead_the_active_list() {
+        let mut shelves = owned();
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                saved("a", Some("a"), 3),
+                saved("b", Some("b"), 2),
+                saved("old", Some("old"), 1),
+            ],
+        );
+        shelves.pin(&id("old"), 10);
+        shelves.pin(&id("b"), 20);
+        rebuild(&mut list, &shelves, 30);
+        assert_eq!(shown(&list), ["b", "old", "a"]);
+
+        shelves.unpin(&id("b"));
+        rebuild(&mut list, &shelves, 30);
+        assert_eq!(shown(&list), ["old", "a", "b"]);
+    }
+
+    /// A turn that stops working marks its row Done until the session is
+    /// seen or works again; waiting on a person is not Done.
+    #[test]
+    fn a_finished_turn_is_done_until_seen() {
+        let done = |list: &SessionList| list.row(&id("a")).is_some_and(|row| row.done);
+        let mut list = SessionList::default();
+        list.set_saved(&here(), vec![saved("a", Some("a"), 1)]);
+        let now = Instant::now();
+        list.set_live(live("a", None, Activity::Waiting(now)), 0, 2);
+        list.set_live(live("a", None, Activity::Idle), 0, 3);
+        assert!(!done(&list), "a request answered no is not a finished turn");
+
+        list.set_live(live("a", None, Activity::Working(now)), 0, 4);
+        list.set_live(live("a", None, Activity::Idle), 0, 5);
+        assert!(done(&list));
+        list.set_live(live("a", None, Activity::Working(now)), 0, 6);
+        assert!(!done(&list), "working again");
+
+        // A turn another client ran, seen through the daemon's jobs.
+        list.close_live(&id("a"));
+        list.set_jobs(&here(), vec![job("a", JobActivity::Working, None)], now, 7);
+        list.set_jobs(&here(), Vec::new(), now, 8);
+        assert!(done(&list));
+        assert!(list.mark_seen(&id("a")));
+        assert!(!done(&list));
     }
 
     #[test]

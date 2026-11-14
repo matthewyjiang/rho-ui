@@ -1,12 +1,14 @@
-//! Settled and snoozed sessions. This is rho-ui's own organization; rho knows
-//! nothing about it.
+//! Pinned, settled and snoozed sessions. This is rho-ui's own organization;
+//! rho knows nothing about it.
 //!
 //! rho-ui owns the sessions started or continued in it. Every other session,
 //! such as one from rho's terminal UI, starts out settled, so the sidebar
 //! doesn't fill with history from elsewhere; snoozing or restoring one makes
 //! it rho-ui's. An owned session that was settled comes back when it has new
 //! activity; a snoozed session comes back when its time is up. Neither needs a
-//! timer: the sidebar asks [`Shelves::shelf`] whenever it rebuilds.
+//! timer: the sidebar asks [`Shelves::shelf`] whenever it rebuilds. A pinned
+//! session stays active, above the others, until unpinned; settling or
+//! snoozing it would unpin it, so the sidebar offers neither.
 //!
 //! The state lives in the state database's `shelves` table (see
 //! [`StateDb`]), a row per session rho-ui knows something about.
@@ -43,6 +45,8 @@ enum Mark {
     Settled(i64),
     /// Snoozed until this time.
     Snoozed(i64),
+    /// Pinned at this time, which orders the pinned sessions.
+    Pinned(i64),
 }
 
 /// What rho-ui knows about one session.
@@ -75,14 +79,15 @@ impl Shelves {
     pub(crate) fn load(db: &StateDb, now: i64) -> Self {
         // SQLite's default collation compares bytes, as `str` does.
         let entries = db.query(
-            "SELECT machine, session_id, owned, settled_at, snoozed_until FROM shelves \
-             ORDER BY machine, session_id",
+            "SELECT machine, session_id, owned, settled_at, snoozed_until, pinned_at \
+             FROM shelves ORDER BY machine, session_id",
             [],
             |row| {
-                let mark = match (row.get(3)?, row.get(4)?) {
-                    (Some(at), _) => Some(Mark::Settled(at)),
-                    (None, Some(until)) if until > now => Some(Mark::Snoozed(until)),
-                    (None, _) => None,
+                let mark = match (row.get(3)?, row.get(4)?, row.get(5)?) {
+                    (Some(at), _, _) => Some(Mark::Settled(at)),
+                    (None, Some(until), _) if until > now => Some(Mark::Snoozed(until)),
+                    (None, _, Some(at)) => Some(Mark::Pinned(at)),
+                    (None, _, None) => None,
                 };
                 let entry = Entry {
                     owned: row.get(2)?,
@@ -116,6 +121,7 @@ impl Shelves {
         match entry.mark {
             Some(Mark::Settled(at)) if updated <= at => Shelf::Settled,
             Some(Mark::Snoozed(until)) if now < until => Shelf::Snoozed,
+            Some(Mark::Pinned(_)) => Shelf::Active,
             _ if entry.owned => Shelf::Active,
             _ => Shelf::Settled,
         }
@@ -127,6 +133,31 @@ impl Shelves {
             Some(Mark::Snoozed(until)) => Some(until),
             _ => None,
         }
+    }
+
+    /// When `id` was pinned, if it is.
+    pub(crate) fn pinned(&self, id: &SessionKey) -> Option<i64> {
+        match self.entry(id).mark {
+            Some(Mark::Pinned(at)) => Some(at),
+            _ => None,
+        }
+    }
+
+    /// Pins `id` to the top of the active list, and makes it rho-ui's.
+    pub(crate) fn pin(&mut self, id: &SessionKey, now: i64) {
+        self.change(id, |entry| {
+            entry.owned = true;
+            entry.mark = Some(Mark::Pinned(now));
+        });
+    }
+
+    /// Unpins `id`, leaving it active.
+    pub(crate) fn unpin(&mut self, id: &SessionKey) {
+        self.change(id, |entry| {
+            if matches!(entry.mark, Some(Mark::Pinned(_))) {
+                entry.mark = None;
+            }
+        });
     }
 
     /// Marks `id` as started or continued in rho-ui.
@@ -203,16 +234,17 @@ impl Shelves {
             );
             return;
         }
-        let (settled, snoozed) = match entry.mark {
-            Some(Mark::Settled(at)) => (Some(at), None),
-            Some(Mark::Snoozed(until)) => (None, Some(until)),
-            None => (None, None),
+        let (settled, snoozed, pinned) = match entry.mark {
+            Some(Mark::Settled(at)) => (Some(at), None, None),
+            Some(Mark::Snoozed(until)) => (None, Some(until), None),
+            Some(Mark::Pinned(at)) => (None, None, Some(at)),
+            None => (None, None, None),
         };
         db.execute(
             "INSERT OR REPLACE INTO shelves \
-             (machine, session_id, owned, settled_at, snoozed_until) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            (key.0, key.1, entry.owned, settled, snoozed),
+             (machine, session_id, owned, settled_at, snoozed_until, pinned_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (key.0, key.1, entry.owned, settled, snoozed, pinned),
         );
     }
 }
@@ -255,6 +287,13 @@ mod tests {
         );
         shelves.restore(&k("a"));
         assert_eq!(shelves.shelf(&k("a"), 5, 0), Shelf::Active);
+        shelves.pin(&k("a"), 20);
+        shelves.unpin(&k("a"));
+        assert_eq!(
+            (shelves.shelf(&k("a"), 5, 0), shelves.pinned(&k("a"))),
+            (Shelf::Active, None),
+            "unpinned stays active"
+        );
         assert_eq!(shelves.shelf(&k("b"), 0, 0), Shelf::Active);
         assert_eq!(shelves.shelf(&k("c"), 0, 0), Shelf::Active);
 
@@ -285,6 +324,7 @@ mod tests {
         shelves.snooze(&k("old"), 50);
         shelves.restore(&k("b"));
         shelves.forget(&k("b"));
+        shelves.pin(&k("p"), 150);
 
         let entry = |owned, mark| Entry { owned, mark };
         assert_eq!(
@@ -292,6 +332,7 @@ mod tests {
             vec![
                 (k("a"), entry(true, Some(Mark::Settled(100)))),
                 (k("old"), entry(true, None)),
+                (k("p"), entry(true, Some(Mark::Pinned(150)))),
                 (k("z"), entry(true, Some(Mark::Snoozed(300)))),
             ],
             "a forgotten session leaves no row"

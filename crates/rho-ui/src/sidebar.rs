@@ -3,7 +3,10 @@
 //! bottom until opened shelves fill the list. An active row shows the
 //! workspace, the session's status or age, its title, its branch, and with
 //! more than one machine, the machine's label; hovering it swaps the status
-//! for Snooze and Settle. A shelf opens from its header into one-line rows,
+//! for Snooze and Settle, or Unpin. Pinned sessions lead the list, and a
+//! turn that finished off screen shows Done until its session is opened.
+//! Right-click a row for its menu, which also renames it in place. A shelf
+//! opens from its header into one-line rows,
 //! and hovering one shows its details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
 //! which machines aren't connected.
@@ -42,10 +45,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    canvas, div, px, rems, size, Anchor, AnyElement, App, AppContext as _, Axis, Context, Entity,
-    EventEmitter, FocusHandle, Focusable as _, Hsla, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement, Pixels, Rems, Render, ScrollStrategy, SharedString,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
+    canvas, div, px, rems, size, Anchor, AnyElement, App, AppContext as _, Axis, ClipboardItem,
+    Context, Entity, EventEmitter, FocusHandle, Focusable as _, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Rems, Render, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task,
+    WeakEntity, Window,
 };
 use rho_ui_core::{Job, SessionSummary};
 
@@ -126,7 +130,7 @@ struct Snooze {
     /// The inline button's element ID and label.
     id: &'static str,
     short: &'static str,
-    /// The context menu label.
+    /// The label in the context menu's Snooze submenu.
     long: &'static str,
     seconds: i64,
 }
@@ -135,19 +139,19 @@ const SNOOZES: [Snooze; 3] = [
     Snooze {
         id: "snooze-1h",
         short: "1h",
-        long: "Snooze 1 hour",
+        long: "1 hour",
         seconds: 3600,
     },
     Snooze {
         id: "snooze-4h",
         short: "4h",
-        long: "Snooze 4 hours",
+        long: "4 hours",
         seconds: 4 * 3600,
     },
     Snooze {
         id: "snooze-1d",
         short: "1d",
-        long: "Snooze 1 day",
+        long: "1 day",
         seconds: 24 * 3600,
     },
 ];
@@ -169,7 +173,15 @@ impl ShelfAction {
     ];
 
     /// What a row offers, inline and in its menu. A busy session offers
-    /// nothing: it shows as active until its turn ends.
+    /// nothing: it shows as active until its turn ends. Nor does a pinned
+    /// one, which stays active until unpinned.
+    fn for_row(row: &Row) -> &'static [ShelfAction] {
+        if row.pinned.is_some() {
+            return &[];
+        }
+        Self::offered(row.shelf, row.activity)
+    }
+
     fn offered(shelf: Shelf, activity: Activity) -> &'static [ShelfAction] {
         if !activity.is_idle() {
             return &[];
@@ -181,11 +193,11 @@ impl ShelfAction {
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self) -> SharedString {
         match self {
-            ShelfAction::Settle => "Settle",
-            ShelfAction::Snooze(snooze) => snooze.long,
-            ShelfAction::Restore => "Restore",
+            ShelfAction::Settle => "Settle".into(),
+            ShelfAction::Snooze(snooze) => format!("Snooze {}", snooze.long).into(),
+            ShelfAction::Restore => "Restore".into(),
         }
     }
 
@@ -210,6 +222,11 @@ pub(crate) enum SidebarEvent {
     /// Delete a saved session; the user has confirmed.
     Delete {
         id: SessionKey,
+    },
+    /// Save `title` as the session's title. The row shows it already.
+    Rename {
+        id: SessionKey,
+        title: SharedString,
     },
     /// Connect to a machine whose connection failed.
     Retry(MachineId),
@@ -237,6 +254,14 @@ struct Hover {
     id: SessionKey,
     /// The snooze button was pressed: show the durations.
     snoozing: bool,
+}
+
+/// A row whose title is being edited in place. Enter or leaving the box
+/// saves it; Escape doesn't.
+struct Renaming {
+    id: SessionKey,
+    input: Entity<InputState>,
+    _subscription: Subscription,
 }
 
 /// What the sidebar remembers between runs, each part loaded from the
@@ -268,6 +293,7 @@ pub(crate) struct SidebarView {
     saved_filter: SavedFilter,
     active: Option<SessionKey>,
     hover: Option<Hover>,
+    renaming: Option<Renaming>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
     /// The list's height in the last frame, which the gap above the
@@ -322,6 +348,7 @@ impl SidebarView {
             saved_filter: state.filter,
             active: None,
             hover: None,
+            renaming: None,
             search,
             scroll: VirtualListScrollHandle::new(),
             viewport: Pixels::ZERO,
@@ -396,6 +423,7 @@ impl SidebarView {
         });
         self.list
             .set_jobs(machine, jobs, Instant::now(), time::now_unix());
+        self.mark_active_seen();
         self.rebuild(cx);
     }
 
@@ -406,6 +434,7 @@ impl SidebarView {
             .workspaces
             .update(cx, |workspaces, cx| workspaces.index(&place, cx));
         if self.list.set_live(live, workspace, time::now_unix()) {
+            self.mark_active_seen();
             self.rebuild(cx);
         }
     }
@@ -449,7 +478,15 @@ impl SidebarView {
     pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.active != id {
             self.active = id;
+            self.mark_active_seen();
             cx.notify();
+        }
+    }
+
+    /// The session on screen has no Done to show: its turn ended in view.
+    fn mark_active_seen(&mut self) {
+        if let Some(active) = &self.active {
+            self.list.mark_seen(active);
         }
     }
 
@@ -521,6 +558,89 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
+    fn set_pinned(&mut self, id: &SessionKey, pin: Pin, cx: &mut Context<'_, Self>) {
+        match pin {
+            Pin::Pin => self.shelves.pin(id, time::now_unix()),
+            Pin::Unpin => self.shelves.unpin(id),
+        }
+        self.hover = None;
+        self.rebuild(cx);
+    }
+
+    /// Turns `id`'s title into a text box holding it, all selected.
+    fn start_rename(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(row) = self.list.row(id) else {
+            return;
+        };
+        let title = row.title.clone().unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        input.update(cx, |input, cx| {
+            input.select_all(window, cx);
+            input.focus(window, cx);
+        });
+        let subscription = cx.subscribe_in(&input, window, |this, _, event, _, cx| match event {
+            InputEvent::PressEnter { .. } | InputEvent::Blur => this.finish_rename(cx),
+            InputEvent::Change | InputEvent::Focus => {}
+        });
+        self.renaming = Some(Renaming {
+            id: id.clone(),
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Shows the edited title and asks the app to save it, unless it is
+    /// blank or unchanged.
+    fn finish_rename(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        let title: SharedString = renaming.input.read(cx).value().trim().to_owned().into();
+        let changed = self
+            .list
+            .row(&renaming.id)
+            .is_some_and(|row| row.title.as_ref() != Some(&title));
+        if !title.is_empty() && changed {
+            self.list.rename(&renaming.id, title.clone());
+            self.rebuild(cx);
+            cx.emit(SidebarEvent::Rename {
+                id: renaming.id,
+                title,
+            });
+        }
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<'_, Self>) {
+        if self.renaming.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The text box in place of `row`'s title, while it is being renamed.
+    fn rename_box(&self, row: &Row, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        let renaming = self
+            .renaming
+            .as_ref()
+            .filter(|renaming| renaming.id == row.id)?;
+        Some(
+            div()
+                .flex_1()
+                .min_w_0()
+                // A click in the box must not also open the session.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.cancel_rename(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(Input::new(&renaming.input).xsmall())
+                .into_any_element(),
+        )
+    }
+
     fn hover(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         if self.hover.as_ref().is_none_or(|hover| hover.id != *id) {
             self.hover = Some(Hover {
@@ -549,7 +669,22 @@ impl SidebarView {
     /// The buttons a hovered row shows in place of its status: Snooze and
     /// Settle, or the snooze durations once Snooze is pressed.
     fn render_actions(&self, row: &Row, cx: &Context<'_, Self>) -> Option<AnyElement> {
-        let offered = ShelfAction::offered(row.shelf, row.activity);
+        if row.pinned.is_some() {
+            let row_id = row.id.clone();
+            return Some(
+                Button::new("unpin")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(Lucide::PinOff))
+                    .tooltip("Unpin")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_pinned(&row_id, Pin::Unpin, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let offered = ShelfAction::for_row(row);
         if offered.is_empty() {
             return None;
         }
@@ -571,7 +706,7 @@ impl SidebarView {
                 buttons.push(
                     button(snooze.id, action)
                         .label(snooze.short)
-                        .tooltip(snooze.long)
+                        .tooltip(action.label())
                         .into_any_element(),
                 );
             }
@@ -672,14 +807,15 @@ impl SidebarView {
             .gap(rems(GAP_REMS))
             .py(rems(PAD_REMS))
             .child(workspace_line(workspace, theme).child(right))
-            .child(
+            .child(self.rename_box(row, cx).unwrap_or_else(|| {
                 div()
                     .h(rems(TITLE_REMS))
                     .truncate()
                     .text_sm()
                     .when(state.active, StyledExt::font_medium)
-                    .child(row.title()),
-            )
+                    .child(row.title())
+                    .into_any_element()
+            }))
             .child(branch_line(
                 workspace,
                 machine.map(|label| (format!("{}-machine", row.element_id).into(), label)),
@@ -741,9 +877,9 @@ impl SidebarView {
             .h(height)
             .px_2()
             .py(rems(GUTTER_REMS))
-            .child(inner.context_menu(move |popup, _, _| {
+            .child(inner.context_menu(move |popup, window, cx| {
                 let (view, row) = &menu;
-                row_menu(popup, view, row)
+                row_menu(popup, view, row, window, cx)
             }))
     }
 
@@ -763,7 +899,7 @@ impl SidebarView {
         let theme = cx.theme();
         let state = self.row_state(row);
         let wakes = self.shelves.wakes(&row.id);
-        let offered = ShelfAction::offered(row.shelf, row.activity);
+        let offered = ShelfAction::for_row(row);
         let right = if state.hovered && !offered.is_empty() {
             // Icon-only: the row is one line.
             h_flex()
@@ -819,15 +955,16 @@ impl SidebarView {
                 badge(card.initials.clone())
                     .when(!(state.active || state.hovered), |this| this.opacity(0.4)),
             )
-            .child(
+            .child(self.rename_box(row, cx).unwrap_or_else(|| {
                 div()
                     .flex_1()
                     .min_w_0()
                     .h(rems(TITLE_REMS))
                     .truncate()
                     .text_sm()
-                    .child(card.title.clone()),
-            )
+                    .child(card.title.clone())
+                    .into_any_element()
+            }))
             .child(
                 h_flex()
                     .flex_shrink_0()
@@ -1281,10 +1418,29 @@ fn branch_line(
         })
 }
 
-/// "Working 24m", "Waiting 9m", or the age: "3h". Icons are static: an
-/// animated one would redraw the whole sidebar every frame. So Working
-/// gets a symmetric dashed circle, not a spinner frozen mid-turn.
+/// "Working 24m", "Waiting 9m", "Done", or the age: "3h", after a pin on a
+/// pinned row. Icons are static: an animated one would redraw the whole
+/// sidebar every frame. So Working gets a symmetric dashed circle, not a
+/// spinner frozen mid-turn.
 fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
+    let status = activity(row, clock, theme);
+    if row.pinned.is_none() {
+        return status;
+    }
+    h_flex()
+        .flex_shrink_0()
+        .gap_1()
+        .child(
+            Icon::new(Lucide::Pin)
+                .xsmall()
+                .text_color(theme.muted_foreground),
+        )
+        .child(status)
+        .into_any_element()
+}
+
+/// What [`status`] says of the session's activity.
+fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
     let label = |word: &str, since: Instant| match time::elapsed(
         clock.instant.duration_since(since).as_secs(),
     ) {
@@ -1311,6 +1467,16 @@ fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             Icon::new(Lucide::CircleAlert),
             label("Waiting", since),
         ),
+        Activity::Idle if row.done => h_flex()
+            .id(SharedString::from(format!("{}-done", row.element_id)))
+            .test_support()
+            .aria_label("Done")
+            .flex_shrink_0()
+            .gap_1()
+            .text_color(theme.success)
+            .child(Icon::new(Lucide::CircleCheck).xsmall())
+            .child("Done")
+            .into_any_element(),
         Activity::Idle => div()
             .flex_shrink_0()
             .text_color(theme.muted_foreground)
@@ -1321,54 +1487,176 @@ fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
     }
 }
 
-/// The right-click menu: the same moves the hover buttons offer, then
-/// Delete. A busy session offers neither.
-fn row_menu(menu: PopupMenu, view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenu {
-    let menu = row.offered.iter().fold(menu, |menu, &action| {
-        let (view, id) = (view.clone(), row.id.clone());
-        menu.item(
-            PopupMenuItem::new(action.label())
-                .icon(action.icon())
-                .on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| this.shelve(&id, action, cx));
-                }),
+/// Pinning a session, or unpinning it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pin {
+    Pin,
+    Unpin,
+}
+
+/// The right-click menu: Rename, Pin, the moves the hover buttons offer,
+/// Copy, and Delete, which a busy session can't do.
+fn row_menu(
+    menu: PopupMenu,
+    view: &WeakEntity<SidebarView>,
+    row: &MenuRow,
+    window: &mut Window,
+    cx: &mut Context<'_, PopupMenu>,
+) -> PopupMenu {
+    let (pin, pin_icon, pin_label) = if row.pinned {
+        (Pin::Unpin, Lucide::PinOff, "Unpin")
+    } else {
+        (Pin::Pin, Lucide::Pin, "Pin")
+    };
+    let id = row.id.clone();
+    let mut menu = menu
+        .item(
+            PopupMenuItem::new("Rename…")
+                .icon(Icon::new(Lucide::Pencil))
+                .on_click(on_view(view, move |this, window, cx| {
+                    this.start_rename(&id, window, cx);
+                })),
         )
-    });
-    if !row.deletable {
+        .item({
+            let id = row.id.clone();
+            PopupMenuItem::new(pin_label)
+                .icon(Icon::new(pin_icon))
+                .on_click(on_view(view, move |this, _, cx| {
+                    this.set_pinned(&id, pin, cx);
+                }))
+        });
+    menu = snooze_menu(menu, view, row, window, cx);
+    for &action in row.offered {
+        if !matches!(action, ShelfAction::Snooze(_)) {
+            let id = row.id.clone();
+            menu = menu.item(
+                PopupMenuItem::new(action.label())
+                    .icon(action.icon())
+                    .on_click(on_view(view, move |this, _, cx| {
+                        this.shelve(&id, action, cx);
+                    })),
+            );
+        }
+    }
+    copy_menu(menu, row, window, cx)
+        .separator()
+        .item(delete_item(view, row))
+}
+
+/// A menu item's click handler that runs `f` on the sidebar.
+fn on_view(
+    view: &WeakEntity<SidebarView>,
+    f: impl Fn(&mut SidebarView, &mut Window, &mut Context<'_, SidebarView>) + 'static,
+) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
+    let view = view.clone();
+    move |_, window, cx| {
+        let _ = view.update(cx, |this, cx| f(this, window, cx));
+    }
+}
+
+/// The Snooze submenu, when the row offers snoozes.
+fn snooze_menu(
+    menu: PopupMenu,
+    view: &WeakEntity<SidebarView>,
+    row: &MenuRow,
+    window: &mut Window,
+    cx: &mut Context<'_, PopupMenu>,
+) -> PopupMenu {
+    let snoozes: Vec<(ShelfAction, &'static Snooze)> = row
+        .offered
+        .iter()
+        .filter_map(|&action| match action {
+            ShelfAction::Snooze(snooze) => Some((action, snooze)),
+            ShelfAction::Settle | ShelfAction::Restore => None,
+        })
+        .collect();
+    if snoozes.is_empty() {
         return menu;
     }
-    let (view, id, title) = (view.clone(), row.id.clone(), row.title.clone());
-    menu.separator().item(
-        PopupMenuItem::new("Delete…")
-            .icon(Icon::new(IconName::Delete))
-            .on_click(move |_, window, cx| {
-                let (view, id, title) = (view.clone(), id.clone(), title.clone());
-                window.open_alert_dialog(cx, move |alert, _, cx| {
-                    let (view, id) = (view.clone(), id.clone());
-                    alert
-                        .icon(Icon::new(IconName::Delete).text_color(cx.theme().danger))
-                        .title(format!("Delete \"{title}\"?"))
-                        .description("rho deletes the saved session. This can't be undone.")
-                        .confirm()
-                        .ok_text("Delete")
-                        .ok_variant(ButtonVariant::Danger)
-                        .on_ok(move |_, _, cx| {
-                            let id = id.clone();
-                            let _ = view.update(cx, |_, cx| cx.emit(SidebarEvent::Delete { id }));
-                            true
-                        })
-                });
-            }),
+    let (view, id) = (view.clone(), row.id.clone());
+    menu.submenu_with_icon(
+        Some(Icon::new(Lucide::AlarmClock)),
+        "Snooze",
+        window,
+        cx,
+        move |menu, _, _| {
+            snoozes.iter().fold(menu, |menu, &(action, snooze)| {
+                let id = id.clone();
+                menu.item(PopupMenuItem::new(snooze.long).on_click(on_view(
+                    &view,
+                    move |this, _, cx| {
+                        this.shelve(&id, action, cx);
+                    },
+                )))
+            })
+        },
     )
+}
+
+/// The Copy submenu: the session's ID, the command that resumes it, and its
+/// folder's path.
+fn copy_menu(
+    menu: PopupMenu,
+    row: &MenuRow,
+    window: &mut Window,
+    cx: &mut Context<'_, PopupMenu>,
+) -> PopupMenu {
+    let copies = [
+        ("Session ID", row.id.id.to_string()),
+        ("Resume command", format!("rho -R {}", row.id.id)),
+        ("Folder path", row.cwd.display().to_string()),
+    ];
+    menu.submenu_with_icon(
+        Some(Icon::new(Lucide::Copy)),
+        "Copy",
+        window,
+        cx,
+        move |menu, _, _| {
+            copies.iter().fold(menu, |menu, (label, text)| {
+                let text = text.clone();
+                menu.item(PopupMenuItem::new(*label).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                }))
+            })
+        },
+    )
+}
+
+/// Delete…, which asks first, and is greyed out while the session is busy.
+fn delete_item(view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenuItem {
+    let (view, id, title) = (view.clone(), row.id.clone(), row.title.clone());
+    PopupMenuItem::new("Delete…")
+        .icon(Icon::new(IconName::Delete))
+        .disabled(row.busy)
+        .on_click(move |_, window, cx| {
+            let (view, id, title) = (view.clone(), id.clone(), title.clone());
+            window.open_alert_dialog(cx, move |alert, _, cx| {
+                let (view, id) = (view.clone(), id.clone());
+                alert
+                    .icon(Icon::new(IconName::Delete).text_color(cx.theme().danger))
+                    .title(format!("Delete \"{title}\"?"))
+                    .description("rho deletes the saved session. This can't be undone.")
+                    .confirm()
+                    .ok_text("Delete")
+                    .ok_variant(ButtonVariant::Danger)
+                    .on_ok(move |_, _, cx| {
+                        let id = id.clone();
+                        let _ = view.update(cx, |_, cx| cx.emit(SidebarEvent::Delete { id }));
+                        true
+                    })
+            });
+        })
 }
 
 /// What a row's menu needs, captured when the row is drawn.
 struct MenuRow {
     id: SessionKey,
     title: SharedString,
+    cwd: PathBuf,
     offered: &'static [ShelfAction],
+    pinned: bool,
     /// Busy sessions can't be deleted.
-    deletable: bool,
+    busy: bool,
 }
 
 impl MenuRow {
@@ -1376,8 +1664,10 @@ impl MenuRow {
         Self {
             id: row.id.clone(),
             title: row.title(),
-            offered: ShelfAction::offered(row.shelf, row.activity),
-            deletable: row.activity.is_idle(),
+            cwd: row.cwd.clone(),
+            offered: ShelfAction::for_row(row),
+            pinned: row.pinned.is_some(),
+            busy: !row.activity.is_idle(),
         }
     }
 }

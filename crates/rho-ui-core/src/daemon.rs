@@ -31,7 +31,8 @@ use rho_protocol::{
     SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams,
     SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionHoldParams,
     SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
-    SessionSteerParams, SessionUnsteerParams, SettingChange, TurnOutcome, UnsteerOutcome,
+    SessionRenameParams, SessionSteerParams, SessionUnsteerParams, SettingChange, TurnOutcome,
+    UnsteerOutcome,
 };
 use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
 
@@ -1010,6 +1011,26 @@ impl Daemon {
             changes,
         };
         self.client.request::<methods::ConfigSet>(&params).await?;
+        Ok(())
+    }
+
+    /// Saves `title` as the session's title, which a generated title never
+    /// replaces. Clients attached to it get the title as a
+    /// `TitleChanged` event.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon refuses the title (empty, a control character,
+    /// or over its 500 characters), doesn't know the session, or the
+    /// connection is gone.
+    pub async fn rename_session(&self, id: &SessionId, title: &str) -> Result<(), DaemonError> {
+        let params = SessionRenameParams {
+            session: id.to_wire(),
+            title: title.to_owned(),
+        };
+        self.client
+            .request::<methods::SessionRename>(&params)
+            .await?;
         Ok(())
     }
 
