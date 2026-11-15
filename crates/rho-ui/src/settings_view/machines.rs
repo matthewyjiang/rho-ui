@@ -271,7 +271,7 @@ impl SettingsView {
 }
 
 /// One remote machine, titled by its host: its name, its `rho` program,
-/// and Remove.
+/// its clone folder, and Remove.
 fn machine_group(fields: &RemoteFields) -> SettingGroup {
     let input = |state: &Entity<InputState>| {
         let state = state.clone();

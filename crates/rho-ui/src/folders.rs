@@ -98,8 +98,12 @@ pub(crate) struct Found {
 }
 
 impl Found {
-    fn new(root: PathBuf, as_typed: PathBuf) -> Self {
-        let alias = (as_typed != root).then_some(as_typed);
+    /// The project at `root` of a folder typed as `typed`, which resolves
+    /// to `real`. Typed at the project's own folder, the alias is its
+    /// spelling as typed; typed below it, git gives no other.
+    fn new(root: PathBuf, real: &Path, typed: &Path) -> Self {
+        let alias =
+            (real == root.as_path() && typed != root.as_path()).then(|| typed.to_path_buf());
         Self { root, alias }
     }
 
@@ -261,6 +265,13 @@ pub(crate) fn find(output: &[u8], marker: &[u8]) -> Option<usize> {
         .position(|window| window == marker)
 }
 
+/// What `output` holds after the first `marker`, which a script prints
+/// before its fields so that whatever a login file prints is skipped.
+pub(crate) fn after<'a>(output: &'a [u8], marker: &[u8]) -> Option<&'a [u8]> {
+    let at = find(output, marker)?;
+    output.get(at + marker.len()..)
+}
+
 /// Why a script can't run on a machine that isn't connected.
 const UNREAD: &str = "The machine isn't connected.";
 
@@ -312,10 +323,7 @@ pub(crate) async fn look(
 /// thread.
 fn look_here(typed: &Typed) -> Lookup {
     let found = match typed.path.canonicalize() {
-        Ok(dir) if dir.is_dir() => Some(Found::new(
-            repo::inspect(&dir).root,
-            repo::inspect(&typed.path).root,
-        )),
+        Ok(dir) if dir.is_dir() => Some(Found::new(repo::inspect(&dir).root, &dir, &typed.path)),
         _ => None,
     };
     let names = std::fs::read_dir(&typed.browse)
@@ -344,13 +352,14 @@ async fn look_there(ssh: &SshLink, typed: &Typed) -> Result<Lookup, DaemonError>
 }
 
 /// The POSIX `sh` script that looks a typed path up on a remote machine,
-/// given the path and the folder to browse as its arguments. It prints
-/// four fields, each ended by a NUL: `y` if the path is a folder, else
-/// `n`; its resolved path; and as `git` says, its work tree root and
-/// common git dir, empty outside a repository. Then it prints the name of
-/// each subfolder of the second argument, each ended by a NUL. Read with
-/// [`parse_remote`].
+/// given the path and the folder to browse as its arguments. After
+/// [`LOOKED`], it prints four fields, each ended by a NUL: `y` if the path
+/// is a folder, else `n`; its resolved path; and as `git` says, its work
+/// tree root and common git dir, empty outside a repository. Then it
+/// prints the name of each subfolder of the second argument, each ended by
+/// a NUL. Read with [`parse_remote`].
 pub(crate) const REMOTE_SCRIPT: &str = r#"unset CDPATH
+printf 'rho-ui-folder\0'
 if [ -d "$1" ] && real=$(cd "$1" && pwd -P); then
   if top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null); then
     common=$(cd "$1" && cd "$(git rev-parse --git-common-dir)" && pwd -P)
@@ -369,10 +378,14 @@ for sub in "$2"/* "$2"/.*; do
 done
 "#;
 
+/// Printed before [`REMOTE_SCRIPT`]'s fields, so whatever a login file
+/// prints comes first and is skipped.
+const LOOKED: &[u8] = b"rho-ui-folder\0";
+
 /// What [`REMOTE_SCRIPT`] printed for `typed`. `None` if it printed
 /// something else.
 fn parse_remote(typed: &Typed, output: &[u8]) -> Option<Lookup> {
-    let fields = repo::nul_fields(output)?;
+    let fields = repo::nul_fields(after(output, LOOKED)?)?;
     let ([is_dir, real, top, common], names) = fields.split_first_chunk::<4>()?;
     let path = platform::path_from_bytes;
     let found = match *is_dir {
@@ -383,14 +396,7 @@ fn parse_remote(typed: &Typed, output: &[u8]) -> Option<Lookup> {
             } else {
                 repo::project_root(path(top), &path(common))
             };
-            // Typed at the project's own folder, the path is its spelling
-            // as typed; typed below it, git gives no other.
-            let as_typed = if real == root {
-                typed.path.clone()
-            } else {
-                root.clone()
-            };
-            Some(Found::new(root, as_typed))
+            Some(Found::new(root, &real, &typed.path))
         }
         b"n" => None,
         _ => return None,
@@ -416,6 +422,28 @@ fn next(typed: &Typed, names: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
         .into_iter()
         .map(|(_, name)| typed.browse.join(name))
         .collect()
+}
+
+/// For tests: runs `git` in `dir` with `args`, as a user with a name who
+/// doesn't sign commits, and fails the test if it fails.
+#[cfg(test)]
+pub(crate) fn git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
 }
 
 #[cfg(test)]
@@ -449,24 +477,7 @@ mod tests {
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .current_dir(&dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
+        let git = |args: &[&str]| git(&dir, args);
         git(&["init", "-q", "-b", "main", "project"]);
         git(&["-C", "project", "commit", "-q", "--allow-empty", "-m", "x"]);
         git(&[
@@ -500,7 +511,9 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{output:?}");
-            let remote = parse_remote(typed, &output.stdout).expect("the script's fields");
+            // As a login file that prints would have it.
+            let output = [b"Welcome!\n".as_slice(), output.stdout.as_slice()].concat();
+            let remote = parse_remote(typed, &output).expect("the script's fields");
             assert_eq!(&remote, local, "{typed:?}");
         }
         // What the cases name, so agreeing on nothing can't pass.

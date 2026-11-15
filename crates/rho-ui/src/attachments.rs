@@ -1,8 +1,10 @@
 //! Attachments as the composer and the transcript draw them, as GPUI Kit
 //! attachment cards: a file as a chip with an icon for its kind, and an
 //! image as a square tile as tall as a chip, or in the transcript, larger
-//! and in its own proportions. Also reads what the user attaches, from the
-//! clipboard or from disk.
+//! and in its own proportions. An image with a side over [`MAX_SIDE`] px
+//! shows as a chip saying it is too large to preview, and is sent all the
+//! same. Also reads what the user attaches, from the clipboard or from
+//! disk.
 
 use std::{ffi::OsStr, fs, io::Cursor, path::Path, sync::Arc};
 
@@ -17,6 +19,8 @@ use rho_ui_core::{
     MAX_PROMPT_ATTACHMENT_BYTES,
 };
 
+use crate::pictures::MAX_SIDE;
+
 /// The narrowest and widest a tile gets, as width over height: a phone's
 /// 9:19.5 screenshot (0.46) and a 32:9 ultrawide one (3.56) both show
 /// whole, and a thinner image is cropped to fit.
@@ -30,8 +34,8 @@ pub(crate) enum Preview {
         name: SharedString,
         /// How it goes: as text, and how long, or by its path.
         detail: SharedString,
-        /// Where it is, for its tooltip.
-        place: SharedString,
+        /// Its tooltip: where it is, or why an image shows as a chip.
+        tooltip: SharedString,
         /// What kind of file it is, by its name.
         icon: Lucide,
     },
@@ -41,9 +45,9 @@ impl Preview {
     /// The preview of `attachment`; `None` for an image whose header
     /// doesn't read as its format.
     pub(crate) fn new(attachment: &Attachment) -> Option<Self> {
-        Some(match attachment {
-            Attachment::Image(image) => Self::Image(ImagePreview::new(image)?),
-            Attachment::File(file) => Self::File {
+        match attachment {
+            Attachment::Image(image) => Self::of_image(image),
+            Attachment::File(file) => Some(Self::File {
                 name: file.name().to_owned().into(),
                 detail: match file.text() {
                     Some(text) => match text.lines().count() {
@@ -52,13 +56,42 @@ impl Preview {
                     },
                     None => "Sent by path".into(),
                 },
-                place: file
+                tooltip: file
                     .path()
                     .map_or_else(|| file.uri().to_owned(), |path| path.display().to_string())
                     .into(),
                 icon: file_icon(file.name()),
-            },
+            }),
+        }
+    }
+
+    /// The preview of `image`: a tile, or for one with a side over
+    /// [`MAX_SIDE`] px, a chip saying it is too large to preview. `None`
+    /// when its header doesn't read as its format.
+    pub(crate) fn of_image(image: &Image) -> Option<Self> {
+        let (width, height) = dimensions(image.format(), image.bytes())?;
+        if width.max(height) <= MAX_SIDE {
+            return Some(Self::Image(ImagePreview::new(image, width, height)));
+        }
+        let format = image.format().name();
+        Some(Self::File {
+            name: "Too large to preview".into(),
+            detail: format!("{format} image, {width} × {height} px (max {MAX_SIDE} px)").into(),
+            tooltip: format!(
+                "rho-ui previews images up to {MAX_SIDE} px a side; this one is sent all the same."
+            )
+            .into(),
+            icon: Lucide::FileImage,
         })
+    }
+
+    /// Says why a file goes by its path, `why`, where it would only say
+    /// that it does.
+    pub(crate) fn linked_because(mut self, why: &str) -> Self {
+        if let Self::File { detail, .. } = &mut self {
+            *detail = format!("By path: {why}").into();
+        }
+        self
     }
 
     /// What it is, for screen readers, such as "PNG image, 1920 × 1080".
@@ -71,8 +104,8 @@ impl Preview {
 
     /// As a Kit attachment card in Kit's own geometry: an image as a
     /// square tile as tall as a file chip, cropped to fill it, and a file as
-    /// a chip whose tooltip says where it is. Give a row of them one size,
-    /// and it lines up.
+    /// a chip whose tooltip says where it is, or for an image too large to
+    /// preview, why. Give a row of them one size, and it lines up.
     pub(crate) fn card(&self) -> Card {
         match self {
             Self::Image(image) => Card::new()
@@ -81,10 +114,10 @@ impl Preview {
             Self::File {
                 name,
                 detail,
-                place,
+                tooltip,
                 icon,
             } => Card::new()
-                .tooltip(place.clone())
+                .tooltip(tooltip.clone())
                 .media(AttachmentMedia::new().child(Icon::new(*icon)))
                 .content(
                     AttachmentContent::new()
@@ -113,9 +146,13 @@ impl Preview {
 }
 
 /// An image ready to draw: a GPUI image of its bytes, its size, and its
-/// proportions for a tile.
+/// proportions for a tile. None has a side over [`MAX_SIDE`] px.
 #[derive(Clone, Debug)]
 pub(crate) struct ImagePreview {
+    /// The image it was made from, sharing its bytes, to tell whether it
+    /// still shows the same one; see [`Self::shows`]. `None` for a file's
+    /// picture, whose bytes it doesn't keep twice.
+    source: Option<Image>,
     image: Arc<gpui_kit::Image>,
     /// Its size in pixels, neither of them zero.
     width: u32,
@@ -127,15 +164,18 @@ pub(crate) struct ImagePreview {
 }
 
 impl ImagePreview {
-    /// The preview of `image`; `None` when its header doesn't read as its
-    /// format.
-    pub(crate) fn new(image: &Image) -> Option<Self> {
-        let reader =
-            image::ImageReader::with_format(Cursor::new(image.bytes()), decoder(image.format()));
-        let (width, height) = reader.into_dimensions().ok()?;
-        if width == 0 || height == 0 {
-            return None;
+    /// The preview of `image`, `width` × `height` px as its header says.
+    /// Copies its bytes, which GPUI then hashes, so callers build one once.
+    fn new(image: &Image, width: u32, height: u32) -> Self {
+        Self {
+            source: Some(image.clone()),
+            ..Self::drawn(image.format(), image.bytes().to_vec(), width, height)
         }
+    }
+
+    /// The preview of `bytes`, an image of `format` `width` × `height` px
+    /// as its header says.
+    fn drawn(format: ImageFormat, bytes: Vec<u8>, width: u32, height: u32) -> Self {
         let aspect = (f64::from(width) / f64::from(height)).clamp(ASPECT_RANGE.0, ASPECT_RANGE.1);
         #[expect(
             clippy::as_conversions,
@@ -143,26 +183,23 @@ impl ImagePreview {
             reason = "a ratio within ASPECT_RANGE fits f32 with room to spare"
         )]
         let aspect = aspect as f32;
-        let format = image.format();
-        Some(Self {
-            image: Arc::new(gpui_kit::Image::from_bytes(
-                gpui_format(format),
-                image.bytes().to_vec(),
-            )),
+        Self {
+            source: None,
+            image: Arc::new(gpui_kit::Image::from_bytes(gpui_format(format), bytes)),
             width,
             height,
             aspect,
             label: format!("{} image, {width} × {height}", format.name()).into(),
-        })
+        }
     }
 
     /// The preview of a file's `bytes`, read as the image they are.
     ///
     /// # Errors
     ///
-    /// Says why when they aren't an image rho shows, or one with no side
-    /// over `max_side` pixels.
-    pub(crate) fn from_file(bytes: Vec<u8>, max_side: u32) -> Result<Self, String> {
+    /// Says why when they aren't an image rho shows, or one with a side
+    /// over [`MAX_SIDE`] pixels.
+    pub(crate) fn from_file(bytes: Vec<u8>) -> Result<Self, String> {
         let format = match sniff(&bytes) {
             Sniffed::Image(format) => format,
             Sniffed::OtherImage(mime_type) => {
@@ -172,15 +209,20 @@ impl ImagePreview {
             }
             Sniffed::NotImage => return Err("It isn't an image.".to_owned()),
         };
-        let preview = Self::new(&Image::new(format, bytes))
+        let (width, height) = dimensions(format, &bytes)
             .ok_or_else(|| format!("Its {} data doesn't read.", format.name()))?;
-        let (width, height) = preview.pixels();
-        if width.max(height) > max_side {
+        if width.max(height) > MAX_SIDE {
             return Err(format!(
-                "It's {width} × {height} px, and rho-ui shows up to {max_side} px a side."
+                "It's {width} × {height} px, and rho-ui shows up to {MAX_SIDE} px a side."
             ));
         }
-        Ok(preview)
+        Ok(Self::drawn(format, bytes, width, height))
+    }
+
+    /// Whether it was made from `image`. Cheap when it was: clones of an
+    /// image share its bytes, which compare by address first.
+    pub(crate) fn shows(&self, image: &Image) -> bool {
+        self.source.as_ref() == Some(image)
     }
 
     /// The image, for GPUI to draw.
@@ -238,6 +280,15 @@ fn file_icon(name: &str) -> Lucide {
     }
 }
 
+/// The width and height in pixels of `bytes`, an image of `format`, as its
+/// header says; `None` when the header doesn't read as that format, or
+/// gives it no pixels.
+fn dimensions(format: ImageFormat, bytes: &[u8]) -> Option<(u32, u32)> {
+    let reader = image::ImageReader::with_format(Cursor::new(bytes), decoder(format));
+    let (width, height) = reader.into_dimensions().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 /// What a file's first bytes say it is.
 enum Sniffed {
     /// An image rho takes.
@@ -274,15 +325,42 @@ pub(crate) fn from_clipboard(image: &gpui_kit::Image) -> Result<Image, String> {
     }
 }
 
+/// A file read to attach: the attachment, and for a file that goes by its
+/// path only because of a limit or a fault, why, so the user can see it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReadFile {
+    pub(crate) attachment: Attachment,
+    /// The limit it passed, and by how much, such as "250000 characters,
+    /// over the 200000 sent whole". `None` for a file sent whole, or one
+    /// that goes by its path because it isn't text.
+    pub(crate) why_linked: Option<String>,
+}
+
+impl ReadFile {
+    fn whole(attachment: Attachment) -> Self {
+        Self {
+            attachment,
+            why_linked: None,
+        }
+    }
+
+    fn linked(path: &Path, why: Option<String>) -> Self {
+        Self {
+            attachment: Attachment::File(AttachedFile::linked(path)),
+            why_linked: why,
+        }
+    }
+}
+
 /// The file at `path` as an attachment: an image rho takes as an image, a
 /// text file of at most [`MAX_ATTACHED_TEXT_CHARS`] whole, and any other
-/// file, or one too large to send, as a link to it. Blocking: run it off
-/// the UI thread.
+/// file, or one too large to send, as a link to it, saying why when a
+/// limit or a fault made it one. Blocking: run it off the UI thread.
 ///
 /// # Errors
 ///
 /// Says why when `path` isn't a file that can be read.
-pub(crate) fn read(path: &Path) -> Result<Attachment, String> {
+pub(crate) fn read(path: &Path) -> Result<ReadFile, String> {
     let path = std::path::absolute(path).map_err(|error| error.to_string())?;
     if path.to_string_lossy().contains('\n') {
         // A link's path is a line of its own; this one would break it.
@@ -294,24 +372,44 @@ pub(crate) fn read(path: &Path) -> Result<Attachment, String> {
     }
     // An image no message can carry is linked unread.
     let sendable = MAX_PROMPT_ATTACHMENT_BYTES / 4 * 3;
-    if usize::try_from(metadata.len()).map_or(true, |len| len > sendable) {
-        return Ok(Attachment::File(AttachedFile::linked(&path)));
+    let len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if len > sendable {
+        let why = format!(
+            "{}, over the {} a message carries",
+            mebibytes(len),
+            mebibytes(sendable)
+        );
+        return Ok(ReadFile::linked(&path, Some(why)));
     }
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
     if let Sniffed::Image(format) = sniff(&bytes) {
-        let image = Image::new(format, bytes);
-        if ImagePreview::new(&image).is_some() {
-            return Ok(Attachment::Image(image));
+        if dimensions(format, &bytes).is_some() {
+            return Ok(ReadFile::whole(Attachment::Image(Image::new(
+                format, bytes,
+            ))));
         }
-        return Ok(Attachment::File(AttachedFile::linked(&path)));
+        let why = format!("its {} data doesn't read", format.name());
+        return Ok(ReadFile::linked(&path, Some(why)));
     }
-    let file = match String::from_utf8(bytes) {
-        Ok(text) if !text.contains('\0') && text.chars().count() <= MAX_ATTACHED_TEXT_CHARS => {
-            AttachedFile::with_text(&path, text)
+    match String::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => {
+            let chars = text.chars().count();
+            if chars <= MAX_ATTACHED_TEXT_CHARS {
+                let file = AttachedFile::with_text(&path, text);
+                return Ok(ReadFile::whole(Attachment::File(file)));
+            }
+            let why = format!("{chars} characters, over the {MAX_ATTACHED_TEXT_CHARS} sent whole");
+            Ok(ReadFile::linked(&path, Some(why)))
         }
-        _ => AttachedFile::linked(&path),
-    };
-    Ok(Attachment::File(file))
+        _ => Ok(ReadFile::linked(&path, None)),
+    }
+}
+
+/// `bytes` in MiB, to one decimal place, such as `12.0 MiB`, as
+/// rho-ui-core words its attachment limit.
+fn mebibytes(bytes: usize) -> String {
+    let tenths = bytes.saturating_mul(10) / (1024 * 1024);
+    format!("{}.{} MiB", tenths / 10, tenths % 10)
 }
 
 fn decoder(format: ImageFormat) -> image::ImageFormat {
@@ -371,8 +469,19 @@ mod tests {
         assert!((preview.aspect - 4.).abs() < f32::EPSILON, "{preview:?}");
     }
 
-    /// Binary files and text too long to send go by their path, and a
-    /// directory is refused. The UI tests own images and short text.
+    /// An image too large for a texture shows as a chip, not a tile that
+    /// would draw nothing; it still goes as an image.
+    #[test]
+    fn an_image_too_large_to_preview_shows_as_a_chip() {
+        let image = Attachment::Image(Image::new(ImageFormat::Png, png(MAX_SIDE + 1, 1)));
+        assert!(
+            matches!(Preview::new(&image), Some(Preview::File { .. })),
+            "a chip"
+        );
+    }
+
+    /// Binary files and text too long to send go by their path, the long
+    /// text saying why, and a directory is refused. The UI tests own images and short text.
     #[test]
     fn a_file_is_read_as_what_it_is() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -387,11 +496,17 @@ mod tests {
             "x".repeat(MAX_ATTACHED_TEXT_CHARS + 1).as_bytes(),
         );
 
-        for linked in [&binary, &long] {
-            let Ok(Attachment::File(file)) = read(linked) else {
+        // Only the limit says why; a binary file goes by path as a rule.
+        for (linked, says_why) in [(&binary, false), (&long, true)] {
+            let Ok(ReadFile {
+                attachment: Attachment::File(file),
+                why_linked,
+            }) = read(linked)
+            else {
                 panic!("{} is a file", linked.display());
             };
             assert_eq!(file.text(), None, "{} goes by path", linked.display());
+            assert_eq!(why_linked.is_some(), says_why, "{}", linked.display());
         }
         assert_eq!(read(dir.path()), Err("it isn't a file".to_owned()));
     }

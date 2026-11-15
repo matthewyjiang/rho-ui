@@ -60,6 +60,7 @@ use crate::{
     machines::{MachineId, MachineStatus, Machines, Place},
     projects::Projects,
     repo,
+    session_list::contains_ignore_case,
     store::{Key, StateDb},
     time,
     workspaces::{self, Workspaces},
@@ -432,7 +433,10 @@ impl ProjectPicker {
 
     /// Clones `source` into the draft's machine's clone folder, then adds
     /// the clone to the projects and starts the session there. One clone
-    /// at a time; a failure says git's or ssh's words.
+    /// at a time in this picker, though another draft's can clone the same
+    /// repository into the same folder at once: the later one then takes
+    /// the finished clone, or fails saying the folder is taken or the clone
+    /// incomplete. A failure says git's or ssh's words.
     fn clone_repo(&mut self, source: Source, window: &mut Window, cx: &mut Context<'_, Self>) {
         let list = self.list.read(cx).delegate();
         if list.cloning.is_some() {
@@ -624,6 +628,15 @@ fn remove(projects: &Entity<Projects>, root: &Place, cx: &mut App) {
             cx.notify();
         }
     });
+}
+
+/// The item of a project row's right-click menu that takes `root` off the
+/// user's projects.
+fn remove_item(projects: &Entity<Projects>, root: &Place) -> PopupMenuItem {
+    let (projects, root) = (projects.clone(), root.clone());
+    PopupMenuItem::new("Remove from list")
+        .icon(Icon::new(IconName::Close))
+        .on_click(move |_, _, cx| remove(&projects, &root, cx))
 }
 
 impl Render for ProjectPicker {
@@ -887,11 +900,10 @@ impl ProjectList {
             .copied()
             .find(|&ix| *workspaces.get(ix).place() == current);
         self.listed = here.len() + elsewhere.len();
-        let query = self.query.to_lowercase();
-        let name_matches = |ix: &usize| workspaces.get(*ix).name.to_lowercase().contains(&query);
-        let matches = |ix: &usize| {
-            name_matches(ix) || workspaces.get(*ix).path.to_lowercase().contains(&query)
-        };
+        let query = self.query.as_str();
+        let name_matches = |ix: &usize| contains_ignore_case(&workspaces.get(*ix).name, query);
+        let matches =
+            |ix: &usize| name_matches(ix) || contains_ignore_case(&workspaces.get(*ix).path, query);
         let found = &self.found;
         self.rows = found
             .iter()
@@ -991,14 +1003,7 @@ impl ProjectList {
                         .child(trailing)
                         .child(check),
                 )
-                .context_menu(move |menu, _, _| {
-                    let (projects, root) = (projects.clone(), root.clone());
-                    menu.item(
-                        PopupMenuItem::new("Remove from list")
-                            .icon(Icon::new(IconName::Close))
-                            .on_click(move |_, _, cx| remove(&projects, &root, cx)),
-                    )
-                }),
+                .context_menu(move |menu, _, _| menu.item(remove_item(&projects, &root))),
             )
     }
 
@@ -1047,14 +1052,7 @@ impl ProjectList {
                 .child(trailing)
                 // Its machine may be gone from the settings, so it can be
                 // removed from here.
-                .context_menu(move |menu, _, _| {
-                    let (projects, root) = (projects.clone(), root.clone());
-                    menu.item(
-                        PopupMenuItem::new("Remove from list")
-                            .icon(Icon::new(IconName::Close))
-                            .on_click(move |_, _, cx| remove(&projects, &root, cx)),
-                    )
-                }),
+                .context_menu(move |menu, _, _| menu.item(remove_item(&projects, &root))),
             )
     }
 }
@@ -1163,7 +1161,7 @@ impl ListDelegate for ProjectList {
                 .accessibility_label(folder.shown.clone())
                 .child(row(
                     folder_tile(Icon::new(IconName::Plus), cx).into_any_element(),
-                    format!("Add {}", folder_name(&folder.root.path)).into(),
+                    format!("Add {}", repo::folder_name(&folder.root.path)).into(),
                     div().child(folder.shown.clone()),
                     cx,
                 )),
@@ -1171,7 +1169,7 @@ impl ListDelegate for ProjectList {
                 .accessibility_label(folder.shown.clone())
                 .child(row(
                     folder_tile(Icon::new(IconName::Folder), cx).into_any_element(),
-                    format!("{}/", folder_name(&folder.root.path)).into(),
+                    format!("{}/", repo::folder_name(&folder.root.path)).into(),
                     div().child(folder.shown.clone()),
                     cx,
                 )),
@@ -1265,11 +1263,4 @@ fn folder_tile(icon: Icon, cx: &App) -> impl IntoElement {
         .rounded(rems(0.25))
         .bg(cx.theme().secondary)
         .child(icon.small())
-}
-
-fn folder_name(cwd: &Path) -> String {
-    cwd.file_name().map_or_else(
-        || cwd.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
 }

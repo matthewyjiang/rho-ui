@@ -33,6 +33,8 @@ use rho_ui_core::{
     FAST_MODE_ID,
 };
 
+use crate::session_list::contains_ignore_case;
+
 /// Whether the user can change settings right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Availability {
@@ -589,14 +591,13 @@ impl ListDelegate for ModelList {
         _: &mut Window,
         _: &mut Context<'_, ListState<Self>>,
     ) -> Task<()> {
-        let query = query.to_lowercase();
         self.matches = self
             .choices
             .iter()
             .enumerate()
             .filter(|(_, choice)| {
-                choice.name().to_lowercase().contains(&query)
-                    || choice.value().to_lowercase().contains(&query)
+                contains_ignore_case(choice.name(), query)
+                    || contains_ignore_case(choice.value(), query)
             })
             .map(|(ix, _)| ix)
             .collect();

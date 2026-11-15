@@ -69,6 +69,7 @@ fn live_daemon() {
     ui.shot("turn-done");
 
     let Ok(attach) = std::env::var("RHO_UI_LIVE_ATTACH") else {
+        eprintln!("RHO_UI_LIVE_ATTACH is unset: skipping the attach half");
         return;
     };
     let row: &'static str = Box::leak(format!("session-local-{attach}").into_boxed_str());
@@ -122,8 +123,8 @@ const BACKGROUND_TURN: Duration = Duration::from_secs(240);
 /// run; the list shows them; stopping one lists it as stopped while the
 /// daemon's own turn tells the model; a message sent during that turn is
 /// taken without an error; the other process exits by itself, shows its
-/// exit status while the daemon's next turn tells the model, and leaves the
-/// list. Runs as [`live_daemon`] does, through `RHO_UI_LIVE_RHO`; it takes
+/// exit status, and leaves the list once the daemon's turns end, the last
+/// in a reply. Runs as [`live_daemon`] does, through `RHO_UI_LIVE_RHO`; it takes
 /// a few minutes.
 #[test]
 #[ignore = "needs a real rho daemon and a signed-in model; see docs/testing.md"]
@@ -261,17 +262,14 @@ fn stop_and_follow_the_daemons_turn(ui: &mut Harness, long: usize) {
         .iter()
         .filter(|entry| matches!(entry, Entry::Wake));
     assert!(wakes.count() >= 1, "the daemon's turn opened with a wake");
-    let left: Vec<_> = session
-        .background()
-        .iter()
-        .map(|work| (work.title().to_owned(), work.status()))
-        .collect();
-    eprintln!("after the stop's turn: {left:?}");
     ui.shot("stop-delivered");
 }
 
-/// Waits for `sleep 120` to exit by itself and the daemon's turn that tells
-/// the model to end, with the list empty.
+/// Waits for `sleep 120` to exit by itself, then for the list to empty and
+/// the session to go idle after a reply. It prints how many turns the
+/// daemon started and what the last one replied, for a person to check
+/// that a turn told the model of the exit: the wakes can't tell which
+/// event started them.
 fn follow_the_exit(ui: &mut Harness) {
     ui.wait_within(BACKGROUND_TURN, "the exited process", |_, cx, app| {
         app.active_session().is_some_and(|view| {

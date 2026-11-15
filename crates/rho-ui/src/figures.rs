@@ -172,7 +172,10 @@ impl MarkdownPlugin for Diagrams {
     }
 
     /// Kit parses off the UI thread, except for a short message, which
-    /// waits about a millisecond for pele per diagram.
+    /// waits for pele per diagram: 0.2 to 1.3 ms to draw one, but up to
+    /// [`pele`]'s one-second limit for a runaway one. It waits rather than
+    /// giving up after a frame, because Kit never parses a finished
+    /// message again, so a diagram given up on would stay as code.
     fn parse(&self, node: &mdast::Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
         let mdast::Node::Code(code) = node else {
             return None;

@@ -233,9 +233,10 @@ impl DraftView {
 
     /// Moves the draft to `cwd`. The session opened for the old directory
     /// goes, unfollowed and unsaved, and the app opens one in the new; the
-    /// text in the composer stays.
+    /// text in the composer stays. A draft already sent stays where it is,
+    /// including one whose worktree is still being made.
     fn move_to(&mut self, cwd: Place, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if cwd == self.cwd || matches!(self.state, SessionState::Started) {
+        if cwd == self.cwd || self.launching || matches!(self.state, SessionState::Started) {
             window.focus(&self.composer.focus_handle(cx), cx);
             return;
         }

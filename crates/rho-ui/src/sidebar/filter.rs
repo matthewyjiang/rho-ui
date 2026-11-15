@@ -12,15 +12,17 @@ use gpui_kit::{
     Anchor, App, ClickEvent, Context, IntoElement, ScrollStrategy, SharedString, WeakEntity, Window,
 };
 
+use rho_ui_core::platform;
+
 use super::SidebarView;
 use crate::{
     machines::{MachineId, Place},
     session_list::Filter,
-    store::{Key, StateDb},
+    store::StateDb,
 };
 
 /// The sidebar's [`Filter`], kept in the state database's
-/// [`Key::SidebarFilter`].
+/// `filter_machines` and `filter_projects` tables.
 pub(crate) struct SavedFilter {
     filter: Filter,
     db: StateDb,
@@ -28,11 +30,16 @@ pub(crate) struct SavedFilter {
 
 impl SavedFilter {
     pub(crate) fn load(db: &StateDb) -> Self {
-        let filter = db
-            .get(Key::SidebarFilter)
-            .map_or_default(|text| Filter::from_text(&text));
+        let hidden = db.query("SELECT machine FROM filter_machines", [], |row| {
+            Ok(MachineId::from(row.get::<_, String>(0)?.as_str()))
+        });
+        let projects = db.query("SELECT machine, path FROM filter_projects", [], |row| {
+            let machine = MachineId::from(row.get::<_, String>(0)?.as_str());
+            let path = platform::path_from_bytes(&row.get::<_, Vec<u8>>(1)?);
+            Ok(Place::new(machine, path))
+        });
         Self {
-            filter,
+            filter: Filter::new(hidden.into_iter().collect(), projects.into_iter().collect()),
             db: db.clone(),
         }
     }
@@ -41,8 +48,38 @@ impl SavedFilter {
         &self.filter
     }
 
+    /// Makes `filter` the saved one, writing a row for each machine or
+    /// project that came or went.
     fn save(&mut self, filter: Filter) {
-        self.db.set(Key::SidebarFilter, &filter.to_text());
+        let (old, new) = (&self.filter, &filter);
+        for machine in old.hidden().difference(new.hidden()) {
+            self.db.execute(
+                "DELETE FROM filter_machines WHERE machine = ?1",
+                [machine.as_str()],
+            );
+        }
+        for machine in new.hidden().difference(old.hidden()) {
+            self.db.execute(
+                "INSERT OR IGNORE INTO filter_machines (machine) VALUES (?1)",
+                [machine.as_str()],
+            );
+        }
+        let row = |project: &Place| {
+            let path = platform::path_to_bytes(project.path.as_os_str());
+            (project.machine.as_str().to_owned(), path)
+        };
+        for project in old.projects().difference(new.projects()) {
+            self.db.execute(
+                "DELETE FROM filter_projects WHERE machine = ?1 AND path = ?2",
+                row(project),
+            );
+        }
+        for project in new.projects().difference(old.projects()) {
+            self.db.execute(
+                "INSERT OR IGNORE INTO filter_projects (machine, path) VALUES (?1, ?2)",
+                row(project),
+            );
+        }
         self.filter = filter;
     }
 }
@@ -57,6 +94,16 @@ impl SidebarView {
         self.saved_filter.save(filter);
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.rebuild(cx);
+    }
+
+    /// Drops from the filter what the menu no longer offers, with `prune`,
+    /// so it can't keep hiding sessions with no item left to undo it.
+    pub(super) fn prune_filter(&mut self, prune: impl FnOnce(&mut Filter) -> bool) {
+        let mut filter = self.saved_filter.filter().clone();
+        if prune(&mut filter) {
+            self.list.set_filter(filter.clone());
+            self.saved_filter.save(filter);
+        }
     }
 }
 
@@ -116,7 +163,14 @@ pub(super) fn button(sidebar: &SidebarView, cx: &mut Context<'_, SidebarView>) -
         .tooltip("Filter by machine or project")
         .selected(filtering)
         .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-            menu_items(menu, &view, &machine_items, &project_items)
+            let menu = menu_items(menu, &view, &machine_items, &project_items);
+            // With any filter at all, even one the items don't show, such
+            // as a hidden machine while only one is listed.
+            if filtering {
+                show_all(menu, &view)
+            } else {
+                menu
+            }
         })
 }
 
@@ -126,8 +180,6 @@ fn menu_items(
     machines: &[(MachineId, SharedString, bool)],
     projects: &[(Place, SharedString, bool)],
 ) -> PopupMenu {
-    let filtering = machines.iter().any(|(_, _, shown)| !shown)
-        || projects.iter().any(|(_, _, chosen)| *chosen);
     if !machines.is_empty() {
         menu = menu.label("Machines");
         for (machine, label, shown) in machines {
@@ -160,11 +212,43 @@ fn menu_items(
     if machines.is_empty() && projects.is_empty() {
         menu = menu.label("Add a project or a machine to filter by");
     }
-    if filtering {
-        menu = menu.separator().item(
-            PopupMenuItem::new("Show all")
-                .on_click(on_click(view, |filter| *filter = Filter::default())),
-        );
-    }
     menu
+}
+
+/// Ends the menu with Show all, which clears the filter.
+fn show_all(menu: PopupMenu, view: &WeakEntity<SidebarView>) -> PopupMenu {
+    menu.separator().item(
+        PopupMenuItem::new("Show all")
+            .on_click(on_click(view, |filter| *filter = Filter::default())),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The filter survives a reload, a path that isn't UTF-8 or holds a
+    /// tab or a newline too, and what it drops stays dropped.
+    #[test]
+    fn the_filter_survives_a_reload() {
+        let db = StateDb::in_memory();
+        let there = MachineId::remote("workstation");
+        let mut filter = Filter::default();
+        filter.toggle_machine(&there);
+        for path in [
+            platform::path_from_bytes(b"/w/\xff"),
+            "/w/tab\there".into(),
+            "/w/two\nlines".into(),
+        ] {
+            filter.toggle_project(&Place::new(there.clone(), path));
+        }
+        let mut saved = SavedFilter::load(&db);
+        saved.save(filter.clone());
+        assert_eq!(SavedFilter::load(&db).filter(), &filter);
+
+        filter.toggle_machine(&there);
+        filter.toggle_project(&Place::new(there.clone(), "/w/tab\there"));
+        saved.save(filter.clone());
+        assert_eq!(SavedFilter::load(&db).filter(), &filter);
+    }
 }

@@ -51,7 +51,7 @@ impl Source {
     /// The repository's name without its owner: its folder's name once
     /// cloned.
     pub(crate) fn folder(&self) -> &str {
-        self.name.rsplit('/').next().unwrap_or(&self.name)
+        repo::without_owner(&self.name)
     }
 }
 
@@ -59,11 +59,14 @@ impl Source {
 /// clone folder setting, and the folder name as its arguments. It runs
 /// from the home directory, so a relative folder is from there; an empty
 /// one is `$RHO_HOME/projects`, the rho home found as rho-ui's ssh setup
-/// finds it. A folder that already holds a clone of the URL is taken as
-/// it is, so a clone cut short by rho-ui quitting can be picked again.
-/// git never prompts: with no terminal, a password or host key question
-/// fails with git's message. It prints a NUL, then the clone's resolved
-/// path and a NUL, so whatever a login file prints comes before them.
+/// finds it. A folder that already holds a clone of the URL with a
+/// commit checked out is taken as it is, so a clone that finished before
+/// rho-ui quit can be picked again. One without, as a clone killed partway
+/// leaves, is refused as incomplete: removing it lets the next pick clone
+/// afresh. git never prompts: with no terminal, a password or host key
+/// question fails with git's message. It prints a NUL, then the clone's
+/// resolved path and a NUL, so whatever a login file prints comes before
+/// them.
 pub(crate) const SCRIPT: &str = r#"url=$1 folder=$2 name=$3
 cd || exit
 case $folder in
@@ -79,6 +82,10 @@ if [ -e "$dest" ]; then
     echo "$dest is already there, and isn't a clone of $url" >&2
     exit 1
   fi
+  git -C "$dest" rev-parse -q --verify HEAD >/dev/null || {
+    echo "$dest holds a clone of $url with no commit, as one cut short leaves; remove it to clone again" >&2
+    exit 1
+  }
 else
   git clone --quiet -- "$url" "$dest" </dev/null || exit
 fi
@@ -112,7 +119,7 @@ pub(crate) async fn clone(
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     use super::*;
 
@@ -142,29 +149,13 @@ mod tests {
 
     /// The script clones into the folder it is given, from home when
     /// relative, and takes a folder that already holds a clone of the URL
-    /// as it is, but not one that holds something else.
+    /// as it is, but not one that holds something else, nor a clone cut
+    /// short.
     #[test]
     fn the_script_clones_once_and_refuses_strangers() {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| {
-            let status = Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .current_dir(&dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
+        let git = |args: &[&str]| crate::folders::git(&dir, args);
         git(&["init", "-q", "-b", "main", "origin"]);
         git(&["-C", "origin", "commit", "-q", "--allow-empty", "-m", "x"]);
         let url = format!("file://{}/origin", dir.display());
@@ -188,5 +179,17 @@ mod tests {
         assert_eq!(run("~/code", "thing"), Some(cloned), "already cloned");
         std::fs::create_dir_all(dir.join("code/other")).unwrap();
         assert_eq!(run("code", "other"), None, "holds something else");
+        // What a clone killed after git wrote its config leaves: the origin
+        // set, no commit.
+        git(&["init", "-q", "code/partial"]);
+        git(&[
+            "-C",
+            "code/partial",
+            "remote",
+            "add",
+            "origin",
+            url.as_str(),
+        ]);
+        assert_eq!(run("code", "partial"), None, "an incomplete clone");
     }
 }

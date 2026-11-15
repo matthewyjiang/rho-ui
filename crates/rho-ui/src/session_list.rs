@@ -671,36 +671,38 @@ impl Filter {
         }
     }
 
-    /// The filter as the state database keeps it: a line per hidden
-    /// machine (`machine <id>`) and chosen project (`project <machine>
-    /// <path>`, tab-separated). A path that isn't UTF-8 isn't kept.
-    pub(crate) fn to_text(&self) -> String {
-        let machines = self.hidden.iter().map(|id| format!("machine\t{id}"));
-        let projects = self.projects.iter().filter_map(|project| {
-            let path = project.path.to_str()?;
-            Some(format!("project\t{}\t{path}", project.machine))
-        });
-        machines.chain(projects).collect::<Vec<_>>().join("\n")
+    /// Forgets `machine`, gone from the settings, which the menu no longer
+    /// offers: it isn't hidden, and none of its projects is chosen. Returns
+    /// whether the filter changed.
+    pub(crate) fn forget_machine(&mut self, machine: &MachineId) -> bool {
+        let before = self.clone();
+        self.hidden.remove(machine);
+        self.projects.retain(|project| project.machine != *machine);
+        *self != before
     }
 
-    /// Reads [`Self::to_text`]'s lines, skipping any it can't.
-    pub(crate) fn from_text(text: &str) -> Self {
-        let mut filter = Self::default();
-        for line in text.lines() {
-            let mut fields = line.split('\t');
-            match (fields.next(), fields.next(), fields.next()) {
-                (Some("machine"), Some(id), None) => {
-                    filter.hidden.insert(MachineId::from(id));
-                }
-                (Some("project"), Some(machine), Some(path)) => {
-                    filter
-                        .projects
-                        .insert(Place::new(MachineId::from(machine), path));
-                }
-                _ => {}
-            }
-        }
-        filter
+    /// Keeps to the chosen projects still in `roots`, the ones the menu
+    /// offers. Returns whether the filter changed.
+    pub(crate) fn keep_projects(&mut self, roots: &[Place]) -> bool {
+        let before = self.projects.len();
+        self.projects.retain(|project| roots.contains(project));
+        self.projects.len() != before
+    }
+
+    /// The filter that hides the machines `hidden` and keeps to the
+    /// projects `projects`, as the state database gave them back.
+    pub(crate) fn new(hidden: BTreeSet<MachineId>, projects: BTreeSet<Place>) -> Self {
+        Self { hidden, projects }
+    }
+
+    /// The machines whose sessions it hides.
+    pub(crate) fn hidden(&self) -> &BTreeSet<MachineId> {
+        &self.hidden
+    }
+
+    /// The projects it keeps to; every one when empty.
+    pub(crate) fn projects(&self) -> &BTreeSet<Place> {
+        &self.projects
     }
 }
 
@@ -711,14 +713,19 @@ pub(crate) struct Busy {
     pub(crate) working: usize,
 }
 
-/// Whether `haystack` contains `needle`, ignoring ASCII case. Allocates
-/// nothing, so filtering on every keystroke stays cheap.
-fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+/// Whether `haystack` contains `needle`, ignoring case in any script, so
+/// `É` finds `é`: how every list's search matches. Compares lowercase
+/// chars as it goes and allocates nothing, so filtering on every
+/// keystroke stays cheap.
+pub(crate) fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    fn lower(text: &str) -> impl Iterator<Item = char> + '_ {
+        text.chars().flat_map(char::to_lowercase)
+    }
     needle.is_empty()
-        || haystack
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+        || haystack.char_indices().any(|(at, _)| {
+            let mut rest = lower(&haystack[at..]);
+            lower(needle).all(|c| rest.next() == Some(c))
+        })
 }
 
 #[cfg(test)]
@@ -1049,6 +1056,14 @@ mod tests {
         list.set_query("design ui");
         rebuild(&mut list, &shelves, 5);
         assert!(list.is_empty(), "words must appear together");
+        // Case beyond ASCII, as every list's search matches.
+        for (haystack, needle) in [("Café crème", "CRÈME"), ("ÉTÉ", "été")] {
+            assert!(
+                contains_ignore_case(haystack, needle),
+                "{needle:?} in {haystack:?}"
+            );
+        }
+        assert!(!contains_ignore_case("Café", "cafés"), "past the end");
         list.set_query("atl");
         rebuild(&mut list, &shelves, 5);
         assert_eq!(list.items.len(), 5, "the workspace name matches too");
@@ -1116,6 +1131,15 @@ mod tests {
         list.set_filter(filter.clone());
         list.rebuild(&owned, 6, roots);
         assert_eq!(shown(&list), ["there a"]);
-        assert_eq!(Filter::from_text(&filter.to_text()), filter);
+
+        // What the menu no longer offers stops filtering, so nothing stays
+        // hidden with no item left to undo it.
+        assert!(!filter.keep_projects(&[Place::new(there.clone(), "/srv")]));
+        assert!(filter.keep_projects(&[]), "the chosen project was removed");
+        assert!(filter.is_empty());
+        filter.toggle_machine(&there);
+        filter.toggle_project(&Place::new(there.clone(), "/srv"));
+        assert!(filter.forget_machine(&there));
+        assert!(filter.is_empty(), "the removed machine's project went too");
     }
 }

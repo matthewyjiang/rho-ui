@@ -38,7 +38,7 @@ use gpui_kit::{
 use rho_ui_core::{Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent};
 
 use crate::{
-    attachments::{ImagePreview, Preview},
+    attachments::Preview,
     figures,
     fold::Folding,
     lightbox,
@@ -260,9 +260,14 @@ impl Transcript {
     /// Entry `ix` was added or changed. A new entry gets its row in
     /// [`Self::sync`].
     pub(crate) fn changed(&mut self, entries: &[Entry], ix: usize, cx: &mut App) {
-        // A new entry gets its attachments in `sync`.
+        // A new entry gets its attachments in `sync`. A tool call's status
+        // or text changes far more often than its images, and a preview
+        // copies and hashes the whole image, so it is made again only for
+        // images that changed.
         if let (Some(attachments), Some(entry)) = (self.attachments.get_mut(ix), entries.get(ix)) {
-            *attachments = previews(entry);
+            if !shows_images_of(attachments, entry) {
+                *attachments = previews(entry);
+            }
         }
         // A reply streams in.
         if let (Some(Some(markdown)), Some(text)) = (
@@ -370,29 +375,40 @@ impl Transcript {
         }
     }
 
+    /// Does what a click asked for. `action` names rows, entries and turns
+    /// as last drawn; one the transcript has lost since is ignored.
     pub(crate) fn act(&mut self, action: Action, entries: &[Entry], cx: &mut App) {
         let rows = match action {
             Action::Fold {
                 row,
                 fold: Fold::Steps,
             } => {
-                self.steps[row].toggle();
+                let Some(steps) = self.steps.get_mut(row) else {
+                    return;
+                };
+                steps.toggle();
                 row..row + 1
             }
             Action::Fold {
                 row,
                 fold: Fold::Details(ix),
             } => {
+                let Some(details) = self.details.get_mut(ix) else {
+                    return;
+                };
+                details.toggle();
                 if let Some(Entry::Tool(tool)) = entries.get(ix) {
                     if !self.diffs.iter().any(|diff| diff.entry == ix) {
                         self.diffs.extend(DiffView::new(ix, tool, cx));
                     }
                 }
-                self.details[ix].toggle();
                 row..row + 1
             }
             Action::Worked { turn } => {
-                self.worked[turn].toggle();
+                let Some(worked) = self.worked.get_mut(turn) else {
+                    return;
+                };
+                worked.toggle();
                 self.timeline.turn_rows(turn)
             }
             Action::Notice { entry } => {
@@ -692,12 +708,32 @@ fn previews(entry: &Entry) -> Vec<Preview> {
             .content()
             .iter()
             .filter_map(|content| match content {
-                ToolContent::Image(image) => ImagePreview::new(image).map(Preview::Image),
+                ToolContent::Image(image) => Preview::of_image(image),
                 ToolContent::Text(_) | ToolContent::Diff { .. } => None,
             })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Whether `previews` are of tool call `entry`'s images, each still the
+/// one it was made from. Only a tool call's are checked: a user message's
+/// attachments are made again whenever it changes, which is seldom.
+fn shows_images_of(previews: &[Preview], entry: &Entry) -> bool {
+    let Entry::Tool(tool) = entry else {
+        return false;
+    };
+    let images = || {
+        tool.content().iter().filter_map(|content| match content {
+            ToolContent::Image(image) => Some(image),
+            ToolContent::Text(_) | ToolContent::Diff { .. } => None,
+        })
+    };
+    previews.len() == images().count()
+        && previews
+            .iter()
+            .zip(images())
+            .all(|(preview, image)| preview.image().is_some_and(|shown| shown.shows(image)))
 }
 
 /// One row of a user message's attachments, against the message's edge;

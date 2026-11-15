@@ -35,7 +35,9 @@ const FILE_LIMIT: usize = 32 << 20;
 /// The longest side of an image shown, in pixels: what rho's own
 /// `read_file` decodes (the same doc). A larger one can take hundreds of
 /// MiB decoded, and pass the GPU's largest texture, which draws nothing.
-const MAX_SIDE: u32 = 4096;
+/// Attached and tool-result images keep to it too; see
+/// [`crate::attachments::Preview::of_image`].
+pub(crate) const MAX_SIDE: u32 = 4096;
 
 /// The tallest a picture shows in a message, in rems: 384 px at 100%, so a
 /// tall screenshot leaves the text around it in view.
@@ -158,7 +160,7 @@ impl Pictures {
                 .await;
             let load = match read {
                 Ok(FileRead::Bytes(bytes)) => executor
-                    .spawn(async move { ImagePreview::from_file(bytes, MAX_SIDE) })
+                    .spawn(async move { ImagePreview::from_file(bytes) })
                     .await
                     .map_or_else(|why| Load::Failed(why.into()), Load::Read),
                 Ok(FileRead::TooLarge) => {

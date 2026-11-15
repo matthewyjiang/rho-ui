@@ -12,7 +12,8 @@
 //! Show more under them adds 25 more at a time. Hovering a row shows its
 //! details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
-//! which machines aren't connected.
+//! which machines aren't connected, and why any remote machine's
+//! repositories couldn't be read.
 //!
 //! Drag the open sidebar's right edge to resize it, and double-click the
 //! edge for its default width. The sidebar collapses to a rail of buttons;
@@ -313,7 +314,7 @@ pub(crate) struct SidebarView {
     /// The list's height in the last frame, which the gap above the
     /// shelves fills up to.
     viewport: Pixels,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 4],
     _tick: Task<()>,
 }
 
@@ -343,6 +344,11 @@ impl SidebarView {
             cx.observe(&workspaces, |this, _, cx| this.rebuild(cx)),
             // Labels changed, or a machine came or went.
             cx.observe(&machines, |_, _, cx| cx.notify()),
+            cx.observe(&projects, |this, projects, cx| {
+                let roots = projects.read(cx).roots().to_vec();
+                this.prune_filter(|filter| filter.keep_projects(&roots));
+                this.rebuild(cx);
+            }),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -425,6 +431,7 @@ impl SidebarView {
     /// Drops everything of `machine`, gone from the settings.
     pub(crate) fn remove_machine(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
         self.list.remove_machine(machine);
+        self.prune_filter(|filter| filter.forget_machine(machine));
         if self
             .active
             .as_ref()
@@ -641,8 +648,16 @@ impl SidebarView {
             .row(&renaming.id)
             .is_some_and(|row| row.title.as_ref() != Some(&title));
         if !title.is_empty() && changed {
-            self.list.rename(&renaming.id, title.clone());
-            self.rebuild(cx);
+            // Shown at once only when the daemon can take it; otherwise the
+            // app says the machine isn't connected and the title stays.
+            let connected = matches!(
+                self.machines.read(cx).status(&renaming.id.machine),
+                Some(MachineStatus::Ready { .. })
+            );
+            if connected {
+                self.list.rename(&renaming.id, title.clone());
+                self.rebuild(cx);
+            }
             cx.emit(SidebarEvent::Rename {
                 id: renaming.id,
                 title,
@@ -1265,8 +1280,9 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// What isn't right with each machine, then Settings and the local
-    /// rho's version.
+    /// What isn't right with each machine, then why any remote machine's
+    /// repositories couldn't be read, then Settings and the local rho's
+    /// version.
     fn render_footer(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -1282,19 +1298,11 @@ impl SidebarView {
                 .tag(machine)
                 .map_or_default(|_| format!(" on {label}"));
             if let Some(error) = error {
-                troubles.push(
-                    div()
-                        .px_2()
-                        .child(
-                            Alert::error(
-                                SharedString::from(format!("sessions-error-{machine}")),
-                                error.clone(),
-                            )
-                            .title(format!("Couldn't load sessions{on}"))
-                            .small(),
-                        )
-                        .into_any_element(),
-                );
+                troubles.push(footer_alert(
+                    format!("sessions-error-{machine}"),
+                    format!("Couldn't read sessions{on}"),
+                    error.clone(),
+                ));
             }
             match status {
                 MachineStatus::Ready { .. } => {}
@@ -1339,6 +1347,20 @@ impl SidebarView {
                 }
             }
         }
+        let workspaces = self.workspaces.read(cx);
+        for machine in machines.iter() {
+            let Some(why) = workspaces.unread(&machine.id) else {
+                continue;
+            };
+            let on = machines
+                .tag(&machine.id)
+                .map_or_default(|label| format!(" on {label}"));
+            troubles.push(footer_alert(
+                format!("repos-error-{}", machine.id),
+                format!("Couldn't read repositories{on}"),
+                why.clone(),
+            ));
+        }
         v_flex()
             .flex_shrink_0()
             .py_2()
@@ -1351,6 +1373,18 @@ impl SidebarView {
                 ),
             )
     }
+}
+
+/// A small error in the footer, with element ID `id`.
+fn footer_alert(id: String, title: String, why: SharedString) -> AnyElement {
+    div()
+        .px_2()
+        .child(
+            Alert::error(SharedString::from(id), why)
+                .title(title)
+                .small(),
+        )
+        .into_any_element()
 }
 
 impl Render for SidebarView {

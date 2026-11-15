@@ -4,8 +4,10 @@
 //! files on the background executor, then re-read every [`REREAD`] to pick
 //! up branch switches. A remote machine's are read with `git` there, over
 //! the ssh connection to its daemon, and show their folder's name until
-//! then. The saved sessions say how recently each was used, which dates the
-//! projects in the new-session picker.
+//! then. A remote machine whose repositories can't be read says why at the
+//! foot of the sidebar until a read succeeds. The saved sessions say how
+//! recently each was used, which dates the projects in the new-session
+//! picker.
 
 use std::{
     path::{Path, PathBuf},
@@ -150,6 +152,8 @@ struct Remote {
     home: Option<PathBuf>,
     /// While its daemon is connected: how to read its repositories.
     ssh: Option<SshLink>,
+    /// Why its repositories couldn't be read, until a read succeeds.
+    unread: Option<SharedString>,
 }
 
 /// Every workspace seen so far. Only ever appended to, so callers hold
@@ -212,6 +216,12 @@ impl Workspaces {
             .find(|remote| remote.machine == *machine)
     }
 
+    /// Why remote `machine`'s repositories couldn't be read, until a read
+    /// succeeds or its connection goes.
+    pub(crate) fn unread(&self, machine: &MachineId) -> Option<&SharedString> {
+        self.remote(machine)?.unread.as_ref()
+    }
+
     /// Takes what remote `machine`'s newly connected `daemon` says: shows
     /// its workspaces' paths from its home directory, and reads their
     /// repositories over its ssh link.
@@ -235,13 +245,15 @@ impl Workspaces {
             machine: machine.clone(),
             home,
             ssh: daemon.ssh().cloned(),
+            unread: None,
         });
         let theirs = (0..self.list.len()).filter(|&ix| self.list[ix].machine() == machine);
         self.read(theirs.collect(), cx);
     }
 
     /// Stops reading remote `machine`'s repositories, as its daemon's
-    /// connection is gone. Its workspaces keep what was last read.
+    /// connection is gone, which the sidebar says instead of why they
+    /// couldn't be read. Its workspaces keep what was last read.
     pub(crate) fn disconnected(&mut self, machine: &MachineId) {
         if let Some(remote) = self
             .remotes
@@ -249,6 +261,7 @@ impl Workspaces {
             .find(|remote| remote.machine == *machine)
         {
             remote.ssh = None;
+            remote.unread = None;
         }
     }
 
@@ -368,18 +381,18 @@ impl Workspaces {
         for (ssh, indices) in by_link {
             let dirs = self.dirs(&indices);
             cx.spawn(async move |this, cx| {
-                let repos = match ssh.run_script(repo::REMOTE_SCRIPT, &dirs).await {
-                    Ok(output) => repo::parse_remote(&dirs, &output),
-                    Err(error) => {
-                        say_unread(&error.to_string());
-                        return;
+                let read = match ssh.run_script(repo::REMOTE_SCRIPT, &dirs).await {
+                    Ok(output) => repo::parse_remote(&dirs, &output)
+                        .ok_or_else(|| "The script printed something else.".to_owned()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = this.update(cx, |this, cx| match read {
+                    Ok(repos) => {
+                        this.set_unread(&ssh, None, cx);
+                        this.set_repos(&indices, repos, cx);
                     }
-                };
-                let Some(repos) = repos else {
-                    say_unread("the script printed something else");
-                    return;
-                };
-                let _ = this.update(cx, |this, cx| this.set_repos(&indices, repos, cx));
+                    Err(why) => this.set_unread(&ssh, Some(why.as_str()), cx),
+                });
             })
             .detach();
         }
@@ -390,6 +403,25 @@ impl Workspaces {
             .iter()
             .map(|&ix| self.list[ix].cwd().to_path_buf())
             .collect()
+    }
+
+    /// Records why the repositories of the machines `ssh` reaches couldn't
+    /// be read, or with `None` that they were. Each [`REREAD`] tries again,
+    /// so stderr hears of a failure only when it changes.
+    fn set_unread(&mut self, ssh: &SshLink, why: Option<&str>, cx: &mut Context<'_, Self>) {
+        let mut changed = false;
+        for remote in &mut self.remotes {
+            if remote.ssh.as_ref() == Some(ssh) && remote.unread.as_deref() != why {
+                remote.unread = why.map(|why| SharedString::from(why.to_owned()));
+                changed = true;
+            }
+        }
+        if changed {
+            if let Some(why) = why {
+                say_unread(why);
+            }
+            cx.notify();
+        }
     }
 
     /// Takes the repositories read for `indices`, and notifies only if one

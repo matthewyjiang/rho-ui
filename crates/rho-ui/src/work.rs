@@ -40,9 +40,11 @@ use crate::{
     transcript::{Phase, IMAGE_HEIGHT},
 };
 
-/// Output past this many lines shows only its tail. At `text_xs` that is
-/// about seven screens of text, more than anyone reads inline, and it keeps
-/// a huge `cat` from stalling layout.
+/// Output past this many lines shows only its tail: a card's text and code
+/// bodies (a file a `read_file` shows is code), a call's text content when
+/// it has no card, and patches shown as text. Markdown and search bodies
+/// show whole. At `text_xs` that is about seven screens of text, more than
+/// anyone reads inline, and it keeps a huge `cat` from stalling layout.
 const MAX_OUTPUT_LINES: usize = 400;
 
 /// Details taller than this scroll inside the row, as in T3 Code.
@@ -789,15 +791,19 @@ fn output(tool: &ToolCall, ix: usize, diff: Option<&DiffView>, cx: &App) -> Opti
 /// clicked.
 fn tool_images(tool: &ToolCall, ix: usize, images: &[Preview]) -> AnyElement {
     let caption = SharedString::from(tool.label().to_owned());
-    let tiles = images.iter().enumerate().filter_map(|(n, preview)| {
-        let image = preview.image()?;
+    let tiles = images.iter().enumerate().map(|(n, preview)| {
         let id = SharedString::from(format!("step-{ix}-image-{n}"));
-        Some(lightbox::opens(
-            id,
-            image,
-            caption.clone(),
-            image.tile(IMAGE_HEIGHT),
-        ))
+        match preview.image() {
+            Some(image) => lightbox::opens(id, image, caption.clone(), image.tile(IMAGE_HEIGHT))
+                .into_any_element(),
+            // Too large to preview: its chip says so.
+            None => div()
+                .id(id)
+                .aria_label(preview.label())
+                .test_support()
+                .child(preview.card())
+                .into_any_element(),
+        }
     });
     h_flex()
         .flex_wrap()
@@ -806,10 +812,11 @@ fn tool_images(tool: &ToolCall, ix: usize, images: &[Preview]) -> AnyElement {
         .into_any_element()
 }
 
-/// Source code, highlighted as `language`. Kit highlights code only in a
-/// text view's code blocks, so it is one, without the block's frame: the
-/// details are framed already.
+/// Source code, highlighted as `language`, its tail only when long (see
+/// [`tail`]). Kit highlights code only in a text view's code blocks, so it
+/// is one, without the block's frame: the details are framed already.
 fn code(language: &str, text: &str, ix: usize) -> AnyElement {
+    let (text, hidden) = tail(text.trim_end());
     let longest_ticks = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest_ticks.max(2) + 1);
     let style = TextViewStyle {
@@ -820,7 +827,7 @@ fn code(language: &str, text: &str, ix: usize) -> AnyElement {
             .text_xs(),
         ..TextViewStyle::default()
     };
-    TextView::markdown(
+    let view = TextView::markdown(
         ElementId::named_usize("tool-code", ix),
         format!("{fence}{language}\n{text}\n{fence}"),
     )
@@ -828,8 +835,8 @@ fn code(language: &str, text: &str, ix: usize) -> AnyElement {
     // Actions take the corner the language name would; none, so neither
     // shows.
     .code_block_actions(|_, _, _| div())
-    .selectable(true)
-    .into_any_element()
+    .selectable(true);
+    tailed(hidden, view).into_any_element()
 }
 
 /// What a search found: each file, then its matching lines under it, each
@@ -898,8 +905,9 @@ fn tail(text: &str) -> (&str, usize) {
     (&text[start..], hidden)
 }
 
-fn monospace(text: &str, cx: &App) -> impl IntoElement {
-    let (shown, hidden) = tail(text.trim_end());
+/// `body`, under a line saying how many earlier lines [`tail`] hid from
+/// it, if any.
+fn tailed(hidden: usize, body: impl IntoElement) -> impl IntoElement {
     v_flex()
         .gap_1()
         .when(hidden > 0, |this| {
@@ -909,12 +917,18 @@ fn monospace(text: &str, cx: &App) -> impl IntoElement {
                     .child(format!("{hidden} earlier lines hidden")),
             )
         })
-        .child(
-            div()
-                .text_xs()
-                .font_family(cx.theme().mono_font_family.clone())
-                .child(shown.to_owned()),
-        )
+        .child(body)
+}
+
+fn monospace(text: &str, cx: &App) -> impl IntoElement {
+    let (shown, hidden) = tail(text.trim_end());
+    tailed(
+        hidden,
+        div()
+            .text_xs()
+            .font_family(cx.theme().mono_font_family.clone())
+            .child(shown.to_owned()),
+    )
 }
 
 #[cfg(test)]

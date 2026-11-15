@@ -144,7 +144,7 @@ enum Note {
     Status(String),
     /// A problem in the file, which rho works around.
     Warning(String),
-    /// A change of the user's that didn't land.
+    /// A change of the user's that didn't land as made.
     Problem(SharedString),
 }
 
@@ -227,7 +227,9 @@ impl SettingsView {
     }
 
     /// Writes what setting `key`'s box holds, if the setting takes it and
-    /// it changes something; otherwise the box shows the value again.
+    /// it changes something; otherwise the box shows the value again. The
+    /// page says why when the setting doesn't take it, or takes it clamped
+    /// to its bounds.
     fn commit_rho_input(
         &mut self,
         key: &SettingKey,
@@ -236,16 +238,24 @@ impl SettingsView {
         cx: &mut Context<'_, Self>,
     ) {
         let machine = self.rho_machine(cx);
-        let change = match self.rho.settings.read(cx).loaded(&machine) {
+        let typed = match self.rho.settings.read(cx).loaded(&machine) {
             Some(Loaded::Ready(settings)) => typed_change(settings, key, text.trim()),
-            _ => None,
+            _ => Typed::Nothing,
         };
-        match change {
-            Some(change) => self
-                .rho
-                .settings
-                .update(cx, |settings, cx| settings.change(&machine, change, cx)),
-            None => self.sync_rho_inputs(window, cx),
+        match typed {
+            Typed::Change(change, clamped) => self.rho.settings.update(cx, |settings, cx| {
+                settings.change(&machine, change, cx);
+                if let Some(why) = clamped {
+                    settings.set_problem(&machine, why.into(), cx);
+                }
+            }),
+            Typed::Nothing => self.sync_rho_inputs(window, cx),
+            Typed::Refused(why) => {
+                self.rho.settings.update(cx, |settings, cx| {
+                    settings.set_problem(&machine, why.into(), cx);
+                });
+                self.sync_rho_inputs(window, cx);
+            }
         }
     }
 
@@ -668,27 +678,65 @@ fn text_settings(settings: &AgentSettings) -> Vec<(SettingKey, TextKind, SharedS
         .collect()
 }
 
-/// What typing `text` in setting `key`'s box changes: nothing when the
-/// setting holds it already or doesn't take it. Empty resets the setting.
-fn typed_change(settings: &AgentSettings, key: &SettingKey, text: &str) -> Option<SettingChange> {
-    let spec = settings.spec(key)?;
-    if text.is_empty() {
-        return settings
-            .is_set(key)
-            .then(|| SettingChange::Reset { key: key.clone() });
-    }
-    let value = match &spec.kind {
-        SettingKind::Integer { min, max, .. } => {
-            let number: u64 = text.parse().ok()?;
-            SettingValue::Integer(number.max(*min).min(max.unwrap_or(u64::MAX)))
-        }
-        SettingKind::Text => SettingValue::Text(text.to_owned()),
-        _ => return None,
+/// What typing in a setting's box does.
+enum Typed {
+    /// Nothing: the setting holds the value already, or has no box.
+    Nothing,
+    /// Makes the change, and says why when it isn't what was typed: a
+    /// number past the setting's bounds is clamped to them.
+    Change(SettingChange, Option<String>),
+    /// Nothing changes, and why: the setting doesn't take the text, or
+    /// clamping it gives the value the setting holds already.
+    Refused(String),
+}
+
+/// What typing `text` in setting `key`'s box does. Empty resets the
+/// setting.
+fn typed_change(settings: &AgentSettings, key: &SettingKey, text: &str) -> Typed {
+    let Some(spec) = settings.spec(key) else {
+        return Typed::Nothing;
     };
-    (settings.value(key) != Some(&value)).then(|| SettingChange::Set {
-        key: key.clone(),
-        value,
-    })
+    if text.is_empty() {
+        if settings.is_set(key) {
+            return Typed::Change(SettingChange::Reset { key: key.clone() }, None);
+        }
+        return Typed::Nothing;
+    }
+    let (value, clamped) = match &spec.kind {
+        SettingKind::Integer { min, max, .. } => {
+            let bounds = match max {
+                Some(max) => format!("from {min} to {max}"),
+                None => format!("of at least {min}"),
+            };
+            let Ok(number) = text.parse::<u64>() else {
+                return Typed::Refused(format!(
+                    "{} takes a whole number {bounds}, not \"{text}\".",
+                    spec.label
+                ));
+            };
+            let kept = number.max(*min).min(max.unwrap_or(u64::MAX));
+            let clamped = (kept != number).then(|| {
+                format!(
+                    "{} takes a number {bounds}, so {number} became {kept}.",
+                    spec.label
+                )
+            });
+            (SettingValue::Integer(kept), clamped)
+        }
+        SettingKind::Text => (SettingValue::Text(text.to_owned()), None),
+        _ => return Typed::Nothing,
+    };
+    if settings.value(key) == Some(&value) {
+        // Clamped to what it holds already, the page still says why.
+        return clamped.map_or(Typed::Nothing, Typed::Refused);
+    }
+    Typed::Change(
+        SettingChange::Set {
+            key: key.clone(),
+            value,
+        },
+        clamped,
+    )
 }
 
 /// A setting's bound as the number box takes it.
