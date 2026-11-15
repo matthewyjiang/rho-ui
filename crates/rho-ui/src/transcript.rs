@@ -63,13 +63,13 @@ const CODE_BLOCK_PAD_TOP: f32 = 19.;
 /// far from both edges.
 const CODE_BLOCK_PAD_BOTTOM: f32 = 21.;
 
-/// How many lines of a notice's detail show until it is opened. Kit counts
-/// body lines, so headings and code blocks take more room: a subagent's
-/// result cut at 12 lines, with two headings and a code block, measured
-/// 340px tall card and all in the UI test's 800px window, leaving most of
-/// the window to the conversation, while a short card, such as a finished
-/// command's, shows whole.
-const NOTICE_LINES: usize = 12;
+/// How many lines of a notice's detail show until it is opened. Kit caps
+/// the height at this many body lines, so headings and code blocks take
+/// more room: a subagent's result cut at 6 lines shows its first line and
+/// heading, and measured 202px tall, card and all, in the UI test's window
+/// (12 lines measured 340px and read as most of the result). A short card,
+/// such as a finished command's, still shows whole.
+const NOTICE_LINES: usize = 6;
 
 /// The gap between a notice's paragraphs, in rems: Kit's alerts' own, so a
 /// detail sets as tight as the card it is in.

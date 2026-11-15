@@ -3766,7 +3766,7 @@ fn a_long_card_shows_its_first_lines_until_opened() {
         .update_window(ui.window, |_, window, _| height(window))
         .expect("window is open")
         .expect("the card is drawn");
-    assert!(short < px(400.), "{short:?} tall, cut short");
+    assert!(short < px(300.), "{short:?} tall, cut short");
     ui.shot("result-short");
     ui.click(toggle);
     ui.wait_until("the whole result, taller", |window, _, _| {
