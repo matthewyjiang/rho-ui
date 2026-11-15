@@ -1,11 +1,17 @@
-//! rho's A2UI v1.0 core: the data model, the paths that address it, and the
-//! expressions and basic catalog functions that read it.
+//! rho's A2UI v1.0 core: the data model, expressions and catalogs, and the
+//! renderer side that applies an agent's messages to surfaces.
 //!
 //! This crate has no GUI code. It is tested against the conformance suites
 //! that Google publishes with A2UI, vendored under `vendor/a2ui`.
 //!
 //! [`Catalog`] loads a v1.0 catalog, the components and functions a surface
 //! may use, and [`CatalogValidator`] checks component instances against one.
+//!
+//! [`MessageProcessor`] is the renderer side: it applies an agent's messages
+//! to [`Surface`]s, reporting each [`Change`] for a view to act on, resolves
+//! a component's properties with [`MessageProcessor::resolve`], and turns a
+//! user's action into a message for the agent with
+//! [`MessageProcessor::dispatch_action`].
 
 mod action;
 mod basic_catalog;
