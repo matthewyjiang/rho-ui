@@ -1,8 +1,9 @@
-//! One ssh connection per host, shared by everything rho-ui does there:
-//! the daemon's socket, and every script. A connection costs a key
-//! signature, which an agent such as 1Password's asks the user to
-//! approve, so rho-ui makes one per host, keeps it while anything uses
-//! it, and for [`LINGER`] after, for the next user to take.
+//! The ssh connections to a host: one for the daemon's socket and every
+//! script, and one more for the terminals' shells, made when the first
+//! terminal opens ([`Purpose`]). A connection costs a key signature, which an agent
+//! such as 1Password's asks the user to approve, so rho-ui makes one of
+//! each per host, keeps it while anything uses it, and for [`LINGER`]
+//! after, for the next user to take.
 
 use std::{
     borrow::Cow,
@@ -13,9 +14,12 @@ use std::{
 
 use russh::{
     client::{self, Handle, Msg},
-    Channel, ChannelOpenFailure, ChannelStream, Preferred,
+    ChannelOpenFailure, ChannelReadHalf, ChannelStream, ChannelWriteHalf, Preferred,
 };
-use tokio::net::TcpStream;
+use tokio::{
+    net::TcpStream,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 
 use super::{
     auth::{self, Identities},
@@ -48,11 +52,40 @@ const KEEPALIVE_MAX: usize = 3;
 /// the host go after this.
 const LINGER: Duration = Duration::from_secs(600);
 
+/// The session channels sshd allows open at once on one connection: the
+/// default of its `MaxSessions` (`sshd_config(5)`: "open shell, login or
+/// subsystem (e.g. sftp) sessions"; the daemon's `direct-streamlocal`
+/// channel isn't one). Each script and each terminal takes one.
+const SSHD_SESSIONS: usize = 10;
+
+/// The most terminals' shells open at once on one remote machine: all of
+/// sshd's default `MaxSessions` on the terminals' own connection, so they
+/// never take a session a script needs. A host whose `MaxSessions` is
+/// lower refuses past it, and that error names it.
+pub const MAX_SHELLS: usize = SSHD_SESSIONS;
+
+/// What a connection to a host carries. Scripts burst to a handful of
+/// sessions at once as a session's turn ends, and a terminal pane keeps a
+/// shell for each session it has shown, so the two sharing sshd's 10
+/// sessions would leave each too few.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Purpose {
+    /// The daemon's socket and every script.
+    Daemon,
+    /// The terminals' shells.
+    Terminals,
+}
+
 /// A signed-in ssh connection to a host.
 pub(super) struct Connection {
     /// The destination the user named, for messages and `ssh` commands.
     host: String,
+    /// How it was reached, to reach the host again so for another
+    /// [`Purpose`].
+    resolved: Resolved,
     handle: Handle<Verifier>,
+    /// A permit for each terminal's shell open on it, of [`MAX_SHELLS`].
+    shells: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -92,18 +125,22 @@ impl Drop for Lease {
     }
 }
 
-/// A lease on the open connection to `host`, opening one if none is:
-/// with `route`, else as `ssh -G` resolves the host. Callers for one host
-/// wait on one another, so they share one connection, and the user
-/// approves one signature; other hosts don't wait. Runs on the I/O
-/// runtime.
+/// A lease on the open connection to `host` for `purpose`, opening one if
+/// none is: with `route`, else as `ssh -G` resolves the host. Callers for
+/// one host and purpose wait on one another, so they share one
+/// connection, and the user approves one signature; others don't wait.
+/// Runs on the I/O runtime.
 ///
 /// # Errors
 ///
 /// Fails, saying why, if the host can't be reached, its key isn't the
 /// one `known_hosts` lists, or it accepts none of the user's keys.
-pub(super) async fn shared(host: &str, route: Option<&Resolved>) -> Result<Lease, DaemonError> {
-    let slot = slot(host);
+pub(super) async fn shared(
+    host: &str,
+    route: Option<&Resolved>,
+    purpose: Purpose,
+) -> Result<Lease, DaemonError> {
+    let slot = slot(host, purpose);
     let mut held = slot.lock().await;
     if let Some(open) = held.upgrade().filter(|connection| !connection.is_closed()) {
         return Ok(Lease { connection: open });
@@ -123,17 +160,18 @@ pub(super) async fn shared(host: &str, route: Option<&Resolved>) -> Result<Lease
     Ok(Lease { connection })
 }
 
-/// Where one host's connection is found while anything holds it.
+/// Where one host's connection for one purpose is found while anything
+/// holds it.
 type Slot = Arc<tokio::sync::Mutex<Weak<Connection>>>;
 
-/// `host`'s slot, one for the life of the process.
-fn slot(host: &str) -> Slot {
-    static SLOTS: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
+/// `host`'s slot for `purpose`, one for the life of the process.
+fn slot(host: &str, purpose: Purpose) -> Slot {
+    static SLOTS: OnceLock<Mutex<HashMap<(String, Purpose), Slot>>> = OnceLock::new();
     let mut slots = SLOTS
         .get_or_init(Mutex::default)
         .lock()
         .expect("the connection slots' mutex is never held across a panic");
-    Arc::clone(slots.entry(host.to_owned()).or_default())
+    Arc::clone(slots.entry((host.to_owned(), purpose)).or_default())
 }
 
 /// What connecting reads from disk, read before it starts so the I/O
@@ -211,7 +249,9 @@ impl Connection {
         auth::sign_in(&mut handle, host, resolved, &identities).await?;
         Ok(Self {
             host: host.to_owned(),
+            resolved: resolved.clone(),
             handle,
+            shells: Arc::new(Semaphore::new(MAX_SHELLS)),
         })
     }
 
@@ -220,31 +260,69 @@ impl Connection {
         &self.host
     }
 
+    /// How it was reached.
+    pub(super) fn resolved(&self) -> &Resolved {
+        &self.resolved
+    }
+
     /// Whether the connection is gone, as after a link died.
     pub(super) fn is_closed(&self) -> bool {
         self.handle.is_closed()
     }
 
-    /// Opens a session channel, for one command.
+    /// Opens a session channel, for one command: its reading half, and its
+    /// writing half, which closes the channel when dropped.
     ///
     /// # Errors
     ///
-    /// Fails if the host refuses it, as at sshd's `MaxSessions`, or the
-    /// connection is gone.
-    pub(super) async fn session(&self) -> Result<Channel<Msg>, DaemonError> {
+    /// Fails if the connection is gone, or the host refuses a session, as
+    /// at sshd's `MaxSessions`.
+    pub(super) async fn session(&self) -> Result<(ChannelReadHalf, CloseOnDrop), DaemonError> {
         let host = &self.host;
-        self.handle
+        if self.is_closed() {
+            return Err(DaemonError::Unreachable(format!(
+                "no ssh connection to {host}"
+            )));
+        }
+        let channel = self
+            .handle
             .channel_open_session()
             .await
             .map_err(|error| match error {
                 russh::Error::ChannelOpenFailure(reason) => DaemonError::Unreachable(format!(
-                    "{host} refused an ssh session ({reason:?}): sshd allows 10 at once on one \
-                     connection unless its MaxSessions says otherwise"
+                    "{host} refused an ssh session ({reason:?}): sshd allows \
+                     {SSHD_SESSIONS} at once on one connection unless its MaxSessions says \
+                     otherwise"
                 )),
                 other => DaemonError::Unreachable(format!(
                     "couldn't open an ssh session on {host}: {other}"
                 )),
-            })
+            })?;
+        let (read, write) = channel.split();
+        Ok((read, CloseOnDrop(Some(write))))
+    }
+
+    /// A slot for one more terminal's shell, of [`MAX_SHELLS`]; the shell
+    /// holds it while it runs, and dropping it frees it. sshd frees the
+    /// shell's session a moment later, once the shell has gone, so a
+    /// terminal opened at once in its place may meet sshd's own refusal,
+    /// whose error names `MaxSessions` too.
+    ///
+    /// # Errors
+    ///
+    /// Says why, for the user, when every slot is held.
+    pub(super) fn shell_slot(&self) -> Result<OwnedSemaphorePermit, String> {
+        Arc::clone(&self.shells).try_acquire_owned().map_err(|_| {
+            format!(
+                "rho-ui runs at most {MAX_SHELLS} terminals on {host}, the ssh sessions \
+                 sshd allows on their connection by default (MaxSessions); this would be \
+                 terminal {asked}. Exit a shell on {host}, or close a terminal pane (a pane \
+                 keeps a shell for each of the machine's sessions it has shown), to open \
+                 another.",
+                host = self.host,
+                asked = MAX_SHELLS + 1,
+            )
+        })
     }
 
     /// A stream to the Unix socket `socket` on the host, such as the Rho
@@ -277,5 +355,27 @@ impl Connection {
                 })
             })?;
         Ok(channel.into_stream())
+    }
+}
+
+/// A channel's writing half that closes the channel when dropped, as when
+/// a script's future is given up, a shell ends or is hung up on, or sshd
+/// refused either. Closing one already closed does nothing.
+pub(super) struct CloseOnDrop(Option<ChannelWriteHalf<Msg>>);
+
+impl CloseOnDrop {
+    pub(super) fn channel(&self) -> &ChannelWriteHalf<Msg> {
+        self.0.as_ref().expect("only dropping takes the channel")
+    }
+}
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(channel) = self.0.take() {
+            // On the I/O runtime, as the future may drop on any thread.
+            io().spawn(async move {
+                let _ = channel.close().await;
+            });
+        }
     }
 }

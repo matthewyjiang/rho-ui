@@ -4813,10 +4813,6 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 /// A typed path to a worktree adds its repository's project, not the
 /// worktree, and Remove takes a project off the list without picking it.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "the project search parses typed paths with POSIX rules: `Typed` splits at `/`"
-)]
 fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let dir = std::env::temp_dir().join(format!("rho-ui-projects-{}", std::process::id()));
     let (main, tree) = crate::repo::fake_worktree(&dir);

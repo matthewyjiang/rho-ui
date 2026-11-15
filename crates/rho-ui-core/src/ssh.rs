@@ -8,11 +8,14 @@
 //! the login environment ([`setup`]), then opens a `direct-streamlocal`
 //! channel to the daemon's socket, as `ssh -W` does, and speaks rho's
 //! protocol over it. Every script after that runs in a session channel
-//! of its own on the same connection ([`script`]). A new connection costs
-//! a key signature, which an agent such as 1Password's asks the user to
-//! approve, so the user approves once per host while the app uses the
-//! host and the link stays up; a connection nothing uses closes 10
-//! minutes later.
+//! of its own on the same connection ([`script`]). The terminals' login
+//! shells, under a pseudo-terminal there ([`shell`]), run on a second
+//! connection, made when the first terminal opens, so they never take the sessions
+//! scripts need; [`MAX_SHELLS`] at most. A new connection costs a key
+//! signature, which an agent such as 1Password's asks the user to
+//! approve, so the user approves once per host, and once more for its
+//! terminals, while the app uses the host and the link stays up; a
+//! connection nothing uses closes 10 minutes later.
 //!
 //! The connection follows the user's ssh config as `ssh -G` resolves it
 //! ([`config`]), checks the host's key against `known_hosts` and
@@ -27,13 +30,9 @@ mod connection;
 mod host_key;
 mod script;
 mod setup;
+mod shell;
 
-use std::{
-    ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{ffi::OsStr, sync::Arc, time::Duration};
 
 use rho_protocol::{Client, ClientError, ClientHello, HelloResponse, Notifications};
 use russh::{client::Msg, ChannelStream};
@@ -41,8 +40,10 @@ use russh::{client::Msg, ChannelStream};
 pub(crate) use config::Resolved;
 #[cfg(feature = "test-support")]
 pub(crate) use config::{AgentKeys, IdentityAgent};
-use connection::Lease;
+pub use connection::MAX_SHELLS;
+use connection::{Lease, Purpose};
 use script::ScriptError;
+pub use shell::{RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput};
 
 use crate::{
     daemon::{on_io, DaemonError, Machine, HANDSHAKE_DEADLINE},
@@ -115,7 +116,7 @@ impl SshTarget {
                 "{host:?} is not an ssh destination"
             )));
         }
-        let lease = connection::shared(host, self.route.as_deref()).await?;
+        let lease = connection::shared(host, self.route.as_deref(), Purpose::Daemon).await?;
         Ok(SshLink {
             lease: Arc::new(lease),
         })
@@ -190,9 +191,10 @@ where
 }
 
 /// The ssh connection to one remote machine, shared by its daemon
-/// connection and every script run there. The connection stays open
-/// while any link to it does, and 10 minutes after. Links are equal when
-/// they share a connection.
+/// connection and every script run there; its terminals open one of their
+/// own through it ([`Self::open_shell`]). The connection stays open while
+/// any link to it does, and 10 minutes after. Links are equal when they
+/// share a connection.
 #[derive(Clone)]
 pub struct SshLink {
     lease: Arc<Lease>,
@@ -284,39 +286,6 @@ impl SshLink {
             };
             DaemonError::Unreachable(why)
         })
-    }
-
-    /// The program and arguments of an `ssh` that runs the user's login
-    /// shell in `dir` on the machine, in a terminal of its own (`-tt`), for
-    /// a terminal emulator to run under a pseudo-terminal here. The local
-    /// OpenSSH program makes a connection of its own for it, in
-    /// `BatchMode`, so an agent such as 1Password's may ask to approve it;
-    /// a pseudo-terminal channel on the shared connection is to replace it.
-    ///
-    /// sshd hands the command line, `cd -- 'dir' && exec "$SHELL" -l`, to
-    /// the user's login shell to parse, so this assumes a POSIX one, such
-    /// as sh, bash or zsh, unlike the setup script, which `sh` reads. fish
-    /// reads `\\` and `\'` inside single quotes, so there a `dir` holding a
-    /// backslash goes wrong.
-    pub fn terminal_command(&self, dir: &Path) -> (PathBuf, Vec<OsString>) {
-        let mut remote = b"cd -- ".to_vec();
-        remote.extend(quote_bytes(&platform::path_to_bytes(dir.as_os_str())));
-        remote.extend(br#" && exec "$SHELL" -l"#);
-        let mut args: Vec<OsString> = [
-            "BatchMode=yes",
-            // Nor the user's key agent, nor X11, go to the machine.
-            "ForwardAgent=no",
-            "ForwardX11=no",
-        ]
-        .iter()
-        .flat_map(|&option| [OsString::from("-o"), OsString::from(option)])
-        .collect();
-        args.extend([
-            "-tt".into(),
-            self.lease.connection().host().into(),
-            platform::path_from_bytes(&remote).into_os_string(),
-        ]);
-        (config::ssh_program(), args)
     }
 }
 

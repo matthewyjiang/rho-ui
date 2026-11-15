@@ -50,6 +50,9 @@ jobs:
           vulkan_version: 1.4.363.0
           install_runtime_only: true
           install_lavapipe: true
+          # It reads release lists through GitHub's API, whose anonymous
+          # limit of 60 an hour a runner's shared address runs out of.
+          github_token: ${{ github.token }}
       - name: Put the Vulkan loader on PATH
         if: runner.os == 'Windows'
         shell: pwsh
