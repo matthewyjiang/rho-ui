@@ -4,7 +4,9 @@
 //! message. rho writes no file for a session until its first prompt, and a
 //! draft stops following its session when it goes away unused, which lets
 //! the daemon discard it, so an unused New session leaves nothing behind in
-//! the sidebar or in rho.
+//! the sidebar or in rho. One left with a message in its composer stays,
+//! session and all: the sidebar lists it at the top until it is sent or
+//! discarded.
 //!
 //! Above the composer, a [`ProjectPicker`] lists the user's projects it can
 //! start in, and chooses whether the session works in the project's
@@ -165,6 +167,28 @@ impl DraftView {
         &self.cwd
     }
 
+    /// The draft's workspace's index into the shared table.
+    pub(crate) fn workspace_index(&self) -> usize {
+        self.workspace.index()
+    }
+
+    /// Whether the composer holds a message worth coming back to: more than
+    /// whitespace, or an attachment.
+    pub(crate) fn has_message(&self, cx: &App) -> bool {
+        self.composer.read(cx).has_message(cx)
+    }
+
+    /// The first line of the message with any text, for the sidebar's row.
+    pub(crate) fn title(&self, cx: &App) -> Option<SharedString> {
+        let input = self.composer.read(cx).input().read(cx);
+        input
+            .value()
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| SharedString::from(line.to_owned()))
+    }
+
     pub(crate) fn composer_focus_handle(&self, cx: &App) -> FocusHandle {
         self.composer.focus_handle(cx)
     }
@@ -255,6 +279,19 @@ impl DraftView {
     pub(crate) fn launch_failed(&mut self, error: String, cx: &mut Context<'_, Self>) {
         self.launching = false;
         self.error = Some(error);
+        cx.notify();
+    }
+
+    /// The connection to the draft's machine is gone, and with it the
+    /// draft's session and any worktree start under way. The message and a
+    /// send waiting on it stay; the app asks for a session again.
+    pub(crate) fn disconnected(&mut self, cx: &mut Context<'_, Self>) {
+        let_go(
+            std::mem::replace(&mut self.state, SessionState::Opening),
+            cx,
+        );
+        self.launching = false;
+        self.error = None;
         cx.notify();
     }
 

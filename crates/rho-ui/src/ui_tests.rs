@@ -19,8 +19,8 @@ use gpui_kit::test::{
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem,
     ElementId, ElementInputHandler, Entity, ExternalPaths, HeadlessAppContext, ImageFormat,
-    Modifiers, MouseButton, MouseExitEvent, Pixels, PlatformInput, Size, Window, WindowBounds,
-    WindowOptions,
+    Modifiers, MouseButton, MouseExitEvent, Pixels, PlatformInput, SharedString, Size, Window,
+    WindowBounds, WindowOptions,
 };
 use rho_ui_core::{
     agent_settings::SettingValue,
@@ -547,7 +547,7 @@ impl Harness {
     }
 
     /// The accessibility label of element `id`, once it is drawn.
-    fn label(&mut self, id: &'static str) -> Option<String> {
+    fn label(&mut self, id: impl Into<ElementId>) -> Option<String> {
         self.cx
             .update_window(self.window, |_, window, _| {
                 window
@@ -665,7 +665,7 @@ fn labels(window: &Window) -> Vec<String> {
         .collect()
 }
 
-fn is_visible(window: &Window, id: &'static str) -> bool {
+fn is_visible(window: &Window, id: impl Into<ElementId>) -> bool {
     window.try_find(id).is_some_and(|element| element.visible())
 }
 
@@ -1450,6 +1450,92 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
     ui.wait_until("the session gone", |window, _, app| {
         !is_visible(window, "session-local-new-2") && app.active_session().is_none()
     });
+}
+
+/// A draft left with a message waits at the top of the sidebar with its
+/// session: a click brings it back as it was, and Send starts it in that
+/// session. Discard drops one; an empty draft is never listed.
+#[test]
+fn a_draft_left_with_a_message_waits_in_the_sidebar() {
+    let mut ui = Harness::start("draft-left", Script::default());
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    let (first, session) = leave_a_draft(&mut ui, "fix the flaky test");
+    assert_eq!(
+        ui.label(first.clone()).as_deref(),
+        Some("fix the flaky test")
+    );
+    let (second, _) = leave_a_draft(&mut ui, "rename the crate");
+    ui.act(|window, cx| window.hover(second.clone(), cx));
+    ui.shot("listed");
+
+    ui.click("discard-draft");
+    ui.wait_until("the second draft gone", |window, _, _| {
+        !is_visible(window, second.clone()) && is_visible(window, first.clone())
+    });
+
+    ui.act(|window, cx| window.click(first.clone(), cx));
+    ui.wait_until("the first draft back as it was", |_, cx, app| {
+        app.draft().is_some_and(|draft| {
+            let draft = draft.read(cx);
+            draft.composer_prompt(cx).text() == "fix the flaky test"
+                && draft.session_key().as_ref() == Some(&session)
+        })
+    });
+    ui.shot("back");
+    // New session leaves a draft with a message listed, for a fresh one.
+    ui.click("new-session");
+    ui.wait_until("a fresh draft", |window, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).composer_prompt(cx).is_empty())
+            && is_visible(window, first.clone())
+    });
+    ui.act(|window, cx| window.click(first.clone(), cx));
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_until("the draft started in its session", |window, cx, app| {
+        app.active_session()
+            .is_some_and(|view| view.read(cx).key() == session)
+            && !is_visible(window, first.clone())
+    });
+
+    ui.click("new-session");
+    let empty = draft_row(&mut ui);
+    ui.click("session-local-s1");
+    ui.wait_until("the empty draft gone, unlisted", |window, _, app| {
+        app.draft().is_none() && !is_visible(window, empty.clone())
+    });
+}
+
+/// Opens a draft, types `text` in it once its session opens, and leaves
+/// it for session s1. Returns its sidebar row's element ID and its session.
+fn leave_a_draft(ui: &mut Harness, text: &str) -> (SharedString, SessionKey) {
+    ui.click("new-session");
+    ui.wait_until("the draft's session", |_, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).session_key().is_some())
+    });
+    ui.type_in(text);
+    let row = draft_row(ui);
+    let app = ui.app.clone();
+    let session = ui.cx.update(|cx| {
+        let draft = app.read(cx).draft().expect("the draft is on screen");
+        draft.read(cx).session_key().expect("its session is open")
+    });
+    ui.click("session-local-s1");
+    ui.wait_until("the draft listed", |window, _, app| {
+        app.active_session().is_some() && is_visible(window, row.clone())
+    });
+    (row, session)
+}
+
+/// The element ID the sidebar gives the draft on screen.
+fn draft_row(ui: &mut Harness) -> SharedString {
+    let app = ui.app.clone();
+    ui.cx.update(|cx| {
+        let draft = app.read(cx).draft().expect("the draft is on screen");
+        format!("draft-{}", draft.entity_id()).into()
+    })
 }
 
 /// Clicks the element labelled `label`, such as a menu item or dialog

@@ -3,6 +3,8 @@
 //! is routed to the [`SessionView`] of its session. The open sessions
 //! include subagents' sessions opened from their parent, which the sidebar
 //! does not list: they show nested under the parent, and go when it goes.
+//! It also keeps the drafts of new sessions the user left with a message,
+//! which the sidebar lists until they are sent or discarded.
 //!
 //! The sidebar, the session view and the right panel are drawn as cached
 //! views: each redraws only when it changes, so a hover in one never
@@ -19,7 +21,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, App, AppContext as _, Context, DragMoveEvent, Entity, FocusHandle,
+    div, App, AppContext as _, Context, DragMoveEvent, Entity, EntityId, FocusHandle,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
@@ -38,6 +40,7 @@ use crate::{
     right_panel::{
         PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, TerminalShortcut, MIN_PANE_REMS,
     },
+    session_list::DraftRow,
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
@@ -132,13 +135,19 @@ impl Connection {
 /// What the main pane shows.
 enum Pane {
     Empty,
-    /// A new session before its first message. Switching away drops it.
-    Draft {
-        view: Entity<DraftView>,
-        _subscription: Subscription,
-    },
+    /// One of [`RhoApp::drafts`].
+    Draft(Entity<DraftView>),
     /// One of [`RhoApp::sessions`].
     Session(Entity<SessionView>),
+}
+
+/// A new session before its first message, with the subscriptions that
+/// answer its requests and keep its sidebar row in step.
+struct OpenDraft {
+    view: Entity<DraftView>,
+    /// The user left it with a message, so the sidebar lists it.
+    listed: bool,
+    _subscriptions: [Subscription; 2],
 }
 
 /// A session the user opened in this run, with the subscription that keeps
@@ -170,6 +179,9 @@ pub(crate) struct RhoApp {
     panel: Entity<RightPanel>,
     /// Sessions opened in this run. A handful at most, so lookups by ID scan.
     sessions: Vec<OpenSession>,
+    /// The draft on screen, if any, and those left with a message, the
+    /// one left last at the end. An empty draft goes once it is left.
+    drafts: Vec<OpenDraft>,
     pane: Pane,
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
@@ -213,6 +225,8 @@ impl RhoApp {
                     this.open_session(id.clone(), cwd.clone(), title.clone(), window, cx);
                 }
                 SidebarEvent::NewSession => this.new_session(window, cx),
+                SidebarEvent::OpenDraft(id) => this.open_draft(*id, window, cx),
+                SidebarEvent::DiscardDraft(id) => this.discard_draft(*id, window, cx),
                 SidebarEvent::Delete { id } => this.delete_session(id.clone(), window, cx),
                 SidebarEvent::Rename { id, title } => {
                     this.rename_session(id.clone(), title.clone(), window, cx);
@@ -238,6 +252,7 @@ impl RhoApp {
             sidebar,
             panel,
             sessions: Vec::new(),
+            drafts: Vec::new(),
             pane: Pane::Empty,
             kinetic: Rc::default(),
             focus_handle,
@@ -261,7 +276,7 @@ impl RhoApp {
                 cx.observe_global_in::<PanelLayout>(window, |this, _, cx| {
                     match &this.pane {
                         Pane::Session(view) => view.update(cx, |_, cx| cx.notify()),
-                        Pane::Draft { view, .. } => view.update(cx, |_, cx| cx.notify()),
+                        Pane::Draft(view) => view.update(cx, |_, cx| cx.notify()),
                         Pane::Empty => {}
                     }
                     cx.notify();
@@ -304,6 +319,7 @@ impl RhoApp {
             self.rho_settings
                 .update(cx, |settings, cx| settings.forget(&gone.machine, cx));
             self.forget_sessions(&gone.machine, window, cx);
+            self.drop_drafts(&gone.machine, window, cx);
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.remove_machine(&gone.machine, cx));
         }
@@ -393,7 +409,9 @@ impl RhoApp {
                     events
                 }
                 Err(error) => {
-                    let _ = this.update(cx, |this, cx| this.failed(&id, &error, cx));
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.failed(&id, &error, window, cx);
+                    });
                     return;
                 }
             };
@@ -412,6 +430,7 @@ impl RhoApp {
             });
         });
         self.set_status(machine, MachineStatus::Connecting, cx);
+        self.restart_drafts(machine, window, cx);
         cx.notify();
     }
 
@@ -465,19 +484,27 @@ impl RhoApp {
             connection.daemon = Some(daemon);
         }
         self.refresh_sessions(machine, cx);
-        // A draft opened while this machine connected waits for it.
-        if let Pane::Draft { view, .. } = &self.pane {
-            let draft = view.read(cx);
-            if draft.cwd().machine == *machine && draft.awaits(draft.request().1) {
-                let view = view.clone();
-                self.open_draft_session(&view, window, cx);
+        // Drafts asked for a session while this machine connected.
+        for draft in self.drafts_on(machine, cx) {
+            let waits = {
+                let draft = draft.read(cx);
+                draft.awaits(draft.request().1)
+            };
+            if waits {
+                self.open_draft_session(&draft, window, cx);
             }
         }
         cx.notify();
     }
 
     /// `machine`'s daemon couldn't be reached, because of `error`.
-    fn failed(&mut self, machine: &MachineId, error: &DaemonError, cx: &mut Context<'_, Self>) {
+    fn failed(
+        &mut self,
+        machine: &MachineId,
+        error: &DaemonError,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
         }
@@ -486,6 +513,7 @@ impl RhoApp {
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
         self.set_status(machine, MachineStatus::Failed(error.to_string().into()), cx);
+        self.restart_drafts(machine, window, cx);
         cx.notify();
     }
 
@@ -511,8 +539,8 @@ impl RhoApp {
         self.refresh_sessions(machine, cx);
     }
 
-    /// Drops the views of `machine`'s open sessions, and a draft there, as
-    /// the connection that followed them is gone.
+    /// Drops the views of `machine`'s open sessions, as the connection that
+    /// followed them is gone. Its drafts stay; see [`Self::restart_drafts`].
     fn forget_sessions(
         &mut self,
         machine: &MachineId,
@@ -521,8 +549,7 @@ impl RhoApp {
     ) {
         let shown = match &self.pane {
             Pane::Session(view) => view.read(cx).key().machine == *machine,
-            Pane::Draft { view, .. } => view.read(cx).cwd().machine == *machine,
-            Pane::Empty => false,
+            Pane::Draft(_) | Pane::Empty => false,
         };
         if shown {
             self.show(Pane::Empty, window, cx);
@@ -606,7 +633,7 @@ impl RhoApp {
             self.connect(machine, window, cx);
         } else {
             self.forget_sessions(machine, window, cx);
-            self.failed(machine, &DaemonError::Closed, cx);
+            self.failed(machine, &DaemonError::Closed, window, cx);
         }
     }
 
@@ -683,16 +710,18 @@ impl RhoApp {
         }
     }
 
-    /// Where a new session starts: in the project of the session on screen,
-    /// else where the last new session started, else the launch directory.
+    /// Where a new session starts: in the project of the session or draft
+    /// on screen, else where the last new session started, else the launch
+    /// directory.
     fn new_session_cwd(&self, cx: &App) -> Place {
         match &self.pane {
             Pane::Session(view) => {
                 let live = view.read(cx).live();
                 Place::new(live.id.machine, live.cwd)
             }
+            Pane::Draft(view) => view.read(cx).cwd().clone(),
             // Not on a machine since taken off the settings.
-            Pane::Empty | Pane::Draft { .. } => self
+            Pane::Empty => self
                 .last_project
                 .clone()
                 .filter(|project| self.machines.read(cx).get(&project.machine).is_some())
@@ -703,51 +732,152 @@ impl RhoApp {
     /// Shows a draft for a new session and opens the session right away; see
     /// [`DraftView`].
     pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let cwd = self.new_session_cwd(cx);
-        // An open draft is reused, so its text and settings survive.
-        let pane = std::mem::replace(&mut self.pane, Pane::Empty);
-        let pane = match pane {
-            Pane::Draft { .. } => pane,
-            Pane::Empty | Pane::Session(_) => {
-                let (workspaces, projects, machines) =
-                    (&self.workspaces, &self.projects, &self.machines);
-                let view =
-                    cx.new(|cx| DraftView::new(cwd, workspaces, projects, machines, window, cx));
-                let subscription = cx.subscribe_in(
-                    &view,
-                    window,
-                    |this, draft, event: &DraftEvent, window, cx| match event {
-                        DraftEvent::Start { session, prompt } => {
-                            let cwd = draft.read(cx).cwd().clone();
-                            this.start_session(
-                                draft,
-                                (**session).clone(),
-                                &cwd,
-                                prompt.clone(),
-                                window,
-                                cx,
-                            );
-                        }
-                        DraftEvent::StartInWorktree { config, prompt } => {
-                            this.start_in_worktree(
-                                draft,
-                                config.clone(),
-                                prompt.clone(),
-                                window,
-                                cx,
-                            );
-                        }
-                        DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
-                    },
-                );
-                self.open_draft_session(&view, window, cx);
-                Pane::Draft {
-                    view,
-                    _subscription: subscription,
-                }
+        // An empty draft on screen is reused, so its settings survive; one
+        // with a message is left for the sidebar, in place of the new one.
+        if let Pane::Draft(view) = &self.pane {
+            if !view.read(cx).has_message(cx) {
+                let view = view.clone();
+                self.show(Pane::Draft(view), window, cx);
+                return;
             }
+        }
+        let cwd = self.new_session_cwd(cx);
+        let (workspaces, projects, machines) = (&self.workspaces, &self.projects, &self.machines);
+        let view = cx.new(|cx| DraftView::new(cwd, workspaces, projects, machines, window, cx));
+        let subscriptions = [
+            cx.subscribe_in(
+                &view,
+                window,
+                |this, draft, event: &DraftEvent, window, cx| match event {
+                    DraftEvent::Start { session, prompt } => {
+                        let cwd = draft.read(cx).cwd().clone();
+                        this.start_session(
+                            draft,
+                            (**session).clone(),
+                            &cwd,
+                            prompt.clone(),
+                            window,
+                            cx,
+                        );
+                    }
+                    DraftEvent::StartInWorktree { config, prompt } => {
+                        this.start_in_worktree(draft, config.clone(), prompt.clone(), window, cx);
+                    }
+                    DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
+                },
+            ),
+            // A listed draft's row follows its message and project.
+            cx.observe(&view, |this, _, cx| this.sync_drafts(cx)),
+        ];
+        self.drafts.push(OpenDraft {
+            view: view.clone(),
+            listed: false,
+            _subscriptions: subscriptions,
+        });
+        self.open_draft_session(&view, window, cx);
+        self.show(Pane::Draft(view), window, cx);
+    }
+
+    /// Shows the draft `id` the sidebar lists.
+    fn open_draft(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let view = self
+            .drafts
+            .iter()
+            .find(|open| open.view.entity_id() == id)
+            .map(|open| open.view.clone());
+        if let Some(view) = view {
+            self.show(Pane::Draft(view), window, cx);
+        }
+    }
+
+    /// Drops the draft `id`, with its message and session.
+    fn discard_draft(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.drafts.retain(|open| open.view.entity_id() != id);
+        if matches!(&self.pane, Pane::Draft(view) if view.entity_id() == id) {
+            self.show(Pane::Empty, window, cx);
+        } else {
+            self.sync_drafts(cx);
+        }
+    }
+
+    /// The user left `draft`. With a message, it stays, listed in the
+    /// sidebar as the one left last; without, it goes, and with it its
+    /// session.
+    fn leave_draft(&mut self, draft: &Entity<DraftView>, cx: &App) {
+        let Some(ix) = self.drafts.iter().position(|open| open.view == *draft) else {
+            return;
         };
-        self.show(pane, window, cx);
+        let mut open = self.drafts.remove(ix);
+        if draft.read(cx).has_message(cx) {
+            open.listed = true;
+            self.drafts.push(open);
+        }
+    }
+
+    /// Lists the drafts left with a message in the sidebar, the one left
+    /// last on top.
+    fn sync_drafts(&self, cx: &mut Context<'_, Self>) {
+        let shown = match &self.pane {
+            Pane::Draft(view) => Some(view.entity_id()),
+            Pane::Empty | Pane::Session(_) => None,
+        };
+        let rows = self
+            .drafts
+            .iter()
+            .rev()
+            .filter(|open| open.listed)
+            .map(|open| {
+                let draft = open.view.read(cx);
+                DraftRow::new(
+                    open.view.entity_id(),
+                    draft.cwd().clone(),
+                    draft.title(cx),
+                    draft.workspace_index(),
+                )
+            })
+            .collect();
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_drafts(rows, shown, cx));
+    }
+
+    /// `machine`'s drafts.
+    fn drafts_on(&self, machine: &MachineId, cx: &App) -> Vec<Entity<DraftView>> {
+        self.drafts
+            .iter()
+            .filter(|open| open.view.read(cx).cwd().machine == *machine)
+            .map(|open| open.view.clone())
+            .collect()
+    }
+
+    /// Lets `machine`'s drafts' sessions go with the connection that held
+    /// them, and asks again for each: it opens once the machine connects,
+    /// and fails as not connected if it won't. Their messages stay.
+    fn restart_drafts(
+        &mut self,
+        machine: &MachineId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        for draft in self.drafts_on(machine, cx) {
+            draft.update(cx, DraftView::disconnected);
+            self.open_draft_session(&draft, window, cx);
+        }
+    }
+
+    /// Drops `machine`'s drafts, as it is gone from the settings.
+    fn drop_drafts(
+        &mut self,
+        machine: &MachineId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let gone = self.drafts_on(machine, cx);
+        self.drafts.retain(|open| !gone.contains(&open.view));
+        if matches!(&self.pane, Pane::Draft(view) if gone.contains(view)) {
+            self.show(Pane::Empty, window, cx);
+        } else {
+            self.sync_drafts(cx);
+        }
     }
 
     /// Collapses the sidebar to its rail, or opens it again. The keyboard
@@ -770,19 +900,17 @@ impl RhoApp {
     /// Shows a new session's draft with its project list open.
     fn new_session_in(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.new_session(window, cx);
-        if let Pane::Draft { view, .. } = &self.pane {
+        if let Pane::Draft(view) = &self.pane {
             view.update(cx, |draft, cx| draft.choose_project(window, cx));
         }
     }
 
-    /// The shown draft, if its session is `id`.
+    /// The draft whose session is `id`.
     fn draft_with(&self, id: &SessionKey, cx: &App) -> Option<Entity<DraftView>> {
-        match &self.pane {
-            Pane::Draft { view, .. } if view.read(cx).session_key().as_ref() == Some(id) => {
-                Some(view.clone())
-            }
-            _ => None,
-        }
+        self.drafts
+            .iter()
+            .find(|open| open.view.read(cx).session_key().as_ref() == Some(id))
+            .map(|open| open.view.clone())
     }
 
     /// Opens the session for `draft` and follows it. The draft takes the
@@ -941,8 +1069,9 @@ impl RhoApp {
         .detach();
     }
 
-    /// Shows `draft`'s session, which works in `cwd`, in its own view and
-    /// sends `prompt` as its first.
+    /// Opens `draft`'s session, which works in `cwd`, in its own view, in
+    /// place of the draft, and sends `prompt` as its first. It shows if the
+    /// draft did: a worktree's session may start after the user moved on.
     fn start_session(
         &mut self,
         draft: &Entity<DraftView>,
@@ -952,14 +1081,21 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // Sent, the draft is done with, whether or not the session opens.
+        let shown = matches!(&self.pane, Pane::Draft(view) if view == draft);
+        self.drafts.retain(|open| open.view != *draft);
         let Some(daemon) = self.daemon(&cwd.machine).cloned() else {
+            self.sync_drafts(cx);
             return;
         };
         // The project, not a worktree the daemon added in it.
         self.last_project = Some(draft.read(cx).cwd().clone());
         let view = self.open_new_session(daemon, cwd, session, prompt, window, cx);
-        self.set_pane(Pane::Session(view), cx);
-        self.focus_pane(window, cx);
+        if shown {
+            self.show(Pane::Session(view), window, cx);
+        } else {
+            self.sync_drafts(cx);
+        }
     }
 
     /// Deletes a saved session in its daemon, then drops it here.
@@ -1028,7 +1164,7 @@ impl RhoApp {
             .retain(|open| open.view != closed && !open.view.read(cx).descends_from(&closed, cx));
         let gone = match &self.pane {
             Pane::Session(view) => !self.sessions.iter().any(|open| open.view == *view),
-            Pane::Empty | Pane::Draft { .. } => false,
+            Pane::Empty | Pane::Draft(_) => false,
         };
         if gone {
             self.show(Pane::Empty, window, cx);
@@ -1062,15 +1198,21 @@ impl RhoApp {
 
     /// Puts `pane` in the main area, marks its row in the sidebar, and
     /// shows its session in the right panel, leaving the keyboard where it
-    /// is.
+    /// is. A draft it replaces is left; see [`Self::leave_draft`].
     fn set_pane(&mut self, pane: Pane, cx: &mut Context<'_, Self>) {
         let session = match &pane {
             Pane::Session(view) => Some(view.clone()),
-            Pane::Empty | Pane::Draft { .. } => None,
+            Pane::Empty | Pane::Draft(_) => None,
         };
         // A subagent's session marks the row of the session it is nested in.
         let active = session.as_ref().map(|view| view.read(cx).root_id(cx));
-        self.pane = pane;
+        let left = std::mem::replace(&mut self.pane, pane);
+        if let Pane::Draft(left) = left {
+            if !matches!(&self.pane, Pane::Draft(view) if *view == left) {
+                self.leave_draft(&left, cx);
+            }
+        }
+        self.sync_drafts(cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_active(active, cx));
         self.panel
@@ -1085,7 +1227,7 @@ impl RhoApp {
             return;
         }
         let handle = match &self.pane {
-            Pane::Draft { view, .. } => view.read(cx).composer_focus_handle(cx),
+            Pane::Draft(view) => view.read(cx).composer_focus_handle(cx),
             Pane::Session(view) => view.read(cx).focus_target(cx),
             Pane::Empty => self.focus_handle.clone(),
         };
@@ -1306,13 +1448,13 @@ impl RhoApp {
     pub(crate) fn active_session(&self) -> Option<Entity<SessionView>> {
         match &self.pane {
             Pane::Session(view) => Some(view.clone()),
-            Pane::Empty | Pane::Draft { .. } => None,
+            Pane::Empty | Pane::Draft(_) => None,
         }
     }
     /// The new session's draft the main pane shows, for UI tests.
     pub(crate) fn draft(&self) -> Option<Entity<DraftView>> {
         match &self.pane {
-            Pane::Draft { view, .. } => Some(view.clone()),
+            Pane::Draft(view) => Some(view.clone()),
             Pane::Empty | Pane::Session(_) => None,
         }
     }
@@ -1387,7 +1529,7 @@ impl Render for RhoApp {
         let row = f32::from(window.viewport_size().width) / rem;
         let main = match &self.pane {
             Pane::Session(view) => view.clone().cached(pane_style()).into_any_element(),
-            Pane::Draft { view, .. } => view.clone().cached(pane_style()).into_any_element(),
+            Pane::Draft(view) => view.clone().cached(pane_style()).into_any_element(),
             Pane::Empty => Self::render_no_session(cx).into_any_element(),
         };
         root.child(

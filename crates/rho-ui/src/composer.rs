@@ -261,6 +261,12 @@ impl ComposerState {
         self.attachments.is_empty() && self.input.read(cx).value().is_empty()
     }
 
+    /// Whether there is a message to send: more than whitespace, or an
+    /// attachment.
+    pub(crate) fn has_message(&self, cx: &App) -> bool {
+        !self.attachments.is_empty() || !self.input.read(cx).value().trim().is_empty()
+    }
+
     /// The message as it stands: the text, trimmed, and the attachments.
     pub(crate) fn prompt(&self, cx: &App) -> Prompt {
         let text = self.input.read(cx).value().trim().to_owned();

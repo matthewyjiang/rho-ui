@@ -1,6 +1,7 @@
 //! The sidebar's data: every listed session of every machine as a flat row,
 //! newest first, which shelf each is on, and the items the sidebar's one
-//! scrolling list shows: active sessions, a gap, then each shelf's header
+//! scrolling list shows: drafts of new sessions the user left unsent,
+//! active sessions, a gap, then each shelf's header
 //! and, when it's open, its newest [`SHELF_PAGE`] sessions, then a Show
 //! more that adds as many again. A [`Filter`] hides machines and keeps
 //! to chosen projects. Plain data with no GUI code; [`crate::sidebar`] draws
@@ -13,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::SharedString;
+use gpui_kit::{EntityId, SharedString};
 use rho_ui_core::JobActivity;
 
 use crate::{
@@ -78,6 +79,43 @@ pub(crate) struct JobSession {
     pub(crate) workspace: usize,
 }
 
+/// A new session's draft the user left with a message in its composer,
+/// listed above every session until it is sent or discarded.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DraftRow {
+    /// The draft's view, which the app keeps.
+    pub(crate) id: EntityId,
+    /// `draft-<id>`, made once: the row's element ID.
+    pub(crate) element_id: SharedString,
+    pub(crate) cwd: Place,
+    /// The first line of its message; `None` while it has none, such as a
+    /// message of attachments alone.
+    pub(crate) title: Option<SharedString>,
+    /// Index into [`crate::workspaces::Workspaces`].
+    pub(crate) workspace: usize,
+}
+
+impl DraftRow {
+    pub(crate) fn new(
+        id: EntityId,
+        cwd: Place,
+        title: Option<SharedString>,
+        workspace: usize,
+    ) -> Self {
+        Self {
+            id,
+            element_id: format!("draft-{id}").into(),
+            cwd,
+            title,
+            workspace,
+        }
+    }
+
+    pub(crate) fn title(&self) -> SharedString {
+        self.title.clone().unwrap_or_else(|| NEW_SESSION.into())
+    }
+}
+
 /// A [`JobSession`] as last polled, with the moment its activity began.
 struct JobClock {
     id: SessionKey,
@@ -136,6 +174,8 @@ impl Row {
 /// One entry in the sidebar's list. Each kind has its own height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
+    /// A draft, drawn as an active session is. An index into the drafts.
+    Draft(usize),
     /// An active session, drawn in full. An index into the rows.
     Session(usize),
     /// A snoozed or settled session, drawn as one line.
@@ -157,6 +197,8 @@ pub(crate) struct SessionList {
     /// Unsaved sessions first, then saved ones of every machine, newest
     /// first.
     rows: Vec<Row>,
+    /// Listed above the rows, in this order.
+    drafts: Vec<DraftRow>,
     /// Open sessions' live state, laid over the saved list.
     live: Vec<LiveSession>,
     /// Sessions with work under way in the daemon. An open session's own
@@ -340,6 +382,15 @@ impl SessionList {
         }
     }
 
+    /// Replaces the listed drafts. Returns whether anything changed.
+    pub(crate) fn set_drafts(&mut self, drafts: Vec<DraftRow>) -> bool {
+        if self.drafts == drafts {
+            return false;
+        }
+        self.drafts = drafts;
+        true
+    }
+
     /// Forgets what an open session's view said about it, once the view is
     /// gone: its row shows what the daemon's jobs say again.
     pub(crate) fn close_live(&mut self, id: &SessionKey) {
@@ -459,20 +510,29 @@ impl SessionList {
             };
             row.pinned = shelves.pinned(&row.id);
         }
-        let matches = |row: &Row| {
-            let (name, root) = workspace(row.workspace);
+        let matches = |machine: &MachineId, title: Option<&str>, ix: usize| {
+            let (name, root) = workspace(ix);
             let matches = |text: &str| contains_ignore_case(text, &self.query);
-            self.filter.shows(&row.id.machine, root)
-                && (self.query.is_empty()
-                    || row.title.as_deref().is_some_and(matches)
-                    || matches(name))
+            self.filter.shows(machine, root)
+                && (self.query.is_empty() || title.is_some_and(matches) || matches(name))
         };
-        let mut items = Vec::with_capacity(self.rows.len() + 2);
+        let mut items = Vec::with_capacity(self.drafts.len() + self.rows.len() + 2);
+        items.extend(
+            self.drafts
+                .iter()
+                .enumerate()
+                .filter(|(_, draft)| {
+                    matches(&draft.cwd.machine, draft.title.as_deref(), draft.workspace)
+                })
+                .map(|(ix, _)| Item::Draft(ix)),
+        );
         let mut counts = [0; 3];
         for shelf in [Shelf::Active, Shelf::Snoozed, Shelf::Settled] {
             let start = items.len();
             for (ix, row) in self.rows.iter().enumerate() {
-                if row.shelf == shelf && matches(row) {
+                if row.shelf == shelf
+                    && matches(&row.id.machine, row.title.as_deref(), row.workspace)
+                {
                     counts[slot(shelf)] += 1;
                     items.push(match shelf {
                         Shelf::Active => Item::Session(ix),
@@ -481,8 +541,8 @@ impl SessionList {
                 }
             }
             if shelf == Shelf::Active {
-                // Stable, so the rest keep their order.
-                items.sort_by_key(|&item| match item {
+                // Stable, so the rest keep their order, drafts first.
+                items[start..].sort_by_key(|&item| match item {
                     Item::Session(ix) => Reverse(self.rows[ix].pinned),
                     _ => Reverse(None),
                 });
@@ -529,6 +589,11 @@ impl SessionList {
     /// What the list shows, in order.
     pub(crate) fn items(&self) -> &[Item] {
         &self.items
+    }
+
+    /// The draft an [`Item::Draft`] points at.
+    pub(crate) fn draft_at(&self, ix: usize) -> &DraftRow {
+        &self.drafts[ix]
     }
 
     /// The row an [`Item`] points at.
@@ -688,6 +753,7 @@ mod tests {
         list.items()
             .iter()
             .map(|&item| match item {
+                Item::Draft(ix) => format!("draft {}", list.draft_at(ix).title()),
                 Item::Session(ix) | Item::Shelved(ix) => list.row_at(ix).title().to_string(),
                 Item::Header(shelf) => format!("[{} {}]", shelf.label(), list.count(shelf)),
                 Item::More(shelf) => format!("[{} more {}]", shelf.label(), list.held_back(shelf)),
@@ -859,10 +925,10 @@ mod tests {
         assert_eq!(list.count(Shelf::Active), 1, "the turn is new activity");
     }
 
-    /// Pinned sessions lead the active list, the latest pinned first,
+    /// Drafts lead the list, then pinned sessions, the latest pinned first,
     /// whatever their age; the rest keep newest first.
     #[test]
-    fn pinned_sessions_lead_the_active_list() {
+    fn drafts_then_pinned_sessions_lead_the_active_list() {
         let mut shelves = owned();
         let mut list = SessionList::default();
         list.set_saved(
@@ -881,6 +947,17 @@ mod tests {
         shelves.unpin(&id("b"));
         rebuild(&mut list, &shelves, 30);
         assert_eq!(shown(&list), ["old", "a", "b"]);
+
+        let draft = DraftRow::new(
+            EntityId::from(1_u64),
+            Place::new(here(), "/w"),
+            Some("half a thought".into()),
+            0,
+        );
+        assert!(list.set_drafts(vec![draft.clone()]));
+        assert!(!list.set_drafts(vec![draft]), "unchanged");
+        rebuild(&mut list, &shelves, 30);
+        assert_eq!(shown(&list), ["draft half a thought", "old", "a", "b"]);
     }
 
     /// A turn that stops working marks its row Done until the session is

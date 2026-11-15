@@ -1,6 +1,8 @@
 //! The session list, drawn: one scrolling list of every machine's active
 //! sessions, newest first, then the Snoozed and Settled shelves, held at the
-//! bottom until opened shelves fill the list. An active row shows the
+//! bottom until opened shelves fill the list. Drafts of new sessions the
+//! user left with a message lead it, saying Draft; hovering one offers
+//! Discard. An active row shows the
 //! workspace, the session's status or age, its title, its branch, and with
 //! more than one machine, the machine's label; hovering it swaps the status
 //! for Snooze and Settle, or Unpin. Pinned sessions lead the list, and a
@@ -47,10 +49,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     canvas, div, px, rems, size, Anchor, AnyElement, App, AppContext as _, Axis, ClipboardItem,
-    Context, Entity, EventEmitter, FocusHandle, Focusable as _, Hsla, InteractiveElement as _,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Rems, Render, ScrollStrategy,
-    SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task,
-    WeakEntity, Window,
+    Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable as _, Hsla,
+    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, Rems,
+    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
+    Subscription, Task, WeakEntity, Window,
 };
 use rho_ui_core::{Job, SessionSummary};
 
@@ -59,7 +61,8 @@ use crate::{
     machines::{MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
     session_list::{
-        Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList, SHELF_PAGE,
+        Activity, DraftRow, Item, JobSession, LiveSession, Row, SavedSession, SessionList,
+        SHELF_PAGE,
     },
     shelf::{Shelf, Shelves},
     store::StateDb,
@@ -116,7 +119,7 @@ use rail::{toggle_button, Layout};
 /// [`SidebarView::render_list`].
 fn item_rems(item: Item) -> f32 {
     match item {
-        Item::Session(_) => ROW_REMS,
+        Item::Draft(_) | Item::Session(_) => ROW_REMS,
         Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
         Item::Header(_) => HEADER_REMS,
         Item::Gap => 0.,
@@ -222,6 +225,10 @@ pub(crate) enum SidebarEvent {
         title: Option<SharedString>,
     },
     NewSession,
+    /// Show a listed draft.
+    OpenDraft(EntityId),
+    /// Drop a listed draft, message and all.
+    DiscardDraft(EntityId),
     /// Delete a saved session; the user has confirmed.
     Delete {
         id: SessionKey,
@@ -295,7 +302,11 @@ pub(crate) struct SidebarView {
     layout: SidebarLayout,
     saved_filter: SavedFilter,
     active: Option<SessionKey>,
+    /// The listed draft on screen.
+    active_draft: Option<EntityId>,
     hover: Option<Hover>,
+    /// The draft row under the mouse, which offers Discard.
+    draft_hover: Option<EntityId>,
     renaming: Option<Renaming>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
@@ -350,7 +361,9 @@ impl SidebarView {
             layout: state.layout,
             saved_filter: state.filter,
             active: None,
+            active_draft: None,
             hover: None,
+            draft_hover: None,
             renaming: None,
             search,
             scroll: VirtualListScrollHandle::new(),
@@ -390,6 +403,23 @@ impl SidebarView {
         });
         self.list.set_saved(machine, saved);
         self.rebuild(cx);
+    }
+
+    /// Lists `drafts` above the sessions, in their order, with `active`
+    /// on screen.
+    pub(crate) fn set_drafts(
+        &mut self,
+        drafts: Vec<DraftRow>,
+        active: Option<EntityId>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.active_draft != active {
+            self.active_draft = active;
+            cx.notify();
+        }
+        if self.list.set_drafts(drafts) {
+            self.rebuild(cx);
+        }
     }
 
     /// Drops everything of `machine`, gone from the settings.
@@ -521,6 +551,7 @@ impl SidebarView {
         self.layout.toggle();
         // No row is under the pointer once the rows are gone.
         self.hover = None;
+        self.draft_hover = None;
         cx.notify();
         self.layout.current() == Layout::Rail
     }
@@ -777,6 +808,12 @@ impl SidebarView {
         self.list.items()[range]
             .iter()
             .map(|&item| match item {
+                Item::Draft(ix) => {
+                    let draft = self.list.draft_at(ix);
+                    let workspace = workspaces.get(draft.workspace);
+                    let label = machines.tag(&draft.cwd.machine);
+                    self.render_draft(draft, workspace, label, cx)
+                }
                 Item::Session(row) => {
                     let row = self.list.row_at(row);
                     let workspace = workspaces.get(row.workspace);
@@ -833,6 +870,95 @@ impl SidebarView {
         Self::row_frame(rems(ROW_REMS), row, state, inner, view, cx).into_any_element()
     }
 
+    /// A draft, laid out as an active session: workspace, Draft or on
+    /// hover Discard, the first line of its message, and branch. A click
+    /// shows it again; its menu discards it.
+    fn render_draft(
+        &self,
+        draft: &DraftRow,
+        workspace: &Workspace,
+        machine: Option<SharedString>,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let id = draft.id;
+        let state = RowState {
+            active: self.active_draft == Some(id),
+            hovered: self.draft_hover == Some(id),
+        };
+        let right = if state.hovered {
+            Button::new("discard-draft")
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(Lucide::Trash))
+                .tooltip("Discard draft")
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::DiscardDraft(id))))
+                .into_any_element()
+        } else {
+            div()
+                .flex_shrink_0()
+                .text_color(theme.muted_foreground)
+                .child("Draft")
+                .into_any_element()
+        };
+        let title = draft.title();
+        let view = cx.weak_entity();
+        let inner = v_flex()
+            .id(draft.element_id.clone())
+            .test_support()
+            .aria_label(title.clone())
+            .gap(rems(GAP_REMS))
+            .py(rems(PAD_REMS))
+            .child(workspace_line(workspace, theme).child(right))
+            .child(
+                div()
+                    .h(rems(TITLE_REMS))
+                    .truncate()
+                    .text_sm()
+                    .when(state.active, StyledExt::font_medium)
+                    .child(title),
+            )
+            .child(branch_line(
+                workspace,
+                machine.map(|label| (format!("{}-machine", draft.element_id).into(), label)),
+                theme,
+            ))
+            .size_full()
+            .px_2()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .map(|this| lit(this, state, theme))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                let hover = match (*hovered, this.draft_hover) {
+                    (true, _) => Some(id),
+                    // Unless another row already took it.
+                    (false, Some(other)) if other != id => Some(other),
+                    (false, _) => None,
+                };
+                if this.draft_hover != hover {
+                    this.draft_hover = hover;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::OpenDraft(id))))
+            .context_menu(move |menu, _, _| {
+                menu.item(
+                    PopupMenuItem::new("Discard draft")
+                        .icon(Icon::new(Lucide::Trash))
+                        .on_click(on_view(&view, move |_, _, cx| {
+                            cx.emit(SidebarEvent::DiscardDraft(id));
+                        })),
+                )
+            });
+        div()
+            .h(rems(ROW_REMS))
+            .px_2()
+            .py(rems(GUTTER_REMS))
+            .child(inner)
+            .into_any_element()
+    }
+
     fn row_state(&self, row: &Row) -> RowState {
         RowState {
             active: self.active.as_ref() == Some(&row.id),
@@ -856,7 +982,6 @@ impl SidebarView {
         E: StatefulInteractiveElement + ParentElement + Styled + IntoElement + 'static,
     {
         let theme = cx.theme();
-        let accent = theme.sidebar_accent;
         let open_id = row.id.clone();
         let menu = (view.clone(), MenuRow::new(row));
         let (hover_id, hover_view) = (row.id.clone(), view.clone());
@@ -867,11 +992,7 @@ impl SidebarView {
             .px_2()
             .rounded(theme.radius)
             .cursor_pointer()
-            .map(|this| match (state.active, state.hovered) {
-                (true, _) => this.bg(accent).text_color(theme.sidebar_accent_foreground),
-                (false, true) => this.bg(accent.opacity(0.5)),
-                (false, false) => this,
-            })
+            .map(|this| lit(this, state, theme))
             .on_hover(move |hovered, _, cx| {
                 let _ = hover_view.update(cx, |this, cx| {
                     if *hovered {
@@ -1364,6 +1485,16 @@ fn age_width(window: &Window) -> Pixels {
 struct RowState {
     active: bool,
     hovered: bool,
+}
+
+/// Lights a row as `state` says.
+fn lit<E: Styled>(row: E, state: RowState, theme: &Theme) -> E {
+    let accent = theme.sidebar_accent;
+    match (state.active, state.hovered) {
+        (true, _) => row.bg(accent).text_color(theme.sidebar_accent_foreground),
+        (false, true) => row.bg(accent.opacity(0.5)),
+        (false, false) => row,
+    }
 }
 
 /// A shelved session's details, shown beside the sidebar while hovered.

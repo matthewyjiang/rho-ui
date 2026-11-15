@@ -132,6 +132,11 @@ impl WorkspaceRef {
         self.workspaces.read(cx).get(self.ix)
     }
 
+    /// Its index into the table.
+    pub(crate) fn index(&self) -> usize {
+        self.ix
+    }
+
     /// The table, to observe for changes.
     pub(crate) fn table(&self) -> &Entity<Workspaces> {
         &self.workspaces
