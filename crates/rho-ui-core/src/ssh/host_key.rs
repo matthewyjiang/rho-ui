@@ -5,7 +5,7 @@
 //! `RevokedHostKeys` file stops it too. rho-ui checks plain host keys
 //! only, not host certificates.
 
-use std::{io, path::PathBuf};
+use std::path::PathBuf;
 
 use base64::Engine as _;
 use russh::{
@@ -51,7 +51,7 @@ enum Verdict {
     Changed { file: PathBuf, line: usize },
     /// They mark it revoked, here.
     Revoked { file: PathBuf, line: usize },
-    /// They list none of its keys, but a certificate authority for it,
+    /// They list no key of its kind, but a certificate authority for it,
     /// here, and rho-ui doesn't check host certificates.
     Certified { file: PathBuf, line: usize },
 }
@@ -197,8 +197,9 @@ pub(super) fn read(resolved: &Resolved) -> Result<Vec<KnownKey>, String> {
                 file.display()
             )
         };
+        // As OpenSSH: a RevokedHostKeys that isn't there or can't be read
+        // refuses every host.
         match std::fs::read(file) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(refused(error.to_string())),
             Ok(bytes) => known.extend(revoked(&bytes).map_err(refused)?.into_iter().map(
                 |(line, key)| KnownKey {
@@ -334,20 +335,22 @@ fn verdict(known: &[KnownKey], offered: &PublicKey) -> Verdict {
     {
         return Verdict::Known;
     }
-    if let Some(authority) = known.iter().find(listed(Listing::Authority)) {
-        return Verdict::Certified {
-            file: authority.file.clone(),
-            line: authority.line,
-        };
-    }
-    match known
+    // Another key of its kind beats a certificate authority: the warning
+    // that the connection may be intercepted mustn't turn into advice.
+    if let Some(other) = known
         .iter()
         .filter(listed(Listing::Trusted))
         .find(|known| known.key.algorithm() == offered.algorithm())
     {
-        Some(other) => Verdict::Changed {
+        return Verdict::Changed {
             file: other.file.clone(),
             line: other.line,
+        };
+    }
+    match known.iter().find(listed(Listing::Authority)) {
+        Some(authority) => Verdict::Certified {
+            file: authority.file.clone(),
+            line: authority.line,
         },
         None => Verdict::Unknown,
     }
@@ -477,9 +480,20 @@ mod tests {
                 },
             ),
             (
-                "vouched for only by a certificate authority",
+                "another key of its kind, and a certificate authority",
                 vec![
                     at(1, Listing::Trusted, &other_ed),
+                    at(2, Listing::Authority, &ecdsa),
+                ],
+                Verdict::Changed {
+                    file: PathBuf::from("/kh"),
+                    line: 1,
+                },
+            ),
+            (
+                "vouched for only by a certificate authority",
+                vec![
+                    at(1, Listing::Trusted, &ecdsa),
                     at(2, Listing::Authority, &ecdsa),
                 ],
                 Verdict::Certified {

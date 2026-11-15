@@ -116,6 +116,7 @@ impl Identities {
                 continue;
             }
             let data = key.public_key().key_data();
+            let rsa = matches!(algorithm, Algorithm::Rsa { .. });
             let mut certificates: Vec<CertificateFile> =
                 read_certificate(&suffixed(path, "-cert.pub"))
                     .into_iter()
@@ -129,6 +130,22 @@ impl Identities {
                         certificate: named.certificate.clone(),
                     });
                 }
+            }
+            if rsa {
+                // russh signs an RSA certificate file's sign-in with SHA-512
+                // under the name `ssh-rsa-cert-v01`, which sshd refuses, and
+                // each refusal spends one of its MaxAuthTries.
+                identities
+                    .skipped
+                    .extend(certificates.drain(..).map(|certificate| {
+                        Skipped {
+                            file: certificate.path.display().to_string(),
+                            why:
+                                "rho-ui can't sign in with an RSA certificate from a file; add the \
+                              key and its certificate to your key agent"
+                                    .to_owned(),
+                        }
+                    }));
             }
             identities.files.push(KeyFile {
                 path: path.clone(),
