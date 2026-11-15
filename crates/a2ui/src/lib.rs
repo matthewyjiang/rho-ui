@@ -23,6 +23,7 @@ mod component;
 mod data_context;
 mod data_model;
 mod expr;
+mod express;
 mod functions;
 mod ident;
 mod message;
@@ -48,6 +49,7 @@ pub use component::{Accessibility, CheckRule, ChildList, Component, Live, Proper
 pub use data_context::{DataContext, UserActivation};
 pub use data_model::{DataError, DataModel, WatchId, MAX_LIST_INDEX};
 pub use expr::{Call, Expr, ExpressionError};
+pub use express::{ErrorKind, ExpressError, Position};
 pub use functions::{Args, Effect, Function, FunctionError, Functions};
 pub use ident::is_identifier;
 pub use message::{
