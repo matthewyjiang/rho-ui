@@ -14,6 +14,8 @@ use crate::ident::is_identifier;
 mod component;
 mod value;
 
+pub(super) use component::default_check_message;
+
 /// The highest list index a data path assignment may name.
 const MAX_LIST_INDEX: usize = 10_000;
 
@@ -226,7 +228,7 @@ impl Express {
     }
 
     /// The index of the active catalog with id `id`.
-    fn catalog_for(&self, id: &str) -> Result<usize, ExpressError> {
+    pub(super) fn catalog_for(&self, id: &str) -> Result<usize, ExpressError> {
         self.catalog_index(id).ok_or_else(|| {
             let ids: Vec<&str> = self.catalogs.iter().map(Catalog::id).collect();
             ExpressError::validation(format!(

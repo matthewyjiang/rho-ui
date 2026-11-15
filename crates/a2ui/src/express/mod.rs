@@ -8,6 +8,7 @@ use crate::catalog::Catalog;
 use crate::validate::CatalogValidator;
 
 mod compile;
+mod decompile;
 mod error;
 mod lexer;
 mod parser;
