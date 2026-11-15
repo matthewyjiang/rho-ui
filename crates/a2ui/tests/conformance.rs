@@ -1,5 +1,8 @@
 //! Runs the vendored upstream conformance suites against the crate.
 
+#[path = "conformance/processing.rs"]
+mod processing;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -13,7 +16,16 @@ use serde_json::{json, Map, Value};
 
 /// Cases the harness cannot express in Rust, with the reason. A case here is
 /// not run.
-const SKIPPED: &[(&str, &str)] = &[];
+const SKIPPED: &[(&str, &str)] = &[
+    (
+        "test_v10_get_renderer_data_model_excludes_surface_without_default_from_v09",
+        "asks for a v0.9 data model; the crate holds only v1.0 surfaces",
+    ),
+    (
+        "test_v10_get_renderer_data_model_filters_by_surface_protocol_version",
+        "creates a v0.9 surface; the crate processes only v1.0 messages",
+    ),
+];
 
 fn load_suite(file: &str) -> Vec<Value> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -42,21 +54,33 @@ fn assert_no_failures(suite: &str, failures: &[String]) {
     );
 }
 
-fn is_skipped(name: &str) -> bool {
-    SKIPPED.iter().any(|(skipped, _)| *skipped == name)
+/// Every skipped case is a vendored one, so that an entry a vendor refresh
+/// leaves stale is noticed.
+#[test]
+fn skipped_cases_exist() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/a2ui/conformance/core");
+    let names: Vec<String> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .flat_map(|file| load_suite(&file))
+        .map(|case| case_name(&case).to_owned())
+        .collect();
+    for (name, _) in SKIPPED {
+        assert!(
+            names.iter().any(|known| known == name),
+            "SKIPPED names no case {name:?}"
+        );
+    }
 }
 
-/// The cases `deferred` does not claim, after checking that it claims exactly
-/// `want` of them, so that a vendor refresh that moves cases is noticed.
-fn in_scope(
-    suite: &str,
-    cases: Vec<Value>,
-    deferred: impl Fn(&Value) -> bool,
-    want: usize,
-) -> Vec<Value> {
-    let (later, now): (Vec<Value>, Vec<Value>) = cases.into_iter().partition(|c| deferred(c));
-    assert_eq!(later.len(), want, "{suite}: deferred case count changed");
-    now
+fn is_skipped(name: &str) -> bool {
+    SKIPPED.iter().any(|(skipped, _)| *skipped == name)
 }
 
 /// A case's error expectation, under either spelling the suites use.
@@ -66,38 +90,35 @@ fn expected_error(case: &Value) -> Option<&Value> {
 
 #[test]
 fn expressions_suite() {
-    // `validate` cases render a surface, which needs the message processor.
-    let cases = in_scope(
-        "expressions",
-        load_suite("expressions.yaml"),
-        |case| case["action"] == "validate",
-        6,
-    );
     let mut failures = Vec::new();
-    for case in cases {
+    for case in load_suite("expressions.yaml") {
         let name = case_name(&case);
         if is_skipped(name) {
             continue;
         }
-        assert_eq!(
-            case["action"], "parse_expression_template",
-            "{name}: unknown action"
-        );
-        let input = case["input"].as_str().expect("input is a string");
-        let outcome =
-            parse_template(input).map(|parts| Value::Array(parts.iter().map(part_json).collect()));
-        let verdict = match (outcome, expected_error(&case)) {
-            (Ok(got), None) if got == case["expect"] => Ok(()),
-            (Ok(got), None) => Err(format!("got {got}, want {}", case["expect"])),
-            (Ok(got), Some(_)) => Err(format!("parsed to {got}, want an error")),
-            (Err(e), None) => Err(format!("failed: {e}")),
-            (Err(e), Some(want)) => check_parse_error(&e, want),
+        let verdict = match case["action"].as_str() {
+            Some("parse_expression_template") => run_template_case(&case),
+            Some("validate") => processing::run_case(&case),
+            _ => Err(format!("unknown action {}", case["action"])),
         };
         if let Err(reason) = verdict {
             failures.push(format!("{name}: {reason}"));
         }
     }
     assert_no_failures("expressions", &failures);
+}
+
+fn run_template_case(case: &Value) -> Result<(), String> {
+    let input = case["input"].as_str().ok_or("input is not a string")?;
+    let outcome =
+        parse_template(input).map(|parts| Value::Array(parts.iter().map(part_json).collect()));
+    match (outcome, expected_error(case)) {
+        (Ok(got), None) if got == case["expect"] => Ok(()),
+        (Ok(got), None) => Err(format!("got {got}, want {}", case["expect"])),
+        (Ok(got), Some(_)) => Err(format!("parsed to {got}, want an error")),
+        (Err(e), None) => Err(format!("failed: {e}")),
+        (Err(e), Some(want)) => check_parse_error(&e, want),
+    }
 }
 
 /// A template part in the suite's notation.
@@ -165,33 +186,44 @@ fn parse_error_phrase(error: &ExpressionError) -> Option<&'static str> {
     }
 }
 
+/// `evaluate_function` cases on a surface for a version before 1.0, which
+/// the functions suite leaves out.
+const FILTERED_FUNCTIONS: usize = 1;
+
 #[test]
 fn functions_suite() {
-    // `validate` cases render a surface, which needs the message processor.
-    // A case naming a surface or a catalog goes through catalog resolution.
-    let deferred = |case: &Value| {
-        case["action"] == "validate"
-            || ["surface", "catalogId", "catalogPaths", "catalog"]
-                .iter()
-                .any(|key| case.get(key).is_some())
-    };
-    let cases = in_scope("functions", load_suite("functions.yaml"), deferred, 23);
     let functions = Functions::basic();
     let mut failures = Vec::new();
-    for case in cases {
+    let mut left_out = 0;
+    for case in load_suite("functions.yaml") {
         let name = case_name(&case);
         if is_skipped(name) {
             continue;
         }
-        assert_eq!(
-            case["action"], "evaluate_function",
-            "{name}: unknown action"
-        );
-        if let Err(reason) = run_function_case(&case, &functions) {
+        let on_surface = ["surface", "catalogId", "catalogPaths", "catalog"]
+            .iter()
+            .any(|key| case.get(key).is_some());
+        let verdict = match case["action"].as_str() {
+            Some("validate") => processing::run_case(&case),
+            Some("evaluate_function") if on_surface => {
+                if processing::case_version(&case, "functions.yaml") != "1.0" {
+                    left_out += 1;
+                    continue;
+                }
+                processing::run_function_on_surface(&case)
+            }
+            Some("evaluate_function") => run_function_case(&case, &functions),
+            _ => Err(format!("unknown action {}", case["action"])),
+        };
+        if let Err(reason) = verdict {
             failures.push(format!("{name}: {reason}"));
         }
     }
     assert_no_failures("functions", &failures);
+    assert_eq!(
+        left_out, FILTERED_FUNCTIONS,
+        "functions: cases left out as pre-1.0"
+    );
 }
 
 /// Calls the case's function with its arguments, at the root of its data.
