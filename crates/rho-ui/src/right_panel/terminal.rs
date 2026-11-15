@@ -10,7 +10,9 @@
 //! Each Terminal tab ([`TerminalTab`]) splits into panes ([`TerminalPane`]),
 //! side by side or one above another. In each pane, each session gets its
 //! own terminal, started the first time it is on screen there, and kept
-//! until the pane closes.
+//! until the pane closes or its shell exits. When the shell of the session
+//! on screen exits, the pane closes ([`ShellExited`]), as a terminal
+//! window does.
 //!
 //! A tab is named for the program its shell runs now ([`TerminalView::program`]):
 //! the pseudo-terminal's foreground process on this machine, or the title
@@ -46,11 +48,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     canvas, div, fill, point, px, size, AnyElement, App, AppContext as _, Bounds, ClipboardItem,
-    Context, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    Focusable, Font, FontStyle, FontWeight, Hitbox, HitboxBehavior, Hsla, InteractiveElement as _,
-    IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, ScrollEvent, SharedString, Size, Styled as _, Task,
-    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
+    Context, DispatchPhase, ElementInputHandler, Entity, EntityId, EntityInputHandler,
+    EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hitbox, HitboxBehavior,
+    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollEvent,
+    SharedString, Size, Styled as _, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
+    Window,
 };
 use libghostty_vt::{
     color::Rgb,
@@ -107,6 +110,10 @@ const SCROLLBACK_LINES: usize = 10_000;
 /// of a percent of a core; a tab's name lags the program by up to this.
 pub(crate) const PROGRAM_POLL: Duration = Duration::from_millis(500);
 
+/// Emitted when the shell of the session on screen exits, so the tab
+/// closes the pane.
+struct ShellExited;
+
 /// A pane of a [`TerminalTab`]: the terminal of the session on screen.
 struct TerminalPane {
     workspaces: Entity<Workspaces>,
@@ -120,6 +127,8 @@ struct TerminalPane {
     /// Reads `program` every [`PROGRAM_POLL`]; dropped with the pane.
     _poll: Task<()>,
 }
+
+impl EventEmitter<ShellExited> for TerminalPane {}
 
 impl TerminalPane {
     fn new(
@@ -220,6 +229,25 @@ impl TerminalPane {
         self.terminals.retain(|(known, _)| *known != key);
         self.terminals.push((key, terminal));
     }
+
+    /// Follows terminal `view`'s shell exiting. The on-screen session's
+    /// closes the pane, keeping the terminal until then so its keyboard
+    /// goes on to the next pane; another session's terminal goes, and the
+    /// next time that session shows it starts a new shell.
+    fn shell_exited(&mut self, view: EntityId, cx: &mut Context<'_, Self>) {
+        if self
+            .terminal()
+            .is_some_and(|terminal| terminal.entity_id() == view)
+        {
+            cx.emit(ShellExited);
+        } else {
+            self.terminals.retain(|(_, terminal)| {
+                !terminal
+                    .as_ref()
+                    .is_ok_and(|terminal| terminal.entity_id() == view)
+            });
+        }
+    }
 }
 
 /// Where a terminal reads the name of the program it runs.
@@ -233,7 +261,7 @@ enum ProgramSource {
     Title,
 }
 
-/// A message, with a button to start the shell again.
+/// Why the shell couldn't start, with a button to try again.
 fn restart(text: SharedString, cx: &Context<'_, TerminalPane>) -> AnyElement {
     Empty::new()
         .h_full()
@@ -269,9 +297,6 @@ impl Render for TerminalPane {
                 .into_any_element();
         };
         match self.terminals.iter().find(|(known, _)| known == key) {
-            Some((_, Ok(terminal))) if terminal.read(cx).exited => {
-                restart("The shell exited.".into(), cx)
-            }
             Some((_, Ok(terminal))) => terminal.clone().into_any_element(),
             Some((_, Err(why))) => restart(why.clone(), cx),
             None => div().into_any_element(),
@@ -311,7 +336,6 @@ pub(crate) struct TerminalView {
     autoscroll: Option<Task<()>>,
     /// Autoscroll ticks since the grid was last drawn.
     undrawn_ticks: u8,
-    exited: bool,
     focus: FocusHandle,
     /// Feeds the terminal what the reader thread reads; dropped with it.
     reader: Task<()>,
@@ -391,7 +415,6 @@ impl TerminalView {
             scrolled: Pixels::ZERO,
             autoscroll: None,
             undrawn_ticks: 0,
-            exited: false,
             focus: cx.focus_handle(),
             reader: Task::ready(()),
         };
@@ -412,15 +435,8 @@ impl TerminalView {
                         return;
                     }
                 }
-                let _ = view.update(cx, |view, cx| {
-                    view.exited = true;
-                    let _ = view.child.try_wait();
-                    cx.notify();
-                });
-                let _ = pane.update(cx, |pane, cx| {
-                    pane.follow_program(cx);
-                    cx.notify();
-                });
+                let _ = view.update(cx, |view, _| view.child.try_wait());
+                let _ = pane.update(cx, |pane, cx| pane.shell_exited(view.entity_id(), cx));
             }
         });
         view.update(cx, |view, _| view.reader = read);
@@ -428,11 +444,8 @@ impl TerminalView {
     }
 
     /// The name of the program the shell runs now, or of the shell when it
-    /// runs none; `None` once it exits, or when there is no name to read.
+    /// runs none; `None` when there is no name to read.
     fn program(&self) -> Option<SharedString> {
-        if self.exited {
-            return None;
-        }
         let foreground = match self.program_source {
             ProgramSource::Foreground => foreground_program(&*self.pty),
             ProgramSource::Title => None,

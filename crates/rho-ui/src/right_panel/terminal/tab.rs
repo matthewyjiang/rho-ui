@@ -18,7 +18,7 @@ use gpui_kit::{
     Subscription, WeakEntity, Window,
 };
 
-use super::{TerminalPane, TerminalShell, TerminalView};
+use super::{ShellExited, TerminalPane, TerminalShell, TerminalView};
 use crate::{right_panel::TerminalShortcut, session_view::SessionView, workspaces::Workspaces};
 
 /// What a pane of a terminal tab does, from its menu or a shortcut.
@@ -118,8 +118,9 @@ struct Pane {
     /// Over the whole pane, from the last frame: whether the pointer is on
     /// it, and where it is for [`PaneCommand::Focus`].
     hitbox: Option<Hitbox>,
-    /// Redraws the tab as the pane's program changes.
-    _redraw: Subscription,
+    /// Redraw the tab as the pane's program changes, and close the pane
+    /// when its shell exits.
+    _subscriptions: [Subscription; 2],
 }
 
 /// The view of one Terminal tab of [`crate::right_panel::RightPanel`].
@@ -148,6 +149,7 @@ impl TerminalTab {
         workspaces: Entity<Workspaces>,
         shell: TerminalShell,
         session: Option<&Entity<SessionView>>,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let first = PaneId(0);
@@ -161,21 +163,26 @@ impl TerminalTab {
             next_id: 1,
             pointer_in_window: true,
         };
-        let pane = this.new_pane(first, cx);
+        let pane = this.new_pane(first, window, cx);
         this.panes.push(pane);
         this
     }
 
-    fn new_pane(&self, id: PaneId, cx: &mut Context<'_, Self>) -> Pane {
+    fn new_pane(&self, id: PaneId, window: &Window, cx: &mut Context<'_, Self>) -> Pane {
         let (workspaces, shell) = (self.workspaces.clone(), self.shell.clone());
         let session = self.session.as_ref();
         let view = cx.new(|cx| TerminalPane::new(workspaces, shell, session, cx));
-        let redraw = cx.observe(&view, |_, _, cx| cx.notify());
+        let subscriptions = [
+            cx.observe(&view, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&view, window, move |tab, _, _: &ShellExited, window, cx| {
+                tab.run(PaneCommand::Close, id, window, cx);
+            }),
+        ];
         Pane {
             id,
             view,
             hitbox: None,
-            _redraw: redraw,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -261,7 +268,7 @@ impl TerminalTab {
                 let new = PaneId(self.next_id);
                 if self.layout.split(id, new, axis) {
                     self.next_id += 1;
-                    let pane = self.new_pane(new, cx);
+                    let pane = self.new_pane(new, window, cx);
                     self.panes.push(pane);
                     self.activate(new, window, cx);
                 }

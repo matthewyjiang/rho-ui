@@ -2995,6 +2995,42 @@ fn terminal_tabs_split_and_name_their_programs() {
     assert_eq!(ui.terminal_panes(), 2);
 }
 
+/// A shell that exits closes its pane, as a terminal window closes, and
+/// the keyboard goes on to the pane left; the last pane's takes the tab
+/// with it.
+#[test]
+fn a_shell_that_exits_closes_its_pane() {
+    let mut ui = Harness::with_terminal("terminal-exit");
+    ui.act(|window, cx| window.press(key("ctrl-shift-o", "cmd-d"), cx));
+    assert_eq!(ui.terminal_panes(), 2);
+    ui.wait_for_terminal("the new pane's prompt", |lines| {
+        lines.iter().any(|line| line.starts_with('$'))
+    });
+    ui.act(|window, cx| {
+        window.input("exit", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the exited pane to close", |_, cx, app| {
+        app.terminal_panes(cx) == 1
+    });
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        let terminal = app.read(cx).terminal(cx).expect("a pane is left");
+        assert!(
+            gpui_kit::Focusable::focus_handle(terminal.read(cx), cx).is_focused(window),
+            "the keyboard is in the pane left"
+        );
+    });
+    ui.shot("exited");
+    ui.act(|window, cx| {
+        window.input("exit", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the tab to close", |window, _, _| {
+        !is_visible(window, "panel-tab-terminal")
+    });
+}
+
 /// Dragging the right panel's edge resizes it, as far as leaves the pane
 /// its room; the width outlives a restart, and a double-click on the edge
 /// puts the default back.

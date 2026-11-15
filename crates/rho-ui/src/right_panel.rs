@@ -417,7 +417,7 @@ impl RightPanel {
 
     /// Shows `surface`: a new tab of a surface that opens many, else its
     /// tab, opened if it has none. Returns the tab shown.
-    fn open(&mut self, surface: Surface, cx: &mut Context<'_, Self>) -> TabKey {
+    fn open(&mut self, surface: Surface, window: &Window, cx: &mut Context<'_, Self>) -> TabKey {
         let open = self
             .tabs
             .iter()
@@ -426,7 +426,7 @@ impl RightPanel {
         let key = match open {
             Some(key) if !surface.opens_many() => key,
             _ => {
-                let tab = self.new_tab(surface, cx);
+                let tab = self.new_tab(surface, window, cx);
                 let key = tab.key();
                 self.tabs.push(tab);
                 self.tab_scroll.scroll_to_item(self.tabs.len() - 1);
@@ -438,7 +438,7 @@ impl RightPanel {
     }
 
     /// A new tab of `surface`.
-    fn new_tab(&mut self, surface: Surface, cx: &mut Context<'_, Self>) -> Tab {
+    fn new_tab(&mut self, surface: Surface, window: &Window, cx: &mut Context<'_, Self>) -> Tab {
         let session = self.session.as_ref().map(|(view, _)| view);
         match surface {
             Surface::Background => Tab::Background,
@@ -455,7 +455,7 @@ impl RightPanel {
                 self.next_terminal += 1;
                 let key = TabKey { surface, number };
                 let (workspaces, shell) = (self.workspaces.clone(), self.shell.clone());
-                let view = cx.new(|cx| TerminalTab::new(workspaces, shell, session, cx));
+                let view = cx.new(|cx| TerminalTab::new(workspaces, shell, session, window, cx));
                 let subscriptions = [
                     cx.observe(&view, |_, _, cx| cx.notify()),
                     cx.subscribe(&view, move |this, _, _: &Emptied, cx| this.close(key, cx)),
@@ -518,7 +518,7 @@ impl RightPanel {
         };
         match shortcut {
             TerminalShortcut::NewTab => {
-                let key = self.open(Surface::Terminal, cx);
+                let key = self.open(Surface::Terminal, window, cx);
                 self.focus_terminal(key, window, cx);
             }
             TerminalShortcut::NextTab => self.cycle_terminals(Step::Next, window, cx),
@@ -648,8 +648,8 @@ impl RightPanel {
             menu = menu.item(
                 PopupMenuItem::new(surface.label())
                     .icon(Icon::new(surface.icon()))
-                    .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| this.open(surface, cx));
+                    .on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |this, cx| this.open(surface, window, cx));
                     }),
             );
         }
@@ -800,8 +800,8 @@ impl RightPanel {
                 surface.icon(),
                 surface.label(),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open(surface, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open(surface, window, cx);
             }))
         });
         v_flex()
