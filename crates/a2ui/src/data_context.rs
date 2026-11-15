@@ -147,7 +147,7 @@ impl<'a> DataContext<'a> {
     /// # Errors
     ///
     /// Fails when the resolved path is not a valid pointer.
-    fn read(&self, path: &str) -> Result<Value, ExpressionError> {
+    pub fn read(&self, path: &str) -> Result<Value, ExpressionError> {
         let pointer = self.pointer(path)?;
         Ok(self.model.get(&pointer).cloned().unwrap_or(Value::Null))
     }
@@ -157,7 +157,7 @@ impl<'a> DataContext<'a> {
     /// # Errors
     ///
     /// Fails when the resolved path is not a valid pointer.
-    fn pointer(&self, path: &str) -> Result<Pointer, ExpressionError> {
+    pub fn pointer(&self, path: &str) -> Result<Pointer, ExpressionError> {
         Ok(Pointer::parse(&resolve_path(path, self.scope.as_deref()))?)
     }
 
@@ -166,7 +166,9 @@ impl<'a> DataContext<'a> {
         std::mem::take(&mut self.effects)
     }
 
-    pub(crate) fn push_effect(&mut self, effect: Effect) {
+    /// Asks the host to do something once the evaluation is over. A function
+    /// calls this, since evaluation itself only reads.
+    pub fn push_effect(&mut self, effect: Effect) {
         self.effects.push(effect);
     }
 

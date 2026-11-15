@@ -1,10 +1,20 @@
-//! A component's `Action`: an event for the agent, or a function to run
-//! locally.
+//! A component's `Action`, an event for the agent or a function to run
+//! locally, and dispatching it when the user interacts with the component.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chrono::{DateTime, Datelike, Timelike};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::coerce::to_string;
+use crate::data_context::{DataContext, UserActivation};
 use crate::expr::{Call, Expr, ExpressionError};
+use crate::functions::Effect;
+use crate::message::{ActionMessage, ErrorCode, ErrorMessage, Metadata, RendererMessage};
+use crate::pointer::Pointer;
+use crate::processor::{data_models, Change, MessageProcessor};
+use crate::resolve::{evaluation_error, Scope};
 
 /// What a component does when the user interacts with it.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,4 +114,226 @@ fn parse_event(event: &Value) -> Result<Event, ActionError> {
         context,
         user_message,
     })
+}
+
+/// A user's interaction with a component that has an action.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Interaction<'a> {
+    /// The surface.
+    pub surface_id: &'a str,
+    /// The component the user interacted with.
+    pub source_component_id: &'a str,
+    /// The scope the component was resolved in.
+    pub scope: Scope,
+    /// Whether a gesture of the user's triggered it, which a function such
+    /// as `openUrl` requires.
+    pub activation: UserActivation,
+    /// Metadata to attach to the `action` message.
+    pub metadata: Option<Metadata>,
+    /// When it happened.
+    pub at: SystemTime,
+}
+
+/// What dispatching an action did.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[must_use]
+pub struct Dispatched {
+    /// What the action changed in the surface's data model.
+    pub changes: Vec<Change>,
+    /// The messages to send the agent: the `action`, or the `error` that
+    /// stopped it.
+    pub outbound: Vec<RendererMessage>,
+    /// What the host should do, such as open a URL.
+    pub effects: Vec<Effect>,
+    /// The surface's data model, for the transport to attach to the
+    /// `action`, when the surface was created with `sendDataModel`.
+    pub data_model: Option<Value>,
+}
+
+impl MessageProcessor {
+    /// Runs `action` for `interaction`: evaluates an event's context and
+    /// `userMessage` into an `action` message, or runs a function call,
+    /// applying the data writes it asks for. Returns `None` when there is no
+    /// such surface.
+    pub fn dispatch_action(
+        &mut self,
+        interaction: &Interaction<'_>,
+        action: &Action,
+    ) -> Option<Dispatched> {
+        let sid = interaction.surface_id;
+        let surface = self.surfaces.get(sid)?;
+        let mut context = self.context(surface, &interaction.scope, interaction.activation);
+        let mut dispatched = Dispatched::default();
+        match action {
+            Action::Event(event) => match event_message(&mut context, event, interaction) {
+                Ok(message) => {
+                    dispatched.outbound.push(RendererMessage::Action(message));
+                    dispatched.data_model =
+                        data_models(std::iter::once(surface).filter(|s| s.send_data_model));
+                }
+                Err(error) => dispatched.outbound.push(RendererMessage::Error(error)),
+            },
+            Action::Call(call) => match context.evaluate(&Expr::Call(call.clone())) {
+                Ok(_) => dispatched.effects = context.take_effects(),
+                Err(error) => {
+                    dispatched
+                        .outbound
+                        .push(RendererMessage::Error(ErrorMessage::surface(
+                            ErrorCode::ExecutionError,
+                            sid,
+                            format!("function call action '{}' failed: {error}", call.name),
+                        )));
+                }
+            },
+        }
+        let writes: Vec<(Pointer, Value)> = dispatched
+            .effects
+            .extract_if(.., |effect| matches!(effect, Effect::SetData { .. }))
+            .filter_map(|effect| match effect {
+                Effect::SetData { path, value } => Some((path, value)),
+                Effect::OpenUrl(_) => None,
+            })
+            .collect();
+        let surface = self.surfaces.get_mut(sid)?;
+        for (path, value) in writes {
+            match surface.data.set(&path, value) {
+                Ok(fired) => dispatched.changes.push(Change::DataUpdated {
+                    surface: sid.to_owned(),
+                    path,
+                    fired,
+                }),
+                Err(error) => {
+                    dispatched
+                        .outbound
+                        .push(RendererMessage::Error(ErrorMessage::surface(
+                            ErrorCode::ExecutionError,
+                            sid,
+                            format!("an action's data write failed: {error}"),
+                        )));
+                }
+            }
+        }
+        Some(dispatched)
+    }
+}
+
+/// The `action` message an event action sends, with its context and
+/// `userMessage` evaluated.
+fn event_message(
+    context: &mut DataContext<'_>,
+    event: &Event,
+    interaction: &Interaction<'_>,
+) -> Result<ActionMessage, ErrorMessage> {
+    let sid = interaction.surface_id;
+    let what = format!("action '{}'", event.name);
+    let user_message = event
+        .user_message
+        .as_ref()
+        .map(|message| context.evaluate(message))
+        .transpose()
+        .map_err(|error| evaluation_error(sid, &what, &error))?;
+    let Value::Object(evaluated) = context
+        .evaluate(&event.context)
+        .map_err(|error| evaluation_error(sid, &what, &error))?
+    else {
+        return Err(ErrorMessage::surface(
+            ErrorCode::InvalidAction,
+            sid,
+            format!("the context of {what} is not an object"),
+        ));
+    };
+    Ok(ActionMessage {
+        name: event.name.clone(),
+        surface_id: sid.to_owned(),
+        source_component_id: interaction.source_component_id.to_owned(),
+        timestamp: timestamp(interaction.at),
+        context: evaluated,
+        user_message: user_message.as_ref().map(to_string),
+        metadata: interaction.metadata.clone(),
+    })
+}
+
+/// `at` in ISO 8601, to the millisecond, in UTC.
+fn timestamp(at: SystemTime) -> String {
+    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = i64::try_from(since.as_secs()).unwrap_or(i64::MAX);
+    let Some(time) = DateTime::from_timestamp(seconds, since.subsec_nanos()) else {
+        return "1970-01-01T00:00:00.000Z".to_owned();
+    };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        time.year(),
+        time.month(),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+        since.subsec_millis(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::functions::Functions;
+    use crate::processor::Validation;
+
+    /// What a dispatch hands the host beyond the `action` message: the
+    /// surface's data model, when it was created with `sendDataModel`, and
+    /// the URL an `openUrl` call asks to open.
+    #[test]
+    fn dispatch_hands_the_host_the_data_model_and_effects() {
+        let mut processor = MessageProcessor::new(Validation::Skip);
+        processor
+            .add_catalog(Catalog::basic().clone(), Functions::basic())
+            .expect("the basic catalog compiles");
+        let created = processor.process(&json!({ "version": "1.0", "createSurface": {
+            "surfaceId": "s", "catalogId": Catalog::basic().id(), "sendDataModel": true,
+            "dataModel": { "email": "ada@example.com" },
+        }}));
+        assert_eq!(created.outbound, []);
+        let interaction = Interaction {
+            surface_id: "s",
+            source_component_id: "submit",
+            scope: Scope::root(),
+            activation: UserActivation::Present,
+            metadata: None,
+            at: UNIX_EPOCH,
+        };
+        let submit = Action::from_json(&json!({ "event": { "name": "submit",
+            "context": { "email": { "@path": "/email" } } } }))
+        .expect("a valid action");
+        let dispatched = processor
+            .dispatch_action(&interaction, &submit)
+            .expect("surface s");
+        let sent: Vec<Value> = dispatched
+            .outbound
+            .iter()
+            .map(RendererMessage::to_json)
+            .collect();
+        let want = json!({ "version": "1.0", "action": { "name": "submit", "surfaceId": "s",
+            "sourceComponentId": "submit", "timestamp": "1970-01-01T00:00:00.000Z",
+            "context": { "email": "ada@example.com" } } });
+        assert_eq!(sent, [want]);
+        let model =
+            json!({ "version": "1.0", "surfaces": { "s": { "email": "ada@example.com" } } });
+        assert_eq!(dispatched.data_model, Some(model));
+
+        let open = Action::from_json(&json!({ "functionCall": {
+            "@call": "openUrl", "args": { "url": "https://example.com" } } }))
+        .expect("a valid action");
+        let dispatched = processor
+            .dispatch_action(&interaction, &open)
+            .expect("surface s");
+        assert_eq!(
+            (dispatched.outbound, dispatched.effects),
+            (
+                Vec::new(),
+                vec![Effect::OpenUrl("https://example.com".to_owned())]
+            )
+        );
+    }
 }

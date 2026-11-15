@@ -32,7 +32,7 @@ mod template;
 mod topology;
 mod validate;
 
-pub use action::{Action, ActionError, Event};
+pub use action::{Action, ActionError, Dispatched, Event, Interaction};
 pub use catalog::{
     Callers, Catalog, CatalogError, ComponentDef, Derivation, Entry, EntryKind, FunctionDef,
     ReturnType,

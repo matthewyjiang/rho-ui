@@ -157,8 +157,9 @@ pub enum InlineCatalogs {
 ///
 /// Messages go in through [`MessageProcessor::process`], which checks each
 /// one against the surface it joins and changes nothing for a message it
-/// rejects. A view reads the surfaces and resolves a component's properties
-/// with [`MessageProcessor::resolve`].
+/// rejects. A view reads the surfaces, resolves a component's properties with
+/// [`MessageProcessor::resolve`], and reports a user's action with
+/// [`MessageProcessor::dispatch_action`].
 #[derive(Debug)]
 pub struct MessageProcessor {
     pub(crate) catalogs: Catalogs,

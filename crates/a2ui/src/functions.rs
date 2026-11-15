@@ -7,6 +7,7 @@ use crate::basic_catalog::{date, format, logic, url, validation};
 use crate::coerce;
 use crate::data_context::DataContext;
 use crate::expr::ExpressionError;
+use crate::pointer::Pointer;
 use crate::regex_dialect::RegexError;
 
 /// A function's implementation. It gets its arguments already evaluated and
@@ -115,10 +116,18 @@ impl Args {
 
 /// Something a function asks the host to do, which evaluation cannot do
 /// itself. [`DataContext::take_effects`] hands them over.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     /// Open this URL, already checked to be `http`, `https`, `mailto` or `tel`.
     OpenUrl(String),
+    /// Write `value` at `path` in the data model of the surface the call ran
+    /// on, as an action's function call may.
+    SetData {
+        /// Where to write.
+        path: Pointer,
+        /// What to write; null removes, as `updateDataModel` does.
+        value: Value,
+    },
 }
 
 /// Why a function refused its arguments.
@@ -152,4 +161,7 @@ pub enum FunctionError {
     /// evaluate.
     #[error("in template: {0}")]
     Template(#[from] Box<ExpressionError>),
+    /// A function the host defines failed, for the reason given.
+    #[error("{0}")]
+    Failed(String),
 }
