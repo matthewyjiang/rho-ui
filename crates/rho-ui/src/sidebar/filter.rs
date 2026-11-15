@@ -30,8 +30,7 @@ impl SavedFilter {
     pub(crate) fn load(db: &StateDb) -> Self {
         let filter = db
             .get(Key::SidebarFilter)
-            .map(|text| Filter::from_text(&text))
-            .unwrap_or_default();
+            .map_or_default(|text| Filter::from_text(&text));
         Self {
             filter,
             db: db.clone(),

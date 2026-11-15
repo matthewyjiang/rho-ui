@@ -362,8 +362,7 @@ impl FilesSurface {
             .session
             .as_ref()
             .and_then(|(place, _)| place.path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy().into_owned());
         let theme = cx.theme();
         h_flex()
             .id("files-summary")
@@ -564,8 +563,7 @@ fn language(path: &str) -> String {
     let path = Path::new(path);
     path.extension()
         .or_else(|| path.file_name())
-        .map(|token| token.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|token| token.to_string_lossy().into_owned())
 }
 
 /// Lists the files with `reader` and [`LIST_SCRIPT`]'s `args`, and sorts

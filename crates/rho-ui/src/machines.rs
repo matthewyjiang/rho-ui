@@ -212,8 +212,7 @@ impl Machines {
     /// Where projects are cloned on `id`; see [`Machine::clone_folder`].
     pub(crate) fn clone_folder(&self, id: &MachineId) -> SharedString {
         self.get(id)
-            .map(|machine| machine.clone_folder.clone())
-            .unwrap_or_default()
+            .map_or_default(|machine| machine.clone_folder.clone())
     }
 
     /// The label to show beside something on `id`: none with one machine,

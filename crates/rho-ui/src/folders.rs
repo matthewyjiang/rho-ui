@@ -61,8 +61,7 @@ impl Typed {
         let browse = path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         let prefix = path
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy().into_owned());
         Some(Self {
             path,
             browse,

@@ -156,8 +156,7 @@ impl Settings {
         let mut settings = file
             .as_ref()
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| parse(&text))
-            .unwrap_or_default();
+            .map_or_default(|text| parse(&text));
         settings.file = file;
         settings
     }

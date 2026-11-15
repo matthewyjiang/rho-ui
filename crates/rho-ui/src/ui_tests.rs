@@ -1465,6 +1465,53 @@ fn click_label(ui: &mut Harness, label: &str) {
     });
 }
 
+/// Every item in the macOS menu bar works where it's chosen: the window
+/// handles its action, else the app does. An item nothing handles shows
+/// greyed out and does nothing. Items that edit text work in a text box.
+/// Choosing Settings opens the settings, as a menu item dispatches it.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_menu_bar_offers_only_what_works() {
+    use gpui_kit::OwnedMenuItem;
+
+    let mut ui = Harness::start("menu-bar", Script::default());
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    // The draft's composer has the keyboard, so the Edit items apply.
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.act(|window, _| window.activate_window());
+    let menus = ui.cx.update(|cx| cx.get_menus()).expect("a menu bar");
+    let mut items = 0;
+    for menu in &menus {
+        for item in &menu.items {
+            let OwnedMenuItem::Action { name, action, .. } = item else {
+                continue;
+            };
+            items += 1;
+            let works = ui.cx.update(|cx| cx.is_action_available(action.as_ref()));
+            assert!(works, "{} > {name} does nothing here", menu.name);
+        }
+    }
+    assert!(items > 10, "the menu bar lists its items, not {items}");
+
+    let settings = menus
+        .iter()
+        .flat_map(|menu| &menu.items)
+        .find_map(|item| match item {
+            OwnedMenuItem::Action { name, action, .. } if name == "Settings…" => {
+                Some(action.boxed_clone())
+            }
+            _ => None,
+        })
+        .expect("Settings in the menu bar");
+    ui.cx.update(|cx| cx.dispatch_action(settings.as_ref()));
+    ui.wait_until("the settings dialog", |window, _, _| {
+        is_visible(window, "setting-ui-font")
+    });
+}
+
 /// The gear opens settings in a dialog over the sessions; a new scale
 /// reaches the theme; About opens; Escape closes.
 #[test]

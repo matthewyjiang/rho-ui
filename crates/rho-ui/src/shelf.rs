@@ -197,9 +197,7 @@ impl Shelves {
     }
 
     fn entry(&self, id: &SessionKey) -> Entry {
-        self.find(id)
-            .map(|at| self.entries[at].1)
-            .unwrap_or_default()
+        self.find(id).map_or_default(|at| self.entries[at].1)
     }
 
     /// Applies `change` to `id`'s entry and saves if anything changed. An
