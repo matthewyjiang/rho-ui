@@ -140,7 +140,8 @@ gpui_kit::assets::icon_assets!(
         ZoomIn,
         ZoomOut,
         Scan,
-        ImageOff
+        ImageOff,
+        Hourglass
     ]
 );
 

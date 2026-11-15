@@ -16,6 +16,7 @@
 //! await, and replies cross over on channels or task handles.
 
 use std::{
+    collections::HashSet,
     future::Future,
     path::{Path, PathBuf},
     process::Command,
@@ -26,13 +27,13 @@ use std::{
 use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
-    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobKind,
-    JobListParams, JobState, JobSummary, Notifications, RestartParams, SessionAnswerParams,
-    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
-    SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
-    SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
-    SessionSteerParams, SessionUnsteerParams, SettingChange, StatusParams, TurnOutcome,
-    UnsteerOutcome,
+    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobId,
+    JobKind, JobListParams, JobState, JobSummary, Notifications, RestartParams,
+    SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams,
+    SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionHoldParams,
+    SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
+    SessionRenameParams, SessionSteerParams, SessionUnsteerParams, SettingChange, StatusParams,
+    TurnOutcome, UnsteerOutcome,
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
@@ -228,6 +229,10 @@ pub enum JobActivity {
     Working,
     /// The session waits for a person: an approval or a question.
     Waiting,
+    /// No turn runs, but subagents or workflow runs a turn started still
+    /// do. The daemon's job list doesn't show background processes, so a
+    /// session with only those has no job.
+    Background,
 }
 
 /// A session with work under way in the daemon, whichever client started it.
@@ -277,9 +282,23 @@ impl Job {
             && self.activity == other.activity
     }
 
+    /// The sessions with work under way among `jobs`, a whole listing.
+    fn from_list(jobs: Vec<JobSummary>) -> Vec<Self> {
+        // A subagent or workflow run names the job that started it.
+        let started: HashSet<JobId> = jobs
+            .iter()
+            .filter(|job| job.kind != JobKind::Session && job.state.in_progress())
+            .filter_map(|job| job.parent.clone())
+            .collect();
+        jobs.into_iter()
+            .filter_map(|job| Self::from_wire(job, &started))
+            .collect()
+    }
+
     /// The job as the sidebar needs it, or `None` for one that is not a
-    /// session with work under way.
-    fn from_wire(job: JobSummary) -> Option<Self> {
+    /// session with work under way. `started` holds the jobs whose
+    /// subagent or workflow runs are under way.
+    fn from_wire(job: JobSummary, started: &HashSet<JobId>) -> Option<Self> {
         // A subagent's or workflow's session belongs to the session that
         // started it, and can't be attached to.
         if job.kind != JobKind::Session {
@@ -292,6 +311,7 @@ impl Job {
             // A subagent's question waits whether or not a turn runs.
             _ if asks => JobActivity::Waiting,
             JobState::Running | JobState::Queued => JobActivity::Working,
+            _ if started.contains(&job.id) => JobActivity::Background,
             _ => return None,
         };
         Some(Self {
@@ -689,8 +709,10 @@ impl Daemon {
     }
 
     /// The sessions with work under way in the daemon, whichever client
-    /// started them: a turn running or queued, or a request waiting for a
-    /// person. Nothing pushes changes to this list; ask again to refresh.
+    /// started them: a turn running or queued, a request waiting for a
+    /// person, or subagents or workflow runs still under way after the
+    /// turn that started them. Nothing pushes changes to this list; ask
+    /// again to refresh.
     ///
     /// # Errors
     ///
@@ -700,7 +722,7 @@ impl Daemon {
             .client
             .request::<methods::JobList>(&JobListParams {})
             .await?;
-        Ok(list.jobs.into_iter().filter_map(Job::from_wire).collect())
+        Ok(Job::from_list(list.jobs))
     }
 
     /// Opens a new session in `cwd`, or in a new worktree of the
@@ -1144,10 +1166,21 @@ mod tests {
 
     use super::*;
 
+    fn summary(
+        id: &str,
+        kind: &str,
+        state: &str,
+        parent: Option<&str>,
+        live: &serde_json::Value,
+    ) -> JobSummary {
+        let summary = json!({"id": id, "kind": kind, "state": state, "parent": parent,
+            "workspace": "/w", "session": format!("s-{id}"), "created_at": 0, "updated_at": 0,
+            "live": live});
+        serde_json::from_value(summary).expect("a valid job summary")
+    }
+
     fn job(kind: &str, state: &str, live: &serde_json::Value) -> Option<Job> {
-        let summary = serde_json::from_value(json!({"id": "j1", "kind": kind, "state": state,
-            "workspace": "/w", "session": "s1", "created_at": 0, "updated_at": 0, "live": live}));
-        Job::from_wire(summary.expect("a valid job summary"))
+        Job::from_list(vec![summary("j1", kind, state, None, live)]).pop()
     }
 
     fn live(elapsed_ms: u64, inputs: &serde_json::Value) -> serde_json::Value {
@@ -1186,6 +1219,26 @@ mod tests {
             activity(job("session", "completed", &live(5, &asks))),
             Some(JobActivity::Waiting)
         );
+    }
+
+    /// A session whose turn ended while a subagent or workflow run it
+    /// started goes on waits on that run, and only while it runs.
+    #[test]
+    fn a_session_waits_on_the_runs_its_turn_started() {
+        let cases = [
+            ("subagent", "running", Some(JobActivity::Background)),
+            ("subagent", "queued", Some(JobActivity::Background)),
+            ("workflow", "running", Some(JobActivity::Background)),
+            ("subagent", "completed", None),
+        ];
+        for (kind, state, want) in cases {
+            let jobs = vec![
+                summary("j1", "session", "completed", None, &live(5, &json!([]))),
+                summary("j2", kind, state, Some("j1"), &serde_json::Value::Null),
+            ];
+            let activities: Vec<_> = Job::from_list(jobs).iter().map(Job::activity).collect();
+            assert_eq!(activities, Vec::from_iter(want), "a {state} {kind}");
+        }
     }
 
     /// The daemon reports a running turn's elapsed time anew at each

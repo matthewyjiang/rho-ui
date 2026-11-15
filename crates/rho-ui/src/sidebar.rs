@@ -1652,7 +1652,7 @@ fn branch_line(
         })
 }
 
-/// "Working 24m", "Waiting 9m", "Done", or the age: "3h", after a pin on a
+/// "Working 24m", "Needs you 9m", "Waiting" on background work, "Done", or the age: "3h", after a pin on a
 /// pinned row. Icons are static: an animated one would redraw the whole
 /// sidebar every frame. So Working gets a symmetric dashed circle, not a
 /// spinner frozen mid-turn.
@@ -1702,8 +1702,18 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
         Activity::Waiting(since) => busy(
             theme.warning,
             Icon::new(Lucide::CircleAlert),
-            label("Waiting", since),
+            label("Needs you", since),
         ),
+        Activity::Background => h_flex()
+            .id(SharedString::from(format!("{}-background", row.element_id)))
+            .test_support()
+            .aria_label("Waiting on background work")
+            .flex_shrink_0()
+            .gap_1()
+            .text_color(theme.muted_foreground)
+            .child(Icon::new(Lucide::Hourglass).xsmall())
+            .child("Waiting")
+            .into_any_element(),
         Activity::Idle if row.done => h_flex()
             .id(SharedString::from(format!("{}-done", row.element_id)))
             .test_support()

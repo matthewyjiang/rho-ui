@@ -2443,6 +2443,37 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
     });
 }
 
+/// A turn that ends off screen while the process it started runs on leaves
+/// the row waiting on that work; Done shows once the work and the daemon's
+/// turn about it have ended.
+#[test]
+fn a_turn_that_leaves_work_running_waits_before_done() {
+    let mut ui = Harness::start("background-waits", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_daemon("s1 attached", |daemon| daemon.attaches("s1") == 1);
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+
+    ui.send_from_elsewhere("s1", "background", Send::Prompt);
+    ui.wait_until("s1 waiting on its process", |window, _, _| {
+        is_visible(window, "session-local-s1-background")
+    });
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "session-local-s1-done"), "not done yet");
+    });
+    ui.shot("waiting");
+
+    ui.fake().finish_background(&SessionId::from("s1"), 0);
+    ui.wait_until("the daemon's turn about the exit", |window, _, _| {
+        is_visible(window, "session-local-s1-busy")
+    });
+    ui.send_from_elsewhere("s1", "thanks", Send::Steer);
+    ui.wait_for_label("session-local-s1-done", "Done");
+}
+
 /// The sidebar collapses to a rail and opens again, with Ctrl+B or its
 /// toggle, and the state database remembers which. The toggle and Settings
 /// stay where they were at any UI scale, the pane takes the width, the

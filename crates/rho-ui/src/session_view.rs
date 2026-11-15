@@ -48,8 +48,9 @@ use gpui_kit::{
     Window,
 };
 use rho_ui_core::{
-    Answer, Attached, Attachment, BackgroundId, Daemon, DaemonError, Entry, InputId, Prompt,
-    RunState, Session, SessionId, SessionUpdate, SteerId, TurnId, Unsteered,
+    Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon, DaemonError, Entry,
+    InputId, JobActivity, Prompt, RunState, Session, SessionId, SessionUpdate, SteerId, TurnId,
+    Unsteered,
 };
 
 use crate::{
@@ -395,9 +396,16 @@ impl SessionView {
     }
 
     fn activity(&self) -> Activity {
+        let running = || {
+            self.session
+                .background()
+                .iter()
+                .any(|work| work.status() == BackgroundStatus::Running)
+        };
         match (self.waiting_since, self.busy_since) {
             (Some(since), _) => Activity::Waiting(since),
             (None, Some(since)) => Activity::Working(since),
+            (None, None) if running() => Activity::Background,
             (None, None) => Activity::Idle,
         }
     }
@@ -671,7 +679,11 @@ impl SessionView {
             let jobs = daemon.active_jobs().await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let id = this.session.id();
-                let listed = jobs.is_ok_and(|jobs| jobs.iter().any(|job| job.session() == id));
+                // Only a turn under way or waiting for a person refuses one.
+                let listed = jobs.is_ok_and(|jobs| {
+                    jobs.iter()
+                        .any(|job| job.session() == id && job.activity() != JobActivity::Background)
+                });
                 // The turn's events may have come in meanwhile.
                 if listed || this.session.has_turn_since(sent_after.as_ref()) {
                     this.hold(prompt, sent_after, window, cx);

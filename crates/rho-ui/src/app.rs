@@ -30,7 +30,7 @@ use gpui_kit::{
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job, JobActivity,
     PendingUpgrade, Prompt, Session, SessionId,
 };
 
@@ -870,7 +870,11 @@ impl RhoApp {
             .iter()
             .filter(|open| open.id.machine == *machine && !open.view.read(cx).is_subagent())
             .map(|open| open.id.id.clone())
-            .filter(|id| jobs.iter().any(|job| job.session() == id))
+            // Work in the background goes on, or not, with nobody attached.
+            .filter(|id| {
+                jobs.iter()
+                    .any(|job| job.session() == id && job.activity() != JobActivity::Background)
+            })
             .filter(|id| shown.as_ref().is_none_or(|shown| shown.id.id != *id))
             .collect();
         Resume { shown, working }
