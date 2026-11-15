@@ -3144,22 +3144,9 @@ struct StubGh {
 
 impl StubGh {
     fn new() -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let checkout = tempfile::tempdir().unwrap();
-        let repo = checkout.path().canonicalize().unwrap();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(["-c", "commit.gpgsign=false"])
-                .args(args)
-                .current_dir(&repo)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
+        let repo = rho_ui_core::platform::canonicalize(checkout.path()).unwrap();
+        let git = |args: &[&str]| crate::local::test::git(&repo, args);
         git(&["init", "-q", "-b", "main"]);
         git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
         git(&["commit", "-q", "--allow-empty", "-m", "x"]);
@@ -3179,8 +3166,7 @@ impl StubGh {
             bin.path().join("answer.json").display(),
             bin.path().join("comment").display(),
         );
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_program(&gh, &script);
         StubGh {
             _checkout: checkout,
             repo,
@@ -3258,6 +3244,7 @@ fn open_pr_surface(gh: &StubGh, name: &'static str) -> Harness {
 /// every 30 seconds while it shows, and none while the panel is hidden or
 /// GitHub's limit is nearly spent, which it says.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn the_pull_request_surface_shows_the_branchs_pr() {
     let gh = StubGh::new();
     let asked = || gh.asked();
@@ -3326,6 +3313,7 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
 /// An active session's row marks its PR, failing checks and all, read for
 /// the sidebar by one query of summaries, then again every five minutes.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn a_sidebar_row_marks_its_pr() {
     let gh = StubGh::new();
     let mut ui = open_pr_session(&gh, "pull-request-row");
@@ -3352,6 +3340,7 @@ fn a_sidebar_row_marks_its_pr() {
 /// read of the state database, until it is unlinked; what names no PR says
 /// so.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn a_pull_request_links_by_hand() {
     let gh = StubGh::new();
     let mut ui = open_pr_surface(&gh, "pull-request-link");
@@ -3398,6 +3387,7 @@ fn a_pull_request_links_by_hand() {
 /// comment posted through the session machine's gh, after which the PR
 /// is read again to show it.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn a_pull_request_conversation_takes_a_comment() {
     let gh = StubGh::new();
     let mut ui = open_pr_surface(&gh, "pull-request-conversation");
@@ -3446,6 +3436,7 @@ fn a_pull_request_conversation_takes_a_comment() {
 /// confirmed, through `gh pr merge` without deleting the branch; then it is
 /// read again.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn a_pull_request_merges_once_confirmed() {
     let gh = StubGh::new();
     let mut ui = open_pr_surface(&gh, "pull-request-merge");
@@ -5522,9 +5513,8 @@ fn a_machine_added_in_settings_lists_its_sessions() {
 /// and a token GitHub refused shows as signed out, with no sign-in to copy
 /// when the token comes from a variable.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn source_control_shows_this_machines_gh() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let bin = tempfile::tempdir().unwrap();
     let fake_gh = |name: &str, account: &str| {
         let path = bin.path().join(name);
@@ -5532,8 +5522,7 @@ fn source_control_shows_this_machines_gh() {
             "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
              auth) echo '{{\"hosts\":{{\"github.com\":[{account}]}}}}' ;;\nesac\n"
         );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_program(&path, &script);
         path.display().to_string()
     };
     let signed_in = fake_gh(

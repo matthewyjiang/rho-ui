@@ -1,14 +1,19 @@
 //! GitHub's CLI, `gh`: the script that finds it on a machine and reports
 //! its version and accounts, and the parser of what that script prints.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use gpui_kit::SharedString;
 use rho_ui_core::platform;
 use serde::Deserialize;
 
-use super::{Account, AuthState, CliProbe, CliStatus, FoundBy, TokenSource};
-use crate::folders;
+use super::{Account, AuthState, CliProbe, CliStatus, FoundBy, Job, TokenSource};
+use crate::{folders, local};
 
 /// The POSIX `sh` script that checks `gh` on a machine. Its argument is the
 /// program set in Settings: empty finds `gh` on the `PATH`, then through
@@ -60,6 +65,150 @@ printf '\0'
 /// Printed before the fields, so whatever a login file prints comes first
 /// and is skipped.
 const MARKER: &[u8] = b"rho-ui-forge\0";
+
+/// Checks `gh`: [`SCRIPT`] on a remote machine, [`check_here`] here.
+pub(super) const CHECK: Job = Job {
+    script: SCRIPT,
+    here: check_here,
+};
+
+/// `gh` at `program`, to run here as the scripts run it: never asking,
+/// without colors, spinners or update notices.
+pub(super) fn command(program: &OsStr) -> Command {
+    let mut command = platform::background_command(program);
+    command.envs([
+        ("GH_PROMPT_DISABLED", "1"),
+        ("GH_NO_UPDATE_NOTIFIER", "1"),
+        ("GH_SPINNER_DISABLED", "1"),
+        ("NO_COLOR", "1"),
+    ]);
+    command
+}
+
+/// The environment [`check_here_in`] finds `gh` in.
+struct Env<'a> {
+    path: Option<&'a OsStr>,
+    shell: Option<&'a OsStr>,
+    home: Option<&'a Path>,
+}
+
+/// [`SCRIPT`] in Rust, with the same argument, printing what it prints.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "a Job's here may fail; this one says why in what it prints"
+)]
+fn check_here(args: &[OsString]) -> Result<Vec<u8>, String> {
+    let path = std::env::var_os("PATH");
+    let shell = std::env::var_os("SHELL");
+    let home = platform::home_dir();
+    let env = Env {
+        path: path.as_deref(),
+        shell: shell.as_deref(),
+        home: home.as_deref(),
+    };
+    let want = args.first().map(OsString::as_os_str).unwrap_or_default();
+    Ok(check_here_in(want, &env))
+}
+
+fn check_here_in(want: &OsStr, env: &Env<'_>) -> Vec<u8> {
+    let mut out = MARKER.to_vec();
+    let mut field = |bytes: &[u8]| {
+        out.extend(bytes);
+        out.push(0);
+    };
+    let want = Path::new(want);
+    let found = if want.as_os_str().is_empty() {
+        on_path("gh", env.path)
+            .map(|gh| ("path", gh))
+            .or_else(|| login_shell_gh(env.shell).map(|gh| ("login", gh)))
+    } else if want.starts_with("~") {
+        let gh = env.home.map_or_else(
+            || want.to_path_buf(),
+            |home| platform::expand_tilde(want, home),
+        );
+        Some(("setting", gh))
+    } else if want.components().count() > 1 {
+        Some(("setting", want.to_path_buf()))
+    } else {
+        Some((
+            "setting",
+            on_path(want, env.path).unwrap_or_else(|| want.to_path_buf()),
+        ))
+    };
+    let Some((how, gh)) = found else {
+        field(b"missing");
+        return out;
+    };
+    field(b"found");
+    field(how.as_bytes());
+    field(&platform::path_to_bytes(gh.as_os_str()));
+    if !is_program(&gh) {
+        field(b"broken");
+        field(b"");
+        return out;
+    }
+    let said = |output: &std::process::Output| [&output.stdout[..], &output.stderr[..]].concat();
+    match local::run(command(gh.as_os_str()).arg("--version")) {
+        Err(why) => {
+            field(b"broken");
+            field(why.as_bytes());
+            return out;
+        }
+        Ok(output) if !output.status.success() => {
+            field(b"broken");
+            field(&said(&output));
+            return out;
+        }
+        Ok(output) => {
+            field(b"version");
+            field(&said(&output));
+        }
+    }
+    field(b"auth");
+    // A failing token is in the JSON, so how it ends doesn't matter.
+    let auth = local::run(command(gh.as_os_str()).args(["auth", "status", "--json", "hosts"]));
+    field(&auth.map(|output| output.stdout).unwrap_or_default());
+    out
+}
+
+/// `name` in a folder of `path`, as the shell finds a program.
+fn on_path(name: impl AsRef<Path>, path: Option<&OsStr>) -> Option<PathBuf> {
+    let mut program = name.as_ref().as_os_str().to_owned();
+    program.push(std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(&program))
+        .find(|candidate| is_program(candidate))
+}
+
+/// Where the user's login shell `shell` finds `gh`: its last line, after
+/// whatever its login files print. Unix only, as `$SHELL` is.
+fn login_shell_gh(shell: Option<&OsStr>) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    let mut command = platform::background_command(shell?);
+    command.args(["-l", "-c", "command -v gh"]);
+    let output = local::run(&mut command).ok()?;
+    let line = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .rfind(|line| !line.is_empty())?;
+    Some(platform::path_from_bytes(line)).filter(|gh| gh.is_file())
+}
+
+/// Whether `path` is a file it may run.
+fn is_program(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
 
 /// `gh auth status --json hosts`: each host's accounts.
 #[derive(Deserialize)]
@@ -207,17 +356,14 @@ fn version_number(version: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        os::unix::fs::PermissionsExt as _,
-        path::{Path, PathBuf},
-        process::Command,
-    };
-
     use super::*;
 
+    #[cfg(unix)]
     /// A `gh` that prints `auth` for `gh auth status`, and what a real one
     /// prints for its version.
     fn fake_gh(dir: &Path, name: &str, auth: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let path = dir.join(name);
         let script = format!(
             "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
@@ -228,9 +374,26 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     /// Runs [`SCRIPT`] with `want`, a `PATH` of `path` and a login shell
-    /// `shell`, and reads what it found.
+    /// `shell`, and reads what it found; [`check_here`], run here in the
+    /// same environment, must find the same.
     fn check(want: &str, path: &Path, shell: &Path, home: &Path) -> CliProbe {
+        let env = Env {
+            path: Some(path.as_os_str()),
+            shell: Some(shell.as_os_str()),
+            home: Some(home),
+        };
+        let here = parse(&check_here_in(OsStr::new(want), &env)).unwrap();
+        let there = check_there(want, path, shell, home);
+        assert_eq!(here, there, "Program {want:?}: here and there differ");
+        there
+    }
+
+    #[cfg(unix)]
+    fn check_there(want: &str, path: &Path, shell: &Path, home: &Path) -> CliProbe {
+        use std::process::Command;
+
         let output = Command::new("/bin/sh")
             .args(["-c", SCRIPT, "sh", want])
             .env_clear()
@@ -243,15 +406,19 @@ mod tests {
         parse(&output.stdout).unwrap()
     }
 
+    #[cfg(unix)]
     /// A lookup: the Program setting, the `PATH`, the login shell, and the
     /// program found and how.
     type Lookup<'a> = (&'a str, &'a Path, &'a Path, Option<(PathBuf, FoundBy)>);
 
-    /// The script finds `gh` the way the Program setting says: a set path,
+    #[cfg(unix)]
+    /// The check finds `gh` the way the Program setting says, here and on
+    /// a remote machine: a set path,
     /// a `~/` path, a name on the `PATH`; and with none, on the `PATH`,
     /// else where the login shell finds it, else nowhere.
     #[test]
-    fn the_script_finds_gh_as_the_setting_says() {
+    fn the_check_finds_gh_as_the_setting_says() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
         let on_path = dir.join("bin");

@@ -26,9 +26,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, relative, AnyElement, App, AppContext as _, Context, Div, Entity, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, relative, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity,
+    Focusable as _, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 
 pub(crate) use self::header::state_look;
@@ -136,15 +136,15 @@ impl PullRequestSurface {
         if key.as_ref() != self.session.as_ref().map(|followed| &followed.key) {
             // A form open for the last session doesn't link this one, nor
             // does a merge asked for there, or a comment written there, go
-            // to this one's PR. One under way still finishes.
+            // to this one's PR. One under way still finishes, unseen.
             self.link_form = None;
-            if !matches!(self.acting, Acting::Running { .. }) {
-                self.acting = Acting::Idle;
+            if let Acting::Running(task) = std::mem::replace(&mut self.acting, Acting::Idle) {
+                task.detach();
             }
-            if !matches!(self.posting, Posting::Sending { .. }) {
-                self.comment_box = None;
-                self.posting = Posting::Idle;
+            if let Posting::Sending(task) = std::mem::replace(&mut self.posting, Posting::Idle) {
+                task.detach();
             }
+            self.comment_box = None;
         }
         self.session = session.map(|view| {
             let live = view.read(cx).live();
@@ -273,9 +273,17 @@ impl PullRequestSurface {
         Some(
             div()
                 .text_sm()
-                // Its links are anyone's: only web ones open.
-                .child(TextView::new(state).on_link_click(|url, _, _, cx| {
-                    if let Some(url) = web_url(url) {
+                // Its links are anyone's: only web ones open, as Kit opens
+                // links without a handler.
+                .child(TextView::new(state).on_link_click(|url, event, _, cx| {
+                    let opens = match event {
+                        ClickEvent::Mouse(click) => {
+                            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+                        }
+                        ClickEvent::Keyboard(_) => true,
+                        ClickEvent::Touch(click) => !click.long_press,
+                    };
+                    if let Some(url) = web_url(url).filter(|_| opens) {
                         cx.open_url(&url);
                     }
                 }))

@@ -26,7 +26,7 @@ use gpui_kit::{Context, Entity, SharedString, Task};
 use gpui_kit::BackgroundExecutor;
 
 use crate::{
-    folders::Reader,
+    folders::{Deadline, Reader},
     machines::MachineId,
     pull_requests::model::{Batch, FetchPlan, PrAction, PrId},
     settings::Settings,
@@ -41,17 +41,35 @@ use crate::{
 /// running until that gives up.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// Runs `cli`'s `script` with `args` through `reader`, giving up after
+/// Something a CLI does on a machine, with the same arguments either way:
+/// on a remote machine, which is Unix, the POSIX `sh` script `script`;
+/// here, `here`, which does it in Rust (so on Windows too) and prints what
+/// the script prints, so one parser reads both.
+pub(super) struct Job {
+    pub(super) script: &'static str,
+    pub(super) here: fn(&[OsString]) -> Result<Vec<u8>, String>,
+}
+
+/// Does `cli`'s `job` with `args` through `reader`, giving up after
 /// [`DEADLINE`].
 async fn run(
     cli: ForgeCli,
     reader: Reader,
-    script: &'static str,
+    job: &Job,
     args: Vec<OsString>,
     executor: &BackgroundExecutor,
 ) -> Result<Vec<u8>, String> {
     let deadline = executor.timer(DEADLINE);
-    let run = reader.run_script(script, args, executor);
+    let here = job.here;
+    let here_args = args.clone();
+    let run = reader.query(
+        executor,
+        move || here(&here_args),
+        job.script,
+        args,
+        Deadline::Script,
+        Ok,
+    );
     match future::select(pin!(run), deadline).await {
         Either::Left((output, _)) => output,
         Either::Right(_) => Err(format!(
@@ -95,7 +113,7 @@ pub(crate) async fn query_prs(
 ) -> Result<Batch, QueryError> {
     let query = gh_pulls::query(plan);
     let args = vec![program.into_os_string(), host.into(), query.into()];
-    let output = run(ForgeCli::Gh, reader, gh_pulls::SCRIPT, args, executor)
+    let output = run(ForgeCli::Gh, reader, &gh_pulls::API, args, executor)
         .await
         .map_err(QueryError::Failed)?;
     gh_pulls::parse(plan, &output)
@@ -121,14 +139,7 @@ pub(crate) async fn act(
         pr.number.to_string().into(),
     ];
     args.extend(gh_pulls::action_args(action));
-    let output = run(
-        ForgeCli::Gh,
-        reader,
-        gh_pulls::ACTION_SCRIPT,
-        args,
-        executor,
-    )
-    .await?;
+    let output = run(ForgeCli::Gh, reader, &gh_pulls::ACTION, args, executor).await?;
     gh_pulls::parse_action(&output)
 }
 
@@ -185,9 +196,9 @@ impl ForgeCli {
         }
     }
 
-    fn script(self) -> &'static str {
+    fn check(self) -> &'static Job {
         match self {
-            ForgeCli::Gh => gh::SCRIPT,
+            ForgeCli::Gh => &gh::CHECK,
         }
     }
 
@@ -382,7 +393,7 @@ impl Forges {
             let key = key.clone();
             async move |this, cx| {
                 let args = vec![program.into()];
-                let output = run(cli, reader, cli.script(), args, &executor).await;
+                let output = run(cli, reader, cli.check(), args, &executor).await;
                 let check = match output.and_then(|output| cli.parse(&output)) {
                     Ok(probe) => Check::Done(probe),
                     Err(why) => Check::Failed(why.into()),

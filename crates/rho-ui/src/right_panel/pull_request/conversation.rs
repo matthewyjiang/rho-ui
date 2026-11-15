@@ -28,9 +28,7 @@ use crate::{
 pub(super) enum Posting {
     Idle,
     /// Posting it; dropping the task stops it.
-    Sending {
-        _post: Task<()>,
-    },
+    Sending(Task<()>),
     /// It wasn't posted, and why; the box still holds it.
     Failed(SharedString),
 }
@@ -71,19 +69,24 @@ impl PullRequestSurface {
             return;
         };
         let body = input.read(cx).value().trim().to_owned();
-        if body.is_empty() || matches!(self.posting, Posting::Sending { .. }) {
+        if body.is_empty() || matches!(self.posting, Posting::Sending(_)) {
             return;
         }
         let Some(id) = self.shown_pr(cx) else {
             return;
         };
         let input = input.clone();
-        let posted = self
-            .prs
-            .update(cx, |prs, cx| prs.act(id, PrAction::Comment(body), cx));
+        let posted = self.prs.update(cx, |prs, cx| {
+            prs.act(id.clone(), PrAction::Comment(body), cx)
+        });
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = posted.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if this.shown_pr(cx).as_ref() != Some(&id) {
+                    // Another session's PR is on screen: this one's box is
+                    // gone.
+                    return;
+                }
                 this.posting = match result {
                     Ok(()) => {
                         input.update(cx, |input, cx| input.set_value("", window, cx));
@@ -94,7 +97,7 @@ impl PullRequestSurface {
                 cx.notify();
             });
         });
-        self.posting = Posting::Sending { _post: task };
+        self.posting = Posting::Sending(task);
         cx.notify();
     }
 
@@ -103,7 +106,7 @@ impl PullRequestSurface {
     fn comment_form(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
         let (input, _) = self.comment_box.as_ref()?;
         let theme = cx.theme();
-        let sending = matches!(self.posting, Posting::Sending { .. });
+        let sending = matches!(self.posting, Posting::Sending(_));
         let empty = input.read(cx).value().trim().is_empty();
         let poster = self.prs.read(cx).poster(cx);
         let (note, color) = match (&self.posting, &poster) {

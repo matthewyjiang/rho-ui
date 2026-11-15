@@ -28,9 +28,7 @@ pub(super) enum Acting {
         head: String,
     },
     /// Doing it; dropping the task stops waiting for it.
-    Running {
-        _task: Task<()>,
-    },
+    Running(Task<()>),
     /// It wasn't done, and why.
     Failed(SharedString),
 }
@@ -41,10 +39,16 @@ impl PullRequestSurface {
         let Some(id) = self.shown_pr(cx) else {
             return;
         };
-        let done = self.prs.update(cx, |prs, cx| prs.act(id, action, cx));
+        let done = self
+            .prs
+            .update(cx, |prs, cx| prs.act(id.clone(), action, cx));
         let task = cx.spawn(async move |this, cx| {
             let result = done.await;
             let _ = this.update(cx, |this, cx| {
+                if this.shown_pr(cx).as_ref() != Some(&id) {
+                    // What it says is about a PR no longer on screen.
+                    return;
+                }
                 this.acting = match result {
                     Ok(()) => Acting::Idle,
                     Err(why) => Acting::Failed(why),
@@ -52,14 +56,14 @@ impl PullRequestSurface {
                 cx.notify();
             });
         });
-        self.acting = Acting::Running { _task: task };
+        self.acting = Acting::Running(task);
         cx.notify();
     }
 
     /// Whether an action runs, or no machine's account can act: the
     /// comment box says why.
     fn busy(&self, cx: &Context<'_, Self>) -> bool {
-        matches!(self.acting, Acting::Running { .. }) || self.prs.read(cx).poster(cx).is_err()
+        matches!(self.acting, Acting::Running(_)) || self.prs.read(cx).poster(cx).is_err()
     }
 
     /// Asks to confirm a merge `method`'s way of the PR on screen's head.

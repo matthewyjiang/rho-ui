@@ -10,9 +10,9 @@ use gpui_kit::SharedString;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::QueryError;
+use super::{Job, QueryError};
 use crate::{
-    folders,
+    folders, local,
     pull_requests::model::{
         Batch, Budget, ChangeKey, CheckRun, CheckStatus, FetchPlan, Found, MergeMethod, Mergeable,
         Post, PrAction, PrDetail, PrId, PrState, PrSummary, RepoId, Review, Rollup, Thread,
@@ -38,6 +38,29 @@ printf '\0%s\0' "$err"
 /// first and is skipped.
 const MARKER: &[u8] = b"rho-ui-gh-api\0";
 
+/// Asks GitHub: [`SCRIPT`] on a remote machine, [`api_here`] here.
+pub(super) const API: Job = Job {
+    script: SCRIPT,
+    here: api_here,
+};
+
+/// [`SCRIPT`] in Rust, with the same arguments, printing what it prints.
+fn api_here(args: &[OsString]) -> Result<Vec<u8>, String> {
+    let [gh, host, query] = args else {
+        return Err("The gh query takes gh, a host and a query.".to_owned());
+    };
+    let mut field = OsString::from("query=");
+    field.push(query);
+    let mut command = super::gh::command(gh);
+    command
+        .args(["api", "graphql", "--hostname"])
+        .arg(host)
+        .arg("-f")
+        .arg(field);
+    let output = local::run(&mut command)?;
+    Ok([MARKER, &output.stdout, b"\0", &output.stderr, b"\0"].concat())
+}
+
 /// The POSIX `sh` script that acts on a PR: `gh` is its first argument,
 /// then the host, the repository as `owner/name`, the PR's number, and the
 /// `gh pr` subcommand with its arguments ([`action_args`]). With `--repo`,
@@ -53,6 +76,36 @@ printf '%s\0%s\0' "$?" "$err"
 "#;
 
 const ACTION_MARKER: &[u8] = b"rho-ui-gh-pr\0";
+
+/// Acts on a PR: [`ACTION_SCRIPT`] on a remote machine, [`action_here`]
+/// here.
+pub(super) const ACTION: Job = Job {
+    script: ACTION_SCRIPT,
+    here: action_here,
+};
+
+/// [`ACTION_SCRIPT`] in Rust, with the same arguments, printing what it
+/// prints.
+fn action_here(args: &[OsString]) -> Result<Vec<u8>, String> {
+    let [gh, host, repo, number, verb, rest @ ..] = args else {
+        return Err("A gh pr action takes gh, a repository, a number and a verb.".to_owned());
+    };
+    let mut full = host.clone();
+    full.push("/");
+    full.push(repo);
+    let mut command = super::gh::command(gh);
+    command
+        .arg("pr")
+        .arg(verb)
+        .arg(number)
+        .arg("--repo")
+        .arg(full)
+        .args(rest);
+    let output = local::run(&mut command)?;
+    // As `$?` reads, so 0 is success.
+    let code = output.status.code().unwrap_or(1).to_string();
+    Ok([ACTION_MARKER, code.as_bytes(), b"\0", &output.stderr, b"\0"].concat())
+}
 
 /// The `gh pr` subcommand and arguments that do `action`. A merge never
 /// passes `--delete-branch`: a session may still work on the branch.
