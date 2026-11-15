@@ -163,7 +163,7 @@ pub fn questions() -> Vec<Question> {
 }
 
 /// Writes the program `text` to `path`, runnable, from a child process,
-/// for tests that stand in a fake `ssh` or `rho`. A handle written through
+/// for tests that stand in a fake `rho` or the like. A handle written through
 /// this process would leak into the processes other tests spawn meanwhile,
 /// until they exec, and running the file then fails with "Text file busy"
 /// (ETXTBSY).
@@ -227,14 +227,14 @@ pub enum TuiJob {
     Running,
 }
 
-/// A running fake daemon. Dropping it stops it, and removes the directory
-/// of its socket when it made one.
+/// A running fake daemon. Dropping it stops it, and removes its rho home
+/// and the directory of its socket.
 #[derive(Debug)]
 pub struct FakeDaemon {
     socket: PathBuf,
     service: Arc<Fake>,
-    /// Its rho home, when the fake made it.
-    _dir: Option<tempfile::TempDir>,
+    /// Its rho home.
+    _dir: tempfile::TempDir,
     _runtime: Runtime,
 }
 
@@ -249,21 +249,10 @@ impl FakeDaemon {
     pub fn start(script: Script) -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory for the fake daemon");
         let socket = endpoint_of(dir.path());
-        Self::serve(script, socket, Some(dir))
+        Self::serve(script, socket, dir)
     }
 
-    /// Starts a daemon holding `script` where rho's daemon of the rho home
-    /// `rho_home` listens when `XDG_RUNTIME_DIR` is unset, making the home
-    /// if missing. The caller keeps the home.
-    ///
-    /// # Panics
-    ///
-    /// If the OS refuses the home, a socket in it, or a thread.
-    pub fn start_in_home(script: Script, rho_home: &Path) -> Self {
-        Self::serve(script, endpoint_of(rho_home), None)
-    }
-
-    fn serve(script: Script, socket: PathBuf, dir: Option<tempfile::TempDir>) -> Self {
+    fn serve(script: Script, socket: PathBuf, dir: tempfile::TempDir) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_io()
@@ -308,6 +297,11 @@ impl FakeDaemon {
     /// How a client reaches this daemon.
     pub fn target(&self) -> DaemonTarget {
         DaemonTarget::Socket(self.socket.clone())
+    }
+
+    /// Where it listens: its Unix socket, or on Windows its named pipe.
+    pub fn socket(&self) -> &Path {
+        &self.socket
     }
 
     /// The value of variable `name` in the environment the latest

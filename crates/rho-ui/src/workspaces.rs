@@ -169,7 +169,7 @@ pub(crate) struct Workspaces {
     /// Workspaces [`Self::index`] added this effect cycle, read together
     /// at its end: a session list of a remote machine names many at once,
     /// and reading each alone would open an ssh session per workspace,
-    /// past the 10 that sshd's default `MaxSessions` allows on a master.
+    /// past the 10 that sshd's default `MaxSessions` allows on a connection.
     unread: Vec<usize>,
     _reread: Task<()>,
 }

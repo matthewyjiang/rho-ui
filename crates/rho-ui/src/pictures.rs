@@ -56,7 +56,7 @@ pub(crate) struct Pictures {
     loads: HashMap<Key, Load>,
     /// Reads waiting their turn, with the path each reads. One runs at a
     /// time: on a remote machine each is an ssh session on the shared
-    /// master, which sshd's default `MaxSessions` holds to 10, and the
+    /// connection, which sshd's default `MaxSessions` holds to 10, and the
     /// Files surface and git need some too.
     queue: VecDeque<(Key, String)>,
     reading: bool,

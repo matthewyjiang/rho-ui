@@ -10,10 +10,12 @@
 //! while let Some(event) = events.recv().await { /* route by session id */ }
 //! ```
 //!
-//! rho-protocol's `Client` reads and writes the socket in Tokio tasks, so
-//! this module keeps one small Tokio runtime for that I/O. Nothing else runs
-//! on it: every method here returns a plain future that any executor can
-//! await, and replies cross over on channels or task handles.
+//! rho-protocol's `Client` reads and writes the socket in Tokio tasks, and
+//! the ssh client that carries a remote daemon's socket (`ssh.rs`) runs on
+//! Tokio too, so this module keeps one small Tokio runtime for that I/O.
+//! Nothing else runs on it: every method here returns a plain future that
+//! any executor can await, and replies cross over on channels or task
+//! handles.
 
 use std::{
     collections::HashSet,
@@ -493,9 +495,10 @@ const _: () = {
 };
 
 /// The runtime the connection's socket I/O runs on, made on first use and
-/// kept for the life of the process. One worker: the work is one socket's
-/// reads and writes, and `LocalDaemon` waiting on `rho daemon start`, or
-/// the ssh commands that reach a daemon on another machine.
+/// kept for the life of the process. One worker: the work is the daemon
+/// sockets' reads and writes, `LocalDaemon` waiting on `rho daemon start`,
+/// and for a daemon on another machine, the ssh connection that carries
+/// its socket and the scripts run there.
 pub(crate) fn io() -> &'static Runtime {
     static IO: OnceLock<Runtime> = OnceLock::new();
     IO.get_or_init(|| {
@@ -503,8 +506,8 @@ pub(crate) fn io() -> &'static Runtime {
             .worker_threads(1)
             .thread_name("rho-ui-daemon-io")
             .enable_io()
-            // The handshake's deadline, and those on a remote machine's
-            // scripts; see `ssh.rs`.
+            // The handshake's deadline, those on a remote machine's
+            // scripts, and the ssh connection's keepalives; see `ssh.rs`.
             .enable_time()
             .build()
             .expect("the OS lets this process start a thread and an I/O driver")
@@ -513,8 +516,8 @@ pub(crate) fn io() -> &'static Runtime {
 
 /// Runs `future` on the I/O runtime and waits for it. Dropping the future
 /// this returns stops the task, and drops what the task holds, such as a
-/// half-open connection or an ssh process (spawned `kill_on_drop`), so a
-/// caller that stops waiting leaves nothing running.
+/// half-open connection or a script's ssh channel, so a caller that stops
+/// waiting leaves nothing running.
 ///
 /// # Errors
 ///
@@ -539,7 +542,7 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 /// How long a daemon may take to answer the handshake once its socket
-/// connected, at a socket target or over `ssh -W`. A daemon that accepts
+/// connected, at a socket target or over an ssh channel. A daemon that accepts
 /// and never answers would otherwise hold the connection attempt forever.
 /// The default local target has none: rho-protocol's `LocalDaemon` does
 /// that handshake itself, with no deadline, until rho-protocol adds one.
@@ -625,7 +628,9 @@ fn session_setup() -> rho_protocol::SessionSetup {
 impl Daemon {
     /// Connects to the daemon, starting it first if `target` says how.
     /// Dropping the future gives up the attempt: whatever it started to
-    /// reach the daemon, such as ssh, stops with it.
+    /// reach the daemon, such as an ssh connection still signing in or the
+    /// setup script on the machine, stops with it. An ssh connection that
+    /// signed in stays, for the next attempt to reach that machine.
     ///
     /// # Errors
     ///
