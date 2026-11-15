@@ -339,6 +339,14 @@ impl ErrorMessage {
         }
     }
 
+    /// The same error with its path moved below `prefix`.
+    pub(crate) fn under(mut self, prefix: &str) -> Self {
+        if let Some(path) = &mut self.path {
+            path.insert_str(0, prefix);
+        }
+        self
+    }
+
     /// The code.
     #[must_use]
     pub fn code(&self) -> ErrorCode {

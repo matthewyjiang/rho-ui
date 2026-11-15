@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::ident::is_identifier;
 use crate::schema;
 use crate::shape;
+use crate::slot::{self, Slot};
 
 /// The component type the protocol reserves for the surface container.
 const SURFACE: &str = "Surface";
@@ -46,6 +47,11 @@ pub struct ComponentDef {
     schema: Value,
     properties: Vec<String>,
     required: Vec<String>,
+    /// What each property that is not a plain value holds.
+    pub(crate) slots: BTreeMap<String, Slot>,
+    /// The property names it declares as its own; see
+    /// [`shape::own_property_names`].
+    pub(crate) own: BTreeSet<String>,
     allowed_parents: Option<Vec<String>>,
     allowed_children: Option<Vec<String>>,
     metadata: Option<Map<String, Value>>,
@@ -282,7 +288,9 @@ impl Catalog {
     /// Every component and function is checked, then those that the
     /// document's `anyComponent` and `anyFunction` unions leave out, when it
     /// has such `oneOf` unions, are dropped. No `$ref` is fetched: one must
-    /// point into the document itself or into `common_types.json`.
+    /// point into the document itself or into `common_types.json`. A local
+    /// `#/$defs/X` that the document does not define names the common type
+    /// `X`.
     ///
     /// # Errors
     ///
@@ -589,6 +597,8 @@ impl ComponentDef {
             .map(|metadata| parse_metadata(name, metadata))
             .transpose()?;
         Ok(Self {
+            slots: slot::slots(&shape.properties, defs),
+            own: shape::own_property_names(definition, defs),
             properties: shape.properties.keys().cloned().collect(),
             required: shape.required.into_iter().collect(),
             allowed_parents,
@@ -941,7 +951,8 @@ fn descend(
 
 fn check_ref(reference: &str, document: &Value, at: &str) -> Result<(), CatalogError> {
     let (target, fragment) = reference.split_once('#').unwrap_or((reference, ""));
-    let target = if target.is_empty() || target == "catalog.json" {
+    let target_is_document = target.is_empty() || target == "catalog.json";
+    let target = if target_is_document {
         document
     } else if target == "common_types.json" || target.ends_with("/common_types.json") {
         schema::common_types()
@@ -951,7 +962,10 @@ fn check_ref(reference: &str, document: &Value, at: &str) -> Result<(), CatalogE
             reference: reference.to_owned(),
         });
     };
-    if target.pointer(fragment).is_some() {
+    // A local `#/$defs/X` that the catalog does not define names the common
+    // type `X`, as validation bundles it.
+    let common = || target_is_document && schema::common_types().pointer(fragment).is_some();
+    if target.pointer(fragment).is_some() || (fragment.starts_with("/$defs/") && common()) {
         Ok(())
     } else {
         Err(CatalogError::UnresolvedRef {

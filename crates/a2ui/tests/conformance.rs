@@ -157,6 +157,10 @@ fn parse_error_phrase(error: &ExpressionError) -> Option<&'static str> {
         | UnknownFunction { .. }
         | IndexOutsideCollection
         | EvaluationTooDeep
+        | UnknownSystemFunction { .. }
+        | UnresolvedCatalog(_)
+        | AgentOnly { .. }
+        | UserActivationRequired { .. }
         | Function { .. } => None,
     }
 }

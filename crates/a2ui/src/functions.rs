@@ -37,12 +37,24 @@ const BASIC: [(&str, Function); 14] = [
 /// The functions a [`DataContext`] can call, by name.
 ///
 /// System functions such as `@index` are not here: the context answers them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Functions {
     table: BTreeMap<String, Function>,
 }
 
 impl Functions {
+    /// No functions, for a catalog whose functions run elsewhere or that
+    /// declares none.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds `function` as `name`, replacing any function of that name.
+    pub fn insert(&mut self, name: &str, function: Function) {
+        self.table.insert(name.to_owned(), function);
+    }
+
     /// The functions of A2UI's basic catalog: the validators `required`,
     /// `regex`, `length`, `numeric` and `email`; `formatString`,
     /// `formatNumber`, `formatCurrency`, `formatDate` and `pluralize`, which

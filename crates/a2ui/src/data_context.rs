@@ -1,9 +1,11 @@
 use serde_json::{Map, Value};
 
+use crate::catalog::Callers;
+use crate::catalogs::Catalogs;
 use crate::coerce::{number_value, to_number};
 use crate::data_model::DataModel;
 use crate::expr::{Call, Expr, ExpressionError};
-use crate::functions::{Args, Effect, Functions};
+use crate::functions::{Args, Effect, Function, Functions};
 use crate::pointer::{resolve_path, Pointer};
 use crate::template::MAX_DEPTH;
 
@@ -13,6 +15,17 @@ use crate::template::MAX_DEPTH;
 /// template that reads itself back from the data model.
 const MAX_EVALUATION_DEPTH: usize = 2 * MAX_DEPTH;
 
+/// Whether a user's gesture, such as a click, set off an evaluation. Only
+/// then may a function that requires user activation, such as `openUrl`, run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum UserActivation {
+    /// A binding, a check, or anything else the renderer evaluates by itself.
+    #[default]
+    Absent,
+    /// An action the user triggered.
+    Present,
+}
+
 /// Evaluates expressions against a data model, in one scope.
 ///
 /// Relative bindings resolve against the scope path, and `@index` reads the
@@ -20,23 +33,65 @@ const MAX_EVALUATION_DEPTH: usize = 2 * MAX_DEPTH;
 #[derive(Debug)]
 pub struct DataContext<'a> {
     model: &'a DataModel,
-    functions: &'a Functions,
+    calls: Calls<'a>,
     scope: Option<String>,
     index: Option<usize>,
     depth: usize,
+    activation: UserActivation,
+    /// The catalog of the function running now, which a template call that
+    /// names no catalog inherits.
+    running: Option<&'a str>,
     effects: Vec<Effect>,
 }
 
+/// Where a call finds its function.
+#[derive(Debug, Clone, Copy)]
+enum Calls<'a> {
+    /// One table, whatever catalog the call names.
+    Table(&'a Functions),
+    /// The catalogs of a surface, resolved for each call.
+    Surface {
+        catalogs: &'a Catalogs,
+        surface: &'a str,
+        default: Option<&'a str>,
+    },
+}
+
 impl<'a> DataContext<'a> {
-    /// A context at the root of `model`, calling `functions`.
+    /// A context at the root of `model`, calling `functions` whatever catalog
+    /// a call names.
     #[must_use]
     pub fn new(model: &'a DataModel, functions: &'a Functions) -> Self {
+        Self::with_calls(model, Calls::Table(functions))
+    }
+
+    /// A context at the root of a surface's model, where each call runs in
+    /// the catalog it names, else in the surface's default catalog.
+    pub(crate) fn on_surface(
+        model: &'a DataModel,
+        catalogs: &'a Catalogs,
+        surface: &'a str,
+        default: Option<&'a str>,
+    ) -> Self {
+        Self::with_calls(
+            model,
+            Calls::Surface {
+                catalogs,
+                surface,
+                default,
+            },
+        )
+    }
+
+    fn with_calls(model: &'a DataModel, calls: Calls<'a>) -> Self {
         Self {
             model,
-            functions,
+            calls,
             scope: None,
             index: None,
             depth: 0,
+            activation: UserActivation::Absent,
+            running: None,
             effects: Vec::new(),
         }
     }
@@ -55,13 +110,22 @@ impl<'a> DataContext<'a> {
         self
     }
 
+    /// Says whether a user's gesture set off this evaluation.
+    #[must_use]
+    pub fn with_activation(mut self, activation: UserActivation) -> Self {
+        self.activation = activation;
+        self
+    }
+
     /// Evaluates `expr`. A binding to a path with nothing there is null.
     ///
     /// # Errors
     ///
     /// Fails on an invalid path, an unknown function, `@index` outside a
     /// collection, a function that refuses its arguments, or recursion
-    /// deeper than the evaluation bound.
+    /// deeper than the evaluation bound. On a surface, a call also fails when
+    /// its catalog cannot be resolved, when only the agent may call it, and
+    /// when it requires user activation that is absent.
     pub fn evaluate(&mut self, expr: &Expr) -> Result<Value, ExpressionError> {
         match expr {
             Expr::Literal(value) => Ok(value.clone()),
@@ -78,6 +142,25 @@ impl<'a> DataContext<'a> {
         }
     }
 
+    /// Reads the value at `path`, resolved against the scope, or null.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the resolved path is not a valid pointer.
+    fn read(&self, path: &str) -> Result<Value, ExpressionError> {
+        let pointer = self.pointer(path)?;
+        Ok(self.model.get(&pointer).cloned().unwrap_or(Value::Null))
+    }
+
+    /// The absolute pointer `path` names, resolved against the scope.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the resolved path is not a valid pointer.
+    fn pointer(&self, path: &str) -> Result<Pointer, ExpressionError> {
+        Ok(Pointer::parse(&resolve_path(path, self.scope.as_deref()))?)
+    }
+
     /// Hands over the effects that functions asked for, in order.
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
@@ -85,11 +168,6 @@ impl<'a> DataContext<'a> {
 
     pub(crate) fn push_effect(&mut self, effect: Effect) {
         self.effects.push(effect);
-    }
-
-    fn read(&self, path: &str) -> Result<Value, ExpressionError> {
-        let pointer = Pointer::parse(&resolve_path(path, self.scope.as_deref()))?;
-        Ok(self.model.get(&pointer).cloned().unwrap_or(Value::Null))
     }
 
     fn evaluate_nested(&mut self, expr: &Expr) -> Result<Value, ExpressionError> {
@@ -113,17 +191,58 @@ impl<'a> DataContext<'a> {
         if call.name == "@index" {
             return self.index(call);
         }
-        let function =
-            self.functions
-                .get(&call.name)
-                .ok_or_else(|| ExpressionError::UnknownFunction {
-                    name: call.name.clone(),
-                })?;
+        if call.name.starts_with('@') {
+            return Err(ExpressionError::UnknownSystemFunction {
+                name: call.name.clone(),
+            });
+        }
+        let (catalog, function) = self.find(call)?;
         let args = self.evaluate_args(call)?;
-        function(&args, self).map_err(|source| ExpressionError::Function {
+        let outer = std::mem::replace(&mut self.running, catalog);
+        let value = function(&args, self);
+        self.running = outer;
+        value.map_err(|source| ExpressionError::Function {
             name: call.name.clone(),
             source,
         })
+    }
+
+    /// The function a call runs and the catalog it runs in, checked against
+    /// what that catalog declares about it.
+    fn find(&self, call: &Call) -> Result<(Option<&'a str>, Function), ExpressionError> {
+        let unknown = || ExpressionError::UnknownFunction {
+            name: call.name.clone(),
+        };
+        match self.calls {
+            Calls::Table(functions) => Ok((None, functions.get(&call.name).ok_or_else(unknown)?)),
+            Calls::Surface {
+                catalogs,
+                surface,
+                default,
+            } => {
+                let named = call.catalog_id.as_deref();
+                // A template call names no catalog: it runs in the catalog of
+                // the formatString that evaluates it.
+                let (id, supported) = match named {
+                    Some(named) => catalogs.resolve(Some(named), None, surface),
+                    None => catalogs.resolve(self.running, default, surface),
+                }?;
+                if let Some(def) = supported.catalog.function(&call.name) {
+                    if def.callers() == Callers::AgentOnly {
+                        return Err(ExpressionError::AgentOnly {
+                            name: call.name.clone(),
+                        });
+                    }
+                    if def.requires_user_activation() && self.activation == UserActivation::Absent {
+                        return Err(ExpressionError::UserActivationRequired {
+                            name: call.name.clone(),
+                        });
+                    }
+                }
+                let function = supported.functions.get(&call.name).ok_or_else(unknown)?;
+                Ok((Some(id), function))
+            }
+        }
     }
 
     fn evaluate_args(&mut self, call: &Call) -> Result<Args, ExpressionError> {

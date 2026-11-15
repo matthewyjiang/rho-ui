@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::catalogs::UnresolvedCatalog;
 use crate::functions::FunctionError;
 use crate::pointer::{check_escapes, PointerError};
 use crate::template::{MAX_DEPTH, MAX_TEMPLATE_CHARS, MAX_TEMPLATE_PARTS};
@@ -136,6 +137,29 @@ pub enum ExpressionError {
     #[error("unknown function {name:?}")]
     UnknownFunction {
         /// The name called.
+        name: String,
+    },
+    /// A call to an `@` name other than the system functions the protocol
+    /// defines, `@index`.
+    #[error("unknown system function {name:?}")]
+    UnknownSystemFunction {
+        /// The name called.
+        name: String,
+    },
+    /// A call on a surface whose catalog cannot be resolved.
+    #[error(transparent)]
+    UnresolvedCatalog(#[from] UnresolvedCatalog),
+    /// A renderer call to a function whose catalog lets only the agent call
+    /// it.
+    #[error("function {name:?} is agentOnly and cannot be called by renderer")]
+    AgentOnly {
+        /// The function called.
+        name: String,
+    },
+    /// A call, outside a user's gesture, to a function that requires one.
+    #[error("function {name:?} requires user activation")]
+    UserActivationRequired {
+        /// The function called.
         name: String,
     },
     /// `@index` evaluated outside a collection item.

@@ -125,6 +125,85 @@ fn pieces<'a>(
     all
 }
 
+/// The names of the properties `definition` declares as its own, wherever it
+/// declares them: in its `properties`, in `allOf`, `oneOf` and `anyOf`
+/// members at any depth, and in the local definitions those reference. The
+/// standard `ComponentCommon` and `Checkable` mixins are not its own, nor are
+/// a `catalogId` and a `metadata` of their standard shape declared inline
+/// beside `id`, which is `ComponentCommon` written out.
+///
+/// During the v1.0 transition a bare `catalogId`, `accessibility`,
+/// `metadata` or `checks` key is read as the `@` envelope key unless the
+/// component declares a property of that name as its own.
+pub(crate) fn own_property_names(
+    definition: &Map<String, Value>,
+    defs: &Map<String, Value>,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_own(definition, defs, &mut HashSet::new(), &mut names);
+    names
+}
+
+fn collect_own<'a>(
+    definition: &'a Map<String, Value>,
+    defs: &'a Map<String, Value>,
+    visited: &mut HashSet<&'a str>,
+    names: &mut BTreeSet<String>,
+) {
+    if let Some(Value::Object(properties)) = definition.get("properties") {
+        let inline_common = properties.contains_key("id");
+        for (name, schema) in properties {
+            if !(inline_common && is_standard_envelope(name, schema)) {
+                names.insert(name.clone());
+            }
+        }
+    }
+    let mut members: Vec<&Value> = Vec::new();
+    for keyword in ["allOf", "oneOf", "anyOf"] {
+        members.extend(
+            definition
+                .get(keyword)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        );
+    }
+    for member in members {
+        let Value::Object(member) = member else {
+            continue;
+        };
+        match member.get("$ref").and_then(Value::as_str) {
+            None => collect_own(member, defs, visited, names),
+            Some(reference) => {
+                if let Some(Value::Object(target)) = resolve_local(defs, reference) {
+                    if visited.insert(reference) {
+                        collect_own(target, defs, visited, names);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether `schema` declares `name` as `ComponentCommon` does: a string
+/// `catalogId`, or a `metadata` object whose only property is `extensions`.
+fn is_standard_envelope(name: &str, schema: &Value) -> bool {
+    let type_is = |kind: &str| schema.get("type").and_then(Value::as_str) == Some(kind);
+    match name {
+        "catalogId" => type_is("string"),
+        "metadata" => {
+            type_is("object")
+                && schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| {
+                        properties.len() == 1 && properties.contains_key("extensions")
+                    })
+        }
+        _ => false,
+    }
+}
+
 /// The value a local reference such as `#/$defs/Base` points at in a
 /// catalog's `$defs`.
 pub(crate) fn resolve_local<'a>(

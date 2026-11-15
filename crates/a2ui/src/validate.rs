@@ -4,8 +4,9 @@
 //! crate.
 
 use std::collections::HashMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 
+use jsonschema::error::ValidationErrorKind;
 use jsonschema::{Retrieve, Uri};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -117,7 +118,7 @@ impl CatalogValidator {
             .components()
             .keys()
             .map(|name| {
-                let root = json!({ "$ref": format!("#/components/{name}") });
+                let root = json!({ "$ref": format!("#/components/{}", fragment_token(name)) });
                 Ok((name.clone(), build(EntryKind::Component, name, root)?))
             })
             .collect::<Result<_, CatalogError>>()?;
@@ -128,7 +129,7 @@ impl CatalogValidator {
                 let root = json!({
                     "allOf": [
                         { "$ref": "#/$defs/FunctionCommon" },
-                        { "$ref": format!("#/functions/{name}") },
+                        { "$ref": format!("#/functions/{}", fragment_token(name)) },
                     ],
                     "unevaluatedProperties": false,
                 });
@@ -176,6 +177,30 @@ impl CatalogValidator {
         schema_violations(validator, &body, "", &mut violations);
         self.check_calls(&body, home, &mut String::new(), &mut violations);
         ValidationError::check(violations)
+    }
+
+    /// The violations of a component's own schema, with every call in it
+    /// checked as an envelope only, or `None` when the catalog has no such
+    /// component. The processor checks each call in the catalog it resolves
+    /// to with [`CatalogValidator::call_violations`].
+    pub(crate) fn schema_violations(
+        &self,
+        component: &str,
+        instance: &Value,
+    ) -> Option<Vec<Violation>> {
+        let validator = self.components.get(component)?;
+        let mut violations = Vec::new();
+        schema_violations(validator, instance, "", &mut violations);
+        Some(violations)
+    }
+
+    /// The violations of one call to a function of this catalog, or `None`
+    /// when the catalog has no such function.
+    pub(crate) fn call_violations(&self, name: &str, call: &Value) -> Option<Vec<Violation>> {
+        let validator = self.functions.get(name)?;
+        let mut violations = Vec::new();
+        schema_violations(validator, call, "", &mut violations);
+        Some(violations)
     }
 
     /// Fully checks every call below `node` that runs in this catalog.
@@ -344,6 +369,22 @@ fn call_envelope() -> Value {
     })
 }
 
+/// `name` as a token of a JSON Pointer in a URI fragment: escaped as RFC 6901
+/// says, then percent-encoded where RFC 3986 does not allow it in a fragment,
+/// as a non-ASCII identifier is.
+fn fragment_token(name: &str) -> String {
+    let escaped = name.replace('~', "~0").replace('/', "~1");
+    let mut token = String::with_capacity(escaped.len());
+    for byte in escaped.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&byte) {
+            token.push(char::from(byte));
+        } else {
+            let _ = write!(token, "%{byte:02X}");
+        }
+    }
+    token
+}
+
 fn common_type_validator(name: &str) -> jsonschema::Validator {
     let root = json!({ "$ref": format!("{}#/$defs/{name}", schema::COMMON_TYPES_URI) });
     compile(&root)
@@ -364,9 +405,26 @@ fn schema_violations(
     path: &str,
     violations: &mut Vec<Violation>,
 ) {
-    violations.extend(validator.iter_errors(value).map(|error| Violation::Schema {
-        path: format!("{path}{}", error.instance_path().as_str()),
-        message: error.to_string(),
+    violations.extend(validator.iter_errors(value).map(|error| {
+        // A missing or unexpected property is reported at that property, not
+        // at the object that lacks or holds it.
+        let field = match error.kind() {
+            ValidationErrorKind::Required { property } => property.as_str().map(str::to_owned),
+            ValidationErrorKind::AdditionalProperties { unexpected }
+            | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
+                unexpected.first().cloned()
+            }
+            _ => None,
+        };
+        let mut at = format!("{path}{}", error.instance_path().as_str());
+        if let Some(field) = field {
+            at.push('/');
+            at.push_str(&field.replace('~', "~0").replace('/', "~1"));
+        }
+        Violation::Schema {
+            path: at,
+            message: error.to_string(),
+        }
     }));
 }
 

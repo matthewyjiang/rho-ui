@@ -81,7 +81,11 @@ pub(crate) fn email(args: &Args) -> Value {
     if matches!(args.get("value"), Some(Value::String(text)) if is_email(text)) {
         valid()
     } else {
-        invalid("Must be a valid email address.")
+        json!({
+            "valid": false,
+            "code": "INVALID_EMAIL",
+            "message": "Please enter a valid email address (e.g. user@example.com).",
+        })
     }
 }
 
