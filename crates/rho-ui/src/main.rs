@@ -40,6 +40,7 @@ mod transcript;
 mod turn_times;
 #[cfg(test)]
 mod ui_tests;
+mod usage;
 mod work;
 mod workspaces;
 

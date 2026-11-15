@@ -755,6 +755,24 @@ fn new_session_runs_a_turn_through_an_approval() {
         is_visible(window, "details-1")
     });
     ui.shot("done");
+
+    // The footer's context ring opens its numbers on hover.
+    let usage = ui
+        .session()
+        .usage()
+        .cloned()
+        .expect("the daemon reported usage");
+    assert_eq!((usage.used(), usage.size()), (2_500, Some(10_000)));
+    ui.act(|window, cx| {
+        let ring = window.find("composer-usage");
+        assert_eq!(ring.label(), Some("Context 25% · $0.01"));
+        window.pointer_move(ring.bounds().center(), None, cx);
+    });
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the usage card", |window, _, _| {
+        is_visible(window, "usage-details")
+    });
+    ui.shot("usage");
 }
 
 /// Opens a new session and sends it `prompt`.

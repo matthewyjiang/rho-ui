@@ -1,8 +1,8 @@
 //! The prompt box under the transcript. Enter sends, Shift+Enter or
 //! Alt+Enter starts a new line; while a turn runs Send becomes Stop, and
 //! Enter steers the turn. Its footer holds the attach button and the session
-//! settings on the left, then context use and cost, the model, and the round
-//! Send button.
+//! settings on the left, then the context ring, the model, and the round Send
+//! button.
 //!
 //! What the user attaches shows above the text and goes with it, after it,
 //! as one message, as rho's terminal UI sends one: an image pasted, or any
@@ -39,7 +39,10 @@ use rho_ui_core::{
     check_attachment_total, Attachment, CommandInfo, CommandKind, Completion, Prompt,
 };
 
-use crate::attachments::{self, Preview};
+use crate::{
+    attachments::{self, Preview},
+    usage::UsageRing,
+};
 
 /// Grows from one line to this many before it scrolls: enough for a short
 /// multi-paragraph prompt without pushing the transcript off a laptop screen.
@@ -470,8 +473,8 @@ pub(crate) struct Composer {
     leading: Option<AnyElement>,
     /// Session settings just before Send.
     trailing: Option<AnyElement>,
-    /// Context use and cost, before Send.
-    meta: Option<String>,
+    /// Context use and cost, before the trailing settings.
+    usage: Option<UsageRing>,
     on_send: Handler,
     on_stop: Handler,
 }
@@ -488,7 +491,7 @@ impl Composer {
             mode,
             leading: None,
             trailing: None,
-            meta: None,
+            usage: None,
             on_send: Rc::new(on_send),
             on_stop: Rc::new(on_stop),
         }
@@ -504,8 +507,8 @@ impl Composer {
         self
     }
 
-    pub(crate) fn meta(mut self, meta: Option<String>) -> Self {
-        self.meta = meta;
+    pub(crate) fn usage(mut self, usage: Option<UsageRing>) -> Self {
+        self.usage = usage;
         self
     }
 
@@ -780,14 +783,7 @@ impl RenderOnce for Composer {
                             .overflow_hidden()
                             .children(self.leading),
                     )
-                    .children(self.meta.map(|meta| {
-                        div()
-                            .flex_shrink_0()
-                            .px_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(meta)
-                    }))
+                    .children(self.usage)
                     .children(self.trailing)
                     .child(action),
             );

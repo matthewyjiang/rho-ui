@@ -63,6 +63,7 @@ use crate::{
     session_settings::{Availability, SessionSettings, SettingsEvent},
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
+    usage::UsageRing,
     workspaces::WorkspaceRef,
     StopTurn,
 };
@@ -1068,7 +1069,7 @@ impl SessionView {
                 )
                 .leading(SessionSettings::render_modes(&self.settings, cx))
                 .trailing(SessionSettings::render_panel_button(&self.settings, cx))
-                .meta(self.usage_label()),
+                .usage(self.session.usage().cloned().map(UsageRing::new)),
             )
             .into_any_element()
     }
@@ -1202,20 +1203,6 @@ impl SessionView {
                     .on_click(cx.listener(|this, _, window, cx| this.take_back_held(window, cx))),
             );
         Some(row.into_any_element())
-    }
-
-    /// "Context 25% · $0.01", once the daemon reports usage.
-    fn usage_label(&self) -> Option<String> {
-        let usage = self.session.usage()?;
-        let mut parts = Vec::new();
-        if let Some(size) = usage.size().filter(|size| *size > 0) {
-            let percent = usage.used().saturating_mul(100) / size;
-            parts.push(format!("Context {percent}%"));
-        }
-        if let Some(cost) = usage.cost_usd() {
-            parts.push(format!("${cost:.2}"));
-        }
-        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 }
 

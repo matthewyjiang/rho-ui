@@ -2,7 +2,7 @@
 
 How rho-ui behaves, in detail.
 
-The composer's footer holds the session's settings: the permission mode (which tool calls run without asking) on the left, and on the right one button naming the model and reasoning, which opens the model list with search beside the reasoning levels and fast mode. New session opens the session right away, so these can be set before the first message; rho writes no file for a session until its first prompt, and the daemon discards an unused draft's session, so nothing is left behind. A setting changed while a turn runs applies when the turn ends.
+The composer's footer holds the session's settings: the permission mode (which tool calls run without asking) on the left, and on the right one button naming the model and reasoning, which opens the model list with search beside the reasoning levels and fast mode. Beside that button, a ring fills as the context window does; hover it for the tokens in use and what the session has cost. New session opens the session right away, so these can be set before the first message; rho writes no file for a session until its first prompt, and the daemon discards an unused draft's session, so nothing is left behind. A setting changed while a turn runs applies when the turn ends.
 
 The app's shortcuts below are written with Ctrl; on macOS, Cmd takes its place, and tooltips show the shortcut this platform uses. The terminal's own keys say how they differ.
 
