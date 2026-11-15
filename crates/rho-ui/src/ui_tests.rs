@@ -105,6 +105,7 @@ const WAIT: Duration = Duration::from_secs(10);
 /// `sh`, so the shell it runs keeps the name the terminal tab shows. Kept
 /// in `target/`, beside the screenshots, as a static is never dropped to
 /// clean up a temporary folder.
+#[cfg(unix)]
 static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell");
@@ -119,6 +120,11 @@ static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
         .expect("make the test shell executable");
     path
 });
+
+/// `cmd.exe`, the shell a Windows terminal runs; the tests that script a
+/// shell's output speak POSIX `sh` and are ignored there.
+#[cfg(windows)]
+static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| PathBuf::from("cmd.exe"));
 
 /// Writes a `rho` at `path` that answers as rho 3.1.0, with 3.2.0 out:
 /// `update --check --json` says whether an update is available with the
@@ -1197,6 +1203,7 @@ fn composer_settings_change_the_session() {
 /// A socket that takes the app's connection but passes it on to `daemon`
 /// only once the returned sender sends or drops, so a test can act while
 /// the app connects.
+#[cfg(unix)]
 fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::mpsc::Sender<()>) {
     use std::os::unix::net::{UnixListener, UnixStream};
     let DaemonTarget::Socket(real) = daemon.clone() else {
@@ -1225,6 +1232,7 @@ fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::
 /// A new session asked for while this machine connects waits for the
 /// daemon, then opens, rather than failing as not connected.
 #[test]
+#[cfg(unix)]
 fn a_draft_opened_while_connecting_waits_for_the_daemon() {
     let daemon = FakeDaemon::start(Script::default());
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2259,6 +2267,7 @@ fn a_missing_rho_offers_its_install() {
 /// others it opened with work under way, so the daemon carries on their
 /// turns; other clients' sessions are left to them.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake rho written as a POSIX sh script")]
 fn an_update_installs_then_restarts_the_daemon_on_request() {
     let dir = tempfile::tempdir().expect("a folder for the fake rho");
     let rho = dir.path().join("rho");
@@ -3122,6 +3131,7 @@ fn the_files_surface_opens_the_sessions_files() {
 /// method's composing stays out of the shell until it commits; and a
 /// program that asks for the mouse gets a click as an escape sequence.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn the_terminal_surface_runs_a_shell() {
     let mut ui = Harness::with_terminal("terminal");
     ui.act(|window, cx| {
@@ -3218,6 +3228,7 @@ fn the_terminal_surface_runs_a_shell() {
 /// A selection dragged past the terminal's top or bottom scrolls and
 /// selects on while the pointer rests there.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn a_terminal_selection_scrolls_past_its_edges() {
     let mut ui = Harness::with_terminal("terminal-autoscroll");
     ui.input_method(|input, cx| input.commit_text("seq 200", cx));
@@ -3304,6 +3315,7 @@ fn a_terminal_selection_scrolls_past_its_edges() {
 /// else, with the keyboard elsewhere, the one under the pointer, and on
 /// nothing with neither, as when the pointer has left the window.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn terminal_tabs_split_and_name_their_programs() {
     const SPLIT_DOWN: &str = key("ctrl-shift-e", "cmd-shift-d");
     const CLOSE: &str = key("ctrl-shift-w", "cmd-w");
@@ -3428,6 +3440,7 @@ fn terminal_tabs_split_and_name_their_programs() {
 /// and the keyboard goes on to the pane left; the last pane's takes the
 /// tab with it.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn a_shell_that_exits_closes_its_pane() {
     let mut ui = Harness::with_terminal("terminal-exit");
     ui.act(|window, cx| window.press(key("ctrl-shift-o", "cmd-d"), cx));

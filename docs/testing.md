@@ -4,7 +4,7 @@
 cargo test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on Linux and macOS for every pull request and push to `main`, with the toolchain `mise.toml` pins. Each run uploads the UI tests' screenshots as `ui-shots-<os>` artifacts.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on Linux, macOS and Windows for every pull request and push to `main`, with the toolchain `mise.toml` pins. Each run uploads the UI tests' screenshots as `ui-shots-<os>` artifacts. On Windows the fake daemon listens on a named pipe; the tests that script a POSIX `sh` (the terminal's, and those that stand in a fake `rho`) are ignored there, and those of symlinks, ssh and the remote folder script, which are Unix-only, aren't built.
 
 Before adding or growing a test, load the `rho-ui-test-selection` skill (`.agents/skills`): every test needs a failure mode, one owner layer, and a gap.
 

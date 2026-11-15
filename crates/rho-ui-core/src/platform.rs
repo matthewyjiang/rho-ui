@@ -276,7 +276,7 @@ pub(crate) mod endpoint {
         process::Command,
     };
 
-    use rho_protocol::{Client, ClientHello, HelloResponse, Notifications};
+    use rho_protocol::{Client, ClientHello, CloseOnShutdown, HelloResponse, Notifications};
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
     use crate::DaemonError;
@@ -303,7 +303,10 @@ pub(crate) mod endpoint {
         )))
     }
 
-    /// Connects to the named pipe at `path`. Runs on the I/O runtime.
+    /// Connects to the named pipe at `path`. Runs on the I/O runtime. A
+    /// pipe can't close one direction alone, so the client's shutdown
+    /// closes it whole, as rho's own client does; else a dropped client
+    /// and the daemon would each wait for the other.
     ///
     /// # Errors
     ///
@@ -312,8 +315,8 @@ pub(crate) mod endpoint {
         clippy::unused_async,
         reason = "the same signature as on Unix, where connecting awaits"
     )]
-    pub(crate) async fn connect(path: &Path) -> io::Result<NamedPipeClient> {
-        ClientOptions::new().open(path)
+    pub(crate) async fn connect(path: &Path) -> io::Result<CloseOnShutdown<NamedPipeClient>> {
+        ClientOptions::new().open(path).map(CloseOnShutdown::new)
     }
 }
 

@@ -339,6 +339,8 @@ mod tests {
     /// A linked worktree: `.git` file pointing into the main repository. It
     /// and any subfolder belong to the main checkout's project, at its
     /// resolved path, as is the checkout reached through a symlink.
+    // Making a symlink on Windows needs Developer Mode or an administrator.
+    #[cfg(unix)]
     #[test]
     fn linked_worktrees_use_the_main_repository() {
         let root = std::env::temp_dir().join(format!("rho-ui-repo-test-{}", std::process::id()));

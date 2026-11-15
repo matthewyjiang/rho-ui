@@ -473,6 +473,8 @@ mod tests {
     /// what reading the files here does: a subfolder of a checkout, a
     /// linked worktree, a plain folder, a symlink to one and to a checkout,
     /// a prefix, a hidden folder, and a missing path.
+    // The script runs on remote machines, which are Unix.
+    #[cfg(unix)]
     #[test]
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();
