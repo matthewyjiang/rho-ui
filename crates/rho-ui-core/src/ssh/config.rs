@@ -281,10 +281,10 @@ fn parse(
     })
 }
 
-/// A space-separated list of paths, each with a leading `~` as `home`.
-/// The files a list setting names, such as `UserKnownHostsFile`. `ssh -G`
-/// prints `none` for one that names none (OpenSSH's
-/// `dump_cfg_strarray_oneline`), as `RevokedHostKeys` is when unset.
+/// The files a list setting names, such as `UserKnownHostsFile`: paths
+/// split at spaces, each with a leading `~` as `home`. `ssh -G` prints
+/// `none` for one that names none (OpenSSH's `dump_cfg_strarray_oneline`),
+/// as `RevokedHostKeys` is when unset.
 fn paths(value: &str, home: Option<&Path>) -> Vec<PathBuf> {
     if value.eq_ignore_ascii_case("none") {
         return Vec::new();
@@ -575,6 +575,7 @@ mod tests {
             let output = format!("user me\nhostname box\nuserknownhostsfile none\n{line}\n");
             let resolved = parse("box", &output, &local(), &vars).expect("a route");
             assert_eq!(resolved.revoked_host_keys, revoked, "{line}");
+            assert_eq!(resolved.known_hosts, Vec::<PathBuf>::new(), "{line}");
         }
     }
 

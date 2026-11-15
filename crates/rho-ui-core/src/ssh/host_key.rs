@@ -163,13 +163,13 @@ fn lookup_name(resolved: &Resolved) -> String {
 }
 
 /// The keys `resolved`'s `known_hosts` files list for its host, and those
-/// its `RevokedHostKeys` file lists. A `known_hosts` file that can't be
-/// read lists none, as for ssh, and so does a `RevokedHostKeys` file that
-/// isn't there. Reads the files, so runs off the I/O runtime.
+/// its `RevokedHostKeys` files list. A `known_hosts` file that can't be
+/// read lists none, as for ssh. Reads the files, so runs off the I/O
+/// runtime.
 ///
 /// # Errors
 ///
-/// Fails, saying why, when the `RevokedHostKeys` file can't be read or
+/// Fails, saying why, when a `RevokedHostKeys` file can't be read or
 /// isn't a text list of keys, such as a binary KRL: rho-ui won't connect
 /// without checking it.
 pub(super) fn read(resolved: &Resolved) -> Result<Vec<KnownKey>, String> {
