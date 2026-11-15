@@ -27,3 +27,17 @@ specification/v1_0/json/renderer_to_agent.json
 specification/v1_0/json/renderer_to_agent_list.json
 specification/v1_0/json/renderer_to_agent_list_wrapper.json
 specification/v1_0/json/sample.json
+conformance/core/message_processor_v1_0.yaml
+conformance/core/validator_v1_0.yaml
+conformance/core/data_deletion.yaml
+conformance/core/data_model_pointers.yaml
+conformance/core/reserved_keys.yaml
+conformance/core/composition_constraints.yaml
+conformance/core/index_function.yaml
+conformance/core/validation_result.yaml
+conformance/core/error_responses.yaml
+conformance/core/actions.yaml
+conformance/core/multi_catalog.yaml
+conformance/test_data/catalogs/allowed_callers_catalog_v1_0.json
+conformance/test_data/catalogs/custom_catalog_v1_0.json
+specification/v0_9/catalogs/basic/catalog.json
