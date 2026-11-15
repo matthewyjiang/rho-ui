@@ -690,6 +690,7 @@ mod tests {
     /// of it: tracked files that are there and untracked ones not ignored.
     /// Outside one it lists every file, and it stops at its limit with
     /// whole paths only.
+    #[cfg_attr(windows, ignore = "runs a POSIX sh script on this machine")]
     #[test]
     fn the_list_script_lists_what_git_sees() {
         let dir = tempfile::tempdir().unwrap();

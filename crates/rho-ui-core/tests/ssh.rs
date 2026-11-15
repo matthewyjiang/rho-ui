@@ -1,6 +1,9 @@
 //! `Daemon` over ssh. The hermetic test runs a fake `ssh` that plays the
 //! remote machine in a temporary directory, with the fake daemon listening
 //! where that machine's rho home puts it. The live test runs the real `ssh`.
+//! Unix only: reaching a machine rides OpenSSH's `ControlMaster`, which
+//! Win32-OpenSSH lacks.
+#![cfg(unix)]
 
 use std::{
     path::Path,

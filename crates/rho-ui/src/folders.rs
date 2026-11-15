@@ -451,6 +451,11 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "a remote machine's POSIX path doesn't parse on a Windows host: \
+                  `Typed` uses this machine's path rules"
+    )]
     fn a_typed_path_browses_its_folder_after_a_slash_else_its_parent() {
         let home = Some(Path::new("/home/me"));
         let parse = |text| Typed::parse(text, home).map(|t| (t.path, t.browse, t.prefix));
@@ -473,6 +478,8 @@ mod tests {
     /// what reading the files here does: a subfolder of a checkout, a
     /// linked worktree, a plain folder, a symlink to one and to a checkout,
     /// a prefix, a hidden folder, and a missing path.
+    // The script runs on remote machines, which are Unix.
+    #[cfg(unix)]
     #[test]
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();

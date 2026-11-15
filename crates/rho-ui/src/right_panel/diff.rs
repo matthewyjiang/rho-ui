@@ -406,6 +406,7 @@ mod tests {
     /// [`SCRIPT`] finds every kind of uncommitted change from any folder of
     /// the repository, staged or not, untracked files included and ignored
     /// ones left out, and says when a folder is in no repository.
+    #[cfg_attr(windows, ignore = "runs a POSIX sh script on this machine")]
     #[test]
     fn the_script_lists_uncommitted_changes() {
         let dir = tempfile::tempdir().unwrap();

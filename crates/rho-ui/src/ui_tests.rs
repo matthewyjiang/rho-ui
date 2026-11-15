@@ -85,6 +85,19 @@ fn text_system() -> Arc<dyn gpui_kit::PlatformTextSystem> {
     Arc::new(gpui_apple::AppleTextSystem::new())
 }
 
+/// GPUI's offscreen renderer for this platform.
+#[cfg(not(windows))]
+use gpui_kit::platform::current_headless_renderer as headless_renderer;
+
+/// GPUI has no offscreen renderer for Windows; its wgpu one draws there,
+/// on Vulkan, which CI gives with Mesa lavapipe.
+#[cfg(windows)]
+fn headless_renderer() -> gpui_kit::Result<Option<Box<dyn gpui_kit::PlatformHeadlessRenderer>>> {
+    let renderer: Box<dyn gpui_kit::PlatformHeadlessRenderer> =
+        Box::new(gpui_wgpu::WgpuHeadlessRenderer::new()?);
+    Ok(Some(renderer))
+}
+
 /// `linux` off macOS, `macos` on it: the terminal's keys, as Ghostty's,
 /// differ by more than Cmd for Ctrl, so `secondary-` can't say them.
 const fn key(linux: &'static str, macos: &'static str) -> &'static str {
@@ -105,6 +118,7 @@ const WAIT: Duration = Duration::from_secs(10);
 /// `sh`, so the shell it runs keeps the name the terminal tab shows. Kept
 /// in `target/`, beside the screenshots, as a static is never dropped to
 /// clean up a temporary folder.
+#[cfg(unix)]
 static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell");
@@ -119,6 +133,11 @@ static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
         .expect("make the test shell executable");
     path
 });
+
+/// `cmd.exe`, the shell a Windows terminal runs; the tests that script a
+/// shell's output speak POSIX `sh` and are ignored there.
+#[cfg(windows)]
+static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| PathBuf::from("cmd.exe"));
 
 /// Writes a `rho` at `path` that answers as rho 3.1.0, with 3.2.0 out:
 /// `update --check --json` says whether an update is available with the
@@ -246,7 +265,7 @@ impl Harness {
         let mut cx = HeadlessAppContext::with_platform(
             text_system(),
             Arc::new(crate::Assets),
-            gpui_kit::platform::current_headless_renderer,
+            headless_renderer,
         );
         // The daemon's answers arrive on a socket: its I/O thread wakes
         // tasks, which the deterministic scheduler only accepts this way.
@@ -1197,6 +1216,7 @@ fn composer_settings_change_the_session() {
 /// A socket that takes the app's connection but passes it on to `daemon`
 /// only once the returned sender sends or drops, so a test can act while
 /// the app connects.
+#[cfg(unix)]
 fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::mpsc::Sender<()>) {
     use std::os::unix::net::{UnixListener, UnixStream};
     let DaemonTarget::Socket(real) = daemon.clone() else {
@@ -1225,6 +1245,8 @@ fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::
 /// A new session asked for while this machine connects waits for the
 /// daemon, then opens, rather than failing as not connected.
 #[test]
+// The gate proxies a Unix socket.
+#[cfg(unix)]
 fn a_draft_opened_while_connecting_waits_for_the_daemon() {
     let daemon = FakeDaemon::start(Script::default());
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2259,6 +2281,7 @@ fn a_missing_rho_offers_its_install() {
 /// others it opened with work under way, so the daemon carries on their
 /// turns; other clients' sessions are left to them.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake rho written as a POSIX sh script")]
 fn an_update_installs_then_restarts_the_daemon_on_request() {
     let dir = tempfile::tempdir().expect("a folder for the fake rho");
     let rho = dir.path().join("rho");
@@ -2638,6 +2661,7 @@ fn a_reply_draws_its_diagram_and_formula_in_the_theme() {
 /// the lightbox at its own size, under its caption; it zooms in and fits
 /// again, and Escape closes it.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn pictures_show_in_place_and_open_in_the_lightbox() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let folder = dir.path().canonicalize().expect("it resolves");
@@ -2992,6 +3016,7 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
 /// screen works, read with this machine's `git`, and reads them again when
 /// the session's turn ends.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn the_diff_surface_follows_the_sessions_changes() {
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path().canonicalize().unwrap();
@@ -3048,6 +3073,7 @@ fn the_diff_surface_follows_the_sessions_changes() {
 /// open file again, and Back returns to the tree with its folder still
 /// open.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn the_files_surface_opens_the_sessions_files() {
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path().canonicalize().unwrap();
@@ -3122,6 +3148,7 @@ fn the_files_surface_opens_the_sessions_files() {
 /// method's composing stays out of the shell until it commits; and a
 /// program that asks for the mouse gets a click as an escape sequence.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn the_terminal_surface_runs_a_shell() {
     let mut ui = Harness::with_terminal("terminal");
     ui.act(|window, cx| {
@@ -3218,6 +3245,7 @@ fn the_terminal_surface_runs_a_shell() {
 /// A selection dragged past the terminal's top or bottom scrolls and
 /// selects on while the pointer rests there.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn a_terminal_selection_scrolls_past_its_edges() {
     let mut ui = Harness::with_terminal("terminal-autoscroll");
     ui.input_method(|input, cx| input.commit_text("seq 200", cx));
@@ -3304,6 +3332,7 @@ fn a_terminal_selection_scrolls_past_its_edges() {
 /// else, with the keyboard elsewhere, the one under the pointer, and on
 /// nothing with neither, as when the pointer has left the window.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn terminal_tabs_split_and_name_their_programs() {
     const SPLIT_DOWN: &str = key("ctrl-shift-e", "cmd-shift-d");
     const CLOSE: &str = key("ctrl-shift-w", "cmd-w");
@@ -3428,6 +3457,7 @@ fn terminal_tabs_split_and_name_their_programs() {
 /// and the keyboard goes on to the pane left; the last pane's takes the
 /// tab with it.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn a_shell_that_exits_closes_its_pane() {
     let mut ui = Harness::with_terminal("terminal-exit");
     ui.act(|window, cx| window.press(key("ctrl-shift-o", "cmd-d"), cx));
@@ -4172,9 +4202,9 @@ fn attached_files_go_with_the_message() {
         );
     };
     assert_eq!(text.text(), Some("# Notes\n\nShip it.\n"));
-    assert_eq!(text.path(), Some(notes.as_path()));
+    assert_eq!(text.path(), Some(notes));
     assert_eq!(linked.text(), None, "a binary file goes by path");
-    assert_eq!(linked.path(), Some(report.as_path()));
+    assert_eq!(linked.path(), Some(report));
     ui.act(|window, _| {
         for n in 0..3 {
             let id = format!("user-0-attachment-{n}");
@@ -4339,6 +4369,10 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 /// A typed path to a worktree adds its repository's project, not the
 /// worktree, and Remove takes a project off the list without picking it.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the project search parses typed paths with POSIX rules: `Typed` splits at `/`"
+)]
 fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let dir = std::env::temp_dir().join(format!("rho-ui-projects-{}", std::process::id()));
     let (main, tree) = crate::repo::fake_worktree(&dir);
@@ -4435,6 +4469,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
 /// machine's clone folder, adds the clone to the projects, and starts the
 /// draft there.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn a_typed_git_url_clones_into_the_clone_folder() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let dir = dir.path().canonicalize().expect("it resolves");
@@ -4588,7 +4623,9 @@ fn a_new_session_can_work_in_a_new_worktree() {
             let cwd = view.live().cwd;
             let plan = setting(view.session(), "mode").as_deref() == Some("plan");
             cwd.parent() == Some(Path::new("/rho/worktrees"))
-                && cwd.to_string_lossy().contains("/project-")
+                && cwd
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("project-"))
                 && plan
         })
     });
@@ -4830,8 +4867,9 @@ fn machines_list_side_by_side() {
     let draft_at = |path| draft_at(there.clone(), path);
     ui.click("new-session");
     ui.wait_until("the draft's session on the workstation", draft_at("/w/a"));
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     assert!(
-        remote.new_session_var("HOME").is_some(),
+        remote.new_session_var(home).is_some(),
         "the workstation opened it"
     );
 

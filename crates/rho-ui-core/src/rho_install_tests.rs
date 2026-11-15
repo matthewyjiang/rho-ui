@@ -68,6 +68,7 @@ fn the_check_reads_every_way_rho_answers() {
 /// The script finds rho through `sh` as a machine runs it, and tells a
 /// machine without rho from one whose rho answers.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake rho written as a POSIX sh script")]
 fn the_check_script_finds_rho_or_says_it_is_missing() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let rho = dir.path().join("rho");

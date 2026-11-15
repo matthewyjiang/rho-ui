@@ -1,6 +1,6 @@
 //! A scripted rho daemon for tests: rho-protocol's own server side on a real
-//! Unix socket, with no model behind it. rho-ui-core's daemon tests and
-//! rho-ui's headless UI tests both run it.
+//! Unix socket, or named pipe on Windows, with no model behind it.
+//! rho-ui-core's daemon tests and rho-ui's headless UI tests both run it.
 //!
 //! - `rho/session/new` returns "new-1", "new-2", ...
 //! - `rho/session/list` returns pages of two: new sessions that have had a
@@ -92,14 +92,16 @@ use rho_protocol::{
     Publisher, Question, RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent,
     Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
 };
-use tokio::{net::UnixListener, runtime::Runtime};
+use tokio::runtime::Runtime;
 
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
 
 mod config;
+mod listener;
 mod service;
 
 use config::FakeConfig;
+use listener::Listener;
 use service::Fake;
 
 /// The session [`Script::tui_job`] runs.
@@ -183,6 +185,17 @@ pub fn write_program(path: &Path, text: &str) {
     assert!(status.success(), "writing {} failed", path.display());
 }
 
+/// Where rho's daemon of the rho home `rho_home` listens when
+/// `XDG_RUNTIME_DIR` is unset: a Unix socket, or on Windows a named pipe.
+/// Makes the home and the daemon's runtime directory if missing.
+fn endpoint_of(rho_home: &Path) -> PathBuf {
+    std::fs::create_dir_all(rho_home).expect("the fake daemon makes its rho home");
+    let canonical = std::fs::canonicalize(rho_home).expect("the rho home resolves");
+    let endpoint = DaemonEndpoint::locate(&canonical, None).expect("a short rho home");
+    std::fs::create_dir_all(&endpoint.runtime_dir).expect("the daemon's runtime directory");
+    endpoint.socket
+}
+
 /// What the fake daemon holds when it starts.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Script {
@@ -210,19 +223,20 @@ pub enum TuiJob {
     Running,
 }
 
-/// A running fake daemon. Dropping it stops it and removes its socket.
+/// A running fake daemon. Dropping it stops it, and removes the directory
+/// of its socket when it made one.
 #[derive(Debug)]
 pub struct FakeDaemon {
     socket: PathBuf,
     service: Arc<Fake>,
-    /// The directory of its socket, when the fake made it.
+    /// Its rho home, when the fake made it.
     _dir: Option<tempfile::TempDir>,
     _runtime: Runtime,
 }
 
 impl FakeDaemon {
-    /// Starts a daemon holding `script`, listening on a socket in a
-    /// directory of its own.
+    /// Starts a daemon holding `script`, listening where rho's daemon of a
+    /// rho home of its own, a temporary directory, would.
     ///
     /// # Panics
     ///
@@ -230,7 +244,7 @@ impl FakeDaemon {
     /// thread: a test cannot go on without them.
     pub fn start(script: Script) -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory for the fake daemon");
-        let socket = dir.path().join("daemon.sock");
+        let socket = endpoint_of(dir.path());
         Self::serve(script, socket, Some(dir))
     }
 
@@ -242,11 +256,7 @@ impl FakeDaemon {
     ///
     /// If the OS refuses the home, a socket in it, or a thread.
     pub fn start_in_home(script: Script, rho_home: &Path) -> Self {
-        std::fs::create_dir_all(rho_home).expect("the fake daemon makes its rho home");
-        let canonical = std::fs::canonicalize(rho_home).expect("the rho home resolves");
-        let endpoint = DaemonEndpoint::locate(&canonical, None).expect("a short rho home");
-        std::fs::create_dir_all(&endpoint.runtime_dir).expect("the daemon's runtime directory");
-        Self::serve(script, endpoint.socket, None)
+        Self::serve(script, endpoint_of(rho_home), None)
     }
 
     fn serve(script: Script, socket: PathBuf, dir: Option<tempfile::TempDir>) -> Self {
@@ -256,9 +266,9 @@ impl FakeDaemon {
             .enable_time()
             .build()
             .expect("a runtime for the fake daemon");
-        let listener = {
+        let mut listener = {
             let _guard = runtime.enter();
-            UnixListener::bind(&socket).expect("the fake daemon binds its socket")
+            Listener::bind(&socket).expect("the fake daemon binds its socket")
         };
         let service = Arc::new(Fake {
             state: Mutex::new(State::new(script)),
@@ -271,7 +281,7 @@ impl FakeDaemon {
                 pid: std::process::id(),
                 build: BuildId::of_this_crate(),
             };
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let (service, info) = (Arc::clone(&serving), info.clone());
                 tokio::spawn(async move {
                     // Runs until the client leaves, or the daemon restarts.
