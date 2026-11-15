@@ -2,11 +2,9 @@
 //! read straight from `.git` files: no `git` process, no git library. On a
 //! remote machine, from [`REMOTE_SCRIPT`], which runs `git` there.
 
-use std::{
-    ffi::OsString,
-    os::unix::ffi::OsStringExt as _,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+use rho_ui_core::platform;
 
 /// A workspace's project, as the sidebar shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +152,7 @@ pub(crate) fn parse_remote(dirs: &[PathBuf], output: &[u8]) -> Option<Vec<Repo>>
     if facts.len() != dirs.len() {
         return None;
     }
-    let path = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    let path = platform::path_from_bytes;
     let text =
         |bytes: &[u8]| (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned());
     let repos = dirs

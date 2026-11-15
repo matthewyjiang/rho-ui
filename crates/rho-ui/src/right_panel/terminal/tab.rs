@@ -25,12 +25,11 @@ use crate::{right_panel::TerminalShortcut, session_view::SessionView, workspaces
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneCommand {
     /// Splits the pane, a new one after it: side by side along
-    /// [`Axis::Horizontal`] (Ctrl+Shift+O), one above the other along
-    /// [`Axis::Vertical`] (Ctrl+Shift+E).
+    /// [`Axis::Horizontal`], one above the other along [`Axis::Vertical`].
     Split(Axis),
-    /// Closes the pane, and the tab with its last pane (Ctrl+Shift+W).
+    /// Closes the pane, and the tab with its last pane.
     Close,
-    /// Puts the keyboard in the next pane that way (Ctrl+Alt+arrow).
+    /// Puts the keyboard in the next pane that way.
     Focus(Direction),
 }
 
@@ -514,7 +513,7 @@ mod tests {
     use super::*;
     use gpui_kit::{point, size};
 
-    /// Ctrl+Alt+arrow goes to the pane that way, past panes on another
+    /// Focusing a direction goes to the pane that way, past panes on another
     /// side: here, one pane on the left, and two stacked on the right.
     #[test]
     fn focus_goes_to_the_pane_that_way() {

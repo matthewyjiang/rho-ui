@@ -25,22 +25,26 @@ The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 
 ## Keys
 
+On macOS, Cmd takes the place of Ctrl in these.
+
 | Key | Action |
 | --- | --- |
 | Ctrl+N | New session |
 | Ctrl+Shift+N | New session, picking the project from the keyboard |
 | Ctrl+, | Settings |
 | Ctrl+B | Collapse or open the sidebar |
+| Ctrl+Alt+B | Show or hide the right panel |
+| Ctrl+Q | Quit |
 | Enter (while a turn runs) | Steer the turn |
 | Shift+Enter or Alt+Enter | New line in the composer |
-| Ctrl+V or Ctrl+Shift+V | Paste text, an image, or a copied file |
+| Ctrl+V, or Ctrl+Shift+V on any platform | Paste text, an image, or a copied file |
 
 ## Files
 
 - `~/.config/rho-ui/settings`: theme, scale, fonts, machines
 - `~/.local/state/rho-ui/state.sqlite3`: your projects, settled and snoozed sessions, turn times, and the sidebar's layout and filter
 
-These follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set.
+These follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set, on macOS too.
 
 ## More
 

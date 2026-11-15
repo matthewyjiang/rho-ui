@@ -1,12 +1,14 @@
 //! rho-ui's own settings: light or dark, UI scale, fonts, and the machines
-//! it connects to. They live in `$XDG_CONFIG_HOME/rho-ui/settings` (by
-//! default `~/.config/rho-ui/settings`), one `key = value` per line. The
+//! it connects to. They live in `settings` in rho-ui's config folder
+//! ([`AppDir::Config`]: by default `~/.config/rho-ui`), one `key = value`
+//! per line. The
 //! look applies to GPUI Kit's theme; the app follows the machines.
 
 use std::{fmt::Write as _, path::PathBuf};
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{px, App, Global, SharedString, WindowAppearance};
+use rho_ui_core::platform::{self, AppDir};
 
 use crate::{
     machines::{RemoteMachine, LOCAL},
@@ -150,7 +152,7 @@ impl Settings {
     /// Reads the settings file. Missing or unreadable values keep their
     /// defaults.
     pub(crate) fn load() -> Self {
-        let file = store::xdg_dir("XDG_CONFIG_HOME", ".config").map(|dir| dir.join("settings"));
+        let file = platform::app_dir(AppDir::Config).map(|dir| dir.join("settings"));
         let mut settings = file
             .as_ref()
             .and_then(|path| std::fs::read_to_string(path).ok())

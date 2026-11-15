@@ -13,7 +13,6 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     io,
-    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, OnceLock},
@@ -30,7 +29,10 @@ use tokio::{
     sync::oneshot,
 };
 
-use crate::daemon::{io, DaemonError, Machine};
+use crate::{
+    daemon::{io, DaemonError, Machine},
+    platform::{self, MAX_SOCKET_PATH_BYTES},
+};
 
 /// A rho daemon on another machine, reached over ssh.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,7 +84,7 @@ pub(crate) async fn connect(
             "{host:?} is not an ssh destination"
         )));
     }
-    let control = control_dir()
+    let control = platform::private_socket_dir("ssh")
         .map_err(|error| {
             DaemonError::Unreachable(format!(
                 "couldn't make a private directory for ssh's control socket: {error}"
@@ -163,7 +165,7 @@ impl SshLink {
         let mut input = b"set --".to_vec();
         for arg in args {
             input.push(b' ');
-            input.extend(quote_bytes(arg.as_ref().as_bytes()));
+            input.extend(quote_bytes(&platform::path_to_bytes(arg.as_ref())));
         }
         input.push(b'\n');
         input.extend(script.as_bytes());
@@ -241,7 +243,7 @@ impl SshLink {
     /// opened, and fails rather than connect again.
     pub fn terminal_command(&self, dir: &Path) -> (PathBuf, Vec<OsString>) {
         let mut remote = b"cd -- ".to_vec();
-        remote.extend(quote_bytes(dir.as_os_str().as_bytes()));
+        remote.extend(quote_bytes(&platform::path_to_bytes(dir.as_os_str())));
         remote.extend(br#" && exec "$SHELL" -l"#);
         let args = [
             format!("ControlPath={}", self.control.display()),
@@ -254,7 +256,7 @@ impl SshLink {
         .into_iter()
         .flat_map(|option| [OsString::from("-o"), option.into()])
         .chain(["-tt".into(), self.target.host.clone().into()])
-        .chain([OsString::from_vec(remote)])
+        .chain([platform::path_from_bytes(&remote).into_os_string()])
         .collect();
         (self.target.ssh.clone(), args)
     }
@@ -512,45 +514,6 @@ async fn read_stderr(mut stderr: ChildStderr) -> String {
     String::from_utf8_lossy(&kept).trim().to_owned()
 }
 
-/// The private directory that holds the control sockets, made if missing:
-/// `$XDG_RUNTIME_DIR/rho-ui/ssh`, else one named after the user in the
-/// temporary directory.
-///
-/// # Errors
-///
-/// Fails if the directory cannot be made, or other users can open it.
-fn control_dir() -> io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        Some(run) if run.is_absolute() => run.join("rho-ui").join("ssh"),
-        _ => {
-            let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-            std::env::temp_dir().join(format!("rho-ui-ssh-{user}"))
-        }
-    };
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    let mode = std::fs::metadata(&dir)?.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(io::Error::other(format!(
-            "{} is open to other users (mode {:o})",
-            dir.display(),
-            mode & 0o777
-        )));
-    }
-    Ok(dir)
-}
-
-/// Bytes `bind(2)` takes in a Unix socket path, as rho-protocol counts
-/// them: `sockaddr_un.sun_path` less its NUL.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const MAX_SOCKET_PATH_BYTES: usize = 107;
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-const MAX_SOCKET_PATH_BYTES: usize = 103;
-
 /// What ssh adds to the control path while it binds the master's socket:
 /// a dot and 16 random letters (`muxserver_listen` in OpenSSH's mux.c).
 const MASTER_SUFFIX_BYTES: usize = 17;
@@ -743,9 +706,10 @@ fn is_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-#[cfg(test)]
+// They run shell scripts, as the host does.
+#[cfg(all(test, unix))]
 mod tests {
-    use std::process::Command;
+    use std::{os::unix::ffi::OsStrExt as _, process::Command};
 
     use super::*;
 

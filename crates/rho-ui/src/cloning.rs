@@ -5,7 +5,9 @@
 //! the ssh connection to its daemon, on a remote one, so both find the
 //! folder by the same rules.
 
-use std::{ffi::OsString, os::unix::ffi::OsStringExt as _, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf};
+
+use rho_ui_core::platform;
 
 use gpui_kit::BackgroundExecutor;
 
@@ -104,7 +106,7 @@ pub(crate) async fn clone(
     let mut fields = output.split(|&byte| byte == 0).filter(|f| !f.is_empty());
     fields
         .next_back()
-        .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
+        .map(platform::path_from_bytes)
         .ok_or_else(|| "the clone script printed no path".to_owned())
 }
 
@@ -177,7 +179,7 @@ mod tests {
                 .unwrap();
             output.status.success().then(|| {
                 let path = output.stdout.split(|&b| b == 0).rfind(|f| !f.is_empty());
-                PathBuf::from(OsString::from_vec(path.unwrap().to_vec()))
+                platform::path_from_bytes(path.unwrap())
             })
         };
         let cloned = dir.join("code/thing");

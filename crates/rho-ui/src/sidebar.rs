@@ -1260,7 +1260,7 @@ fn new_session_button(cx: &Context<'_, SidebarView>) -> Button {
         .small()
         .icon(Lucide::SquarePen)
         .accessibility_label("New session")
-        .tooltip("New session (Ctrl+N)")
+        .tooltip_with_action("New session", &crate::NewSession, Some("RhoApp"))
         .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewSession)))
 }
 
@@ -1270,7 +1270,7 @@ fn settings_button(cx: &Context<'_, SidebarView>) -> Button {
         .small()
         .icon(IconName::Settings)
         .accessibility_label("Settings")
-        .tooltip("Settings (Ctrl+,)")
+        .tooltip_with_action("Settings", &crate::OpenSettings, Some("RhoApp"))
         .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenSettings)))
 }
 
@@ -1678,7 +1678,10 @@ mod tests {
 
     #[test]
     fn busy_sessions_offer_no_moves_and_shelves_offer_a_way_back() {
-        assert!(ShelfAction::offered(Shelf::Active, Activity::Working(Instant::now())).is_empty());
+        assert_eq!(
+            ShelfAction::offered(Shelf::Active, Activity::Working(Instant::now())),
+            []
+        );
         assert_eq!(
             ShelfAction::offered(Shelf::Settled, Activity::Idle),
             [ShelfAction::Restore]

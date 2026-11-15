@@ -259,6 +259,6 @@ mod tests {
             assert!(same(got, want), "{got:?} read back for {want:?}");
         }
         log.forget(&key);
-        assert!(log.load(&key).is_empty());
+        assert_eq!(log.load(&key), []);
     }
 }
