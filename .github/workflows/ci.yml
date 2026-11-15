@@ -42,10 +42,13 @@ jobs:
       - uses: jdx/mise-action@v5
 
       # A cold build takes 8 to 13 minutes a step, almost all of it
-      # dependencies, so keep them even when a test fails.
+      # dependencies, so keep them even when a test fails. rust-cache keys
+      # on the member crates' manifests, not the root one, so the root's
+      # [profile] goes into the key here.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: ${{ hashFiles('Cargo.toml') }}
 
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
