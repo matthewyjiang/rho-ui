@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 serde_json = "1"
 thiserror = "2"
+unicode-ident = "1"
 
 [dev-dependencies]
 serde_yaml_ng = "0.10"
