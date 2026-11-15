@@ -114,6 +114,9 @@ pub(crate) enum Key {
     /// The right panel's width in rems; see
     /// [`crate::right_panel::PanelLayout`].
     RightPanelWidth,
+    /// `local` or `new-worktree`; see
+    /// [`crate::project_picker::LastCheckout`].
+    Checkout,
 }
 
 impl Key {
@@ -124,6 +127,7 @@ impl Key {
             Key::SidebarFilter => "sidebar-filter",
             Key::RightPanel => "right-panel",
             Key::RightPanelWidth => "right-panel-width",
+            Key::Checkout => "checkout",
         }
     }
 }

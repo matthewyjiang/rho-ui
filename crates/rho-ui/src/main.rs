@@ -58,6 +58,7 @@ use crate::{
     app::{LaunchConfig, RhoApp},
     background_log::BackgroundLog,
     machines::RemoteMachine,
+    project_picker::LastCheckout,
     projects::Projects,
     right_panel::{Direction, PaneCommand, PanelLayout, TerminalShell, TerminalShortcut},
     settings::Settings,
@@ -245,6 +246,7 @@ fn init(cx: &mut App, db: &StateDb) {
     cx.set_global(TurnTimes::load(db));
     cx.set_global(BackgroundLog::new(db));
     cx.set_global(PanelLayout::load(db));
+    cx.set_global(LastCheckout::load(db));
     // `secondary` is Cmd on macOS and Ctrl elsewhere.
     cx.bind_keys([
         shortcut("secondary-n", NewSession, Some("RhoApp"), cx),

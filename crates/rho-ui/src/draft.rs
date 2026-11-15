@@ -192,7 +192,7 @@ impl DraftView {
     /// Where the session will work, for UI tests.
     #[cfg(test)]
     pub(crate) fn checkout(&self, cx: &App) -> Checkout {
-        self.picker.read(cx).checkout()
+        self.picker.read(cx).checkout(cx)
     }
 
     /// The project row the keyboard is on, for UI tests.
@@ -387,7 +387,7 @@ impl DraftView {
         if prompt.is_empty() {
             return;
         }
-        let checkout = self.picker.read(cx).checkout();
+        let checkout = self.picker.read(cx).checkout(cx);
         match (
             std::mem::replace(&mut self.state, SessionState::Started),
             checkout,

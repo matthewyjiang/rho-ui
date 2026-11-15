@@ -141,12 +141,17 @@ impl Harness {
     /// Closes the app and opens it again on the same daemon and state
     /// database, as a restart does, with `shelves` as its settled and
     /// snoozed state.
-    fn reopen(mut self, name: &'static str, shelves: Shelves) -> Self {
+    fn reopen(self, name: &'static str, shelves: Shelves) -> Self {
+        self.reopen_with(name, shelves, Projects::default())
+    }
+
+    /// [`Self::reopen`] with `projects` as the user's projects.
+    fn reopen_with(mut self, name: &'static str, shelves: Shelves, projects: Projects) -> Self {
         let (target, daemon, state) = (self.target.clone(), self.daemon.take(), self.state.clone());
         drop(self);
         let machines = Machines {
             shelves,
-            projects: Projects::default(),
+            projects,
             settings: Settings::default(),
             remote_sockets: Vec::new(),
             workspace: None,
@@ -4059,9 +4064,10 @@ fn a_typed_git_url_clones_into_the_clone_folder() {
 
 /// In a git project, the project list offers a new worktree, made only
 /// when the first message goes: switching to New worktree and back makes
-/// none and keeps the draft's session, and a folder git doesn't track goes
-/// back to Local. The message then starts a session in a new worktree with
-/// the draft's settings, and runs there.
+/// none and keeps the draft's session, and a folder git doesn't track works
+/// in Local without forgetting the choice. The message then starts a session
+/// in a new worktree with the draft's settings, and runs there. New drafts
+/// keep the last choice, after a restart too.
 #[test]
 fn a_new_session_can_work_in_a_new_worktree() {
     let dir = std::env::temp_dir().join(format!("rho-ui-worktree-{}", std::process::id()));
@@ -4119,7 +4125,8 @@ fn a_new_session_can_work_in_a_new_worktree() {
     assert_eq!(draft_session(&mut ui), opened, "the draft kept its session");
     assert_eq!(ui.fake().worktrees(), 0, "switching adds no worktree");
 
-    // /w/a is no git repository, so the draft goes back to Local there.
+    // /w/a is no git repository, so the draft works in Local there, and
+    // back in the project, in a new worktree again.
     ui.click("project-checkout");
     click_label(&mut ui, "New worktree");
     ui.wait_until("New worktree", in_checkout(&main, Checkout::NewWorktree));
@@ -4129,13 +4136,10 @@ fn a_new_session_can_work_in_a_new_worktree() {
         in_checkout(Path::new("/w/a"), Checkout::Local),
     );
     ui.click(main_row);
-    ui.wait_until("Local in the project", in_checkout(&main, Checkout::Local));
+    ui.wait_until("back in it", in_checkout(&main, Checkout::NewWorktree));
 
     // With Plan mode set in the draft, the first message starts a session
     // in a new worktree, in Plan mode.
-    ui.click("project-checkout");
-    click_label(&mut ui, "New worktree");
-    ui.wait_until("New worktree", in_checkout(&main, Checkout::NewWorktree));
     ui.click("config-mode");
     click_label(&mut ui, "Plan");
     ui.wait_until("Plan mode in the draft", |_, cx, app| {
@@ -4157,6 +4161,20 @@ fn a_new_session_can_work_in_a_new_worktree() {
     });
     assert_eq!(ui.fake().worktrees(), 1);
     ui.shot("running");
+
+    // After a restart, a new draft in the project starts in a new worktree.
+    let mut ui = ui.reopen_with(
+        "worktree-reopened",
+        Shelves::default(),
+        Projects::of([main.clone()]),
+    );
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    ui.click("new-session");
+    ui.wait_until("the project", |window, _, _| is_visible(window, main_row));
+    ui.click(main_row);
+    ui.wait_until("remembered", in_checkout(&main, Checkout::NewWorktree));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

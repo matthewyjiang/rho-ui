@@ -19,7 +19,8 @@
 //! this machine, and starts the search at `~/` on a remote one, whose
 //! folders are read over ssh (see [`folders`]). Remove takes a project off
 //! the list. In the footer, a git project offers a new worktree for the
-//! session instead of its checkout; see [`Checkout`].
+//! session instead of its checkout; see [`Checkout`]. The choice holds for
+//! new sessions after it, across runs too ([`LastCheckout`]).
 //!
 //! A project's age and the check read [`Workspaces`]: the saved sessions
 //! date each folder, and its repository says which project it is in, so a
@@ -44,10 +45,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    accesskit::Toggled, div, px, rems, Anchor, App, AppContext as _, Context, Div, Entity,
-    EventEmitter, Focusable as _, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window,
+    accesskit::Toggled, div, px, rems, Anchor, App, AppContext as _, BorrowAppContext as _,
+    Context, Div, Entity, EventEmitter, Focusable as _, Global, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
 };
 
 use rho_ui_core::Checkout;
@@ -58,7 +59,9 @@ use crate::{
     folders::{self, Reader, Typed},
     machines::{MachineId, MachineStatus, Machines, Place},
     projects::Projects,
-    repo, time,
+    repo,
+    store::{Key, StateDb},
+    time,
     workspaces::{self, Workspaces},
 };
 
@@ -81,13 +84,52 @@ pub(crate) enum PickerEvent {
     Dismissed,
 }
 
+/// The checkout the user last chose in any draft, remembered across runs
+/// under [`Key::Checkout`]. A global, as each draft has its own picker and
+/// a new one starts with the last choice.
+#[derive(Debug)]
+pub(crate) struct LastCheckout {
+    checkout: Checkout,
+    db: StateDb,
+}
+
+impl Global for LastCheckout {}
+
+impl LastCheckout {
+    /// Loads the saved choice: Local unless New worktree was chosen.
+    pub(crate) fn load(db: &StateDb) -> Self {
+        let checkout = match db.get(Key::Checkout).as_deref() {
+            Some("new-worktree") => Checkout::NewWorktree,
+            _ => Checkout::Local,
+        };
+        Self {
+            checkout,
+            db: db.clone(),
+        }
+    }
+
+    fn get(cx: &App) -> Checkout {
+        cx.try_global::<Self>()
+            .map_or(Checkout::Local, |this| this.checkout)
+    }
+
+    /// Chooses `checkout`, and saves it.
+    fn set(checkout: Checkout, cx: &mut App) {
+        cx.update_global(|this: &mut Self, _| {
+            this.checkout = checkout;
+            let value = match checkout {
+                Checkout::Local => "local",
+                Checkout::NewWorktree => "new-worktree",
+            };
+            this.db.set(Key::Checkout, value);
+        });
+    }
+}
+
 /// The project list, for one draft.
 pub(crate) struct ProjectPicker {
     list: Entity<ListState<ProjectList>>,
     projects: Entity<Projects>,
-    /// Whether the session works in the project's checkout or in a new
-    /// worktree of it, which the daemon adds only as the session starts.
-    checkout: Checkout,
     _subscriptions: [Subscription; 5],
 }
 
@@ -153,18 +195,24 @@ impl ProjectPicker {
         Self {
             list,
             projects: projects.clone(),
-            checkout: Checkout::Local,
             _subscriptions: subscriptions,
         }
     }
 
-    /// Where the session works: the project's checkout or a new worktree.
-    pub(crate) fn checkout(&self) -> Checkout {
-        self.checkout
+    /// Where the session works: the project's checkout, or a new worktree
+    /// of it, which the daemon adds only as the session starts. The user's
+    /// last choice ([`LastCheckout`]), but the checkout outside git, which
+    /// leaves the choice for the next git project.
+    pub(crate) fn checkout(&self, cx: &App) -> Checkout {
+        if self.in_repository(cx) {
+            LastCheckout::get(cx)
+        } else {
+            Checkout::Local
+        }
     }
 
-    fn set_checkout(&mut self, checkout: Checkout, cx: &mut Context<'_, Self>) {
-        self.checkout = checkout;
+    fn set_checkout(checkout: Checkout, cx: &mut Context<'_, Self>) {
+        LastCheckout::set(checkout, cx);
         cx.notify();
     }
 
@@ -182,11 +230,11 @@ impl ProjectPicker {
     /// the project's checkout, or a new worktree.
     fn render_checkout(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let in_repository = self.in_repository(cx);
-        let label = match self.checkout {
+        let current = self.checkout(cx);
+        let label = match current {
             Checkout::NewWorktree => "New worktree",
             Checkout::Local => "Local",
         };
-        let current = self.checkout;
         let view = cx.entity().downgrade();
         Button::new("project-checkout")
             .ghost()
@@ -213,8 +261,7 @@ impl ProjectPicker {
                         PopupMenuItem::new(name)
                             .checked(checkout == current)
                             .on_click(move |_, _, cx| {
-                                let _ =
-                                    view.update(cx, |picker, cx| picker.set_checkout(checkout, cx));
+                                let _ = view.update(cx, |_, cx| Self::set_checkout(checkout, cx));
                             }),
                     )
                 })
@@ -333,10 +380,6 @@ impl ProjectPicker {
             list.set_query("", window, cx);
             cx.notify();
         });
-        // Only a git repository has worktrees to add.
-        if !self.in_repository(cx) {
-            self.checkout = Checkout::Local;
-        }
     }
 
     /// Puts the keyboard in the search field, the current project
