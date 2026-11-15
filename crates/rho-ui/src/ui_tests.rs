@@ -1245,6 +1245,7 @@ fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::
 /// A new session asked for while this machine connects waits for the
 /// daemon, then opens, rather than failing as not connected.
 #[test]
+// The gate proxies a Unix socket.
 #[cfg(unix)]
 fn a_draft_opened_while_connecting_waits_for_the_daemon() {
     let daemon = FakeDaemon::start(Script::default());
@@ -2660,6 +2661,7 @@ fn a_reply_draws_its_diagram_and_formula_in_the_theme() {
 /// the lightbox at its own size, under its caption; it zooms in and fits
 /// again, and Escape closes it.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn pictures_show_in_place_and_open_in_the_lightbox() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let folder = dir.path().canonicalize().expect("it resolves");
@@ -3014,6 +3016,7 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
 /// screen works, read with this machine's `git`, and reads them again when
 /// the session's turn ends.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn the_diff_surface_follows_the_sessions_changes() {
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path().canonicalize().unwrap();
@@ -3070,6 +3073,7 @@ fn the_diff_surface_follows_the_sessions_changes() {
 /// open file again, and Back returns to the tree with its folder still
 /// open.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn the_files_surface_opens_the_sessions_files() {
     let repo = tempfile::tempdir().unwrap();
     let repo = repo.path().canonicalize().unwrap();
@@ -4198,9 +4202,9 @@ fn attached_files_go_with_the_message() {
         );
     };
     assert_eq!(text.text(), Some("# Notes\n\nShip it.\n"));
-    assert_eq!(text.path(), Some(notes.as_path()));
+    assert_eq!(text.path(), Some(notes));
     assert_eq!(linked.text(), None, "a binary file goes by path");
-    assert_eq!(linked.path(), Some(report.as_path()));
+    assert_eq!(linked.path(), Some(report));
     ui.act(|window, _| {
         for n in 0..3 {
             let id = format!("user-0-attachment-{n}");
@@ -4365,6 +4369,10 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 /// A typed path to a worktree adds its repository's project, not the
 /// worktree, and Remove takes a project off the list without picking it.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the project search parses typed paths with POSIX rules: `Typed` splits at `/`"
+)]
 fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let dir = std::env::temp_dir().join(format!("rho-ui-projects-{}", std::process::id()));
     let (main, tree) = crate::repo::fake_worktree(&dir);
@@ -4461,6 +4469,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
 /// machine's clone folder, adds the clone to the projects, and starts the
 /// draft there.
 #[test]
+#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn a_typed_git_url_clones_into_the_clone_folder() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let dir = dir.path().canonicalize().expect("it resolves");
@@ -4614,7 +4623,9 @@ fn a_new_session_can_work_in_a_new_worktree() {
             let cwd = view.live().cwd;
             let plan = setting(view.session(), "mode").as_deref() == Some("plan");
             cwd.parent() == Some(Path::new("/rho/worktrees"))
-                && cwd.to_string_lossy().contains("/project-")
+                && cwd
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("project-"))
                 && plan
         })
     });
@@ -4856,8 +4867,9 @@ fn machines_list_side_by_side() {
     let draft_at = |path| draft_at(there.clone(), path);
     ui.click("new-session");
     ui.wait_until("the draft's session on the workstation", draft_at("/w/a"));
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     assert!(
-        remote.new_session_var("HOME").is_some(),
+        remote.new_session_var(home).is_some(),
         "the workstation opened it"
     );
 

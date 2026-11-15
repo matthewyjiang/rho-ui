@@ -477,14 +477,16 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(&["/tmp"]).unwrap().local.daemon,
+            parse(&[workspace]).unwrap().local.daemon,
             DaemonTarget::rho("rho").unwrap()
         );
     }
 
     #[test]
     fn rejects_extra_positional_and_missing_program() {
-        assert!(parse(&["/tmp", "/var"]).is_err());
+        let dir = std::env::temp_dir();
+        let workspace = dir.to_str().expect("a UTF-8 temporary directory");
+        assert!(parse(&[workspace, workspace]).is_err());
         assert!(parse(&["--rho"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
     }

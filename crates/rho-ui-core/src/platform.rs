@@ -10,7 +10,7 @@
 use std::{
     ffi::{OsStr, OsString},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 /// The user's home directory: `$HOME`, else on Windows `%USERPROFILE%`,
@@ -93,6 +93,31 @@ fn app_dir_from(which: AppDir, var: impl Fn(&str) -> Option<OsString>) -> Option
         .filter(|dir| dir.is_absolute())
         .or_else(|| home_dir_from(&var).map(|home| home.join(fallback)))?;
     Some(base.join("rho-ui"))
+}
+
+/// The `file://` URI of `path`, an absolute path on this machine:
+/// `file:///home/me/a.md` on Unix, and on Windows `file:///C:/Users/me/a.md`,
+/// with `/` for `\\`, as a URI names a Windows path. Its name is what follows
+/// the last `/`.
+#[must_use]
+pub fn file_uri(path: &Path) -> String {
+    if cfg!(windows) {
+        format!("file:///{}", path.display().to_string().replace('\\', "/"))
+    } else {
+        format!("file://{}", path.display())
+    }
+}
+
+/// The path of a `file://` URI that [`file_uri`] made, or `None` if `uri`
+/// isn't one. On Windows, with `\\` again for `/`.
+#[must_use]
+pub fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let path = uri.strip_prefix("file:///")?;
+        Some(PathBuf::from(path.replace('/', "\\")))
+    } else {
+        uri.strip_prefix("file://").map(PathBuf::from)
+    }
 }
 
 /// The shell a terminal on this machine runs. On Unix, `$SHELL`, else

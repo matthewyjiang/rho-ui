@@ -453,7 +453,8 @@ mod tests {
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "typed paths are POSIX; Windows paths aren't parsed yet"
+        ignore = "a remote machine's POSIX path doesn't parse on a Windows host: \
+                  `Typed` uses this machine's path rules"
     )]
     fn a_typed_path_browses_its_folder_after_a_slash_else_its_parent() {
         let home = Some(Path::new("/home/me"));

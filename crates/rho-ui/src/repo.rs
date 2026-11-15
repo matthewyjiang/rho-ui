@@ -336,16 +336,15 @@ mod tests {
         );
     }
 
-    /// A linked worktree: `.git` file pointing into the main repository. It
-    /// and any subfolder belong to the main checkout's project, at its
-    /// resolved path, as is the checkout reached through a symlink.
+    /// A checkout reached through a symlink belongs to the project at its
+    /// resolved path.
     // Making a symlink on Windows needs Developer Mode or an administrator.
     #[cfg(unix)]
     #[test]
-    fn linked_worktrees_use_the_main_repository() {
-        let root = std::env::temp_dir().join(format!("rho-ui-repo-test-{}", std::process::id()));
+    fn a_symlinked_checkout_uses_its_resolved_path() {
+        let root = std::env::temp_dir().join(format!("rho-ui-link-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let (main, tree) = fake_worktree(&root);
+        let (main, _) = fake_worktree(&root);
         let link = root.join("link");
         std::os::unix::fs::symlink(&main, &link).unwrap();
 
@@ -358,6 +357,18 @@ mod tests {
                 root: main.canonicalize().unwrap(),
             }
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A linked worktree: `.git` file pointing into the main repository. It
+    /// and any subfolder belong to the main checkout's project, at its
+    /// resolved path.
+    #[test]
+    fn linked_worktrees_use_the_main_repository() {
+        let root = std::env::temp_dir().join(format!("rho-ui-repo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (main, tree) = fake_worktree(&root);
+
         assert_eq!(
             inspect(&tree.join("src")),
             Repo {
