@@ -6,7 +6,10 @@
 //! the variables the client sets (as an sshd whose `AcceptEnv` names
 //! them all). After a `pty-req` the command runs under a real
 //! pseudo-terminal of the size asked, with `TERM` as asked, and each
-//! `window-change` resizes it, as sshd does. It forwards each
+//! `window-change` resizes it, as sshd does; a client that closes the
+//! channel first hangs up on it. [`FakeSshd::terminal_ended`] says how
+//! each such session ended, and [`FakeSshd::refuse_terminals`] makes it
+//! refuse pseudo-terminals, as `PermitTTY no` does. It forwards each
 //! `direct-streamlocal` channel to the local socket it names, such as a
 //! [`FakeDaemon`](crate::fake_daemon::FakeDaemon)'s.
 //!
@@ -20,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -33,7 +36,11 @@ use russh::{
     Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelReadHalf, ChannelWriteHalf,
     MethodKind, MethodSet, Pty,
 };
-use tokio::{net::TcpListener, runtime::Runtime};
+use tokio::{
+    net::TcpListener,
+    runtime::Runtime,
+    sync::{mpsc, Mutex},
+};
 
 use crate::{
     platform,
@@ -63,6 +70,16 @@ pub enum ClientKey {
     Encrypted,
 }
 
+/// How a session under a pseudo-terminal ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalEnd {
+    /// Its command exited with this status, after all it printed went.
+    Exited(u32),
+    /// The client closed the channel first, and the command, hung up on,
+    /// exited.
+    HungUp,
+}
+
 /// A running fake ssh server. Dropping it stops it.
 #[derive(Debug)]
 pub struct FakeSshd {
@@ -73,6 +90,10 @@ pub struct FakeSshd {
     key_offers: Arc<AtomicUsize>,
     /// Clients that signed in.
     sign_ins: Arc<AtomicUsize>,
+    /// Whether to refuse pseudo-terminals.
+    refuse_terminals: Arc<AtomicBool>,
+    /// How each session under a pseudo-terminal ended, in order.
+    terminal_ends: Mutex<mpsc::UnboundedReceiver<TerminalEnd>>,
     /// Numbers each target's host, so each gets a connection of its own.
     targets: AtomicUsize,
     _runtime: Runtime,
@@ -143,11 +164,15 @@ impl FakeSshd {
         });
         let key_offers: Arc<AtomicUsize> = Arc::default();
         let sign_ins: Arc<AtomicUsize> = Arc::default();
+        let refuse_terminals: Arc<AtomicBool> = Arc::default();
+        let (terminal_ended, ends) = mpsc::unbounded_channel();
         let sshd = Sshd {
             home: home.to_path_buf(),
             accepted: accepted.public_key().clone(),
             key_offers: Arc::clone(&key_offers),
             sign_ins: Arc::clone(&sign_ins),
+            refuse_terminals: Arc::clone(&refuse_terminals),
+            terminal_ended,
         };
         runtime.spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -164,6 +189,8 @@ impl FakeSshd {
             dir,
             key_offers,
             sign_ins,
+            refuse_terminals,
+            terminal_ends: Mutex::new(ends),
             targets: AtomicUsize::new(0),
             _runtime: runtime,
         }
@@ -215,6 +242,18 @@ impl FakeSshd {
     pub fn sign_ins(&self) -> usize {
         self.sign_ins.load(Ordering::SeqCst)
     }
+
+    /// Refuses each pseudo-terminal asked for from now on, as an sshd
+    /// whose `PermitTTY` is `no`; the command then runs without one.
+    pub fn refuse_terminals(&self) {
+        self.refuse_terminals.store(true, Ordering::SeqCst);
+    }
+
+    /// How the next session under a pseudo-terminal ended, in the order
+    /// they did. Waits for one to end.
+    pub async fn terminal_ended(&self) -> Option<TerminalEnd> {
+        self.terminal_ends.lock().await.recv().await
+    }
 }
 
 fn file_name(key: ClientKey) -> &'static str {
@@ -244,6 +283,8 @@ struct Sshd {
     accepted: PublicKey,
     key_offers: Arc<AtomicUsize>,
     sign_ins: Arc<AtomicUsize>,
+    refuse_terminals: Arc<AtomicBool>,
+    terminal_ended: mpsc::UnboundedSender<TerminalEnd>,
 }
 
 impl server::Handler for Sshd {
@@ -281,7 +322,7 @@ impl server::Handler for Sshd {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         reply.accept().await;
-        tokio::spawn(run_session(channel, self.home.clone()));
+        tokio::spawn(run_session(channel, self.clone()));
         Ok(())
     }
 
@@ -298,7 +339,11 @@ impl server::Handler for Sshd {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        std::future::ready(session.channel_success(channel))
+        std::future::ready(if self.refuse_terminals.load(Ordering::SeqCst) {
+            session.channel_failure(channel)
+        } else {
+            session.channel_success(channel)
+        })
     }
 
     fn exec_request(
@@ -332,10 +377,13 @@ impl server::Handler for Sshd {
 }
 
 /// Runs the command of the session channel's `exec` request with `sh -c`
-/// in `home`: under a pseudo-terminal if the client asked for one first,
-/// else with its stdin from the channel and its stdout and stderr to it.
-/// Then sends its exit status and closes the channel.
-async fn run_session(channel: Channel<Msg>, home: PathBuf) {
+/// in `sshd`'s home: under a pseudo-terminal if the client asked for one
+/// first and `sshd` didn't refuse it, else with its stdin from the channel
+/// and its stdout and stderr to it. Then sends its exit status and closes
+/// the channel; a session under a pseudo-terminal tells `sshd` how it
+/// ended.
+async fn run_session(channel: Channel<Msg>, sshd: Sshd) {
+    let home = sshd.home;
     let (mut read, write) = channel.split();
     let mut env: Vec<(OsString, OsString)> = vec![
         ("HOME".into(), home.clone().into_os_string()),
@@ -350,7 +398,7 @@ async fn run_session(channel: Channel<Msg>, home: PathBuf) {
                 col_width,
                 row_height,
                 ..
-            }) => {
+            }) if !sshd.refuse_terminals.load(Ordering::SeqCst) => {
                 env.push(("TERM".into(), term.into()));
                 terminal = Some(pty_size(col_width, row_height));
             }
@@ -367,7 +415,14 @@ async fn run_session(channel: Channel<Msg>, home: PathBuf) {
         }
     };
     let code = match terminal {
-        Some(size) => in_terminal(&mut read, &write, &command, &home, &env, size).await,
+        Some(size) => {
+            let end = in_terminal(&mut read, &write, &command, &home, &env, size).await;
+            let _ = sshd.terminal_ended.send(end);
+            match end {
+                TerminalEnd::Exited(code) => code,
+                TerminalEnd::HungUp => return,
+            }
+        }
         None => piped(&mut read, &write, &command, &home, &env).await,
     };
     let _ = write.exit_status(code).await;
@@ -425,7 +480,8 @@ async fn piped(
 /// Runs `command` with `sh -c` in `home` with `env`, under a
 /// pseudo-terminal of `size`: what it prints goes to the channel, the
 /// channel's data to it, and each `window-change` resizes it. Returns its
-/// exit status; a client that closes the channel first hangs up on it.
+/// exit status once all it printed went, as sshd sends it; a client that
+/// closes the channel first hangs up on it.
 async fn in_terminal(
     read: &mut ChannelReadHalf,
     write: &ChannelWriteHalf<Msg>,
@@ -433,9 +489,9 @@ async fn in_terminal(
     home: &Path,
     env: &[(OsString, OsString)],
     size: PtySize,
-) -> u32 {
+) -> TerminalEnd {
     let Ok(pair) = native_pty_system().openpty(size) else {
-        return 127;
+        return TerminalEnd::Exited(127);
     };
     let mut shell = CommandBuilder::new("sh");
     shell.args(["-c", command]);
@@ -445,7 +501,7 @@ async fn in_terminal(
         shell.env(name, value);
     }
     let Ok(mut child) = pair.slave.spawn_command(shell) else {
-        return 127;
+        return TerminalEnd::Exited(127);
     };
     drop(pair.slave);
     let mut killer = child.clone_killer();
@@ -453,7 +509,7 @@ async fn in_terminal(
         (pair.master.try_clone_reader(), pair.master.take_writer())
     else {
         let _ = killer.kill();
-        return 127;
+        return TerminalEnd::Exited(127);
     };
     // Threads of their own, as a read and the wait block: not the
     // runtime's blocking pool, which dropping the runtime waits on.
@@ -490,15 +546,24 @@ async fn in_terminal(
                 }
                 Some(_) => {}
                 None => {
+                    // SIGHUP, as sshd's closing the pseudo-terminal sends.
                     let _ = killer.kill();
-                    return 255;
+                    let _ = (&mut exit).await;
+                    return TerminalEnd::HungUp;
                 }
             },
             status = &mut exit => {
-                return status
-                    .ok()
-                    .and_then(Result::ok)
-                    .map_or(255, |status| status.exit_code());
+                // The reader ends once the pseudo-terminal's last holder
+                // closes it, as the command that exited did.
+                while let Some(bytes) = output.recv().await {
+                    let _ = write.data_bytes(bytes).await;
+                }
+                return TerminalEnd::Exited(
+                    status
+                        .ok()
+                        .and_then(Result::ok)
+                        .map_or(255, |status| status.exit_code()),
+                );
             }
         }
     }

@@ -1,21 +1,50 @@
 //! The user's login shell on a host, under a pseudo-terminal sshd makes
-//! there, in a session channel of its own on the host's shared
-//! connection: the right panel's terminal on a remote machine. It asks
-//! the user's key agent for nothing, as the connection signed in already.
+//! there, in a session channel of its own on the host's terminals'
+//! connection: the right panel's terminal on a remote machine. The first
+//! terminal on a host opens that connection, reached as the daemon's was,
+//! which costs one more key signature; the rest share it, as scripts
+//! share the daemon's, so scripts and terminals never compete for sshd's
+//! sessions.
+//!
+//! [`SshLink::open_shell`] starts it: a task on the I/O runtime opens the
+//! channel, asks for a pseudo-terminal (`pty-req`, with `IUTF8`), sets
+//! `COLORTERM=truecolor` and this machine's locale (`LANG` and `LC_*`)
+//! where sshd's `AcceptEnv` lets them through, and runs
+//! `cd -- DIR && exec "$SHELL" -l`. Then it forwards what the shell
+//! prints to [`ShellOutput`], and what [`ShellInput`] and
+//! [`ShellControl`] send to the channel, side by side, so a write waiting
+//! on the host's window never stops the reading. A resize goes as
+//! `window-change`.
+//!
+//! [`ShellControl`] owns the shell's life, as a local pseudo-terminal's
+//! owner does: dropping it, or the [`ShellOutput`], closes the channel at
+//! once, without sending the input still queued, and sshd hangs up on
+//! the shell. Clones of [`ShellInput`] don't keep it. One machine runs at
+//! most [`MAX_SHELLS`](crate::MAX_SHELLS) shells at once, the sessions
+//! sshd allows on their connection by default; a shell's slot frees when
+//! its task ends.
 //!
 //! russh's session loop hands each channel what arrives for it through a
-//! bounded queue, and waits while that queue is full, so a shell that
-//! prints faster than its reader takes it slows the whole connection,
-//! the daemon's channel and every script on it too, to the reader's
-//! pace. The reader must keep reading [`ShellOutput`], as a terminal that
-//! draws what it reads does.
+//! queue of `channel_buffer_size` messages (100, `client::Config`'s
+//! default), each a packet of at most `maximum_packet_size` (32 KiB), and
+//! waits while that queue is full (`client/encrypted.rs`, at
+//! `CHANNEL_DATA`). It tops the channel's window up as packets arrive,
+//! not as they are read, so the window (2 MiB) bounds none of it. A
+//! shell's output that its reader doesn't take holds up the whole
+//! connection, the daemon's channel and every script on it too, once
+//! about 4.1 MiB waits: russh's queue (up to 3.2 MiB) and
+//! [`ShellOutput`]'s [`OUTPUT_QUEUE`] packets (1 MiB). The reader must
+//! keep reading, as a terminal that draws what it reads does.
 
-use std::{path::Path, pin::pin, sync::Arc};
+use std::{convert::Infallible, path::Path, pin::pin, sync::Arc};
 
 use russh::{client::Msg, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{connection::Connection, quote_bytes, script::CloseOnDrop, SshLink};
+use super::{
+    connection::{self, Connection, Purpose},
+    quote_bytes, SshLink,
+};
 use crate::{
     daemon::{io, DaemonError},
     platform,
@@ -28,23 +57,23 @@ use crate::{
 /// 9.6 s with a queue of 1 read and in 8.8 s with 64.
 const OUTPUT_QUEUE: usize = 32;
 
-/// What the shell's channel asks sshd for with a reply, in the order sshd
-/// answers, as each refusal words it.
-const ASKED: [&str; 2] = [
-    "a pseudo-terminal (its sshd_config may say PermitTTY no)",
-    "to run the login shell",
-];
+/// The pseudo-terminal request, as its refusal names it.
+const PSEUDO_TERMINAL: &str = "a pseudo-terminal (its sshd_config may say PermitTTY no)";
+
+/// The `exec` request, as its refusal names it.
+const LOGIN_SHELL: &str = "to run the login shell";
 
 /// A login shell on a remote machine, from [`SshLink::open_shell`]: what
-/// it prints, where to type, and how it ended. The shell lives while any
-/// [`ShellInput`] does and its output is read; dropping the last input,
-/// or the output, closes its channel, and sshd hangs up on it.
+/// it prints, where to type, its terminal's size and life, and how it
+/// ended.
 #[derive(Debug)]
 pub struct RemoteShell {
-    /// What it prints.
+    /// What it prints. Dropping it hangs up on the shell.
     pub output: ShellOutput,
-    /// What it reads, and the size of its terminal.
+    /// What it reads; clones go to the same shell.
     pub input: ShellInput,
+    /// The size of its terminal. Dropping it hangs up on the shell.
+    pub control: ShellControl,
     /// How it ended.
     pub ended: ShellEnded,
 }
@@ -59,15 +88,11 @@ impl ShellOutput {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         self.0.recv().await
     }
-
-    /// The next bytes the shell printed, if they came; doesn't wait.
-    pub fn try_recv(&mut self) -> Option<Vec<u8>> {
-        self.0.try_recv().ok()
-    }
 }
 
-/// Types into a [`RemoteShell`] and sizes its terminal, in the order
-/// called. Clones go to the same shell, which lives while any does.
+/// Types into a [`RemoteShell`], in the order called, and in order with
+/// its [`ShellControl`]'s resizes. Clones go to the same shell, and don't
+/// keep it running.
 #[derive(Clone, Debug)]
 pub struct ShellInput(mpsc::UnboundedSender<Request>);
 
@@ -76,51 +101,92 @@ impl ShellInput {
     pub fn write(&self, bytes: Vec<u8>) {
         let _ = self.0.send(Request::Write(bytes));
     }
+}
 
+/// Sizes a [`RemoteShell`]'s terminal, and owns the shell's life: dropping
+/// it closes the shell's channel at once, without sending the input still
+/// queued, and sshd hangs up on the shell, as on a terminal closed.
+#[derive(Debug)]
+pub struct ShellControl {
+    requests: mpsc::UnboundedSender<Request>,
+    /// Never sent: the shell's task hangs up when it is dropped.
+    _owner: oneshot::Sender<Infallible>,
+}
+
+impl ShellControl {
     /// Tells the shell its terminal is now `columns` by `rows`, as
     /// `window-change`; sshd resizes the pseudo-terminal, which signals
     /// the program in it. Does nothing once the shell is gone.
     pub fn resize(&self, columns: u16, rows: u16) {
-        let _ = self.0.send(Request::Resize { columns, rows });
+        let _ = self.requests.send(Request::Resize { columns, rows });
     }
+}
+
+/// Why a [`RemoteShell`] ended other than by exiting. Each holds why, in
+/// words for people.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ShellError {
+    /// It never ran: there is no connection, the machine has
+    /// [`MAX_SHELLS`](crate::MAX_SHELLS) open, or sshd refused a session,
+    /// the pseudo-terminal or the shell.
+    #[error("{0}")]
+    NotStarted(String),
+    /// It ran, then its connection went, or rho-ui lost its task.
+    #[error("{0}")]
+    Stopped(String),
 }
 
 /// How a [`RemoteShell`] ended.
 #[derive(Debug)]
-pub struct ShellEnded(oneshot::Receiver<Result<(), DaemonError>>);
+pub struct ShellEnded(oneshot::Receiver<Result<(), ShellError>>);
 
 impl ShellEnded {
-    /// Waits for the shell to end: it exited, a signal killed it, or its
-    /// last [`ShellInput`] or its [`ShellOutput`] went.
+    /// Waits for the shell to end: it exited, a signal killed it, sshd
+    /// closed its channel, or its [`ShellControl`] or [`ShellOutput`]
+    /// went.
     ///
     /// # Errors
     ///
-    /// Says why if it couldn't start: the connection is gone, or sshd
-    /// refused a session, a pseudo-terminal, or the shell. Or if the
-    /// channel closed with no word of the shell's end, as when the
-    /// connection died.
-    pub async fn wait(self) -> Result<(), DaemonError> {
-        self.0.await.unwrap_or(Err(DaemonError::Closed))
+    /// [`ShellError::NotStarted`] if it couldn't start, and
+    /// [`ShellError::Stopped`] if its connection went while it ran.
+    pub async fn wait(self) -> Result<(), ShellError> {
+        self.0.await.unwrap_or_else(|_| {
+            Err(ShellError::Stopped(
+                "the task that ran it in rho-ui stopped unexpectedly".to_owned(),
+            ))
+        })
     }
 }
 
-/// What a [`ShellInput`] asks of the shell.
+/// What a [`ShellInput`] or [`ShellControl`] asks of the shell.
 #[derive(Debug)]
 enum Request {
     Write(Vec<u8>),
     Resize { columns: u16, rows: u16 },
 }
 
+/// What the shell's channel sends in its first requests.
+struct Start<'a> {
+    /// `cd -- DIR && exec "$SHELL" -l`.
+    command: Vec<u8>,
+    term: &'a str,
+    columns: u16,
+    rows: u16,
+    /// Variables to set, as `LANG` and `LC_*`, best effort.
+    env: Vec<(String, String)>,
+}
+
 impl SshLink {
     /// Starts the user's login shell in `dir` on the machine, under a
     /// pseudo-terminal there of `columns` by `rows` that is a `term`, with
-    /// `COLORTERM=truecolor` if sshd accepts it (its `AcceptEnv` must name
-    /// it). Returns at once: the shell starts on the I/O runtime, and
-    /// [`RemoteShell::ended`] says if it couldn't. It runs only on the
-    /// connection the daemon connection opened: once that is gone this
-    /// fails rather than connect again, which could ask the user's key
-    /// agent for another approval. The connection stays open while the
-    /// shell runs.
+    /// `COLORTERM=truecolor` and this machine's `LANG` and `LC_*` if sshd
+    /// accepts them (its `AcceptEnv` must name them). Returns at once: the
+    /// shell starts on the I/O runtime, and [`RemoteShell::ended`] says if
+    /// it couldn't. It runs only on the connection the daemon connection
+    /// opened: once that is gone this fails rather than connect again,
+    /// which could ask the user's key agent for another approval. The
+    /// connection stays open while the shell runs, which ends when it
+    /// exits or [`RemoteShell::control`] goes.
     ///
     /// sshd hands the command line, `cd -- 'dir' && exec "$SHELL" -l`, to
     /// the user's login shell to parse, so this assumes a POSIX one, such
@@ -131,62 +197,120 @@ impl SshLink {
         let mut command = b"cd -- ".to_vec();
         command.extend(quote_bytes(&platform::path_to_bytes(dir.as_os_str())));
         command.extend(br#" && exec "$SHELL" -l"#);
+        let mut env = vec![("COLORTERM".to_owned(), "truecolor".to_owned())];
+        env.extend(locale());
         let term = term.to_owned();
         let (printed, output) = mpsc::channel(OUTPUT_QUEUE);
         let (input, mut requests) = mpsc::unbounded_channel();
+        let (owner, disowned) = oneshot::channel();
         let (end, ended) = oneshot::channel();
-        // Held while the shell runs, so the connection is.
-        let lease = Arc::clone(&self.lease);
+        // The host and how the daemon's connection reached it, to reach it
+        // again for the terminals.
+        let daemon = Arc::clone(self.lease.connection());
         io().spawn(async move {
-            let ended = run(
-                lease.connection(),
+            let start = Start {
                 command,
-                &term,
-                (columns, rows),
-                &printed,
-                &mut requests,
-            )
-            .await;
+                term: &term,
+                columns,
+                rows,
+                env,
+            };
+            let ran = async {
+                // Held while the shell runs, so the connection is.
+                let lease =
+                    connection::shared(daemon.host(), Some(daemon.resolved()), Purpose::Terminals)
+                        .await
+                        .map_err(|error| ShellError::NotStarted(error.to_string()))?;
+                drop(daemon);
+                run(lease.connection(), start, &printed, &mut requests).await
+            };
+            let ended = tokio::select! {
+                ended = ran => ended,
+                // The terminal went. Dropping `ran` drops the channel's
+                // writing half, which closes it, and the shell's slot.
+                _ = disowned => Ok(()),
+                () = printed.closed() => Ok(()),
+            };
             let _ = end.send(ended);
         });
         RemoteShell {
             output: ShellOutput(output),
-            input: ShellInput(input),
+            input: ShellInput(input.clone()),
+            control: ShellControl {
+                requests: input,
+                _owner: owner,
+            },
             ended: ShellEnded(ended),
         }
     }
 }
 
-/// Opens a session channel on `connection` and asks for a pseudo-terminal
-/// that is a `term` of `columns` by `rows`, and to run `command`; then
-/// forwards what it prints to `output`, and `requests` to it, at once, so
-/// a write waiting on the host's window never stops the reading. Runs on
-/// the I/O runtime; returns when the shell ends, and closes the channel.
+/// This machine's locale, `LANG` and `LC_*`, to send as the
+/// `SendEnv LANG LC_*` in the `ssh_config` Debian and macOS ship does,
+/// which the `ssh -tt` this replaced followed. A variable that isn't
+/// UTF-8 stays here: russh sends text.
+fn locale() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| name == "LANG" || name.starts_with("LC_"))
+        .collect()
+}
+
+/// The requests the shell's channel sent asking for a reply, in order, as
+/// a refusal of each names it. sshd answers a channel's requests in the
+/// order they came, and those sent with no reply asked not at all. Every
+/// request's `want_reply` comes from here, so the list follows the flags
+/// sent: a request that comes to ask for a reply takes [`Self::reply`],
+/// and names itself.
+#[derive(Debug, Default)]
+struct Asked(Vec<&'static str>);
+
+impl Asked {
+    /// A `want_reply` that asks for none.
+    const NO_REPLY: bool = false;
+
+    /// A `want_reply` that asks for one, noting the request as `what`.
+    fn reply(&mut self, what: &'static str) -> bool {
+        self.0.push(what);
+        true
+    }
+}
+
+/// Takes a shell slot on `connection`, opens a session channel and sends
+/// it `start`; then forwards what it prints to `output`, and `requests` to
+/// it, at once, so a write waiting on the host's window never stops the
+/// reading. Runs on the I/O runtime; returns when the shell ends, and
+/// closes the channel. Dropped, it closes the channel too, and frees the
+/// slot.
 ///
 /// # Errors
 ///
 /// As [`ShellEnded::wait`].
 async fn run(
     connection: &Connection,
-    command: Vec<u8>,
-    term: &str,
-    (columns, rows): (u16, u16),
+    start: Start<'_>,
     output: &mpsc::Sender<Vec<u8>>,
     requests: &mut mpsc::UnboundedReceiver<Request>,
-) -> Result<(), DaemonError> {
-    let host = connection.host();
-    if connection.is_closed() {
-        return Err(DaemonError::Unreachable(format!(
-            "no ssh connection to {host}"
-        )));
-    }
-    let (mut read, write) = connection.session().await?.split();
-    let write = CloseOnDrop::new(write);
+) -> Result<(), ShellError> {
+    // Held while this runs.
+    let _slot = connection.shell_slot().map_err(ShellError::NotStarted)?;
+    let (mut read, write) = connection.session().await.map_err(|error| match error {
+        DaemonError::Unreachable(why) => ShellError::NotStarted(why),
+        other => ShellError::NotStarted(other.to_string()),
+    })?;
     let channel = write.channel();
-    let ask = async move {
+    let Start {
+        command,
+        term,
+        columns,
+        rows,
+        env,
+    } = start;
+    let mut asked = Asked::default();
+    let sent: Result<(), russh::Error> = async {
         channel
             .request_pty(
-                true,
+                asked.reply(PSEUDO_TERMINAL),
                 term,
                 u32::from(columns),
                 u32::from(rows),
@@ -195,22 +319,27 @@ async fn run(
                 &[(Pty::IUTF8, 1)],
             )
             .await?;
-        channel.set_env(false, "COLORTERM", "truecolor").await?;
-        channel.exec(true, command).await
-    };
-    if ask.await.is_err() {
-        return Err(DaemonError::Unreachable(format!(
-            "the connection to {host} closed"
+        // Best effort, as OpenSSH's `SendEnv`: sshd sets those its
+        // `AcceptEnv` names and drops the rest without a word.
+        for (name, value) in env {
+            channel.set_env(Asked::NO_REPLY, name, value).await?;
+        }
+        channel.exec(asked.reply(LOGIN_SHELL), command).await
+    }
+    .await;
+    if sent.is_err() {
+        // A send fails only once russh's session loop is gone.
+        return Err(ShellError::NotStarted(format!(
+            "the connection to {} closed",
+            connection.host()
         )));
     }
-    let mut receiving = pin!(receive(&mut read, output, host));
+    let mut receiving = pin!(receive(&mut read, output, connection, asked));
     tokio::select! {
         ended = &mut receiving => ended,
-        served = serve(channel, requests) => match served {
-            Served::InputGone => Ok(()),
-            // How the channel ended says why.
-            Served::ChannelGone => receiving.await,
-        },
+        // The channel or every request's sender went; how the channel
+        // ends says why.
+        () = serve(channel, requests) => receiving.await,
     }
 }
 
@@ -218,14 +347,16 @@ async fn run(
 ///
 /// # Errors
 ///
-/// If sshd refuses something [`ASKED`] lists, or the channel closes with
-/// no word of the shell's end, as when the connection died.
+/// [`ShellError::NotStarted`] if sshd refuses something `asked` lists,
+/// and [`ShellError::Stopped`] if the connection closes.
 async fn receive(
     read: &mut ChannelReadHalf,
     output: &mpsc::Sender<Vec<u8>>,
-    host: &str,
-) -> Result<(), DaemonError> {
-    let mut asked = ASKED.iter();
+    connection: &Connection,
+    asked: Asked,
+) -> Result<(), ShellError> {
+    let host = connection.host();
+    let mut answers = asked.0.into_iter();
     while let Some(message) = read.wait().await {
         match message {
             // Under a pseudo-terminal stderr is stdout, so sshd sends no
@@ -237,35 +368,33 @@ async fn receive(
                 }
             }
             ChannelMsg::Success => {
-                asked.next();
+                answers.next();
             }
             ChannelMsg::Failure => {
-                let what = asked.next().copied().unwrap_or("a request");
-                return Err(DaemonError::Unreachable(format!("{host} refused {what}")));
+                let what = answers.next().unwrap_or("a request");
+                return Err(ShellError::NotStarted(format!("{host} refused {what}")));
             }
             ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. } => return Ok(()),
+            ChannelMsg::Close => break,
             _ => {}
         }
     }
-    Err(DaemonError::Unreachable(format!(
-        "the connection to {host} closed"
-    )))
+    // sshd closed the channel with no word of how the shell ended, or the
+    // connection went. russh's session drops its handle's queue before
+    // the channels' (its `Session`'s fields drop in that order), so a
+    // connection that went reads as closed by the time its channels end.
+    if connection.is_closed() {
+        Err(ShellError::Stopped(format!(
+            "the connection to {host} closed"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
-/// How [`serve`] ended.
-enum Served {
-    /// Every [`ShellInput`] went.
-    InputGone,
-    /// The channel closed.
-    ChannelGone,
-}
-
-/// Sends `requests` to the shell's channel in order, until every
-/// [`ShellInput`] or the channel is gone.
-async fn serve(
-    channel: &ChannelWriteHalf<Msg>,
-    requests: &mut mpsc::UnboundedReceiver<Request>,
-) -> Served {
+/// Sends `requests` to the shell's channel in order, until the channel or
+/// every request's sender is gone.
+async fn serve(channel: &ChannelWriteHalf<Msg>, requests: &mut mpsc::UnboundedReceiver<Request>) {
     while let Some(request) = requests.recv().await {
         let sent = match request {
             Request::Write(bytes) => channel.data_bytes(bytes).await,
@@ -276,8 +405,7 @@ async fn serve(
             }
         };
         if sent.is_err() {
-            return Served::ChannelGone;
+            return;
         }
     }
-    Served::InputGone
 }

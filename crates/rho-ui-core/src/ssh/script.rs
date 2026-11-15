@@ -3,10 +3,10 @@
 
 use std::{pin::pin, time::Duration};
 
-use russh::{client::Msg, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Sig};
+use russh::{ChannelMsg, ChannelReadHalf, Sig};
 
 use super::connection::Connection;
-use crate::daemon::{io, DaemonError};
+use crate::daemon::DaemonError;
 
 /// How long a script that has a deadline may run: a tripwire for a
 /// script stuck on a hung disk. rho-ui's longest, reading the git
@@ -88,12 +88,6 @@ pub(super) async fn run(
     input: &[u8],
     deadline: Option<Duration>,
 ) -> Result<Vec<u8>, ScriptError> {
-    if connection.is_closed() {
-        return Err(ScriptError::Session(DaemonError::Unreachable(format!(
-            "no ssh connection to {}",
-            connection.host()
-        ))));
-    }
     let ran = sh(connection, input);
     let output = match deadline {
         Some(deadline) => tokio::time::timeout(deadline, ran)
@@ -113,14 +107,9 @@ pub(super) async fn run(
 ///
 /// # Errors
 ///
-/// Fails if the host refuses a session.
+/// Fails if the connection is gone, or the host refuses a session.
 async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, ScriptError> {
-    let (mut read, write) = connection
-        .session()
-        .await
-        .map_err(ScriptError::Session)?
-        .split();
-    let write = CloseOnDrop::new(write);
+    let (mut read, write) = connection.session().await.map_err(ScriptError::Session)?;
     let channel = write.channel();
     let mut send = pin!(async {
         channel.exec(true, "sh -s").await?;
@@ -184,30 +173,4 @@ fn signal(signal: &Sig) -> String {
         Sig::Custom(name) => name.as_str(),
     };
     format!("SIG{name}")
-}
-
-/// A channel's writing half that closes the channel when dropped, as when
-/// a script's future is given up, a shell ends, or sshd refused either.
-/// Closing one already closed does nothing.
-pub(super) struct CloseOnDrop(Option<ChannelWriteHalf<Msg>>);
-
-impl CloseOnDrop {
-    pub(super) fn new(channel: ChannelWriteHalf<Msg>) -> Self {
-        Self(Some(channel))
-    }
-
-    pub(super) fn channel(&self) -> &ChannelWriteHalf<Msg> {
-        self.0.as_ref().expect("only dropping takes the channel")
-    }
-}
-
-impl Drop for CloseOnDrop {
-    fn drop(&mut self) {
-        if let Some(channel) = self.0.take() {
-            // On the I/O runtime, as the future may drop on any thread.
-            io().spawn(async move {
-                let _ = channel.close().await;
-            });
-        }
-    }
 }

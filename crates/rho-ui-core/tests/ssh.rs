@@ -110,15 +110,20 @@ fn install_rho(home: &std::path::Path, fake: &rho_ui_core::fake_daemon::FakeDaem
 
 /// A terminal on the machine runs the login shell in the folder asked,
 /// under a pseudo-terminal there of the type and size asked, on the
-/// daemon's ssh connection, so it signs in no more: what is typed reaches
+/// terminals' own ssh connection, which every shell there shares, so they
+/// sign in once more in all and leave the daemon's sessions to scripts:
+/// what is typed reaches
 /// the shell, Enter as a terminal sends it, a CR; what it prints comes
-/// back; a resize reaches the programs in it; and its exit ends it.
+/// back; a resize reaches the programs in it; and its exit ends it. A
+/// host that refuses the pseudo-terminal leaves a shell that didn't
+/// start, and says so.
 #[cfg(unix)]
 #[test]
 fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_daemons_connection() {
     use rho_ui_core::{
         fake_daemon::{FakeDaemon, Script},
-        RemoteShell,
+        fake_sshd::TerminalEnd,
+        RemoteShell, ShellError,
     };
 
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -140,6 +145,7 @@ fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_daemons_connection() {
         let RemoteShell {
             mut output,
             input,
+            control,
             ended,
         } = ssh.open_shell(&project, "xterm-256color", 80, 24);
         // `$((6*7))` and the like print what the echo of the line typed
@@ -149,7 +155,7 @@ fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_daemons_connection() {
         let want = format!("xterm-256color|truecolor|{}|42|24 80", project.display());
         read_until(&mut output, &want).await;
 
-        input.resize(100, 30);
+        control.resize(100, 30);
         input.write(b"stty size\r".to_vec());
         read_until(&mut output, "30 100").await;
 
@@ -157,8 +163,93 @@ fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_daemons_connection() {
         within("the shell's end", ended.wait())
             .await
             .expect("the shell exits");
+        assert_eq!(
+            within("sshd's end of it", sshd.terminal_ended()).await,
+            Some(TerminalEnd::Exited(0))
+        );
+
+        sshd.refuse_terminals();
+        let refused = ssh.open_shell(&project, "xterm-256color", 80, 24);
+        match within("the refusal", refused.ended.wait()).await {
+            Err(ShellError::NotStarted(why)) if why.contains("pseudo-terminal") => {}
+            other => panic!("not a refused pseudo-terminal: {other:?}"),
+        }
     });
-    assert_eq!(sshd.sign_ins(), 1, "the shell rode the daemon's connection");
+    assert_eq!(
+        sshd.sign_ins(),
+        2,
+        "the daemon's connection, and the terminals' own, which both shells shared"
+    );
+}
+
+/// A machine runs at most `MAX_SHELLS` terminals' shells at once, the
+/// sessions sshd allows on their connection: one more doesn't start, and
+/// names the limit. Dropping a shell's control hangs up on it at once,
+/// though its output and a clone of its input live on, and frees its
+/// slot for another.
+#[cfg(unix)]
+#[test]
+fn a_machine_runs_at_most_max_shells_and_a_dropped_control_hangs_up() {
+    use rho_ui_core::{
+        fake_daemon::{FakeDaemon, Script},
+        fake_sshd::TerminalEnd,
+        RemoteShell, ShellError, MAX_SHELLS,
+    };
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let home = dir.path().join("home");
+    let fake = FakeDaemon::start(Script::default());
+    install_rho(&home, &fake);
+    let sshd = FakeSshd::start(&home);
+    block_on(async {
+        let (daemon, _events) = Daemon::connect(DaemonTarget::Ssh(sshd.target()))
+            .await
+            .expect("the fake daemon answers over the fake sshd");
+        let ssh = daemon.ssh().expect("a remote daemon's ssh link");
+        let open = || ssh.open_shell(&home, "xterm-256color", 80, 24);
+        let mut shells = Vec::new();
+        for _ in 0..MAX_SHELLS {
+            let mut shell = open();
+            started(&mut shell).await;
+            shells.push(shell);
+        }
+        // Its control and output stay, so nothing but the limit ends it.
+        let over = open();
+        match within("the shell past the limit", over.ended.wait()).await {
+            Err(ShellError::NotStarted(why)) if why.contains(&format!("at most {MAX_SHELLS}")) => {}
+            other => panic!("not the limit: {other:?}"),
+        }
+
+        let RemoteShell {
+            output,
+            input,
+            control,
+            ended,
+        } = shells.pop().expect("a shell");
+        drop(control);
+        within("the hung-up shell's end", ended.wait())
+            .await
+            .expect("a hang-up ends the shell");
+        assert_eq!(
+            within("sshd's end of it", sshd.terminal_ended()).await,
+            Some(TerminalEnd::HungUp)
+        );
+        drop((output, input));
+        started(&mut open()).await;
+    });
+    assert_eq!(
+        sshd.sign_ins(),
+        2,
+        "every shell on the terminals' one connection"
+    );
+}
+
+/// Waits for `shell` to answer what is typed.
+#[cfg(unix)]
+async fn started(shell: &mut rho_ui_core::RemoteShell) {
+    // The echo of the line typed doesn't hold what `$((1+1))` prints.
+    shell.input.write(b"echo started-$((1+1))\r".to_vec());
+    read_until(&mut shell.output, "started-2").await;
 }
 
 /// How long a test waits on the fake sshd's shell before it fails: far

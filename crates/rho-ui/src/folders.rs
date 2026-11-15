@@ -33,7 +33,7 @@ const REMOTE_PAUSE: Duration = Duration::from_millis(150);
 pub(crate) enum PathStyle {
     /// This machine's, as `std::path` has them: on Windows, `\` or `/`
     /// between names, and absolute from a drive's root.
-    Here,
+    Native,
     /// A remote machine's, which is Unix, whatever this machine is: `/`
     /// between names, and absolute from `/`.
     Posix,
@@ -43,7 +43,7 @@ impl PathStyle {
     /// The rules `machine`'s paths follow.
     pub(crate) fn of(machine: &MachineId) -> Self {
         if machine.is_local() {
-            Self::Here
+            Self::Native
         } else {
             Self::Posix
         }
@@ -51,14 +51,14 @@ impl PathStyle {
 
     fn is_separator(self, c: char) -> bool {
         match self {
-            Self::Here => std::path::is_separator(c),
+            Self::Native => std::path::is_separator(c),
             Self::Posix => c == '/',
         }
     }
 
     fn is_absolute(self, text: &str) -> bool {
         match self {
-            Self::Here => Path::new(text).is_absolute(),
+            Self::Native => Path::new(text).is_absolute(),
             Self::Posix => text.starts_with('/'),
         }
     }
@@ -66,7 +66,7 @@ impl PathStyle {
     /// `name`, which may hold separators, in `folder`.
     fn join(self, folder: &Path, name: &OsStr) -> PathBuf {
         match self {
-            Self::Here => folder.join(name),
+            Self::Native => folder.join(name),
             Self::Posix => {
                 let mut bytes = platform::path_to_bytes(folder.as_os_str());
                 if !bytes.ends_with(b"/") {
@@ -82,7 +82,7 @@ impl PathStyle {
     /// Windows, this machine's with `\` between names.
     fn tidy(self, path: &Path) -> PathBuf {
         match self {
-            Self::Here => path.components().collect(),
+            Self::Native => path.components().collect(),
             Self::Posix => {
                 let bytes = platform::path_to_bytes(path.as_os_str());
                 let names: Vec<&[u8]> = bytes
@@ -100,15 +100,17 @@ impl PathStyle {
         }
     }
 
-    /// The folder `path` is in, and its last name; `None` at a root.
+    /// The folder `path` is in, and its last name; `None` at a root, or
+    /// after a last `..`, which names a folder but not by its name (as
+    /// `std::path`'s `file_name` has it), so the path is browsed itself.
     fn split(self, path: &Path) -> Option<(PathBuf, OsString)> {
         match self {
-            Self::Here => Some((path.parent()?.to_path_buf(), path.file_name()?.to_owned())),
+            Self::Native => Some((path.parent()?.to_path_buf(), path.file_name()?.to_owned())),
             Self::Posix => {
                 let bytes = platform::path_to_bytes(path.as_os_str());
                 let at = bytes.iter().rposition(|&byte| byte == b'/')?;
                 let (folder, name) = bytes.split_at(at);
-                let name = name.get(1..).filter(|name| !name.is_empty())?;
+                let name = name.get(1..).filter(|name| !matches!(*name, b"" | b".."))?;
                 let folder: &[u8] = if folder.is_empty() { b"/" } else { folder };
                 Some((
                     platform::path_from_bytes(folder),
@@ -154,7 +156,8 @@ impl Typed {
         };
         let path = style.tidy(&path);
         let at_folder = text == "~" || text.ends_with(|c: char| style.is_separator(c));
-        match style.split(&path).filter(|_| !at_folder) {
+        let split = if at_folder { None } else { style.split(&path) };
+        match split {
             Some((browse, name)) => Some(Self {
                 path,
                 browse,
@@ -578,6 +581,8 @@ mod tests {
             ("~", Some(("/home/me", "/home/me", ""))),
             ("/srv/x", Some(("/srv/x", "/srv", "x"))),
             ("/srv//x/./", Some(("/srv/x", "/srv/x", ""))),
+            // A last `..` browses the folder it names, as `std::path` has it.
+            ("/srv/app/..", Some(("/srv/app/..", "/srv/app/..", ""))),
             ("/", Some(("/", "/", ""))),
             ("rho-ui", None),
             (r"C:\code", None),
@@ -590,6 +595,7 @@ mod tests {
             &[
                 (r"C:\code\", Some((r"C:\code", r"C:\code", ""))),
                 ("C:/code", Some((r"C:\code", r"C:\", "code"))),
+                (r"C:\code\..", Some((r"C:\code\..", r"C:\code\..", ""))),
                 (r"~\x", Some((r"C:\Users\me\x", r"C:\Users\me", "x"))),
                 ("~/x", Some((r"C:\Users\me\x", r"C:\Users\me", "x"))),
                 ("/srv/x", None),
@@ -601,12 +607,13 @@ mod tests {
             "/home/me",
             &[
                 ("~/co", Some(("/home/me/co", "/home/me", "co"))),
+                ("/srv/app/..", Some(("/srv/app/..", "/srv/app/..", ""))),
                 ("/", Some(("/", "/", ""))),
                 (r"C:\code", None),
                 (r"~\x", None),
             ],
         );
-        check(here, home, PathStyle::Here);
+        check(here, home, PathStyle::Native);
         assert_eq!(
             Typed::parse("~/code", None, PathStyle::Posix),
             None,
@@ -638,7 +645,12 @@ mod tests {
         std::os::unix::fs::symlink(&plain, dir.join("link")).unwrap();
         std::os::unix::fs::symlink(&main, dir.join("plink")).unwrap();
         let at = |rest: &str| {
-            Typed::parse(&format!("{}/{rest}", dir.display()), None, PathStyle::Here).unwrap()
+            Typed::parse(
+                &format!("{}/{rest}", dir.display()),
+                None,
+                PathStyle::Native,
+            )
+            .unwrap()
         };
         let cases = [
             at("project/docs"),
