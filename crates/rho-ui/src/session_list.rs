@@ -232,8 +232,14 @@ fn slot(shelf: Shelf) -> usize {
 impl SessionList {
     /// Replaces the saved sessions of `machine`, whose daemon listed
     /// `saved`. Unsaved sessions the daemon now lists become saved rows;
-    /// live titles and activity carry over.
+    /// live titles, activity and Done carry over.
     pub(crate) fn set_saved(&mut self, machine: &MachineId, saved: Vec<SavedSession>) {
+        let done: Vec<SessionKey> = self
+            .rows
+            .iter()
+            .filter(|row| row.done)
+            .map(|row| row.id.clone())
+            .collect();
         self.rows.retain(|row| {
             let listed = || saved.iter().any(|session| session.id == row.id);
             if row.saved {
@@ -252,6 +258,7 @@ impl SessionList {
                 title: live.and_then(|live| live.title.clone()).or(session.title),
                 placeholder: live.map_or(UNTITLED, |live| live.placeholder),
                 activity: self.activity(&session.id),
+                done: done.contains(&session.id),
                 id: session.id,
                 cwd: session.cwd,
                 workspace: session.workspace,
@@ -259,7 +266,6 @@ impl SessionList {
                 shelf: Shelf::Active,
                 saved: true,
                 pinned: None,
-                done: false,
             });
         }
         self.rows[unsaved..].sort_by_key(|row| Reverse(row.updated));
@@ -983,6 +989,9 @@ mod tests {
         list.set_jobs(&here(), vec![job("a", JobActivity::Working, None)], now, 7);
         list.set_jobs(&here(), Vec::new(), now, 8);
         assert!(done(&list));
+        // The app lists the sessions again when the jobs change.
+        list.set_saved(&here(), vec![saved("a", Some("a"), 8)]);
+        assert!(done(&list), "the daemon's list keeps Done");
         assert!(list.mark_seen(&id("a")));
         assert!(!done(&list));
     }

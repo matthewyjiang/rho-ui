@@ -4,6 +4,8 @@
 cargo test
 ```
 
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on Linux and macOS for every pull request and push to `main`, with the toolchain `mise.toml` pins. Each run uploads the UI tests' screenshots as `ui-shots-<os>` artifacts.
+
 Before adding or growing a test, load the `rho-ui-test-selection` skill (`.agents/skills`): every test needs a failure mode, one owner layer, and a gap.
 
 - `rho-ui-core` has a scripted daemon for tests (`fake_daemon`, behind the `test-support` feature): `rho-protocol`'s real server side on a real Unix socket, with no model or network. `tests/fixtures/bash_turn.jsonl` is a recorded turn from a real daemon, and `tests/fixtures/tool_cards.jsonl` holds tool calls a rho 3 daemon sent with their cards, streamed and finished.
