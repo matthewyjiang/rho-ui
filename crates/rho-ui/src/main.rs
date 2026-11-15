@@ -20,6 +20,7 @@ mod folders;
 mod input_card;
 mod kinetic;
 mod lightbox;
+mod local;
 mod machines;
 mod pele;
 mod pictures;
@@ -190,8 +191,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
         None => std::env::current_dir()
             .map_err(|error| format!("can't read the current directory: {error}"))?,
     };
-    let workspace = dir
-        .canonicalize()
+    let workspace = rho_ui_core::platform::canonicalize(&dir)
         .map_err(|error| format!("can't open {}: {error}", dir.display()))?;
     if !workspace.is_dir() {
         return Err(format!("{} is not a directory", workspace.display()));
@@ -465,7 +465,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let workspace = dir.to_str().expect("a UTF-8 temporary directory");
         let launch = parse(&[workspace, "--rho", "/opt/rho/bin/rho"]).unwrap();
-        assert_eq!(launch.workspace, dir.canonicalize().unwrap());
+        assert_eq!(
+            launch.workspace,
+            rho_ui_core::platform::canonicalize(&dir).unwrap()
+        );
         // Both sides read the rho home from this process's environment.
         assert_eq!(
             launch.local.daemon,

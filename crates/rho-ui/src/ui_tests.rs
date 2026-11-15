@@ -2692,10 +2692,9 @@ fn a_reply_draws_its_diagram_and_formula_in_the_theme() {
 /// the lightbox at its own size, under its caption; it zooms in and fits
 /// again, and Escape closes it.
 #[test]
-#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn pictures_show_in_place_and_open_in_the_lightbox() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let folder = dir.path().canonicalize().expect("it resolves");
+    let folder = rho_ui_core::platform::canonicalize(dir.path()).expect("it resolves");
     std::fs::write(
         folder.join("plot.png"),
         crate::attachments::png(640, 320, RED),
@@ -3047,10 +3046,9 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
 /// screen works, read with this machine's `git`, and reads them again when
 /// the session's turn ends.
 #[test]
-#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn the_diff_surface_follows_the_sessions_changes() {
     let repo = tempfile::tempdir().unwrap();
-    let repo = repo.path().canonicalize().unwrap();
+    let repo = rho_ui_core::platform::canonicalize(repo.path()).unwrap();
     let git = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -3104,10 +3102,9 @@ fn the_diff_surface_follows_the_sessions_changes() {
 /// open file again, and Back returns to the tree with its folder still
 /// open.
 #[test]
-#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn the_files_surface_opens_the_sessions_files() {
     let repo = tempfile::tempdir().unwrap();
-    let repo = repo.path().canonicalize().unwrap();
+    let repo = rho_ui_core::platform::canonicalize(repo.path()).unwrap();
     let status = std::process::Command::new("git")
         .args(["init", "-q", "-b", "main"])
         .current_dir(&repo)
@@ -4407,7 +4404,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let dir = std::env::temp_dir().join(format!("rho-ui-projects-{}", std::process::id()));
     let (main, tree) = crate::repo::fake_worktree(&dir);
-    let main = main.canonicalize().expect("the checkout exists");
+    let main = rho_ui_core::platform::canonicalize(&main).expect("the checkout exists");
     let main_row: &'static str = format!("project-local:{}", main.display()).leak();
     let daemon = FakeDaemon::start(Script::default());
     let mut ui = Harness::open(
@@ -4500,10 +4497,9 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
 /// machine's clone folder, adds the clone to the projects, and starts the
 /// draft there.
 #[test]
-#[cfg_attr(windows, ignore = "reads this machine's files with a POSIX sh script")]
 fn a_typed_git_url_clones_into_the_clone_folder() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let dir = dir.path().canonicalize().expect("it resolves");
+    let dir = rho_ui_core::platform::canonicalize(dir.path()).expect("it resolves");
     for args in [
         &["init", "-q", "-b", "main", "thing"][..],
         &["-C", "thing", "commit", "-q", "--allow-empty", "-m", "x"],

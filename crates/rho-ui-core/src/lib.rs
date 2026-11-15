@@ -36,7 +36,7 @@ pub use prompt::{
     check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
     ImageFormat, Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
 };
-pub use rho_install::{RhoCheck, RhoInstall, Update, INSTALL_DIR};
+pub use rho_install::{RhoCheck, RhoInstall, Update};
 pub use session::{
     Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,
     RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,

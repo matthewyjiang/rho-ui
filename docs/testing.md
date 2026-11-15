@@ -6,7 +6,7 @@ cargo test
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on Linux, macOS and Windows for every pull request and push to `main`, with the toolchain `mise.toml` pins. Each run uploads the UI tests' screenshots as `ui-shots-<os>` artifacts, and runs every test binary even when one fails (`--no-fail-fast`).
 
-A test that can't run on Windows says so on the test itself. `#[cfg_attr(windows, ignore = "…")]` means it should run there once its reason is fixed: rho-ui still does the thing with a POSIX `sh` script, or the test scripts one. `#[cfg(unix)]` means it doesn't apply there: symlinks, a Unix socket, the remote machine's scripts, and ssh, which rides OpenSSH's `ControlMaster`.
+A test that can't run on Windows says so on the test itself. `#[cfg_attr(windows, ignore = "…")]` means it should run there once its reason is fixed: rho-ui still does the thing with a POSIX `sh` script, or the test scripts one. `#[cfg(unix)]` means it doesn't apply there: symlinks, a Unix socket, the remote machine's scripts, and ssh, which rides OpenSSH's `ControlMaster`. Each feature that reads a machine is tested against one fixture through its local Rust path and, on Unix, through the `sh` script a remote machine runs, so the two can't drift apart. The local path runs on Windows too, except the check of an installed rho, whose fake `rho` is an `sh` script; that a missing rho checks as missing runs everywhere.
 
 Before adding or growing a test, load the `rho-ui-test-selection` skill (`.agents/skills`): every test needs a failure mode, one owner layer, and a gap.
 

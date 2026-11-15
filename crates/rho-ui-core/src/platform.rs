@@ -1,7 +1,9 @@
 //! What differs between the operating systems rho-ui runs on, in one
-//! place: where the user's home and rho-ui's own folders are, which shell
-//! a terminal runs, how a path becomes the bytes a database row or a
-//! remote shell takes, and how to reach a daemon's local endpoint.
+//! place: where the user's home, rho-ui's own folders and rho's install
+//! folder are, how a setting's `~` reads, which shell a terminal runs, how
+//! to run a program in the background, how a path becomes the bytes a
+//! database row or a remote shell takes, and how to reach a daemon's local
+//! endpoint.
 //!
 //! The rest of rho-ui, this crate and the app, asks here instead of
 //! reading variables or naming an OS itself. Each function says what it
@@ -11,6 +13,7 @@ use std::{
     ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
 /// The user's home directory: `$HOME`, else on Windows `%USERPROFILE%`,
@@ -50,6 +53,19 @@ fn rho_home_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| home_dir_from(var).map(|home| home.join(".rho")))
+}
+
+/// `path`, a setting, with a leading `~` as `home`, as `sh` reads one: `~`
+/// alone is `home`, and `~/x` is `x` in it, as is `~\x` on Windows, where
+/// `\` divides a path too. Anything else, `~user` among it, is kept as it
+/// is.
+#[must_use]
+pub fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Which of rho-ui's own folders [`app_dir`] names.
@@ -118,6 +134,61 @@ pub fn file_uri_path(uri: &str) -> Option<PathBuf> {
     } else {
         uri.strip_prefix("file://").map(PathBuf::from)
     }
+}
+
+/// The folder rho's installer puts `rho` in when not told where. On Unix,
+/// `~/.local/bin`, as its `install.sh` does. On Windows,
+/// `%LOCALAPPDATA%\Programs\rho\bin`, as its `install.ps1` does; that adds
+/// the folder to the user's `PATH`, but not to that of programs already
+/// running. `None` when the variable that places it is unset.
+#[must_use]
+pub fn rho_install_dir() -> Option<PathBuf> {
+    rho_install_dir_from(|name| std::env::var_os(name))
+}
+
+fn rho_install_dir_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let local = var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())?;
+        return Some(local.join("Programs").join("rho").join("bin"));
+    }
+    home_dir_from(var).map(|home| home.join(".local").join("bin"))
+}
+
+/// A command for `program` that runs in the background of the app, as
+/// `git` and `rho` do for it: its stdin is empty, and on Windows it opens no
+/// console window, which would otherwise flash up for each one a GUI app
+/// starts.
+#[must_use]
+pub fn background_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// The process creation flag that starts a console program without a
+/// console window (`CREATE_NO_WINDOW` in the Win32 API).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `path` resolved, as [`std::fs::canonicalize`] does. On Windows, without
+/// the `\\?\` prefix that gives it, where the path reads the same without:
+/// git, the shells and the user all take `C:\code`, and few take
+/// `\\?\C:\code`. A rho home is the exception: rho names its daemon after
+/// the home's path as [`std::fs::canonicalize`] gives it. `clippy.toml`
+/// disallows std's, so each call to it says why.
+///
+/// # Errors
+///
+/// As [`std::fs::canonicalize`]: if `path` isn't there, or can't be read.
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    dunce::canonicalize(path)
 }
 
 /// The shell a terminal on this machine runs. On Unix, `$SHELL`, else
@@ -369,6 +440,22 @@ mod tests {
         assert_eq!(rho_home_from(env(&[("HOME", "")])), None);
     }
 
+    /// A leading `~` is the home directory, alone or as a path's first
+    /// part; `~user` and a `~` further in are kept.
+    #[test]
+    fn a_leading_tilde_is_home() {
+        let home = Path::new("/home/me");
+        let expand = |path: &str| expand_tilde(Path::new(path), home);
+        assert_eq!(expand("~"), home);
+        assert_eq!(expand("~/"), home);
+        assert_eq!(expand("~/code"), home.join("code"));
+        assert_eq!(expand("~me/code"), Path::new("~me/code"));
+        assert_eq!(expand("code/~"), Path::new("code/~"));
+        assert_eq!(expand("/srv/code"), Path::new("/srv/code"));
+        #[cfg(windows)]
+        assert_eq!(expand(r"~\code"), home.join("code"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_app_dirs_follow_xdg_and_take_no_relative_base() {
@@ -387,7 +474,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_finds_home_and_app_data() {
+    fn windows_finds_home_app_data_and_the_rho_install_dir() {
         let profile = [
             ("USERPROFILE", r"C:\Users\me"),
             ("APPDATA", r"C:\Users\me\AppData\Roaming"),
@@ -399,6 +486,11 @@ mod tests {
         assert_eq!(
             app_dir_from(AppDir::State, env(&profile)),
             Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\rho-ui\state"))
+        );
+        let local = [("LOCALAPPDATA", r"C:\Users\me\AppData\Local")];
+        assert_eq!(
+            rho_install_dir_from(env(&local)),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Local\Programs\rho\bin"))
         );
     }
 

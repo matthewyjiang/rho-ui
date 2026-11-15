@@ -85,13 +85,13 @@ pub(crate) fn inspect(cwd: &Path) -> Repo {
     let Some((work_tree, git_dir)) = find_git_dir(cwd) else {
         return folder(cwd);
     };
-    let work_tree = work_tree.canonicalize().unwrap_or(work_tree);
-    let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+    let work_tree = platform::canonicalize(&work_tree).unwrap_or(work_tree);
+    let git_dir = platform::canonicalize(&git_dir).unwrap_or(git_dir);
     // A linked worktree keeps its config in the main repository's git dir.
     let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
         .ok()
         .map(|dir| git_dir.join(dir.trim()))
-        .and_then(|dir| dir.canonicalize().ok())
+        .and_then(|dir| platform::canonicalize(&dir).ok())
         .unwrap_or_else(|| git_dir.clone());
     let origin = std::fs::read_to_string(common_dir.join("config"))
         .ok()
@@ -354,7 +354,7 @@ mod tests {
                 name: "project".into(),
                 origin: None,
                 branch: Some("main".into()),
-                root: main.canonicalize().unwrap(),
+                root: platform::canonicalize(&main).unwrap(),
             }
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -375,7 +375,7 @@ mod tests {
                 name: "project".into(),
                 origin: None,
                 branch: Some("feature".into()),
-                root: main.canonicalize().unwrap(),
+                root: platform::canonicalize(&main).unwrap(),
             }
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -390,8 +390,8 @@ mod tests {
     #[test]
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| folders::git(&dir, args);
+        let dir = platform::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| crate::local::test::git(&dir, args);
         git(&["init", "-q", "-b", "main", "main"]);
         git(&[
             "-C",

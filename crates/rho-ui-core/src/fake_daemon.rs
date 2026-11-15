@@ -190,6 +190,10 @@ pub fn write_program(path: &Path, text: &str) {
 /// Makes the home and the daemon's runtime directory if missing.
 fn endpoint_of(rho_home: &Path) -> PathBuf {
     std::fs::create_dir_all(rho_home).expect("the fake daemon makes its rho home");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "rho names its daemon after the rho home as std resolves it, prefix and all"
+    )]
     let canonical = std::fs::canonicalize(rho_home).expect("the rho home resolves");
     let endpoint = DaemonEndpoint::locate(&canonical, None).expect("a short rho home");
     std::fs::create_dir_all(&endpoint.runtime_dir).expect("the daemon's runtime directory");
