@@ -1,0 +1,207 @@
+use serde_json::{Map, Value};
+
+use crate::coerce::{number_value, to_number};
+use crate::data_model::DataModel;
+use crate::expr::{Call, Expr, ExpressionError};
+use crate::functions::{Args, Effect, Functions};
+use crate::pointer::{resolve_path, Pointer};
+use crate::template::MAX_DEPTH;
+
+/// The deepest evaluation may recurse, counting bindings, containers and
+/// calls, including those a `formatString` template evaluates. It leaves room
+/// for any expression within [`MAX_DEPTH`] inside a template, and stops a
+/// template that reads itself back from the data model.
+const MAX_EVALUATION_DEPTH: usize = 2 * MAX_DEPTH;
+
+/// Evaluates expressions against a data model, in one scope.
+///
+/// Relative bindings resolve against the scope path, and `@index` reads the
+/// index of the collection item being evaluated.
+#[derive(Debug)]
+pub struct DataContext<'a> {
+    model: &'a DataModel,
+    functions: &'a Functions,
+    scope: Option<String>,
+    index: Option<usize>,
+    depth: usize,
+    effects: Vec<Effect>,
+}
+
+impl<'a> DataContext<'a> {
+    /// A context at the root of `model`, calling `functions`.
+    #[must_use]
+    pub fn new(model: &'a DataModel, functions: &'a Functions) -> Self {
+        Self {
+            model,
+            functions,
+            scope: None,
+            index: None,
+            depth: 0,
+            effects: Vec::new(),
+        }
+    }
+
+    /// Moves the scope to `path`, itself resolved against the current scope.
+    #[must_use]
+    pub fn with_scope(mut self, path: &str) -> Self {
+        self.scope = Some(resolve_path(path, self.scope.as_deref()));
+        self
+    }
+
+    /// Marks the scope as item `index` of a collection, which `@index` reads.
+    #[must_use]
+    pub fn with_index(mut self, index: usize) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// Evaluates `expr`. A binding to a path with nothing there is null.
+    ///
+    /// # Errors
+    ///
+    /// Fails on an invalid path, an unknown function, `@index` outside a
+    /// collection, a function that refuses its arguments, or recursion
+    /// deeper than the evaluation bound.
+    pub fn evaluate(&mut self, expr: &Expr) -> Result<Value, ExpressionError> {
+        match expr {
+            Expr::Literal(value) => Ok(value.clone()),
+            Expr::Path(path) => self.read(path),
+            nested => {
+                if self.depth >= MAX_EVALUATION_DEPTH {
+                    return Err(ExpressionError::EvaluationTooDeep);
+                }
+                self.depth += 1;
+                let value = self.evaluate_nested(nested);
+                self.depth -= 1;
+                value
+            }
+        }
+    }
+
+    /// Hands over the effects that functions asked for, in order.
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
+
+    pub(crate) fn push_effect(&mut self, effect: Effect) {
+        self.effects.push(effect);
+    }
+
+    fn read(&self, path: &str) -> Result<Value, ExpressionError> {
+        let pointer = Pointer::parse(&resolve_path(path, self.scope.as_deref()))?;
+        Ok(self.model.get(&pointer).cloned().unwrap_or(Value::Null))
+    }
+
+    fn evaluate_nested(&mut self, expr: &Expr) -> Result<Value, ExpressionError> {
+        match expr {
+            Expr::Literal(_) | Expr::Path(_) => self.evaluate(expr),
+            Expr::List(items) => items
+                .iter()
+                .map(|item| self.evaluate(item))
+                .collect::<Result<_, _>>()
+                .map(Value::Array),
+            Expr::Object(fields) => fields
+                .iter()
+                .map(|(key, field)| Ok((key.clone(), self.evaluate(field)?)))
+                .collect::<Result<Map<_, _>, _>>()
+                .map(Value::Object),
+            Expr::Call(call) => self.call(call),
+        }
+    }
+
+    fn call(&mut self, call: &Call) -> Result<Value, ExpressionError> {
+        if call.name == "@index" {
+            return self.index(call);
+        }
+        let function =
+            self.functions
+                .get(&call.name)
+                .ok_or_else(|| ExpressionError::UnknownFunction {
+                    name: call.name.clone(),
+                })?;
+        let args = self.evaluate_args(call)?;
+        function(&args, self).map_err(|source| ExpressionError::Function {
+            name: call.name.clone(),
+            source,
+        })
+    }
+
+    fn evaluate_args(&mut self, call: &Call) -> Result<Args, ExpressionError> {
+        call.args
+            .iter()
+            .map(|(name, arg)| Ok((name.clone(), self.evaluate(arg)?)))
+            .collect::<Result<Map<_, _>, _>>()
+            .map(Args::new)
+    }
+
+    /// `@index(offset)`: the collection index plus `offset`, 0 by default.
+    fn index(&mut self, call: &Call) -> Result<Value, ExpressionError> {
+        let index = self.index.ok_or(ExpressionError::IndexOutsideCollection)?;
+        let offset = self
+            .evaluate_args(call)?
+            .get("offset")
+            .map_or(0.0, to_number);
+        let index = u32::try_from(index).map_or(f64::INFINITY, f64::from);
+        Ok(number_value(index + offset))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::functions::FunctionError;
+
+    fn evaluate(
+        model: &DataModel,
+        scope: Option<(&str, usize)>,
+        template: &str,
+    ) -> Result<Value, ExpressionError> {
+        let functions = Functions::basic();
+        let mut context = DataContext::new(model, &functions);
+        if let Some((path, index)) = scope {
+            context = context.with_scope(path).with_index(index);
+        }
+        let call = Expr::from_json(&json!({"@call": "formatString", "args": {"value": template}}))?;
+        context.evaluate(&call)
+    }
+
+    /// Relative bindings read the scope's item and `@index` its position;
+    /// outside a collection `@index` is an error rather than a made-up 0.
+    #[test]
+    fn scope_and_index() {
+        let model = DataModel::new(json!({"items": [{"name": "a"}, {"name": "b"}]}));
+        assert_eq!(
+            evaluate(
+                &model,
+                Some(("/items/1", 1)),
+                "${@index(offset: 1)}. ${name}"
+            ),
+            Ok(json!("2. b"))
+        );
+        assert!(matches!(
+            evaluate(&model, None, "${@index()}"),
+            Err(ExpressionError::Function { source: FunctionError::Template(e), .. })
+                if *e == ExpressionError::IndexOutsideCollection
+        ));
+    }
+
+    /// A template that reads itself back from the data model fails instead
+    /// of recursing until the stack overflows.
+    #[test]
+    fn self_referencing_template_stops() {
+        let model = DataModel::new(json!({"t": "${formatString(value: /t)}"}));
+        let error =
+            evaluate(&model, None, "${formatString(value: /t)}").expect_err("recursion is bounded");
+        let mut source: &ExpressionError = &error;
+        while let ExpressionError::Function {
+            source: FunctionError::Template(inner),
+            ..
+        } = source
+        {
+            source = inner;
+        }
+        assert_eq!(*source, ExpressionError::EvaluationTooDeep);
+    }
+}

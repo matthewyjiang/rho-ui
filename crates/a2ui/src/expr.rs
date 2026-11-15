@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::functions::FunctionError;
+use crate::pointer::PointerError;
 use crate::template::{MAX_DEPTH, MAX_TEMPLATE_CHARS, MAX_TEMPLATE_PARTS};
 
 /// A dynamic value, parsed: a literal, a data binding or a function call.
@@ -127,6 +129,29 @@ pub enum ExpressionError {
     /// an object, whose `catalogId` is not a string, or with any other key.
     #[error("a function call must be {{\"@call\": <string>, \"args\"?: {{...}}, \"catalogId\"?: <string>}}")]
     MalformedCall,
+    /// A binding whose path is not a valid pointer once resolved.
+    #[error(transparent)]
+    InvalidPath(#[from] PointerError),
+    /// A call to a function the context does not have.
+    #[error("unknown function {name:?}")]
+    UnknownFunction {
+        /// The name called.
+        name: String,
+    },
+    /// `@index` evaluated outside a collection item.
+    #[error("@index function can only be evaluated inside a collection template iteration scope.")]
+    IndexOutsideCollection,
+    /// Evaluation, through templates that call functions, recursed too deep.
+    #[error("evaluation exceeded the maximum recursion depth")]
+    EvaluationTooDeep,
+    /// A function refused its arguments.
+    #[error("{name}: {source}")]
+    Function {
+        /// The function called.
+        name: String,
+        /// Why it refused.
+        source: FunctionError,
+    },
 }
 
 impl Expr {
