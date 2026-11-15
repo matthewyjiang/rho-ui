@@ -935,8 +935,8 @@ fn a_timed_question_holds_on_the_first_key() {
     });
     let countdown = ui.label("input-timeout").unwrap_or_default();
     assert!(
-        countdown.starts_with("rho answers “Language: Rust” in 4:")
-            || countdown.starts_with("rho answers “Language: Rust” in 5:00"),
+        countdown.starts_with("Rho answers “Language: Rust” in 4:")
+            || countdown.starts_with("Rho answers “Language: Rust” in 5:00"),
         "the countdown names the fallback: {countdown:?}"
     );
     ui.shot("countdown");
@@ -1406,7 +1406,7 @@ fn click_label(ui: &mut Harness, label: &str) {
 }
 
 /// The gear opens settings in a dialog over the sessions; a new scale
-/// reaches the theme; Escape closes.
+/// reaches the theme; About opens; Escape closes.
 #[test]
 fn settings_open_apply_and_close() {
     let mut ui = Harness::start("settings", Script::default());
@@ -1460,6 +1460,12 @@ fn settings_open_apply_and_close() {
         settings.apply(cx);
     });
     ui.shot("light");
+
+    open_settings_page(&mut ui, "About");
+    ui.wait_until("the About page", |window, _, _| {
+        is_visible(window, "about-source")
+    });
+    ui.shot("about");
 
     ui.act(|window, cx| window.press("escape", cx));
     // Past the dialog's exit transition.
@@ -4495,7 +4501,7 @@ fn rho_settings_write_and_follow_the_daemon() {
         Projects::default(),
     );
     open_settings(&mut ui);
-    open_settings_page(&mut ui, "rho");
+    open_settings_page(&mut ui, "Rho");
     let compact = "setting-general.auto_compact";
     let switch_is = |on: bool| {
         move |window: &Window, _: &App, _: &RhoApp| {

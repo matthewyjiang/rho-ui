@@ -1033,7 +1033,7 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// The toggle, "rho", and New session at the far end.
+    /// The toggle, "Rho", and New session at the far end.
     fn render_header(cx: &Context<'_, Self>) -> impl IntoElement {
         h_flex()
             .flex_shrink_0()
@@ -1041,7 +1041,7 @@ impl SidebarView {
             .px_3()
             .gap_1()
             .child(toggle_button(Layout::Open, cx))
-            .child(div().flex_1().font_semibold().child("rho"))
+            .child(div().flex_1().font_semibold().child("Rho"))
             .child(new_session_button(cx))
     }
 
@@ -1635,7 +1635,7 @@ fn delete_item(view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenuItem {
                 alert
                     .icon(Icon::new(Lucide::Trash).text_color(cx.theme().danger))
                     .title(format!("Delete \"{title}\"?"))
-                    .description("rho deletes the saved session. This can't be undone.")
+                    .description("Rho deletes the saved session. This can't be undone.")
                     .confirm()
                     .ok_text("Delete")
                     .ok_variant(ButtonVariant::Danger)

@@ -290,8 +290,8 @@ fn machine_group(fields: &RemoteFields) -> SettingGroup {
                 .description("Shown in the sidebar. Empty uses the host."),
         )
         .item(
-            SettingItem::new("rho path", input(&fields.rho))
-                .description("Use an absolute path if ssh can't find rho."),
+            SettingItem::new("Rho path", input(&fields.rho))
+                .description("Use an absolute path if ssh can't find it."),
         )
         .item(
             SettingItem::new("Clone folder", input(&fields.clone_folder))

@@ -425,8 +425,8 @@ impl RhoApp {
         let info = daemon.info();
         if let Some(notice) = info.notice() {
             let title = match self.machines.read(cx).tag(machine) {
-                Some(label) => format!("rho on {label} is another build"),
-                None => "rho daemon is another build".to_owned(),
+                Some(label) => format!("Rho on {label} is another build"),
+                None => "Rho daemon is another build".to_owned(),
             };
             window.push_notification(Notification::warning(notice.to_owned()).title(title), cx);
         }
@@ -436,7 +436,7 @@ impl RhoApp {
             });
         }
         let status = MachineStatus::Ready {
-            version: format!("rho {}", info.version()).into(),
+            version: format!("Rho {}", info.version()).into(),
         };
         self.set_status(machine, status, cx);
         self.rho_settings.update(cx, |settings, cx| {

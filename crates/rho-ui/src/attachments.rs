@@ -220,7 +220,7 @@ pub(crate) fn from_clipboard(image: &gpui_kit::Image) -> Result<Image, String> {
     match sniff(&image.bytes) {
         Sniffed::Image(format) => Ok(Image::new(format, image.bytes.as_slice())),
         Sniffed::OtherImage(mime_type) => Err(format!(
-            "rho takes PNG, JPEG, GIF and WebP images, and this is {mime_type}"
+            "Rho takes PNG, JPEG, GIF and WebP images, and this is {mime_type}"
         )),
         Sniffed::NotImage => Err("the clipboard's image data isn't an image".to_owned()),
     }

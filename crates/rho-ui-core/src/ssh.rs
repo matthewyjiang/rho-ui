@@ -425,12 +425,12 @@ impl SshLink {
                 if output.status.code() == Some(255) {
                     format!("couldn't run a command on {host} over ssh: {said}")
                 } else {
-                    format!("couldn't start the rho daemon on {host}: {said}")
+                    format!("couldn't start the Rho daemon on {host}: {said}")
                 },
             ));
         }
         parse_setup(&String::from_utf8_lossy(&output.stdout)).map_err(|problem| {
-            DaemonError::Unreachable(format!("couldn't read {host}'s rho setup: {problem}"))
+            DaemonError::Unreachable(format!("couldn't read {host}'s Rho setup: {problem}"))
         })
     }
 
@@ -481,7 +481,7 @@ impl SshLink {
                     said
                 };
                 Err(DaemonError::Unreachable(format!(
-                    "couldn't reach the rho daemon on {host} at {}: {said}",
+                    "couldn't reach the Rho daemon on {host} at {}: {said}",
                     socket.display()
                 )))
             }
@@ -612,7 +612,7 @@ fn setup_script(rho: &str) -> String {
         r#"rho={rho}
 case $rho in "~/"*) rho="$HOME/${{rho#??}}" ;; esac
 if ! command -v "$rho" >/dev/null 2>&1; then
-  echo "there is no program $rho; a non-interactive ssh command's PATH may lack it, so set this machine's rho path in Settings to an absolute path" >&2
+  echo "there is no program $rho; a non-interactive ssh command's PATH may lack it, so set this machine's Rho path in Settings to an absolute path" >&2
   exit 127
 fi
 "$rho" daemon start </dev/null >/dev/null || exit

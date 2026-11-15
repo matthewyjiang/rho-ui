@@ -261,7 +261,7 @@ pub struct InputRequest {
 }
 
 /// Where to answer what this app can't.
-const ELSEWHERE: &str = "Answer it in rho's terminal UI.";
+const ELSEWHERE: &str = "Answer it in Rho's terminal UI.";
 
 impl InputRequest {
     /// Names the request in [`crate::Daemon::answer`].
@@ -369,7 +369,7 @@ impl InputRequest {
             Ask::Question(ask) => questions(ask, request.timeout),
             // A kind a newer daemon added: nothing here can answer it.
             _ => (
-                "rho is waiting for an answer this app can't show".to_owned(),
+                "Rho is waiting for an answer this app can't show".to_owned(),
                 Some(ELSEWHERE.to_owned()),
                 Form::Unsupported,
             ),

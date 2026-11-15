@@ -765,7 +765,7 @@ fn render_message(
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(Icon::new(Lucide::Bell).xsmall())
-            .child("rho continued on its own")
+            .child("Rho continued on its own")
             .into_any_element(),
         // The timeline puts these in work rows, never message rows, and
         // the transcript draws notices itself.

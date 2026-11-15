@@ -133,7 +133,7 @@ impl RemoteMachine {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MachineStatus {
     Connecting,
-    /// Connected to a daemon of this rho version, such as `rho 3.0.0`.
+    /// Connected to a daemon of this rho version, such as `Rho 3.0.0`.
     Ready {
         version: SharedString,
     },

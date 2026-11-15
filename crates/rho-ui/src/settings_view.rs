@@ -4,8 +4,10 @@
 //! applies at once and is saved. rho-ui's own settings come first, kept in
 //! its settings file: Appearance, and the Machines page in [`machines`].
 //! Then come rho's own, a page per category its daemon describes, saved in
-//! that machine's `config.toml`: see [`rho`].
+//! that machine's `config.toml`: see [`rho`]. Last, [`about`] shows the
+//! versions of rho-ui and of Rho on each machine.
 
+mod about;
 mod machines;
 mod rho;
 
@@ -345,6 +347,7 @@ impl Render for SettingsView {
             );
         let machines = self.machines_page(cx);
         let rho = self.rho_page(window, cx);
+        let about = about::about_page(self.rho.machines.read(cx));
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
         // corners, since the dialog has no padding to keep it inside.
@@ -363,7 +366,8 @@ impl Render for SettingsView {
                     .with_group_variant(GroupBoxVariant::Fill)
                     .page(appearance)
                     .page(machines)
-                    .page(rho),
+                    .page(rho)
+                    .page(about),
             )
     }
 }

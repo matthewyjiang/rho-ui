@@ -1049,7 +1049,7 @@ impl Session {
                 return Some(self.push_notice(Notice {
                     level: NoticeLevel::Warning,
                     title: format!(
-                        "No answer came in time, so rho answered “{}”",
+                        "No answer came in time, so Rho answered “{}”",
                         timeout.fallback()
                     ),
                     description: Some(closed.title().to_owned()),

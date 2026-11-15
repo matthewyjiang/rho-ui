@@ -371,7 +371,7 @@ fn window_options(cx: &App) -> WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.), px(800.)), cx)),
         window_min_size: Some(size(px(720.), px(480.))),
         titlebar: Some(TitlebarOptions {
-            title: Some("rho".into()),
+            title: Some("Rho".into()),
             ..Default::default()
         }),
         app_id: Some("rho-ui".to_owned()),

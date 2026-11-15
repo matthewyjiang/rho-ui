@@ -58,6 +58,8 @@ After rho-ui's own pages comes rho's: one page with a group for each category of
 
 Every machine's rho has its own `config.toml`. With remote machines, a Machine picker heads rho's page, set to this machine when Settings opens; picking another shows that machine's settings. A machine that is connecting or can't be reached says so in place of its settings.
 
+Last comes About: rho-ui's version, a link to its source and its license, then the version of Rho on each machine, or that it is connecting or can't be reached.
+
 rho-ui's own settings stay in its own file, not in rho's: the theme, scale and fonts must apply before the first frame, before any daemon answers, and the machines list is how rho-ui finds the remote daemons in the first place.
 
 ## Machines

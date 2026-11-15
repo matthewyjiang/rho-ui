@@ -368,10 +368,10 @@ impl InputCard {
         let left = timeout.remaining(SystemTime::now());
         let fallback = timeout.fallback();
         let label = if left.is_zero() {
-            format!("rho is answering “{fallback}”")
+            format!("Rho is answering “{fallback}”")
         } else {
             format!(
-                "rho answers “{fallback}” in {} unless you start on it",
+                "Rho answers “{fallback}” in {} unless you start on it",
                 countdown(left)
             )
         };

@@ -115,7 +115,7 @@ impl ComposerState {
             TextareaState::new(window, cx)
                 .auto_grow(1, MAX_ROWS)
                 .submit_on_enter(true)
-                .placeholder("Ask rho to do something")
+                .placeholder("Ask Rho to do something")
         });
         // The text box notifies when its text or cursor moves.
         let subscription = cx.observe(&input, |this, _, cx| this.update_menu(cx));
@@ -245,7 +245,7 @@ impl ComposerState {
         let before = self.attachments.len();
         self.attachments.retain(|item| !by_path(&item.attachment));
         if self.attachments.len() != before {
-            self.refusal = Some(format!("Took off the files that go by path: rho on {machine} can't read this machine's files.").into());
+            self.refusal = Some(format!("Took off the files that go by path: Rho on {machine} can't read this machine's files.").into());
         }
         cx.notify();
     }
@@ -399,7 +399,7 @@ impl ComposerState {
     fn add(&mut self, attachment: Attachment) -> Result<(), String> {
         if let (Some(machine), true) = (&self.remote, by_path(&attachment)) {
             return Err(format!(
-                "it would go by its path, and rho on {machine} can't read this machine's files"
+                "it would go by its path, and Rho on {machine} can't read this machine's files"
             ));
         }
         let held = self.attachments.iter().map(|item| &item.attachment);

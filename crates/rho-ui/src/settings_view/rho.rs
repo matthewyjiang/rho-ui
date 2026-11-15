@@ -42,7 +42,7 @@ use crate::{
 /// of its text and number settings.
 pub(super) struct RhoFields {
     view: WeakEntity<SettingsView>,
-    machines: Entity<Machines>,
+    pub(super) machines: Entity<Machines>,
     settings: Entity<RhoSettings>,
     /// The machine picked; this one until the user picks another.
     machine: MachineId,
@@ -282,10 +282,10 @@ impl SettingsView {
             (Some(why), _) => Err(why),
             (None, Some(Loaded::Ready(settings))) => Ok(settings),
             (None, Some(Loaded::Failed(why))) => {
-                Err(format!("Couldn't read rho's settings on {label}: {why}"))
+                Err(format!("Couldn't read Rho's settings on {label}: {why}"))
             }
             (None, Some(Loaded::Reading) | None) => {
-                Err(format!("Reading rho's settings on {label}…"))
+                Err(format!("Reading Rho's settings on {label}…"))
             }
         };
         let settings = match settings {
@@ -475,7 +475,7 @@ fn file_notes(
                 .map(|key| format!(" ({key})"))
                 .unwrap_or_default();
             Note::Warning(format!(
-                "config.toml doesn't load{place}: {}. rho uses the last values that did.",
+                "config.toml doesn't load{place}: {}. Rho uses the last values that did.",
                 error.message
             ))
         })
@@ -484,7 +484,7 @@ fn file_notes(
 
 /// The rho settings page, before its groups.
 fn rho_page() -> SettingPage {
-    SettingPage::new("rho")
+    SettingPage::new("Rho")
         .icon(Lucide::Bot)
         .default_open(true)
         .header_style(&page_header())
@@ -583,7 +583,7 @@ fn machine_picker(
         .w(rems(CONTROL_REMS))
         .justify_between(),
     )
-    .description("Each machine's rho has its own config.toml.")
+    .description("Each machine's Rho has its own config.toml.")
 }
 
 /// `spec`'s help, when a change applies, where to change a model, and the
@@ -591,7 +591,7 @@ fn machine_picker(
 fn description(spec: &SettingSpec, settings: &AgentSettings) -> String {
     let mut text = spec.help.clone();
     let model = matches!(spec.kind, SettingKind::Model { .. })
-        .then_some("Change it with /config in rho's terminal UI.");
+        .then_some("Change it with /config in Rho's terminal UI.");
     for sentence in [applies(spec.applies), model].into_iter().flatten() {
         if !text.is_empty() {
             text.push(' ');
@@ -614,7 +614,7 @@ fn applies(applies: Applies) -> Option<&'static str> {
     match applies {
         Applies::NextTurn => Some("Applies from the next turn."),
         Applies::NextSession => Some("Applies to new sessions."),
-        Applies::Restart => Some("Applies once rho restarts."),
+        Applies::Restart => Some("Applies once Rho restarts."),
         // `Immediately`, or a time a newer daemon names.
         _ => None,
     }

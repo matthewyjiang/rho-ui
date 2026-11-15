@@ -524,7 +524,7 @@ fn a_timed_out_question_leaves_the_answer_rho_gave() {
         [Entry::Notice(notice)] => {
             assert_eq!(
                 notice.title(),
-                "No answer came in time, so rho answered “A”"
+                "No answer came in time, so Rho answered “A”"
             );
             assert_eq!(notice.level(), NoticeLevel::Warning);
         }

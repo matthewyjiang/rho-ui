@@ -100,7 +100,7 @@ pub enum DaemonError {
     #[error("{0}")]
     Conflict(String),
     /// The connection is gone.
-    #[error("the rho daemon closed the connection")]
+    #[error("the Rho daemon closed the connection")]
     Closed,
 }
 
@@ -493,7 +493,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
                 .await
                 .map_err(|error| {
                     DaemonError::Unreachable(format!(
-                        "could not connect to the rho daemon at {}: {error}",
+                        "could not connect to the Rho daemon at {}: {error}",
                         socket.display()
                     ))
                 })?;

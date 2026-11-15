@@ -297,7 +297,7 @@ pub(crate) mod endpoint {
         _hello: ClientHello,
     ) -> Result<(Client, Notifications, HelloResponse), DaemonError> {
         Err(DaemonError::Unreachable(format!(
-            "rho-ui can't yet find or start the rho daemon of {} on Windows: \
+            "rho-ui can't yet find or start the Rho daemon of {} on Windows: \
              rho-protocol's LocalDaemon is Unix-only",
             home.display()
         )))
