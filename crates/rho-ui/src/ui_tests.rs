@@ -85,6 +85,19 @@ fn text_system() -> Arc<dyn gpui_kit::PlatformTextSystem> {
     Arc::new(gpui_apple::AppleTextSystem::new())
 }
 
+/// GPUI's offscreen renderer for this platform.
+#[cfg(not(windows))]
+use gpui_kit::platform::current_headless_renderer as headless_renderer;
+
+/// GPUI has no offscreen renderer for Windows; its wgpu one draws there,
+/// on Vulkan, which CI gives with Mesa lavapipe.
+#[cfg(windows)]
+fn headless_renderer() -> gpui_kit::Result<Option<Box<dyn gpui_kit::PlatformHeadlessRenderer>>> {
+    let renderer: Box<dyn gpui_kit::PlatformHeadlessRenderer> =
+        Box::new(gpui_wgpu::WgpuHeadlessRenderer::new()?);
+    Ok(Some(renderer))
+}
+
 /// `linux` off macOS, `macos` on it: the terminal's keys, as Ghostty's,
 /// differ by more than Cmd for Ctrl, so `secondary-` can't say them.
 const fn key(linux: &'static str, macos: &'static str) -> &'static str {
@@ -252,7 +265,7 @@ impl Harness {
         let mut cx = HeadlessAppContext::with_platform(
             text_system(),
             Arc::new(crate::Assets),
-            gpui_kit::platform::current_headless_renderer,
+            headless_renderer,
         );
         // The daemon's answers arrive on a socket: its I/O thread wakes
         // tasks, which the deterministic scheduler only accepts this way.

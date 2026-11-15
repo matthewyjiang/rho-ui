@@ -38,6 +38,25 @@ jobs:
             libfontconfig-dev libwayland-dev libxkbcommon-x11-dev \
             libx11-xcb-dev libvulkan1 mesa-vulkan-drivers
 
+      # GPUI has no offscreen renderer for Windows, so there the UI tests
+      # draw with its wgpu one on Mesa lavapipe, as on Linux. Windows has no
+      # Vulkan loader of its own: the runtime gives vulkan-1.dll, and the
+      # action registers lavapipe as the driver.
+      - name: Install Vulkan and lavapipe
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          install_runtime_only: true
+          install_lavapipe: true
+      - name: Put the Vulkan loader on PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $loader = Get-ChildItem -Path $env:VULKAN_SDK -Recurse -Filter vulkan-1.dll |
+            Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
+          if (-not $loader) { throw "no x64 vulkan-1.dll under $env:VULKAN_SDK" }
+          $loader.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append
+
       # Rust and Zig, at the versions mise.toml pins.
       - uses: jdx/mise-action@v5
 

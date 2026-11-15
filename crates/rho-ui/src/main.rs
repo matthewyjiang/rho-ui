@@ -461,11 +461,10 @@ mod tests {
 
     #[test]
     fn rho_program_follows_its_flag() {
-        let launch = parse(&["/tmp", "--rho", "/opt/rho/bin/rho"]).unwrap();
-        assert_eq!(
-            launch.workspace,
-            PathBuf::from("/tmp").canonicalize().unwrap()
-        );
+        let dir = std::env::temp_dir();
+        let workspace = dir.to_str().expect("a UTF-8 temporary directory");
+        let launch = parse(&[workspace, "--rho", "/opt/rho/bin/rho"]).unwrap();
+        assert_eq!(launch.workspace, dir.canonicalize().unwrap());
         // Both sides read the rho home from this process's environment.
         assert_eq!(
             launch.local.daemon,

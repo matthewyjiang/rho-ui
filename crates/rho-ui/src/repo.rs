@@ -374,6 +374,8 @@ mod tests {
     /// project as reading its `.git` files here does: a main checkout with
     /// an origin, a linked worktree of it, a detached checkout, a folder
     /// outside any repository, and one that isn't there.
+    // The script runs on remote machines, which are Unix.
+    #[cfg(unix)]
     #[test]
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();

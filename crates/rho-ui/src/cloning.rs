@@ -151,6 +151,7 @@ mod tests {
     /// relative, and takes a folder that already holds a clone of the URL
     /// as it is, but not one that holds something else, nor a clone cut
     /// short.
+    #[cfg_attr(windows, ignore = "runs a POSIX sh script on this machine")]
     #[test]
     fn the_script_clones_once_and_refuses_strangers() {
         let dir = tempfile::tempdir().unwrap();

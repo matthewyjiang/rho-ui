@@ -451,6 +451,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "typed paths are POSIX; Windows paths aren't parsed yet"
+    )]
     fn a_typed_path_browses_its_folder_after_a_slash_else_its_parent() {
         let home = Some(Path::new("/home/me"));
         let parse = |text| Typed::parse(text, home).map(|t| (t.path, t.browse, t.prefix));
