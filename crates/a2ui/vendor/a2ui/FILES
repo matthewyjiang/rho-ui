@@ -1,3 +1,5 @@
 LICENSE
 conformance/core/data_model.yaml
 conformance/core/data_context.yaml
+conformance/core/expressions.yaml
+conformance/core/functions.yaml
