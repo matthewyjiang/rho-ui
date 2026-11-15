@@ -2270,8 +2270,14 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
     let shelves = Shelves::owning([TUI_SESSION, "s1", "old"]);
     let mut ui = Harness::start_with("done", script, shelves);
     ui.wait_until("the running job among the sessions", |window, _, _| {
-        is_visible(window, "session-local-tui-1") && is_visible(window, "session-local-s1")
+        is_visible(window, "session-local-s1")
+            && window
+                .try_find("session-local-tui-1-busy")
+                .and_then(|status| status.label().map(|label| label.starts_with("Working")))
+                .unwrap_or(false)
     });
+    // Only once the sidebar has seen the turn at work: a turn that ends
+    // before the first poll of the jobs was never under way here.
     ui.send_from_elsewhere(TUI_SESSION, "wrap up", Send::Steer);
     // The sidebar learns of it from the daemon's jobs, which it polls.
     ui.wait_for_label("session-local-tui-1-done", "Done");

@@ -1612,6 +1612,9 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
     };
     let busy = |color: Hsla, icon: Icon, text: String| {
         h_flex()
+            .id(SharedString::from(format!("{}-busy", row.element_id)))
+            .test_support()
+            .aria_label(text.clone())
             .flex_shrink_0()
             .gap_1()
             .text_color(color)
