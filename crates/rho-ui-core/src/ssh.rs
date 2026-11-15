@@ -31,6 +31,7 @@ use tokio::{
 use crate::{
     daemon::{on_io, DaemonError, Machine, HANDSHAKE_DEADLINE},
     platform::{self, MAX_SOCKET_PATH_BYTES},
+    rho_install::find_rho_sh,
 };
 
 /// A rho daemon on another machine, reached over ssh.
@@ -69,6 +70,50 @@ impl SshTarget {
         self.ssh = ssh.into();
         self
     }
+
+    /// The `rho` program it runs on the machine; see [`Self::with_rho`].
+    pub(crate) fn rho(&self) -> &str {
+        &self.rho
+    }
+
+    /// The link to the machine, opening its master connection if none
+    /// runs, for scripts to run there whether or not its daemon answers.
+    ///
+    /// # Errors
+    ///
+    /// Fails if ssh can't reach the machine.
+    pub(crate) async fn link(&self) -> Result<SshLink, DaemonError> {
+        let target = self.clone();
+        on_io(async move { target.open_link().await }).await?
+    }
+
+    /// [`Self::link`], on the I/O runtime.
+    async fn open_link(&self) -> Result<SshLink, DaemonError> {
+        let host = &self.host;
+        if host.is_empty() || host.starts_with('-') {
+            return Err(DaemonError::Unreachable(format!(
+                "{host:?} is not an ssh destination"
+            )));
+        }
+        let control = platform::private_socket_dir("ssh")
+            .map_err(|error| {
+                DaemonError::Unreachable(format!(
+                    "couldn't make a private directory for ssh's control socket: {error}"
+                ))
+            })
+            .and_then(|dir| {
+                // Named by the ssh program too, so a test's fake ssh never
+                // touches the app's master for the same host.
+                let key = format!("{}\0{host}", self.ssh.display());
+                control_path(&dir, &key).map_err(DaemonError::Unreachable)
+            })?;
+        let ssh = SshLink {
+            target: self.clone(),
+            control,
+        };
+        ssh.ensure_master().await?;
+        Ok(ssh)
+    }
 }
 
 /// Connects to the daemon `target` names, starting it there first if none
@@ -78,28 +123,7 @@ pub(crate) async fn connect(
     hello: ClientHello,
 ) -> Result<(Client, Notifications, HelloResponse, Machine), DaemonError> {
     let host = &target.host;
-    if host.is_empty() || host.starts_with('-') {
-        return Err(DaemonError::Unreachable(format!(
-            "{host:?} is not an ssh destination"
-        )));
-    }
-    let control = platform::private_socket_dir("ssh")
-        .map_err(|error| {
-            DaemonError::Unreachable(format!(
-                "couldn't make a private directory for ssh's control socket: {error}"
-            ))
-        })
-        .and_then(|dir| {
-            // Named by the ssh program too, so a test's fake ssh never
-            // touches the app's master for the same host.
-            let key = format!("{}\0{host}", target.ssh.display());
-            control_path(&dir, &key).map_err(DaemonError::Unreachable)
-        })?;
-    let ssh = SshLink {
-        target: target.clone(),
-        control,
-    };
-    ssh.ensure_master().await?;
+    let ssh = target.open_link().await?;
     let setup = ssh.setup().await?;
     let endpoint = DaemonEndpoint::locate(&setup.rho_home, setup.xdg_runtime_dir.as_deref())
         .map_err(|error| DaemonError::Unreachable(format!("on {host}: {error}")))?;
@@ -629,7 +653,8 @@ fn quote_bytes(bytes: &[u8]) -> Vec<u8> {
 
 /// The POSIX sh script [`SshLink::setup`] feeds `sh -s` on the host, so the
 /// user's login shell, which may be zsh or fish, never parses it. It
-/// starts the daemon through `rho` as `rho daemon start` does locally,
+/// finds `rho` as [`find_rho_sh`] says and starts the daemon through it,
+/// as `rho daemon start` does locally,
 /// then prints, after [`SETUP_MARKER`], the canonical rho home,
 /// `XDG_RUNTIME_DIR` (maybe empty), `HOME`, and after [`ENV_MARKER`], the
 /// login shell's `env`. `env -0`
@@ -638,8 +663,7 @@ fn setup_script(rho: &str) -> String {
     let rho = quote(rho);
     format!(
         r#"rho={rho}
-case $rho in "~/"*) rho="$HOME/${{rho#??}}" ;; esac
-if ! command -v "$rho" >/dev/null 2>&1; then
+{find_rho}if ! command -v "$rho" >/dev/null 2>&1; then
   echo "there is no program $rho; a non-interactive ssh command's PATH may lack it, so set this machine's Rho path in Settings to an absolute path" >&2
   exit 127
 fi
@@ -648,7 +672,8 @@ home=${{RHO_HOME:-$HOME/.rho}}
 home=$(CDPATH= cd -P -- "$home" && pwd -P) || exit
 printf '\n%s\n%s\n%s\n%s\n' {SETUP_MARKER} "$home" "${{XDG_RUNTIME_DIR-}}" "$HOME"
 exec "${{SHELL:-/bin/sh}}" -l -c 'printf "\n%s\n" {ENV_MARKER}; env'
-"#
+"#,
+        find_rho = find_rho_sh!(),
     )
 }
 

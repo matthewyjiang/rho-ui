@@ -27,6 +27,7 @@ mod plan;
 mod project_picker;
 mod projects;
 mod repo;
+mod rho_install;
 mod rho_settings;
 mod right_panel;
 mod session_list;
@@ -56,12 +57,12 @@ use gpui_kit::{
     KeyBindingContextPredicate, NoAction, QuitMode, SharedString, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
-use rho_ui_core::DaemonTarget;
+use rho_ui_core::{DaemonTarget, RhoInstall};
 
 use crate::{
     app::{LaunchConfig, RhoApp},
     background_log::BackgroundLog,
-    machines::RemoteMachine,
+    machines::{Reach, RemoteMachine},
     project_picker::LastCheckout,
     projects::Projects,
     right_panel::{Direction, PaneCommand, PanelLayout, TerminalShell, TerminalShortcut},
@@ -194,11 +195,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
     if !workspace.is_dir() {
         return Err(format!("{} is not a directory", workspace.display()));
     }
-    let daemon = DaemonTarget::rho(rho).ok_or("can't find the rho home: set RHO_HOME or HOME")?;
+    let daemon = DaemonTarget::rho(&rho).ok_or("can't find the rho home: set RHO_HOME or HOME")?;
     Ok(LaunchConfig {
         workspace,
-        daemon,
-        remote: Rc::new(RemoteMachine::ssh_target),
+        local: Reach {
+            daemon,
+            rho: Some(RhoInstall::Here { rho }),
+        },
+        remote: Rc::new(RemoteMachine::ssh_reach),
         shell: TerminalShell::from_env(),
     })
 }
@@ -464,11 +468,17 @@ mod tests {
         );
         // Both sides read the rho home from this process's environment.
         assert_eq!(
-            launch.daemon,
+            launch.local.daemon,
             DaemonTarget::rho("/opt/rho/bin/rho").unwrap()
         );
         assert_eq!(
-            parse(&["/tmp"]).unwrap().daemon,
+            launch.local.rho,
+            Some(RhoInstall::Here {
+                rho: PathBuf::from("/opt/rho/bin/rho")
+            })
+        );
+        assert_eq!(
+            parse(&["/tmp"]).unwrap().local.daemon,
             DaemonTarget::rho("rho").unwrap()
         );
     }

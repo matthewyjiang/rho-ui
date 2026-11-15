@@ -17,6 +17,9 @@ base64 = "0.22"
 # Highlights what a search matched, with the pattern rho's grep used.
 regex = "1"
 rho-protocol.workspace = true
+# Reads `rho update --check --json` (`rho_install.rs`).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 similar = "2"
 tempfile = { version = "3", optional = true }
 thiserror = "2"
@@ -27,7 +30,6 @@ tokio = { version = "1.36", features = ["io-util", "net", "process", "rt-multi-t
 [dev-dependencies]
 futures = "0.3"
 rho-ui-core = { path = ".", features = ["test-support"] }
-serde_json = "1"
 smol = "2"
 tempfile = "3"
 

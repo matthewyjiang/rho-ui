@@ -32,6 +32,9 @@ use super::{shell_card, shell_output, FakeSession, State, Turn};
 #[derive(Debug)]
 pub(super) struct Fake {
     pub(super) state: Mutex<State>,
+    /// Counts restarts; each connection ends when it changes, as a daemon
+    /// restarting in place closes them.
+    pub(super) restarted: tokio::sync::watch::Sender<usize>,
 }
 
 impl Fake {
@@ -271,13 +274,22 @@ impl Service for Fake {
                 selected_by: StoreSelectedBy::Config,
                 unreachable: None,
             },
-            upgrade: None,
+            upgrade: self.lock().upgrade.clone(),
         }
     }
 
     async fn stop(&self) {}
 
-    async fn restart(&self) {}
+    async fn restart(&self) {
+        let mut state = self.lock();
+        state.upgrade = None;
+        for session in state.sessions.values_mut() {
+            for publisher in session.publishers.drain(..) {
+                publisher.close(DetachReason::Restarting);
+            }
+        }
+        self.restarted.send_modify(|restarts| *restarts += 1);
+    }
 
     async fn new_session(&self, params: SessionNewParams) -> Result<SessionNewResponse, RpcError> {
         let mut state = self.lock();
@@ -583,6 +595,7 @@ impl Service for Fake {
                 "a subagent's session is continued only by its parent",
             ));
         }
+        session.attaches += 1;
         let (response, publisher, subscription) = session.follow();
         session.publishers.push(publisher);
         Ok((response, subscription))

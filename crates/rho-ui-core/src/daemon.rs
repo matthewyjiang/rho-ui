@@ -27,11 +27,12 @@ use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
     ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobKind,
-    JobListParams, JobState, JobSummary, Notifications, SessionAnswerParams, SessionAttachParams,
-    SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
-    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
-    SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
-    SessionUnsteerParams, SettingChange, TurnOutcome, UnsteerOutcome,
+    JobListParams, JobState, JobSummary, Notifications, RestartParams, SessionAnswerParams,
+    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
+    SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
+    SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
+    SessionSteerParams, SessionUnsteerParams, SettingChange, StatusParams, TurnOutcome,
+    UnsteerOutcome,
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
@@ -315,6 +316,17 @@ pub enum Unsteered {
     Kept,
 }
 
+/// A newer rho the daemon has found installed over its own program, and
+/// runs once nothing would be cut short.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingUpgrade {
+    /// The newer rho's version, such as `3.2.0`.
+    pub version: String,
+    /// How many things it waits for: turns under way or waiting for a
+    /// person, logins, and sessions with background work.
+    pub waiting_for: u64,
+}
+
 /// Why the daemon stopped sending a session's events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detached {
@@ -523,8 +535,9 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
     });
     let (client, notifications, hello, machine) = match target {
         DaemonTarget::Home { home, rho } => {
+            let rho = Command::new(crate::rho_install::find_rho(&rho));
             let (client, notifications, hello) =
-                platform::endpoint::connect_or_start(home, Command::new(rho), hello).await?;
+                platform::endpoint::connect_or_start(home, rho, hello).await?;
             (client, notifications, hello, Machine::this_process())
         }
         DaemonTarget::Socket(socket) => {
@@ -643,6 +656,38 @@ impl Daemon {
         }
     }
 
+    /// The upgrade the daemon waits to run, if its program was replaced.
+    /// Nothing pushes it; ask again to refresh.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon rejects the request or the connection is gone.
+    pub async fn pending_upgrade(&self) -> Result<Option<PendingUpgrade>, DaemonError> {
+        let status = self
+            .client
+            .request::<methods::Status>(&StatusParams {})
+            .await?;
+        Ok(status.upgrade.map(|upgrade| PendingUpgrade {
+            version: upgrade.version,
+            waiting_for: upgrade.waiting_for,
+        }))
+    }
+
+    /// Restarts the daemon in place now, into the program installed: every
+    /// followed session gets [`Detached::Restarting`] and the connection
+    /// closes, so connect again. Turns under way are cut short; a rho that
+    /// resumes them carries them on once it is back.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon rejects the request or the connection is gone.
+    pub async fn restart(&self) -> Result<(), DaemonError> {
+        self.client
+            .request::<methods::Restart>(&RestartParams {})
+            .await?;
+        Ok(())
+    }
+
     /// The sessions with work under way in the daemon, whichever client
     /// started them: a turn running or queued, or a request waiting for a
     /// person. Nothing pushes changes to this list; ask again to refresh.
@@ -717,6 +762,21 @@ impl Daemon {
             .request::<methods::SessionAttach>(&params)
             .await?;
         Ok(Attached(Box::new(response)))
+    }
+
+    /// Attaches to session `id` and lets it go at once, dropping the events
+    /// that arrive meanwhile, which no [`crate::Session`] reads. After the
+    /// daemon restarted in place, a rho that resumes turns carries on the
+    /// one the restart cut short when a client attaches, as
+    /// `idle_wake: turn` (see [`session_setup`]) lets it start turns of
+    /// its own.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the session does not exist or the connection is gone.
+    pub async fn resume(&self, id: &SessionId) -> Result<(), DaemonError> {
+        self.attach(id).await?;
+        self.detach(id).await
     }
 
     /// Follows session `id` without taking part in it, as for a subagent's

@@ -1,21 +1,31 @@
 //! The About page: rho-ui's version, source and license, then the version
-//! of Rho on each machine, or why there is none to show yet.
+//! of Rho on each machine, or why there is none to show yet, with what its
+//! rho needs: installing, updating, or a restart into the newer one.
 
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage},
     ActiveTheme as _, IconName, Sizable as _,
 };
-use gpui_kit::{div, ParentElement as _, SharedString, Styled as _};
+use gpui_kit::{div, App, Entity, ParentElement as _, SharedString, Styled as _};
 
 use super::page_header;
-use crate::machines::{MachineStatus, Machines};
+use crate::{
+    machines::{MachineStatus, Machines},
+    rho_install::{render_offer, Installs},
+};
 
 /// rho-ui's source, from its `Cargo.toml`.
 const SOURCE: &str = env!("CARGO_PKG_REPOSITORY");
 
-/// The About page, with a row for each of `machines`.
-pub(super) fn about_page(machines: &Machines) -> SettingPage {
+/// The About page, with a row for each of `machines`, and what `installs`
+/// offers for its rho under it.
+pub(super) fn about_page(
+    machines: &Entity<Machines>,
+    installs: &Entity<Installs>,
+    cx: &App,
+) -> SettingPage {
+    let machines_read = machines.read(cx);
     let app = SettingGroup::new().items([
         SettingItem::new("Version", value(env!("CARGO_PKG_VERSION"), Tone::Plain)),
         SettingItem::new(
@@ -32,20 +42,28 @@ pub(super) fn about_page(machines: &Machines) -> SettingPage {
     ]);
     let rho = SettingGroup::new()
         .title("Rho versions")
-        .items(machines.iter().map(|machine| {
+        .items(machines_read.iter().flat_map(|machine| {
             let label = machine.label.clone();
-            match machines.status(&machine.id) {
+            let item = match machines_read.status(&machine.id) {
                 Some(MachineStatus::Ready { version }) => {
-                    SettingItem::new(label, value(version.clone(), Tone::Plain))
+                    SettingItem::new(label.clone(), value(version.clone(), Tone::Plain))
                 }
                 None | Some(MachineStatus::Connecting) => {
-                    SettingItem::new(label, value("Connecting…", Tone::Muted))
+                    SettingItem::new(label.clone(), value("Connecting…", Tone::Muted))
                 }
                 Some(MachineStatus::Failed(why)) => {
-                    SettingItem::new(label, value("Can't reach", Tone::Muted))
+                    SettingItem::new(label.clone(), value("Can't reach", Tone::Muted))
                         .description(why.clone())
                 }
-            }
+            };
+            // What its rho needs, on a row of its own under it.
+            let offer = installs.read(cx).offer(&machine.id, cx).map(|offer| {
+                let (installs, id) = (installs.clone(), machine.id.clone());
+                SettingItem::render(move |_, _, cx| {
+                    render_offer(&installs, &id, Some(&label), &offer, cx)
+                })
+            });
+            std::iter::once(item).chain(offer)
         }));
     SettingPage::new("About")
         .icon(IconName::Info)
