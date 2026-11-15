@@ -85,5 +85,11 @@ enum_glob_use = "allow"                  # use Enum::* inside a function that ma
 # slower unoptimized (measured with the `frame_times` probe in rho-ui's UI
 # tests). Optimize dependencies in dev builds; our own crates stay
 # debuggable and quick to rebuild.
+#
+# Optimized code steps badly in a debugger anyway, so dependencies keep only
+# line tables, enough for backtraces. On a cold `cargo test --no-run`, line
+# tables for everything left 5.2 GB in target, against 8.4 GB with full
+# debug info, and built in 489 s against 535 s (Linux, 4 jobs).
 [profile.dev.package."*"]
 opt-level = 3
+debug = "line-tables-only"
