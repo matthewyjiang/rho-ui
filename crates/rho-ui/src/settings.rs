@@ -1,8 +1,8 @@
-//! rho-ui's own settings: light or dark, UI scale, fonts, and the machines
-//! it connects to. They live in `settings` in rho-ui's config folder
-//! ([`AppDir::Config`]: by default `~/.config/rho-ui`), one `key = value`
-//! per line. The
-//! look applies to GPUI Kit's theme; the app follows the machines.
+//! rho-ui's own settings: light or dark, UI scale, fonts, the machines it
+//! connects to, and the forge CLIs' programs on each. They live in
+//! `settings` in rho-ui's config folder ([`AppDir::Config`]: by default
+//! `~/.config/rho-ui`), one `key = value` per line. The look applies to
+//! GPUI Kit's theme; the app follows the machines.
 
 use std::{fmt::Write as _, io, path::PathBuf};
 
@@ -11,7 +11,8 @@ use gpui_kit::{px, App, Global, SharedString, WindowAppearance};
 use rho_ui_core::platform::{self, AppDir};
 
 use crate::{
-    machines::{RemoteMachine, LOCAL},
+    forge::{CliPaths, ForgeCli},
+    machines::{MachineId, RemoteMachine, LOCAL},
     store,
 };
 
@@ -125,6 +126,8 @@ pub(crate) struct Settings {
     /// Where this machine clones projects; see
     /// [`crate::machines::Machine::clone_folder`].
     pub(crate) local_clone_folder: String,
+    /// This machine's forge CLIs' programs; see [`CliPaths`].
+    pub(crate) local_cli: CliPaths,
     /// The remote machines, in the order added.
     pub(crate) machines: Vec<RemoteMachine>,
     /// Where [`Self::save`] writes; `None` keeps changes in memory (tests).
@@ -140,6 +143,7 @@ impl Default for Settings {
             code_font: DEFAULT_CODE_FONT.into(),
             local_label: LOCAL.into(),
             local_clone_folder: String::new(),
+            local_cli: CliPaths::default(),
             machines: Vec::new(),
             file: None,
         }
@@ -204,8 +208,28 @@ impl Settings {
             .find(|machine| machine.host == host)
     }
 
-    /// The settings file's text: `key = value` lines, and for each remote
-    /// machine `machine.<host>.label`, `.rho` and `.clone_folder`.
+    /// The program of `cli` set for `machine`; empty finds it there.
+    pub(crate) fn cli_path(&self, machine: &MachineId, cli: ForgeCli) -> &str {
+        if machine.is_local() {
+            return self.local_cli.get(cli);
+        }
+        self.machine(machine.as_str())
+            .map_or("", |remote| remote.cli.get(cli))
+    }
+
+    /// Sets the program of `cli` for `machine`; empty clears it.
+    pub(crate) fn set_cli_path(&mut self, machine: &MachineId, cli: ForgeCli, path: String) {
+        if machine.is_local() {
+            self.local_cli.set(cli, path);
+        } else if let Some(remote) = self.machine_mut(machine.as_str()) {
+            remote.cli.set(cli, path);
+        }
+    }
+
+    /// The settings file's text: `key = value` lines, `local.<program>` for
+    /// each of this machine's CLIs with a program set, and for each remote
+    /// machine `machine.<host>.label`, `.rho`, `.clone_folder` and
+    /// `.<program>`.
     fn to_text(&self) -> String {
         let mut text = format!(
             "appearance = {}\nui_scale = {}\nui_font = {}\ncode_font = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
@@ -216,6 +240,10 @@ impl Settings {
             self.local_label,
             self.local_clone_folder,
         );
+        // Writing to a String can't fail.
+        for (cli, path) in self.local_cli.iter() {
+            let _ = writeln!(text, "local.{} = {path}", cli.program());
+        }
         for machine in &self.machines {
             let host = &machine.host;
             let (label, rho, folder) = (&machine.label, &machine.rho, &machine.clone_folder);
@@ -224,6 +252,9 @@ impl Settings {
                 text,
                 "machine.{host}.label = {label}\nmachine.{host}.rho = {rho}\nmachine.{host}.clone_folder = {folder}\n"
             );
+            for (cli, path) in machine.cli.iter() {
+                let _ = writeln!(text, "machine.{host}.{} = {path}", cli.program());
+            }
         }
         text
     }
@@ -289,7 +320,9 @@ fn parse(text: &str) -> Settings {
             "local.label" if !value.is_empty() => settings.local_label = value.to_owned().into(),
             "local.clone_folder" => value.clone_into(&mut settings.local_clone_folder),
             key => {
-                if let Some((host, field)) = key
+                if let Some(cli) = key.strip_prefix("local.").and_then(ForgeCli::from_program) {
+                    settings.local_cli.set(cli, value.to_owned());
+                } else if let Some((host, field)) = key
                     .strip_prefix("machine.")
                     .and_then(|rest| rest.rsplit_once('.'))
                 {
@@ -317,7 +350,11 @@ fn machine_field(machines: &mut Vec<RemoteMachine>, host: &str, field: &str, val
         "label" => value.clone_into(&mut machine.label),
         "rho" if !value.is_empty() => value.clone_into(&mut machine.rho),
         "clone_folder" => value.clone_into(&mut machine.clone_folder),
-        _ => {}
+        program => {
+            if let Some(cli) = ForgeCli::from_program(program) {
+                machine.cli.set(cli, value.to_owned());
+            }
+        }
     }
 }
 
@@ -345,15 +382,22 @@ mod tests {
             local_clone_folder: "~/code".to_owned(),
             ..Settings::default()
         };
+        settings
+            .local_cli
+            .set(ForgeCli::Gh, "/opt/gh/bin/gh".to_owned());
         let mut workstation = RemoteMachine::new("workstation");
         workstation.label = "Workstation".to_owned();
         workstation.rho = "~/.cargo/bin/rho".to_owned();
         workstation.clone_folder = "/scratch/me".to_owned();
+        workstation
+            .cli
+            .set(ForgeCli::Gh, "~/.local/bin/gh".to_owned());
         settings.machines = vec![workstation, RemoteMachine::new("me@node0.example.edu")];
         let read = parse(&settings.to_text());
         assert_eq!(read.machines, settings.machines);
         assert_eq!(read.local_label, "laptop");
         assert_eq!(read.local_clone_folder, "~/code");
+        assert_eq!(read.local_cli, settings.local_cli);
         assert_eq!(read.machines[1].shown_label(), "me@node0.example.edu");
         assert!(
             parse("machine.local.label = x\nmachine.-x.rho = y\n")

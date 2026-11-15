@@ -21,7 +21,7 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
 
 /// Bump on any change to [`SCHEMA`]. A database of another version starts
 /// over empty: rho-ui has no release, so there is nothing to migrate.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Every table. Each belongs to the module that reads and writes it.
 /// Tables keyed by text are `WITHOUT ROWID`, so the key is stored once
@@ -77,6 +77,18 @@ const SCHEMA: &str = "
         ended INTEGER,
         PRIMARY KEY (machine, session_id, kind, work_id),
         CHECK ((status = 'running') = (ended IS NULL))
+    ) STRICT, WITHOUT ROWID;
+    -- The pull request linked by hand to a session, which the Pull request
+    -- surface shows in place of its branch's; by machine and session. See
+    -- crate::pull_requests::PrLinks.
+    CREATE TABLE pr_links (
+        machine TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        host TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        name TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        PRIMARY KEY (machine, session_id)
     ) STRICT, WITHOUT ROWID;
     -- One-off values, by Key.
     CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT, WITHOUT ROWID;

@@ -5,11 +5,11 @@
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage},
-    ActiveTheme as _, IconName, Sizable as _,
+    IconName, Sizable as _,
 };
-use gpui_kit::{div, App, Entity, ParentElement as _, SharedString, Styled as _};
+use gpui_kit::{App, Entity};
 
-use super::page_header;
+use super::{page_header, value, Tone};
 use crate::{
     machines::{MachineStatus, Machines},
     rho_install::{render_offer, Installs},
@@ -70,24 +70,4 @@ pub(super) fn about_page(
         .header_style(&page_header())
         .group(app)
         .group(rho)
-}
-
-/// How a value reads: muted when it stands in for one not known yet.
-#[derive(Clone, Copy)]
-enum Tone {
-    Plain,
-    Muted,
-}
-
-/// A value to read, not change.
-fn value(text: impl Into<SharedString>, tone: Tone) -> SettingField<SharedString> {
-    let text = text.into();
-    SettingField::render(move |_, _, cx| {
-        let theme = cx.theme();
-        let color = match tone {
-            Tone::Plain => theme.foreground,
-            Tone::Muted => theme.muted_foreground,
-        };
-        div().text_sm().text_color(color).child(text.clone())
-    })
 }

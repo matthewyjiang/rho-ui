@@ -27,6 +27,9 @@ futures = "0.3"
 # Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
 rquickjs = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }
+# Reads what forge CLIs such as gh print as JSON; see src/forge.rs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -243,6 +243,13 @@ impl TerminalTab {
             .is_some_and(|view| view.read(cx).focus.is_focused(window))
     }
 
+    /// Whether any pane's terminal has the keyboard.
+    pub(crate) fn has_keyboard_anywhere(&self, window: &Window, cx: &App) -> bool {
+        self.panes
+            .iter()
+            .any(|pane| self.has_keyboard(pane.id, window, cx))
+    }
+
     /// Puts the keyboard in the active pane, starting its shell first if
     /// the pane hasn't shown yet.
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {

@@ -21,8 +21,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     div, rems, App, AppContext as _, Context, Entity, Focusable as _, FontWeight,
-    InteractiveElement as _, ParentElement as _, SharedString, Styled as _, Subscription,
-    WeakEntity, Window,
+    InteractiveElement as _, ParentElement as _, SharedString, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
     agent_settings::{
@@ -32,20 +31,19 @@ use rho_ui_core::{
     AgentSettings,
 };
 
-use super::{page_header, SettingsView, CONTROL_REMS};
+use super::{
+    machine_picker, page_header, unreachable_note, PickedMachine, SettingsView, CONTROL_REMS,
+};
 use crate::{
-    machines::{MachineId, MachineStatus, Machines},
+    machines::{MachineId, Machines},
     rho_settings::{Loaded, RhoSettings},
 };
 
 /// The rho pages' own state: which machine they show, and the text boxes
 /// of its text and number settings.
 pub(super) struct RhoFields {
-    view: WeakEntity<SettingsView>,
-    pub(super) machines: Entity<Machines>,
     settings: Entity<RhoSettings>,
-    /// The machine picked; this one until the user picks another.
-    machine: MachineId,
+    machine: PickedMachine,
     inputs: Vec<SettingInput>,
     /// The machine whose settings `inputs` hold.
     inputs_for: Option<MachineId>,
@@ -68,7 +66,7 @@ enum TextKind {
 
 impl RhoFields {
     pub(super) fn new(
-        machines: Entity<Machines>,
+        machines: &Entity<Machines>,
         settings: Entity<RhoSettings>,
         window: &mut Window,
         cx: &mut Context<'_, SettingsView>,
@@ -80,14 +78,11 @@ impl RhoFields {
                 cx.notify();
             }),
             // A machine connecting, failing, or leaving the list.
-            cx.observe(&machines, |_, _, cx| cx.notify()),
+            cx.observe(machines, |_, _, cx| cx.notify()),
         ];
         Self {
-            // Not `entity()`: the view is still being made.
-            view: cx.weak_entity(),
-            machines,
             settings,
-            machine: MachineId::local(),
+            machine: PickedMachine::new(),
             inputs: Vec::new(),
             inputs_for: None,
             _subscriptions: subscriptions,
@@ -149,21 +144,14 @@ enum Note {
 }
 
 impl SettingsView {
-    /// The machine whose settings show: the one picked, while it is still
-    /// on the list.
+    /// The machine whose settings show.
     fn rho_machine(&self, cx: &App) -> MachineId {
-        let picked = &self.rho.machine;
-        if self.rho.machines.read(cx).get(picked).is_some() {
-            picked.clone()
-        } else {
-            MachineId::local()
-        }
+        self.rho.machine.shown(self.machine_list.read(cx))
     }
 
     /// Shows `machine`'s settings.
     fn pick_machine(&mut self, machine: MachineId, cx: &mut Context<'_, Self>) {
-        if self.rho.machine != machine {
-            self.rho.machine = machine;
+        if self.rho.machine.pick(machine) {
             cx.notify();
         }
     }
@@ -272,16 +260,19 @@ impl SettingsView {
         if self.rho.inputs_for.as_ref() != Some(&machine) {
             self.sync_rho_inputs(window, cx);
         }
-        let machines = self.rho.machines.read(cx);
+        let view = cx.entity().downgrade();
+        let machines = self.machine_list.read(cx);
         let label = machines.label(&machine);
-        let picker = machines
-            .several()
-            .then(|| machine_picker(machines, &machine, self.rho.view.clone()));
-        let unreachable = match machines.status(&machine) {
-            None | Some(MachineStatus::Connecting) => Some(format!("Connecting to {label}…")),
-            Some(MachineStatus::Failed(why)) => Some(format!("Can't reach {label}: {why}")),
-            Some(MachineStatus::Ready { .. }) => None,
-        };
+        let picker = machines.several().then(|| {
+            machine_picker(
+                machines,
+                &machine,
+                "Each machine's Rho has its own config.toml.",
+                view,
+                Self::pick_machine,
+            )
+        });
+        let unreachable = unreachable_note(machines, &machine);
         let rho_settings = self.rho.settings.read(cx);
         let mut notes: Vec<Note> = rho_settings
             .problem(&machine)
@@ -559,37 +550,6 @@ fn header_group(picker: Option<SettingItem>, notes: Vec<Note>) -> Option<Setting
         }));
     }
     Some(group)
-}
-
-/// The picker of the machine whose settings show, among `machines`.
-fn machine_picker(
-    machines: &Machines,
-    shown: &MachineId,
-    view: WeakEntity<SettingsView>,
-) -> SettingItem {
-    let options: Vec<(SharedString, SharedString)> = machines
-        .iter()
-        .map(|machine| {
-            let id = SharedString::from(machine.id.as_str().to_owned());
-            (id, machine.label.clone())
-        })
-        .collect();
-    let shown = SharedString::from(shown.as_str().to_owned());
-    SettingItem::new(
-        "Machine",
-        SettingField::dropdown(
-            options,
-            move |_: &App| shown.clone(),
-            move |id: SharedString, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| {
-                    this.pick_machine(MachineId::from(&*id), cx);
-                });
-            },
-        )
-        .w(rems(CONTROL_REMS))
-        .justify_between(),
-    )
-    .description("Each machine's Rho has its own config.toml.")
 }
 
 /// `spec`'s help, when a change applies, where to change a model, and the

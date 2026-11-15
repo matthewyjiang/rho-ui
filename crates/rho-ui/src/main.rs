@@ -17,6 +17,7 @@ mod draft;
 mod figures;
 mod fold;
 mod folders;
+mod forge;
 mod input_card;
 mod kinetic;
 mod lightbox;
@@ -27,6 +28,7 @@ mod pictures;
 mod plan;
 mod project_picker;
 mod projects;
+mod pull_requests;
 mod repo;
 mod rho_install;
 mod rho_settings;
@@ -142,7 +144,16 @@ gpui_kit::assets::icon_assets!(
         ZoomOut,
         Scan,
         ImageOff,
-        Hourglass
+        Hourglass,
+        GitPullRequest,
+        GitPullRequestDraft,
+        GitPullRequestClosed,
+        GitMerge,
+        CircleMinus,
+        CircleSlash,
+        MessageSquare,
+        Link,
+        Unlink
     ]
 );
 
@@ -259,6 +270,7 @@ fn init(cx: &mut App, db: &StateDb) {
     cx.set_global(BackgroundLog::new(db));
     cx.set_global(PanelLayout::load(db));
     cx.set_global(LastCheckout::load(db));
+    cx.set_global(pull_requests::PrLinks::load(db));
     cx.on_action(|_: &Quit, cx| cx.quit());
     // `secondary` is Cmd on macOS and Ctrl elsewhere.
     cx.bind_keys([

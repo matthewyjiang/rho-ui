@@ -22,6 +22,9 @@
 
 mod diff;
 mod files;
+mod pull_request;
+
+pub(crate) use self::pull_request::state_look;
 mod terminal;
 
 use std::cmp::Ordering;
@@ -46,11 +49,13 @@ use gpui_kit::{
 
 use self::diff::DiffSurface;
 use self::files::FilesSurface;
+use self::pull_request::{PullRequestSurface, Visibility};
 pub(crate) use self::terminal::{Direction, PaneCommand, TerminalShell};
 use self::terminal::{Emptied, TerminalTab};
 #[cfg(test)]
 pub(crate) use self::terminal::{TerminalView, PROGRAM_POLL};
 use crate::{
+    pull_requests::PullRequests,
     session_view::SessionView,
     store::{Key, StateDb},
     title_bar::TOP_ROW_REMS,
@@ -81,16 +86,19 @@ pub(crate) enum Surface {
     Diff,
     /// The files where the session works, and one opened to read.
     Files,
+    /// The pull request of the branch the session works on.
+    PullRequest,
     /// A shell in the session's folder.
     Terminal,
 }
 
 impl Surface {
     /// Every surface, in the order the panel lists them.
-    const ALL: [Surface; 4] = [
+    const ALL: [Surface; 5] = [
         Surface::Files,
         Surface::Terminal,
         Surface::Diff,
+        Surface::PullRequest,
         Surface::Background,
     ];
 
@@ -100,6 +108,7 @@ impl Surface {
             Surface::Background => "background",
             Surface::Diff => "diff",
             Surface::Files => "files",
+            Surface::PullRequest => "pull-request",
             Surface::Terminal => "terminal",
         }
     }
@@ -109,6 +118,7 @@ impl Surface {
             Surface::Background => "Background work",
             Surface::Diff => "Diff",
             Surface::Files => "Files",
+            Surface::PullRequest => "Pull request",
             Surface::Terminal => "Terminal",
         }
     }
@@ -118,6 +128,7 @@ impl Surface {
             Surface::Background => Lucide::ListChecks,
             Surface::Diff => Lucide::FileDiff,
             Surface::Files => Lucide::FolderTree,
+            Surface::PullRequest => Lucide::GitPullRequest,
             Surface::Terminal => Lucide::SquareTerminal,
         }
     }
@@ -155,6 +166,7 @@ enum Tab {
     Background,
     Diff(Entity<DiffSurface>),
     Files(Entity<FilesSurface>),
+    PullRequest(Entity<PullRequestSurface>),
     /// One of any number of terminal tabs, by its number, with the
     /// subscriptions that redraw the panel as its program changes and close
     /// the tab when its last pane closes.
@@ -171,6 +183,7 @@ impl Tab {
             Tab::Background => (Surface::Background, 1),
             Tab::Diff(_) => (Surface::Diff, 1),
             Tab::Files(_) => (Surface::Files, 1),
+            Tab::PullRequest(_) => (Surface::PullRequest, 1),
             Tab::Terminal { number, .. } => (Surface::Terminal, *number),
         };
         TabKey { surface, number }
@@ -183,7 +196,9 @@ impl Tab {
                 .read(cx)
                 .program(cx)
                 .unwrap_or_else(|| Surface::Terminal.label().into()),
-            Tab::Background | Tab::Diff(_) | Tab::Files(_) => self.key().surface.label().into(),
+            Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::PullRequest(_) => {
+                self.key().surface.label().into()
+            }
         }
     }
 }
@@ -369,10 +384,19 @@ pub(crate) struct RightPanel {
     /// The session on screen, if any, with the subscription that redraws
     /// the panel as it changes.
     session: Option<(Entity<SessionView>, Subscription)>,
+    /// What the Pull request surface reads PRs through.
+    prs: Entity<PullRequests>,
+    /// Tells the Pull request surface when the panel shows or hides.
+    _layout: Subscription,
 }
 
 impl RightPanel {
-    pub(crate) fn new(workspaces: Entity<Workspaces>, shell: TerminalShell) -> Self {
+    pub(crate) fn new(
+        workspaces: Entity<Workspaces>,
+        shell: TerminalShell,
+        prs: Entity<PullRequests>,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
         Self {
             workspaces,
             shell,
@@ -382,6 +406,33 @@ impl RightPanel {
             tab_scroll: ScrollHandle::new(),
             next_terminal: 1,
             session: None,
+            prs,
+            _layout: cx.observe_global::<PanelLayout>(|this, cx| this.sync_shown(cx)),
+        }
+    }
+
+    /// Whether something in the panel has the keyboard.
+    pub(crate) fn has_keyboard(&self, window: &Window, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| match tab {
+            Tab::PullRequest(view) => view.read(cx).has_keyboard(window, cx),
+            Tab::Terminal { view, .. } => view.read(cx).has_keyboard_anywhere(window, cx),
+            Tab::Background | Tab::Diff(_) | Tab::Files(_) => false,
+        })
+    }
+
+    /// Tells the Pull request surface whether it is on screen: its tab
+    /// shown, in a panel that shows. It polls only then.
+    fn sync_shown(&self, cx: &mut Context<'_, Self>) {
+        let shown = PanelLayout::get(cx);
+        for tab in &self.tabs {
+            if let Tab::PullRequest(view) = tab {
+                let visibility = if shown && self.active == Some(tab.key()) {
+                    Visibility::Shown
+                } else {
+                    Visibility::Hidden
+                };
+                view.update(cx, |view, cx| view.set_visibility(visibility, cx));
+            }
         }
     }
 
@@ -402,6 +453,9 @@ impl RightPanel {
                 }
                 Tab::Files(files) => {
                     files.update(cx, |files, cx| files.set_session(session.as_ref(), cx));
+                }
+                Tab::PullRequest(view) => {
+                    view.update(cx, |view, cx| view.set_session(session.as_ref(), cx));
                 }
                 Tab::Terminal { view, .. } => {
                     view.update(cx, |tab, cx| tab.set_session(session.as_ref(), cx));
@@ -450,6 +504,10 @@ impl RightPanel {
                 let workspaces = self.workspaces.clone();
                 Tab::Files(cx.new(|cx| FilesSurface::new(workspaces, session, cx)))
             }
+            Surface::PullRequest => {
+                let (prs, workspaces) = (self.prs.clone(), self.workspaces.clone());
+                Tab::PullRequest(cx.new(|cx| PullRequestSurface::new(prs, workspaces, session, cx)))
+            }
             Surface::Terminal => {
                 let number = self.next_terminal;
                 self.next_terminal += 1;
@@ -472,6 +530,7 @@ impl RightPanel {
     /// Shows `key`'s tab.
     fn show(&mut self, key: TabKey, cx: &mut Context<'_, Self>) {
         self.active = Some(key);
+        self.sync_shown(cx);
         cx.notify();
     }
 
@@ -485,6 +544,7 @@ impl RightPanel {
         if self.active == Some(key) {
             self.active = self.tabs.last().map(Tab::key);
         }
+        self.sync_shown(cx);
         cx.notify();
     }
 
@@ -568,7 +628,7 @@ impl RightPanel {
     pub(crate) fn diff_paths(&self, cx: &App) -> Option<Vec<String>> {
         self.tabs.iter().find_map(|tab| match tab {
             Tab::Diff(diff) => Some(diff.read(cx).paths(cx)),
-            Tab::Background | Tab::Files(_) | Tab::Terminal { .. } => None,
+            Tab::Background | Tab::Files(_) | Tab::PullRequest(_) | Tab::Terminal { .. } => None,
         })
     }
 
@@ -578,7 +638,7 @@ impl RightPanel {
     pub(crate) fn open_file(&self, cx: &App) -> Option<(String, String)> {
         self.tabs.iter().find_map(|tab| match tab {
             Tab::Files(files) => files.read(cx).open_file_text(cx),
-            Tab::Background | Tab::Diff(_) | Tab::Terminal { .. } => None,
+            Tab::Background | Tab::Diff(_) | Tab::PullRequest(_) | Tab::Terminal { .. } => None,
         })
     }
 
@@ -588,7 +648,7 @@ impl RightPanel {
     pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<TerminalView>> {
         match self.active.and_then(|key| self.tab(key))? {
             Tab::Terminal { view, .. } => view.read(cx).current(cx),
-            Tab::Background | Tab::Diff(_) | Tab::Files(_) => None,
+            Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::PullRequest(_) => None,
         }
     }
 
@@ -825,6 +885,7 @@ impl RightPanel {
             },
             Tab::Diff(diff) => diff.clone().into_any_element(),
             Tab::Files(files) => files.clone().into_any_element(),
+            Tab::PullRequest(view) => view.clone().into_any_element(),
             Tab::Terminal { view, .. } => view.clone().into_any_element(),
         }
     }
