@@ -128,7 +128,8 @@ gpui_kit::assets::icon_assets!(
         Pin,
         PinOff,
         Circle,
-        CircleDot
+        CircleDot,
+        Trash
     ]
 );
 

@@ -1626,14 +1626,14 @@ fn copy_menu(
 fn delete_item(view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenuItem {
     let (view, id, title) = (view.clone(), row.id.clone(), row.title.clone());
     PopupMenuItem::new("Delete…")
-        .icon(Icon::new(IconName::Delete))
+        .icon(Icon::new(Lucide::Trash))
         .disabled(row.busy)
         .on_click(move |_, window, cx| {
             let (view, id, title) = (view.clone(), id.clone(), title.clone());
             window.open_alert_dialog(cx, move |alert, _, cx| {
                 let (view, id) = (view.clone(), id.clone());
                 alert
-                    .icon(Icon::new(IconName::Delete).text_color(cx.theme().danger))
+                    .icon(Icon::new(Lucide::Trash).text_color(cx.theme().danger))
                     .title(format!("Delete \"{title}\"?"))
                     .description("rho deletes the saved session. This can't be undone.")
                     .confirm()
