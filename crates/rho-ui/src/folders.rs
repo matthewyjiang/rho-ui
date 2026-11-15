@@ -19,9 +19,9 @@ use crate::repo;
 
 /// How long a remote lookup waits for the next key before it runs. Kit
 /// drops a search's task when the next one starts, so a burst of keys runs
-/// one ssh script, not one a key: each takes two ssh sessions on the
-/// shared master, past sshd's default `MaxSessions` of 10 if a dozen ran
-/// at once. 150 ms is longer than the gap between keys at 80 words a
+/// one ssh script, not one a key: each takes an ssh session on the
+/// shared connection, past sshd's default `MaxSessions` of 10 if a dozen
+/// ran at once. 150 ms is longer than the gap between keys at 80 words a
 /// minute (about 400 keys a minute, 150 ms apart) and short enough to read
 /// as instant.
 const REMOTE_PAUSE: Duration = Duration::from_millis(150);

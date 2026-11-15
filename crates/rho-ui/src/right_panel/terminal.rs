@@ -4,8 +4,8 @@
 //! asked. rho-ui runs the pseudo-terminal and draws the cells with GPUI.
 //!
 //! On this machine the shell is [`TerminalShell`]; on a remote one it is the
-//! login shell there, through `ssh -tt` over the master the daemon
-//! connection opened ([`SshLink::terminal_command`]).
+//! login shell there, through the local `ssh -tt` on a connection of its
+//! own ([`SshLink::terminal_command`]).
 //!
 //! Each Terminal tab ([`TerminalTab`]) splits into panes ([`TerminalPane`]),
 //! side by side or one above another. In each pane, each session gets its

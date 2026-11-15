@@ -9,6 +9,7 @@ rust-version.workspace = true
 # Everything the desktop UI needs from the rho daemon, with no GUI dependency.
 [features]
 # `fake_daemon`: a scripted daemon for tests, this crate's and rho-ui's.
+# `fake_sshd`: an ssh server in the test's process, for the ssh tests.
 test-support = ["dep:tempfile", "tokio/time"]
 
 [dependencies]
@@ -16,18 +17,37 @@ test-support = ["dep:tempfile", "tokio/time"]
 base64 = "0.22"
 # `platform::canonicalize`: a resolved path without Windows' `\\?\` prefix.
 dunce = "1"
+# This machine's hostname, for the `%l`, `%L` and `%C` tokens of an ssh
+# config's `IdentityFile` (`ssh/config.rs`). Already in the lock, under GPUI.
+gethostname = "1"
 # Highlights what a search matched, with the pattern rho's grep used.
 regex = "1"
 rho-protocol.workspace = true
-# Reads `rho update --check --json` (`rho_install.rs`).
+# Checks a hashed `known_hosts` entry, HMAC-SHA1 (`ssh/host_key.rs`), and
+# makes the `%C` token, SHA-1 (`ssh/config.rs`). russh's crypto backend
+# below, so no second copy.
+ring = "0.17"
+# The ssh client that reaches a daemon on another machine (`ssh.rs`), in this
+# process, so Windows reaches Unix machines as Linux and macOS do. Defaults
+# off: they pick aws-lc-rs, which needs cmake and NASM to build on Windows,
+# and zlib compression, which nothing here asks for. `ring` is the crypto
+# backend (russh needs one of the two); `rsa` signs with and checks RSA keys.
+# Ed25519 and ECDSA keys, and the key agent client (OpenSSH's named pipe on
+# Windows), come without a feature. russh brings a Pageant client too, which
+# rho-ui doesn't use (`ssh/auth.rs` says why).
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
+# Reads `rho update --check --json` (`rho_install.rs`) and a remote
+# machine's `rho daemon status --json` (`ssh/setup.rs`).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
 tempfile = { version = "3", optional = true }
 thiserror = "2"
-# The runtime rho-protocol's `Client` needs for the socket; see `daemon.rs`.
-# `process` and `io-util` run ssh for a daemon on another machine (`ssh.rs`).
-tokio = { version = "1.36", features = ["io-util", "net", "process", "rt-multi-thread", "sync", "time"] }
+# The runtime rho-protocol's `Client` and russh need, for the daemon socket
+# and the ssh connection that carries a remote one; see `daemon.rs`.
+# `process` runs `ssh -G` to read the user's ssh config (`ssh/config.rs`);
+# `macros` waits on a script's input and output at once (`ssh/script.rs`).
+tokio = { version = "1.36", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 futures = "0.3"

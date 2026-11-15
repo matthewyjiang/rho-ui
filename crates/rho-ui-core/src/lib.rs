@@ -7,6 +7,8 @@ mod completion;
 mod daemon;
 #[cfg(feature = "test-support")]
 pub mod fake_daemon;
+#[cfg(feature = "test-support")]
+pub mod fake_sshd;
 mod input;
 mod options;
 pub mod platform;

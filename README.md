@@ -8,8 +8,9 @@ Sessions run in the rho daemon, so they keep running after you close the window,
 
 ## Requirements
 
-- rho 3 or later, which rho-ui offers to install on a machine without it
+- rho 3 or later, which rho-ui offers to install on a machine without it; on a remote machine, one whose `rho daemon status --json` names its socket, as rho 3.1's does
 - Linux or macOS (no Windows yet)
+- For a remote machine: its host key in your `known_hosts` (not only a certificate authority for it), and a key or certificate it accepts in your key agent, or in a key file without a passphrase (`ssh HOST` in a terminal should sign in without asking anything)
 - On Linux: Wayland or X11 with a working Vulkan driver, plus the system packages in GPUI Kit's [installation guide](https://gpui-kit.com/docs/installation/)
 
 ## Run
