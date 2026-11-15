@@ -1292,15 +1292,15 @@ impl SidebarView {
             _ => None,
         };
         let mut troubles: Vec<AnyElement> = Vec::new();
-        for (machine, status, error) in machines.troubles() {
+        for (machine, status, refused) in machines.troubles() {
             let label = machines.label(machine);
             let on = machines
                 .tag(machine)
                 .map_or_default(|_| format!(" on {label}"));
-            if let Some(error) = error {
+            for (listing, error) in refused {
                 troubles.push(footer_alert(
-                    format!("sessions-error-{machine}"),
-                    format!("Couldn't read sessions{on}"),
+                    format!("{}-error-{machine}", listing.name()),
+                    format!("{}{on}", listing.failed()),
                     error.clone(),
                 ));
             }

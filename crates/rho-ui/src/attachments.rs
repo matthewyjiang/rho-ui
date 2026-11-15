@@ -15,7 +15,7 @@ use gpui_kit::component::attachment::{
 use gpui_kit::component::Icon;
 use gpui_kit::{rems, App, Axis, ParentElement as _, SharedString, Styled as _};
 use rho_ui_core::{
-    AttachedFile, Attachment, Image, ImageFormat, MAX_ATTACHED_TEXT_CHARS,
+    mebibytes, AttachedFile, Attachment, Image, ImageFormat, MAX_ATTACHED_TEXT_CHARS,
     MAX_PROMPT_ATTACHMENT_BYTES,
 };
 
@@ -403,13 +403,6 @@ pub(crate) fn read(path: &Path) -> Result<ReadFile, String> {
         }
         _ => Ok(ReadFile::linked(&path, None)),
     }
-}
-
-/// `bytes` in MiB, to one decimal place, such as `12.0 MiB`, as
-/// rho-ui-core words its attachment limit.
-fn mebibytes(bytes: usize) -> String {
-    let tenths = bytes.saturating_mul(10) / (1024 * 1024);
-    format!("{}.{} MiB", tenths / 10, tenths % 10)
 }
 
 fn decoder(format: ImageFormat) -> image::ImageFormat {

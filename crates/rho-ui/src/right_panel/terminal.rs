@@ -386,7 +386,7 @@ impl TerminalView {
             .spawn_command(command)
             .map_err(|error| error.to_string())?;
         drop(pair.slave);
-        let killer = child.clone_killer();
+        let hang_up = HangUp(Some(child.clone_killer()));
         let exited = Arc::new(AtomicBool::new(false));
         let exit = wait_for(child, Arc::clone(&exited)).map_err(|error| error.to_string())?;
         let reader = pair
@@ -420,7 +420,6 @@ impl TerminalView {
             keys: Keys::new().map_err(ghostty)?,
             pty: pair.master,
             input,
-            killer,
             exited,
             program_source,
             mouse: Mouse::new().map_err(ghostty)?,
@@ -434,6 +433,8 @@ impl TerminalView {
             focus: cx.focus_handle(),
             reader: Task::ready(()),
             waiter: Task::ready(()),
+            // Last, after every step that can fail.
+            killer: hang_up.disarm(),
         };
         let view = cx.new(|_| view);
         let read = cx.spawn({
@@ -841,6 +842,25 @@ impl Drop for TerminalView {
     fn drop(&mut self) {
         if !self.exited.load(Ordering::Acquire) {
             let _ = self.killer.kill();
+        }
+    }
+}
+
+/// Hangs up on a shell whose view couldn't be made, so a step failing
+/// after it started doesn't leave it running, with the threads that read
+/// and wait on it. [`Self::disarm`] hands the killer to the view instead.
+struct HangUp(Option<Box<dyn ChildKiller + Send + Sync>>);
+
+impl HangUp {
+    fn disarm(mut self) -> Box<dyn ChildKiller + Send + Sync> {
+        self.0.take().expect("a HangUp is armed until disarmed")
+    }
+}
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        if let Some(killer) = &mut self.0 {
+            let _ = killer.kill();
         }
     }
 }

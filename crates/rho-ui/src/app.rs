@@ -34,7 +34,9 @@ use crate::{
     background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
-    machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
+    machines::{
+        Listing, Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey,
+    },
     projects::Projects,
     rho_settings::RhoSettings,
     right_panel::{
@@ -113,9 +115,6 @@ struct Connection {
     jobs_task: Task<()>,
     /// The jobs as last polled, to tell when they change.
     jobs: Vec<Job>,
-    /// Why the daemon last refused to list its jobs, as shown in
-    /// [`Machines`], so a listing that succeeds clears only that.
-    jobs_error: Option<SharedString>,
     /// The latest `list_sessions`; a newer refresh replaces it.
     sessions_task: Task<()>,
 }
@@ -130,7 +129,6 @@ impl Connection {
             task: Task::ready(()),
             jobs_task: Task::ready(()),
             jobs: Vec::new(),
-            jobs_error: None,
             sessions_task: Task::ready(()),
         }
     }
@@ -535,57 +533,50 @@ impl RhoApp {
     /// Shows which sessions have work under way in `machine`'s daemon. A
     /// change is also when the saved list goes stale: a session another
     /// client started appears, or one's turn ended. A listing also clears
-    /// why the last one was refused, unless another error replaced it.
+    /// why the last one was refused.
     fn set_jobs(&mut self, machine: &MachineId, jobs: &[Job], cx: &mut Context<'_, Self>) {
+        self.set_listing_error(machine, Listing::Jobs, None, cx);
         let Some(connection) = self.connection_mut(machine) else {
             return;
         };
-        let refused = connection.jobs_error.take();
         let same = connection.jobs.len() == jobs.len()
             && connection
                 .jobs
                 .iter()
                 .zip(jobs)
                 .all(|(was, now)| was.is_same_work(now));
-        if !same {
-            jobs.clone_into(&mut connection.jobs);
-        }
-        if let Some(refused) = refused {
-            self.machines.update(cx, |machines, cx| {
-                let shown = machines
-                    .troubles()
-                    .any(|(id, _, error)| id == machine && error == Some(&refused));
-                if shown && machines.set_error(machine, None) {
-                    cx.notify();
-                }
-            });
-        }
         if same {
             return;
         }
+        jobs.clone_into(&mut connection.jobs);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_jobs(machine, jobs, cx));
         self.refresh_sessions(machine, cx);
     }
 
     /// `machine`'s daemon refused to list its jobs, because of `error`. The
-    /// sidebar says so where it says why sessions couldn't be listed, as
-    /// its rows' activity is stale until a listing succeeds. Repeats of the
-    /// same refusal change nothing.
+    /// sidebar says so, as its rows' activity is stale until a listing
+    /// succeeds. Repeats of the same refusal change nothing.
     fn jobs_failed(
         &mut self,
         machine: &MachineId,
         error: &DaemonError,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(connection) = self.connection_mut(machine) else {
-            return;
-        };
-        let message =
-            SharedString::from(format!("Couldn't read which sessions are working: {error}"));
-        connection.jobs_error = Some(message.clone());
+        self.set_listing_error(machine, Listing::Jobs, Some(error.to_string().into()), cx);
+    }
+
+    /// Records why `machine`'s daemon refused `listing`, or with `None`
+    /// that it listed it, for the sidebar.
+    fn set_listing_error(
+        &self,
+        machine: &MachineId,
+        listing: Listing,
+        error: Option<SharedString>,
+        cx: &mut App,
+    ) {
         self.machines.update(cx, |machines, cx| {
-            if machines.set_error(machine, Some(message)) {
+            if machines.set_error(machine, listing, error) {
                 cx.notify();
             }
         });
@@ -750,11 +741,7 @@ impl RhoApp {
                     }
                     Err(error) => Some(error.to_string().into()),
                 };
-                this.machines.update(cx, |machines, cx| {
-                    if machines.set_error(&id, error) {
-                        cx.notify();
-                    }
-                });
+                this.set_listing_error(&id, Listing::Sessions, error, cx);
             });
         });
         if let Some(connection) = self.connection_mut(machine) {

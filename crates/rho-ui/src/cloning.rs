@@ -60,10 +60,10 @@ impl Source {
 /// from the home directory, so a relative folder is from there; an empty
 /// one is `$RHO_HOME/projects`, the rho home found as rho-ui's ssh setup
 /// finds it. A folder that already holds a clone of the URL with a
-/// commit checked out is taken as it is, so a clone that finished before
-/// rho-ui quit can be picked again. One without, as a clone killed partway
-/// leaves, is refused as incomplete: removing it lets the next pick clone
-/// afresh. git never prompts: with no terminal, a password or host key
+/// commit is taken as it is, so a clone that finished before rho-ui quit
+/// can be picked again. One with none yet is refused: a clone may still be
+/// running into it, from another draft, or one was cut short, which
+/// removing the folder lets the next pick redo. git never prompts: with no terminal, a password or host key
 /// question fails with git's message. It prints a NUL, then the clone's
 /// resolved path and a NUL, so whatever a login file prints comes before
 /// them.
@@ -83,7 +83,7 @@ if [ -e "$dest" ]; then
     exit 1
   fi
   git -C "$dest" rev-parse -q --verify HEAD >/dev/null || {
-    echo "$dest holds a clone of $url with no commit, as one cut short leaves; remove it to clone again" >&2
+    echo "$dest holds a clone of $url with no commit yet: a clone may still be running into it, or one was cut short; if so, remove it to clone again" >&2
     exit 1
   }
 else

@@ -510,7 +510,7 @@ impl<T> Drop for AbortOnDrop<T> {
 /// connected, at a socket target or over `ssh -W`. A daemon that accepts
 /// and never answers would otherwise hold the connection attempt forever.
 /// The default local target has none: rho-protocol's `LocalDaemon` does
-/// that handshake itself.
+/// that handshake itself, with no deadline, until rho-protocol adds one.
 /// The handshake is one round trip over a socket that already connected,
 /// so this is a tripwire, not a budget: it matches the ssh setup's
 /// deadline, which covers a whole login and `rho daemon start`.
