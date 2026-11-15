@@ -6390,6 +6390,7 @@ name = "rho-ui-core"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "dunce",
  "futures",
  "regex",
  "rho-protocol",

@@ -21,9 +21,12 @@ use gpui_kit::{
     div, AnyElement, App, Context, Div, Entity, EventEmitter, IntoElement, ParentElement as _,
     SharedString, Styled as _, Task,
 };
-use rho_ui_core::{DaemonError, PendingUpgrade, RhoCheck, RhoInstall, Update};
+use rho_ui_core::{platform, DaemonError, PendingUpgrade, RhoCheck, RhoInstall, Update};
 
-use crate::machines::{MachineId, MachineStatus, Machines};
+use crate::{
+    machines::{MachineId, MachineStatus, Machines},
+    workspaces::tilde,
+};
 
 /// How long a check that found rho stays fresh. Each check asks GitHub's
 /// API once, which allows 60 unauthenticated requests an hour from one
@@ -196,13 +199,16 @@ impl Installs {
     }
 
     /// Where installing rho on this machine puts it, to show: the folder
-    /// of its program when `--rho` gave a path, else the install script's.
+    /// of its program when `--rho` gave a path, else the installer's.
     fn local_install_dir(&self, cx: &App) -> String {
         match self.rho(&MachineId::local(), cx) {
             Some(RhoInstall::Here { rho }) if rho.components().count() > 1 => {
                 rho.parent().map_or_default(|dir| dir.display().to_string())
             }
-            _ => format!("~/{}", rho_ui_core::INSTALL_DIR),
+            _ => platform::rho_install_dir().map_or_else(
+                || "rho's install folder".to_owned(),
+                |dir| tilde(&dir, platform::home_dir().as_deref()),
+            ),
         }
     }
 

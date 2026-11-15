@@ -2,8 +2,9 @@
 //! project of the folder typed, if it is there, and the folders the path
 //! can go on to, so the search browses folders on any machine. This
 //! machine's are read from its files; a remote machine's with
-//! [`REMOTE_SCRIPT`], over the ssh connection to its daemon. Also how
-//! rho-ui runs scripts and reads files on any machine ([`Reader`]).
+//! [`REMOTE_SCRIPT`], over the ssh connection to its daemon. Also
+//! [`Reader`], which every feature that reads a machine goes through, and
+//! the file read that the Files surface and pictures share.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -123,7 +124,12 @@ pub(crate) struct Lookup {
     pub(crate) next: Vec<PathBuf>,
 }
 
-/// How rho-ui reads a machine's files and runs scripts there.
+/// Where rho-ui reads a machine's files and runs `git`. A feature that
+/// reads a machine has two ways to, which [`Self::query`] picks between:
+/// here, with the files themselves and `git` run as a program (see
+/// [`crate::local`]); on a remote machine, which is Unix, with a POSIX `sh`
+/// script over its ssh link, whose output it parses. Both give the feature
+/// the same value.
 pub(crate) enum Reader {
     /// From this machine's files.
     Here,
@@ -133,50 +139,48 @@ pub(crate) enum Reader {
     Unread,
 }
 
-impl Reader {
-    /// Runs the POSIX `sh` script `script` on the machine, with `args` as
-    /// its positional parameters, and returns what it wrote to stdout:
-    /// here with `sh` on `executor`, there over ssh within
-    /// [`SshLink::run_script`]'s deadline.
-    ///
-    /// # Errors
-    ///
-    /// Says why, in the script's or ssh's words, if the machine isn't
-    /// connected or the script failed.
-    pub(crate) async fn run_script(
-        self,
-        script: &'static str,
-        args: Vec<OsString>,
-        executor: &BackgroundExecutor,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            Reader::Here => executor.spawn(async move { run_here(script, &args) }).await,
-            Reader::There(ssh) => ssh
-                .run_script(script, &args)
-                .await
-                .map_err(|error| error.to_string()),
-            Reader::Unread => Err(UNREAD.to_owned()),
-        }
-    }
+/// How long a remote machine's script in [`Reader::query`] may run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Deadline {
+    /// [`SshLink::run_script`]'s, for a script that reads.
+    Script,
+    /// None, for a script whose time the network and the work set, such as
+    /// a `git clone` (see [`SshLink::run_long_script`]).
+    Never,
+}
 
-    /// [`Self::run_script`] with no deadline, for a script whose time the
-    /// network and the work set, such as a `git clone`.
+/// Why a [`Reader::Unread`] machine can't be read.
+const UNREAD: &str = "The machine isn't connected.";
+
+impl Reader {
+    /// Finds something out on the machine: here by calling `here` on
+    /// `executor`; there by running the POSIX `sh` script `script` with
+    /// `args` as its positional parameters, within `deadline`, and reading
+    /// what it printed with `parse` on `executor`.
     ///
     /// # Errors
     ///
-    /// As [`Self::run_script`].
-    pub(crate) async fn run_long_script(
+    /// Says why, in ssh's words or those of `here` or `parse`, if the
+    /// machine isn't connected, the script fails, or either of those does.
+    pub(crate) async fn query<T: Send + 'static>(
         self,
+        executor: &BackgroundExecutor,
+        here: impl FnOnce() -> Result<T, String> + Send + 'static,
         script: &'static str,
         args: Vec<OsString>,
-        executor: &BackgroundExecutor,
-    ) -> Result<Vec<u8>, String> {
+        deadline: Deadline,
+        parse: impl FnOnce(Vec<u8>) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
         match self {
-            Reader::Here => executor.spawn(async move { run_here(script, &args) }).await,
-            Reader::There(ssh) => ssh
-                .run_long_script(script, &args)
-                .await
-                .map_err(|error| error.to_string()),
+            Reader::Here => executor.spawn(async move { here() }).await,
+            Reader::There(ssh) => {
+                let output = match deadline {
+                    Deadline::Script => ssh.run_script(script, &args).await,
+                    Deadline::Never => ssh.run_long_script(script, &args).await,
+                }
+                .map_err(|error| error.to_string())?;
+                executor.spawn(async move { parse(output) }).await
+            }
             Reader::Unread => Err(UNREAD.to_owned()),
         }
     }
@@ -185,7 +189,8 @@ impl Reader {
 /// The POSIX `sh` script that prints the file at the path given as its
 /// second argument, from the folder given as its first: [`OPENED`], then
 /// as many of its bytes as the third argument says. [`GONE`] if it isn't a
-/// file. Read with [`parse_read`].
+/// file. It fails if the folder isn't one. Read with [`parse_read`];
+/// [`read_here`] does the same here.
 pub(crate) const READ_SCRIPT: &str = r#"unset CDPATH
 cd -- "$1" || exit
 if [ -f "$2" ]; then
@@ -214,13 +219,27 @@ pub(crate) enum FileRead {
     Gone,
 }
 
+impl FileRead {
+    /// What a read that stopped after `limit + 1` bytes of a file found.
+    fn within(bytes: Vec<u8>, limit: usize) -> Self {
+        if bytes.len() > limit {
+            Self::TooLarge
+        } else {
+            Self::Bytes(bytes)
+        }
+    }
+}
+
 impl Reader {
     /// Reads the file at `path`, from `folder` when relative, if it holds
-    /// at most `limit` bytes.
+    /// at most `limit` bytes: here with [`read_here`], there with
+    /// [`READ_SCRIPT`].
     ///
     /// # Errors
     ///
-    /// As [`Self::run_script`], or if the script printed something else.
+    /// As [`Self::query`]: if the machine isn't connected, `folder` isn't
+    /// a folder, the file can't be read, or the script printed something
+    /// else.
     pub(crate) async fn read_file(
         self,
         folder: &Path,
@@ -233,9 +252,43 @@ impl Reader {
             OsString::from(path),
             (limit + 1).to_string().into(),
         ];
-        let output = self.run_script(READ_SCRIPT, args, executor).await?;
-        parse_read(output, limit)
+        let (folder, path) = (folder.to_path_buf(), path.to_owned());
+        self.query(
+            executor,
+            move || read_here(&folder, &path, limit),
+            READ_SCRIPT,
+            args,
+            Deadline::Script,
+            move |output| parse_read(output, limit),
+        )
+        .await
     }
+}
+
+/// Reads the file at `path`, from `folder` when relative, on this machine,
+/// as [`READ_SCRIPT`] does: no more than `limit + 1` of its bytes, or
+/// [`FileRead::Gone`] if it isn't a file. Blocks; call it off the UI
+/// thread.
+///
+/// # Errors
+///
+/// Says why if `folder` isn't a folder, or the file can't be read.
+pub(crate) fn read_here(folder: &Path, path: &str, limit: usize) -> Result<FileRead, String> {
+    use std::io::Read as _;
+
+    if !folder.is_dir() {
+        return Err(format!("{} isn't a folder.", folder.display()));
+    }
+    let path = folder.join(path);
+    if !path.is_file() {
+        return Ok(FileRead::Gone);
+    }
+    let couldnt = |error: std::io::Error| format!("Couldn't read {}: {error}", path.display());
+    let file = std::fs::File::open(&path).map_err(couldnt)?;
+    let mut bytes = Vec::new();
+    let most = u64::try_from(limit).map_or(u64::MAX, |limit| limit.saturating_add(1));
+    file.take(most).read_to_end(&mut bytes).map_err(couldnt)?;
+    Ok(FileRead::within(bytes, limit))
 }
 
 /// The file [`READ_SCRIPT`] printed, told to stop after `limit + 1` bytes.
@@ -246,11 +299,7 @@ impl Reader {
 pub(crate) fn parse_read(mut output: Vec<u8>, limit: usize) -> Result<FileRead, String> {
     if let Some(at) = find(&output, OPENED) {
         output.drain(..at + OPENED.len());
-        return Ok(if output.len() > limit {
-            FileRead::TooLarge
-        } else {
-            FileRead::Bytes(output)
-        });
+        return Ok(FileRead::within(output, limit));
     }
     match find(&output, GONE) {
         Some(_) => Ok(FileRead::Gone),
@@ -270,32 +319,6 @@ pub(crate) fn find(output: &[u8], marker: &[u8]) -> Option<usize> {
 pub(crate) fn after<'a>(output: &'a [u8], marker: &[u8]) -> Option<&'a [u8]> {
     let at = find(output, marker)?;
     output.get(at + marker.len()..)
-}
-
-/// Why a script can't run on a machine that isn't connected.
-const UNREAD: &str = "The machine isn't connected.";
-
-/// Runs the POSIX `sh` script `script` on this machine with `args`, and
-/// returns its stdout, or its stderr as the error if it fails. Blocks
-/// until it ends; call it off the UI thread.
-pub(crate) fn run_here(script: &str, args: &[impl AsRef<OsStr>]) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("Couldn't run sh: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(match stderr.trim() {
-            "" => format!("The script ended with {}.", output.status),
-            why => why.to_owned(),
-        })
-    }
 }
 
 /// Looks `typed` up with `reader`, doing file I/O on `executor`.
@@ -322,7 +345,7 @@ pub(crate) async fn look(
 /// Looks `typed` up on this machine. Does file I/O; call it off the UI
 /// thread.
 fn look_here(typed: &Typed) -> Lookup {
-    let found = match typed.path.canonicalize() {
+    let found = match platform::canonicalize(&typed.path) {
         Ok(dir) if dir.is_dir() => Some(Found::new(repo::inspect(&dir).root, &dir, &typed.path)),
         _ => None,
     };
@@ -424,28 +447,6 @@ fn next(typed: &Typed, names: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// For tests: runs `git` in `dir` with `args`, as a user with a name who
-/// doesn't sign commits, and fails the test if it fails.
-#[cfg(test)]
-pub(crate) fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?}");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,8 +484,8 @@ mod tests {
     #[test]
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| git(&dir, args);
+        let dir = platform::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| crate::local::test::git(&dir, args);
         git(&["init", "-q", "-b", "main", "project"]);
         git(&["-C", "project", "commit", "-q", "--allow-empty", "-m", "x"]);
         git(&[
@@ -510,16 +511,10 @@ mod tests {
         ];
         let looked: Vec<Lookup> = cases.iter().map(look_here).collect();
         for (typed, local) in cases.iter().zip(&looked) {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(REMOTE_SCRIPT)
-                .arg("sh")
-                .args([&typed.path, &typed.browse])
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
+            let output = crate::local::test::sh(REMOTE_SCRIPT, &[&typed.path, &typed.browse])
+                .expect("the script runs");
             // As a login file that prints would have it.
-            let output = [b"Welcome!\n".as_slice(), output.stdout.as_slice()].concat();
+            let output = [b"Welcome!\n".as_slice(), output.as_slice()].concat();
             let remote = parse_remote(typed, &output).expect("the script's fields");
             assert_eq!(&remote, local, "{typed:?}");
         }
