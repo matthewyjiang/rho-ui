@@ -469,11 +469,7 @@ fn file_notes(
         .iter()
         .filter(|error| !error.key.as_ref().is_some_and(shown))
         .map(|error| {
-            let place = error
-                .key
-                .as_ref()
-                .map(|key| format!(" ({key})"))
-                .unwrap_or_default();
+            let place = error.key.as_ref().map_or_default(|key| format!(" ({key})"));
             Note::Warning(format!(
                 "config.toml doesn't load{place}: {}. Rho uses the last values that did.",
                 error.message

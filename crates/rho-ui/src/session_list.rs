@@ -272,7 +272,7 @@ impl SessionList {
         let job = || self.jobs.iter().find(|job| job.id == *id);
         match live {
             Some(live) => live.activity,
-            None => job().map(|job| job.activity).unwrap_or_default(),
+            None => job().map_or_default(|job| job.activity),
         }
     }
 

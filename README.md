@@ -25,7 +25,7 @@ The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 
 ## Keys
 
-On macOS, Cmd takes the place of Ctrl in these.
+On macOS, Cmd takes the place of Ctrl in these, and the menu bar lists them, with Cmd+H to hide and Cmd+M to minimize.
 
 | Key | Action |
 | --- | --- |

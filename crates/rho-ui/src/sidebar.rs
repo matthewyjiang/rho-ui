@@ -1159,8 +1159,7 @@ impl SidebarView {
             let label = machines.label(machine);
             let on = machines
                 .tag(machine)
-                .map(|_| format!(" on {label}"))
-                .unwrap_or_default();
+                .map_or_default(|_| format!(" on {label}"));
             if let Some(error) = error {
                 troubles.push(
                     div()

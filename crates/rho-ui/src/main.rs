@@ -5,6 +5,8 @@
 //! starts the daemon when none runs (default: `rho` on `PATH`).
 
 mod app;
+#[cfg(target_os = "macos")]
+mod app_menu;
 mod attachments;
 mod background;
 mod background_log;
@@ -222,7 +224,6 @@ fn main() {
             // doesn't slow the tests that time animations.
             pele::start();
             Settings::load().apply(cx);
-            cx.on_action(|_: &Quit, cx| cx.quit());
             let options = window_options(cx);
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
@@ -247,6 +248,7 @@ fn init(cx: &mut App, db: &StateDb) {
     cx.set_global(BackgroundLog::new(db));
     cx.set_global(PanelLayout::load(db));
     cx.set_global(LastCheckout::load(db));
+    cx.on_action(|_: &Quit, cx| cx.quit());
     // `secondary` is Cmd on macOS and Ctrl elsewhere.
     cx.bind_keys([
         shortcut("secondary-n", NewSession, Some("RhoApp"), cx),
@@ -303,6 +305,8 @@ fn init(cx: &mut App, db: &StateDb) {
             .into_iter()
             .flat_map(|(keys, shortcut)| terminal_keys(keys, shortcut)),
     );
+    #[cfg(target_os = "macos")]
+    app_menu::install(cx);
 }
 
 /// The terminal's keys for tabs and splits: Ghostty's defaults on each
