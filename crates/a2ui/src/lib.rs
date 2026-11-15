@@ -12,6 +12,10 @@
 //! a component's properties with [`MessageProcessor::resolve`], and turns a
 //! user's action into a message for the agent with
 //! [`MessageProcessor::dispatch_action`].
+//!
+//! [`Express`] is the agent side of A2UI Express, the compact notation a
+//! model writes a surface in: it compiles a block into v1.0 messages,
+//! decompiles messages back, and renders the prompt that teaches it.
 
 mod action;
 mod basic_catalog;
