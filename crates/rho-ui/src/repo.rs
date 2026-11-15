@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use rho_ui_core::platform;
 
+use crate::folders;
+
 /// A workspace's project, as the sidebar shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Repo {
@@ -47,8 +49,14 @@ impl Repo {
     /// The repository name without its owner: what the badge and the title
     /// bar show.
     pub(crate) fn short_name(&self) -> &str {
-        self.name.rsplit('/').next().unwrap_or(&self.name)
+        without_owner(&self.name)
     }
+}
+
+/// `name`, an `owner/name` repository name, without its owner: the name of
+/// the folder a clone of it makes.
+pub(crate) fn without_owner(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
 }
 
 /// What to show for `cwd` before [`inspect`] has read it: the folder name.
@@ -61,18 +69,24 @@ pub(crate) fn folder(cwd: &Path) -> Repo {
     }
 }
 
-fn folder_name(cwd: &Path) -> String {
-    cwd.file_name().map_or_else(
-        || cwd.display().to_string(),
+/// The last part of `path`, or all of it when it has none, as `/`.
+pub(crate) fn folder_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
 }
 
 /// Reads the project for `cwd`. Does file I/O; call it off the UI thread.
+/// A checkout's root is resolved, as a remote machine's `pwd -P` and the
+/// project picker give it, so one project has one path however a session
+/// reached it, as through a symlink.
 pub(crate) fn inspect(cwd: &Path) -> Repo {
     let Some((work_tree, git_dir)) = find_git_dir(cwd) else {
         return folder(cwd);
     };
+    let work_tree = work_tree.canonicalize().unwrap_or(work_tree);
+    let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
     // A linked worktree keeps its config in the main repository's git dir.
     let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
         .ok()
@@ -121,11 +135,13 @@ pub(crate) fn project_root(work_tree: PathBuf, common_dir: &Path) -> PathBuf {
 }
 
 /// The POSIX `sh` script that reads the repositories of the folders given
-/// as its arguments, on a remote machine with `git`. For each, it prints
-/// four fields, each ended by a NUL: the work tree root, the common git
-/// dir, what `HEAD` holds (as its file would), and the origin remote's URL.
-/// All four are empty outside a git repository. Read with [`parse_remote`].
+/// as its arguments, on a remote machine with `git`. After [`READ`], for
+/// each it prints four fields, each ended by a NUL: the work tree root, the
+/// common git dir, what `HEAD` holds (as its file would), and the origin
+/// remote's URL. All four are empty outside a git repository. Read with
+/// [`parse_remote`].
 pub(crate) const REMOTE_SCRIPT: &str = r#"unset CDPATH
+printf 'rho-ui-repos\0'
 for dir do
   if top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
     common=$(cd "$dir" && cd "$(git rev-parse --git-common-dir)" && pwd -P)
@@ -142,10 +158,14 @@ for dir do
 done
 "#;
 
+/// Printed before [`REMOTE_SCRIPT`]'s fields, so whatever a login file
+/// prints comes first and is skipped.
+const READ: &[u8] = b"rho-ui-repos\0";
+
 /// The projects of `dirs`, from what [`REMOTE_SCRIPT`] printed for them.
-/// `None` if it printed the wrong number of fields.
+/// `None` if it printed something else, or the wrong number of fields.
 pub(crate) fn parse_remote(dirs: &[PathBuf], output: &[u8]) -> Option<Vec<Repo>> {
-    let fields = nul_fields(output)?;
+    let fields = nul_fields(folders::after(output, READ)?)?;
     let (facts, []) = fields.as_chunks::<4>() else {
         return None;
     };
@@ -317,19 +337,23 @@ mod tests {
     }
 
     /// A linked worktree: `.git` file pointing into the main repository. It
-    /// and any subfolder belong to the main checkout's project.
+    /// and any subfolder belong to the main checkout's project, at its
+    /// resolved path, as is the checkout reached through a symlink.
     #[test]
     fn linked_worktrees_use_the_main_repository() {
         let root = std::env::temp_dir().join(format!("rho-ui-repo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let (main, tree) = fake_worktree(&root);
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&main, &link).unwrap();
 
         assert_eq!(
-            inspect(&main.join("docs")),
+            inspect(&link.join("docs")),
             Repo {
                 name: "project".into(),
                 origin: None,
                 branch: Some("main".into()),
-                root: main.clone(),
+                root: main.canonicalize().unwrap(),
             }
         );
         assert_eq!(
@@ -352,24 +376,7 @@ mod tests {
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .current_dir(&dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
+        let git = |args: &[&str]| folders::git(&dir, args);
         git(&["init", "-q", "-b", "main", "main"]);
         git(&[
             "-C",
@@ -413,7 +420,9 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        let remote = parse_remote(&dirs, &output.stdout).expect("four fields a folder");
+        // As a login file that prints would have it.
+        let output = [b"Welcome!\n".as_slice(), output.stdout.as_slice()].concat();
+        let remote = parse_remote(&dirs, &output).expect("four fields a folder");
 
         let local: Vec<Repo> = dirs.iter().map(|dir| inspect(dir)).collect();
         assert_eq!(remote, local);

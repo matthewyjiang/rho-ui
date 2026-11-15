@@ -8,7 +8,7 @@ use std::{
 };
 
 use rho_ui_core::{
-    fake_daemon::{FakeDaemon, Script},
+    fake_daemon::{write_program, FakeDaemon, Script},
     Checkout, Daemon, DaemonTarget, SshTarget,
 };
 use smol::block_on;
@@ -57,24 +57,6 @@ cd '{home}' && exec env -i HOME='{home}' PATH='{bin}:/usr/bin:/bin' SHELL=/bin/s
         home = home.display(),
         bin = bin.display(),
     )
-}
-
-/// Writes the program `text` to `path`, runnable, from a child process. A
-/// handle written through here would leak into the processes other tests
-/// spawn meanwhile, until they exec, and running the file then fails with
-/// "Text file busy" (ETXTBSY).
-fn write_program(path: &Path, text: &str) {
-    let status = Command::new("sh")
-        .args([
-            "-c",
-            r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#,
-            "sh",
-            text,
-        ])
-        .arg(path)
-        .status()
-        .expect("sh runs");
-    assert!(status.success(), "writing {} failed", path.display());
 }
 
 fn have_python() -> bool {

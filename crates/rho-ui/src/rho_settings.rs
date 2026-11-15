@@ -30,7 +30,7 @@ struct MachineSettings {
     /// returns.
     queued: Vec<SettingChange>,
     writing: bool,
-    /// Why the last change didn't land, until the next one.
+    /// Why the user's last change didn't land as made, until the next one.
     problem: Option<SharedString>,
     read_task: Task<()>,
     write_task: Task<()>,
@@ -57,9 +57,23 @@ impl RhoSettings {
         self.entry(machine).map(|entry| &entry.loaded)
     }
 
-    /// Why the last change on `machine` didn't land.
+    /// Why the last change on `machine` didn't land as made.
     pub(crate) fn problem(&self, machine: &MachineId) -> Option<&SharedString> {
         self.entry(machine)?.problem.as_ref()
+    }
+
+    /// Says why the user's last change on `machine` didn't land as made,
+    /// as one the page refused or clamped, until the next change.
+    pub(crate) fn set_problem(
+        &mut self,
+        machine: &MachineId,
+        problem: SharedString,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(entry) = self.entry_mut(machine) {
+            entry.problem = Some(problem);
+            cx.notify();
+        }
     }
 
     /// `machine` connected to `daemon`: reads its settings, which replace

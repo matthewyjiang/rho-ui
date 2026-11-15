@@ -14,7 +14,7 @@ use std::{
     ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Output, Stdio},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -26,11 +26,10 @@ use rho_protocol::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{ChildStderr, Command},
-    sync::oneshot,
 };
 
 use crate::{
-    daemon::{io, DaemonError, Machine},
+    daemon::{on_io, DaemonError, Machine, HANDSHAKE_DEADLINE},
     platform::{self, MAX_SOCKET_PATH_BYTES},
 };
 
@@ -142,7 +141,8 @@ impl SshLink {
 
     /// [`Self::run_script`] with no deadline, for a script whose time the
     /// network and the work set, such as a `git clone`: it ends when the
-    /// script does, or the connection.
+    /// script does, the connection does, or the caller drops the future,
+    /// which kills the script's ssh.
     ///
     /// # Errors
     ///
@@ -156,6 +156,9 @@ impl SshLink {
         self.spawn_script(script, args, None).await
     }
 
+    /// Runs [`Self::run`] on the I/O runtime, which ssh's pipes need, with
+    /// `args` set as the script's positional parameters. Dropping the
+    /// future stops the script and kills its ssh.
     async fn spawn_script(
         &self,
         script: &str,
@@ -169,62 +172,27 @@ impl SshLink {
         }
         input.push(b'\n');
         input.extend(script.as_bytes());
-        let (reply, ran) = oneshot::channel();
         let link = self.clone();
-        io().spawn(async move {
-            let _ = reply.send(link.run(input, deadline).await);
-        });
-        ran.await.map_err(|_| DaemonError::Closed)?
+        on_io(async move { link.run(&input, deadline).await }).await?
     }
 
-    async fn run(
-        &self,
-        input: Vec<u8>,
-        deadline: Option<Duration>,
-    ) -> Result<Vec<u8>, DaemonError> {
+    async fn run(&self, input: &[u8], deadline: Option<Duration>) -> Result<Vec<u8>, DaemonError> {
         let host = &self.target.host;
-        let alive = self
-            .command()
-            .args(["-O", "check", host])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|error| self.cannot_run(&error))?
-            .success();
-        if !alive {
+        if !self.master_alive().await? {
             return Err(DaemonError::Unreachable(format!(
                 "no ssh connection to {host}"
             )));
         }
-        let mut child = self
-            .multiplexed()
-            .args(["-T", "-o", "ForwardAgent=no", "-o", "ForwardX11=no"])
-            .args(["-o", "ClearAllForwardings=yes", host, "sh", "-s"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| self.cannot_run(&error))?;
-        let mut stdin = child.stdin.take().expect("ssh's stdin is piped");
-        // A failed write means ssh exited, and its stderr says why.
-        let _ = stdin.write_all(&input).await;
-        drop(stdin);
-        let finished = child.wait_with_output();
+        let ran = self.sh(input);
         let output = match deadline {
-            Some(deadline) => tokio::time::timeout(deadline, finished)
-                .await
-                .map_err(|_| {
-                    DaemonError::Unreachable(format!(
-                        "a script on {host} ran past {} s",
-                        deadline.as_secs()
-                    ))
-                })?,
-            None => finished.await,
-        }
-        .map_err(|error| self.cannot_run(&error))?;
+            Some(deadline) => tokio::time::timeout(deadline, ran).await.map_err(|_| {
+                DaemonError::Unreachable(format!(
+                    "a script on {host} ran past {} s",
+                    deadline.as_secs()
+                ))
+            })?,
+            None => ran.await,
+        }?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
@@ -241,50 +209,96 @@ impl SshLink {
     /// a terminal emulator to run under a pseudo-terminal here. Like
     /// [`Self::run_script`], it rides the master the daemon connection
     /// opened, and fails rather than connect again.
+    ///
+    /// sshd hands the command line, `cd -- 'dir' && exec "$SHELL" -l`, to
+    /// the user's login shell to parse, so this assumes a POSIX one, such
+    /// as sh, bash or zsh, unlike [`setup_script`], which `sh` reads. fish
+    /// reads `\\` and `\'` inside single quotes, so there a `dir` holding a
+    /// backslash goes wrong.
     pub fn terminal_command(&self, dir: &Path) -> (PathBuf, Vec<OsString>) {
         let mut remote = b"cd -- ".to_vec();
         remote.extend(quote_bytes(&platform::path_to_bytes(dir.as_os_str())));
         remote.extend(br#" && exec "$SHELL" -l"#);
-        let args = [
-            format!("ControlPath={}", self.control.display()),
-            "BatchMode=yes".to_owned(),
-            "ControlMaster=no".to_owned(),
-            "ProxyCommand=false".to_owned(),
-            "ForwardAgent=no".to_owned(),
-            "ForwardX11=no".to_owned(),
-        ]
-        .into_iter()
-        .flat_map(|option| [OsString::from("-o"), option.into()])
-        .chain(["-tt".into(), self.target.host.clone().into()])
-        .chain([platform::path_from_bytes(&remote).into_os_string()])
-        .collect();
+        let mut args = self.session_options();
+        args.extend([
+            "-tt".into(),
+            self.target.host.clone().into(),
+            platform::path_from_bytes(&remote).into_os_string(),
+        ]);
         (self.target.ssh.clone(), args)
     }
 
-    /// `ssh` with the options every call takes. `BatchMode`: the app has
-    /// no terminal to type a password or accept a host key in. An agent
-    /// still signs, and an unknown host key fails at once with ssh's
-    /// message, which the user sees.
+    /// `ssh` with the options every call takes.
     fn command(&self) -> Command {
         let mut command = Command::new(&self.target.ssh);
-        command
-            .arg("-o")
-            .arg(format!("ControlPath={}", self.control.display()))
-            .args(["-o", "BatchMode=yes"]);
+        command.args(self.options(&[]));
         command
     }
 
-    /// `ssh` that rides the master and never becomes one, nor connects on
-    /// its own. When the master refuses a session, as at sshd's
-    /// `MaxSessions` (10 by default), ssh would otherwise make a connection
-    /// of its own, which may ask the user's key agent for an approval and
-    /// counts against sshd's `MaxStartups`. `ProxyCommand=false` makes that
-    /// connection fail at once, before it reaches the network; the master
-    /// ignores it.
+    /// `ssh` that rides the master, with [`MULTIPLEXED`].
     fn multiplexed(&self) -> Command {
-        let mut command = self.command();
-        command.args(["-o", "ControlMaster=no", "-o", "ProxyCommand=false"]);
+        let mut command = Command::new(&self.target.ssh);
+        command.args(self.options(&MULTIPLEXED));
         command
+    }
+
+    /// The `-o` options of a session on the machine, a script's or a
+    /// terminal's: it rides the master ([`MULTIPLEXED`]) and forwards
+    /// neither the user's key agent nor X11.
+    fn session_options(&self) -> Vec<OsString> {
+        self.options(&[MULTIPLEXED.as_slice(), NO_FORWARDING.as_slice()].concat())
+    }
+
+    /// The `-o` options every call takes, then `extra`'s. `BatchMode`: the
+    /// app has no terminal to type a password or accept a host key in. An
+    /// agent still signs, and an unknown host key fails at once with ssh's
+    /// message, which the user sees.
+    fn options(&self, extra: &[&str]) -> Vec<OsString> {
+        let control = format!("ControlPath={}", self.control.display());
+        [control.as_str(), "BatchMode=yes"]
+            .iter()
+            .chain(extra)
+            .flat_map(|&option| [OsString::from("-o"), OsString::from(option)])
+            .collect()
+    }
+
+    /// Whether the host's master runs, as `ssh -O check` finds it.
+    async fn master_alive(&self) -> Result<bool, DaemonError> {
+        let host = &self.target.host;
+        let status = self
+            .command()
+            .args(["-O", "check", host])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|error| self.cannot_run(&error))?;
+        Ok(status.success())
+    }
+
+    /// Runs `sh -s` on the machine through the master, feeds it `input`,
+    /// and waits for it to exit. Dropping the future kills ssh, so a
+    /// deadline around this covers writing the input too.
+    async fn sh(&self, input: &[u8]) -> Result<Output, DaemonError> {
+        let host = &self.target.host;
+        let mut child = Command::new(&self.target.ssh)
+            .args(self.session_options())
+            .args(["-T", "-o", "ClearAllForwardings=yes", host, "sh", "-s"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| self.cannot_run(&error))?;
+        let mut stdin = child.stdin.take().expect("ssh's stdin is piped");
+        // A failed write means ssh exited, and its stderr says why.
+        let _ = stdin.write_all(input).await;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .map_err(|error| self.cannot_run(&error))
     }
 
     fn cannot_run(&self, error: &io::Error) -> DaemonError {
@@ -309,17 +323,7 @@ impl SshLink {
         let lock = master_lock(&self.control);
         let _one_at_a_time = lock.lock().await;
         let host = &self.target.host;
-        let alive = self
-            .command()
-            .args(["-O", "check", host])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|error| self.cannot_run(&error))?
-            .success();
-        if alive {
+        if self.master_alive().await? {
             return Ok(());
         }
         // A master that died without cleanup leaves its socket, which
@@ -367,6 +371,10 @@ impl SshLink {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
+            // A connection given up while ssh still signs in stops it, so
+            // its master can't race the next attempt's for the socket. Once
+            // signed in, ssh has forked the master and exited.
+            .kill_on_drop(true)
             .status()
             .await
             .map_err(|error| self.cannot_run(&error));
@@ -391,23 +399,8 @@ impl SshLink {
     /// Runs [`setup_script`] on the host and reads what it reports.
     async fn setup(&self) -> Result<Setup, DaemonError> {
         let host = &self.target.host;
-        let mut child = self
-            .multiplexed()
-            .args(["-T", "-o", "ForwardAgent=no", "-o", "ForwardX11=no"])
-            .args(["-o", "ClearAllForwardings=yes", host, "sh", "-s"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| self.cannot_run(&error))?;
-        let mut stdin = child.stdin.take().expect("ssh's stdin is piped");
-        // A failed write means ssh exited, and its stderr says why.
-        let _ = stdin
-            .write_all(setup_script(&self.target.rho).as_bytes())
-            .await;
-        drop(stdin);
-        let output = tokio::time::timeout(SETUP_DEADLINE, child.wait_with_output())
+        let script = setup_script(&self.target.rho);
+        let output = tokio::time::timeout(SETUP_DEADLINE, self.sh(script.as_bytes()))
             .await
             .map_err(|_| {
                 DaemonError::Unreachable(format!(
@@ -415,8 +408,7 @@ impl SshLink {
                      there starts without waiting for input",
                     SETUP_DEADLINE.as_secs()
                 ))
-            })?
-            .map_err(|error| self.cannot_run(&error))?;
+            })??;
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
             let said = or_status(stderr.trim(), output.status);
@@ -435,8 +427,9 @@ impl SshLink {
     }
 
     /// Forwards stdio to `socket` on the host with `ssh -W`, and completes
-    /// the handshake over it. The ssh process lives as long as the
-    /// connection: dropping the client closes its stdin, and it exits.
+    /// the handshake over it within [`HANDSHAKE_DEADLINE`]. The ssh process
+    /// lives as long as the connection: dropping the client closes its
+    /// stdin, and it exits. Dropping the future before then kills it.
     async fn bridge(
         &self,
         socket: &Path,
@@ -451,13 +444,23 @@ impl SshLink {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|error| self.cannot_run(&error))?;
         let stdin = child.stdin.take().expect("ssh's stdin is piped");
         let stdout = child.stdout.take().expect("ssh's stdout is piped");
         let stderr = child.stderr.take().expect("ssh's stderr is piped");
         let said = tokio::spawn(read_stderr(stderr));
-        match Client::handshake(tokio::io::join(stdout, stdin), hello).await {
+        let handshake = Client::handshake(tokio::io::join(stdout, stdin), hello);
+        let Ok(handshake) = tokio::time::timeout(HANDSHAKE_DEADLINE, handshake).await else {
+            let _ = child.kill().await;
+            return Err(DaemonError::Unreachable(format!(
+                "the Rho daemon on {host} at {} didn't answer the handshake within {} s",
+                socket.display(),
+                HANDSHAKE_DEADLINE.as_secs()
+            )));
+        };
+        match handshake {
             Ok(connected) => {
                 tokio::spawn(async move {
                     // Reaps ssh once the connection ends.
@@ -503,16 +506,41 @@ fn or_status(said: &str, status: std::process::ExitStatus) -> String {
 const STDERR_KEPT: usize = 4096;
 
 /// Reads ssh's stderr to its end, keeping the first [`STDERR_KEPT`] bytes
-/// and dropping the rest, so ssh never blocks on a full pipe.
+/// and dropping the rest, so ssh never blocks on a full pipe. When it
+/// drops some, the text ends saying how much ssh wrote.
 async fn read_stderr(mut stderr: ChildStderr) -> String {
     let mut kept = Vec::new();
+    let mut dropped = 0;
     let mut buffer = [0; 1024];
     while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
-        let room = STDERR_KEPT.saturating_sub(kept.len());
-        kept.extend_from_slice(&buffer[..read.min(room)]);
+        let keep = read.min(STDERR_KEPT.saturating_sub(kept.len()));
+        kept.extend_from_slice(&buffer[..keep]);
+        dropped += read - keep;
     }
-    String::from_utf8_lossy(&kept).trim().to_owned()
+    let said = String::from_utf8_lossy(&kept);
+    let said = said.trim();
+    if dropped == 0 {
+        said.to_owned()
+    } else {
+        format!(
+            "{said} [ssh wrote {} bytes; this shows the first {STDERR_KEPT}]",
+            kept.len() + dropped
+        )
+    }
 }
+
+/// The `-o` options of an ssh that rides the master and never becomes one,
+/// nor connects on its own. When the master refuses a session, as at
+/// sshd's `MaxSessions` (10 by default), ssh would otherwise make a
+/// connection of its own, which may ask the user's key agent for an
+/// approval and counts against sshd's `MaxStartups`. `ProxyCommand=false`
+/// makes that connection fail at once, before it reaches the network; the
+/// master ignores it.
+const MULTIPLEXED: [&str; 2] = ["ControlMaster=no", "ProxyCommand=false"];
+
+/// The `-o` options that keep a session on the machine from forwarding the
+/// user's key agent or X11 to it.
+const NO_FORWARDING: [&str; 2] = ["ForwardAgent=no", "ForwardX11=no"];
 
 /// What ssh adds to the control path while it binds the master's socket:
 /// a dot and 16 random letters (`muxserver_listen` in OpenSSH's mux.c).
@@ -712,24 +740,7 @@ mod tests {
     use std::{os::unix::ffi::OsStrExt as _, process::Command};
 
     use super::*;
-
-    /// Writes the program `text` to `path`, runnable, from a child process. A
-    /// handle written through here would leak into the processes other tests
-    /// spawn meanwhile, until they exec, and running the file then fails with
-    /// "Text file busy" (ETXTBSY).
-    fn write_program(path: &Path, text: &str) {
-        let status = Command::new("sh")
-            .args([
-                "-c",
-                r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#,
-                "sh",
-                text,
-            ])
-            .arg(path)
-            .status()
-            .expect("sh runs");
-        assert!(status.success(), "writing {} failed", path.display());
-    }
+    use crate::fake_daemon::write_program;
 
     fn vars(environment: ClientEnvironment) -> Vec<(String, String)> {
         environment.into_iter().collect()

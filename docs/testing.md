@@ -17,9 +17,9 @@ To check rho-ui against a real daemon and model, install rho 3, sign it in, and 
 RHO_UI_LIVE_RHO=/path/to/rho cargo test -p rho-ui live_daemon -- --ignored --nocapture
 ```
 
-Set `RHO_UI_LIVE_ATTACH` to the ID of a session whose turn waits on an approval, such as one you started in rho's terminal UI, and the test also opens that session, answers the approval, and steers the turn. Give that turn a command that runs for several seconds, such as `sleep 8`, so the steer arrives while it runs. Use a `RHO_HOME` of its own to keep the run away from your sessions.
+Set `RHO_UI_LIVE_ATTACH` to the ID of a session whose turn waits on an approval, such as one you started in rho's terminal UI, and the test also opens that session, answers the approval, and steers the turn; without it, the test says it skipped that half. Give that turn a command that runs for several seconds, such as `sleep 8`, so the steer arrives while it runs. Use a `RHO_HOME` of its own to keep the run away from your sessions.
 
-`live_background` checks background work the same way: a turn starts two background processes and ends while they run, one is stopped from the list, and the other exits by itself; each time the daemon's own turn tells the model, and the test sends a message during one of those turns. It takes a few minutes:
+`live_background` checks background work the same way: a turn starts two background processes and ends while they run, one is stopped from the list, and the other exits by itself. The daemon's own turn tells the model of the stop, and the test sends a message during it; after the exit, the test prints the daemon's turns and its last reply for you to check. It takes a few minutes:
 
 ```bash
 RHO_UI_LIVE_RHO=/path/to/rho cargo test -p rho-ui live_background -- --ignored --nocapture

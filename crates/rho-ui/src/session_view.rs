@@ -1311,7 +1311,9 @@ fn held_summary(held: &Prompt) -> String {
 /// so the header matches the title rho lists for an untitled session.
 const PROMPT_TITLE_CHARS: usize = 80;
 
-/// The first prompt's text on one line, cut to [`PROMPT_TITLE_CHARS`].
+/// The first prompt's text on one line, cut to [`PROMPT_TITLE_CHARS`]. It
+/// runs on every daemon event, so it reads only as far into the prompt as
+/// the title needs: one character more tells whether to cut.
 fn first_prompt(session: &Session) -> Option<String> {
     let text = session.entries().iter().find_map(|entry| match entry {
         Entry::User(message) => Some(message.text()),
@@ -1319,14 +1321,22 @@ fn first_prompt(session: &Session) -> Option<String> {
             None
         }
     })?;
-    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut line: String = text
+        .split_whitespace()
+        .enumerate()
+        .flat_map(|(n, word)| (n > 0).then_some(' ').into_iter().chain(word.chars()))
+        .take(PROMPT_TITLE_CHARS + 1)
+        .collect();
     if line.is_empty() {
         return None;
     }
-    if line.chars().count() <= PROMPT_TITLE_CHARS {
-        return Some(line);
+    if line.chars().count() > PROMPT_TITLE_CHARS {
+        let end = line
+            .char_indices()
+            .nth(PROMPT_TITLE_CHARS - 1)
+            .map_or(line.len(), |(at, _)| at);
+        line.truncate(end);
+        line.push('…');
     }
-    let mut cut: String = line.chars().take(PROMPT_TITLE_CHARS - 1).collect();
-    cut.push('…');
-    Some(cut)
+    Some(line)
 }

@@ -312,25 +312,37 @@ impl Harness {
         what: &str,
         ready: impl Fn(&Window, &App, &RhoApp) -> bool,
     ) {
+        self.poll(
+            limit,
+            what,
+            |ui| {
+                ui.frame();
+                let app = ui.app.clone();
+                ui.cx
+                    .update_window(ui.window, |_, window, cx| ready(window, cx, app.read(cx)))
+                    .expect("window is open")
+            },
+            Self::labels_seen,
+        );
+    }
+
+    /// Tries `ready` until it holds, 5 ms apart; `ready` draws the frames
+    /// it needs. Past `limit`, panics naming `what`, with what `seen` says
+    /// is there instead and a screenshot.
+    fn poll(
+        &mut self,
+        limit: Duration,
+        what: &str,
+        mut ready: impl FnMut(&mut Self) -> bool,
+        seen: impl FnOnce(&mut Self) -> String,
+    ) {
         let deadline = Instant::now() + limit;
-        loop {
-            self.frame();
-            let app = self.app.clone();
-            let done = self
-                .cx
-                .update_window(self.window, |_, window, cx| ready(window, cx, app.read(cx)))
-                .expect("window is open");
-            if done {
-                return;
-            }
+        while !ready(self) {
             if Instant::now() >= deadline {
-                let seen = self
-                    .cx
-                    .update_window(self.window, |_, window, _| labels(window))
-                    .expect("window is open");
+                let seen = seen(self);
                 let shot = self.shot("timeout");
                 panic!(
-                    "timed out waiting for {what}; labelled elements: {seen:?}; screenshot: {}",
+                    "timed out waiting for {what}; {seen}; screenshot: {}",
                     shot.display()
                 );
             }
@@ -338,28 +350,34 @@ impl Harness {
         }
     }
 
+    /// Every accessibility label in the window, for [`Self::poll`]'s
+    /// failure message.
+    fn labels_seen(&mut self) -> String {
+        let seen = self
+            .cx
+            .update_window(self.window, |_, window, _| labels(window))
+            .expect("window is open");
+        format!("labelled elements: {seen:?}")
+    }
+
     /// Waits for the right panel's terminal to show `ready` lines.
     fn wait_for_terminal(&mut self, what: &str, ready: impl Fn(&[String]) -> bool) {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            self.frame();
-            let app = self.app.clone();
-            let lines = self.cx.update(|cx| {
+        let lines = |ui: &mut Self| {
+            let app = ui.app.clone();
+            ui.cx.update(|cx| {
                 let terminal = app.read(cx).terminal(cx)?;
                 Some(terminal.update(cx, |terminal, _| terminal.text()))
-            });
-            if lines.as_deref().is_some_and(&ready) {
-                return;
-            }
-            if Instant::now() >= deadline {
-                let shot = self.shot("timeout");
-                panic!(
-                    "timed out waiting for {what}; the terminal shows {lines:?}; screenshot: {}",
-                    shot.display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+            })
+        };
+        self.poll(
+            WAIT,
+            what,
+            |ui| {
+                ui.frame();
+                lines(ui).as_deref().is_some_and(&ready)
+            },
+            |ui| format!("the terminal shows {:?}", lines(ui)),
+        );
     }
 
     /// A harness named `name` whose session's terminal runs its shell
@@ -382,23 +400,16 @@ impl Harness {
     /// Waits for element `id` to be labelled `want`, moving the clock on
     /// for timers that poll, such as a terminal tab's program.
     fn wait_for_label(&mut self, id: &'static str, want: &str) {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            self.cx.advance_clock(PROGRAM_POLL);
-            self.frame();
-            let label = self.label(id);
-            if label.as_deref() == Some(want) {
-                return;
-            }
-            if Instant::now() >= deadline {
-                let shot = self.shot("timeout");
-                panic!(
-                    "timed out waiting for {id} to say {want:?}; it says {label:?}; screenshot: {}",
-                    shot.display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        self.poll(
+            WAIT,
+            &format!("{id} to say {want:?}"),
+            |ui| {
+                ui.cx.advance_clock(PROGRAM_POLL);
+                ui.frame();
+                ui.label(id).as_deref() == Some(want)
+            },
+            |ui| format!("it says {:?}", ui.label(id)),
+        );
     }
 
     /// The number of panes in the right panel's terminal tab on screen.
@@ -538,12 +549,15 @@ impl Harness {
 
     /// Waits for the fake daemon to be `ready`, as once it has a request.
     fn wait_for_daemon(&mut self, what: &str, ready: impl Fn(&FakeDaemon) -> bool) {
-        let deadline = Instant::now() + WAIT;
-        while !ready(self.fake()) {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            self.frame();
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        self.poll(
+            WAIT,
+            what,
+            |ui| {
+                ui.frame();
+                ready(ui.fake())
+            },
+            Self::labels_seen,
+        );
     }
 
     /// The accessibility label of element `id`, once it is drawn.
@@ -2137,17 +2151,23 @@ fn a_wheel_notch_glides() {
     assert_eq!(top(&mut ui), before, "the notch doesn't jump");
 
     // The glide runs on animation frames, which `wait_until` doesn't draw.
-    let deadline = Instant::now() + WAIT;
-    while top(&mut ui) == before {
-        assert!(Instant::now() < deadline, "the glide never scrolled");
-        ui.cx
-            .update_window(ui.window, |_, window, cx| {
-                window.simulate_next_frame(cx);
-                window.draw(cx).clear(cx);
-            })
-            .expect("window is open");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    ui.poll(
+        WAIT,
+        "the glide to scroll",
+        |ui| {
+            if top(ui) != before {
+                return true;
+            }
+            ui.cx
+                .update_window(ui.window, |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.draw(cx).clear(cx);
+                })
+                .expect("window is open");
+            false
+        },
+        |_| format!("the transcript stayed scrolled to {before:?}"),
+    );
 
     // A high-resolution wheel's eighth of a notch glides too, rather than
     // passing through as a touchpad would.
@@ -2459,6 +2479,44 @@ fn a_reply_draws_its_diagram_and_formula_in_the_theme() {
             );
             assert!(shown.height < shown.width / 4., "{shown:?}");
         });
+        // Drawn again in each theme: the formula's ink stands out from the
+        // background toward the theme's text color, which a drawing kept
+        // from the other theme's doesn't.
+        let (background, foreground) = ui
+            .cx
+            .update(|cx| (cx.theme().background.l, cx.theme().foreground.l));
+        let (shown, scale) = ui
+            .cx
+            .update_window(ui.window, |_, window, _| {
+                let shown = window.within(formula).find("picture").bounds();
+                (shown, f64::from(window.scale_factor()))
+            })
+            .expect("window is open");
+        let image = ui
+            .cx
+            .capture_screenshot(ui.window)
+            .expect("the window renders offscreen");
+        let span = |from: Pixels, to: Pixels| f64::from(from)..f64::from(to);
+        let (across, down) = (
+            span(shown.left(), shown.right()),
+            span(shown.top(), shown.bottom()),
+        );
+        let ink = image
+            .enumerate_pixels()
+            .filter(|(x, y, _)| {
+                across.contains(&(f64::from(*x) / scale)) && down.contains(&(f64::from(*y) / scale))
+            })
+            .map(|(_, _, pixel)| {
+                let [r, g, b, _] = pixel.0.map(|channel| f32::from(channel) / 255.);
+                let lightness = f32::midpoint(r.max(g).max(b), r.min(g).min(b));
+                (lightness - background) / (foreground - background)
+            })
+            .fold(0., f32::max);
+        assert!(
+            ink > 0.5,
+            "the formula is drawn in the {} theme's text color: its inkiest pixel is {ink} of the way from the background",
+            appearance.name()
+        );
         ui.shot(appearance.name());
     }
 }
@@ -3260,9 +3318,10 @@ fn terminal_tabs_split_and_name_their_programs() {
     assert_eq!(ui.terminal_panes(), 2);
 }
 
-/// A shell that exits closes its pane, as a terminal window closes, and
-/// the keyboard goes on to the pane left; the last pane's takes the tab
-/// with it.
+/// A shell that exits closes its pane, as a terminal window closes, even
+/// with a job it left in the background holding the pseudo-terminal open,
+/// and the keyboard goes on to the pane left; the last pane's takes the
+/// tab with it.
 #[test]
 fn a_shell_that_exits_closes_its_pane() {
     let mut ui = Harness::with_terminal("terminal-exit");
@@ -3271,8 +3330,10 @@ fn a_shell_that_exits_closes_its_pane() {
     ui.wait_for_terminal("the new pane's prompt", |lines| {
         lines.iter().any(|line| line.starts_with('$'))
     });
+    // The job outlasts `WAIT`, so a pane that waited for the end of the
+    // output would never close.
     ui.act(|window, cx| {
-        window.input("exit", cx);
+        window.input("sleep 60 & exit", cx);
         window.press("enter", cx);
     });
     ui.wait_until("the exited pane to close", |_, cx, app| {

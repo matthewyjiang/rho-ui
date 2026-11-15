@@ -17,7 +17,6 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
     input::{Editor, EditorState},
     list::ListItem,
@@ -31,6 +30,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window,
 };
 
+use super::message;
 use crate::{
     folders::{find, FileRead, Reader},
     machines::Place,
@@ -490,15 +490,6 @@ fn refresh_button(cx: &Context<'_, FilesSurface>) -> Button {
         .icon(IconName::RotateCw)
         .tooltip("Refresh")
         .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
-}
-
-/// A message in place of the files.
-fn message(text: impl Into<SharedString>, media: Option<AnyElement>) -> AnyElement {
-    let mut header = EmptyHeader::new().description(EmptyDescription::new().child(text.into()));
-    if let Some(media) = media {
-        header = header.media(EmptyMedia::new().child(media));
-    }
-    Empty::new().h_full().header(header).into_any_element()
 }
 
 impl Render for FilesSurface {

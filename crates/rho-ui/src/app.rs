@@ -34,7 +34,9 @@ use crate::{
     background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
-    machines::{Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey},
+    machines::{
+        Listing, Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey,
+    },
     projects::Projects,
     rho_settings::RhoSettings,
     right_panel::{
@@ -177,7 +179,11 @@ pub(crate) struct RhoApp {
     sidebar: Entity<SidebarView>,
     /// The panel at the right, laid out while [`PanelLayout`].
     panel: Entity<RightPanel>,
-    /// Sessions opened in this run. A handful at most, so lookups by ID scan.
+    /// Sessions opened in this run, with the subagents' opened under them.
+    /// Each stays open, and attached to its daemon, for the rest of the
+    /// run: nothing lets go of one that was only viewed. Only its deletion,
+    /// a reread, or the end of its connection drops it. Lookups by ID scan:
+    /// the list grows only as the user opens sessions by hand.
     sessions: Vec<OpenSession>,
     /// The draft on screen, if any, and those left with a message, the
     /// one left last at the end. An empty draft goes once it is left.
@@ -473,8 +479,15 @@ impl RhoApp {
                     }
                     // The event pump reports the connection's end.
                     Err(DaemonError::Closed) => return,
-                    // One refused listing is no reason to stop asking.
-                    Err(_) => {}
+                    // One refused listing is no reason to stop asking, but
+                    // the sidebar says why its activity is stale.
+                    Err(error) => {
+                        let shown =
+                            this.update(cx, |this, cx| this.jobs_failed(&machine, &error, cx));
+                        if shown.is_err() {
+                            return;
+                        }
+                    }
                 }
                 cx.background_executor().timer(JOB_POLL).await;
             }
@@ -519,8 +532,10 @@ impl RhoApp {
 
     /// Shows which sessions have work under way in `machine`'s daemon. A
     /// change is also when the saved list goes stale: a session another
-    /// client started appears, or one's turn ended.
+    /// client started appears, or one's turn ended. A listing also clears
+    /// why the last one was refused.
     fn set_jobs(&mut self, machine: &MachineId, jobs: &[Job], cx: &mut Context<'_, Self>) {
+        self.set_listing_error(machine, Listing::Jobs, None, cx);
         let Some(connection) = self.connection_mut(machine) else {
             return;
         };
@@ -537,6 +552,34 @@ impl RhoApp {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_jobs(machine, jobs, cx));
         self.refresh_sessions(machine, cx);
+    }
+
+    /// `machine`'s daemon refused to list its jobs, because of `error`. The
+    /// sidebar says so, as its rows' activity is stale until a listing
+    /// succeeds. Repeats of the same refusal change nothing.
+    fn jobs_failed(
+        &mut self,
+        machine: &MachineId,
+        error: &DaemonError,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.set_listing_error(machine, Listing::Jobs, Some(error.to_string().into()), cx);
+    }
+
+    /// Records why `machine`'s daemon refused `listing`, or with `None`
+    /// that it listed it, for the sidebar.
+    fn set_listing_error(
+        &self,
+        machine: &MachineId,
+        listing: Listing,
+        error: Option<SharedString>,
+        cx: &mut App,
+    ) {
+        self.machines.update(cx, |machines, cx| {
+            if machines.set_error(machine, listing, error) {
+                cx.notify();
+            }
+        });
     }
 
     /// Drops the views of `machine`'s open sessions, as the connection that
@@ -698,11 +741,7 @@ impl RhoApp {
                     }
                     Err(error) => Some(error.to_string().into()),
                 };
-                this.machines.update(cx, |machines, cx| {
-                    if machines.set_error(&id, error) {
-                        cx.notify();
-                    }
-                });
+                this.set_listing_error(&id, Listing::Sessions, error, cx);
             });
         });
         if let Some(connection) = self.connection_mut(machine) {
@@ -1101,6 +1140,7 @@ impl RhoApp {
     /// Deletes a saved session in its daemon, then drops it here.
     fn delete_session(&mut self, id: SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(daemon) = self.daemon(&id.machine).cloned() else {
+            self.not_connected(&id.machine, "Couldn't delete the session", window, cx);
             return;
         };
         // The daemon refuses to delete a session a client follows, so that
@@ -1128,7 +1168,8 @@ impl RhoApp {
 
     /// Saves `title` as session `id`'s title in its daemon, then reads the
     /// saved list again: it holds the new title, or on failure the old one,
-    /// which the sidebar showed before the rename.
+    /// which the sidebar showed before the rename. While the machine isn't
+    /// connected the user is told, and the sidebar keeps the old title.
     fn rename_session(
         &mut self,
         id: SessionKey,
@@ -1137,6 +1178,7 @@ impl RhoApp {
         cx: &mut Context<'_, Self>,
     ) {
         let Some(daemon) = self.daemon(&id.machine).cloned() else {
+            self.not_connected(&id.machine, "Couldn't rename the session", window, cx);
             return;
         };
         cx.spawn_in(window, async move |this, cx| {
@@ -1152,6 +1194,24 @@ impl RhoApp {
             });
         })
         .detach();
+    }
+
+    /// Tells the user that what `title` names needs `machine`'s daemon,
+    /// which isn't connected: its saved sessions stay listed after the
+    /// connection drops, and their rows still offer to open, rename and
+    /// delete them.
+    fn not_connected(
+        &self,
+        machine: &MachineId,
+        title: &'static str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let label = self.machines.read(cx).label(machine);
+        window.push_notification(
+            Notification::error(format!("Not connected to {label}")).title(title),
+            cx,
+        );
     }
 
     /// Drops the open session `id`, if any, with the subagents' sessions
@@ -1288,6 +1348,7 @@ impl RhoApp {
             None => {}
         }
         let Some(daemon) = self.daemon(&id.machine).cloned() else {
+            self.not_connected(&id.machine, "Couldn't open the session", window, cx);
             return;
         };
         // The session must exist before the attach: the conversation
@@ -1346,6 +1407,12 @@ impl RhoApp {
             None => {}
         }
         let Some(daemon) = self.daemon(&id.machine).cloned() else {
+            self.not_connected(
+                &id.machine,
+                "Couldn't open the subagent's session",
+                window,
+                cx,
+            );
             return;
         };
         // As for an attach, the session must exist before the observe.

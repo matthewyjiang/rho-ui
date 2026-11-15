@@ -154,6 +154,29 @@ pub fn questions() -> Vec<Question> {
     ]
 }
 
+/// Writes the program `text` to `path`, runnable, from a child process,
+/// for tests that stand in a fake `ssh` or `rho`. A handle written through
+/// this process would leak into the processes other tests spawn meanwhile,
+/// until they exec, and running the file then fails with "Text file busy"
+/// (ETXTBSY).
+///
+/// # Panics
+///
+/// If `sh` can't run or fails to write the file.
+pub fn write_program(path: &Path, text: &str) {
+    let status = std::process::Command::new("sh")
+        .args([
+            "-c",
+            r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#,
+            "sh",
+            text,
+        ])
+        .arg(path)
+        .status()
+        .expect("sh runs");
+    assert!(status.success(), "writing {} failed", path.display());
+}
+
 /// What the fake daemon holds when it starts.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Script {

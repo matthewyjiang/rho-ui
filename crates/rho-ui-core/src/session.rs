@@ -457,10 +457,8 @@ pub struct Session {
     /// The first entry changed by a removal since the last
     /// [`Self::take_removed`].
     removed: Option<usize>,
-    /// How many entries there were when the turn's latest provider request
-    /// went: what its response streams comes after them.
-    attempt: Option<usize>,
-    delay: Option<Delay>,
+    /// What the turn under way has shown so far, cleared when it ends.
+    turn: LiveTurn,
     state: RunState,
     usage: Option<Usage>,
     config: Vec<ConfigOption>,
@@ -491,13 +489,24 @@ pub struct Session {
     /// The turn that last ended, so [`Self::turn_began`] can tell an answer
     /// that arrives after its whole turn.
     ended_turn: Option<TurnId>,
-    /// A turn began live and nothing of it that [`opening`] reads has
-    /// arrived yet: its prompt opens it, or else an [`Entry::Wake`] does.
-    unopened_turn: bool,
     /// The directory the session works in, once attached. Diffs name their
     /// files relative to it.
     workspace: Option<PathBuf>,
     sync: Sync,
+}
+
+/// What [`Session`] follows of the turn under way, all of which goes when
+/// the turn ends.
+#[derive(Clone, Debug, Default)]
+struct LiveTurn {
+    /// The turn began live and nothing of it that [`opening`] reads has
+    /// arrived yet: its prompt opens it, or else an [`Entry::Wake`] does.
+    unopened: bool,
+    /// How many entries there were when the turn's latest provider request
+    /// went: what its response streams comes after them.
+    attempt: Option<usize>,
+    /// What holds up the turn's answer, if anything does.
+    delay: Option<Delay>,
 }
 
 /// How far the session's attachment has come.
@@ -523,8 +532,7 @@ impl Session {
             title: None,
             entries: Vec::new(),
             removed: None,
-            attempt: None,
-            delay: None,
+            turn: LiveTurn::default(),
             state: RunState::Idle,
             usage: None,
             config: Vec::new(),
@@ -539,7 +547,6 @@ impl Session {
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
             ended_turn: None,
-            unopened_turn: false,
             workspace: None,
             sync: Sync::Attaching(Vec::new()),
         }
@@ -681,7 +688,7 @@ impl Session {
 
     /// What holds up the running turn's answer, if anything does.
     pub fn delay(&self) -> Option<Delay> {
-        self.delay
+        self.turn.delay
     }
 
     /// The first index whose entry went or changed since the last call,
@@ -884,8 +891,8 @@ impl Session {
     fn apply_change(&mut self, event: SessionEvent) -> Option<usize> {
         self.open_turn(&event);
         // A retry says what the turn does until its next event.
-        if matches!(self.delay, Some(Delay::Retrying { .. })) {
-            self.delay = None;
+        if matches!(self.turn.delay, Some(Delay::Retrying { .. })) {
+            self.turn.delay = None;
         }
         match event {
             SessionEvent::UserMessage {
@@ -987,20 +994,20 @@ impl Session {
     /// up, a retry or a compaction.
     fn track_provider(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::ProviderRequest => self.attempt = Some(self.entries.len()),
+            SessionEvent::ProviderRequest => self.turn.attempt = Some(self.entries.len()),
             SessionEvent::ResponseDiscarded => self.discard_attempt(),
             // A wait read from history has passed already.
             SessionEvent::ProviderRetry {
                 reason,
                 retry_after_ms,
             } if !self.is_replaying() => {
-                self.delay = Some(Delay::Retrying {
+                self.turn.delay = Some(Delay::Retrying {
                     reason: retry_reason(reason),
                     until: retry_after_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
                 });
             }
             SessionEvent::Compaction { status, .. } => {
-                self.delay = match status {
+                self.turn.delay = match status {
                     CompactionStatus::Started { .. } => Some(Delay::Compacting),
                     _ => None,
                 };
@@ -1013,7 +1020,11 @@ impl Session {
     /// messages, thoughts, and tool calls that never ran. The retry
     /// streams new ones.
     fn discard_attempt(&mut self) {
-        let Some(start) = self.attempt.filter(|&start| start < self.entries.len()) else {
+        let Some(start) = self
+            .turn
+            .attempt
+            .filter(|&start| start < self.entries.len())
+        else {
             return;
         };
         let streamed = |entry: &Entry| match entry {
@@ -1075,7 +1086,7 @@ impl Session {
     /// [`opening`] reads: with an [`Entry::Wake`], unless it is the prompt.
     fn open_turn(&mut self, event: &SessionEvent) {
         if let Some(opening) = opening(event) {
-            if std::mem::take(&mut self.unopened_turn) && opening == Opening::Wake {
+            if std::mem::take(&mut self.turn.unopened) && opening == Opening::Wake {
                 self.entries.push(Entry::Wake);
             }
         }
@@ -1127,7 +1138,7 @@ impl Session {
                     self.early_steers.clear();
                     // A turn of the past, as an attach catches up, opens
                     // nothing here.
-                    self.unopened_turn = matches!(self.sync, Sync::Live);
+                    self.turn.unopened = matches!(self.sync, Sync::Live);
                 }
                 self.state = RunState::Running;
             }
@@ -1141,9 +1152,7 @@ impl Session {
                 if self.state.is_busy() =>
             {
                 self.state = RunState::Idle;
-                self.unopened_turn = false;
-                self.delay = None;
-                self.attempt = None;
+                self.turn = LiveTurn::default();
             }
             // Already settled, or a state a newer daemon added.
             _ => {}
@@ -1151,9 +1160,7 @@ impl Session {
     }
 
     fn end_turn(&mut self, outcome: TurnOutcome) {
-        self.unopened_turn = false;
-        self.delay = None;
-        self.attempt = None;
+        self.turn = LiveTurn::default();
         self.state = match outcome {
             TurnOutcome::Answered { stop, .. } => match stop {
                 AnswerStop::Refusal => RunState::Failed("the model refused".to_owned()),
@@ -1401,6 +1408,17 @@ fn tool_content(
     }
 }
 
+/// How long one tool-card diff may take. It runs on the UI thread, in
+/// [`Session::apply`] and again for each diff an attach replays, and Myers'
+/// diff can spin on two large texts that differ throughout. Past this,
+/// similar stops matching lines and shows what it has not matched as
+/// removed and added: a coarser patch, but still a correct one.
+/// Measured with similar 2.7.0 in a release build: an ordinary edit (20
+/// lines changed in 2,000) takes 0.45 ms and never comes near it, while a
+/// 5,000-line rewrite took 228 ms and a 20,000-line one 3.6 s without it,
+/// and about 52 ms with it.
+const DIFF_DEADLINE: Duration = Duration::from_millis(50);
+
 /// The change from `old` to `new` as a one-file patch in git format, which
 /// is what diff viewers read, naming the file `path`. No `old` is a new
 /// file; no `new`, a deleted one.
@@ -1410,7 +1428,9 @@ fn git_patch(path: &Path, old: Option<&str>, new: Option<&str>) -> String {
     let (before, after) = (format!("a/{name}"), format!("b/{name}"));
     let from = old.map_or("/dev/null", |_| before.as_str());
     let to = new.map_or("/dev/null", |_| after.as_str());
-    let diff = similar::TextDiff::from_lines(old.unwrap_or_default(), new.unwrap_or_default());
+    let diff = similar::TextDiff::configure()
+        .timeout(DIFF_DEADLINE)
+        .diff_lines(old.unwrap_or_default(), new.unwrap_or_default());
     let hunks = diff.unified_diff().header(from, to).to_string();
     format!("diff --git {before} {after}\n{hunks}")
 }

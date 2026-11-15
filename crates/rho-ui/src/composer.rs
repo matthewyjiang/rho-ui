@@ -57,8 +57,8 @@ pub(crate) struct ComposerState {
     /// Names the next attachment. Never reused, so a card keeps its
     /// identity as others come and go.
     next_id: u64,
-    /// Why the last attachment was refused, until it is dismissed, or the
-    /// next attachment or send.
+    /// Why the last attachments were refused, one line each, until it is
+    /// dismissed, or the next attachment or send.
     refusal: Option<SharedString>,
     /// The session's slash commands and skills, which the menu offers.
     commands: Vec<CommandInfo>,
@@ -214,12 +214,15 @@ impl ComposerState {
 
     /// Completes the name at the cursor to the menu's match `ix`.
     fn complete(&mut self, ix: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // `ix` comes from the menu as last drawn; the matches may have
+        // changed since.
         let Some(menu) = self.menu.take() else {
             return;
         };
-        let edit = menu
-            .completion
-            .edit(&self.input.read(cx).value(), &menu.matches[ix]);
+        let Some(choice) = menu.matches.get(ix) else {
+            return;
+        };
+        let edit = menu.completion.edit(&self.input.read(cx).value(), choice);
         self.input.update(cx, |input, cx| {
             input.set_selected_range(edit.range, cx);
             input.replace(edit.text, window, cx);
@@ -340,7 +343,7 @@ impl ComposerState {
     }
 
     /// Reads the files at `paths` off the UI thread, then attaches each, in
-    /// order. One that can't go is refused, saying why.
+    /// order. Those that can't go are refused, each saying why.
     fn attach_paths(paths: Vec<PathBuf>, cx: &mut Context<'_, Self>) {
         if paths.is_empty() {
             return;
@@ -349,22 +352,26 @@ impl ComposerState {
             paths
                 .into_iter()
                 .map(|path| {
-                    let attachment = attachments::read(&path);
-                    (path, attachment)
+                    let read = attachments::read(&path);
+                    (path, read)
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             let _ = this.update(cx, |this, cx| {
-                this.refusal = None;
-                for (path, attachment) in read {
-                    if let Err(why) = attachment.and_then(|attachment| this.add(attachment)) {
+                let refused: Vec<String> = read
+                    .into_iter()
+                    .filter_map(|(path, read)| {
+                        let added = read
+                            .and_then(|read| this.add(read.attachment, read.why_linked.as_deref()));
+                        let why = added.err()?;
                         let name = path.file_name().unwrap_or(path.as_os_str());
                         let name = name.to_string_lossy();
-                        this.refusal = Some(format!("Couldn't attach {name}: {why}.").into());
-                    }
-                }
+                        Some(format!("Couldn't attach {name}: {why}."))
+                    })
+                    .collect();
+                this.refusal = (!refused.is_empty()).then(|| refused.join("\n").into());
                 cx.notify();
             });
         })
@@ -382,7 +389,7 @@ impl ComposerState {
                     took = true;
                     self.refusal = None;
                     if let Err(why) = attachments::from_clipboard(image)
-                        .and_then(|image| self.add(Attachment::Image(image)))
+                        .and_then(|image| self.add(Attachment::Image(image), None))
                     {
                         self.refusal = Some(format!("Couldn't attach the image: {why}.").into());
                     }
@@ -401,18 +408,23 @@ impl ComposerState {
     }
 
     /// Adds `attachment` after the others, if one message can carry it with
-    /// them.
-    fn add(&mut self, attachment: Attachment) -> Result<(), String> {
+    /// them. `why_linked` says why a file goes by its path, for its chip,
+    /// or for the refusal when it can't go that way.
+    fn add(&mut self, attachment: Attachment, why_linked: Option<&str>) -> Result<(), String> {
         if let (Some(machine), true) = (&self.remote, by_path(&attachment)) {
+            let because = why_linked.map_or_default(|why| format!(" ({why})"));
             return Err(format!(
-                "it would go by its path, and Rho on {machine} can't read this machine's files"
+                "it would go by its path{because}, and Rho on {machine} can't read this machine's files"
             ));
         }
         let held = self.attachments.iter().map(|item| &item.attachment);
         check_attachment_total(held.chain([&attachment])).map_err(|error| error.to_string())?;
-        let item = self
+        let mut item = self
             .item(attachment)
             .ok_or("its data doesn't read as the image it starts as")?;
+        if let Some(why) = why_linked {
+            item.preview = item.preview.linked_because(why);
+        }
         self.attachments.push(item);
         Ok(())
     }

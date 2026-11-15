@@ -32,8 +32,8 @@ pub use options::{
     FAST_MODE_ID,
 };
 pub use prompt::{
-    check_attachment_total, AttachedFile, Attachment, AttachmentsTooLarge, Image, ImageFormat,
-    Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
+    check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
+    ImageFormat, Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 pub use session::{
     Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,

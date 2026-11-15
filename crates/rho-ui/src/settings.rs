@@ -4,7 +4,7 @@
 //! per line. The
 //! look applies to GPUI Kit's theme; the app follows the machines.
 
-use std::{fmt::Write as _, path::PathBuf};
+use std::{fmt::Write as _, io, path::PathBuf};
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{px, App, Global, SharedString, WindowAppearance};
@@ -149,23 +149,48 @@ impl Default for Settings {
 impl Global for Settings {}
 
 impl Settings {
-    /// Reads the settings file. Missing or unreadable values keep their
-    /// defaults.
+    /// Reads the settings file. A missing file, or a value it doesn't
+    /// understand, keeps the defaults. A file that exists but can't be read
+    /// keeps them too, and is never written over: changes then last only
+    /// until the app quits.
+    #[expect(
+        clippy::print_stderr,
+        reason = "rho-ui has no log; stderr reaches the terminal or the journal"
+    )]
     pub(crate) fn load() -> Self {
-        let file = platform::app_dir(AppDir::Config).map(|dir| dir.join("settings"));
-        let mut settings = file
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map_or_default(|text| parse(&text));
-        settings.file = file;
-        settings
+        let Some(path) = platform::app_dir(AppDir::Config).map(|dir| dir.join("settings")) else {
+            return Self::default();
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self {
+                file: Some(path),
+                ..parse(&text)
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self {
+                file: Some(path),
+                ..Self::default()
+            },
+            Err(error) => {
+                eprintln!(
+                    "rho-ui: couldn't read {}: {error}; using the defaults, and not saving over it",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
     }
 
-    /// Writes the settings file. Best effort: a failed write only loses the
-    /// change at the next start.
+    /// Writes the settings file. Best effort: a failed write says why on
+    /// stderr and only loses the change at the next start.
+    #[expect(
+        clippy::print_stderr,
+        reason = "rho-ui has no log; stderr reaches the terminal or the journal"
+    )]
     pub(crate) fn save(&self) {
         let Some(path) = &self.file else { return };
-        store::write_atomic(path, &self.to_text());
+        if let Err(error) = store::write_atomic(path, &self.to_text()) {
+            eprintln!("rho-ui: couldn't save {}: {error}", path.display());
+        }
     }
 
     /// The remote machine at `host`, if it is on the list.

@@ -13,9 +13,10 @@
 //! rho-protocol's `Client` reads and writes the socket in Tokio tasks, so
 //! this module keeps one small Tokio runtime for that I/O. Nothing else runs
 //! on it: every method here returns a plain future that any executor can
-//! await, and replies cross over on channels.
+//! await, and replies cross over on channels or task handles.
 
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, OnceLock},
@@ -32,7 +33,7 @@ use rho_protocol::{
     SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
     SessionUnsteerParams, SettingChange, TurnOutcome, UnsteerOutcome,
 };
-use tokio::{runtime::Runtime, sync::oneshot};
+use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
     agent_settings::{AgentSettings, AgentSettingsChanged},
@@ -470,12 +471,50 @@ pub(crate) fn io() -> &'static Runtime {
             .worker_threads(1)
             .thread_name("rho-ui-daemon-io")
             .enable_io()
-            // The deadline on a remote machine's setup; see `ssh.rs`.
+            // The handshake's deadline, and those on a remote machine's
+            // scripts; see `ssh.rs`.
             .enable_time()
             .build()
             .expect("the OS lets this process start a thread and an I/O driver")
     })
 }
+
+/// Runs `future` on the I/O runtime and waits for it. Dropping the future
+/// this returns stops the task, and drops what the task holds, such as a
+/// half-open connection or an ssh process (spawned `kill_on_drop`), so a
+/// caller that stops waiting leaves nothing running.
+///
+/// # Errors
+///
+/// [`DaemonError::Closed`] if the task panicked.
+pub(crate) async fn on_io<F>(future: F) -> Result<F::Output, DaemonError>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut task = AbortOnDrop(io().spawn(future));
+    (&mut task.0).await.map_err(|_| DaemonError::Closed)
+}
+
+/// A task on the I/O runtime that stops when this is dropped.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        // Does nothing to a task that has finished.
+        self.0.abort();
+    }
+}
+
+/// How long a daemon may take to answer the handshake once its socket
+/// connected, at a socket target or over `ssh -W`. A daemon that accepts
+/// and never answers would otherwise hold the connection attempt forever.
+/// The default local target has none: rho-protocol's `LocalDaemon` does
+/// that handshake itself, with no deadline, until rho-protocol adds one.
+/// The handshake is one round trip over a socket that already connected,
+/// so this is a tripwire, not a budget: it matches the ssh setup's
+/// deadline, which covers a whole login and `rho daemon start`.
+pub(crate) const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 
 async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonError> {
     let hello = ClientHello::frontend(ClientInfo {
@@ -497,7 +536,16 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
                         socket.display()
                     ))
                 })?;
-            let (client, notifications, hello) = Client::handshake(stream, hello).await?;
+            let (client, notifications, hello) =
+                tokio::time::timeout(HANDSHAKE_DEADLINE, Client::handshake(stream, hello))
+                    .await
+                    .map_err(|_| {
+                        DaemonError::Unreachable(format!(
+                            "the Rho daemon at {} didn't answer the handshake within {} s",
+                            socket.display(),
+                            HANDSHAKE_DEADLINE.as_secs()
+                        ))
+                    })??;
             (client, notifications, hello, Machine::this_process())
         }
         DaemonTarget::Ssh(target) => ssh::connect(&target, hello).await?,
@@ -543,21 +591,18 @@ fn session_setup() -> rho_protocol::SessionSetup {
 
 impl Daemon {
     /// Connects to the daemon, starting it first if `target` says how.
+    /// Dropping the future gives up the attempt: whatever it started to
+    /// reach the daemon, such as ssh, stops with it.
     ///
     /// # Errors
     ///
     /// Fails if no daemon runs and rho cannot be run or its daemon does not
     /// start, the socket refuses the connection, ssh cannot reach the
-    /// machine, or the daemon speaks another protocol version; the message
-    /// then says which side to update.
+    /// machine, the daemon doesn't answer the handshake in time, or it
+    /// speaks another protocol version; the message then says which side
+    /// to update.
     pub async fn connect(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonError> {
-        let (reply, opened) = oneshot::channel();
-        io().spawn(async move {
-            // The caller may have stopped waiting; the connection then
-            // closes as it drops here.
-            let _ = reply.send(open(target).await);
-        });
-        opened.await.map_err(|_| DaemonError::Closed)?
+        on_io(open(target)).await?
     }
 
     /// Who answered `rho/hello`.

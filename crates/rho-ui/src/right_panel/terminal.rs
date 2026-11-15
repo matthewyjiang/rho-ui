@@ -12,7 +12,12 @@
 //! own terminal, started the first time it is on screen there, and kept
 //! until the pane closes or its shell exits. When the shell of the session
 //! on screen exits, the pane closes ([`ShellExited`]), as a terminal
-//! window does.
+//! window does, though a job it left running in the background still
+//! holds the pseudo-terminal open.
+//!
+//! Threads of its own read the pseudo-terminal, write to it, and wait for
+//! the shell to exit, as each of those blocks; the UI thread only parses
+//! what was read and queues what to write.
 //!
 //! A tab is named for the program its shell runs now ([`TerminalView::program`]):
 //! the pseudo-terminal's foreground process on this machine, or the title
@@ -30,15 +35,20 @@ mod mouse;
 mod tab;
 
 use std::{
-    cell::RefCell,
-    io::{Read as _, Write},
+    io::{Read, Write},
     ops::Range,
     path::PathBuf,
-    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
-use futures::{channel::mpsc, StreamExt as _};
+use futures::{
+    channel::{mpsc, oneshot},
+    SinkExt as _, StreamExt as _,
+};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::Button,
@@ -66,7 +76,7 @@ use libghostty_vt::{
     terminal::ScrollViewport,
     RenderState, Terminal,
 };
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use rho_ui_core::platform;
 
 use self::mouse::{Mouse, Pressed, Released};
@@ -103,6 +113,17 @@ const HIDDEN_AFTER_TICKS: u8 = 8;
 
 /// Lines kept above the screen.
 const SCROLLBACK_LINES: usize = 10_000;
+
+/// The most bytes one read of the pseudo-terminal takes.
+const READ_BYTES: usize = 64 * 1024;
+
+/// The most reads of the program's output, each up to [`READ_BYTES`], that
+/// wait for the UI thread. Past it the reader thread waits, and so does a
+/// program printing faster than the screen takes it, as with any terminal.
+/// That holds about 1 MiB. The screen, not the queue, sets the pace: in
+/// a debug build 40 MB of `yes` took 9.6 s with a queue of 1, 9.3 s with
+/// 16 and 8.8 s with 64.
+const OUTPUT_QUEUE: usize = 16;
 
 /// How often a pane reads the program its terminal runs, as a new one
 /// may start without printing, as `sleep` does. A read of
@@ -306,18 +327,21 @@ impl Render for TerminalPane {
 
 /// One terminal: the shell under a pseudo-terminal, and libghostty-vt's
 /// screen of it. All on the UI thread, as libghostty's handles must stay on
-/// one; a thread of its own reads the pseudo-terminal.
+/// one; threads of their own read, write and wait for the shell.
 pub(crate) struct TerminalView {
     terminal: Terminal<'static, 'static>,
     render: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    keys: key::Encoder<'static>,
-    key: key::Event<'static>,
+    keys: Keys,
     pty: Box<dyn MasterPty + Send>,
-    /// Shared with the terminal's replies to the program's queries.
-    writer: Rc<RefCell<Box<dyn Write + Send>>>,
-    child: Box<dyn Child + Send + Sync>,
+    /// What the writer thread writes to the program, in order; the
+    /// terminal's replies to the program's queries go here too.
+    input: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Hangs up on the shell, if it hasn't exited, when the view goes.
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Whether the waiter thread saw the shell exit, and reaped it.
+    exited: Arc<AtomicBool>,
     /// Where [`Self::program`] reads the program's name.
     program_source: ProgramSource,
     mouse: Mouse,
@@ -339,6 +363,8 @@ pub(crate) struct TerminalView {
     focus: FocusHandle,
     /// Feeds the terminal what the reader thread reads; dropped with it.
     reader: Task<()>,
+    /// Tells the pane when the shell exits; dropped with the view.
+    waiter: Task<()>,
 }
 
 impl TerminalView {
@@ -360,38 +386,28 @@ impl TerminalView {
             .spawn_command(command)
             .map_err(|error| error.to_string())?;
         drop(pair.slave);
-        let mut reader = pair
+        let hang_up = HangUp(Some(child.clone_killer()));
+        let exited = Arc::new(AtomicBool::new(false));
+        let exit = wait_for(child, Arc::clone(&exited)).map_err(|error| error.to_string())?;
+        let reader = pair
             .master
             .try_clone_reader()
             .map_err(|error| error.to_string())?;
-        let writer: Rc<RefCell<Box<dyn Write + Send>>> = Rc::new(RefCell::new(
-            pair.master
-                .take_writer()
-                .map_err(|error| error.to_string())?,
-        ));
+        let mut output = read_from(reader).map_err(|error| error.to_string())?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| error.to_string())?;
+        let input = write_to(writer).map_err(|error| error.to_string())?;
         let mut terminal = Terminal::new(grid.0, grid.1).map_err(|error| error.to_string())?;
-        let replies = Rc::clone(&writer);
+        let replies = input.clone();
         terminal
             .set_scrollback_max_lines(Some(SCROLLBACK_LINES))
             .and_then(|terminal| terminal.set_terminfo_name(TERM))
             .and_then(|terminal| {
                 terminal.on_pty_write(move |_, data| {
-                    let _ = replies.borrow_mut().write_all(data);
+                    let _ = replies.send(data.to_vec());
                 })
-            })
-            .map_err(|error| error.to_string())?;
-
-        // Reads on a thread of its own, as the pseudo-terminal blocks.
-        let (sender, mut output) = mpsc::unbounded::<Vec<u8>>();
-        std::thread::Builder::new()
-            .name("rho-ui-terminal".into())
-            .spawn(move || {
-                let mut buffer = vec![0; 64 * 1024];
-                while let Ok(read @ 1..) = reader.read(&mut buffer) {
-                    if sender.unbounded_send(buffer[..read].to_vec()).is_err() {
-                        return;
-                    }
-                }
             })
             .map_err(|error| error.to_string())?;
 
@@ -401,11 +417,10 @@ impl TerminalView {
             render: RenderState::new().map_err(ghostty)?,
             rows: RowIterator::new().map_err(ghostty)?,
             cells: CellIterator::new().map_err(ghostty)?,
-            keys: key::Encoder::new().map_err(ghostty)?,
-            key: key::Event::new().map_err(ghostty)?,
+            keys: Keys::new().map_err(ghostty)?,
             pty: pair.master,
-            writer,
-            child,
+            input,
+            exited,
             program_source,
             mouse: Mouse::new().map_err(ghostty)?,
             layout: None,
@@ -417,14 +432,21 @@ impl TerminalView {
             undrawn_ticks: 0,
             focus: cx.focus_handle(),
             reader: Task::ready(()),
+            waiter: Task::ready(()),
+            // Last, after every step that can fail.
+            killer: hang_up.disarm(),
         };
         let view = cx.new(|_| view);
         let read = cx.spawn({
             let view = view.downgrade();
-            async move |pane, cx| {
+            async move |_, cx| {
                 while let Some(mut bytes) = output.next().await {
-                    // Everything already read, in one write and one frame.
-                    while let Ok(more) = output.try_recv() {
+                    // What was queued, in one write and one frame; no more,
+                    // as the reader thread refills the queue meanwhile.
+                    for _ in 0..OUTPUT_QUEUE {
+                        let Ok(more) = output.try_recv() else {
+                            break;
+                        };
                         bytes.extend(more);
                     }
                     let wrote = view.update(cx, |view, cx| {
@@ -435,11 +457,22 @@ impl TerminalView {
                         return;
                     }
                 }
-                let _ = view.update(cx, |view, _| view.child.try_wait());
-                let _ = pane.update(cx, |pane, cx| pane.shell_exited(view.entity_id(), cx));
             }
         });
-        view.update(cx, |view, _| view.reader = read);
+        // The shell exiting closes the pane, not the end of its output: a
+        // job it left in the background may keep the pseudo-terminal open.
+        let wait = cx.spawn({
+            let view = view.downgrade();
+            async move |pane, cx| {
+                if exit.await.is_ok() {
+                    let _ = pane.update(cx, |pane, cx| pane.shell_exited(view.entity_id(), cx));
+                }
+            }
+        });
+        view.update(cx, |view, _| {
+            view.reader = read;
+            view.waiter = wait;
+        });
         Ok(view)
     }
 
@@ -458,15 +491,15 @@ impl TerminalView {
         foreground.or_else(title).map(SharedString::from)
     }
 
-    /// Writes `bytes` to the program.
-    fn write(&self, bytes: &[u8]) {
+    /// Queues `bytes` for the writer thread to write to the program.
+    fn write(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            let _ = self.writer.borrow_mut().write_all(bytes);
+            let _ = self.input.send(bytes);
         }
     }
 
     /// Writes what a key, a paste or an input method types.
-    fn send(&mut self, bytes: &[u8]) {
+    fn send(&mut self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
@@ -492,43 +525,19 @@ impl TerminalView {
 
     fn key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<'_, Self>) {
         let keystroke = &event.keystroke;
-        let modifiers = keystroke.modifiers;
         if keystroke.key_char.is_some() {
             // A dead key's accent, composed by the platform rather than an
             // input method, ends with a keystroke typing the letter: as the
             // platform would, that replaces the accent shown.
             self.marked = None;
         }
-        let (key, unshifted) = key_of(&keystroke.key);
-        let text = typed(keystroke);
-        let consumed = if text.is_some() && modifiers.shift {
-            key::Mods::SHIFT
+        let action = if event.is_held {
+            key::Action::Repeat
         } else {
-            key::Mods::empty()
+            key::Action::Press
         };
-        self.key
-            .set_action(if event.is_held {
-                key::Action::Repeat
-            } else {
-                key::Action::Press
-            })
-            .set_key(key)
-            .set_mods(mods(modifiers))
-            .set_consumed_mods(consumed)
-            .set_unshifted_codepoint(unshifted)
-            .set_utf8(text.as_deref());
-        let mut bytes = Vec::new();
-        let encoded = self
-            .keys
-            .set_options_from_terminal(&self.terminal)
-            .encode_to_vec(&self.key, &mut bytes);
-        if encoded.is_err() || bytes.is_empty() {
-            // A key libghostty doesn't know still types its text.
-            if let Some(text) = text.filter(|_| !modifiers.control && !modifiers.alt) {
-                bytes = text.into_bytes();
-            }
-        }
-        self.send(&bytes);
+        let bytes = self.keys.encode(&self.terminal, keystroke, action);
+        self.send(bytes);
         cx.stop_propagation();
         cx.notify();
     }
@@ -554,7 +563,7 @@ impl TerminalView {
         let mut buffer = vec![0; data.len() + 16];
         if let Ok(written) = paste::encode(&mut data, bracketed, &mut buffer) {
             buffer.truncate(written);
-            self.send(&buffer);
+            self.send(buffer);
         }
     }
 
@@ -577,7 +586,7 @@ impl TerminalView {
             .layout
             .and_then(|grid| self.mouse.wheel(&self.terminal, &grid, lines, at));
         if let Some(bytes) = report {
-            self.write(&bytes);
+            self.write(bytes);
         } else {
             self.terminal.scroll_viewport(ScrollViewport::Delta(
                 isize::try_from(-lines).unwrap_or_default(),
@@ -599,7 +608,7 @@ impl TerminalView {
         match self.mouse.down(&self.terminal, &grid, event) {
             Pressed::Nothing => {}
             Pressed::Report(bytes) => {
-                self.write(&bytes);
+                self.write(bytes);
                 // The program's, not the pane's menu.
                 cx.stop_propagation();
             }
@@ -620,7 +629,7 @@ impl TerminalView {
         };
         let held = self.mouse.is_held();
         let bytes = self.mouse.moved(&self.terminal, &grid, event);
-        self.write(&bytes);
+        self.write(bytes);
         if held {
             self.follow_autoscroll(cx);
             cx.notify();
@@ -670,7 +679,7 @@ impl TerminalView {
         };
         match self.mouse.up(&self.terminal, &grid, event) {
             Released::Nothing => return,
-            Released::Report(bytes) => self.write(&bytes),
+            Released::Report(bytes) => self.write(bytes),
             Released::Selection => {
                 if let Some(text) = self.selected_text() {
                     write_primary(text, cx);
@@ -826,8 +835,143 @@ impl TerminalView {
 }
 
 impl Drop for TerminalView {
+    /// Hangs up on a shell still running, once and without waiting, which
+    /// ends the shells rho-ui starts. One known to have exited is left
+    /// alone: the waiter thread reaped it, so its process ID may be
+    /// another process's by now.
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if !self.exited.load(Ordering::Acquire) {
+            let _ = self.killer.kill();
+        }
+    }
+}
+
+/// Hangs up on a shell whose view couldn't be made, so a step failing
+/// after it started doesn't leave it running, with the threads that read
+/// and wait on it. [`Self::disarm`] hands the killer to the view instead.
+struct HangUp(Option<Box<dyn ChildKiller + Send + Sync>>);
+
+impl HangUp {
+    fn disarm(mut self) -> Box<dyn ChildKiller + Send + Sync> {
+        self.0.take().expect("a HangUp is armed until disarmed")
+    }
+}
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        if let Some(killer) = &mut self.0 {
+            let _ = killer.kill();
+        }
+    }
+}
+
+/// Reads what the program prints on a thread of its own, as a read
+/// blocks. The thread waits while [`OUTPUT_QUEUE`] reads are queued, and
+/// ends at the end of the output or when the receiver is dropped.
+fn read_from(mut reader: Box<dyn Read + Send>) -> std::io::Result<mpsc::Receiver<Vec<u8>>> {
+    let (mut sender, output) = mpsc::channel::<Vec<u8>>(OUTPUT_QUEUE);
+    std::thread::Builder::new()
+        .name("rho-ui-terminal-read".into())
+        .spawn(move || {
+            let mut buffer = vec![0; READ_BYTES];
+            while let Ok(read @ 1..) = reader.read(&mut buffer) {
+                let chunk = buffer[..read].to_vec();
+                if futures::executor::block_on(sender.send(chunk)).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(output)
+}
+
+/// Writes to the program, in order, what is sent on the returned sender,
+/// on a thread of its own, as a write blocks while the program doesn't
+/// read. The thread ends when every sender is dropped, or the program is
+/// gone.
+fn write_to(
+    mut writer: Box<dyn Write + Send>,
+) -> std::io::Result<std::sync::mpsc::Sender<Vec<u8>>> {
+    let (input, queued) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name("rho-ui-terminal-write".into())
+        .spawn(move || {
+            for bytes in queued {
+                if writer.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(input)
+}
+
+/// Waits for `child` to exit on a thread of its own, and reaps it: sets
+/// `exited`, then completes the returned receiver.
+fn wait_for(
+    mut child: Box<dyn Child + Send + Sync>,
+    exited: Arc<AtomicBool>,
+) -> std::io::Result<oneshot::Receiver<()>> {
+    let (done, exit) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("rho-ui-terminal-wait".into())
+        .spawn(move || {
+            // An error means there is no child left to wait for.
+            let _ = child.wait();
+            exited.store(true, Ordering::Release);
+            let _ = done.send(());
+        })?;
+    Ok(exit)
+}
+
+/// libghostty's key encoder and the event it encodes, kept for the next
+/// key.
+struct Keys {
+    encoder: key::Encoder<'static>,
+    event: key::Event<'static>,
+}
+
+impl Keys {
+    fn new() -> Result<Self, libghostty_vt::Error> {
+        Ok(Self {
+            encoder: key::Encoder::new()?,
+            event: key::Event::new()?,
+        })
+    }
+
+    /// The bytes `keystroke` sends the program, encoded as the program in
+    /// `terminal` asked. Shift that typed the text counts as consumed, and
+    /// a key libghostty doesn't know still types its text.
+    fn encode(
+        &mut self,
+        terminal: &Terminal<'_, '_>,
+        keystroke: &Keystroke,
+        action: key::Action,
+    ) -> Vec<u8> {
+        let modifiers = keystroke.modifiers;
+        let (key, unshifted) = key_of(&keystroke.key);
+        let text = typed(keystroke);
+        let consumed = if text.is_some() && modifiers.shift {
+            key::Mods::SHIFT
+        } else {
+            key::Mods::empty()
+        };
+        self.event
+            .set_action(action)
+            .set_key(key)
+            .set_mods(mods(modifiers))
+            .set_consumed_mods(consumed)
+            .set_unshifted_codepoint(unshifted)
+            .set_utf8(text.as_deref());
+        let mut bytes = Vec::new();
+        let encoded = self
+            .encoder
+            .set_options_from_terminal(terminal)
+            .encode_to_vec(&self.event, &mut bytes);
+        if encoded.is_err() || bytes.is_empty() {
+            if let Some(text) = text.filter(|_| !modifiers.control && !modifiers.alt) {
+                bytes = text.into_bytes();
+            }
+        }
+        bytes
     }
 }
 
@@ -882,7 +1026,7 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<'_, Self>,
     ) {
         self.marked = None;
-        self.send(text.as_bytes());
+        self.send(text.as_bytes().to_vec());
         cx.notify();
     }
 
@@ -1349,41 +1493,29 @@ mod tests {
 
     /// Keys reach libghostty as the program expects them: control
     /// characters for Ctrl+letters and Enter, escape sequences for arrows,
-    /// and text for what has no key of its own.
+    /// and text for what has no key of its own. Through [`Keys::encode`],
+    /// as [`TerminalView::key_down`] sends them.
     #[test]
     fn keys_encode_as_a_terminal_sends_them() {
         let terminal = Terminal::new(80, 24).unwrap();
-        let mut encoder = key::Encoder::new().unwrap();
-        let mut event = key::Event::new().unwrap();
-        let mut encode = |name: &str, mods: key::Mods| {
-            let (key, unshifted) = key_of(name);
+        let mut keys = Keys::new().unwrap();
+        let ctrl = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let mut encode = |name: &str, modifiers: Modifiers| {
             let keystroke = Keystroke {
-                modifiers: gpui_kit::Modifiers {
-                    control: mods.contains(key::Mods::CTRL),
-                    ..Default::default()
-                },
+                modifiers,
                 key: name.to_owned(),
                 key_char: None,
             };
-            let text = typed(&keystroke);
-            event
-                .set_action(key::Action::Press)
-                .set_key(key)
-                .set_mods(mods)
-                .set_consumed_mods(key::Mods::empty())
-                .set_unshifted_codepoint(unshifted)
-                .set_utf8(text.as_deref());
-            let mut bytes = Vec::new();
-            encoder
-                .set_options_from_terminal(&terminal)
-                .encode_to_vec(&event, &mut bytes)
-                .unwrap();
-            bytes
+            keys.encode(&terminal, &keystroke, key::Action::Press)
         };
-        assert_eq!(encode("a", key::Mods::empty()), b"a");
-        assert_eq!(encode("c", key::Mods::CTRL), [0x03]);
-        assert_eq!(encode("enter", key::Mods::empty()), b"\r");
-        assert_eq!(encode("up", key::Mods::empty()), b"\x1b[A");
-        assert_eq!(encode("space", key::Mods::empty()), b" ");
+        let none = Modifiers::default();
+        assert_eq!(encode("a", none), b"a");
+        assert_eq!(encode("c", ctrl), [0x03]);
+        assert_eq!(encode("enter", none), b"\r");
+        assert_eq!(encode("up", none), b"\x1b[A");
+        assert_eq!(encode("space", none), b" ");
     }
 }

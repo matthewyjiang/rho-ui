@@ -30,7 +30,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    empty::{Empty, EmptyDescription, EmptyHeader},
+    empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
     list::ListItem,
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
@@ -821,7 +821,7 @@ impl RightPanel {
         match tab {
             Tab::Background => match &self.session {
                 Some((view, _)) => SessionView::background_surface(view, cx).into_any_element(),
-                None => no_session("Open a session to see its background work."),
+                None => message("Open a session to see its background work.", None),
             },
             Tab::Diff(diff) => diff.clone().into_any_element(),
             Tab::Files(files) => files.clone().into_any_element(),
@@ -830,12 +830,14 @@ impl RightPanel {
     }
 }
 
-/// A surface's place when it needs a session and none is on screen.
-fn no_session(text: &'static str) -> AnyElement {
-    Empty::new()
-        .h_full()
-        .header(EmptyHeader::new().description(EmptyDescription::new().child(text)))
-        .into_any_element()
+/// A message in place of a surface's content, such as why it has none,
+/// over `media` such as a spinner.
+fn message(text: impl Into<SharedString>, media: Option<AnyElement>) -> AnyElement {
+    let mut header = EmptyHeader::new().description(EmptyDescription::new().child(text.into()));
+    if let Some(media) = media {
+        header = header.media(EmptyMedia::new().child(media));
+    }
+    Empty::new().h_full().header(header).into_any_element()
 }
 
 impl Render for RightPanel {

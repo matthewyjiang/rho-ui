@@ -3,27 +3,25 @@
 //! everything it remembers between runs, in one SQLite database,
 //! [`StateDb`].
 
-use std::{fmt::Write as _, path::Path, rc::Rc};
+use std::{fmt::Write as _, io, path::Path, rc::Rc};
 
 use rho_ui_core::platform::{self, AppDir};
 use rusqlite::{Connection, Params, Row, TransactionBehavior};
 
 /// Writes `text` to a temporary file next to `path` and renames it over
-/// `path`, so a crash never leaves half a file. Best effort: the file only
-/// holds preferences, and losing a write loses one change.
-pub(crate) fn write_atomic(path: &Path, text: &str) {
+/// `path`, so a crash never leaves half a file.
+pub(crate) fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
     let temporary = path.with_extension("tmp");
-    if std::fs::write(&temporary, text).is_ok() {
-        let _ = std::fs::rename(&temporary, path);
-    }
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, path)
 }
 
 /// Bump on any change to [`SCHEMA`]. A database of another version starts
 /// over empty: rho-ui has no release, so there is nothing to migrate.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Every table. Each belongs to the module that reads and writes it.
 /// Tables keyed by text are `WITHOUT ROWID`, so the key is stored once
@@ -51,6 +49,14 @@ const SCHEMA: &str = "
         path BLOB NOT NULL,
         UNIQUE (machine, path)
     ) STRICT;
+    -- The sidebar filter's hidden machines, and the projects it keeps to
+    -- (the path's bytes); see crate::sidebar::SavedFilter.
+    CREATE TABLE filter_machines (machine TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+    CREATE TABLE filter_projects (
+        machine TEXT NOT NULL,
+        path BLOB NOT NULL,
+        PRIMARY KEY (machine, path)
+    ) STRICT, WITHOUT ROWID;
     -- How long each turn took, by a hash of its prompt's message ID, which
     -- is the rowid; see crate::turn_times.
     CREATE TABLE turn_times (prompt INTEGER PRIMARY KEY, ms INTEGER NOT NULL) STRICT;
@@ -106,9 +112,6 @@ pub(crate) enum Key {
     /// The open sidebar's width in rems; see
     /// [`crate::sidebar::SidebarLayout`].
     SidebarWidth,
-    /// The machines and projects the sidebar hides; see
-    /// [`crate::session_list::Filter`].
-    SidebarFilter,
     /// `shown` or `hidden`; see [`crate::right_panel::PanelLayout`].
     RightPanel,
     /// The right panel's width in rems; see
@@ -124,7 +127,6 @@ impl Key {
         match self {
             Key::SidebarLayout => "sidebar-layout",
             Key::SidebarWidth => "sidebar-width",
-            Key::SidebarFilter => "sidebar-filter",
             Key::RightPanel => "right-panel",
             Key::RightPanelWidth => "right-panel-width",
             Key::Checkout => "checkout",

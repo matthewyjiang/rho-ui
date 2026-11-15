@@ -142,13 +142,52 @@ pub(crate) enum MachineStatus {
     Failed(SharedString),
 }
 
+/// What rho-ui asks each daemon to list. Each can be refused on its own,
+/// and each refusal shows until that listing succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listing {
+    /// The saved sessions.
+    Sessions,
+    /// The sessions with work under way, polled every second.
+    Jobs,
+}
+
+impl Listing {
+    /// What the sidebar says couldn't be done.
+    pub(crate) fn failed(self) -> &'static str {
+        match self {
+            Listing::Sessions => "Couldn't list sessions",
+            Listing::Jobs => "Couldn't read which sessions are working",
+        }
+    }
+
+    /// The name in the element ID of its error.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Listing::Sessions => "sessions",
+            Listing::Jobs => "jobs",
+        }
+    }
+}
+
 /// A machine, and what the views show about its daemon.
 #[derive(Debug)]
 struct Entry {
     machine: Machine,
     status: MachineStatus,
-    /// Why its saved sessions couldn't be listed.
-    error: Option<SharedString>,
+    /// Why its daemon refused to list its saved sessions.
+    sessions_error: Option<SharedString>,
+    /// Why its daemon refused to list its jobs.
+    jobs_error: Option<SharedString>,
+}
+
+impl Entry {
+    fn error_mut(&mut self, listing: Listing) -> &mut Option<SharedString> {
+        match listing {
+            Listing::Sessions => &mut self.sessions_error,
+            Listing::Jobs => &mut self.jobs_error,
+        }
+    }
 }
 
 /// Every machine rho-ui connects to, this one first, with how each
@@ -178,7 +217,8 @@ impl Machines {
                     None => Entry {
                         machine,
                         status: MachineStatus::Connecting,
-                        error: None,
+                        sessions_error: None,
+                        jobs_error: None,
                     },
                 },
             )
@@ -231,41 +271,55 @@ impl Machines {
         self.entry(id).map(|entry| &entry.status)
     }
 
-    /// Records how `id`'s connection is doing. Returns whether that
-    /// changed.
+    /// Records how `id`'s connection is doing. A new connection, or none,
+    /// starts its listings over, so their refusals go. Returns whether
+    /// anything changed.
     pub(crate) fn set_status(&mut self, id: &MachineId, status: MachineStatus) -> bool {
         match self.entry_mut(id) {
             Some(entry) if entry.status != status => {
                 entry.status = status;
+                entry.sessions_error = None;
+                entry.jobs_error = None;
                 true
             }
             _ => false,
         }
     }
 
-    /// Records why `id`'s saved sessions couldn't be listed, or with
-    /// `None` that they were. Returns whether that changed.
-    pub(crate) fn set_error(&mut self, id: &MachineId, error: Option<SharedString>) -> bool {
-        match self.entry_mut(id) {
-            Some(entry) if entry.error != error => {
-                entry.error = error;
-                true
-            }
-            _ => false,
+    /// Records why `id`'s daemon refused `listing`, or with `None` that it
+    /// listed it. Returns whether that changed.
+    pub(crate) fn set_error(
+        &mut self,
+        id: &MachineId,
+        listing: Listing,
+        error: Option<SharedString>,
+    ) -> bool {
+        let Some(slot) = self.entry_mut(id).map(|entry| entry.error_mut(listing)) else {
+            return false;
+        };
+        if *slot == error {
+            return false;
         }
+        *slot = error;
+        true
     }
 
     /// Each machine with something wrong: its ID, how its connection is
-    /// doing, and why its sessions couldn't be listed.
+    /// doing, and each listing its daemon refused, with why.
     pub(crate) fn troubles(
         &self,
-    ) -> impl Iterator<Item = (&MachineId, &MachineStatus, Option<&SharedString>)> {
-        self.list
-            .iter()
-            .filter(|entry| {
-                entry.error.is_some() || !matches!(entry.status, MachineStatus::Ready { .. })
-            })
-            .map(|entry| (&entry.machine.id, &entry.status, entry.error.as_ref()))
+    ) -> impl Iterator<Item = (&MachineId, &MachineStatus, Vec<(Listing, &SharedString)>)> {
+        self.list.iter().filter_map(|entry| {
+            let refused: Vec<(Listing, &SharedString)> = [
+                (Listing::Sessions, entry.sessions_error.as_ref()),
+                (Listing::Jobs, entry.jobs_error.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(listing, error)| Some((listing, error?)))
+            .collect();
+            let ready = matches!(entry.status, MachineStatus::Ready { .. });
+            (!ready || !refused.is_empty()).then_some((&entry.machine.id, &entry.status, refused))
+        })
     }
 }
 
@@ -322,6 +376,57 @@ impl Place {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The saved-session listing and the job poll each say why they were
+    /// refused; one succeeding never clears or hides the other's reason,
+    /// and a new connection starts both over.
+    #[test]
+    fn each_listing_keeps_its_own_refusal() {
+        let remote = RemoteMachine::new("workstation");
+        let id = remote.id();
+        let mut machines = Machines::default();
+        machines.set(vec![Machine {
+            id: id.clone(),
+            label: "workstation".into(),
+            target: remote.ssh_target(),
+            clone_folder: SharedString::default(),
+        }]);
+        let ready = || MachineStatus::Ready {
+            version: "Rho 3".into(),
+        };
+        assert!(machines.set_status(&id, ready()));
+        let refused = |machines: &Machines| -> Vec<(Listing, String)> {
+            machines
+                .troubles()
+                .flat_map(|(_, _, refused)| refused)
+                .map(|(listing, error)| (listing, error.to_string()))
+                .collect()
+        };
+        assert!(refused(&machines).is_empty());
+
+        assert!(machines.set_error(&id, Listing::Sessions, Some("no list".into())));
+        assert!(machines.set_error(&id, Listing::Jobs, Some("no jobs".into())));
+        assert!(!machines.set_error(&id, Listing::Jobs, Some("no jobs".into())));
+        assert_eq!(
+            refused(&machines),
+            [
+                (Listing::Sessions, "no list".to_owned()),
+                (Listing::Jobs, "no jobs".to_owned())
+            ]
+        );
+        // The job poll recovers; the saved list still fails.
+        assert!(machines.set_error(&id, Listing::Jobs, None));
+        assert_eq!(
+            refused(&machines),
+            [(Listing::Sessions, "no list".to_owned())]
+        );
+
+        assert!(machines.set_status(&id, MachineStatus::Connecting));
+        assert!(
+            refused(&machines).is_empty(),
+            "a new connection starts over"
+        );
+    }
 
     #[test]
     fn hosts_that_ssh_would_misread_are_refused() {

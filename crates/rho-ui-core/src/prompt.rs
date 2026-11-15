@@ -51,8 +51,10 @@ pub fn check_attachment_total<'a>(
     }
 }
 
-/// `bytes` in MiB, to one decimal place, such as `12.0 MiB`.
-pub(crate) fn mebibytes(bytes: usize) -> String {
+/// `bytes` in MiB, to one decimal place, such as `12.0 MiB`: how limits
+/// on what a message carries are worded.
+#[must_use]
+pub fn mebibytes(bytes: usize) -> String {
     let tenths = bytes.saturating_mul(10) / (1024 * 1024);
     format!("{}.{} MiB", tenths / 10, tenths % 10)
 }

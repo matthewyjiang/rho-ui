@@ -2,7 +2,9 @@
 //! session on screen, staged or not, with its untracked files, as `git` on
 //! the session's machine reports them, drawn with Kit's diff view. It reads
 //! them when it opens, when another session comes on screen, when the
-//! session's turn ends, and on Refresh.
+//! session's turn ends, and on Refresh, and parses them off the UI thread.
+//! A patch over [`PATCH_LIMIT`] shows the whole files that fit, and says
+//! where it stopped.
 
 use std::path::PathBuf;
 
@@ -10,20 +12,20 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     diff::{Diff, DiffFile, DiffFileStatus, DiffState},
-    empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
     spinner::Spinner,
     v_flex, ActiveTheme as _, IconName, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, AnyElement, App, AppContext as _, BackgroundExecutor, Context, Entity,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
+    div, App, AppContext as _, BackgroundExecutor, Context, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window,
 };
 
+use super::message;
 use crate::{
-    folders::Reader,
+    folders::{find, Reader},
     machines::Place,
     session_view::{SessionEvent, SessionView},
     workspaces::Workspaces,
@@ -36,6 +38,17 @@ const CHANGES: &[u8] = b"rho-ui-diff\0";
 
 /// Printed instead when the folder isn't in a git repository.
 const NO_GIT: &[u8] = b"rho-ui-diff-none\0";
+
+/// The most of the patch the surface parses and shows, in bytes; past it,
+/// the whole files that fit, and the summary says where it stopped.
+/// In a debug build, an 8 MiB patch of 363 new Rust files parsed in 79 ms
+/// off the UI thread, and giving it to Kit's diff view took 26 ms on it,
+/// with 7 ms frames after; 2 MiB took 27 ms and 5 ms.
+const PATCH_LIMIT: usize = 8 << 20;
+
+/// Where each file's part of a patch starts, after the newline that ends
+/// the file before.
+const FILE_START: &[u8] = b"\ndiff --git ";
 
 /// The POSIX `sh` script that prints the changes in the repository of the
 /// folder given as its argument: from its top, every change to tracked
@@ -61,6 +74,22 @@ git ls-files -z --others --exclude-standard |
     [ $? -le 1 ]' sh
 "#;
 
+/// The patch [`SCRIPT`] printed, whole files only.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Patch {
+    text: String,
+    /// Whether files past [`PATCH_LIMIT`] were left out.
+    cut: bool,
+}
+
+/// What a read of the changes found.
+enum Changes {
+    /// The session's folder isn't in a git repository.
+    NotGit,
+    /// The patch, and the files parsed from it.
+    Patch(Patch, Vec<DiffFile>),
+}
+
 /// What the surface shows.
 enum Status {
     /// Nothing read yet.
@@ -84,7 +113,7 @@ pub(super) struct DiffSurface {
     status: Status,
     /// The patch on screen, so a read that finds the same changes leaves
     /// the view, and its scroll position, alone.
-    patch: String,
+    patch: Patch,
     /// The read under way; a newer one replaces it.
     load: Task<()>,
 }
@@ -100,19 +129,22 @@ impl DiffSurface {
             session: None,
             state: cx.new(|cx| DiffState::new([], cx)),
             status: Status::Loading,
-            patch: String::new(),
+            patch: Patch::default(),
             load: Task::ready(()),
         };
         this.set_session(session, cx);
         this
     }
 
-    /// Shows the changes where `session` works, or nothing without one.
+    /// Shows the changes where `session` works, or nothing without one. A
+    /// session in the folder already showing keeps the changes as they
+    /// are until the new read comes.
     pub(super) fn set_session(
         &mut self,
         session: Option<&Entity<SessionView>>,
         cx: &mut Context<'_, Self>,
     ) {
+        let before = self.session.take().map(|(place, _)| place);
         self.session = session.map(|view| {
             let live = view.read(cx).live();
             let place = Place::new(live.id.machine, live.cwd);
@@ -123,9 +155,11 @@ impl DiffSurface {
             });
             (place, ended)
         });
-        self.status = Status::Loading;
-        self.patch.clear();
-        self.state.update(cx, |state, cx| state.set_files([], cx));
+        if before.as_ref() != self.session.as_ref().map(|(place, _)| place) {
+            self.status = Status::Loading;
+            self.patch = Patch::default();
+            self.state.update(cx, |state, cx| state.set_files([], cx));
+        }
         self.reload(cx);
     }
 
@@ -146,19 +180,16 @@ impl DiffSurface {
         });
     }
 
-    fn loaded(&mut self, read: Result<Option<String>, String>, cx: &mut Context<'_, Self>) {
+    fn loaded(&mut self, read: Result<Changes, String>, cx: &mut Context<'_, Self>) {
         self.status = match read {
-            Ok(None) => Status::NotGit,
-            Ok(Some(patch)) if patch == self.patch => Status::Ready,
-            Ok(Some(patch)) => match DiffFile::parse(&patch) {
-                Ok(files) => {
-                    self.state
-                        .update(cx, |state, cx| state.set_files(files, cx));
-                    self.patch = patch;
-                    Status::Ready
-                }
-                Err(error) => Status::Failed(format!("Couldn't read git's diff: {error}").into()),
-            },
+            Ok(Changes::NotGit) => Status::NotGit,
+            Ok(Changes::Patch(patch, _)) if patch == self.patch => Status::Ready,
+            Ok(Changes::Patch(patch, files)) => {
+                self.state
+                    .update(cx, |state, cx| state.set_files(files, cx));
+                self.patch = patch;
+                Status::Ready
+            }
             Err(why) => Status::Failed(why.into()),
         };
         cx.notify();
@@ -177,10 +208,16 @@ impl DiffSurface {
         let (added, deleted) = files.iter().fold((0, 0), |(added, deleted), file| {
             (added + file.additions(), deleted + file.deletions())
         });
-        let count = match files.len() {
+        let mut count = match files.len() {
             1 => "1 file changed".to_owned(),
             count => format!("{count} files changed"),
         };
+        if self.patch.cut {
+            count = format!(
+                "The first {count}: the diff stops at {} MiB",
+                PATCH_LIMIT >> 20
+            );
+        }
         let theme = cx.theme();
         h_flex()
             .id("diff-summary")
@@ -266,15 +303,6 @@ fn file_header(file: &DiffFile, _: &mut Window, cx: &mut App) -> impl IntoElemen
         }))
 }
 
-/// A message in place of the changes.
-fn message(text: impl Into<SharedString>, media: Option<AnyElement>) -> AnyElement {
-    let mut header = EmptyHeader::new().description(EmptyDescription::new().child(text.into()));
-    if let Some(media) = media {
-        header = header.media(EmptyMedia::new().child(media));
-    }
-    Empty::new().h_full().header(header).into_any_element()
-}
-
 impl Render for DiffSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         if self.session.is_none() {
@@ -293,7 +321,17 @@ impl Render for DiffSurface {
                 .into_any_element(),
             Status::Ready if self.state.read(cx).files().is_empty() => v_flex()
                 .size_full()
-                .child(message("No uncommitted changes.", None))
+                .child(if self.patch.cut {
+                    message(
+                        format!(
+                            "The changes are over {} MiB, too large to show here.",
+                            PATCH_LIMIT >> 20
+                        ),
+                        None,
+                    )
+                } else {
+                    message("No uncommitted changes.", None)
+                })
                 .child(h_flex().justify_center().pb_4().child(refresh_button(cx)))
                 .into_any_element(),
             Status::Ready => v_flex()
@@ -311,31 +349,47 @@ impl Render for DiffSurface {
     }
 }
 
-/// Reads the changes at `cwd` with `reader`, running `git` on `executor`
-/// on this machine. `None` outside a git repository.
+/// Reads the changes at `cwd` with `reader`, and parses them, both on
+/// `executor` (`git` runs there on this machine).
 async fn read(
     reader: Reader,
     cwd: PathBuf,
     executor: BackgroundExecutor,
-) -> Result<Option<String>, String> {
+) -> Result<Changes, String> {
     let output = reader
         .run_script(SCRIPT, vec![cwd.into_os_string()], &executor)
         .await?;
-    parse(&output)
+    executor
+        .spawn(async move {
+            let Some(patch) = parse(&output, PATCH_LIMIT)? else {
+                return Ok(Changes::NotGit);
+            };
+            let files = DiffFile::parse(&patch.text)
+                .map_err(|error| format!("Couldn't read git's diff: {error}"))?;
+            Ok(Changes::Patch(patch, files))
+        })
+        .await
 }
 
-/// The patch [`SCRIPT`] printed, or `None` if it found no repository.
-fn parse(output: &[u8]) -> Result<Option<String>, String> {
-    let find = |marker: &[u8]| {
-        output
-            .windows(marker.len())
-            .position(|window| window == marker)
-    };
-    if let Some(at) = find(CHANGES) {
-        let patch = &output[at + CHANGES.len()..];
-        return Ok(Some(String::from_utf8_lossy(patch).into_owned()));
+/// The patch [`SCRIPT`] printed, or `None` if it found no repository. Past
+/// `limit` bytes, it keeps the whole files that fit.
+fn parse(output: &[u8], limit: usize) -> Result<Option<Patch>, String> {
+    if let Some(at) = find(output, CHANGES) {
+        let mut patch = &output[at + CHANGES.len()..];
+        let cut = patch.len() > limit;
+        if cut {
+            // Up to the newline ending the last file within the limit,
+            // whose end is the next file's start.
+            let end = patch[..(limit + FILE_START.len() - 1).min(patch.len())]
+                .windows(FILE_START.len())
+                .rposition(|window| window == FILE_START)
+                .map_or(0, |at| at + 1);
+            patch = &patch[..end];
+        }
+        let text = String::from_utf8_lossy(patch).into_owned();
+        return Ok(Some(Patch { text, cut }));
     }
-    match find(NO_GIT) {
+    match find(output, NO_GIT) {
         Some(_) => Ok(None),
         None => Err("The diff script printed nothing.".to_owned()),
     }
@@ -376,8 +430,8 @@ mod tests {
         };
         let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
         let changes = |folder: &PathBuf| {
-            let patch = parse(&run_here(SCRIPT, &[folder]).unwrap()).unwrap();
-            let files = DiffFile::parse(&patch.expect("a repository")).unwrap();
+            let patch = parse(&run_here(SCRIPT, &[folder]).unwrap(), PATCH_LIMIT).unwrap();
+            let files = DiffFile::parse(&patch.expect("a repository").text).unwrap();
             let mut paths: Vec<String> = files.iter().map(|f| f.path().to_string()).collect();
             paths.sort();
             paths
@@ -406,15 +460,30 @@ mod tests {
         assert_eq!(changes(&dir.join("src")), expected, "from a subfolder");
 
         let plain = tempfile::tempdir().unwrap();
-        assert_eq!(parse(&run_here(SCRIPT, &[plain.path()]).unwrap()), Ok(None));
+        let output = run_here(SCRIPT, &[plain.path()]).unwrap();
+        assert_eq!(parse(&output, PATCH_LIMIT), Ok(None));
     }
 
+    /// What a login file prints before the marker is skipped, and a patch
+    /// over the limit keeps only the whole files that fit, as a file cut
+    /// short won't parse.
     #[test]
-    fn output_before_the_marker_is_skipped() {
+    fn parse_skips_what_comes_first_and_keeps_whole_files() {
+        let patch = |text: &str, cut: bool| -> Result<Option<Patch>, String> {
+            let text = text.to_owned();
+            Ok(Some(Patch { text, cut }))
+        };
         let mut output = b"motd from .bashrc\n".to_vec();
         output.extend(CHANGES);
         output.extend(b"diff --git a/x b/x\n");
-        assert_eq!(parse(&output), Ok(Some("diff --git a/x b/x\n".to_owned())));
-        assert!(parse(b"nothing").is_err());
+        assert_eq!(
+            parse(&output, PATCH_LIMIT),
+            patch("diff --git a/x b/x\n", false)
+        );
+        // 19 bytes a file: 30 falls in the second, 10 in the first.
+        output.extend(b"diff --git a/y b/y\n");
+        assert_eq!(parse(&output, 30), patch("diff --git a/x b/x\n", true));
+        assert_eq!(parse(&output, 10), patch("", true));
+        assert!(parse(b"nothing", PATCH_LIMIT).is_err());
     }
 }
