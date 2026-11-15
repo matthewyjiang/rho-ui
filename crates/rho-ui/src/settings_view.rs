@@ -117,6 +117,12 @@ impl SelectItem for Choice {
     fn value(&self) -> &SharedString {
         &self.value
     }
+
+    /// Each row draws its name in its own font, as a preview. The trigger
+    /// keeps the UI font, so a symbol font's name stays readable there.
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div().font_family(self.value.clone()).child(self.title())
+    }
 }
 
 type FontSelect = Entity<SelectState<SearchableVec<Choice>>>;
