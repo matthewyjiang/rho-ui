@@ -30,7 +30,7 @@ Background work a session's turns started (processes, workflow runs, subagents) 
 
 Click a subagent's row, in either list, to open the subagent's own session, nested under the session that started it: the title bar reads `project / session / subagent's task`, and a click on any step above the last goes back to it. rho-ui observes the session (`rho/session/observe`) rather than attaching to it, as only the subagent writes there, so the view shows its messages and tool calls as they come, with no composer and no approvals (a subagent's questions go to its parent). A subagent of a subagent nests one step deeper. When the run ends, the parent shows the subagent's whole result as a card, its Markdown rendered and cut to its first 12 lines; Show more under it shows the rest, and Show less folds it again. Any card rho sends, such as a finished command's, shows the same way. Once the run ends, the daemon stops sending its events and the view keeps what it showed; opening the row again reads the session afresh. The sidebar lists only the session at the top, and marks it while one of its subagents is on screen.
 
-The title bar shows the session's project and its title. Branch and other git details are not in it.
+The title bar shows the session's project and its title. Branch and other git details are not in it. Click the project to start a new session in it, as Ctrl+N does.
 
 The sidebar lists the daemon's saved sessions. Once a second it also asks the daemon which sessions have work under way, so a session that runs a turn or waits for an approval shows as working or waiting whichever client started it. A turn that finishes while its session isn't on screen shows Done, in green, until you open the session or it works again.
 

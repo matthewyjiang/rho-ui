@@ -1,15 +1,18 @@
 //! The bar across the top of the main pane: the project, then the path to
 //! what the pane shows, each step nested under the one before it, as
 //! `rho-ui / Fix the parser / Read the parser` for a subagent's session
-//! under the session that started it. Every step but the last links back to
-//! it; controls for what the pane shows sit at the right, and at the right
+//! under the session that started it. The project can start a new session
+//! in it, and every step but the last links back to it; controls for what the pane shows sit at the right, and at the right
 //! edge, while the right panel is hidden, the toggle that shows it.
 //!
 //! Kit's `Breadcrumb` separates its items with chevrons and gives UI tests
 //! no way to find them; this bar uses slashes, and tests find each step.
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{h_flex, ActiveTheme as _, StyledExt as _};
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    h_flex, ActiveTheme as _, Sizable as _, StyledExt as _,
+};
 use gpui_kit::{
     div, rems, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
@@ -47,6 +50,8 @@ type Go = Box<dyn Fn(&mut Window, &mut App)>;
 pub(crate) struct TitleBar {
     initials: SharedString,
     project: SharedString,
+    /// What a click on the project does; without it, the project is text.
+    on_project: Option<Go>,
     /// The steps between the project and the title, each with what a click
     /// shows.
     parents: Vec<(SharedString, Go)>,
@@ -60,10 +65,18 @@ impl TitleBar {
         Self {
             initials: workspace.initials.clone(),
             project: workspace.short_name.clone(),
+            on_project: None,
             parents: Vec::new(),
             title: title.into(),
             trailing: None,
         }
+    }
+
+    /// Makes the project a button that starts a new session in it, which
+    /// `go` does.
+    pub(crate) fn on_project(mut self, go: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_project = Some(Box::new(go));
+        self
     }
 
     /// Adds a step above the title, after those added before it; a click on
@@ -112,6 +125,26 @@ impl RenderOnce for TitleBar {
                     .child(shorten(&label));
                 [step.into_any_element(), slash().into_any_element()]
             });
+        let project = h_flex()
+            .flex_shrink_0()
+            .gap_2()
+            .child(Badge::new(self.initials, rems(BADGE_REMS)))
+            .child(div().text_color(muted).child(self.project.clone()));
+        let project = match self.on_project {
+            Some(go) => Button::new("title-project")
+                .ghost()
+                .small()
+                .flex_shrink_0()
+                // Back by the button's padding, so the badge stays in line
+                // with the bar's edge.
+                .ml(-rems(0.5))
+                .accessibility_label(format!("New session in {}", self.project))
+                .tooltip_with_action("New session", &crate::NewSession, Some("RhoApp"))
+                .on_click(move |_, window, cx| go(window, cx))
+                .child(project)
+                .into_any_element(),
+            None => project.into_any_element(),
+        };
         h_flex()
             .id("title-bar")
             .flex_shrink_0()
@@ -125,13 +158,7 @@ impl RenderOnce for TitleBar {
                     .flex_1()
                     .min_w_0()
                     .gap_3()
-                    .child(
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap_2()
-                            .child(Badge::new(self.initials, rems(BADGE_REMS)))
-                            .child(div().text_color(muted).child(self.project)),
-                    )
+                    .child(project)
                     .child(slash())
                     .children(parents)
                     .child(

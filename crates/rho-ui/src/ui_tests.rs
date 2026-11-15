@@ -3807,7 +3807,8 @@ fn a_message_after_a_waiting_image_waits_too() {
 /// The draft lists the user's projects, not every folder rho has sessions
 /// in, the most recently used first. Search filters them, and choosing one
 /// opens the draft's session there. The draft's project is checked and the
-/// keyboard's row shows only while the search has the keyboard.
+/// keyboard's row shows only while the search has the keyboard. A
+/// session's project in its title bar starts a new session there.
 #[test]
 fn a_new_session_starts_in_one_of_the_users_projects() {
     let launch_row: &'static str =
@@ -3892,8 +3893,16 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
             .is_some_and(|view| view.read(cx).live().cwd == Path::new("/w/b"))
     });
 
-    // From that session, a new one starts in its project, with the search
-    // on the checked row.
+    // The project in that session's title bar starts a new one there.
+    ui.act(|window, cx| window.hover("title-project", cx));
+    ui.shot("title-hover");
+    ui.click("title-project");
+    ui.wait_until(
+        "a draft in /w/b from the title bar",
+        draft_in(Path::new("/w/b")),
+    );
+
+    // Ctrl+Shift+N keeps the draft and puts the search on the checked row.
     ui.act(|window, cx| window.press("secondary-shift-n", cx));
     ui.wait_until("a draft in /w/b", draft_in(Path::new("/w/b")));
     ui.wait_until("the keyboard on /w/b", |_, cx, app| {

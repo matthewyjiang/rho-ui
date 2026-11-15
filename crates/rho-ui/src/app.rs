@@ -1261,6 +1261,9 @@ impl RhoApp {
                         this.show(Pane::Session(target), window, cx);
                     }
                 }
+                // Only the session on screen shows its title bar, so the
+                // new one starts in its project.
+                SessionEvent::NewSession => this.new_session(window, cx),
             },
         );
         if !view.read(cx).is_subagent() {

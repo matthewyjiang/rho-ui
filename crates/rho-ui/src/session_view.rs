@@ -89,6 +89,8 @@ pub(crate) enum SessionEvent {
     },
     /// Show a session above this one, from the title bar.
     Show(WeakEntity<SessionView>),
+    /// Start a new session in this one's project, from the title bar.
+    NewSession,
 }
 
 /// Whether the session is usable yet.
@@ -1156,8 +1158,8 @@ impl SessionView {
         })
     }
 
-    /// The project, the sessions above this one, each a link to it, and
-    /// this one's title, with its ended background work at the right.
+    /// The project, which starts a new session in it, the sessions above
+    /// this one, each a link to it, and this one's title, with its ended background work at the right.
     fn render_title_bar(&self, cx: &mut Context<'_, Self>) -> TitleBar {
         let mut above = Vec::new();
         let mut next = self.parent();
@@ -1167,6 +1169,12 @@ impl SessionView {
         }
         let mut bar = TitleBar::new(self.workspace.read(cx), self.title());
         let this = cx.entity().downgrade();
+        bar = bar.on_project({
+            let this = this.clone();
+            move |_, cx| {
+                let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::NewSession));
+            }
+        });
         for view in above.into_iter().rev() {
             let (this, target) = (this.clone(), view.downgrade());
             bar = bar.parent(view.read(cx).title(), move |_, cx| {
