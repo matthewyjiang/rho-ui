@@ -630,7 +630,8 @@ impl Daemon {
     /// Dropping the future gives up the attempt: whatever it started to
     /// reach the daemon, such as an ssh connection still signing in or the
     /// setup script on the machine, stops with it. An ssh connection that
-    /// signed in stays, for the next attempt to reach that machine.
+    /// signed in stays for 10 minutes, for the next attempt to reach that
+    /// machine.
     ///
     /// # Errors
     ///

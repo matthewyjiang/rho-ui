@@ -1,33 +1,51 @@
 //! Running a POSIX `sh` script on a host, in a session channel of its
 //! own on the host's shared connection.
 
-use std::time::Duration;
+use std::{pin::pin, time::Duration};
 
-use russh::{client::Msg, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
+use russh::{client::Msg, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Sig};
 
 use super::connection::Connection;
 use crate::daemon::{io, DaemonError};
 
-/// How long [`run`] waits for a script that has a deadline: a tripwire
-/// for a script stuck on a hung disk. rho-ui's longest, reading the git
+/// How long a script that has a deadline may run: a tripwire for a
+/// script stuck on a hung disk. rho-ui's longest, reading the git
 /// repositories of every workspace, took 1.3 s for 133 worktrees (about
 /// 10 ms each), so this leaves room for thousands.
 pub(super) const SCRIPT_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Why a script didn't succeed. Callers word it for what the script did.
+#[derive(Debug)]
+pub(super) enum ScriptError {
+    /// It ran past its deadline, this one.
+    TimedOut(Duration),
+    /// The channel closed with no word of how the script ended, as when
+    /// the connection died.
+    Cut,
+    /// sshd wouldn't run `sh`.
+    Refused,
+    /// It exited with an error, or a signal killed it: why, in its own
+    /// words if it wrote any to stderr.
+    Failed(String),
+    /// It got no session channel: the connection is gone, or the host
+    /// refused one.
+    Session(DaemonError),
+}
+
 /// What a script printed, and how it ended.
 #[derive(Debug)]
-pub(super) struct Output {
-    pub(super) stdout: Vec<u8>,
-    pub(super) stderr: Vec<u8>,
-    pub(super) ending: Ending,
+struct Output {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    ending: Ending,
 }
 
 /// How a script ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Ending {
+enum Ending {
     /// It exited with this status.
     Exited(u32),
-    /// A signal killed it; its name.
+    /// A signal killed it; its name, as `SIGTERM`.
     Killed(String),
     /// sshd wouldn't run `sh`.
     Refused,
@@ -37,23 +55,20 @@ pub(super) enum Ending {
 }
 
 impl Output {
-    /// Why the script failed, in its own words if it wrote any; `None`
-    /// when it exited 0. [`Ending::Cut`] is the caller's to word.
-    pub(super) fn failure(&self) -> Option<String> {
-        let said = String::from_utf8_lossy(&self.stderr);
-        let said = said.trim();
-        let status = match &self.ending {
-            Ending::Exited(0) => return None,
+    /// What it printed, if it exited 0; else why not.
+    fn result(self) -> Result<Vec<u8>, ScriptError> {
+        let status = match self.ending {
+            Ending::Exited(0) => return Ok(self.stdout),
+            Ending::Refused => return Err(ScriptError::Refused),
+            Ending::Cut => return Err(ScriptError::Cut),
             Ending::Exited(code) => format!("it exited with status {code}"),
-            Ending::Killed(signal) => format!("it was killed by signal {signal}"),
-            Ending::Refused => "sshd refused to run sh".to_owned(),
-            Ending::Cut => "the connection closed while it ran".to_owned(),
+            Ending::Killed(signal) => format!("it was killed by {signal}"),
         };
-        Some(if said.is_empty() {
-            status
-        } else {
-            said.to_owned()
-        })
+        let said = String::from_utf8_lossy(&self.stderr);
+        Err(ScriptError::Failed(match said.trim() {
+            "" => status,
+            said => said.to_owned(),
+        }))
     }
 }
 
@@ -66,65 +81,65 @@ impl Output {
 ///
 /// # Errors
 ///
-/// Fails if the connection is gone, the host refuses a session, the
-/// script exits with an error, or it runs past `deadline`.
+/// Fails if the connection is gone, the host refuses a session or `sh`,
+/// the script exits with an error, or it runs past `deadline`.
 pub(super) async fn run(
     connection: &Connection,
     input: &[u8],
     deadline: Option<Duration>,
-) -> Result<Vec<u8>, DaemonError> {
-    let host = connection.host();
+) -> Result<Vec<u8>, ScriptError> {
     if connection.is_closed() {
-        return Err(DaemonError::Unreachable(format!(
-            "no ssh connection to {host}"
-        )));
+        return Err(ScriptError::Session(DaemonError::Unreachable(format!(
+            "no ssh connection to {}",
+            connection.host()
+        ))));
     }
     let ran = sh(connection, input);
     let output = match deadline {
-        Some(deadline) => tokio::time::timeout(deadline, ran).await.map_err(|_| {
-            DaemonError::Unreachable(format!(
-                "a script on {host} ran past {} s",
-                deadline.as_secs()
-            ))
-        })?,
+        Some(deadline) => tokio::time::timeout(deadline, ran)
+            .await
+            .map_err(|_| ScriptError::TimedOut(deadline))?,
         None => ran.await,
     }?;
-    match output.failure() {
-        None => Ok(output.stdout),
-        Some(_) if output.ending == Ending::Cut => Err(DaemonError::Unreachable(format!(
-            "the connection to {host} closed while a script ran"
-        ))),
-        Some(why) => Err(DaemonError::Unreachable(format!(
-            "a script on {host} failed: {why}"
-        ))),
-    }
+    output.result()
 }
 
 /// Runs `sh -s` in a new session channel, feeds it `input`, and collects
-/// what it prints until the channel closes. The input goes while the
-/// output comes, so neither side waits on a full window. Dropping the
-/// future closes the channel, so a deadline around this covers sending
-/// the input too, and channels don't pile up against sshd's
-/// `MaxSessions`.
+/// what it prints until the channel closes, or sshd refuses to run `sh`.
+/// The input goes while the output comes, so neither side waits on a full
+/// window. Dropping the future closes the channel, so a deadline around
+/// this covers sending the input too, and channels don't pile up against
+/// sshd's `MaxSessions`.
 ///
 /// # Errors
 ///
 /// Fails if the host refuses a session.
-pub(super) async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, DaemonError> {
-    let (mut read, write) = connection.session().await?.split();
+async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, ScriptError> {
+    let (mut read, write) = connection
+        .session()
+        .await
+        .map_err(ScriptError::Session)?
+        .split();
     let write = CloseOnDrop(Some(write));
     let channel = write.channel();
-    let send = async {
+    let mut send = pin!(async {
         channel.exec(true, "sh -s").await?;
         channel.data(input).await?;
         channel.eof().await
+    });
+    let mut receiving = pin!(receive(&mut read));
+    let output = tokio::select! {
+        output = &mut receiving => output,
+        // A failed send means the channel closed, and how it ended says
+        // why; a refused `sh` reads none of the input, so the output is
+        // what ends this, not the send.
+        _ = &mut send => receiving.await,
     };
-    // A failed send means the channel closed, and how it ended says why.
-    let (_, output) = tokio::join!(send, receive(&mut read));
     Ok(output)
 }
 
-/// Reads a session channel until it closes.
+/// Reads a session channel until it closes, or sshd refuses to run `sh`,
+/// which leaves the channel open.
 async fn receive(read: &mut ChannelReadHalf) -> Output {
     let mut output = Output {
         stdout: Vec::new(),
@@ -138,18 +153,42 @@ async fn receive(read: &mut ChannelReadHalf) -> Output {
             ChannelMsg::ExtendedData { data, ext: 1 } => output.stderr.extend_from_slice(&data),
             ChannelMsg::ExitStatus { exit_status } => output.ending = Ending::Exited(exit_status),
             ChannelMsg::ExitSignal { signal_name, .. } => {
-                output.ending = Ending::Killed(format!("{signal_name:?}"));
+                output.ending = Ending::Killed(signal(&signal_name));
             }
-            ChannelMsg::Failure => output.ending = Ending::Refused,
+            // The only request on the channel is `exec`'s.
+            ChannelMsg::Failure => {
+                output.ending = Ending::Refused;
+                break;
+            }
             _ => {}
         }
     }
     output
 }
 
+/// `signal`'s name, as `SIGTERM`.
+fn signal(signal: &Sig) -> String {
+    let name = match signal {
+        Sig::ABRT => "ABRT",
+        Sig::ALRM => "ALRM",
+        Sig::FPE => "FPE",
+        Sig::HUP => "HUP",
+        Sig::ILL => "ILL",
+        Sig::INT => "INT",
+        Sig::KILL => "KILL",
+        Sig::PIPE => "PIPE",
+        Sig::QUIT => "QUIT",
+        Sig::SEGV => "SEGV",
+        Sig::TERM => "TERM",
+        Sig::USR1 => "USR1",
+        Sig::Custom(name) => name.as_str(),
+    };
+    format!("SIG{name}")
+}
+
 /// A channel's writing half that closes the channel when dropped, as when
-/// a script's future is given up. Closing one already closed does
-/// nothing.
+/// a script's future is given up or sshd refused it. Closing one already
+/// closed does nothing.
 struct CloseOnDrop(Option<ChannelWriteHalf<Msg>>);
 
 impl CloseOnDrop {

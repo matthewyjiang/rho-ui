@@ -61,7 +61,9 @@ pub struct FakeSshd {
     port: u16,
     /// Holds the client's key files and `known_hosts` files.
     dir: tempfile::TempDir,
-    /// Clients that offered a key to sign in with.
+    /// Keys clients offered to sign in with.
+    key_offers: Arc<AtomicUsize>,
+    /// Clients that signed in.
     sign_ins: Arc<AtomicUsize>,
     /// Numbers each target's host, so each gets a connection of its own.
     targets: AtomicUsize,
@@ -131,10 +133,12 @@ impl FakeSshd {
             auth_rejection_time_initial: Some(Duration::ZERO),
             ..server::Config::default()
         });
-        let sign_ins = Arc::new(AtomicUsize::new(0));
+        let key_offers: Arc<AtomicUsize> = Arc::default();
+        let sign_ins: Arc<AtomicUsize> = Arc::default();
         let sshd = Sshd {
             home: home.to_path_buf(),
             accepted: accepted.public_key().clone(),
+            key_offers: Arc::clone(&key_offers),
             sign_ins: Arc::clone(&sign_ins),
         };
         runtime.spawn(async move {
@@ -150,6 +154,7 @@ impl FakeSshd {
         Self {
             port,
             dir,
+            key_offers,
             sign_ins,
             targets: AtomicUsize::new(0),
             _runtime: runtime,
@@ -172,10 +177,13 @@ impl FakeSshd {
             port: self.port,
             user: "tester".to_owned(),
             identity_files: keys.iter().map(|&key| self.key_file(key)).collect(),
+            certificate_files: Vec::new(),
+            skipped: Vec::new(),
             agent_keys: AgentKeys::Configured,
             identity_agent: IdentityAgent::Off,
             known_hosts: vec![self.known_hosts(host_key)],
             host_key_alias: None,
+            revoked_host_keys: None,
         };
         SshTarget::routed(format!("fake-sshd-{}-{number}", self.port), route)
     }
@@ -190,7 +198,12 @@ impl FakeSshd {
         self.dir.path().join(file_name(key))
     }
 
-    /// How many times a client offered a key to sign in with.
+    /// How many keys clients offered to sign in with.
+    pub fn key_offers(&self) -> usize {
+        self.key_offers.load(Ordering::SeqCst)
+    }
+
+    /// How many times a client signed in: one for each connection.
     pub fn sign_ins(&self) -> usize {
         self.sign_ins.load(Ordering::SeqCst)
     }
@@ -221,6 +234,7 @@ fn random_key() -> PrivateKey {
 struct Sshd {
     home: PathBuf,
     accepted: PublicKey,
+    key_offers: Arc<AtomicUsize>,
     sign_ins: Arc<AtomicUsize>,
 }
 
@@ -232,7 +246,7 @@ impl server::Handler for Sshd {
         _user: &str,
         _offer: PublicKeyOffer<'_>,
     ) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
-        self.sign_ins.fetch_add(1, Ordering::SeqCst);
+        self.key_offers.fetch_add(1, Ordering::SeqCst);
         std::future::ready(Ok(Auth::Accept))
     }
 
@@ -242,6 +256,9 @@ impl server::Handler for Sshd {
         key: VerifiedPublicKey<'_>,
     ) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
         let accepted = key.public_key.key_data() == self.accepted.key_data();
+        if accepted {
+            self.sign_ins.fetch_add(1, Ordering::SeqCst);
+        }
         std::future::ready(Ok(if accepted {
             Auth::Accept
         } else {

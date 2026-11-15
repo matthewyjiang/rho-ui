@@ -7064,6 +7064,7 @@ dependencies = [
  "base64",
  "dunce",
  "futures",
+ "gethostname",
  "regex",
  "rho-protocol",
  "rho-ui-core",

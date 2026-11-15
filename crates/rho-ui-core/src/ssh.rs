@@ -3,19 +3,23 @@
 //! macOS do.
 //!
 //! One ssh connection per host carries everything ([`connection`]):
-//! [`connect`] opens it, or takes the live one, runs a setup script on
+//! [`connect`] opens it, or takes the open one, runs a setup script on
 //! the machine that starts its daemon and reports where it listens and
 //! the login environment ([`setup`]), then opens a `direct-streamlocal`
-//! channel to the daemon's socket, as `ssh -W` does. Every script after
-//! that runs in a session channel of its own on the same connection
-//! ([`script`]). A new connection costs a key signature, which an agent
-//! such as 1Password's asks the user to approve, so the user approves
-//! once per host for as long as the app runs and the link stays up.
+//! channel to the daemon's socket, as `ssh -W` does, and speaks rho's
+//! protocol over it. Every script after that runs in a session channel
+//! of its own on the same connection ([`script`]). A new connection costs
+//! a key signature, which an agent such as 1Password's asks the user to
+//! approve, so the user approves once per host while the app uses the
+//! host and the link stays up; a connection nothing uses closes 10
+//! minutes later.
 //!
 //! The connection follows the user's ssh config as `ssh -G` resolves it
-//! ([`config`]), checks the host's key against `known_hosts` without
-//! ever adding to it ([`host_key`]), and signs in with the key agent's
-//! keys or key files that need no passphrase ([`auth`]).
+//! ([`config`]), checks the host's key against `known_hosts` and
+//! `RevokedHostKeys` without ever adding to them ([`host_key`]), and
+//! signs in with the key agent's keys and certificates, or key files
+//! that need no passphrase and their certificates ([`auth`]). The files
+//! are read on Tokio's blocking threads, not the I/O runtime's one worker.
 
 mod auth;
 mod config;
@@ -31,15 +35,17 @@ use std::{
     time::Duration,
 };
 
-use rho_protocol::{Client, ClientHello, HelloResponse, Notifications};
+use rho_protocol::{Client, ClientError, ClientHello, HelloResponse, Notifications};
+use russh::{client::Msg, ChannelStream};
 
 pub(crate) use config::Resolved;
 #[cfg(feature = "test-support")]
 pub(crate) use config::{AgentKeys, IdentityAgent};
-use connection::Connection;
+use connection::Lease;
+use script::ScriptError;
 
 use crate::{
-    daemon::{on_io, DaemonError, Machine},
+    daemon::{on_io, DaemonError, Machine, HANDSHAKE_DEADLINE},
     platform,
 };
 
@@ -50,7 +56,7 @@ pub struct SshTarget {
     rho: String,
     /// How to reach the host, when not as the user's ssh config says: a
     /// test's own server.
-    route: Option<Resolved>,
+    route: Option<Box<Resolved>>,
 }
 
 impl SshTarget {
@@ -72,7 +78,7 @@ impl SshTarget {
         Self {
             host,
             rho: "rho".to_owned(),
-            route: Some(route),
+            route: Some(Box::new(route)),
         }
     }
 
@@ -109,8 +115,10 @@ impl SshTarget {
                 "{host:?} is not an ssh destination"
             )));
         }
-        let connection = connection::shared(host, self.route.as_ref()).await?;
-        Ok(SshLink { connection })
+        let lease = connection::shared(host, self.route.as_deref()).await?;
+        Ok(SshLink {
+            lease: Arc::new(lease),
+        })
     }
 }
 
@@ -121,8 +129,11 @@ pub(crate) async fn connect(
     hello: ClientHello,
 ) -> Result<(Client, Notifications, HelloResponse, Machine), DaemonError> {
     let link = target.open_link().await?;
-    let setup = setup::run(&link.connection, &target.rho).await?;
-    let (client, notifications, hello) = link.connection.daemon(&setup.socket, hello).await?;
+    let connection = link.lease.connection();
+    let setup = setup::run(connection, &target.rho).await?;
+    let stream = connection.daemon(&setup.socket).await?;
+    let (client, notifications, hello) =
+        handshake(connection.host(), &setup.socket, stream, hello).await?;
     let machine = Machine {
         environment: setup.environment,
         home: Some(setup.home),
@@ -131,17 +142,65 @@ pub(crate) async fn connect(
     Ok((client, notifications, hello, machine))
 }
 
+/// Completes rho's handshake as `hello` over `stream`, a channel to the
+/// daemon at `socket` on `host`, within [`HANDSHAKE_DEADLINE`]. The
+/// channel lives as long as the client.
+///
+/// # Errors
+///
+/// Fails if the daemon doesn't answer; a daemon that answers with another
+/// protocol version says which side to update.
+async fn handshake(
+    host: &str,
+    socket: &str,
+    stream: ChannelStream<Msg>,
+    hello: ClientHello,
+) -> Result<(Client, Notifications, HelloResponse), DaemonError> {
+    match tokio::time::timeout(HANDSHAKE_DEADLINE, Client::handshake(stream, hello)).await {
+        Err(_) => Err(DaemonError::Unreachable(format!(
+            "the Rho daemon on {host} at {socket} didn't answer the handshake within {} s",
+            HANDSHAKE_DEADLINE.as_secs()
+        ))),
+        Ok(Ok(connected)) => Ok(connected),
+        // The daemon answered; its message names the side to update.
+        Ok(Err(error @ (ClientError::VersionMismatch(_) | ClientError::Rpc { .. }))) => {
+            Err(error.into())
+        }
+        Ok(Err(error)) => Err(DaemonError::Unreachable(format!(
+            "couldn't reach the Rho daemon on {host} at {socket}: {error}"
+        ))),
+    }
+}
+
+/// Runs `work`, which reads files, on Tokio's blocking threads, so the
+/// I/O runtime's one worker, which every daemon socket shares, never
+/// waits on the disk. Call it on the I/O runtime.
+///
+/// # Errors
+///
+/// [`DaemonError::Closed`] if `work` panicked.
+async fn read_files<T, F>(work: F) -> Result<T, DaemonError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| DaemonError::Closed)
+}
+
 /// The ssh connection to one remote machine, shared by its daemon
-/// connection and every script run there. Links are equal when they share
-/// a connection.
+/// connection and every script run there. The connection stays open
+/// while any link to it does, and 10 minutes after. Links are equal when
+/// they share a connection.
 #[derive(Clone)]
 pub struct SshLink {
-    connection: Arc<Connection>,
+    lease: Arc<Lease>,
 }
 
 impl PartialEq for SshLink {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.connection, &other.connection)
+        Arc::ptr_eq(self.lease.connection(), other.lease.connection())
     }
 }
 
@@ -150,7 +209,7 @@ impl Eq for SshLink {}
 impl std::fmt::Debug for SshLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SshLink")
-            .field("host", &self.connection.host())
+            .field("host", &self.lease.connection().host())
             .finish_non_exhaustive()
     }
 }
@@ -193,8 +252,8 @@ impl SshLink {
     }
 
     /// Runs [`script::run`] on the I/O runtime, with `args` set as the
-    /// script's positional parameters. Dropping the future stops the
-    /// script.
+    /// script's positional parameters, and words how it failed. Dropping
+    /// the future stops the script.
     async fn spawn_script(
         &self,
         script: &str,
@@ -208,8 +267,23 @@ impl SshLink {
         }
         input.push(b'\n');
         input.extend(script.as_bytes());
-        let connection = Arc::clone(&self.connection);
-        on_io(async move { script::run(&connection, &input, deadline).await }).await?
+        let lease = Arc::clone(&self.lease);
+        let ran = on_io(async move { script::run(lease.connection(), &input, deadline).await });
+        let host = self.lease.connection().host();
+        ran.await?.map_err(|error| {
+            let why = match error {
+                ScriptError::Session(error) => return error,
+                ScriptError::TimedOut(deadline) => {
+                    format!("a script on {host} ran past {} s", deadline.as_secs())
+                }
+                ScriptError::Cut => format!("the connection to {host} closed while a script ran"),
+                ScriptError::Refused => {
+                    format!("a script on {host} failed: sshd refused to run sh")
+                }
+                ScriptError::Failed(why) => format!("a script on {host} failed: {why}"),
+            };
+            DaemonError::Unreachable(why)
+        })
     }
 
     /// The program and arguments of an `ssh` that runs the user's login
@@ -239,7 +313,7 @@ impl SshLink {
         .collect();
         args.extend([
             "-tt".into(),
-            self.connection.host().into(),
+            self.lease.connection().host().into(),
             platform::path_from_bytes(&remote).into_os_string(),
         ]);
         (config::ssh_program(), args)

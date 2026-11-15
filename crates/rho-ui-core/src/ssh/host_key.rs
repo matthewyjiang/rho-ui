@@ -1,19 +1,23 @@
 //! Checking a host's key against the user's `known_hosts` files, as OpenSSH
 //! does with `StrictHostKeyChecking yes`: rho-ui has no terminal to ask
 //! whether to trust a new key in, so a key that isn't there stops the
-//! connection, and rho-ui never writes the files.
+//! connection, and rho-ui never writes the files. A key in the
+//! `RevokedHostKeys` file stops it too. rho-ui checks plain host keys
+//! only, not host certificates.
 
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 use base64::Engine as _;
 use russh::{
-    keys::{Algorithm, PublicKey},
+    client,
+    keys::{Algorithm, PublicKey, PublicKeyOrCertificate},
     Preferred,
 };
 
-use super::config::Resolved;
+use super::{config::Resolved, quote};
 
-/// A key the `known_hosts` files list for the host, and where.
+/// A key the `known_hosts` files list for the host, or the
+/// `RevokedHostKeys` file lists, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct KnownKey {
     key: PublicKey,
@@ -23,32 +27,39 @@ pub(super) struct KnownKey {
     line: usize,
 }
 
-/// What a `known_hosts` line says of its key.
+/// What a line says of its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Listing {
     /// The host's key: a plain line.
     Trusted,
-    /// Never the host's key: a line marked `@revoked`.
+    /// Never the host's key: a line marked `@revoked`, or one of the
+    /// `RevokedHostKeys` file.
     Revoked,
+    /// A certificate authority that vouches for the host's certificates:
+    /// a line marked `@cert-authority`.
+    Authority,
 }
 
 /// Whether the host's key is the one the files list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Verdict {
+enum Verdict {
     /// It is.
     Known,
     /// The files list no key of its kind for the host.
     Unknown,
     /// They list another key of its kind for the host, here.
     Changed { file: PathBuf, line: usize },
-    /// They mark it `@revoked`, here.
+    /// They mark it revoked, here.
     Revoked { file: PathBuf, line: usize },
+    /// They list none of its keys, but a certificate authority for it,
+    /// here, and rho-ui doesn't check host certificates.
+    Certified { file: PathBuf, line: usize },
 }
 
 impl Verdict {
     /// Why rho-ui won't connect to `host`, filed under `name` in
     /// `known_hosts`, with a key of this verdict; `None` when it will.
-    pub(super) fn refusal(&self, host: &str, name: &str) -> Option<String> {
+    fn refusal(&self, host: &str, name: &str) -> Option<String> {
         match self {
             Self::Known => None,
             Self::Unknown => Some(format!(
@@ -58,21 +69,88 @@ impl Verdict {
             Self::Changed { file, line } => Some(format!(
                 "{host}'s host key differs from the one in {}:{line}. Someone may be \
                  intercepting the connection; if you know the key changed, remove the old one \
-                 with `ssh-keygen -R {name}` and accept the new one with `ssh {host}` in a \
+                 with `ssh-keygen -R {}` and accept the new one with `ssh {host}` in a \
                  terminal",
-                file.display()
+                file.display(),
+                quote(name)
             )),
             Self::Revoked { file, line } => Some(format!(
                 "{host}'s host key is marked revoked in {}:{line}",
+                file.display()
+            )),
+            Self::Certified { file, line } => Some(format!(
+                "{host}'s host key isn't in your known_hosts, which vouches for it only through \
+                 the certificate authority in {}:{line}, and rho-ui doesn't check host \
+                 certificates yet: it needs the host's own key in known_hosts",
                 file.display()
             )),
         }
     }
 }
 
+/// Checks the host's key against what the files list while the
+/// connection opens. russh's client handler.
+pub(super) struct Verifier {
+    host: String,
+    /// The name the host is filed under in `known_hosts`.
+    name: String,
+    known: Vec<KnownKey>,
+}
+
+/// Why a connection didn't open.
+#[derive(Debug)]
+pub(super) enum Refusal {
+    /// ssh failed, as russh says.
+    Ssh(russh::Error),
+    /// rho-ui won't take the host's key; why, for people.
+    HostKey(String),
+}
+
+impl From<russh::Error> for Refusal {
+    fn from(error: russh::Error) -> Self {
+        Self::Ssh(error)
+    }
+}
+
+impl Verifier {
+    /// Checks `host`'s key, reached as `resolved` says, against `known`.
+    pub(super) fn new(host: &str, resolved: &Resolved, known: Vec<KnownKey>) -> Self {
+        Self {
+            host: host.to_owned(),
+            name: lookup_name(resolved),
+            known,
+        }
+    }
+
+    /// Whether the host's key is one the files name for it.
+    fn check(&self, server_public_key: &PublicKeyOrCertificate) -> Result<bool, Refusal> {
+        let PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
+            return Err(Refusal::HostKey(format!(
+                "{} offered a host certificate, and rho-ui checks only plain host keys",
+                self.host
+            )));
+        };
+        match verdict(&self.known, key).refusal(&self.host, &self.name) {
+            None => Ok(true),
+            Some(why) => Err(Refusal::HostKey(why)),
+        }
+    }
+}
+
+impl client::Handler for Verifier {
+    type Error = Refusal;
+
+    fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKeyOrCertificate,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        std::future::ready(self.check(server_public_key))
+    }
+}
+
 /// The name `resolved`'s host is filed under in `known_hosts`: its
 /// `HostKeyAlias`, else its hostname, as `[hostname]:port` off port 22.
-pub(super) fn lookup_name(resolved: &Resolved) -> String {
+fn lookup_name(resolved: &Resolved) -> String {
     match &resolved.host_key_alias {
         Some(alias) => alias.to_ascii_lowercase(),
         None if resolved.port == 22 => resolved.hostname.to_ascii_lowercase(),
@@ -84,11 +162,19 @@ pub(super) fn lookup_name(resolved: &Resolved) -> String {
     }
 }
 
-/// The keys `resolved`'s `known_hosts` files list for its host. A file
-/// that can't be read lists none, as for ssh.
-pub(super) fn read(resolved: &Resolved) -> Vec<KnownKey> {
+/// The keys `resolved`'s `known_hosts` files list for its host, and those
+/// its `RevokedHostKeys` file lists. A `known_hosts` file that can't be
+/// read lists none, as for ssh, and so does a `RevokedHostKeys` file that
+/// isn't there. Reads the files, so runs off the I/O runtime.
+///
+/// # Errors
+///
+/// Fails, saying why, when the `RevokedHostKeys` file can't be read or
+/// isn't a text list of keys, such as a binary KRL: rho-ui won't connect
+/// without checking it.
+pub(super) fn read(resolved: &Resolved) -> Result<Vec<KnownKey>, String> {
     let name = lookup_name(resolved);
-    resolved
+    let mut known: Vec<KnownKey> = resolved
         .known_hosts
         .iter()
         .flat_map(|file| {
@@ -102,6 +188,56 @@ pub(super) fn read(resolved: &Resolved) -> Vec<KnownKey> {
                     line,
                 })
         })
+        .collect();
+    if let Some(file) = &resolved.revoked_host_keys {
+        let refused = |why: String| {
+            format!(
+                "rho-ui can't check {}, your RevokedHostKeys: {why}. It reads a text list of \
+                 public keys, not a KRL, and won't connect without checking",
+                file.display()
+            )
+        };
+        match std::fs::read(file) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(refused(error.to_string())),
+            Ok(bytes) => known.extend(revoked(&bytes).map_err(refused)?.into_iter().map(
+                |(line, key)| KnownKey {
+                    key,
+                    listing: Listing::Revoked,
+                    file: file.clone(),
+                    line,
+                },
+            )),
+        }
+    }
+    Ok(known)
+}
+
+/// The keys a `RevokedHostKeys` file in text lists, with their line
+/// numbers: one public key a line, blank lines and `#` comments skipped.
+///
+/// # Errors
+///
+/// Says why when the file is a binary key revocation list (KRL), or a line
+/// isn't a key: OpenSSH fails a check of either it can't read.
+fn revoked(bytes: &[u8]) -> Result<Vec<(usize, PublicKey)>, String> {
+    /// How a KRL starts (OpenSSH's `PROTOCOL.krl`).
+    const KRL_MAGIC: &[u8] = b"SSHKRL\n\0";
+    if bytes.starts_with(KRL_MAGIC) {
+        return Err("it is a key revocation list (KRL)".to_owned());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "it isn't text".to_owned())?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .map(|(index, line)| {
+            PublicKey::from_openssh(line.trim())
+                .map(|key| (index + 1, key))
+                .map_err(|_| format!("line {} isn't a public key", index + 1))
+        })
         .collect()
 }
 
@@ -109,8 +245,7 @@ pub(super) fn read(resolved: &Resolved) -> Vec<KnownKey> {
 /// line numbers: lines of `[marker] patterns keytype base64 [comment]`.
 /// The patterns are a comma-separated list that may hold `*`, `?` and
 /// negations (`!pattern`), or one hashed name (`|1|salt|hash`). Lines
-/// marked `@cert-authority` are left out, as rho-ui takes no host
-/// certificates, and so are lines whose key doesn't parse.
+/// whose key doesn't parse are left out.
 fn entries(text: &str, name: &str) -> Vec<(usize, Listing, PublicKey)> {
     text.lines()
         .enumerate()
@@ -119,6 +254,7 @@ fn entries(text: &str, name: &str) -> Vec<(usize, Listing, PublicKey)> {
             let first = fields.next()?;
             let (listing, patterns) = match first {
                 "@revoked" => (Listing::Revoked, fields.next()?),
+                "@cert-authority" => (Listing::Authority, fields.next()?),
                 marker if marker.starts_with('@') || marker.starts_with('#') => return None,
                 patterns => (Listing::Trusted, patterns),
             };
@@ -180,24 +316,33 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
 /// lists for it. A host that holds keys of several kinds offers one, so a
 /// key of another kind than those listed is unknown, not changed; and a
 /// host may have two keys of one kind listed, as when its key is rotated.
-pub(super) fn verdict(known: &[KnownKey], offered: &PublicKey) -> Verdict {
+/// A host the files vouch for only through a certificate authority is
+/// [`Verdict::Certified`] rather than unknown or changed.
+fn verdict(known: &[KnownKey], offered: &PublicKey) -> Verdict {
     let same = |known: &&KnownKey| known.key.key_data() == offered.key_data();
-    let trusted = |known: &&KnownKey| known.listing == Listing::Trusted;
-    if let Some(revoked) = known
-        .iter()
-        .find(|known| known.listing == Listing::Revoked && same(known))
-    {
+    let listed = |listing: Listing| move |known: &&KnownKey| known.listing == listing;
+    if let Some(revoked) = known.iter().filter(listed(Listing::Revoked)).find(same) {
         return Verdict::Revoked {
             file: revoked.file.clone(),
             line: revoked.line,
         };
     }
-    if known.iter().filter(trusted).any(|known| same(&known)) {
+    if known
+        .iter()
+        .filter(listed(Listing::Trusted))
+        .any(|known| same(&known))
+    {
         return Verdict::Known;
+    }
+    if let Some(authority) = known.iter().find(listed(Listing::Authority)) {
+        return Verdict::Certified {
+            file: authority.file.clone(),
+            line: authority.line,
+        };
     }
     match known
         .iter()
-        .filter(trusted)
+        .filter(listed(Listing::Trusted))
         .find(|known| known.key.algorithm() == offered.algorithm())
     {
         Some(other) => Verdict::Changed {
@@ -261,7 +406,7 @@ mod tests {
             line("[box]:2222", &ed),
             HASHED.to_owned(),
             format!("@revoked {}", line("box", &ed)),
-            format!("@cert-authority {}", line("*", &ed)),
+            format!("@cert-authority {}", line("*.example.org", &ed)),
             "box ssh-ed25519 not-base64".to_owned(),
         ]
         .join("\n");
@@ -273,8 +418,11 @@ mod tests {
         };
         assert_eq!(lines("box"), [(2, Listing::Trusted), (6, Listing::Revoked)]);
         assert_eq!(lines("10.0.0.7"), [(2, Listing::Trusted)]);
-        assert_eq!(lines("good.example.org"), [(3, Listing::Trusted)]);
-        assert_eq!(lines("bad.example.org"), []);
+        assert_eq!(
+            lines("good.example.org"),
+            [(3, Listing::Trusted), (7, Listing::Authority)]
+        );
+        assert_eq!(lines("bad.example.org"), [(7, Listing::Authority)]);
         assert_eq!(lines("[box]:2222"), [(4, Listing::Trusted)]);
         assert_eq!(lines("example.com"), [(5, Listing::Trusted)]);
         assert_eq!(lines("other"), []);
@@ -328,9 +476,42 @@ mod tests {
                     line: 2,
                 },
             ),
+            (
+                "vouched for only by a certificate authority",
+                vec![
+                    at(1, Listing::Trusted, &other_ed),
+                    at(2, Listing::Authority, &ecdsa),
+                ],
+                Verdict::Certified {
+                    file: PathBuf::from("/kh"),
+                    line: 2,
+                },
+            ),
         ];
         for (case, known, expected) in cases {
             assert_eq!(verdict(&known, &ed), expected, "{case}");
+        }
+    }
+
+    /// A `RevokedHostKeys` file is read only as a text list of keys; one
+    /// that isn't, as a binary KRL, fails, so the check doesn't pass open.
+    #[test]
+    fn revoked_host_keys_read_a_text_list_and_refuse_anything_else() {
+        let ed = key(Algorithm::Ed25519);
+        let text = format!(
+            "# revoked\n\n{}\n",
+            ed.to_openssh().expect("an OpenSSH key")
+        );
+        let listed = revoked(text.as_bytes()).expect("a text list");
+        assert_eq!(listed, [(3, ed)]);
+        for (case, bytes) in [
+            ("a KRL", b"SSHKRL\n\0\x01\x02".to_vec()),
+            (
+                "a line that isn't a key",
+                b"ssh-ed25519 not-base64\n".to_vec(),
+            ),
+        ] {
+            assert!(revoked(&bytes).is_err(), "{case}");
         }
     }
 

@@ -9,16 +9,17 @@ use serde::Deserialize;
 use super::{
     connection::Connection,
     quote,
-    script::{self, Ending},
+    script::{self, ScriptError},
 };
 use crate::{daemon::DaemonError, rho_install::find_rho_sh};
 
-/// How long the setup script may take on the host. Through OpenSSH's
-/// master, a whole connect to localhost, setup included, took 29 ms with
-/// the daemon running; `rho daemon start` with none running took 20 ms (5
-/// runs), and `zsh -l -c env` over a fresh ssh connection 2.1 s. 30 s is
-/// far past those: it catches a login profile that waits for input or a
-/// home directory that hangs.
+/// How long the setup script may take on the host. Over an ssh connection
+/// already open (OpenSSH's `ControlMaster`, measured before rho-ui had a
+/// client of its own), a whole connect to localhost, setup included, took
+/// 29 ms with the daemon running; `rho daemon start` with none running
+/// took 20 ms (5 runs), and `zsh -l -c env` over a fresh ssh connection
+/// 2.1 s. 30 s is far past those: it catches a login profile that waits
+/// for input or a home directory that hangs.
 const SETUP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The line the setup script prints before the login environment, so
@@ -52,23 +53,29 @@ pub(super) struct Setup {
 pub(super) async fn run(connection: &Connection, rho: &str) -> Result<Setup, DaemonError> {
     let host = connection.host();
     let script = setup_script(rho);
-    let output = tokio::time::timeout(SETUP_DEADLINE, script::sh(connection, script.as_bytes()))
+    let stdout = script::run(connection, script.as_bytes(), Some(SETUP_DEADLINE))
         .await
-        .map_err(|_| {
-            DaemonError::Unreachable(format!(
-                "{host} didn't finish starting rho within {} s: check that a login shell \
-                 there starts without waiting for input",
-                SETUP_DEADLINE.as_secs()
-            ))
-        })??;
-    if let Some(why) = output.failure() {
-        return Err(DaemonError::Unreachable(if output.ending == Ending::Cut {
-            format!("the connection to {host} closed while starting rho there")
-        } else {
-            format!("couldn't start the Rho daemon on {host}: {why}")
-        }));
-    }
-    parse_setup(&String::from_utf8_lossy(&output.stdout)).map_err(|problem| {
+        .map_err(|error| {
+            let why = match error {
+                ScriptError::Session(error) => return error,
+                ScriptError::TimedOut(deadline) => format!(
+                    "{host} didn't finish starting rho within {} s: check that a login shell \
+                     there starts without waiting for input",
+                    deadline.as_secs()
+                ),
+                ScriptError::Cut => {
+                    format!("the connection to {host} closed while starting rho there")
+                }
+                ScriptError::Refused => {
+                    format!("couldn't start the Rho daemon on {host}: sshd refused to run sh")
+                }
+                ScriptError::Failed(why) => {
+                    format!("couldn't start the Rho daemon on {host}: {why}")
+                }
+            };
+            DaemonError::Unreachable(why)
+        })?;
+    parse_setup(&String::from_utf8_lossy(&stdout)).map_err(|problem| {
         DaemonError::Unreachable(format!("couldn't read {host}'s Rho setup: {problem}"))
     })
 }

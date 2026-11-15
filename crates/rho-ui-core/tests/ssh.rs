@@ -14,7 +14,9 @@ use smol::block_on;
 /// scripts after it with `sh`, to a fake daemon whose socket the machine's
 /// `rho daemon status --json` reports. Sessions get the machine's login
 /// environment, and scripts get their arguments as they are, quotes and
-/// bytes that aren't UTF-8 too.
+/// bytes that aren't UTF-8 too. Two connects at once, and one after both
+/// daemons are gone, share one ssh connection: one sign-in, which a key
+/// agent such as 1Password's would ask the user to approve.
 #[cfg(unix)]
 #[test]
 fn a_daemon_over_ssh_runs_sessions_in_the_machines_login_environment() {
@@ -45,10 +47,14 @@ fn a_daemon_over_ssh_runs_sessions_in_the_machines_login_environment() {
     );
     let sshd = FakeSshd::start(&home);
 
+    let target = sshd.target();
+    let connect = || Daemon::connect(DaemonTarget::Ssh(target.clone()));
     block_on(async {
-        let (daemon, _events) = Daemon::connect(DaemonTarget::Ssh(sshd.target()))
-            .await
-            .expect("the fake daemon answers over the fake sshd");
+        let (first, second) = futures::join!(connect(), connect());
+        let (daemon, _events) = first.expect("the fake daemon answers over the fake sshd");
+        let (other, _other_events) = second.expect("a second connect at once");
+        assert_eq!(daemon.ssh(), other.ssh(), "one connection for both");
+        drop(other);
         assert_eq!(daemon.info().home(), Some(home.as_path()));
         let ssh = daemon.ssh().expect("a remote daemon's ssh link");
         let args = [
@@ -74,7 +80,11 @@ fn a_daemon_over_ssh_runs_sessions_in_the_machines_login_environment() {
             .new_session(Path::new("/w/a"), Checkout::Local)
             .await
             .expect("a new session");
+        drop(daemon);
+        // Nothing holds the connection now; it lingers for the next.
+        connect().await.expect("a connect after both daemons went");
     });
+    assert_eq!(sshd.sign_ins(), 1, "one connection, made once");
     assert_eq!(
         fake.new_session_var("RHO_UI_REMOTE").as_deref(),
         Some("from the login\nprofile")
@@ -110,7 +120,7 @@ fn a_host_key_not_in_known_hosts_stops_the_connection_before_signing_in() {
     let changed = refusal(sshd.target_with(HostKey::Changed, &[ClientKey::Accepted]));
     let line = format!("{}:2", sshd.known_hosts(HostKey::Changed).display());
     assert!(changed.contains(&line), "{changed}");
-    assert_eq!(sshd.sign_ins(), 0, "no key went to an unverified host");
+    assert_eq!(sshd.key_offers(), 0, "no key went to an unverified host");
 }
 
 /// With no key the host accepts, signing in fails, and names a key file
@@ -123,7 +133,11 @@ fn signing_in_with_no_accepted_key_names_the_key_that_needs_a_passphrase() {
         refusal(sshd.target_with(HostKey::Known, &[ClientKey::Refused, ClientKey::Encrypted]));
     let encrypted = sshd.key_file(ClientKey::Encrypted).display().to_string();
     assert!(why.contains(&format!("ssh-add {encrypted}")), "{why}");
-    assert_eq!(sshd.sign_ins(), 1, "the refused key, not the encrypted one");
+    assert_eq!(
+        sshd.key_offers(),
+        1,
+        "the refused key, not the encrypted one"
+    );
 }
 
 /// Connects twice to the daemon on `$RHO_UI_LIVE_SSH`, an ssh destination
