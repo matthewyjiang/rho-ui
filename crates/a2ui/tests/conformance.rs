@@ -8,6 +8,7 @@ use a2ui::{
     parse_template, resolve_path, DataContext, DataModel, Expr, ExpressionError, FunctionError,
     Functions, Pointer, WatchId,
 };
+use a2ui::{validate_common_type, Catalog, CatalogError, CatalogValidator, Derivation, Entry};
 use serde_json::{json, Map, Value};
 
 /// Cases the harness cannot express in Rust, with the reason. A case here is
@@ -440,4 +441,515 @@ fn check_notified(
     } else {
         Err(format!("notified {got:?}, want {want:?}"))
     }
+}
+
+/// Cases each catalog suite leaves out because they target a protocol version
+/// before 1.0. A vendor refresh that changes them fails here, to be checked.
+const FILTERED_CATALOG: usize = 26;
+const FILTERED_COMMON_TYPES: usize = 10;
+const FILTERED_AGENT_TO_RENDERER: usize = 3;
+
+/// The protocol version a case targets: its own `protocolVersion`, else its
+/// catalog's, else the spec's default for a catalog that declares none.
+fn case_version(case: &Value) -> String {
+    let declared = case
+        .get("protocolVersion")
+        .or_else(|| case.get("catalog")?.get("protocolVersion"))
+        .cloned()
+        .or_else(|| {
+            let path = case.get("catalogPath")?.as_str()?;
+            read_vendored(path).get("protocolVersion").cloned()
+        });
+    match declared {
+        Some(Value::String(version)) => version,
+        None => "0.9".to_owned(),
+        Some(other) => panic!(
+            "{}: protocolVersion {other} is not a string",
+            case_name(case)
+        ),
+    }
+}
+
+/// Runs the cases of `file` that target v1.0, collecting failures, and
+/// asserts how many it left out.
+fn run_v10_suite(file: &str, filtered: usize, run: fn(&Value) -> Result<(), String>) {
+    let mut failures = Vec::new();
+    let mut left_out = 0;
+    for case in load_suite(file) {
+        let name = case_name(&case);
+        match case_version(&case).as_str() {
+            "1.0" => {}
+            "0.9" | "v0.8" | "v0.9" | "v0.9.1" => {
+                left_out += 1;
+                continue;
+            }
+            other => panic!("{name}: unknown protocol version {other:?}"),
+        }
+        if is_skipped(name) {
+            continue;
+        }
+        if let Err(reason) = run(&case) {
+            failures.push(format!("{name}: {reason}"));
+        }
+    }
+    assert_no_failures(file, &failures);
+    assert_eq!(left_out, filtered, "{file}: cases left out as pre-1.0");
+}
+
+fn read_vendored(path: &str) -> Value {
+    let full = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("vendor/a2ui")
+        .join(path);
+    let text = fs::read_to_string(&full).unwrap_or_else(|e| {
+        panic!(
+            "reading {}: {e} (is it in vendor/a2ui/FILES?)",
+            full.display()
+        )
+    });
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parsing {}: {e}", full.display()))
+}
+
+/// Fails on a key of `object` that `known` does not list, so that a suite
+/// refresh adding an expectation is not silently ignored.
+fn check_keys(object: &Value, known: &[&str]) -> Result<(), String> {
+    let map = object.as_object().ok_or("expectation is not an object")?;
+    match map.keys().find(|key| !known.contains(&key.as_str())) {
+        Some(key) => Err(format!("unknown expectation key {key:?}")),
+        None => Ok(()),
+    }
+}
+
+/// `value` with `enum` and `required` lists sorted, which the suites compare
+/// as sets. Object key order never matters to `Value` equality.
+fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    let mut child = canonical(child);
+                    if let (true, Value::Array(items)) =
+                        (key == "enum" || key == "required", &mut child)
+                    {
+                        items.sort_by_key(ToString::to_string);
+                    }
+                    (key.clone(), child)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
+fn same(got: &Value, want: &Value, what: &str) -> Result<(), String> {
+    if canonical(got) == canonical(want) {
+        Ok(())
+    } else {
+        Err(format!("{what} differs:\n got: {got}\nwant: {want}"))
+    }
+}
+
+/// The suite's error category for a catalog error. Every variant is listed,
+/// so a new one needs a decision.
+fn catalog_error_category(error: &CatalogError) -> &'static str {
+    match error {
+        CatalogError::InvalidMetadataKey { .. } => "ValidationError",
+        CatalogError::NotAnObject
+        | CatalogError::MissingId
+        | CatalogError::InvalidField { .. }
+        | CatalogError::UnsupportedVersion(_)
+        | CatalogError::InvalidEntry { .. }
+        | CatalogError::InvalidComponentName(_)
+        | CatalogError::ReservedComponent
+        | CatalogError::InvalidPropertyName { .. }
+        | CatalogError::InvalidComposition { .. }
+        | CatalogError::InvalidMetadata { .. }
+        | CatalogError::InvalidFunctionName(_)
+        | CatalogError::InvalidArgumentName { .. }
+        | CatalogError::InvalidReturnType(_)
+        | CatalogError::InvalidCallers(_)
+        | CatalogError::InvalidActivation(_)
+        | CatalogError::ActivationByAgent(_)
+        | CatalogError::ExternalRef { .. }
+        | CatalogError::UnresolvedRef { .. }
+        | CatalogError::InvalidSchema { .. }
+        | CatalogError::UnknownEntry { .. } => "CatalogError",
+    }
+}
+
+/// Checks the outcome of a step that `expectError` may say must fail.
+fn check_outcome<T>(case: &Value, outcome: Result<T, CatalogError>) -> Result<Option<T>, String> {
+    match (outcome, case.get("expectError")) {
+        (Ok(value), None) => Ok(Some(value)),
+        (Err(error), Some(expected)) => {
+            let got = catalog_error_category(&error);
+            if expected["category"] == got {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "failed with {got} ({error}), want {}",
+                    expected["category"]
+                ))
+            }
+        }
+        (Ok(_), Some(expected)) => Err(format!("succeeded, want {}", expected["category"])),
+        (Err(error), None) => Err(format!("failed: {error}")),
+    }
+}
+
+/// The catalog document a case loads, with the id and version the case
+/// supplies for a document that lacks them.
+fn case_document(case: &Value) -> Value {
+    let mut document = match (case.get("catalog"), case.get("catalogPath")) {
+        (Some(inline), None) => inline.clone(),
+        (None, Some(Value::String(path))) => read_vendored(path),
+        _ => panic!("{}: needs one of catalog and catalogPath", case_name(case)),
+    };
+    let map = document
+        .as_object_mut()
+        .expect("a catalog document is an object");
+    if let Some(id) = case.get("catalogId") {
+        map.insert("catalogId".to_owned(), id.clone());
+    }
+    if let Some(version) = case.get("protocolVersion") {
+        map.entry("protocolVersion")
+            .or_insert_with(|| version.clone());
+    }
+    document
+}
+
+#[test]
+fn catalog_suite() {
+    run_v10_suite("catalog.yaml", FILTERED_CATALOG, |case| {
+        match case["action"].as_str().ok_or("no action")? {
+            "from_json" => run_from_json(case),
+            "to_json" => run_to_json(case),
+            "round_trip" => run_round_trip(case),
+            "validation_schema" => run_validation_schema(case),
+            "derive" => run_derive(case),
+            other => Err(format!("unknown action {other:?}")),
+        }
+    });
+}
+
+fn run_from_json(case: &Value) -> Result<(), String> {
+    let Some(catalog) = check_outcome(case, Catalog::from_json(case_document(case)))? else {
+        return Ok(());
+    };
+    let Some(expect) = case.get("expect") else {
+        return Ok(());
+    };
+    check_keys(
+        expect,
+        &[
+            "catalogId",
+            "protocolVersion",
+            "components",
+            "functions",
+            "theme",
+            "matchesBuiltinCatalog",
+            "selfContained",
+            "validComponents",
+            "invalidComponents",
+            "componentMetadata",
+        ],
+    )?;
+    let document = catalog.to_json();
+    if let Some(id) = expect.get("catalogId") {
+        same(&Value::from(catalog.id()), id, "catalogId")?;
+    }
+    if let Some(version) = expect.get("protocolVersion") {
+        same(
+            &Value::from(catalog.protocol_version()),
+            version,
+            "protocolVersion",
+        )?;
+    }
+    for kind in ["components", "functions", "theme"] {
+        if let Some(want) = expect.get(kind) {
+            check_entries(&document, kind, want)?;
+        }
+    }
+    if expect["matchesBuiltinCatalog"] == true {
+        check_matches_basic(&catalog)?;
+    }
+    if expect["selfContained"] == true {
+        check_self_contained(&catalog.validation_schema())?;
+    }
+    if let Some(metadata) = expect.get("componentMetadata") {
+        for (name, want) in metadata
+            .as_object()
+            .ok_or("componentMetadata is not a map")?
+        {
+            let def = catalog
+                .component(name)
+                .ok_or(format!("no component {name}"))?;
+            let got = def.metadata().cloned().map_or(Value::Null, Value::Object);
+            same(&got, want, &format!("{name} metadata"))?;
+        }
+    }
+    let valid = expect.get("validComponents").and_then(Value::as_array);
+    let invalid = expect.get("invalidComponents").and_then(Value::as_array);
+    if valid.is_some() || invalid.is_some() {
+        let validator = CatalogValidator::new(&catalog).map_err(|e| e.to_string())?;
+        for instance in valid.into_iter().flatten() {
+            validator
+                .validate_component(instance)
+                .map_err(|e| format!("{instance} is invalid: {e}"))?;
+        }
+        for instance in invalid.into_iter().flatten() {
+            if validator.validate_component(instance).is_ok() {
+                return Err(format!("{instance} is valid, want invalid"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks a top-level part of a catalog document: for `components` and
+/// `functions`, exactly the names `want` lists, or exactly its map of
+/// definitions.
+fn check_entries(document: &Value, kind: &str, want: &Value) -> Result<(), String> {
+    let got = document.get(kind).cloned().unwrap_or(Value::Null);
+    if kind == "theme" {
+        return same(&got, want, kind);
+    }
+    let mut names: Vec<&String> = got
+        .as_object()
+        .map(|map| map.keys().collect())
+        .unwrap_or_default();
+    names.sort();
+    match want {
+        Value::Array(list) => {
+            let mut wanted: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
+            wanted.sort_unstable();
+            if names
+                .iter()
+                .map(|name| name.as_str())
+                .eq(wanted.iter().copied())
+            {
+                Ok(())
+            } else {
+                Err(format!("{kind} are {names:?}, want {wanted:?}"))
+            }
+        }
+        Value::Object(_) => same(&got, want, kind),
+        other => Err(format!(
+            "{kind} expectation {other} is neither a list nor a map"
+        )),
+    }
+}
+
+/// The loaded catalog is equivalent to the crate's own basic catalog, as far
+/// as declarations go: function implementations are not catalogs' business.
+fn check_matches_basic(catalog: &Catalog) -> Result<(), String> {
+    let basic = Catalog::basic();
+    let same_declarations = catalog.id() == basic.id()
+        && catalog.protocol_version() == basic.protocol_version()
+        && catalog.components().len() == basic.components().len()
+        && catalog.components().iter().all(|(name, def)| {
+            basic.component(name).is_some_and(|own| {
+                own.properties() == def.properties() && own.required() == def.required()
+            })
+        })
+        && catalog.functions().len() == basic.functions().len()
+        && catalog.functions().iter().all(|(name, def)| {
+            basic.function(name).is_some_and(|own| {
+                own.return_type() == def.return_type()
+                    && own.callers() == def.callers()
+                    && own.requires_user_activation() == def.requires_user_activation()
+            })
+        });
+    if same_declarations {
+        Ok(())
+    } else {
+        Err("differs from Catalog::basic()".to_owned())
+    }
+}
+
+/// Every `$ref` in `schema` is local and resolves within it, and there is
+/// at least one.
+fn check_self_contained(schema: &Value) -> Result<(), String> {
+    fn refs<'a>(node: &'a Value, found: &mut Vec<&'a str>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::String(reference)) = map.get("$ref") {
+                    found.push(reference);
+                }
+                map.values().for_each(|child| refs(child, found));
+            }
+            Value::Array(items) => items.iter().for_each(|child| refs(child, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    refs(schema, &mut found);
+    if found.is_empty() {
+        return Err("the validation schema has no $ref".to_owned());
+    }
+    for reference in found {
+        let resolves = reference
+            .strip_prefix('#')
+            .is_some_and(|pointer| schema.pointer(pointer).is_some());
+        if !resolves {
+            return Err(format!(
+                "$ref {reference:?} does not resolve within the validation schema"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_to_json(case: &Value) -> Result<(), String> {
+    if case["builtinCatalog"] != "basic" {
+        return Err(format!("unknown builtinCatalog {}", case["builtinCatalog"]));
+    }
+    let want = read_vendored(case["expectFile"].as_str().ok_or("no expectFile")?);
+    same(&Catalog::basic().to_json(), &want, "toJson")
+}
+
+fn run_round_trip(case: &Value) -> Result<(), String> {
+    let document = case_document(case);
+    let catalog = Catalog::from_json(document.clone()).map_err(|e| e.to_string())?;
+    let out = catalog.to_json();
+    same(&out, &document, "toJson")?;
+    let again = Catalog::from_json(out.clone()).map_err(|e| e.to_string())?;
+    same(&again.to_json(), &out, "second toJson")
+}
+
+fn run_validation_schema(case: &Value) -> Result<(), String> {
+    let catalog = Catalog::from_json(case_document(case)).map_err(|e| e.to_string())?;
+    let want = read_vendored(case["expectFile"].as_str().ok_or("no expectFile")?);
+    same(&catalog.validation_schema(), &want, "validationSchema")
+}
+
+fn run_derive(case: &Value) -> Result<(), String> {
+    let source = Catalog::from_json(case_document(case)).map_err(|e| e.to_string())?;
+    let args = &case["args"];
+    check_keys(
+        args,
+        &["catalogId", "components", "functions", "instructions"],
+    )?;
+    let derivation = Derivation {
+        catalog_id: args["catalogId"].as_str().ok_or("no catalogId")?.to_owned(),
+        components: derive_entries(args.get("components"))?,
+        functions: derive_entries(args.get("functions"))?,
+        instructions: args
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    };
+    let Some(derived) = check_outcome(case, source.derive(derivation))? else {
+        return Ok(());
+    };
+    let expect = case.get("expect").ok_or("no expect")?;
+    check_keys(
+        expect,
+        &[
+            "catalogId",
+            "protocolVersion",
+            "components",
+            "functions",
+            "theme",
+            "instructions",
+            "absentKeys",
+        ],
+    )?;
+    let document = derived.to_json();
+    for key in ["catalogId", "protocolVersion", "instructions"] {
+        if let Some(want) = expect.get(key) {
+            same(&document[key], want, key)?;
+        }
+    }
+    for kind in ["components", "functions", "theme"] {
+        if let Some(want) = expect.get(kind) {
+            check_entries(&document, kind, want)?;
+        }
+    }
+    for key in expect["absentKeys"].as_array().into_iter().flatten() {
+        let key = key.as_str().ok_or("absentKeys holds a non-string")?;
+        if document.get(key).is_some() {
+            return Err(format!("toJson has {key:?}, want it absent"));
+        }
+    }
+    Ok(())
+}
+
+/// `args.components` or `args.functions` of a derive case: a name keeps an
+/// entry, a map with one key defines one.
+fn derive_entries(entries: Option<&Value>) -> Result<Option<Vec<Entry>>, String> {
+    let Some(entries) = entries else {
+        return Ok(None);
+    };
+    let entries = entries.as_array().ok_or("derive entries are not a list")?;
+    entries
+        .iter()
+        .map(|entry| match entry {
+            Value::String(name) => Ok(Entry::Keep(name.clone())),
+            Value::Object(map) if map.len() == 1 => {
+                let (name, schema) = map.iter().next().expect("one key");
+                Ok(Entry::Define {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                })
+            }
+            other => Err(format!(
+                "derive entry {other} is neither a name nor a one-key map"
+            )),
+        })
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+#[test]
+fn common_types_suite() {
+    run_v10_suite(
+        "common_types.yaml",
+        FILTERED_COMMON_TYPES,
+        |case| match case["action"].as_str().ok_or("no action")? {
+            "common_types_schema" => {
+                let want = read_vendored(case["expectFile"].as_str().ok_or("no expectFile")?);
+                same(a2ui::common_types(), &want, "common types")
+            }
+            "validate_common_type" => run_validate_common_type(case),
+            other => Err(format!("unknown action {other:?}")),
+        },
+    );
+}
+
+fn run_validate_common_type(case: &Value) -> Result<(), String> {
+    let definition = case["definition"].as_str().ok_or("no definition")?;
+    let steps = case["steps"].as_array().ok_or("no steps")?;
+    for (n, step) in steps.iter().enumerate() {
+        let value = &step["value"];
+        match (
+            validate_common_type(definition, value),
+            step.get("expectError"),
+        ) {
+            (Ok(()), None) => {}
+            (Err(_), Some(expected)) if expected["category"] == "ValidationError" => {}
+            (Err(e), None) => return Err(format!("step {n}: {value} is invalid: {e}")),
+            (outcome, Some(expected)) => {
+                return Err(format!(
+                    "step {n}: {value} gave {outcome:?}, want {expected}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn agent_to_renderer_suite() {
+    run_v10_suite(
+        "agent_to_renderer.yaml",
+        FILTERED_AGENT_TO_RENDERER,
+        |case| match case["action"].as_str().ok_or("no action")? {
+            "agent_to_renderer_schema" => {
+                let want = read_vendored(case["expectFile"].as_str().ok_or("no expectFile")?);
+                same(a2ui::agent_to_renderer(), &want, "agent_to_renderer schema")
+            }
+            other => Err(format!("unknown action {other:?}")),
+        },
+    );
 }
