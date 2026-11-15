@@ -183,7 +183,7 @@ impl FakeSshd {
             identity_agent: IdentityAgent::Off,
             known_hosts: vec![self.known_hosts(host_key)],
             host_key_alias: None,
-            revoked_host_keys: None,
+            revoked_host_keys: Vec::new(),
         };
         SshTarget::routed(format!("fake-sshd-{}-{number}", self.port), route)
     }
