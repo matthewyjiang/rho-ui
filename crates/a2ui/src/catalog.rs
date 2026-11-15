@@ -241,6 +241,17 @@ pub enum CatalogError {
         /// The reference.
         reference: String,
     },
+    /// A definition is not a valid JSON Schema, found by
+    /// [`CatalogValidator::new`](crate::CatalogValidator::new).
+    #[error("{kind} {name:?} is not a valid JSON Schema: {message}")]
+    InvalidSchema {
+        /// What the entry is.
+        kind: EntryKind,
+        /// Its name.
+        name: String,
+        /// What the JSON Schema compiler reported.
+        message: String,
+    },
     /// [`Catalog::derive`] names an entry the source catalog lacks.
     #[error("catalog {catalog:?} has no {kind} {name:?} to derive from")]
     UnknownEntry {

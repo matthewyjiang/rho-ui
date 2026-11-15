@@ -5,7 +5,7 @@
 //! that Google publishes with A2UI, vendored under `vendor/a2ui`.
 //!
 //! [`Catalog`] loads a v1.0 catalog, the components and functions a surface
-//! may use.
+//! may use, and [`CatalogValidator`] checks component instances against one.
 
 mod basic_catalog;
 mod bundle;
@@ -21,6 +21,7 @@ mod regex_dialect;
 mod schema;
 mod shape;
 mod template;
+mod validate;
 
 pub use catalog::{
     Callers, Catalog, CatalogError, ComponentDef, Derivation, Entry, EntryKind, FunctionDef,
@@ -35,3 +36,4 @@ pub use pointer::{resolve_path, Pointer, PointerError};
 pub use regex_dialect::RegexError;
 pub use schema::{agent_to_renderer, common_types};
 pub use template::{parse_template, MAX_DEPTH, MAX_TEMPLATE_CHARS, MAX_TEMPLATE_PARTS};
+pub use validate::{validate_common_type, CatalogValidator, ValidationError, Violation};

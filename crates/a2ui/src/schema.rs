@@ -5,6 +5,9 @@ use std::sync::LazyLock;
 
 use serde_json::Value;
 
+/// The `$id` of the published v1.0 common types.
+pub(crate) const COMMON_TYPES_URI: &str = "https://a2ui.org/specification/v1_0/common_types.json";
+
 /// The published v1.0 basic catalog.
 pub(crate) const BASIC_CATALOG: &str =
     include_str!("../vendor/a2ui/catalogs/basic/v1/catalog.json");
