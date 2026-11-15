@@ -12,9 +12,11 @@ mod decompile;
 mod error;
 mod lexer;
 mod parser;
+mod prompt;
 mod signature;
 
 pub use error::{ErrorKind, ExpressError, Position};
+pub use prompt::{AllowedMessage, Framing, PromptOptions};
 
 use signature::{FunctionSignature, Signatures};
 

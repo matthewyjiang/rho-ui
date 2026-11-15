@@ -29,6 +29,7 @@ mod ident;
 mod message;
 mod pointer;
 mod processor;
+mod prune;
 mod regex_dialect;
 mod resolve;
 mod schema;
@@ -49,7 +50,10 @@ pub use component::{Accessibility, CheckRule, ChildList, Component, Live, Proper
 pub use data_context::{DataContext, UserActivation};
 pub use data_model::{DataError, DataModel, WatchId, MAX_LIST_INDEX};
 pub use expr::{Call, Expr, ExpressionError};
-pub use express::{ErrorKind, Express, ExpressError, Position, DEFAULT_SURFACE_ID};
+pub use express::{
+    AllowedMessage, ErrorKind, Express, ExpressError, Framing, Position, PromptOptions,
+    DEFAULT_SURFACE_ID,
+};
 pub use functions::{Args, Effect, Function, FunctionError, Functions};
 pub use ident::is_identifier;
 pub use message::{

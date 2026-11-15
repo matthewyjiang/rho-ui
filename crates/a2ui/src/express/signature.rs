@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
-use crate::catalog::{Callers, Catalog, EntryKind, FunctionDef};
+use crate::catalog::{Callers, Catalog, EntryKind, FunctionDef, ReturnType};
 use crate::schema;
 
 /// The bare names of the component envelope mixins. From v1.0 they travel
@@ -62,7 +62,6 @@ pub(crate) struct ComponentSignature {
     /// Envelope mixin names the component declares as ordinary properties
     /// of its own, which therefore travel bare.
     pub(crate) custom_envelope: BTreeSet<String>,
-    #[expect(dead_code, reason = "the prompt generator, a later step, reads it")]
     pub(crate) description: Option<String>,
     /// Each property's schema: the component's own definition wins over its
     /// mixins'.
@@ -72,12 +71,11 @@ pub(crate) struct ComponentSignature {
 #[derive(Debug, Clone)]
 pub(crate) struct FunctionSignature {
     pub(crate) params: Vec<String>,
-    #[expect(dead_code, reason = "the prompt generator, a later step, reads it")]
     pub(crate) required: Vec<String>,
-    #[expect(dead_code, reason = "the prompt generator, a later step, reads it")]
     pub(crate) description: Option<String>,
     pub(crate) callers: Callers,
     pub(crate) requires_user_activation: bool,
+    pub(crate) return_type: ReturnType,
     schemas: BTreeMap<String, Value>,
 }
 
@@ -555,6 +553,7 @@ impl FunctionSignature {
                 .map(str::to_owned),
             callers: def.map(FunctionDef::callers).unwrap_or_default(),
             requires_user_activation: def.is_some_and(FunctionDef::requires_user_activation),
+            return_type: def.map_or(ReturnType::Any, FunctionDef::return_type),
             schemas,
         }
     }
