@@ -9,10 +9,7 @@
 //! no way to find them; this bar uses slashes, and tests find each step.
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    h_flex, ActiveTheme as _, Sizable as _, StyledExt as _,
-};
+use gpui_kit::component::{h_flex, ActiveTheme as _, StyledExt as _};
 use gpui_kit::{
     div, rems, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
@@ -72,8 +69,8 @@ impl TitleBar {
         }
     }
 
-    /// Makes the project a button that starts a new session in it, which
-    /// `go` does.
+    /// Makes the project a link that starts a new session in it, which `go`
+    /// does.
     pub(crate) fn on_project(mut self, go: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_project = Some(Box::new(go));
         self
@@ -125,23 +122,22 @@ impl RenderOnce for TitleBar {
                     .child(shorten(&label));
                 [step.into_any_element(), slash().into_any_element()]
             });
+        // The same text with or without a click, so the bar reads alike in
+        // every pane; a link, as the steps after it are.
         let project = h_flex()
             .flex_shrink_0()
             .gap_2()
+            .text_color(muted)
             .child(Badge::new(self.initials, rems(BADGE_REMS)))
-            .child(div().text_color(muted).child(self.project.clone()));
+            .child(self.project.clone());
         let project = match self.on_project {
-            Some(go) => Button::new("title-project")
-                .ghost()
-                .small()
-                .flex_shrink_0()
-                // Back by the button's padding, so the badge stays in line
-                // with the bar's edge.
-                .ml(-rems(0.5))
-                .accessibility_label(format!("New session in {}", self.project))
-                .tooltip_with_action("New session", &crate::NewSession, Some("RhoApp"))
+            Some(go) => project
+                .id("title-project")
+                .test_support()
+                .aria_label(format!("New session in {}", self.project))
+                .cursor_pointer()
+                .hover(move |style| style.text_color(foreground))
                 .on_click(move |_, window, cx| go(window, cx))
-                .child(project)
                 .into_any_element(),
             None => project.into_any_element(),
         };
