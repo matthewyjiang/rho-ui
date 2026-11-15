@@ -64,6 +64,7 @@ use crate::{
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
     usage::UsageRing,
+    work::Disclosure,
     workspaces::WorkspaceRef,
     StopTurn,
 };
@@ -142,6 +143,8 @@ pub(crate) struct SessionView {
     reported: (String, Activity),
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
+    /// Whether the agent's todo list above the composer is open.
+    plan: Disclosure,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
     /// For a subagent's session, redraws the title bar as the sessions
@@ -225,6 +228,7 @@ impl SessionView {
             waiting_since: None,
             reported: (String::new(), Activity::Idle),
             error: None,
+            plan: Disclosure::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             _above: Vec::new(),
@@ -1051,7 +1055,15 @@ impl SessionView {
                 this.child(card.clone())
             })
             .children(self.render_background(cx))
-            .children(PlanList::new(self.session.plan()))
+            .children(PlanList::new(self.session.plan(), self.plan, {
+                let view = cx.entity().downgrade();
+                move |_, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.plan.toggle();
+                        cx.notify();
+                    });
+                }
+            }))
             .children(self.render_steers(cx))
             .children(self.render_held(cx))
             .child(

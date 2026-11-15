@@ -12,7 +12,7 @@ Type `/` at the start of a message, or `$` anywhere in it, and a menu above the 
 
 While a turn runs, its header under the prompt counts up ("Working for 38s"), and says what holds the turn up when the daemon reports it: "compacting the context" while rho compacts it, or why the provider is being asked again and when, as in "rate limited, retrying in 12s". If the provider throws away a reply it was streaming, what had arrived of it leaves the transcript, thoughts and all, and the retry's reply takes its place.
 
-When the agent keeps a plan, its steps show above the composer under "Plan 2 of 5": done steps struck through, the step under way in bold. It scrolls past about seven steps, and goes once every step is done.
+When the agent keeps a plan, "Todo 2 of 5" shows above the composer. It starts folded; a click opens its steps: done steps struck through, the step under way in bold. It scrolls past about seven steps, and goes once every step is done.
 
 While a turn runs, Enter in the composer steers it: the text joins the turn's next model request. Until the model reads it, it waits above the composer, where you can take it back. A message the turn can't take (it waits on an answer, or the daemon had just begun a turn of its own) waits above the composer too, and goes as the next prompt once the turn ends.
 

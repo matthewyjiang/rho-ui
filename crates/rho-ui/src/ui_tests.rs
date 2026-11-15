@@ -802,9 +802,10 @@ fn last_reply(ui: &mut Harness) -> String {
 }
 
 /// While the provider makes the turn wait, the turn's header says why and
-/// for how long, and the agent's plan shows above the composer. A response
-/// the provider discarded leaves the transcript; the retry's answer shows
-/// in its place, and the finished plan goes.
+/// for how long, and the agent's plan shows above the composer, folded
+/// until its heading is clicked. A response the provider discarded leaves
+/// the transcript; the retry's answer shows in its place, and the finished
+/// plan goes.
 #[test]
 fn a_retried_response_replaces_the_discarded_one_and_the_plan_shows() {
     let mut ui = Harness::start("retry", Script::default());
@@ -826,8 +827,15 @@ fn a_retried_response_replaces_the_discarded_one_and_the_plan_shows() {
                 .is_some_and(|header| header.contains(" · rate limited, retrying in ")),
             "the header says why the turn waits: {header:?}"
         );
-        assert_eq!(window.find("plan").label(), Some("Plan 1 of 3"));
+        assert_eq!(window.find("plan").label(), Some("Todo 1 of 3"));
+        assert!(!is_visible(window, "plan-0"), "the todo starts folded");
     });
+    ui.shot("todo-folded");
+    ui.click("plan-toggle");
+    ui.wait_until("the todo's steps", |window, _, _| {
+        is_visible(window, "plan-0")
+    });
+    ui.shot("todo-open");
     assert!(
         ui.session()
             .entries()
