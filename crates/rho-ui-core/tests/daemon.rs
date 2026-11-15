@@ -327,7 +327,7 @@ fn cancel_withdraws_the_approval_and_ends_the_turn() {
 
         until(&mut events, &mut session, |s| !s.state().is_busy()).await;
         assert_eq!(session.state(), &RunState::Cancelled);
-        assert!(session.inputs().is_empty());
+        assert_eq!(session.inputs(), []);
     });
 }
 
@@ -406,7 +406,7 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
             session.entries()
         );
         assert_eq!(session.pending_steers().count(), 0);
-        assert!(session.take_dropped_steers().is_empty());
+        assert_eq!(session.take_dropped_steers(), Vec::<String>::new());
         assert!(daemon.active_jobs().await.unwrap().is_empty());
 
         // Between turns nothing takes a steer.

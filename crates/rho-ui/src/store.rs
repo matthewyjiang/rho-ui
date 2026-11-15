@@ -3,23 +3,10 @@
 //! everything it remembers between runs, in one SQLite database,
 //! [`StateDb`].
 
-use std::{
-    fmt::Write as _,
-    path::{Path, PathBuf},
-    rc::Rc,
-};
+use std::{fmt::Write as _, path::Path, rc::Rc};
 
+use rho_ui_core::platform::{self, AppDir};
 use rusqlite::{Connection, Params, Row, TransactionBehavior};
-
-/// `$<var>/rho-ui`, or `~/<fallback>/rho-ui` when the variable is unset or
-/// not absolute, as the XDG base directory spec says.
-pub(crate) fn xdg_dir(var: &str, fallback: &str) -> Option<PathBuf> {
-    let base = std::env::var_os(var)
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback)))?;
-    Some(base.join("rho-ui"))
-}
 
 /// Writes `text` to a temporary file next to `path` and renames it over
 /// `path`, so a crash never leaves half a file. Best effort: the file only
@@ -141,8 +128,8 @@ impl Key {
     }
 }
 
-/// rho-ui's state database, `$XDG_STATE_HOME/rho-ui/state.sqlite3` (by
-/// default `~/.local/state/rho-ui/state.sqlite3`), or one in memory when
+/// rho-ui's state database, `state.sqlite3` in its state folder
+/// ([`AppDir::State`]: by default `~/.local/state/rho-ui`), or one in memory when
 /// that can't be opened, and in tests. Owners load their rows once and
 /// write each change as it happens. Writes are best effort: a failed one
 /// loses one change and says so on stderr.
@@ -163,7 +150,7 @@ impl std::fmt::Debug for StateDb {
 }
 
 impl StateDb {
-    /// Opens the database in the XDG state directory, creating it if need
+    /// Opens the database in the state folder, creating it if need
     /// be. When it can't, rho-ui runs on one in memory, remembering nothing
     /// past this run, and says why on stderr.
     #[expect(
@@ -171,7 +158,7 @@ impl StateDb {
         reason = "rho-ui has no log; stderr reaches the terminal or the journal"
     )]
     pub(crate) fn open() -> Self {
-        let Some(dir) = xdg_dir("XDG_STATE_HOME", ".local/state") else {
+        let Some(dir) = platform::app_dir(AppDir::State) else {
             eprintln!("rho-ui: no state directory (set HOME); nothing will be remembered");
             return Self::in_memory();
         };

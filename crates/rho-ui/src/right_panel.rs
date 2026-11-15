@@ -188,18 +188,18 @@ impl Tab {
     }
 }
 
-/// A shortcut for terminal tabs and splits, after Ghostty's on Linux, and
-/// the action its keys are bound to. It acts on the terminal with the
+/// A shortcut for terminal tabs and splits, after Ghostty's, and the action
+/// its keys are bound to (`TERMINAL_KEYS` in `main.rs`). It acts on the terminal with the
 /// keyboard, or else the one under the pointer; with neither, the key goes
 /// on as if unbound.
 #[derive(Clone, Copy, Debug, PartialEq, gpui_kit::Action)]
 #[action(namespace = rho_ui, no_json)]
 pub(crate) enum TerminalShortcut {
-    /// Ctrl+Shift+T: a terminal tab, next to the others.
+    /// A terminal tab, next to the others.
     NewTab,
-    /// Ctrl+Page Down: the next terminal tab, round to the first.
+    /// The next terminal tab, round to the first.
     NextTab,
-    /// Ctrl+Page Up: the previous terminal tab, round to the last.
+    /// The previous terminal tab, round to the last.
     PreviousTab,
     /// What a pane of the terminal does ([`PaneCommand`]).
     Pane(PaneCommand),
@@ -345,7 +345,7 @@ pub(crate) fn toggle_button(cx: &App) -> Button {
         .small()
         .icon(icon)
         .accessibility_label(label)
-        .tooltip(format!("{label} (Ctrl+Alt+B)"))
+        .tooltip_with_action(label, &crate::ToggleRightPanel, Some("RhoApp"))
         .on_click(|_, _, cx| PanelLayout::toggle(cx))
 }
 

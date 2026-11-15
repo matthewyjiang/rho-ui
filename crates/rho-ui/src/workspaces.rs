@@ -13,7 +13,7 @@ use std::{
 };
 
 use gpui_kit::{App, Context, Entity, SharedString, Task};
-use rho_ui_core::{Daemon, SshLink};
+use rho_ui_core::{platform, Daemon, SshLink};
 
 use crate::{
     folders::Reader,
@@ -102,11 +102,6 @@ impl Workspace {
     }
 }
 
-/// This machine's home directory, which its paths show as `~`.
-pub(crate) fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
 /// `cwd` with a leading `home` written as `~`, as a shell shows it.
 pub(crate) fn tilde(cwd: &Path, home: Option<&Path>) -> String {
     match home.map(|home| cwd.strip_prefix(home)) {
@@ -185,7 +180,7 @@ impl Workspaces {
     /// The home directory of `machine`, which its paths show as `~`.
     pub(crate) fn home(&self, machine: &MachineId) -> Option<PathBuf> {
         if machine.is_local() {
-            return home();
+            return platform::home_dir();
         }
         self.remote(machine)?.home.clone()
     }

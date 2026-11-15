@@ -39,3 +39,9 @@ rho-ui-core = { path = "../rho-ui-core", features = ["test-support"] }
 serde_json = "1"
 # Files to attach in tests.
 tempfile = "3"
+
+# The UI tests' text system on macOS, the one GPUI's Mac platform makes,
+# built alone: the platform must be made on the main thread, and tests run
+# on others. Same version as GPUI Kit pins, so features unify.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui-apple = { package = "gpui-pre-apple", version = "=0.3.12", features = ["font-kit"] }

@@ -31,6 +31,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
+    kbd::Kbd,
     label::Label,
     list::{List, ListDelegate, ListEvent, ListItem, ListState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
@@ -602,7 +603,17 @@ impl Render for ProjectPicker {
                     .justify_between()
                     .text_sm()
                     .child("Start a session in")
-                    .child(div().text_xs().child("Ctrl+Shift+N to search")),
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .text_xs()
+                            .children(Kbd::binding_for_action(
+                                &crate::NewSessionIn,
+                                Some("RhoApp"),
+                                window,
+                            ))
+                            .child("to search"),
+                    ),
             )
             .content_style(gpui_kit::StyleRefinement::default().p_1().gap_1())
             .child(

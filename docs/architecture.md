@@ -31,13 +31,15 @@ In rho-ui, `Machines` (`machines.rs`) is the one record of the machines the sett
 
 ## State
 
-rho-ui keeps the settings you choose in `$XDG_CONFIG_HOME/rho-ui/settings` (by default `~/.config/rho-ui/settings`), and what it remembers between runs in one SQLite database, `$XDG_STATE_HOME/rho-ui/state.sqlite3` (by default `~/.local/state/rho-ui/state.sqlite3`): your projects, pinned, settled and snoozed sessions, how long each turn took, the background work each session ran, whether the sidebar is collapsed, its filter, and whether the right panel shows, and how wide. Projects, shelved sessions and background work are kept by machine. `crates/rho-ui/src/store.rs` holds the schema and why it is shaped as it is. Each owner loads its rows at start and writes one row per change. rho-ui has no release, so a database of another schema version starts over empty rather than migrating. If rho-ui can't open the database, it says why on stderr and runs without remembering anything.
+rho-ui keeps the settings you choose in `$XDG_CONFIG_HOME/rho-ui/settings` (by default `~/.config/rho-ui/settings`, on macOS too), and what it remembers between runs in one SQLite database, `$XDG_STATE_HOME/rho-ui/state.sqlite3` (by default `~/.local/state/rho-ui/state.sqlite3`): your projects, pinned, settled and snoozed sessions, how long each turn took, the background work each session ran, whether the sidebar is collapsed, its filter, and whether the right panel shows, and how wide. Projects, shelved sessions and background work are kept by machine. `crates/rho-ui/src/store.rs` holds the schema and why it is shaped as it is. Each owner loads its rows at start and writes one row per change. rho-ui has no release, so a database of another schema version starts over empty rather than migrating. If rho-ui can't open the database, it says why on stderr and runs without remembering anything.
 
 rho's own settings are not rho-ui's: they live in each machine's `config.toml`, which rho-ui reads and writes only through that machine's daemon. rho-ui's settings stay in its own file rather than in a daemon's (`rho/config/register` would let rho keep them): the theme, scale and fonts apply before the first frame, before any daemon has answered, and the machines list is how rho-ui reaches the remote daemons at all.
 
 ## Dependencies
 
-The daemon's socket is a Unix socket, so rho-ui does not build on Windows yet.
+rho-ui runs on Linux and macOS. What differs between operating systems lives in `rho-ui-core`'s `platform` module: the home, settings and state folders, the default shell, how a path becomes bytes for the database or a remote shell, the private folder for ssh's control sockets, and how to reach a daemon's local endpoint. The rest of rho-ui asks it rather than reading variables or naming an OS itself. Only the key bindings in `main.rs` branch on the OS where they are bound, as GPUI Kit's do: app shortcuts use `secondary-` (Cmd on macOS, Ctrl elsewhere), and the terminal's own keys, for the clipboard, tabs and splits, are Ghostty's defaults on each platform, which differ by more than the modifier.
+
+rho-ui doesn't run on Windows yet. Three things block it: rho-protocol's `LocalDaemon`, which finds or starts the daemon, is Unix-only; scripts run on this machine (`folders::Reader::run_script`) are POSIX `sh`; and reaching a remote machine relies on ssh's `ControlMaster`, which Win32-OpenSSH lacks.
 
 Neither crate is published to crates.io.
 

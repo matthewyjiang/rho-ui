@@ -6,13 +6,12 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use gpui_kit::BackgroundExecutor;
-use rho_ui_core::{DaemonError, SshLink};
+use rho_ui_core::{platform, DaemonError, SshLink};
 
 use crate::repo;
 
@@ -292,7 +291,7 @@ done
 fn parse_remote(typed: &Typed, output: &[u8]) -> Option<Lookup> {
     let fields = repo::nul_fields(output)?;
     let ([is_dir, real, top, common], names) = fields.split_first_chunk::<4>()?;
-    let path = |bytes: &[u8]| PathBuf::from(OsString::from_vec(bytes.to_vec()));
+    let path = platform::path_from_bytes;
     let found = match *is_dir {
         b"y" => {
             let real = path(real);
@@ -313,7 +312,9 @@ fn parse_remote(typed: &Typed, output: &[u8]) -> Option<Lookup> {
         b"n" => None,
         _ => return None,
     };
-    let names = names.iter().map(|name| OsStr::from_bytes(name).to_owned());
+    let names = names
+        .iter()
+        .map(|name| platform::path_from_bytes(name).into_os_string());
     Some(Lookup {
         found,
         next: next(typed, names),

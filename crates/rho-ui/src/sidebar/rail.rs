@@ -164,24 +164,16 @@ impl SidebarView {
 /// Collapses the sidebar from `layout`, or opens it. Kit's
 /// `SidebarToggleButton` takes no tooltip, so this is a Button with its icons.
 pub(super) fn toggle_button(layout: Layout, cx: &Context<'_, SidebarView>) -> Button {
-    let (icon, label, tooltip) = match layout {
-        Layout::Open => (
-            IconName::PanelLeftClose,
-            "Collapse sidebar",
-            "Collapse sidebar (Ctrl+B)",
-        ),
-        Layout::Rail => (
-            IconName::PanelLeftOpen,
-            "Expand sidebar",
-            "Expand sidebar (Ctrl+B)",
-        ),
+    let (icon, label) = match layout {
+        Layout::Open => (IconName::PanelLeftClose, "Collapse sidebar"),
+        Layout::Rail => (IconName::PanelLeftOpen, "Expand sidebar"),
     };
     Button::new("toggle-sidebar")
         .ghost()
         .small()
         .icon(icon)
         .accessibility_label(label)
-        .tooltip(tooltip)
+        .tooltip_with_action(label, &crate::ToggleSidebar, Some("RhoApp"))
         .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleCollapsed)))
 }
 

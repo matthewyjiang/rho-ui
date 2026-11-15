@@ -6369,6 +6369,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "gpui-kit",
+ "gpui-pre-apple",
  "image",
  "libghostty-vt",
  "portable-pty",

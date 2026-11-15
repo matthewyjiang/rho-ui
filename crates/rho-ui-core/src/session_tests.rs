@@ -120,7 +120,7 @@ fn events_before_the_attach_response_apply_after_it() {
     ));
     session.apply(update(json!({"type": "state", "state": "running"})));
     assert_eq!(early, None, "held, so it names no row yet");
-    assert!(session.entries().is_empty());
+    assert_eq!(session.entries(), []);
     assert!(session.is_replaying());
 
     session.attached(attach_response(JobState::Idle, 3));
@@ -490,7 +490,7 @@ fn requests_open_once_and_close_when_any_client_answers() {
     session.apply(update(
         json!({"type": "input_resolved", "id": 7, "resolution": "answered"}),
     ));
-    assert!(session.inputs().is_empty());
+    assert_eq!(session.inputs(), []);
 }
 
 /// A question with a timeout keeps it until a client holds it; one the
@@ -518,7 +518,7 @@ fn a_timed_out_question_leaves_the_answer_rho_gave() {
     let changed = session.apply(update(
         json!({"type": "input_resolved", "id": 2, "resolution": "timed_out"}),
     ));
-    assert!(session.inputs().is_empty());
+    assert_eq!(session.inputs(), []);
     assert_eq!(changed, Some(0));
     match session.entries() {
         [Entry::Notice(notice)] => {
@@ -736,7 +736,7 @@ fn ended_background_work_outlives_the_daemons_list() {
         process("a", "running"),
         process("b", "running")
     ])));
-    assert!(session.ended_background().is_empty());
+    assert_eq!(session.ended_background(), []);
     session.apply(list(json!([
         process("a", "running"),
         process("b", "cancelled")
@@ -747,7 +747,7 @@ fn ended_background_work_outlives_the_daemons_list() {
     ])));
     session.apply(list(json!([])));
 
-    assert!(session.background().is_empty());
+    assert_eq!(session.background(), []);
     let ended: Vec<_> = session
         .ended_background()
         .iter()

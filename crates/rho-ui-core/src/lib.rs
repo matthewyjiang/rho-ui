@@ -9,6 +9,7 @@ mod daemon;
 pub mod fake_daemon;
 mod input;
 mod options;
+pub mod platform;
 mod prompt;
 mod session;
 mod ssh;

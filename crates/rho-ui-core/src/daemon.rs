@@ -16,7 +16,6 @@
 //! await, and replies cross over on channels.
 
 use std::{
-    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, OnceLock},
@@ -27,20 +26,20 @@ use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
     ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobKind,
-    JobListParams, JobState, JobSummary, LocalDaemon, LocalDaemonError, Notifications,
-    SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams,
-    SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionHoldParams,
-    SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
-    SessionRenameParams, SessionSteerParams, SessionUnsteerParams, SettingChange, TurnOutcome,
-    UnsteerOutcome,
+    JobListParams, JobState, JobSummary, Notifications, SessionAnswerParams, SessionAttachParams,
+    SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
+    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
+    SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
+    SessionUnsteerParams, SettingChange, TurnOutcome, UnsteerOutcome,
 };
-use tokio::{net::UnixStream, runtime::Runtime, sync::oneshot};
+use tokio::{runtime::Runtime, sync::oneshot};
 
 use crate::{
     agent_settings::{AgentSettings, AgentSettingsChanged},
     background::BackgroundId,
     input::{Answer, InputId},
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
+    platform,
     prompt::{mebibytes, Prompt},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
     ssh::{self, SshLink, SshTarget},
@@ -67,25 +66,15 @@ pub enum DaemonTarget {
 }
 
 impl DaemonTarget {
-    /// The daemon of the rho home `rho` itself uses, started through the
-    /// program `rho`; `None` when neither `RHO_HOME` nor `HOME` is set.
+    /// The daemon of the rho home `rho` itself uses
+    /// ([`platform::rho_home`]), started through the program `rho`; `None`
+    /// when no variable places the rho home.
     pub fn rho(rho: impl Into<PathBuf>) -> Option<Self> {
         Some(Self::Home {
-            home: rho_home(|name| std::env::var_os(name))?,
+            home: platform::rho_home()?,
             rho: rho.into(),
         })
     }
-}
-
-/// The rho home as `rho` finds it: `$RHO_HOME`, else `$HOME/.rho`, with an
-/// empty variable taken as unset. rho-protocol does not export this rule,
-/// so it is copied from rho's `paths::rho_dir`, without its Windows
-/// fallbacks (rho-ui does not build there).
-fn rho_home(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let set = |name| var(name).filter(|value| !value.is_empty());
-    set("RHO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".rho")))
 }
 
 /// Why the daemon could not be reached, or refused a request.
@@ -130,16 +119,6 @@ impl From<ClientError> for DaemonError {
             },
             // Each of these names the daemon and what to do, as rho's own
             // frontends show them.
-            other => Self::Unreachable(other.to_string()),
-        }
-    }
-}
-
-impl From<LocalDaemonError> for DaemonError {
-    fn from(error: LocalDaemonError) -> Self {
-        match error {
-            LocalDaemonError::Handshake(error) => error.into(),
-            // Each names the command or socket that failed, and why.
             other => Self::Unreachable(other.to_string()),
         }
     }
@@ -458,9 +437,7 @@ impl Machine {
     fn this_process() -> Self {
         Self {
             environment: ClientEnvironment::of_this_process(),
-            home: std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(PathBuf::from),
+            home: platform::home_dir(),
             ssh: None,
         }
     }
@@ -507,18 +484,19 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
     });
     let (client, notifications, hello, machine) = match target {
         DaemonTarget::Home { home, rho } => {
-            let (client, notifications, hello) = LocalDaemon::new(home)
-                .connect_or_start(Command::new(rho), hello)
-                .await?;
+            let (client, notifications, hello) =
+                platform::endpoint::connect_or_start(home, Command::new(rho), hello).await?;
             (client, notifications, hello, Machine::this_process())
         }
         DaemonTarget::Socket(socket) => {
-            let stream = UnixStream::connect(&socket).await.map_err(|error| {
-                DaemonError::Unreachable(format!(
-                    "could not connect to the rho daemon at {}: {error}",
-                    socket.display()
-                ))
-            })?;
+            let stream = platform::endpoint::connect(&socket)
+                .await
+                .map_err(|error| {
+                    DaemonError::Unreachable(format!(
+                        "could not connect to the rho daemon at {}: {error}",
+                        socket.display()
+                    ))
+                })?;
             let (client, notifications, hello) = Client::handshake(stream, hello).await?;
             (client, notifications, hello, Machine::this_process())
         }
@@ -1065,22 +1043,6 @@ mod tests {
         let summary = serde_json::from_value(json!({"id": "j1", "kind": kind, "state": state,
             "workspace": "/w", "session": "s1", "created_at": 0, "updated_at": 0, "live": live}));
         Job::from_wire(summary.expect("a valid job summary"))
-    }
-
-    #[test]
-    fn the_rho_home_is_rho_home_else_dot_rho_in_home() {
-        let home = |vars: &[(&str, &str)]| {
-            rho_home(|name| {
-                vars.iter()
-                    .find(|(set, _)| *set == name)
-                    .map(|(_, value)| OsString::from(value))
-            })
-        };
-        let both = [("RHO_HOME", "/srv/rho"), ("HOME", "/home/me")];
-        assert_eq!(home(&both), Some(PathBuf::from("/srv/rho")));
-        let empty = [("RHO_HOME", ""), ("HOME", "/home/me")];
-        assert_eq!(home(&empty), Some(PathBuf::from("/home/me/.rho")));
-        assert_eq!(home(&[("HOME", "")]), None);
     }
 
     fn live(elapsed_ms: u64, inputs: &serde_json::Value) -> serde_json::Value {

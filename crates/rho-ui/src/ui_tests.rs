@@ -3,8 +3,8 @@
 //! (`fake_daemon`: rho-protocol's real server side over a real socket).
 //!
 //! Each test saves screenshots to `target/ui-shots/` for a person to review.
-//! Rendering runs on Mesa lavapipe, Vulkan in software: see
-//! [`SELECT_LAVAPIPE`].
+//! On Linux, rendering runs on Mesa lavapipe, Vulkan in software (see
+//! `SELECT_LAVAPIPE`); on macOS, on Metal.
 
 use std::{
     path::{Path, PathBuf},
@@ -69,12 +69,35 @@ static SELECT_LAVAPIPE: extern "C" fn() = {
     select_lavapipe
 };
 
+/// The text system the app draws with on this platform.
+#[cfg(not(target_os = "macos"))]
+fn text_system() -> Arc<dyn gpui_kit::PlatformTextSystem> {
+    gpui_kit::platform::current_platform(true).text_system()
+}
+
+/// The text system GPUI's Mac platform makes, made alone: the platform
+/// itself must be made on the main thread, and tests run on others.
+#[cfg(target_os = "macos")]
+fn text_system() -> Arc<dyn gpui_kit::PlatformTextSystem> {
+    Arc::new(gpui_apple::AppleTextSystem::new())
+}
+
+/// `linux` off macOS, `macos` on it: the terminal's keys, as Ghostty's,
+/// differ by more than Cmd for Ctrl, so `secondary-` can't say them.
+const fn key(linux: &'static str, macos: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        macos
+    } else {
+        linux
+    }
+}
+
 /// Far longer than the fake daemon takes: it answers at once, and its
 /// slowest script waits half a second.
 const WAIT: Duration = Duration::from_secs(10);
 
 /// `/bin/sh` as dash runs it, whatever shell it is: prompting `$ `, where
-/// bash, as on Arch, prompts `sh-5.3$ `, and without line editing, so the
+/// bash, as on Arch and macOS, prompts `sh-5.3$ `, and without line editing, so the
 /// terminal echoes a control key such as Ctrl+B as `^B`. A script named
 /// `sh`, so the shell it runs keeps the name the terminal tab shows. Kept
 /// in `target/`, beside the screenshots, as a static is never dropped to
@@ -192,7 +215,7 @@ impl Harness {
             workspace,
         } = machines;
         let mut cx = HeadlessAppContext::with_platform(
-            gpui_kit::platform::current_platform(true).text_system(),
+            text_system(),
             Arc::new(crate::Assets),
             gpui_kit::platform::current_headless_renderer,
         );
@@ -342,7 +365,7 @@ impl Harness {
         ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
         ui.send("background");
         ui.wait_for_session("the session", |session| session.state() == &RunState::Idle);
-        ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+        ui.act(|window, cx| window.press("secondary-alt-b", cx));
         ui.click("open-surface-terminal");
         ui.wait_for_terminal("the shell's prompt", |lines| {
             lines.iter().any(|line| line.starts_with('$'))
@@ -442,9 +465,10 @@ impl Harness {
         });
     }
 
-    /// Presses Ctrl+Shift+C in the terminal, and returns the clipboard's text.
+    /// Presses the terminal's copy key, Ctrl+Shift+C (Cmd+C on macOS), and
+    /// returns the clipboard's text.
     fn copy_from_terminal(&mut self) -> Option<String> {
-        self.act(|window, cx| window.press("ctrl-shift-c", cx));
+        self.act(|window, cx| window.press(key("ctrl-shift-c", "cmd-c"), cx));
         self.cx
             .update(|cx| cx.read_from_clipboard())
             .and_then(|item| item.text())
@@ -558,13 +582,13 @@ impl Harness {
         })
     }
 
-    /// Pastes `image` in the composer with Ctrl+V, as from a screenshot
+    /// Pastes `image` in the composer with Ctrl+V (Cmd+V on macOS), as from a screenshot
     /// tool.
     fn paste(&mut self, image: gpui_kit::Image) {
         self.paste_entry(ClipboardEntry::Image(image));
     }
 
-    /// Pastes `entry` in the composer with Ctrl+V. In a session, it first
+    /// Pastes `entry` in the composer with Ctrl+V (Cmd+V on macOS). In a session, it first
     /// moves the keyboard to the composer.
     fn paste_entry(&mut self, entry: ClipboardEntry) {
         let app = self.app.clone();
@@ -576,7 +600,7 @@ impl Harness {
             cx.write_to_clipboard(ClipboardItem {
                 entries: vec![entry],
             });
-            window.press("ctrl-v", cx);
+            window.press("secondary-v", cx);
         });
     }
 
@@ -989,7 +1013,7 @@ fn a_sent_message_can_be_selected_and_copied() {
             gpui_kit::point(text.right() + px(20.), y),
             cx,
         );
-        window.press("ctrl-c", cx);
+        window.press("secondary-c", cx);
     });
     ui.shot("selected");
     let copied = ui
@@ -1986,7 +2010,7 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
     });
 
     ui.act(|window, cx| {
-        window.press("ctrl-a", cx);
+        window.press("secondary-a", cx);
         window.input("keep the old API", cx);
         window.press("enter", cx);
     });
@@ -2073,7 +2097,7 @@ fn the_sidebar_collapses_to_a_rail_and_back() {
     ui.act(|window, cx| {
         let search = app.read(cx).sidebar_search(cx);
         window.focus(&search, cx);
-        window.press("ctrl-b", cx);
+        window.press("secondary-b", cx);
     });
     ui.wait_until("the rail", |window, _, _| {
         is_visible(window, "sidebar-rail") && !is_visible(window, "session-local-s1")
@@ -2335,7 +2359,7 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
         session.state() == &RunState::Idle && !session.background().is_empty()
     });
 
-    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.act(|window, _| {
         assert!(
             is_visible(window, "panel-surface-list"),
@@ -2406,7 +2430,7 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-local-s1")
     });
-    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.click("open-surface-background");
 
     // + opens a menu over the open surface, not the list in its place.
@@ -2492,7 +2516,7 @@ fn the_diff_surface_follows_the_sessions_changes() {
             workspace: Some(repo.clone()),
         },
     );
-    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.click("open-surface-diff");
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -2541,7 +2565,7 @@ fn the_files_surface_opens_the_sessions_files() {
             workspace: Some(repo.clone()),
         },
     );
-    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.click("open-surface-files");
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
@@ -2587,7 +2611,7 @@ fn the_files_surface_opens_the_sessions_files() {
 /// The Terminal surface runs a shell in the session's folder: what the
 /// keyboard types reaches it once, what it prints shows, and the app's own
 /// shortcuts that the shell uses go to the shell. A drag or a double click
-/// selects what Ctrl+Shift+C copies and a middle click pastes; an input
+/// selects what the copy key copies and a middle click pastes; an input
 /// method's composing stays out of the shell until it commits; and a
 /// program that asks for the mouse gets a click as an escape sequence.
 #[test]
@@ -2628,12 +2652,16 @@ fn the_terminal_surface_runs_a_shell() {
         Some("rho"),
         "a selection goes to the primary selection"
     );
-    // A middle click pastes it at the prompt.
-    let middle = ClickOptions::new().with_button(MouseButton::Middle);
-    ui.click_terminal(first.center(), middle);
-    ui.wait_for_terminal("the middle click's paste", |lines| {
-        lines.iter().any(|line| line == "$ ^Brho")
-    });
+    // A middle click pastes it at the prompt. macOS has no primary
+    // selection.
+    #[cfg(target_os = "linux")]
+    {
+        let middle = ClickOptions::new().with_button(MouseButton::Middle);
+        ui.click_terminal(first.center(), middle);
+        ui.wait_for_terminal("the middle click's paste", |lines| {
+            lines.iter().any(|line| line == "$ ^Brho")
+        });
+    }
 
     // A double click selects the word under it.
     let (_, echo) = ui.terminal_cell("$ echo rho", 3);
@@ -2653,7 +2681,7 @@ fn the_terminal_surface_runs_a_shell() {
 
     // An input method composes, then commits a command that turns on the
     // mouse for the program it runs, `cat`. Ctrl+U first: the line still
-    // holds the Ctrl+B, the pasted rho and the é from above.
+    // holds the Ctrl+B, any pasted rho and the é from above.
     ui.act(|window, cx| window.press("ctrl-u", cx));
     ui.input_method(|input, cx| input.compose_text(None, "pr", None, cx));
     ui.shot("composing");
@@ -2749,12 +2777,12 @@ fn a_terminal_selection_scrolls_past_its_edges() {
     ui.act(|window, cx| {
         window.pointer_down(cell.center(), MouseButton::Left, cx);
         window.pointer_move(above, Some(MouseButton::Left), cx);
-        window.press("ctrl-alt-b", cx);
+        window.press("secondary-alt-b", cx);
     });
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.act(|window, cx| {
         window.pointer_up(above, MouseButton::Left, cx);
-        window.press("ctrl-alt-b", cx);
+        window.press("secondary-alt-b", cx);
     });
     let scrolled = top - numbers(&mut ui)[0];
     assert!(
@@ -2770,14 +2798,21 @@ fn a_terminal_selection_scrolls_past_its_edges() {
 /// nothing with neither, as when the pointer has left the window.
 #[test]
 fn terminal_tabs_split_and_name_their_programs() {
+    const SPLIT_DOWN: &str = key("ctrl-shift-e", "cmd-shift-d");
+    const CLOSE: &str = key("ctrl-shift-w", "cmd-w");
     let mut ui = Harness::with_terminal("terminal-tabs");
-    ui.wait_for_label("panel-tab-terminal", "sh");
-    ui.input_method(|input, cx| input.commit_text("sleep 30", cx));
-    ui.act(|window, cx| window.press("enter", cx));
-    ui.wait_for_label("panel-tab-terminal", "sleep");
-    ui.shot("program");
-    ui.act(|window, cx| window.press("ctrl-c", cx));
-    ui.wait_for_label("panel-tab-terminal", "sh");
+    // Only Linux names a tab for the program on this machine
+    // (`foreground_program`); elsewhere it says Terminal.
+    #[cfg(target_os = "linux")]
+    {
+        ui.wait_for_label("panel-tab-terminal", "sh");
+        ui.input_method(|input, cx| input.commit_text("sleep 30", cx));
+        ui.act(|window, cx| window.press("enter", cx));
+        ui.wait_for_label("panel-tab-terminal", "sleep");
+        ui.shot("program");
+        ui.act(|window, cx| window.press("ctrl-c", cx));
+        ui.wait_for_label("panel-tab-terminal", "sh");
+    }
 
     // The pane's menu splits it; the new pane runs a shell of its own and
     // takes the keyboard.
@@ -2799,10 +2834,10 @@ fn terminal_tabs_split_and_name_their_programs() {
     });
 
     // The keyboard outranks the pointer: over the left pane, Ctrl+Shift+E
-    // splits the right one, where the keyboard is, and the new pane below
+    // (Cmd+Shift+D on macOS) splits the right one, where the keyboard is, and the new pane below
     // it takes the keyboard.
     ui.hover_pane(0);
-    ui.act(|window, cx| window.press("ctrl-shift-e", cx));
+    ui.act(|window, cx| window.press(SPLIT_DOWN, cx));
     assert_eq!(ui.terminal_panes(), 3);
     let pane_bounds = |ui: &mut Harness, pane: usize| {
         ui.cx
@@ -2825,10 +2860,10 @@ fn terminal_tabs_split_and_name_their_programs() {
     ui.shot("split");
 
     // With the keyboard in the composer, the pointer chooses: Ctrl+Shift+W
-    // over the left pane closes it, and the keyboard stays in the composer.
+    // (Cmd+W on macOS) over the left pane closes it, and the keyboard stays in the composer.
     ui.focus_composer();
     ui.hover_pane(0);
-    ui.act(|window, cx| window.press("ctrl-shift-w", cx));
+    ui.act(|window, cx| window.press(CLOSE, cx));
     assert_eq!(ui.terminal_panes(), 2);
     let app = ui.app.clone();
     ui.act(|window, cx| {
@@ -2839,26 +2874,26 @@ fn terminal_tabs_split_and_name_their_programs() {
         );
     });
 
-    // Ctrl+Alt+Up goes from the bottom pane to the one above.
+    // Ctrl+Alt+Up (Cmd+Alt+Up on macOS) goes from the bottom pane to the one above.
     ui.act(|window, cx| {
         window
             .within(("terminal-pane", 2_usize))
             .click("terminal", cx);
     });
-    ui.act(|window, cx| window.press("ctrl-alt-up", cx));
+    ui.act(|window, cx| window.press(key("ctrl-alt-up", "cmd-alt-up"), cx));
     ui.wait_for_terminal("the pane above", |lines| {
         lines.iter().any(|line| line == "right")
     });
 
-    // Ctrl+Shift+T opens a second tab, with a shell of its own;
-    // Ctrl+Shift+W closes its only pane, and so the tab.
-    ui.act(|window, cx| window.press("ctrl-shift-t", cx));
+    // Ctrl+Shift+T (Cmd+T on macOS) opens a second tab, with a shell of
+    // its own; closing its only pane closes the tab.
+    ui.act(|window, cx| window.press(key("ctrl-shift-t", "cmd-t"), cx));
     ui.act(|window, _| assert!(is_visible(window, "panel-tab-terminal-2")));
     assert_eq!(ui.terminal_panes(), 1);
     ui.wait_for_terminal("the second tab's prompt", |lines| {
         lines.iter().any(|line| line.starts_with('$'))
     });
-    ui.act(|window, cx| window.press("ctrl-shift-w", cx));
+    ui.act(|window, cx| window.press(CLOSE, cx));
     ui.act(|window, _| assert!(!is_visible(window, "panel-tab-terminal-2")));
     assert_eq!(ui.terminal_panes(), 2, "the first tab shows again");
 
@@ -2876,7 +2911,7 @@ fn terminal_tabs_split_and_name_their_programs() {
             }),
             cx,
         );
-        window.press("ctrl-shift-w", cx);
+        window.press(CLOSE, cx);
     });
     assert_eq!(ui.terminal_panes(), 2);
 }
@@ -2887,7 +2922,7 @@ fn terminal_tabs_split_and_name_their_programs() {
 #[test]
 fn the_right_panel_resizes_from_its_edge() {
     let mut ui = Harness::start("right-panel-resize", Script::default());
-    ui.act(|window, cx| window.press("ctrl-alt-b", cx));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
     let panel = |ui: &mut Harness| {
         ui.cx
             .update_window(ui.window, |_, window, _| {
@@ -3475,7 +3510,7 @@ fn images_go_with_the_message() {
         is_visible(window, "held")
     });
     ui.act(|window, _| {
-        assert!(composer_attachments(window).is_empty());
+        assert_eq!(composer_attachments(window), Vec::<u64>::new());
         assert!(!shows_an_error(window));
     });
     ui.shot("held");
@@ -3604,7 +3639,7 @@ fn attached_files_go_with_the_message() {
                 "{id} shows in the transcript"
             );
         }
-        assert!(composer_attachments(window).is_empty());
+        assert_eq!(composer_attachments(window), Vec::<u64>::new());
     });
     ui.shot("sent");
 }
@@ -3707,7 +3742,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 
     // Ctrl+Shift+N in the draft goes to the search, which filters.
     ui.act(|window, cx| {
-        window.press("ctrl-shift-n", cx);
+        window.press("secondary-shift-n", cx);
         window.input("/w/b", cx);
     });
     ui.wait_until("the search to filter", |window, cx, app| {
@@ -3739,7 +3774,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 
     // From that session, a new one starts in its project, with the search
     // on the checked row.
-    ui.act(|window, cx| window.press("ctrl-shift-n", cx));
+    ui.act(|window, cx| window.press("secondary-shift-n", cx));
     ui.wait_until("a draft in /w/b", draft_in(Path::new("/w/b")));
     ui.wait_until("the keyboard on /w/b", |_, cx, app| {
         selected_project(cx, app).as_deref() == Some("project-local:/w/b")
@@ -3765,7 +3800,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-local-s1")
     });
-    ui.act(|window, cx| window.press("ctrl-shift-n", cx));
+    ui.act(|window, cx| window.press("secondary-shift-n", cx));
     ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
 
     // A worktree's path offers its repository's project. Typed a key at a
@@ -3826,7 +3861,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let wt_row: &'static str = format!("project-next:{}", tree.display()).leak();
     let src_row: &'static str = format!("project-next:{}", tree.join("src").display()).leak();
     ui.act(|window, cx| {
-        window.press("ctrl-shift-n", cx);
+        window.press("secondary-shift-n", cx);
         window.input(&format!("{}/", dir.display()), cx);
     });
     ui.wait_until("the folder's subfolders", |window, _, _| {
@@ -3887,7 +3922,7 @@ fn a_typed_git_url_clones_into_the_clone_folder() {
     ui.wait_until("the sidebar", |window, _, _| {
         is_visible(window, "new-session")
     });
-    ui.act(|window, cx| window.press("ctrl-shift-n", cx));
+    ui.act(|window, cx| window.press("secondary-shift-n", cx));
     ui.wait_until("the draft", draft_in(&std::env::temp_dir()));
     let url = format!("file://{}/thing", dir.display());
     ui.act(|window, cx| window.input(&url, cx));
@@ -4425,7 +4460,7 @@ fn a_machine_added_in_settings_lists_its_sessions() {
         !is_visible(window, "session-box-s1") && is_visible(window, "session-local-s1")
     });
     ui.cx
-        .update(|cx| assert!(cx.global::<Settings>().machines.is_empty()));
+        .update(|cx| assert_eq!(cx.global::<Settings>().machines, []));
 }
 
 /// rho's own settings show as a page drawn from its daemon's schema. A

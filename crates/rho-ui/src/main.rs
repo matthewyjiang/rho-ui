@@ -45,10 +45,11 @@ mod workspaces;
 
 use std::{borrow::Cow, path::PathBuf, rc::Rc};
 
-use gpui_kit::component::input::{Enter, Paste};
+use gpui_kit::component::input::{Copy, Enter, Paste};
 use gpui_kit::{
-    px, size, App, AppContext as _, AssetSource, Axis, KeyBinding, NoAction, SharedString,
-    TitlebarOptions, WindowBounds, WindowOptions,
+    px, size, Action, App, AppContext as _, AssetSource, Axis, KeyBinding,
+    KeyBindingContextPredicate, NoAction, QuitMode, SharedString, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 use rho_ui_core::DaemonTarget;
 
@@ -204,26 +205,32 @@ fn main() {
         }
     };
 
-    gpui_kit::application().with_assets(Assets).run(move |cx| {
-        let db = StateDb::open();
-        init(cx, &db);
-        // pele takes about 100 ms to load: started now, it's ready for the
-        // first diagram. Tests load it when they draw one, so the load
-        // doesn't slow the tests that time animations.
-        pele::start();
-        Settings::load().apply(cx);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        let options = window_options(cx);
-        gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| {
-                let sidebar = SidebarState::load(&db, time::now_unix());
-                let projects = Projects::load(&db);
-                RhoApp::new(launch, sidebar, projects, window, cx)
+    // Quit with the window, on macOS too, where GPUI's default keeps the
+    // app running with none: rho-ui has one window and no menu bar or Dock
+    // menu to open another.
+    gpui_kit::application()
+        .with_assets(Assets)
+        .with_quit_mode(QuitMode::LastWindowClosed)
+        .run(move |cx| {
+            let db = StateDb::open();
+            init(cx, &db);
+            // pele takes about 100 ms to load: started now, it's ready for the
+            // first diagram. Tests load it when they draw one, so the load
+            // doesn't slow the tests that time animations.
+            pele::start();
+            Settings::load().apply(cx);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            let options = window_options(cx);
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| {
+                    let sidebar = SidebarState::load(&db, time::now_unix());
+                    let projects = Projects::load(&db);
+                    RhoApp::new(launch, sidebar, projects, window, cx)
+                })
             })
-        })
-        .expect("failed to open the rho-ui window");
-        cx.activate(true);
-    });
+            .expect("failed to open the rho-ui window");
+            cx.activate(true);
+        });
 }
 
 /// App-wide setup shared by `main` and the UI tests: GPUI Kit, the theme
@@ -236,25 +243,46 @@ fn init(cx: &mut App, db: &StateDb) {
     cx.set_global(TurnTimes::load(db));
     cx.set_global(BackgroundLog::new(db));
     cx.set_global(PanelLayout::load(db));
+    // `secondary` is Cmd on macOS and Ctrl elsewhere.
     cx.bind_keys([
-        KeyBinding::new("ctrl-n", NewSession, Some("RhoApp")),
-        KeyBinding::new("ctrl-shift-n", NewSessionIn, Some("RhoApp")),
-        KeyBinding::new("ctrl-,", OpenSettings, Some("RhoApp")),
-        KeyBinding::new("ctrl-b", ToggleSidebar, Some("RhoApp")),
-        KeyBinding::new("ctrl-alt-b", ToggleRightPanel, Some("RhoApp")),
+        shortcut("secondary-n", NewSession, Some("RhoApp"), cx),
+        shortcut("secondary-shift-n", NewSessionIn, Some("RhoApp"), cx),
+        shortcut("secondary-,", OpenSettings, Some("RhoApp"), cx),
+        shortcut("secondary-b", ToggleSidebar, Some("RhoApp"), cx),
+        shortcut("secondary-alt-b", ToggleRightPanel, Some("RhoApp"), cx),
+        shortcut("secondary-q", Quit, None, cx),
+    ]);
+    cx.bind_keys([
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
-        KeyBinding::new("ctrl-q", Quit, None),
         // The terminal takes these keys for the program in it: Tab moves the
-        // keyboard elsewhere, and the app's own shortcuts here are the
-        // shell's (Ctrl+B and Ctrl+N move the cursor in readline).
+        // keyboard elsewhere, and off macOS, where the app's shortcuts take
+        // Ctrl, those are the shell's (Ctrl+B and Ctrl+N move the cursor in
+        // readline). On macOS they take Cmd, which a terminal leaves to the
+        // app.
         KeyBinding::new("tab", NoAction, Some("Terminal")),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-b", NoAction, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-n", NoAction, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-n", NoAction, Some("Terminal")),
+        // The terminal's clipboard keys, as Ghostty's: Cmd+C and Cmd+V on
+        // macOS; elsewhere Ctrl+Shift+C and Ctrl+Shift+V, leaving Ctrl+C,
+        // which Kit's root binds to copy, to the program.
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-c", Copy, Some("Terminal")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-v", Paste, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-c", Copy, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-v", Paste, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-c", NoAction, Some("Terminal")),
         // "Input" is the key context of Kit's text fields. Kit binds only
-        // Ctrl+V to paste; dictation apps set to paste for terminals, such
-        // as Hex, send Ctrl+Shift+V.
+        // Ctrl+V (Cmd+V on macOS) to paste; dictation apps set to paste for
+        // terminals, such as Hex, send Ctrl+Shift+V.
         KeyBinding::new("ctrl-shift-v", Paste, Some("Input")),
         // Alt+Enter starts a line, as Kit's Shift+Enter does.
         KeyBinding::new(
@@ -266,36 +294,72 @@ fn init(cx: &mut App, db: &StateDb) {
             Some("Input"),
         ),
     ]);
-    let pane = TerminalShortcut::Pane;
     cx.bind_keys(
-        [
-            ("ctrl-shift-t", TerminalShortcut::NewTab),
-            ("ctrl-pagedown", TerminalShortcut::NextTab),
-            ("ctrl-pageup", TerminalShortcut::PreviousTab),
-            ("ctrl-shift-o", pane(PaneCommand::Split(Axis::Horizontal))),
-            ("ctrl-shift-e", pane(PaneCommand::Split(Axis::Vertical))),
-            ("ctrl-shift-w", pane(PaneCommand::Close)),
-            ("ctrl-alt-left", pane(PaneCommand::Focus(Direction::Left))),
-            ("ctrl-alt-right", pane(PaneCommand::Focus(Direction::Right))),
-            ("ctrl-alt-up", pane(PaneCommand::Focus(Direction::Up))),
-            ("ctrl-alt-down", pane(PaneCommand::Focus(Direction::Down))),
-        ]
-        .into_iter()
-        .flat_map(|(keys, shortcut)| terminal_keys(keys, shortcut)),
+        TERMINAL_KEYS
+            .into_iter()
+            .flat_map(|(keys, shortcut)| terminal_keys(keys, shortcut)),
     );
 }
 
-/// Binds `keys`, one of Ghostty's keys for tabs and splits on Linux, to
-/// `shortcut`, which acts on the terminal with the keyboard, else the one
-/// under the pointer, and otherwise lets the key go on
-/// (`RightPanel::terminal_shortcut`). Bound in "Input" too, the key context
-/// of Kit's text fields, ahead of Kit's own bindings there (Ctrl+Shift+E
-/// selects to the end of the line), which get the key when no terminal does.
+/// The terminal's keys for tabs and splits: Ghostty's defaults on each
+/// platform. They differ by more than Cmd for Ctrl, so `secondary-` can't
+/// say them. Cmd+Shift+[ reaches GPUI as `cmd-{`, as macOS reports it.
+#[cfg(target_os = "macos")]
+const TERMINAL_KEYS: [(&str, TerminalShortcut); 10] = [
+    ("cmd-t", TerminalShortcut::NewTab),
+    ("cmd-}", TerminalShortcut::NextTab),
+    ("cmd-{", TerminalShortcut::PreviousTab),
+    ("cmd-d", pane(PaneCommand::Split(Axis::Horizontal))),
+    ("cmd-shift-d", pane(PaneCommand::Split(Axis::Vertical))),
+    ("cmd-w", pane(PaneCommand::Close)),
+    ("cmd-alt-left", pane(PaneCommand::Focus(Direction::Left))),
+    ("cmd-alt-right", pane(PaneCommand::Focus(Direction::Right))),
+    ("cmd-alt-up", pane(PaneCommand::Focus(Direction::Up))),
+    ("cmd-alt-down", pane(PaneCommand::Focus(Direction::Down))),
+];
+
+/// The terminal's keys for tabs and splits: Ghostty's defaults on each
+/// platform. They differ by more than Cmd for Ctrl, so `secondary-` can't
+/// say them.
+#[cfg(not(target_os = "macos"))]
+const TERMINAL_KEYS: [(&str, TerminalShortcut); 10] = [
+    ("ctrl-shift-t", TerminalShortcut::NewTab),
+    ("ctrl-pagedown", TerminalShortcut::NextTab),
+    ("ctrl-pageup", TerminalShortcut::PreviousTab),
+    ("ctrl-shift-o", pane(PaneCommand::Split(Axis::Horizontal))),
+    ("ctrl-shift-e", pane(PaneCommand::Split(Axis::Vertical))),
+    ("ctrl-shift-w", pane(PaneCommand::Close)),
+    ("ctrl-alt-left", pane(PaneCommand::Focus(Direction::Left))),
+    ("ctrl-alt-right", pane(PaneCommand::Focus(Direction::Right))),
+    ("ctrl-alt-up", pane(PaneCommand::Focus(Direction::Up))),
+    ("ctrl-alt-down", pane(PaneCommand::Focus(Direction::Down))),
+];
+
+const fn pane(command: PaneCommand) -> TerminalShortcut {
+    TerminalShortcut::Pane(command)
+}
+
+/// Binds `keys`, from [`TERMINAL_KEYS`], to `shortcut`, which acts on the
+/// terminal with the keyboard, else the one under the pointer, and
+/// otherwise lets the key go on (`RightPanel::terminal_shortcut`). Bound in
+/// "Input" too, the key context of Kit's text fields, ahead of Kit's own
+/// bindings there (Ctrl+Shift+E selects to the end of the line, Cmd+Alt+Up
+/// adds a cursor above), which get the key when no terminal does.
 fn terminal_keys(keys: &'static str, shortcut: TerminalShortcut) -> [KeyBinding; 2] {
     [
         KeyBinding::new(keys, shortcut, Some("RhoApp")),
         KeyBinding::new(keys, shortcut, Some("Input")),
     ]
+}
+
+/// The binding of `keys` to `action` in `context`, where `secondary-` in
+/// `keys` takes this platform's modifier, which [`KeyBinding::new`] can't
+/// resolve.
+fn shortcut(keys: &str, action: impl Action, context: Option<&str>, cx: &App) -> KeyBinding {
+    let context = context.map(|context| {
+        Rc::new(KeyBindingContextPredicate::parse(context).expect("the key context parses"))
+    });
+    KeyBinding::load(keys, Box::new(action), context, false, None, cx).expect("the shortcut parses")
 }
 
 /// The main window: centered, large enough for the sidebar and a readable

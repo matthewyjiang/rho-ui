@@ -18,8 +18,9 @@
 //!
 //! The mouse goes to a program that asks for it, such as vim or htop, and
 //! otherwise selects text ([`mouse`]), scrolling while a drag is past the
-//! top or bottom. Ctrl+Shift+C copies the selection; a selection also goes
-//! to the primary selection, which a middle click pastes. Text an input method
+//! top or bottom. Ctrl+Shift+C copies the selection and Ctrl+Shift+V pastes
+//! (Cmd+C and Cmd+V on macOS); on Linux a selection also goes to the
+//! primary selection, which a middle click pastes. Text an input method
 //! commits goes to the shell as typed, and what it composes shows at the
 //! cursor until then ([`EntityInputHandler`]).
 
@@ -40,6 +41,7 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::Button,
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader},
+    input::{Copy, Paste},
     ActiveTheme as _, IconName, Sizable as _,
 };
 use gpui_kit::{
@@ -62,6 +64,7 @@ use libghostty_vt::{
     RenderState, Terminal,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use rho_ui_core::platform;
 
 use self::mouse::{Mouse, Pressed, Released};
 pub(crate) use self::tab::{Direction, PaneCommand};
@@ -73,16 +76,16 @@ use crate::{
     workspaces::Workspaces,
 };
 
-/// The program a terminal on this machine runs: the user's `$SHELL` in the
-/// app, `/bin/sh` in tests, so they don't read the user's shell files.
+/// The program a terminal on this machine runs: the user's shell in the
+/// app ([`platform::default_shell`]), a plain `sh` in tests, so they don't
+/// read the user's shell files.
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalShell(pub(crate) PathBuf);
 
 impl TerminalShell {
-    /// `$SHELL`, else `/bin/sh`.
+    /// The user's shell.
     pub(crate) fn from_env() -> Self {
-        let shell = std::env::var_os("SHELL").filter(|shell| !shell.is_empty());
-        Self(shell.map_or_else(|| PathBuf::from("/bin/sh"), PathBuf::from))
+        Self(platform::default_shell())
     }
 }
 
@@ -477,16 +480,6 @@ impl TerminalView {
     fn key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<'_, Self>) {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
-        if modifiers.control && modifiers.shift && keystroke.key == "v" {
-            self.paste_clipboard(cx);
-            cx.stop_propagation();
-            return;
-        }
-        if modifiers.control && modifiers.shift && keystroke.key == "c" {
-            self.copy(cx);
-            cx.stop_propagation();
-            return;
-        }
         if keystroke.key_char.is_some() {
             // A dead key's accent, composed by the platform rather than an
             // input method, ends with a keystroke typing the letter: as the
@@ -527,14 +520,14 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Copies the selection to the clipboard, as Ctrl+Shift+C does.
+    /// Copies the selection to the clipboard, as the copy key does.
     fn copy(&self, cx: &mut App) {
         if let Some(text) = self.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
-    /// Pastes the clipboard's text, as Ctrl+Shift+V does.
+    /// Pastes the clipboard's text, as the paste key does.
     fn paste_clipboard(&mut self, cx: &mut App) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.paste(text);
@@ -986,6 +979,8 @@ impl Render for TerminalView {
             .bg(frame.background)
             .cursor_text()
             .on_any_mouse_down(cx.listener(Self::mouse_down))
+            .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
+            .on_action(cx.listener(|this, _: &Paste, _, cx| this.paste_clipboard(cx)))
             .on_key_down(cx.listener(|this, event, _, cx| this.key_down(event, cx)))
             .on_scroll(cx.listener(move |this, event, _, cx| {
                 this.scroll(event, line_height, cx);

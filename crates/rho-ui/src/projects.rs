@@ -8,11 +8,9 @@
 //! The list lives in the state database's `projects` table (see
 //! [`StateDb`]), in the order the projects were added.
 
-use std::{
-    ffi::OsString,
-    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
-    path::{Path, PathBuf},
-};
+use std::path::Path;
+
+use rho_ui_core::platform;
 
 use crate::{
     machines::{MachineId, Place},
@@ -43,7 +41,7 @@ impl Projects {
             [],
             |row| {
                 let machine = MachineId::from(row.get::<_, String>(0)?.as_str());
-                let path = PathBuf::from(OsString::from_vec(row.get(1)?));
+                let path = platform::path_from_bytes(&row.get::<_, Vec<u8>>(1)?);
                 Ok(Place::new(machine, path))
             },
         );
@@ -55,7 +53,7 @@ impl Projects {
 
     /// For tests: these projects on this machine, kept in memory.
     #[cfg(test)]
-    pub(crate) fn of<P: Into<PathBuf>>(roots: impl IntoIterator<Item = P>) -> Self {
+    pub(crate) fn of<P: Into<std::path::PathBuf>>(roots: impl IntoIterator<Item = P>) -> Self {
         let mut projects = Self::default();
         for root in roots {
             projects.add(Place::local(root));
@@ -98,9 +96,10 @@ impl Projects {
     }
 }
 
-/// A path as the database keeps it: its bytes, which needn't be UTF-8.
-fn bytes(path: &Path) -> &[u8] {
-    path.as_os_str().as_bytes()
+/// A path as the database keeps it: [`platform::path_to_bytes`], which on
+/// Unix needn't be UTF-8.
+fn bytes(path: &Path) -> Vec<u8> {
+    platform::path_to_bytes(path.as_os_str())
 }
 
 #[cfg(test)]
@@ -115,8 +114,8 @@ mod tests {
             projects.add(Place::local(root));
         }
         projects.remove(&Place::local("/w/a"));
-        // Not UTF-8: a path is bytes.
-        projects.add(Place::local(OsString::from_vec(b"/w/\xff".to_vec())));
+        // Not UTF-8: on Unix a path is bytes.
+        projects.add(Place::local(platform::path_from_bytes(b"/w/\xff")));
         // The same folder on another machine is another project.
         projects.add(Place::new(MachineId::remote("workstation"), "/w/c"));
         assert_eq!(Projects::load(&db).roots(), projects.roots());
