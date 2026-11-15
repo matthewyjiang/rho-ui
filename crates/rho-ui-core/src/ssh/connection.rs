@@ -1,6 +1,6 @@
 //! The ssh connections to a host: one for the daemon's socket and every
 //! script, and one more for the terminals' shells, made when the first
-//! opens ([`Purpose`]). A connection costs a key signature, which an agent
+//! terminal opens ([`Purpose`]). A connection costs a key signature, which an agent
 //! such as 1Password's asks the user to approve, so rho-ui makes one of
 //! each per host, keeps it while anything uses it, and for [`LINGER`]
 //! after, for the next user to take.
@@ -303,7 +303,10 @@ impl Connection {
     }
 
     /// A slot for one more terminal's shell, of [`MAX_SHELLS`]; the shell
-    /// holds it while it runs, and dropping it frees it.
+    /// holds it while it runs, and dropping it frees it. sshd frees the
+    /// shell's session a moment later, once the shell has gone, so a
+    /// terminal opened at once in its place may meet sshd's own refusal,
+    /// whose error names `MaxSessions` too.
     ///
     /// # Errors
     ///

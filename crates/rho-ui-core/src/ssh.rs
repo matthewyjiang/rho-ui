@@ -10,7 +10,7 @@
 //! protocol over it. Every script after that runs in a session channel
 //! of its own on the same connection ([`script`]). The terminals' login
 //! shells, under a pseudo-terminal there ([`shell`]), run on a second
-//! connection, made when the first opens, so they never take the sessions
+//! connection, made when the first terminal opens, so they never take the sessions
 //! scripts need; [`MAX_SHELLS`] at most. A new connection costs a key
 //! signature, which an agent such as 1Password's asks the user to
 //! approve, so the user approves once per host, and once more for its
@@ -191,9 +191,10 @@ where
 }
 
 /// The ssh connection to one remote machine, shared by its daemon
-/// connection and every script and terminal run there. The connection
-/// stays open while any link to it does, and 10 minutes after. Links are
-/// equal when they share a connection.
+/// connection and every script run there; its terminals open one of their
+/// own through it ([`Self::open_shell`]). The connection stays open while
+/// any link to it does, and 10 minutes after. Links are equal when they
+/// share a connection.
 #[derive(Clone)]
 pub struct SshLink {
     lease: Arc<Lease>,

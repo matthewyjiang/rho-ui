@@ -480,8 +480,10 @@ async fn piped(
 /// Runs `command` with `sh -c` in `home` with `env`, under a
 /// pseudo-terminal of `size`: what it prints goes to the channel, the
 /// channel's data to it, and each `window-change` resizes it. Returns its
-/// exit status once all it printed went, as sshd sends it; a client that
-/// closes the channel first hangs up on it.
+/// exit status once it exits, as sshd sends it, after what it printed
+/// that has reached the server: a background job that keeps the
+/// pseudo-terminal open holds up nothing. A client that closes the
+/// channel first hangs up on it.
 async fn in_terminal(
     read: &mut ChannelReadHalf,
     write: &ChannelWriteHalf<Msg>,
@@ -553,9 +555,7 @@ async fn in_terminal(
                 }
             },
             status = &mut exit => {
-                // The reader ends once the pseudo-terminal's last holder
-                // closes it, as the command that exited did.
-                while let Some(bytes) = output.recv().await {
+                while let Ok(bytes) = output.try_recv() {
                     let _ = write.data_bytes(bytes).await;
                 }
                 return TerminalEnd::Exited(

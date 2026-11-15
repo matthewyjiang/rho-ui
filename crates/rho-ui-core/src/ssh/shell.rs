@@ -45,10 +45,7 @@ use super::{
     connection::{self, Connection, Purpose},
     quote_bytes, SshLink,
 };
-use crate::{
-    daemon::{io, DaemonError},
-    platform,
-};
+use crate::{daemon::io, platform};
 
 /// Packets of output that wait for the reader, each at most 32 KiB
 /// (russh's default `maximum_packet_size`, the largest sshd sends this
@@ -182,11 +179,14 @@ impl SshLink {
     /// `COLORTERM=truecolor` and this machine's `LANG` and `LC_*` if sshd
     /// accepts them (its `AcceptEnv` must name them). Returns at once: the
     /// shell starts on the I/O runtime, and [`RemoteShell::ended`] says if
-    /// it couldn't. It runs only on the connection the daemon connection
-    /// opened: once that is gone this fails rather than connect again,
-    /// which could ask the user's key agent for another approval. The
-    /// connection stays open while the shell runs, which ends when it
-    /// exits or [`RemoteShell::control`] goes.
+    /// it couldn't. It runs on the host's terminals' connection, which the
+    /// first terminal there opens, reached as this link's was; once this
+    /// link's connection is gone it fails rather than sign in again, which
+    /// could ask the user's key agent for an approval nobody expects. The
+    /// terminals' connection stays open while the shell runs, which ends
+    /// when it exits or [`RemoteShell::control`] goes. While the first
+    /// terminal on a host waits for the key agent's approval, the others
+    /// there wait for it too.
     ///
     /// sshd hands the command line, `cd -- 'dir' && exec "$SHELL" -l`, to
     /// the user's login shell to parse, so this assumes a POSIX one, such
@@ -216,6 +216,12 @@ impl SshLink {
                 env,
             };
             let ran = async {
+                if daemon.is_closed() {
+                    return Err(ShellError::NotStarted(format!(
+                        "no ssh connection to {}",
+                        daemon.host()
+                    )));
+                }
                 // Held while the shell runs, so the connection is.
                 let lease =
                     connection::shared(daemon.host(), Some(daemon.resolved()), Purpose::Terminals)
@@ -294,10 +300,10 @@ async fn run(
 ) -> Result<(), ShellError> {
     // Held while this runs.
     let _slot = connection.shell_slot().map_err(ShellError::NotStarted)?;
-    let (mut read, write) = connection.session().await.map_err(|error| match error {
-        DaemonError::Unreachable(why) => ShellError::NotStarted(why),
-        other => ShellError::NotStarted(other.to_string()),
-    })?;
+    let (mut read, write) = connection
+        .session()
+        .await
+        .map_err(|error| ShellError::NotStarted(error.to_string()))?;
     let channel = write.channel();
     let Start {
         command,

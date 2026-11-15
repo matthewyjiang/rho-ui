@@ -119,7 +119,7 @@ fn install_rho(home: &std::path::Path, fake: &rho_ui_core::fake_daemon::FakeDaem
 /// start, and says so.
 #[cfg(unix)]
 #[test]
-fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_daemons_connection() {
+fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_terminals_connection() {
     use rho_ui_core::{
         fake_daemon::{FakeDaemon, Script},
         fake_sshd::TerminalEnd,

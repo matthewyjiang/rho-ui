@@ -6,7 +6,7 @@
 //! On this machine the shell is [`TerminalShell`], under a pseudo-terminal
 //! here; on a remote one it is the login shell there, under a
 //! pseudo-terminal sshd makes, in a channel on the ssh connection the
-//! machine's daemon rides, so it asks the key agent nothing. A
+//! machine's terminals share, which asks the key agent once for them all. A
 //! [`Program`] is either ([`program`] says how each runs).
 //!
 //! Each Terminal tab ([`TerminalTab`]) splits into panes ([`TerminalPane`]),

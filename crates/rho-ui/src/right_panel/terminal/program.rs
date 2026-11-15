@@ -1,7 +1,7 @@
 //! What a terminal runs ([`Program`]): a shell under a pseudo-terminal
 //! here, or the user's login shell on a remote machine, under a
 //! pseudo-terminal sshd makes there, in a channel on the ssh connection
-//! the machine's daemon rides ([`SshLink::open_shell`]; rho-ui-core's
+//! the machine's terminals share ([`SshLink::open_shell`]; rho-ui-core's
 //! `ssh/shell.rs` says how it runs).
 //!
 //! Here, threads of its own read the pseudo-terminal, write to it, and
