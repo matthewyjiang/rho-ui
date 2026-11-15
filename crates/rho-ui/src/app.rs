@@ -37,12 +37,14 @@ use rho_ui_core::{
 use crate::{
     background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
+    forge::Forges,
     kinetic::Kinetic,
     machines::{
         Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach, RemoteMachine,
         SessionKey,
     },
     projects::Projects,
+    pull_requests::{Focus, PullRequests},
     rho_install::{render_setup, Installs, InstallsEvent, Offer},
     rho_settings::RhoSettings,
     right_panel::{
@@ -52,7 +54,7 @@ use crate::{
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
-    sidebar::{ResizeSidebar, SidebarEvent, SidebarState, SidebarView},
+    sidebar::{ResizeSidebar, SidebarEvent, SidebarModels, SidebarState, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
     NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
 };
@@ -211,6 +213,10 @@ pub(crate) struct RhoApp {
     rho_settings: Entity<RhoSettings>,
     /// Each machine's rho, apart from its daemon: installing and updating.
     installs: Entity<Installs>,
+    /// The forge CLIs on each machine, for Settings and pull requests.
+    forges: Entity<Forges>,
+    /// The pull requests the right panel shows.
+    prs: Entity<PullRequests>,
     /// The epoch the next connection gets; see [`Connection::epoch`].
     next_epoch: u64,
     workspaces: Entity<Workspaces>,
@@ -234,7 +240,7 @@ pub(crate) struct RhoApp {
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
-    _subscriptions: [Subscription; 5],
+    _subscriptions: [Subscription; 6],
 }
 
 impl RhoApp {
@@ -256,16 +262,17 @@ impl RhoApp {
         // Empty until `sync_machines` connects to each.
         let machines = cx.new(|_| Machines::default());
         let installs = cx.new(|_| Installs::new(machines.clone()));
+        let forges = cx.new(|_| Forges::new(workspaces.clone()));
+        let prs = cx.new(|cx| PullRequests::new(forges.clone(), workspaces.clone(), cx));
         let sidebar = cx.new(|cx| {
-            SidebarView::new(
-                workspaces.clone(),
-                machines.clone(),
-                installs.clone(),
-                projects.clone(),
-                sidebar,
-                window,
-                cx,
-            )
+            let models = SidebarModels {
+                workspaces: workspaces.clone(),
+                machines: machines.clone(),
+                installs: installs.clone(),
+                projects: projects.clone(),
+                prs: prs.clone(),
+            };
+            SidebarView::new(models, sidebar, window, cx)
         });
         let sidebar_subscription = cx.subscribe_in(
             &sidebar,
@@ -304,13 +311,15 @@ impl RhoApp {
             },
         );
         let shell = launch.shell.clone();
-        let panel = cx.new(|_| RightPanel::new(workspaces.clone(), shell));
+        let panel = cx.new(|cx| RightPanel::new(workspaces.clone(), shell, prs.clone(), cx));
         let mut app = Self {
             launch,
             machines,
             connections: Vec::new(),
             rho_settings: cx.new(|_| RhoSettings::default()),
             installs,
+            forges,
+            prs,
             next_epoch: 0,
             workspaces,
             projects,
@@ -337,17 +346,12 @@ impl RhoApp {
                 cx.observe_global_in::<Settings>(window, |this, window, cx| {
                     this.sync_machines(window, cx);
                 }),
-                // The right panel shown or hidden: lay it out, and redraw
-                // the pane's title bar, which offers the toggle while it
-                // is hidden.
-                cx.observe_global_in::<PanelLayout>(window, |this, _, cx| {
-                    match &this.pane {
-                        Pane::Session(view) => view.update(cx, |_, cx| cx.notify()),
-                        Pane::Draft(view) => view.update(cx, |_, cx| cx.notify()),
-                        Pane::Empty => {}
-                    }
-                    cx.notify();
+                // Pull requests wait while the window is unfocused.
+                cx.observe_window_activation(window, |this, window, cx| {
+                    let focus = Focus::of(window);
+                    this.prs.update(cx, |prs, cx| prs.set_focus(focus, cx));
                 }),
+                cx.observe_global_in::<PanelLayout>(window, Self::panel_toggled),
             ],
         };
         app.sync_machines(window, cx);
@@ -385,6 +389,8 @@ impl RhoApp {
         for gone in old {
             self.rho_settings
                 .update(cx, |settings, cx| settings.forget(&gone.machine, cx));
+            self.forges
+                .update(cx, |forges, cx| forges.forget(&gone.machine, cx));
             self.forget_sessions(&gone.machine, window, cx);
             self.drop_drafts(&gone.machine, window, cx);
             self.sidebar
@@ -518,6 +524,10 @@ impl RhoApp {
             };
             window.push_notification(Notification::warning(notice.to_owned()).title(title), cx);
         }
+        // Its CLIs may have changed while it was away; check them afresh
+        // when next asked.
+        self.forges
+            .update(cx, |forges, cx| forges.forget(machine, cx));
         if !machine.is_local() {
             self.workspaces.update(cx, |workspaces, cx| {
                 workspaces.connected(machine, &daemon, cx);
@@ -777,13 +787,14 @@ impl RhoApp {
     /// Opens Settings over the window, with rho's own settings on each
     /// machine.
     fn open_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        settings_view::open(
-            &self.machines,
-            &self.rho_settings,
-            &self.installs,
-            window,
-            cx,
-        );
+        let app = settings_view::AppState {
+            machines: self.machines.clone(),
+            rho_settings: self.rho_settings.clone(),
+            workspaces: self.workspaces.clone(),
+            forges: self.forges.clone(),
+            installs: self.installs.clone(),
+        };
+        settings_view::open(app, window, cx);
     }
 
     /// Notes that `machine`'s daemon may restart in place, so its
@@ -1514,6 +1525,22 @@ impl RhoApp {
         cx.notify();
     }
 
+    /// The right panel shown or hidden: lays it out, and redraws the pane's
+    /// title bar, which offers the toggle while it is hidden.
+    fn panel_toggled(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Hidden with the keyboard in it, the panel would take the keyboard
+        // away, and the app's shortcuts with it: give it to the pane.
+        if !PanelLayout::get(cx) && self.panel.read(cx).has_keyboard(window, cx) {
+            self.focus_pane(window, cx);
+        }
+        match &self.pane {
+            Pane::Session(view) => view.update(cx, |_, cx| cx.notify()),
+            Pane::Draft(view) => view.update(cx, |_, cx| cx.notify()),
+            Pane::Empty => {}
+        }
+        cx.notify();
+    }
+
     /// Puts the keyboard in the main pane's composer, unless a dialog such
     /// as settings is open: it keeps the keyboard until it closes.
     fn focus_pane(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1767,6 +1794,14 @@ impl RhoApp {
 
 #[cfg(test)]
 impl RhoApp {
+    /// The pull requests the right panel reads, for UI tests.
+    pub(crate) fn pull_requests(&self) -> &Entity<PullRequests> {
+        &self.prs
+    }
+    /// The forge CLIs found on each machine, for UI tests.
+    pub(crate) fn forges(&self) -> &Entity<Forges> {
+        &self.forges
+    }
     /// The session the main pane shows, for UI tests.
     pub(crate) fn active_session(&self) -> Option<Entity<SessionView>> {
         match &self.pane {

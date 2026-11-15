@@ -6381,6 +6381,7 @@ dependencies = [
  "rho-ui-core",
  "rquickjs",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]

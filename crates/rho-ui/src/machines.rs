@@ -9,6 +9,8 @@ use std::{fmt, path::PathBuf};
 use gpui_kit::SharedString;
 use rho_ui_core::{DaemonTarget, RhoInstall, SessionId, SshTarget};
 
+use crate::forge::CliPaths;
+
 /// Names a machine in the settings and the state database: [`LOCAL`] for
 /// this one, else the SSH host a remote machine is reached at.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -82,6 +84,8 @@ pub(crate) struct RemoteMachine {
     pub(crate) rho: String,
     /// See [`Machine::clone_folder`].
     pub(crate) clone_folder: String,
+    /// Its forge CLIs' programs, as Settings → Source control sets them.
+    pub(crate) cli: CliPaths,
 }
 
 /// The program a remote machine runs when none is set.
@@ -94,6 +98,7 @@ impl RemoteMachine {
             label: String::new(),
             rho: DEFAULT_REMOTE_RHO.to_owned(),
             clone_folder: String::new(),
+            cli: CliPaths::default(),
         }
     }
 

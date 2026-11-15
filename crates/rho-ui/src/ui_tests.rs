@@ -35,8 +35,10 @@ use gpui_kit::component::ActiveTheme as _;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    forge::ForgeCli,
     machines::{MachineId, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
+    pull_requests::{BranchId, CheckStatus, Found, Lookup, PrLinks, RepoId, Target},
     rho_install::Offer,
     right_panel::{Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, UiScale},
@@ -256,12 +258,18 @@ impl Harness {
         let Machines {
             shelves,
             projects,
-            settings,
+            mut settings,
             remote_sockets,
             workspace,
             rho,
         } = machines;
         let rho = rho.map(|rho| RhoInstall::Here { rho });
+        // Never the user's gh, which would ask GitHub about their account.
+        if settings.local_cli.get(ForgeCli::Gh).is_empty() {
+            settings
+                .local_cli
+                .set(ForgeCli::Gh, "/nonexistent/gh".to_owned());
+        }
         let mut cx = HeadlessAppContext::with_platform(
             text_system(),
             Arc::new(crate::Assets),
@@ -3042,6 +3050,414 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
 }
 
+/// What [`StubGh`]'s API answers: PR 12 on `feature`, a failed check and
+/// a passed one, a comment and an approval, an open thread and a resolved
+/// one.
+fn stub_answer() -> String {
+    let summary = |checks: serde_json::Value| {
+        serde_json::json!({
+            "number": 12, "title": "Add widgets", "url": "https://github.com/acme/widgets/pull/12",
+            "state": "OPEN", "isDraft": false, "isCrossRepository": false,
+            "updatedAt": "2026-11-15T00:00:00Z", "headRefOid": "abc",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": checks } }] },
+        })
+    };
+    let check = |name: &str, conclusion: &str| {
+        serde_json::json!({
+            "__typename": "CheckRun", "name": name, "status": "COMPLETED",
+            "conclusion": conclusion, "detailsUrl": null,
+            "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } },
+        })
+    };
+    // A comment and an approval; an open thread and a resolved one.
+    let post = |login: &str, at: &str, body: &str, url: &str| {
+        serde_json::json!({
+            "author": { "login": login }, "body": body, "createdAt": at, "url": url
+        })
+    };
+    let thread = |id: &str, resolved: bool, path: &str, line: u32, body: &str| {
+        let url = format!("https://github.com/acme/widgets/pull/12#{id}");
+        serde_json::json!({
+            "id": id, "isResolved": resolved, "isOutdated": false, "path": path, "line": line,
+            "comments": {
+                "totalCount": 1,
+                "nodes": [post("octocat", "2026-11-14T23:00:00Z", body, &url)],
+            },
+        })
+    };
+    let mut detail = summary(serde_json::json!({
+        "state": "FAILURE",
+        "contexts": {
+            "totalCount": 2,
+            "nodes": [check("linux", "SUCCESS"), check("macos", "FAILURE")],
+        },
+    }));
+    let extra = serde_json::json!({
+        "body": "Adds **widgets**.", "author": { "login": "octocat" },
+        "headRefName": "feature", "baseRefName": "main",
+        "additions": 10, "deletions": 2, "changedFiles": 3, "reviewDecision": "APPROVED",
+        "mergeable": "MERGEABLE", "repository": {
+            "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": false,
+            "viewerDefaultMergeMethod": "SQUASH",
+        },
+        "comments": { "totalCount": 1, "nodes": [post(
+            "hubot", "2026-11-14T22:00:00Z",
+            "Looks good, one nit on the error path.",
+            "https://github.com/acme/widgets/pull/12#c1",
+        )] },
+        "reviews": { "totalCount": 1, "nodes": [{
+            "author": { "login": "monalisa" }, "body": "Ship it.", "state": "APPROVED",
+            "submittedAt": "2026-11-14T23:30:00Z",
+            "url": "https://github.com/acme/widgets/pull/12#r1",
+        }] },
+        "reviewThreads": { "totalCount": 2, "nodes": [
+            thread("t1", false, "src/lib.rs", 7, "Should this be `pub(crate)`?"),
+            thread("t2", true, "src/widgets/render.rs", 42, "Typo."),
+        ] },
+    });
+    if let (Some(detail), serde_json::Value::Object(extra)) = (detail.as_object_mut(), extra) {
+        detail.extend(extra);
+    }
+    let mut linked = summary(serde_json::json!({ "state": "FAILURE" }));
+    linked["title"] = serde_json::json!("Linked widgets");
+    serde_json::json!({ "data": {
+        "rateLimit": { "remaining": 4999, "resetAt": "2026-11-15T01:00:00Z" },
+        "r0": {
+            "defaultBranchRef": { "name": "main" },
+            "b0": { "nodes": [summary(serde_json::json!({ "state": "FAILURE" }))] },
+            "p0": detail,
+            // The same PR linked by hand, by another title.
+            "l0": linked,
+        },
+    } })
+    .to_string()
+}
+
+/// A checkout of `acme/widgets` on GitHub, on branch `feature`, and a gh
+/// signed in to github.com whose API answers with PR 12 on `feature`, a
+/// failed check and a passed one, and counts its queries.
+struct StubGh {
+    _checkout: tempfile::TempDir,
+    repo: PathBuf,
+    bin: tempfile::TempDir,
+}
+
+impl StubGh {
+    fn new() -> Self {
+        let checkout = tempfile::tempdir().unwrap();
+        let repo = rho_ui_core::platform::canonicalize(checkout.path()).unwrap();
+        let git = |args: &[&str]| crate::local::test::git(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+
+        let bin = tempfile::tempdir().unwrap();
+        let queries = bin.path().join("queries");
+        let answer = stub_answer();
+        std::fs::write(bin.path().join("answer.json"), answer).unwrap();
+        let gh = bin.path().join("gh");
+        let script = format!(
+            "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
+             auth) echo '{{\"hosts\":{{\"github.com\":[{{\"state\":\"success\",\"active\":true,\"host\":\"github.com\",\"login\":\"octocat\"}}]}}}}' ;;\n  \
+             api) echo x >> '{}'; cat '{}' ;;\n  \
+             pr) printf '%s\\n' \"$@\" > '{}' ;;\nesac\n",
+            queries.display(),
+            bin.path().join("answer.json").display(),
+            bin.path().join("comment").display(),
+        );
+        write_program(&gh, &script);
+        StubGh {
+            _checkout: checkout,
+            repo,
+            bin,
+        }
+    }
+
+    fn program(&self) -> PathBuf {
+        self.bin.path().join("gh")
+    }
+
+    /// How many API queries it answered.
+    fn asked(&self) -> usize {
+        std::fs::read_to_string(self.bin.path().join("queries"))
+            .map_or(0, |text| text.lines().count())
+    }
+
+    /// The arguments of its last `gh pr ...`, one a line.
+    fn acted(&self) -> Option<String> {
+        std::fs::read_to_string(self.bin.path().join("comment")).ok()
+    }
+
+    /// Edits its API's answer.
+    fn edit_answer(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = self.bin.path().join("answer.json");
+        let mut answer = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut answer);
+        std::fs::write(&path, answer.to_string()).unwrap();
+    }
+}
+
+/// Opens the Pull request surface on `gh`'s checkout once the session's
+/// first turn ended, so that end reads nothing, and waits for PR 12 and
+/// its checks.
+fn open_pr_session(gh: &StubGh, name: &'static str) -> Harness {
+    let mut settings = Settings::default();
+    settings
+        .local_cli
+        .set(ForgeCli::Gh, gh.program().display().to_string());
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        name,
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::owning(["s1"]),
+            settings,
+            workspace: Some(gh.repo.clone()),
+            ..Machines::default()
+        },
+    );
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+    ui
+}
+
+/// Opens the Pull request surface over a session made by
+/// [`open_pr_session`].
+fn open_pr_surface(gh: &StubGh, name: &'static str) -> Harness {
+    let mut ui = open_pr_session(gh, name);
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-pull-request");
+    ui.wait_until("the PR and its checks", |window, _, _| {
+        is_visible(window, "pull-request-check-1")
+    });
+    ui
+}
+
+/// The Pull request surface shows the PR of the session's branch, read
+/// through gh: one query finds it, one more reads its detail, then one
+/// every 30 seconds while it shows, and none while the panel is hidden or
+/// GitHub's limit is nearly spent, which it says.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn the_pull_request_surface_shows_the_branchs_pr() {
+    let gh = StubGh::new();
+    let asked = || gh.asked();
+    let mut ui = open_pr_surface(&gh, "pull-request");
+    let branch = BranchId {
+        repo: RepoId::from_url("git@github.com:acme/widgets.git").unwrap(),
+        branch: "feature".into(),
+    };
+    let statuses = ui.cx.update(|cx| {
+        let prs = ui.app.read(cx).pull_requests().read(cx);
+        let Lookup::Found(Found::Pr(summary)) = prs.lookup(&Target::Branch(branch.clone())) else {
+            panic!("PR 12");
+        };
+        let detail = prs.detail(&summary.id).expect("its detail");
+        detail
+            .checks
+            .iter()
+            .map(|check| check.status)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(statuses, [CheckStatus::Failed, CheckStatus::Passed]);
+    assert_eq!(
+        ui.label("pull-request-title").as_deref(),
+        Some("Add widgets")
+    );
+    assert_eq!(asked(), 2, "one query found the PR, one read its detail");
+    ui.shot("pr");
+
+    // On screen, it reads again every 30 seconds; its checks done, the
+    // PR's detail isn't read again.
+    ui.cx.advance_clock(Duration::from_secs(30));
+    ui.wait_until("the next poll", |_, _, _| asked() == 3);
+    // A daemon reconnecting forgets the gh it found; the poll that finds
+    // it being checked again runs once it is.
+    let forges = ui.cx.update(|cx| ui.app.read(cx).forges().clone());
+    ui.cx.update(|cx| {
+        forges.update(cx, |forges, cx| forges.forget(&MachineId::local(), cx));
+    });
+    ui.cx.advance_clock(Duration::from_secs(30));
+    ui.wait_until("a poll after gh's check", |_, _, _| asked() == 4);
+
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.cx.advance_clock(Duration::from_secs(120));
+    ui.frame();
+    assert_eq!(asked(), 4, "a hidden panel polls nothing");
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.wait_until("a read as the panel shows", |_, _, _| asked() == 5);
+
+    // Down to GitHub's last points, polling waits for the limit to reset
+    // and says so over the PR it read.
+    gh.edit_answer(|answer| {
+        answer["data"]["rateLimit"] =
+            serde_json::json!({ "remaining": 10, "resetAt": "2099-01-01T00:00:00Z" });
+    });
+    ui.click("pull-request-refresh");
+    ui.wait_until("the pause", |window, _, _| {
+        is_visible(window, "pull-request-trouble") && is_visible(window, "pull-request-title")
+    });
+    assert_eq!(asked(), 6);
+    ui.shot("paused");
+    ui.cx.advance_clock(Duration::from_secs(120));
+    ui.frame();
+    assert_eq!(asked(), 6, "a paused poll asks nothing");
+}
+
+/// An active session's row marks its PR, failing checks and all, read for
+/// the sidebar by one query of summaries, then again every five minutes.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_sidebar_row_marks_its_pr() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_session(&gh, "pull-request-row");
+    let key = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        app.active_session().expect("a session").read(cx).live().id
+    });
+    let mark = SharedString::from(format!("session-{key}-pr"));
+    ui.wait_until("the row's PR", |window, _, _| {
+        is_visible(window, mark.clone())
+    });
+    assert_eq!(
+        ui.label(mark.clone()).as_deref(),
+        Some("#12, checks failing")
+    );
+    assert_eq!(gh.asked(), 1, "one query, without the PR's detail");
+    ui.shot("mark");
+
+    ui.cx.advance_clock(Duration::from_secs(300));
+    ui.wait_until("the next read", |_, _, _| gh.asked() == 2);
+}
+
+/// A PR linked by hand takes the branch's place, also after a restart's
+/// read of the state database, until it is unlinked; what names no PR says
+/// so.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_pull_request_links_by_hand() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-link");
+    ui.click("pull-request-link");
+    ui.act(|window, cx| {
+        window.input("widgets", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("why that's no PR", |window, _, _| {
+        is_visible(window, "pull-request-link-error")
+    });
+    ui.act(|window, cx| {
+        window.press("secondary-a", cx);
+        window.input("acme/widgets#12", cx);
+    });
+    ui.shot("form");
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_until("the linked PR", |window, _, _| {
+        window
+            .try_find("pull-request-title")
+            .is_some_and(|title| title.label() == Some("Linked widgets"))
+    });
+    let key = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        let view = app.active_session().expect("a session");
+        view.read(cx).live().id
+    });
+    let linked = ui.cx.update(|cx| cx.global::<PrLinks>().get(&key).cloned());
+    assert_eq!(linked.map(|id| id.number), Some(12));
+    ui.shot("linked");
+
+    ui.click("pull-request-unlink");
+    ui.wait_until("the branch's PR again", |window, _, _| {
+        window
+            .try_find("pull-request-title")
+            .is_some_and(|title| title.label() == Some("Add widgets"))
+    });
+    let linked = ui.cx.update(|cx| cx.global::<PrLinks>().get(&key).cloned());
+    assert_eq!(linked, None);
+}
+
+/// The PR's conversation: its comments and reviews, its threads on the
+/// code, open ones open and resolved ones closed until clicked; and a
+/// comment posted through the session machine's gh, after which the PR
+/// is read again to show it.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_pull_request_conversation_takes_a_comment() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-conversation");
+    ui.act(|window, _| {
+        assert!(is_visible(window, "pull-request-post-1"), "the approval");
+        assert!(
+            is_visible(window, "pull-request-thread-0-0"),
+            "an open thread shows"
+        );
+        assert!(
+            !is_visible(window, "pull-request-thread-1-0"),
+            "a resolved one waits"
+        );
+    });
+    let to_the_end = |window: &mut Window, cx: &mut App| {
+        let down = gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-2000.)));
+        window.scroll("pull-request-body", down, cx);
+    };
+    ui.act(to_the_end);
+    ui.click("pull-request-thread-1");
+    ui.act(|window, _| assert!(is_visible(window, "pull-request-thread-1-0")));
+
+    ui.act(to_the_end);
+    ui.click("pull-request-comment-box");
+    ui.act(|window, cx| window.input("Thanks!", cx));
+    ui.shot("written");
+    ui.click("pull-request-comment");
+    ui.wait_until("the comment", |_, _, _| gh.acted().is_some());
+    assert_eq!(
+        gh.acted().as_deref(),
+        Some("pr\ncomment\n12\n--repo\ngithub.com/acme/widgets\n--body\nThanks!\n")
+    );
+    ui.wait_until("the PR read again", |_, _, _| gh.asked() == 3);
+
+    // Hidden with the keyboard in the comment box, the panel gives it
+    // back to the pane, where the shortcut that shows it again works.
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.act(|window, _| assert!(!is_visible(window, "pull-request-body")));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.wait_until("the panel again", |window, _, _| {
+        is_visible(window, "pull-request-body")
+    });
+}
+
+/// An open PR merges the way its repository and the viewer prefer, once
+/// confirmed, through `gh pr merge` without deleting the branch; then it is
+/// read again.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_pull_request_merges_once_confirmed() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-merge");
+    ui.shot("open");
+    ui.click("pull-request-merge");
+    ui.wait_until("the confirmation", |window, _, _| {
+        is_visible(window, "pull-request-merge-confirm")
+    });
+    assert_eq!(gh.acted(), None, "one click merges nothing");
+    ui.shot("confirm");
+    ui.click("pull-request-merge-confirm");
+    ui.wait_until("the merge", |_, _, _| gh.acted().is_some());
+    assert_eq!(
+        gh.acted().as_deref(),
+        Some(
+            "pr\nmerge\n12\n--repo\ngithub.com/acme/widgets\n--squash\n--match-head-commit\nabc\n"
+        )
+    );
+    ui.wait_until("the PR read again", |_, _, _| gh.asked() == 3);
+}
+
 /// The Diff surface shows the uncommitted changes where the session on
 /// screen works, read with this machine's `git`, and reads them again when
 /// the session's turn ends.
@@ -5090,6 +5506,86 @@ fn a_machine_added_in_settings_lists_its_sessions() {
     });
     ui.cx
         .update(|cx| assert_eq!(cx.global::<Settings>().machines, []));
+}
+
+/// Settings → Source control shows the gh this machine runs, with the
+/// account it is signed in to. A new Program is saved and checked at once,
+/// and a token GitHub refused shows as signed out, with no sign-in to copy
+/// when the token comes from a variable.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn source_control_shows_this_machines_gh() {
+    let bin = tempfile::tempdir().unwrap();
+    let fake_gh = |name: &str, account: &str| {
+        let path = bin.path().join(name);
+        let script = format!(
+            "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
+             auth) echo '{{\"hosts\":{{\"github.com\":[{account}]}}}}' ;;\nesac\n"
+        );
+        write_program(&path, &script);
+        path.display().to_string()
+    };
+    let signed_in = fake_gh(
+        "gh",
+        r#"{"state":"success","active":true,"host":"github.com","login":"octocat","tokenSource":"keyring","scopes":"repo, workflow","gitProtocol":"ssh"}"#,
+    );
+    let refused = fake_gh(
+        "gh-refused",
+        r#"{"state":"error","error":"non-200 OK status code: 401 Unauthorized","active":true,"host":"github.com","login":"","tokenSource":"GH_TOKEN","gitProtocol":"https"}"#,
+    );
+    let mut settings = Settings::default();
+    settings.local_cli.set(ForgeCli::Gh, signed_in);
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "source-control",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::owning(["s1"]),
+            settings,
+            ..Machines::default()
+        },
+    );
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Source control");
+    let account = "source-control-gh-account-0";
+    ui.wait_until("gh's account", |window, _, _| {
+        window
+            .try_find(account)
+            .is_some_and(|element| element.label() == Some("@octocat"))
+    });
+    assert_eq!(
+        ui.label("source-control-gh-status").as_deref(),
+        Some("gh 2.99.0")
+    );
+    ui.shot("signed-in");
+
+    ui.click("setting-gh-program");
+    ui.act(|window, cx| {
+        window.press("secondary-a", cx);
+        window.input(&refused, cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the refused token", |window, _, _| {
+        window
+            .try_find(account)
+            .is_some_and(|element| element.label() == Some("Not signed in"))
+    });
+    ui.act(|window, _| {
+        assert!(
+            window.try_find("source-control-gh-sign-in-0").is_none(),
+            "signing in again can't replace a token from GH_TOKEN, so nothing offers it"
+        );
+    });
+    ui.cx.update(|cx| {
+        assert_eq!(
+            cx.global::<Settings>()
+                .cli_path(&MachineId::local(), ForgeCli::Gh),
+            refused,
+            "the new Program is saved"
+        );
+    });
+    ui.shot("refused");
 }
 
 /// rho's own settings show as a page drawn from its daemon's schema. A
