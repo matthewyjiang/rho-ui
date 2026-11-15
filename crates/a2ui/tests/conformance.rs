@@ -4,8 +4,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use a2ui::{resolve_path, DataModel, Pointer, WatchId};
-use serde_json::{Map, Value};
+use a2ui::{
+    parse_template, resolve_path, DataContext, DataModel, Expr, ExpressionError, FunctionError,
+    Functions, Pointer, WatchId,
+};
+use serde_json::{json, Map, Value};
 
 /// Cases the harness cannot express in Rust, with the reason. A case here is
 /// not run.
@@ -40,6 +43,217 @@ fn assert_no_failures(suite: &str, failures: &[String]) {
 
 fn is_skipped(name: &str) -> bool {
     SKIPPED.iter().any(|(skipped, _)| *skipped == name)
+}
+
+/// The cases `deferred` does not claim, after checking that it claims exactly
+/// `want` of them, so that a vendor refresh that moves cases is noticed.
+fn in_scope(
+    suite: &str,
+    cases: Vec<Value>,
+    deferred: impl Fn(&Value) -> bool,
+    want: usize,
+) -> Vec<Value> {
+    let (later, now): (Vec<Value>, Vec<Value>) = cases.into_iter().partition(|c| deferred(c));
+    assert_eq!(later.len(), want, "{suite}: deferred case count changed");
+    now
+}
+
+/// A case's error expectation, under either spelling the suites use.
+fn expected_error(case: &Value) -> Option<&Value> {
+    case.get("expect_error").or_else(|| case.get("expectError"))
+}
+
+#[test]
+fn expressions_suite() {
+    // `validate` cases render a surface, which needs the message processor.
+    let cases = in_scope(
+        "expressions",
+        load_suite("expressions.yaml"),
+        |case| case["action"] == "validate",
+        6,
+    );
+    let mut failures = Vec::new();
+    for case in cases {
+        let name = case_name(&case);
+        if is_skipped(name) {
+            continue;
+        }
+        assert_eq!(
+            case["action"], "parse_expression_template",
+            "{name}: unknown action"
+        );
+        let input = case["input"].as_str().expect("input is a string");
+        let outcome =
+            parse_template(input).map(|parts| Value::Array(parts.iter().map(part_json).collect()));
+        let verdict = match (outcome, expected_error(&case)) {
+            (Ok(got), None) if got == case["expect"] => Ok(()),
+            (Ok(got), None) => Err(format!("got {got}, want {}", case["expect"])),
+            (Ok(got), Some(_)) => Err(format!("parsed to {got}, want an error")),
+            (Err(e), None) => Err(format!("failed: {e}")),
+            (Err(e), Some(want)) => check_parse_error(&e, want),
+        };
+        if let Err(reason) = verdict {
+            failures.push(format!("{name}: {reason}"));
+        }
+    }
+    assert_no_failures("expressions", &failures);
+}
+
+/// A template part in the suite's notation.
+fn part_json(part: &Expr) -> Value {
+    match part {
+        Expr::Literal(value) => value.clone(),
+        Expr::Path(path) => json!({ "path": path }),
+        Expr::Call(call) => json!({
+            "call": call.name,
+            "args": call.args.iter().map(|(k, v)| (k.clone(), part_json(v))).collect::<Map<_, _>>(),
+            "returnType": "any",
+        }),
+        Expr::List(_) | Expr::Object(_) => panic!("templates have no containers: {part:?}"),
+    }
+}
+
+/// Checks a parse error against the suite's `ParseError` category and the
+/// message phrase that names its cause.
+fn check_parse_error(error: &ExpressionError, want: &Value) -> Result<(), String> {
+    if want["category"] != "ParseError" {
+        return Err(format!("unknown error category {}", want["category"]));
+    }
+    let phrase = parse_error_phrase(error);
+    if want["message"].as_str() == phrase {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed with {error:?} ({phrase:?}), want {}",
+            want["message"]
+        ))
+    }
+}
+
+/// The phrase the suite's `expect_error.message` uses for each cause it
+/// tests, so a case is matched by cause rather than by wording.
+fn parse_error_phrase(error: &ExpressionError) -> Option<&'static str> {
+    use ExpressionError::*;
+    match error {
+        UnexpectedCharacters { .. } => Some("Unexpected characters"),
+        MissingArgumentColon { .. } => Some("after argument name"),
+        UnclosedCall { .. } => Some("after function arguments"),
+        UnclosedInterpolation => Some("Unclosed interpolation"),
+        InvalidNumber { .. } => Some("Invalid number literal"),
+        NumberOutOfRange { .. } => Some("out of range"),
+        TooDeep => Some("Max recursion depth"),
+        UnclosedString
+        | InvalidPathEscape { .. }
+        | TildeInFunctionName { .. }
+        | InvalidSystemName
+        | SystemNameWithoutCall { .. }
+        | TemplateTooLong { .. }
+        | TooManyParts
+        | UnknownDirective { .. }
+        | MalformedBinding
+        | MalformedCall
+        | InvalidPath(_)
+        | UnknownFunction { .. }
+        | IndexOutsideCollection
+        | EvaluationTooDeep
+        | Function { .. } => None,
+    }
+}
+
+#[test]
+fn functions_suite() {
+    // `validate` cases render a surface, which needs the message processor.
+    // A case naming a surface or a catalog goes through catalog resolution.
+    let deferred = |case: &Value| {
+        case["action"] == "validate"
+            || ["surface", "catalogId", "catalogPaths", "catalog"]
+                .iter()
+                .any(|key| case.get(key).is_some())
+    };
+    let cases = in_scope("functions", load_suite("functions.yaml"), deferred, 23);
+    let functions = Functions::basic();
+    let mut failures = Vec::new();
+    for case in cases {
+        let name = case_name(&case);
+        if is_skipped(name) {
+            continue;
+        }
+        assert_eq!(
+            case["action"], "evaluate_function",
+            "{name}: unknown action"
+        );
+        if let Err(reason) = run_function_case(&case, &functions) {
+            failures.push(format!("{name}: {reason}"));
+        }
+    }
+    assert_no_failures("functions", &failures);
+}
+
+/// Calls the case's function with its arguments, at the root of its data.
+fn run_function_case(case: &Value, functions: &Functions) -> Result<(), String> {
+    let model = DataModel::new(case.get("dataModel").cloned().unwrap_or_else(|| json!({})));
+    let call = json!({"@call": case["function"], "args": case.get("args").cloned().unwrap_or_else(|| json!({}))});
+    let outcome =
+        Expr::from_json(&call).and_then(|call| DataContext::new(&model, functions).evaluate(&call));
+    match (outcome, expected_error(case)) {
+        (Ok(got), None) => check_function_result(case, &got),
+        (Ok(got), Some(_)) => Err(format!("returned {got}, want an error")),
+        (Err(e), None) => Err(format!("failed: {e}")),
+        (Err(e), Some(want)) => check_function_error(&e, want),
+    }
+}
+
+/// Compares a result with `expect`.
+///
+/// Validators return a `ValidationResult`. A v1.0 case states the members it
+/// checks, such as `{valid: false}`, and only those are compared. A case for
+/// an earlier version, written when validators returned a boolean, states
+/// that boolean, which is the result's `valid`.
+fn check_function_result(case: &Value, got: &Value) -> Result<(), String> {
+    let want = &case["expect"];
+    let version = case
+        .get("protocolVersion")
+        .or_else(|| case.pointer("/catalog/protocolVersion"));
+    let validity = got.get("valid").filter(|valid| valid.is_boolean());
+    let matches = match (version.and_then(Value::as_str), want, validity) {
+        (Some("1.0"), Value::Object(members), Some(_)) if members.contains_key("valid") => members
+            .iter()
+            .all(|(key, value)| got.get(key) == Some(value)),
+        (Some("1.0"), _, _) => got == want,
+        (_, Value::Bool(_), Some(valid)) => valid == want,
+        _ => got == want,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!("got {got}, want {want}"))
+    }
+}
+
+/// Checks an error against the suite's `ExpressionError` category and, when
+/// the case names one, the regex dialect's diagnostic token.
+fn check_function_error(error: &ExpressionError, want: &Value) -> Result<(), String> {
+    if want["category"] != "ExpressionError" {
+        return Err(format!(
+            "failed with {error:?}, want a {}",
+            want["category"]
+        ));
+    }
+    let Some(message) = want.get("message") else {
+        return Ok(());
+    };
+    let code = match error {
+        ExpressionError::Function {
+            source: FunctionError::Regex(regex),
+            ..
+        } => regex.code(),
+        _ => None,
+    };
+    if message.as_str() == code {
+        Ok(())
+    } else {
+        Err(format!("failed with {error:?}, want {message}"))
+    }
 }
 
 #[test]
