@@ -163,6 +163,9 @@ pub struct Script {
     /// Whether "old"'s replay ends with a reply over 4 KiB, which GPUI
     /// Kit parses off the UI thread.
     pub long_reply: bool,
+    /// How many more saved sessions, `past-0` and on, each an hour older
+    /// than the last and older than "old", to fill long lists.
+    pub past_sessions: usize,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -1057,6 +1060,15 @@ impl State {
             old.say("long", &paragraphs.join("\n\n"));
         }
         sessions.insert("old".to_owned(), old);
+        let mut updated = 1_767_225_600;
+        for n in 0..script.past_sessions {
+            updated -= 3600;
+            let title = format!("past {n}");
+            sessions.insert(
+                format!("past-{n}"),
+                FakeSession::new("/w/b", Some(&title), updated),
+            );
+        }
         let mut state = Self {
             sessions,
             new_sessions: 0,

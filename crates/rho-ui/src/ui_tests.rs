@@ -1259,6 +1259,61 @@ fn settle_and_snooze_move_sessions_between_lists() {
     ui.shot("both-shelves");
 }
 
+/// An opened shelf shows its newest 25 sessions, Show more adds the rest,
+/// and folding it goes back to 25.
+#[test]
+fn a_long_shelf_shows_25_sessions_at_a_time() {
+    use gpui_kit::{point, ScrollDelta};
+    let script = Script {
+        past_sessions: 30,
+        ..Script::default()
+    };
+    // Nobody's: all 32 sessions start settled.
+    let mut ui = Harness::start_with("shelf-pages", script, Shelves::default());
+    ui.wait_until("the settled entry", |window, _, _| {
+        is_visible(window, "toggle-settled")
+    });
+    ui.click("toggle-settled");
+    let to_end = |ui: &mut Harness| {
+        let down = ScrollDelta::Pixels(point(px(0.), px(-5000.)));
+        ui.act(|window, cx| window.scroll("sidebar", down, cx));
+    };
+    ui.wait_until("the settled shelf", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    to_end(&mut ui);
+    // s1, old, then past-0 to past-22.
+    ui.wait_until("25 sessions, then Show more", |window, _, _| {
+        is_visible(window, "session-local-past-22") && is_visible(window, "more-settled")
+    });
+    ui.act(|window, _| {
+        assert!(window.try_find("session-local-past-23").is_none());
+    });
+    ui.shot("first-page");
+
+    ui.click("more-settled");
+    to_end(&mut ui);
+    ui.wait_until("the rest, with no Show more", |window, _, _| {
+        is_visible(window, "session-local-past-29") && !is_visible(window, "more-settled")
+    });
+    ui.shot("all");
+
+    let up = ScrollDelta::Pixels(point(px(0.), px(5000.)));
+    ui.act(|window, cx| window.scroll("sidebar", up, cx));
+    ui.wait_until("the shelf's header", |window, _, _| {
+        is_visible(window, "toggle-settled")
+    });
+    ui.click("toggle-settled");
+    ui.click("toggle-settled");
+    ui.wait_until("the settled shelf", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    to_end(&mut ui);
+    ui.wait_until("25 sessions again", |window, _, _| {
+        is_visible(window, "more-settled") && window.try_find("session-local-past-23").is_none()
+    });
+}
+
 /// The row menu renames a session in place and saves the title in its
 /// daemon, Escape leaving it as it was; pins a session above newer ones;
 /// and copies a session's ID.

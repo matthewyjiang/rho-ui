@@ -6,8 +6,9 @@
 //! for Snooze and Settle, or Unpin. Pinned sessions lead the list, and a
 //! turn that finished off screen shows Done until its session is opened.
 //! Right-click a row for its menu, which also renames it in place. A shelf
-//! opens from its header into one-line rows,
-//! and hovering one shows its details in a card. The filter beside the
+//! opens from its header into one-line rows, its newest 25 at first, and
+//! Show more under them adds 25 more at a time. Hovering a row shows its
+//! details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
 //! which machines aren't connected.
 //!
@@ -57,7 +58,9 @@ use crate::{
     badge::Badge,
     machines::{MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
-    session_list::{Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList},
+    session_list::{
+        Activity, Item, JobSession, LiveSession, Row, SavedSession, SessionList, SHELF_PAGE,
+    },
     shelf::{Shelf, Shelves},
     store::StateDb,
     time,
@@ -114,7 +117,7 @@ use rail::{toggle_button, Layout};
 fn item_rems(item: Item) -> f32 {
     match item {
         Item::Session(_) => ROW_REMS,
-        Item::Shelved(_) => SHELVED_ROW_REMS,
+        Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
         Item::Header(_) => HEADER_REMS,
         Item::Gap => 0.,
     }
@@ -536,6 +539,11 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
+    fn show_more(&mut self, which: Shelf, cx: &mut Context<'_, Self>) {
+        self.list.show_more(which);
+        self.rebuild(cx);
+    }
+
     fn open(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         if let Some(row) = self.list.row(id) {
             cx.emit(SidebarEvent::Open {
@@ -780,6 +788,7 @@ impl SidebarView {
                     self.render_shelved(row, workspace, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
+                Item::More(which) => self.render_show_more(which, cx),
                 Item::Gap => div().into_any_element(),
             })
             .collect()
@@ -1029,6 +1038,30 @@ impl SidebarView {
                             .text_color(theme.muted_foreground),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(which, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// "Show 25 more" under a shelf that holds back sessions, or as many as
+    /// it holds back when fewer.
+    fn render_show_more(&self, which: Shelf, cx: &Context<'_, Self>) -> AnyElement {
+        let id = match which {
+            Shelf::Snoozed => "more-snoozed",
+            Shelf::Settled | Shelf::Active => "more-settled",
+        };
+        let more = self.list.held_back(which).min(SHELF_PAGE);
+        div()
+            .h(rems(SHELVED_ROW_REMS))
+            .px_2()
+            .py(rems(GUTTER_REMS))
+            .child(
+                Button::new(id)
+                    .ghost()
+                    .small()
+                    .size_full()
+                    .text_color(cx.theme().muted_foreground)
+                    .label(format!("Show {more} more"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.show_more(which, cx))),
             )
             .into_any_element()
     }

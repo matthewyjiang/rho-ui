@@ -1,7 +1,8 @@
 //! The sidebar's data: every listed session of every machine as a flat row,
 //! newest first, which shelf each is on, and the items the sidebar's one
 //! scrolling list shows: active sessions, a gap, then each shelf's header
-//! and, when it's open, its sessions. A [`Filter`] hides machines and keeps
+//! and, when it's open, its newest [`SHELF_PAGE`] sessions, then a Show
+//! more that adds as many again. A [`Filter`] hides machines and keeps
 //! to chosen projects. Plain data with no GUI code; [`crate::sidebar`] draws
 //! it.
 
@@ -141,6 +142,9 @@ pub(crate) enum Item {
     Shelved(usize),
     /// A shelf's header, with its count; it opens and folds the shelf.
     Header(Shelf),
+    /// Under an open shelf that holds back sessions: shows
+    /// [`SHELF_PAGE`] more.
+    More(Shelf),
     /// The gap above the shelves. The sidebar stretches it to fill the
     /// space the list leaves, so folded shelves sit at the bottom and
     /// only rise as opened shelves fill it. Search results have none: they
@@ -164,9 +168,15 @@ pub(crate) struct SessionList {
     counts: [usize; 3],
     /// Which shelves show their sessions; both start folded.
     open: [bool; 3],
+    /// How many times each shelf's Show more was pressed since it opened.
+    more: [usize; 3],
     query: String,
     filter: Filter,
 }
+
+/// How many sessions an opened shelf shows, and how many each Show more
+/// adds, so a long history doesn't build hundreds of rows at once.
+pub(crate) const SHELF_PAGE: usize = 25;
 
 /// A shelf's index into per-shelf arrays.
 fn slot(shelf: Shelf) -> usize {
@@ -399,9 +409,29 @@ impl SessionList {
         query.clone_into(&mut self.query);
     }
 
-    /// Opens a folded shelf or folds an open one.
+    /// Opens a folded shelf or folds an open one. Either way it shows its
+    /// first [`SHELF_PAGE`] sessions next time.
     pub(crate) fn toggle(&mut self, which: Shelf) {
         self.open[slot(which)] ^= true;
+        self.more[slot(which)] = 0;
+    }
+
+    /// Shows [`SHELF_PAGE`] more of `which`'s sessions.
+    pub(crate) fn show_more(&mut self, which: Shelf) {
+        self.more[slot(which)] += 1;
+    }
+
+    /// How many sessions matching the search `which` shows, at most.
+    fn limit(&self, which: Shelf) -> usize {
+        match which {
+            Shelf::Active => usize::MAX,
+            Shelf::Snoozed | Shelf::Settled => SHELF_PAGE * (self.more[slot(which)] + 1),
+        }
+    }
+
+    /// How many sessions matching the search `which` holds back.
+    pub(crate) fn held_back(&self, which: Shelf) -> usize {
+        self.count(which).saturating_sub(self.limit(which))
     }
 
     /// Whether `shelf` shows its sessions. A search opens every shelf.
@@ -412,7 +442,9 @@ impl SessionList {
     /// Puts every row on its shelf and rebuilds the items and counts.
     /// `workspace` gives a workspace's name, for the search, and its
     /// project's folder, for the filter. A busy session is always active.
-    /// Pinned sessions lead the active list, the latest pinned first.
+    /// Pinned sessions lead the active list, the latest pinned first. An
+    /// open shelf shows its newest sessions up to its limit, then a Show
+    /// more.
     pub(crate) fn rebuild<'a>(
         &mut self,
         shelves: &Shelves,
@@ -459,10 +491,14 @@ impl SessionList {
             // An emptied shelf folds, so it comes back folded.
             if count == 0 && self.query.is_empty() {
                 self.open[slot(shelf)] = false;
+                self.more[slot(shelf)] = 0;
             }
             if shelf != Shelf::Active && count > 0 {
                 if !self.is_open(shelf) {
                     items.truncate(start);
+                } else if count > self.limit(shelf) {
+                    items.truncate(start + self.limit(shelf));
+                    items.push(Item::More(shelf));
                 }
                 items.insert(start, Item::Header(shelf));
             }
@@ -654,6 +690,7 @@ mod tests {
             .map(|&item| match item {
                 Item::Session(ix) | Item::Shelved(ix) => list.row_at(ix).title().to_string(),
                 Item::Header(shelf) => format!("[{} {}]", shelf.label(), list.count(shelf)),
+                Item::More(shelf) => format!("[{} more {}]", shelf.label(), list.held_back(shelf)),
                 Item::Gap => "~".to_owned(),
             })
             .collect()
