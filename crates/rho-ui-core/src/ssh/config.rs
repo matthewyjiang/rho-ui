@@ -42,8 +42,8 @@ pub(crate) struct Resolved {
     /// The name the host's key is filed under there (`HostKeyAlias`), in
     /// place of its hostname and port.
     pub(crate) host_key_alias: Option<String>,
-    /// A file of host keys never to accept (`RevokedHostKeys`).
-    pub(crate) revoked_host_keys: Option<PathBuf>,
+    /// Files of host keys never to accept (`RevokedHostKeys`).
+    pub(crate) revoked_host_keys: Vec<PathBuf>,
 }
 
 /// A key or certificate file rho-ui doesn't offer, and why, for the
@@ -204,7 +204,7 @@ fn parse(
     let mut user_known = Vec::new();
     let mut global_known = Vec::new();
     let mut host_key_alias = None;
-    let mut revoked_host_keys = None;
+    let mut revoked_host_keys = Vec::new();
     for line in output.lines() {
         let Some((keyword, value)) = line.split_once(' ') else {
             continue;
@@ -225,7 +225,7 @@ fn parse(
             "userknownhostsfile" => user_known = paths(value, home),
             "globalknownhostsfile" => global_known = paths(value, home),
             "hostkeyalias" => host_key_alias = Some(value.to_owned()),
-            "revokedhostkeys" => revoked_host_keys = Some(tilde(Path::new(value), home)),
+            "revokedhostkeys" => revoked_host_keys = paths(value, home),
             "proxycommand" | "proxyjump" if value != "none" => {
                 let directive = if keyword == "proxycommand" {
                     "ProxyCommand"
@@ -282,7 +282,13 @@ fn parse(
 }
 
 /// A space-separated list of paths, each with a leading `~` as `home`.
+/// The files a list setting names, such as `UserKnownHostsFile`. `ssh -G`
+/// prints `none` for one that names none (OpenSSH's
+/// `dump_cfg_strarray_oneline`), as `RevokedHostKeys` is when unset.
 fn paths(value: &str, home: Option<&Path>) -> Vec<PathBuf> {
+    if value.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
     value
         .split_whitespace()
         .map(|path| tilde(Path::new(path), home))
@@ -442,7 +448,7 @@ fn defaults(host: &str, local: &Local) -> Resolved {
         identity_agent: IdentityAgent::Default,
         known_hosts: in_ssh_dir(&["known_hosts", "known_hosts2"]),
         host_key_alias: None,
-        revoked_host_keys: None,
+        revoked_host_keys: Vec::new(),
     }
 }
 
@@ -501,7 +507,7 @@ mod tests {
                     PathBuf::from("/etc/ssh/ssh_known_hosts"),
                 ],
                 host_key_alias: Some("boxalias".to_owned()),
-                revoked_host_keys: Some(PathBuf::from("/home/me/.ssh/revoked")),
+                revoked_host_keys: vec![PathBuf::from("/home/me/.ssh/revoked")],
             }
         );
     }
@@ -548,6 +554,27 @@ mod tests {
                 expanded.map(PathBuf::from),
                 "{raw}"
             );
+        }
+    }
+
+    /// `ssh -G` prints a list setting that names no file as `none`, as
+    /// `RevokedHostKeys` is when unset: that's no file, not one named
+    /// `none`, which would refuse every host as unreadable.
+    #[test]
+    fn a_list_of_files_reads_none_as_no_file() {
+        for (line, revoked) in [
+            ("revokedhostkeys none", vec![]),
+            (
+                "revokedhostkeys ~/.ssh/revoked /etc/ssh/revoked",
+                vec![
+                    PathBuf::from("/home/me/.ssh/revoked"),
+                    PathBuf::from("/etc/ssh/revoked"),
+                ],
+            ),
+        ] {
+            let output = format!("user me\nhostname box\nuserknownhostsfile none\n{line}\n");
+            let resolved = parse("box", &output, &local(), &vars).expect("a route");
+            assert_eq!(resolved.revoked_host_keys, revoked, "{line}");
         }
     }
 

@@ -189,7 +189,7 @@ pub(super) fn read(resolved: &Resolved) -> Result<Vec<KnownKey>, String> {
                 })
         })
         .collect();
-    if let Some(file) = &resolved.revoked_host_keys {
+    for file in &resolved.revoked_host_keys {
         let refused = |why: String| {
             format!(
                 "rho-ui can't check {}, your RevokedHostKeys: {why}. It reads a text list of \
