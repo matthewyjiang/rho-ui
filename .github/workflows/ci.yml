@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a PR replaces its running check; main keeps every run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # GPUI's build dependencies, from GPUI Kit's installation guide, less
+      # what this app doesn't link (WebKit, ALSA, OpenSSL, zstd). The UI
+      # tests render on Mesa's lavapipe (mesa-vulkan-drivers).
+      - name: Install system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig-dev libwayland-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libvulkan1 mesa-vulkan-drivers
+
+      # Rust and Zig, at the versions mise.toml pins.
+      - uses: jdx/mise-action@v5
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+      - name: Upload UI screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-shots-${{ matrix.os }}
+          path: target/ui-shots/
+          retention-days: 14
+          if-no-files-found: ignore
