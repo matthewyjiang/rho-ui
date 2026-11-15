@@ -1,11 +1,13 @@
 //! The Terminal surface: shells in the folder of the session on screen,
 //! on the session's machine. Ghostty's libghostty-vt keeps the screen: it
 //! parses what the shell prints and encodes keys the way the program in it
-//! asked. rho-ui runs the pseudo-terminal and draws the cells with GPUI.
+//! asked. rho-ui runs the shell and draws the cells with GPUI.
 //!
-//! On this machine the shell is [`TerminalShell`]; on a remote one it is the
-//! login shell there, through the local `ssh -tt` on a connection of its
-//! own ([`SshLink::terminal_command`]).
+//! On this machine the shell is [`TerminalShell`], under a pseudo-terminal
+//! here; on a remote one it is the login shell there, under a
+//! pseudo-terminal sshd makes, in a channel on the ssh connection the
+//! machine's daemon rides ([`SshLink::open_shell`]), so it asks the key
+//! agent nothing. [`Program`] is either.
 //!
 //! Each Terminal tab ([`TerminalTab`]) splits into panes ([`TerminalPane`]),
 //! side by side or one above another. In each pane, each session gets its
@@ -13,15 +15,18 @@
 //! until the pane closes or its shell exits. When the shell of the session
 //! on screen exits, the pane closes ([`ShellExited`]), as a terminal
 //! window does, though a job it left running in the background still
-//! holds the pseudo-terminal open.
+//! holds the pseudo-terminal open. A shell that couldn't start, or whose
+//! ssh connection went, leaves why in its place, with Restart.
 //!
-//! Threads of its own read the pseudo-terminal, write to it, and wait for
-//! the shell to exit, as each of those blocks; the UI thread only parses
-//! what was read and queues what to write.
+//! Here, threads of its own read the pseudo-terminal, write to it, and
+//! wait for the shell to exit, as each of those blocks; for a remote shell
+//! rho-ui-core's I/O runtime does. The UI thread only parses what was read
+//! and queues what to write. It reads all the time: a remote shell's
+//! output that waits unread holds up the whole ssh connection.
 //!
 //! A tab is named for the program its shell runs now ([`TerminalView::program`]):
 //! the pseudo-terminal's foreground process on this machine, or the title
-//! the program sets on a remote one, where that process is ssh.
+//! the program sets on a remote one.
 //!
 //! The mouse goes to a program that asks for it, such as vim or htop, and
 //! otherwise selects text ([`mouse`]), scrolling while a drag is past the
@@ -37,7 +42,7 @@ mod tab;
 use std::{
     io::{Read, Write},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -47,7 +52,8 @@ use std::{
 
 use futures::{
     channel::{mpsc, oneshot},
-    SinkExt as _, StreamExt as _,
+    future::LocalBoxFuture,
+    FutureExt as _, SinkExt as _, StreamExt as _,
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
@@ -77,7 +83,7 @@ use libghostty_vt::{
     RenderState, Terminal,
 };
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use rho_ui_core::platform;
+use rho_ui_core::{platform, RemoteShell, ShellInput, ShellOutput, SshLink};
 
 use self::mouse::{Mouse, Pressed, Released};
 pub(crate) use self::tab::{Direction, PaneCommand};
@@ -122,7 +128,8 @@ const READ_BYTES: usize = 64 * 1024;
 /// program printing faster than the screen takes it, as with any terminal.
 /// That holds about 1 MiB. The screen, not the queue, sets the pace: in
 /// a debug build 40 MB of `yes` took 9.6 s with a queue of 1, 9.3 s with
-/// 16 and 8.8 s with 64.
+/// 16 and 8.8 s with 64. A remote shell's queue is rho-ui-core's; this
+/// many of its packets at most go in one frame.
 const OUTPUT_QUEUE: usize = 16;
 
 /// How often a pane reads the program its terminal runs, as a new one
@@ -229,26 +236,48 @@ impl TerminalPane {
             return;
         };
         let reader = self.workspaces.read(cx).reader(&place.machine);
-        let command = match reader {
+        // The first frame sizes it to the panel.
+        let grid = (80, 24);
+        let couldnt = |why: String| SharedString::from(format!("Couldn't start: {why}"));
+        let program = match reader {
             Reader::Here => {
                 let mut command = CommandBuilder::new(&self.shell.0);
                 command.cwd(&place.path);
-                Ok((command, ProgramSource::Foreground))
+                Program::local(command, grid).map_err(couldnt)
             }
-            Reader::There(ssh) => {
-                let (program, args) = ssh.terminal_command(&place.path);
-                let mut command = CommandBuilder::new(program);
-                command.args(args);
-                Ok((command, ProgramSource::Title))
-            }
+            Reader::There(ssh) => Ok(Program::remote(&ssh, &place.path, grid)),
             Reader::Unread => Err("The session's machine isn't connected.".into()),
         };
-        let terminal = command.and_then(|(command, source)| {
-            TerminalView::spawn(command, source, cx)
-                .map_err(|why| format!("Couldn't start: {why}").into())
-        });
+        let terminal =
+            program.and_then(|program| TerminalView::new(program, grid, cx).map_err(couldnt));
         self.terminals.retain(|(known, _)| *known != key);
         self.terminals.push((key, terminal));
+    }
+
+    /// Follows terminal `view`'s shell ending: [`Self::shell_exited`] when
+    /// it exited; when it couldn't start, or its ssh connection went, the
+    /// pane shows why in its place, with Restart.
+    fn shell_ended(
+        &mut self,
+        view: EntityId,
+        ended: Result<(), SharedString>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match ended {
+            Ok(()) => self.shell_exited(view, cx),
+            Err(why) => {
+                let failed = self.terminals.iter_mut().find(|(_, terminal)| {
+                    terminal
+                        .as_ref()
+                        .is_ok_and(|terminal| terminal.entity_id() == view)
+                });
+                if let Some((_, terminal)) = failed {
+                    *terminal = Err(why);
+                    self.follow_program(cx);
+                    cx.notify();
+                }
+            }
+        }
     }
 
     /// Follows terminal `view`'s shell exiting. The on-screen session's
@@ -271,15 +300,179 @@ impl TerminalPane {
     }
 }
 
-/// Where a terminal reads the name of the program it runs.
-#[derive(Clone, Copy, Debug)]
-enum ProgramSource {
-    /// The pseudo-terminal's foreground process, for a shell on this
-    /// machine; the title the program sets where the system can't say.
-    Foreground,
-    /// The title the program sets, for a shell on a remote machine: the
-    /// foreground process here is ssh.
-    Title,
+/// What a terminal runs: a shell under a pseudo-terminal here, or the
+/// login shell on a remote machine, under one there.
+struct Program {
+    /// What it prints.
+    output: Output,
+    /// Where what is typed goes.
+    input: Input,
+    control: Control,
+    /// Resolves when the shell exits; or for a remote one, with why, when
+    /// it couldn't start or its connection went.
+    ended: LocalBoxFuture<'static, Result<(), SharedString>>,
+}
+
+impl Program {
+    /// Starts `command` under a pseudo-terminal here of `grid`, columns by
+    /// rows.
+    fn local(mut command: CommandBuilder, grid: (u16, u16)) -> Result<Self, String> {
+        let pair = native_pty_system()
+            .openpty(pty_size(grid))
+            .map_err(|error| error.to_string())?;
+        command.env("TERM", TERM);
+        command.env("COLORTERM", "truecolor");
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| error.to_string())?;
+        drop(pair.slave);
+        let exited = Arc::new(AtomicBool::new(false));
+        // Hangs up on the shell, dropped when a step below fails.
+        let pty = LocalPty {
+            master: pair.master,
+            killer: child.clone_killer(),
+            exited: Arc::clone(&exited),
+        };
+        let exit = wait_for(child, exited).map_err(|error| error.to_string())?;
+        let reader = pty
+            .master
+            .try_clone_reader()
+            .map_err(|error| error.to_string())?;
+        let output = read_from(reader).map_err(|error| error.to_string())?;
+        let writer = pty
+            .master
+            .take_writer()
+            .map_err(|error| error.to_string())?;
+        let input = write_to(writer).map_err(|error| error.to_string())?;
+        Ok(Self {
+            output: Output::Local(output),
+            input: Input::Local(input),
+            control: Control::Local(pty),
+            // The waiter thread ends only when the shell does.
+            ended: exit.map(|_| Ok::<_, SharedString>(())).boxed_local(),
+        })
+    }
+
+    /// Starts the user's login shell in `dir` on `ssh`'s machine, under a
+    /// pseudo-terminal there of `grid`, columns by rows.
+    fn remote(ssh: &SshLink, dir: &Path, (columns, rows): (u16, u16)) -> Self {
+        let RemoteShell {
+            output,
+            input,
+            ended,
+        } = ssh.open_shell(dir, TERM, columns, rows);
+        Self {
+            output: Output::Remote(output),
+            input: Input::Remote(input.clone()),
+            control: Control::Remote(input),
+            ended: async move {
+                ended
+                    .wait()
+                    .await
+                    .map_err(|why| SharedString::from(format!("The shell stopped: {why}")))
+            }
+            .boxed_local(),
+        }
+    }
+}
+
+/// What a terminal's program prints.
+enum Output {
+    /// Reads of the pseudo-terminal here, by the reader thread.
+    Local(mpsc::Receiver<Vec<u8>>),
+    /// What sshd sends of a remote shell's.
+    Remote(ShellOutput),
+}
+
+impl Output {
+    /// The next bytes the program printed; `None` at the end of them.
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Output::Local(reads) => reads.next().await,
+            Output::Remote(shell) => shell.recv().await,
+        }
+    }
+
+    /// The next bytes the program printed, if they came; doesn't wait.
+    fn try_recv(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Output::Local(reads) => reads.try_recv().ok(),
+            Output::Remote(shell) => shell.try_recv(),
+        }
+    }
+}
+
+/// Where a terminal's input goes, in order: what is typed, and the
+/// terminal's replies to the program's queries.
+#[derive(Clone)]
+enum Input {
+    /// The writer thread of the pseudo-terminal here.
+    Local(std::sync::mpsc::Sender<Vec<u8>>),
+    /// A remote shell's channel.
+    Remote(ShellInput),
+}
+
+impl Input {
+    /// Queues `bytes` for the program. Does nothing once it is gone.
+    fn write(&self, bytes: Vec<u8>) {
+        match self {
+            Input::Local(writer) => {
+                let _ = writer.send(bytes);
+            }
+            Input::Remote(shell) => shell.write(bytes),
+        }
+    }
+}
+
+/// The rest of a terminal's hold on its program: its size, the name of
+/// what runs in it, and its life. Dropped, the program is hung up on.
+enum Control {
+    /// The pseudo-terminal here.
+    Local(LocalPty),
+    /// A remote shell's channel, which closes, and sshd hangs up on the
+    /// shell, when the last of its inputs goes.
+    Remote(ShellInput),
+}
+
+impl Control {
+    /// Tells the program its terminal is now `grid`, columns by rows.
+    fn resize(&self, grid: (u16, u16)) {
+        match self {
+            Control::Local(pty) => {
+                let _ = pty.master.resize(pty_size(grid));
+            }
+            Control::Remote(shell) => shell.resize(grid.0, grid.1),
+        }
+    }
+
+    /// The name the system gives the foreground process, which only a
+    /// pseudo-terminal here can tell.
+    fn foreground_program(&self) -> Option<String> {
+        match self {
+            Control::Local(pty) => foreground_program(&*pty.master),
+            Control::Remote(_) => None,
+        }
+    }
+}
+
+/// The pseudo-terminal of a shell here. Dropping it hangs up on the shell,
+/// if it hasn't exited, once and without waiting, which ends the shells
+/// rho-ui starts. One known to have exited is left alone: the waiter
+/// thread reaped it, so its process ID may be another process's by now.
+struct LocalPty {
+    master: Box<dyn MasterPty + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Whether the waiter thread saw the shell exit, and reaped it.
+    exited: Arc<AtomicBool>,
+}
+
+impl Drop for LocalPty {
+    fn drop(&mut self) {
+        if !self.exited.load(Ordering::Acquire) {
+            let _ = self.killer.kill();
+        }
+    }
 }
 
 /// Why the shell couldn't start, with a button to try again.
@@ -325,25 +518,22 @@ impl Render for TerminalPane {
     }
 }
 
-/// One terminal: the shell under a pseudo-terminal, and libghostty-vt's
-/// screen of it. All on the UI thread, as libghostty's handles must stay on
-/// one; threads of their own read, write and wait for the shell.
+/// One terminal: a [`Program`], and libghostty-vt's screen of it. All on
+/// the UI thread, as libghostty's handles must stay on one; threads of
+/// their own, or rho-ui-core's I/O runtime, read, write and wait for the
+/// shell.
 pub(crate) struct TerminalView {
     terminal: Terminal<'static, 'static>,
     render: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     keys: Keys,
-    pty: Box<dyn MasterPty + Send>,
-    /// What the writer thread writes to the program, in order; the
-    /// terminal's replies to the program's queries go here too.
-    input: std::sync::mpsc::Sender<Vec<u8>>,
-    /// Hangs up on the shell, if it hasn't exited, when the view goes.
-    killer: Box<dyn ChildKiller + Send + Sync>,
-    /// Whether the waiter thread saw the shell exit, and reaped it.
-    exited: Arc<AtomicBool>,
-    /// Where [`Self::program`] reads the program's name.
-    program_source: ProgramSource,
+    /// What is written to the program, in order; the terminal's replies
+    /// to the program's queries go here too.
+    input: Input,
+    /// Sizes the program's terminal and names what runs in it; hangs up on
+    /// the shell when the view goes.
+    control: Control,
     mouse: Mouse,
     /// Where the grid was last drawn; its size is what the shell was told.
     layout: Option<Grid>,
@@ -361,54 +551,32 @@ pub(crate) struct TerminalView {
     /// Autoscroll ticks since the grid was last drawn.
     undrawn_ticks: u8,
     focus: FocusHandle,
-    /// Feeds the terminal what the reader thread reads; dropped with it.
+    /// Feeds the terminal what the program prints; dropped with it.
     reader: Task<()>,
-    /// Tells the pane when the shell exits; dropped with the view.
+    /// Tells the pane when the shell ends; dropped with the view.
     waiter: Task<()>,
 }
 
 impl TerminalView {
-    /// Starts `command` under a pseudo-terminal of 80 by 24, which the
-    /// first frame sizes to the panel.
-    fn spawn(
-        mut command: CommandBuilder,
-        program_source: ProgramSource,
+    /// The terminal of `program`, which started in a terminal of `grid`,
+    /// columns by rows; the first frame sizes it to the panel.
+    fn new(
+        program: Program,
+        grid: (u16, u16),
         cx: &mut Context<'_, TerminalPane>,
     ) -> Result<Entity<Self>, String> {
-        let grid = (80, 24);
-        let pair = native_pty_system()
-            .openpty(pty_size(grid))
-            .map_err(|error| error.to_string())?;
-        command.env("TERM", TERM);
-        command.env("COLORTERM", "truecolor");
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| error.to_string())?;
-        drop(pair.slave);
-        let hang_up = HangUp(Some(child.clone_killer()));
-        let exited = Arc::new(AtomicBool::new(false));
-        let exit = wait_for(child, Arc::clone(&exited)).map_err(|error| error.to_string())?;
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| error.to_string())?;
-        let mut output = read_from(reader).map_err(|error| error.to_string())?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| error.to_string())?;
-        let input = write_to(writer).map_err(|error| error.to_string())?;
+        let Program {
+            mut output,
+            input,
+            control,
+            ended,
+        } = program;
         let mut terminal = Terminal::new(grid.0, grid.1).map_err(|error| error.to_string())?;
         let replies = input.clone();
         terminal
             .set_scrollback_max_lines(Some(SCROLLBACK_LINES))
             .and_then(|terminal| terminal.set_terminfo_name(TERM))
-            .and_then(|terminal| {
-                terminal.on_pty_write(move |_, data| {
-                    let _ = replies.send(data.to_vec());
-                })
-            })
+            .and_then(|terminal| terminal.on_pty_write(move |_, data| replies.write(data.to_vec())))
             .map_err(|error| error.to_string())?;
 
         let ghostty = |error: libghostty_vt::Error| error.to_string();
@@ -418,10 +586,8 @@ impl TerminalView {
             rows: RowIterator::new().map_err(ghostty)?,
             cells: CellIterator::new().map_err(ghostty)?,
             keys: Keys::new().map_err(ghostty)?,
-            pty: pair.master,
             input,
-            exited,
-            program_source,
+            control,
             mouse: Mouse::new().map_err(ghostty)?,
             layout: None,
             cursor: None,
@@ -433,18 +599,16 @@ impl TerminalView {
             focus: cx.focus_handle(),
             reader: Task::ready(()),
             waiter: Task::ready(()),
-            // Last, after every step that can fail.
-            killer: hang_up.disarm(),
         };
         let view = cx.new(|_| view);
         let read = cx.spawn({
             let view = view.downgrade();
             async move |_, cx| {
-                while let Some(mut bytes) = output.next().await {
+                while let Some(mut bytes) = output.recv().await {
                     // What was queued, in one write and one frame; no more,
-                    // as the reader thread refills the queue meanwhile.
+                    // as the reader refills the queue meanwhile.
                     for _ in 0..OUTPUT_QUEUE {
-                        let Ok(more) = output.try_recv() else {
+                        let Some(more) = output.try_recv() else {
                             break;
                         };
                         bytes.extend(more);
@@ -464,9 +628,8 @@ impl TerminalView {
         let wait = cx.spawn({
             let view = view.downgrade();
             async move |pane, cx| {
-                if exit.await.is_ok() {
-                    let _ = pane.update(cx, |pane, cx| pane.shell_exited(view.entity_id(), cx));
-                }
+                let ended = ended.await;
+                let _ = pane.update(cx, |pane, cx| pane.shell_ended(view.entity_id(), ended, cx));
             }
         });
         view.update(cx, |view, _| {
@@ -479,22 +642,21 @@ impl TerminalView {
     /// The name of the program the shell runs now, or of the shell when it
     /// runs none; `None` when there is no name to read.
     fn program(&self) -> Option<SharedString> {
-        let foreground = match self.program_source {
-            ProgramSource::Foreground => foreground_program(&*self.pty),
-            ProgramSource::Title => None,
-        };
         let title = || {
             let title = self.terminal.title().ok()?;
             let title = String::from_utf8_lossy(title).trim().to_owned();
             Some(title).filter(|title| !title.is_empty())
         };
-        foreground.or_else(title).map(SharedString::from)
+        self.control
+            .foreground_program()
+            .or_else(title)
+            .map(SharedString::from)
     }
 
-    /// Queues `bytes` for the writer thread to write to the program.
+    /// Queues `bytes` for the program.
     fn write(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            let _ = self.input.send(bytes);
+            self.input.write(bytes);
         }
     }
 
@@ -706,7 +868,7 @@ impl TerminalView {
         let _ = self
             .terminal
             .resize(columns, rows, u32::from(width), u32::from(height));
-        let _ = self.pty.resize(pty_size((columns, rows)));
+        self.control.resize((columns, rows));
     }
 
     /// Gives the terminal the theme's colors when they change.
@@ -831,37 +993,6 @@ impl TerminalView {
             .into_iter()
             .map(|line| line.text.trim_end().to_owned())
             .collect()
-    }
-}
-
-impl Drop for TerminalView {
-    /// Hangs up on a shell still running, once and without waiting, which
-    /// ends the shells rho-ui starts. One known to have exited is left
-    /// alone: the waiter thread reaped it, so its process ID may be
-    /// another process's by now.
-    fn drop(&mut self) {
-        if !self.exited.load(Ordering::Acquire) {
-            let _ = self.killer.kill();
-        }
-    }
-}
-
-/// Hangs up on a shell whose view couldn't be made, so a step failing
-/// after it started doesn't leave it running, with the threads that read
-/// and wait on it. [`Self::disarm`] hands the killer to the view instead.
-struct HangUp(Option<Box<dyn ChildKiller + Send + Sync>>);
-
-impl HangUp {
-    fn disarm(mut self) -> Box<dyn ChildKiller + Send + Sync> {
-        self.0.take().expect("a HangUp is armed until disarmed")
-    }
-}
-
-impl Drop for HangUp {
-    fn drop(&mut self) {
-        if let Some(killer) = &mut self.0 {
-            let _ = killer.kill();
-        }
     }
 }
 

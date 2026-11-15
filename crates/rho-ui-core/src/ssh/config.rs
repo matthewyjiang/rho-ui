@@ -86,7 +86,7 @@ const RESOLVE_DEADLINE: Duration = Duration::from_secs(5);
 /// The local `ssh` program: on Windows the one Windows ships, in
 /// `%SystemRoot%\System32\OpenSSH`, when it is there, else `ssh` on PATH.
 /// Looks at the disk on Windows, so off the I/O runtime.
-pub(crate) fn ssh_program() -> PathBuf {
+fn ssh_program() -> PathBuf {
     if cfg!(windows) {
         if let Some(root) = std::env::var_os("SystemRoot") {
             let shipped = Path::new(&root)

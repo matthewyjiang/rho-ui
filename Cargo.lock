@@ -7065,6 +7065,7 @@ dependencies = [
  "dunce",
  "futures",
  "gethostname",
+ "portable-pty",
  "regex",
  "rho-protocol",
  "rho-ui-core",

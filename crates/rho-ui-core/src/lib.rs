@@ -44,6 +44,6 @@ pub use session::{
     RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,
     ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
 };
-pub use ssh::{SshLink, SshTarget};
+pub use ssh::{RemoteShell, ShellEnded, ShellInput, ShellOutput, SshLink, SshTarget};
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};
 pub use tool_card::{SearchLine, ToolBody, ToolCard, ToolFact};

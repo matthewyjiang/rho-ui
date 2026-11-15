@@ -120,7 +120,7 @@ async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, ScriptError
         .await
         .map_err(ScriptError::Session)?
         .split();
-    let write = CloseOnDrop(Some(write));
+    let write = CloseOnDrop::new(write);
     let channel = write.channel();
     let mut send = pin!(async {
         channel.exec(true, "sh -s").await?;
@@ -187,12 +187,16 @@ fn signal(signal: &Sig) -> String {
 }
 
 /// A channel's writing half that closes the channel when dropped, as when
-/// a script's future is given up or sshd refused it. Closing one already
-/// closed does nothing.
-struct CloseOnDrop(Option<ChannelWriteHalf<Msg>>);
+/// a script's future is given up, a shell ends, or sshd refused either.
+/// Closing one already closed does nothing.
+pub(super) struct CloseOnDrop(Option<ChannelWriteHalf<Msg>>);
 
 impl CloseOnDrop {
-    fn channel(&self) -> &ChannelWriteHalf<Msg> {
+    pub(super) fn new(channel: ChannelWriteHalf<Msg>) -> Self {
+        Self(Some(channel))
+    }
+
+    pub(super) fn channel(&self) -> &ChannelWriteHalf<Msg> {
         self.0.as_ref().expect("only dropping takes the channel")
     }
 }

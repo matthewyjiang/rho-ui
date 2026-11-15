@@ -3,14 +3,20 @@
 //! signs in only that client key. It runs each `exec` request with this
 //! machine's `sh`, in a home of the test's choosing and an environment of
 //! only `HOME`, `PATH` (`/usr/bin:/bin`) and `SHELL` (`/bin/sh`), and
-//! forwards each `direct-streamlocal` channel to the local socket it
-//! names, such as a [`FakeDaemon`](crate::fake_daemon::FakeDaemon)'s.
+//! the variables the client sets (as an sshd whose `AcceptEnv` names
+//! them all). After a `pty-req` the command runs under a real
+//! pseudo-terminal of the size asked, with `TERM` as asked, and each
+//! `window-change` resizes it, as sshd does. It forwards each
+//! `direct-streamlocal` channel to the local socket it names, such as a
+//! [`FakeDaemon`](crate::fake_daemon::FakeDaemon)'s.
 //!
 //! [`FakeSshd::target`] reaches it with a client set up as the test asks:
 //! which `known_hosts` file vouches for the host, and which key files it
 //! signs in with. The client uses no key agent.
 
 use std::{
+    ffi::OsString,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -20,10 +26,12 @@ use std::{
     time::Duration,
 };
 
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use russh::{
     keys::{key::safe_rng, ssh_key::LineEnding, Algorithm, PrivateKey, PublicKey},
     server::{self, Auth, ChannelOpenHandle, Msg, PublicKeyOffer, Session, VerifiedPublicKey},
-    Channel, ChannelMsg, ChannelOpenFailure, MethodKind, MethodSet,
+    Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelReadHalf, ChannelWriteHalf,
+    MethodKind, MethodSet, Pty,
 };
 use tokio::{net::TcpListener, runtime::Runtime};
 
@@ -273,8 +281,33 @@ impl server::Handler for Sshd {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         reply.accept().await;
-        tokio::spawn(run_command(channel, self.home.clone()));
+        tokio::spawn(run_session(channel, self.home.clone()));
         Ok(())
+    }
+
+    // `run_session` takes the request from the channel; this answers it,
+    // as sshd does.
+    fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        std::future::ready(session.channel_success(channel))
+    }
+
+    fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        _command: &[u8],
+        session: &mut Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        std::future::ready(session.channel_success(channel))
     }
 
     async fn channel_open_direct_streamlocal(
@@ -299,58 +332,185 @@ impl server::Handler for Sshd {
 }
 
 /// Runs the command of the session channel's `exec` request with `sh -c`
-/// in `home`, its stdin from the channel, its stdout and stderr to it,
-/// then sends its exit status and closes the channel.
-async fn run_command(channel: Channel<Msg>, home: PathBuf) {
+/// in `home`: under a pseudo-terminal if the client asked for one first,
+/// else with its stdin from the channel and its stdout and stderr to it.
+/// Then sends its exit status and closes the channel.
+async fn run_session(channel: Channel<Msg>, home: PathBuf) {
     let (mut read, write) = channel.split();
+    let mut env: Vec<(OsString, OsString)> = vec![
+        ("HOME".into(), home.clone().into_os_string()),
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("SHELL".into(), "/bin/sh".into()),
+    ];
+    let mut terminal = None;
     let command = loop {
         match read.wait().await {
-            Some(ChannelMsg::Exec { command, .. }) => break command,
+            Some(ChannelMsg::RequestPty {
+                term,
+                col_width,
+                row_height,
+                ..
+            }) => {
+                env.push(("TERM".into(), term.into()));
+                terminal = Some(pty_size(col_width, row_height));
+            }
+            Some(ChannelMsg::SetEnv {
+                variable_name,
+                variable_value,
+                ..
+            }) => env.push((variable_name.into(), variable_value.into())),
+            Some(ChannelMsg::Exec { command, .. }) => {
+                break String::from_utf8_lossy(&command).into_owned();
+            }
             Some(_) => {}
             None => return,
         }
     };
+    let code = match terminal {
+        Some(size) => in_terminal(&mut read, &write, &command, &home, &env, size).await,
+        None => piped(&mut read, &write, &command, &home, &env).await,
+    };
+    let _ = write.exit_status(code).await;
+    let _ = write.eof().await;
+    let _ = write.close().await;
+}
+
+/// Runs `command` with `sh -c` in `home` with `env`, its stdin from the
+/// channel and its stdout and stderr to it, and returns its exit status.
+async fn piped(
+    read: &mut ChannelReadHalf,
+    write: &ChannelWriteHalf<Msg>,
+    command: &str,
+    home: &Path,
+    env: &[(OsString, OsString)],
+) -> u32 {
     let spawned = tokio::process::Command::new("sh")
         .arg("-c")
-        .arg(&*String::from_utf8_lossy(&command))
-        .current_dir(&home)
+        .arg(command)
+        .current_dir(home)
         .env_clear()
-        .env("HOME", &home)
-        .env("PATH", "/usr/bin:/bin")
-        .env("SHELL", "/bin/sh")
+        .envs(env.iter().cloned())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn();
-    let code = match spawned {
-        Ok(mut child) => {
-            let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) =
-                (child.stdin.take(), child.stdout.take(), child.stderr.take())
-            else {
-                return;
-            };
-            let (mut out, mut err) = (write.make_writer(), write.make_writer_ext(Some(1)));
-            let feed = async {
-                let _ = tokio::io::copy(&mut read.make_reader(), &mut stdin).await;
-                drop(stdin);
-            };
-            let _ = tokio::join!(
-                feed,
-                tokio::io::copy(&mut stdout, &mut out),
-                tokio::io::copy(&mut stderr, &mut err)
-            );
-            child
-                .wait()
-                .await
-                .ok()
-                .and_then(|status| status.code())
-                .and_then(|code| u32::try_from(code).ok())
-                .unwrap_or(255)
-        }
-        Err(_) => 127,
+    let Ok(mut child) = spawned else {
+        return 127;
     };
-    let _ = write.exit_status(code).await;
-    let _ = write.eof().await;
-    let _ = write.close().await;
+    let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        return 127;
+    };
+    let (mut out, mut err) = (write.make_writer(), write.make_writer_ext(Some(1)));
+    let feed = async {
+        let _ = tokio::io::copy(&mut read.make_reader(), &mut stdin).await;
+        drop(stdin);
+    };
+    let _ = tokio::join!(
+        feed,
+        tokio::io::copy(&mut stdout, &mut out),
+        tokio::io::copy(&mut stderr, &mut err)
+    );
+    child
+        .wait()
+        .await
+        .ok()
+        .and_then(|status| status.code())
+        .and_then(|code| u32::try_from(code).ok())
+        .unwrap_or(255)
+}
+
+/// Runs `command` with `sh -c` in `home` with `env`, under a
+/// pseudo-terminal of `size`: what it prints goes to the channel, the
+/// channel's data to it, and each `window-change` resizes it. Returns its
+/// exit status; a client that closes the channel first hangs up on it.
+async fn in_terminal(
+    read: &mut ChannelReadHalf,
+    write: &ChannelWriteHalf<Msg>,
+    command: &str,
+    home: &Path,
+    env: &[(OsString, OsString)],
+    size: PtySize,
+) -> u32 {
+    let Ok(pair) = native_pty_system().openpty(size) else {
+        return 127;
+    };
+    let mut shell = CommandBuilder::new("sh");
+    shell.args(["-c", command]);
+    shell.cwd(home);
+    shell.env_clear();
+    for (name, value) in env {
+        shell.env(name, value);
+    }
+    let Ok(mut child) = pair.slave.spawn_command(shell) else {
+        return 127;
+    };
+    drop(pair.slave);
+    let mut killer = child.clone_killer();
+    let (Ok(mut reader), Ok(mut writer)) =
+        (pair.master.try_clone_reader(), pair.master.take_writer())
+    else {
+        let _ = killer.kill();
+        return 127;
+    };
+    // Threads of their own, as a read and the wait block: not the
+    // runtime's blocking pool, which dropping the runtime waits on.
+    let (printed, mut output) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    std::thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        while let Ok(read @ 1..) = reader.read(&mut buffer) {
+            if printed.blocking_send(buffer[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    let (exited, mut exit) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = exited.send(child.wait());
+    });
+    loop {
+        tokio::select! {
+            Some(bytes) = output.recv() => {
+                let _ = write.data_bytes(bytes).await;
+            }
+            message = read.wait() => match message {
+                // A blocking write, but a test types far less than the
+                // pseudo-terminal holds.
+                Some(ChannelMsg::Data { data }) => {
+                    let _ = writer.write_all(&data);
+                }
+                Some(ChannelMsg::WindowChange {
+                    col_width,
+                    row_height,
+                    ..
+                }) => {
+                    let _ = pair.master.resize(pty_size(col_width, row_height));
+                }
+                Some(_) => {}
+                None => {
+                    let _ = killer.kill();
+                    return 255;
+                }
+            },
+            status = &mut exit => {
+                return status
+                    .ok()
+                    .and_then(Result::ok)
+                    .map_or(255, |status| status.exit_code());
+            }
+        }
+    }
+}
+
+/// A pseudo-terminal of `columns` by `rows`, as a `pty-req` or
+/// `window-change` gives them.
+fn pty_size(columns: u32, rows: u32) -> PtySize {
+    PtySize {
+        rows: u16::try_from(rows).unwrap_or(u16::MAX),
+        cols: u16::try_from(columns).unwrap_or(u16::MAX),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
 }

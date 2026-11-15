@@ -1,8 +1,10 @@
 //! What a path typed in the project search names on one machine: the
 //! project of the folder typed, if it is there, and the folders the path
-//! can go on to, so the search browses folders on any machine. This
-//! machine's are read from its files; a remote machine's with
-//! [`REMOTE_SCRIPT`], over the ssh connection to its daemon. Also
+//! can go on to, so the search browses folders on any machine. A path
+//! follows its machine's rules ([`PathStyle`]): this machine's, Windows'
+//! on Windows, and a remote machine's POSIX ones whatever this machine
+//! is. This machine's folders are read from its files; a remote machine's
+//! with [`REMOTE_SCRIPT`], over the ssh connection to its daemon. Also
 //! [`Reader`], which every feature that reads a machine goes through, and
 //! the file read that the Files surface and pictures share.
 
@@ -15,7 +17,7 @@ use std::{
 use gpui_kit::BackgroundExecutor;
 use rho_ui_core::{platform, DaemonError, SshLink};
 
-use crate::repo;
+use crate::{machines::MachineId, repo};
 
 /// How long a remote lookup waits for the next key before it runs. Kit
 /// drops a search's task when the next one starts, so a burst of keys runs
@@ -26,57 +28,155 @@ use crate::repo;
 /// as instant.
 const REMOTE_PAUSE: Duration = Duration::from_millis(150);
 
+/// The rules a machine's paths follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathStyle {
+    /// This machine's, as `std::path` has them: on Windows, `\` or `/`
+    /// between names, and absolute from a drive's root.
+    Here,
+    /// A remote machine's, which is Unix, whatever this machine is: `/`
+    /// between names, and absolute from `/`.
+    Posix,
+}
+
+impl PathStyle {
+    /// The rules `machine`'s paths follow.
+    pub(crate) fn of(machine: &MachineId) -> Self {
+        if machine.is_local() {
+            Self::Here
+        } else {
+            Self::Posix
+        }
+    }
+
+    fn is_separator(self, c: char) -> bool {
+        match self {
+            Self::Here => std::path::is_separator(c),
+            Self::Posix => c == '/',
+        }
+    }
+
+    fn is_absolute(self, text: &str) -> bool {
+        match self {
+            Self::Here => Path::new(text).is_absolute(),
+            Self::Posix => text.starts_with('/'),
+        }
+    }
+
+    /// `name`, which may hold separators, in `folder`.
+    fn join(self, folder: &Path, name: &OsStr) -> PathBuf {
+        match self {
+            Self::Here => folder.join(name),
+            Self::Posix => {
+                let mut bytes = platform::path_to_bytes(folder.as_os_str());
+                if !bytes.ends_with(b"/") {
+                    bytes.push(b'/');
+                }
+                bytes.extend(platform::path_to_bytes(name));
+                platform::path_from_bytes(&bytes)
+            }
+        }
+    }
+
+    /// `path` without `.` names, or separators repeated or at its end; on
+    /// Windows, this machine's with `\` between names.
+    fn tidy(self, path: &Path) -> PathBuf {
+        match self {
+            Self::Here => path.components().collect(),
+            Self::Posix => {
+                let bytes = platform::path_to_bytes(path.as_os_str());
+                let names: Vec<&[u8]> = bytes
+                    .split(|&byte| byte == b'/')
+                    .filter(|name| !matches!(*name, b"" | b"."))
+                    .collect();
+                let mut tidy = if bytes.starts_with(b"/") {
+                    vec![b'/']
+                } else {
+                    Vec::new()
+                };
+                tidy.extend(names.join(&b'/'));
+                platform::path_from_bytes(&tidy)
+            }
+        }
+    }
+
+    /// The folder `path` is in, and its last name; `None` at a root.
+    fn split(self, path: &Path) -> Option<(PathBuf, OsString)> {
+        match self {
+            Self::Here => Some((path.parent()?.to_path_buf(), path.file_name()?.to_owned())),
+            Self::Posix => {
+                let bytes = platform::path_to_bytes(path.as_os_str());
+                let at = bytes.iter().rposition(|&byte| byte == b'/')?;
+                let (folder, name) = bytes.split_at(at);
+                let name = name.get(1..).filter(|name| !name.is_empty())?;
+                let folder: &[u8] = if folder.is_empty() { b"/" } else { folder };
+                Some((
+                    platform::path_from_bytes(folder),
+                    platform::path_from_bytes(name).into_os_string(),
+                ))
+            }
+        }
+    }
+}
+
 /// A typed path, split where the user is typing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Typed {
     /// The folder the path names.
     pub(crate) path: PathBuf,
     /// The folder whose subfolders it can go on to: the path itself after
-    /// a trailing `/`, else its parent.
+    /// a trailing separator, else its parent.
     pub(crate) browse: PathBuf,
-    /// What follows the last `/`, which those subfolders' names start with.
+    /// What follows the last separator, which those subfolders' names
+    /// start with.
     pub(crate) prefix: String,
+    /// The rules of the machine it is on.
+    style: PathStyle,
 }
 
 impl Typed {
-    /// The path `text` names, if it is one: absolute, `~`, or under `~/`,
-    /// with `home` as the machine's home directory. Whether it exists is
-    /// for [`look`] to find out.
-    pub(crate) fn parse(text: &str, home: Option<&Path>) -> Option<Self> {
+    /// The path `text` names on a machine whose paths follow `style`, if
+    /// it is one: absolute, `~`, or under `~` and a separator (`~/`, and
+    /// on Windows here `~\` too), with `home` as the machine's home
+    /// directory. Whether it exists is for [`look`] to find out.
+    pub(crate) fn parse(text: &str, home: Option<&Path>, style: PathStyle) -> Option<Self> {
+        let under_home = text
+            .strip_prefix('~')
+            .and_then(|rest| rest.strip_prefix(|c: char| style.is_separator(c)));
         let path = if text == "~" {
             home?.to_path_buf()
-        } else if let Some(rest) = text.strip_prefix("~/") {
-            home?.join(rest)
+        } else if let Some(rest) = under_home {
+            style.join(home?, OsStr::new(rest))
+        } else if style.is_absolute(text) {
+            PathBuf::from(text)
         } else {
-            Some(Path::new(text))
-                .filter(|path| path.is_absolute())?
-                .to_path_buf()
+            return None;
         };
-        let at_folder = text.ends_with('/') || text == "~" || path.parent().is_none();
-        if at_folder {
-            return Some(Self {
+        let path = style.tidy(&path);
+        let at_folder = text == "~" || text.ends_with(|c: char| style.is_separator(c));
+        match style.split(&path).filter(|_| !at_folder) {
+            Some((browse, name)) => Some(Self {
+                path,
+                browse,
+                prefix: name.to_string_lossy().into_owned(),
+                style,
+            }),
+            None => Some(Self {
                 browse: path.clone(),
                 path,
                 prefix: String::new(),
-            });
+                style,
+            }),
         }
-        let browse = path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
-        let prefix = path
-            .file_name()
-            .map_or_default(|name| name.to_string_lossy().into_owned());
-        Some(Self {
-            path,
-            browse,
-            prefix,
-        })
     }
 
     /// Whether the path can go on to `folder`: it is in the browse folder,
     /// and its name starts with the prefix, ignoring case. A hidden folder
     /// only when the prefix starts with `.`.
     pub(crate) fn leads_to(&self, folder: &Path) -> bool {
-        folder.parent() == Some(&self.browse)
-            && folder.file_name().is_some_and(|name| self.matches(name))
+        self.style
+            .split(folder)
+            .is_some_and(|(parent, name)| parent == self.browse && self.matches(&name))
     }
 
     fn matches(&self, name: &OsStr) -> bool {
@@ -443,7 +543,7 @@ fn next(typed: &Typed, names: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
     names.sort();
     names
         .into_iter()
-        .map(|(_, name)| typed.browse.join(name))
+        .map(|(_, name)| typed.style.join(&typed.browse, &name))
         .collect()
 }
 
@@ -451,28 +551,67 @@ fn next(typed: &Typed, names: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A typed path follows its machine's rules, a remote machine's POSIX
+    /// ones on any host, and browses its folder after a separator, else
+    /// its parent.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "a remote machine's POSIX path doesn't parse on a Windows host: \
-                  `Typed` uses this machine's path rules"
-    )]
     fn a_typed_path_browses_its_folder_after_a_slash_else_its_parent() {
-        let home = Some(Path::new("/home/me"));
-        let parse = |text| Typed::parse(text, home).map(|t| (t.path, t.browse, t.prefix));
-        let typed = |path: &str, browse: &str, prefix: &str| {
-            Some((path.into(), browse.into(), prefix.to_owned()))
-        };
-        assert_eq!(parse("~/co"), typed("/home/me/co", "/home/me", "co"));
-        assert_eq!(
-            parse("~/code/"),
-            typed("/home/me/code/", "/home/me/code", "")
+        type Case = (
+            &'static str,
+            Option<(&'static str, &'static str, &'static str)>,
         );
-        assert_eq!(parse("~"), typed("/home/me", "/home/me", ""), "~ is home");
-        assert_eq!(parse("/srv/x"), typed("/srv/x", "/srv", "x"));
-        assert_eq!(parse("/"), typed("/", "/", ""));
-        assert_eq!(parse("rho-ui"), None, "a name is a search");
-        assert_eq!(Typed::parse("~/code", None), None, "no home, no ~");
+        let check = |cases: &[Case], home: &str, style| {
+            for &(text, want) in cases {
+                let got = Typed::parse(text, Some(Path::new(home)), style).map(|typed| {
+                    let shown = |path: &Path| path.display().to_string();
+                    (shown(&typed.path), shown(&typed.browse), typed.prefix)
+                });
+                let want = want.map(|(path, browse, prefix)| {
+                    (path.to_owned(), browse.to_owned(), prefix.to_owned())
+                });
+                assert_eq!(got, want, "{text:?} as {style:?}");
+            }
+        };
+        let remote: &[Case] = &[
+            ("~/co", Some(("/home/me/co", "/home/me", "co"))),
+            ("~/code/", Some(("/home/me/code", "/home/me/code", ""))),
+            ("~", Some(("/home/me", "/home/me", ""))),
+            ("/srv/x", Some(("/srv/x", "/srv", "x"))),
+            ("/srv//x/./", Some(("/srv/x", "/srv/x", ""))),
+            ("/", Some(("/", "/", ""))),
+            ("rho-ui", None),
+            (r"C:\code", None),
+            (r"~\x", None),
+        ];
+        check(remote, "/home/me", PathStyle::Posix);
+        #[cfg(windows)]
+        let (home, here): (&str, &[Case]) = (
+            r"C:\Users\me",
+            &[
+                (r"C:\code\", Some((r"C:\code", r"C:\code", ""))),
+                ("C:/code", Some((r"C:\code", r"C:\", "code"))),
+                (r"~\x", Some((r"C:\Users\me\x", r"C:\Users\me", "x"))),
+                ("~/x", Some((r"C:\Users\me\x", r"C:\Users\me", "x"))),
+                ("/srv/x", None),
+                ("rho-ui", None),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (home, here): (&str, &[Case]) = (
+            "/home/me",
+            &[
+                ("~/co", Some(("/home/me/co", "/home/me", "co"))),
+                ("/", Some(("/", "/", ""))),
+                (r"C:\code", None),
+                (r"~\x", None),
+            ],
+        );
+        check(here, home, PathStyle::Here);
+        assert_eq!(
+            Typed::parse("~/code", None, PathStyle::Posix),
+            None,
+            "no home, no ~"
+        );
     }
 
     /// [`REMOTE_SCRIPT`], run with this machine's `sh` and `git`, names
@@ -498,7 +637,9 @@ mod tests {
         std::fs::write(dir.join("project-notes"), "a file").unwrap();
         std::os::unix::fs::symlink(&plain, dir.join("link")).unwrap();
         std::os::unix::fs::symlink(&main, dir.join("plink")).unwrap();
-        let at = |rest: &str| Typed::parse(&format!("{}/{rest}", dir.display()), None).unwrap();
+        let at = |rest: &str| {
+            Typed::parse(&format!("{}/{rest}", dir.display()), None, PathStyle::Here).unwrap()
+        };
         let cases = [
             at("project/docs"),
             at("wt"),

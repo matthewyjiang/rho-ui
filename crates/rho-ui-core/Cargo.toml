@@ -9,8 +9,9 @@ rust-version.workspace = true
 # Everything the desktop UI needs from the rho daemon, with no GUI dependency.
 [features]
 # `fake_daemon`: a scripted daemon for tests, this crate's and rho-ui's.
-# `fake_sshd`: an ssh server in the test's process, for the ssh tests.
-test-support = ["dep:tempfile", "tokio/time"]
+# `fake_sshd`: an ssh server in the test's process, for the ssh tests; it
+# runs a terminal's shell under a real pseudo-terminal (`portable-pty`).
+test-support = ["dep:portable-pty", "dep:tempfile", "tokio/time"]
 
 [dependencies]
 # Prompt and user-message images travel base64-encoded.
@@ -22,6 +23,9 @@ dunce = "1"
 gethostname = "1"
 # Highlights what a search matched, with the pattern rho's grep used.
 regex = "1"
+# `fake_sshd`'s pseudo-terminals, for a remote terminal's tests. rho-ui runs
+# its own terminals with it, so it is in the lock already.
+portable-pty = { version = "0.9", optional = true }
 rho-protocol.workspace = true
 # Checks a hashed `known_hosts` entry, HMAC-SHA1 (`ssh/host_key.rs`), and
 # makes the `%C` token, SHA-1 (`ssh/config.rs`). russh's crypto backend
