@@ -1,0 +1,19 @@
+[package]
+name = "a2ui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# rho's A2UI v1.0 core. No GUI code, no dependency on any rho crate.
+
+[dependencies]
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+serde_yaml_ng = "0.10"
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rho-ui-core", "crates/rho-ui"]
+members = ["crates/a2ui", "crates/rho-ui-core", "crates/rho-ui"]
 resolver = "2"
 
 [workspace.package]
