@@ -175,9 +175,14 @@ fn check_get(model: &DataModel, step: &Value, path: &str) -> Result<(), String> 
     };
     let got = model.get(&pointer);
     if step["expect_absent"] == true {
-        // The suite counts a null left by padding or removal as no value.
+        // The suite counts a list slot left null by padding or removal as no
+        // value. A key removed from an object must be gone.
+        let in_list = pointer
+            .parent()
+            .is_some_and(|parent| model.get(&parent).is_some_and(Value::is_array));
         return match got {
-            None | Some(Value::Null) => Ok(()),
+            None => Ok(()),
+            Some(Value::Null) if in_list => Ok(()),
             Some(value) => Err(format!("get {path} is {value}, want absent")),
         };
     }

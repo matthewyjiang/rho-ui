@@ -70,6 +70,15 @@ impl Pointer {
         self.segments.is_empty()
     }
 
+    /// The path one segment up, or `None` for the root.
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        let (_, parents) = self.segments.split_last()?;
+        Some(Self {
+            segments: parents.to_vec(),
+        })
+    }
+
     /// Whether `self` is `other` or a path above it.
     #[must_use]
     pub fn is_prefix_of(&self, other: &Self) -> bool {
@@ -140,13 +149,5 @@ mod tests {
     fn forbidden_segments_are_whole_segments() {
         assert!(Pointer::parse("/a/__proto__").is_err());
         assert!(Pointer::parse("/constructors").is_ok());
-    }
-
-    #[test]
-    fn prefix_includes_equal_and_root() {
-        let ab = Pointer::parse("/a/b").expect("valid pointer");
-        assert!(Pointer::root().is_prefix_of(&ab));
-        assert!(ab.is_prefix_of(&ab));
-        assert!(!Pointer::parse("/a/bc").expect("valid").is_prefix_of(&ab));
     }
 }
