@@ -461,19 +461,20 @@ fn a_prompt_past_the_message_limit_is_refused_and_the_connection_lives() {
     });
 }
 
+/// A rho that isn't there fails the connection with a reason that names
+/// it, so the user knows which path to fix.
 #[test]
 fn a_missing_rho_fails_the_connection_with_a_reason() {
     // A home with no daemon, so the connection must start one.
     let target = DaemonTarget::Home {
         home: "/nonexistent/rho-home".into(),
-        rho: "/nonexistent/rho".into(),
+        rho: "/nonexistent/missing-rho".into(),
     };
     let result = block_on(Daemon::connect(target));
-    assert!(
-        matches!(result, Err(DaemonError::Unreachable(_))),
-        "{:?}",
-        result.err()
-    );
+    let Err(DaemonError::Unreachable(reason)) = &result else {
+        panic!("{result:?}");
+    };
+    assert!(reason.contains("/nonexistent/missing-rho"), "{reason}");
 }
 
 #[test]
