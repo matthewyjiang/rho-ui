@@ -34,7 +34,11 @@ use rho_ui_core::{
     ToolKind, ToolStatus,
 };
 
-use crate::{time, transcript::Phase};
+use crate::{
+    attachments::Preview,
+    lightbox, time,
+    transcript::{Phase, IMAGE_HEIGHT},
+};
 
 /// Output past this many lines shows only its tail. At `text_xs` that is
 /// about seven screens of text, more than anyone reads inline, and it keeps
@@ -217,6 +221,8 @@ pub(crate) struct WorkRow<'a> {
     pub(crate) steps: Disclosure,
     /// Whether each step shows its details, one per entry.
     pub(crate) details: &'a [Disclosure],
+    /// The images each tool made, ready to draw, one list per entry.
+    pub(crate) images: &'a [Vec<Preview>],
     pub(crate) diffs: &'a [DiffView],
     pub(crate) phase: Phase,
     pub(crate) on_fold: FoldHandler,
@@ -228,6 +234,7 @@ pub(crate) fn render(row: WorkRow<'_>, cx: &App) -> AnyElement {
         start,
         steps: listed,
         details,
+        images,
         diffs,
         phase,
         on_fold,
@@ -244,6 +251,7 @@ pub(crate) fn render(row: WorkRow<'_>, cx: &App) -> AnyElement {
                     ix,
                     details,
                     newest: live && n + 1 == entries.len(),
+                    images: images.get(n).map_or(&[], Vec::as_slice),
                     diff: diffs.iter().find(|diff| diff.entry == ix),
                 };
                 Some(step(entry.as_step()?, state, &on_fold, cx))
@@ -299,12 +307,14 @@ pub(crate) fn render(row: WorkRow<'_>, cx: &App) -> AnyElement {
 }
 
 /// Where a step is: its entry index, whether its details are open, whether
-/// it is the newest step of a running turn, and its diff viewer if any.
+/// it is the newest step of a running turn, the images it made, and its
+/// diff viewer if any.
 #[derive(Clone, Copy)]
 struct StepState<'a> {
     ix: usize,
     details: Disclosure,
     newest: bool,
+    images: &'a [Preview],
     diff: Option<&'a DiffView>,
 }
 
@@ -314,14 +324,18 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
         ix,
         details,
         newest,
-        diff,
+        images,
+        ..
     } = state;
     let (icon, has_details) = match step {
         Step::Thought(thought) => (
             kind_icon(ToolKind::Think, cx),
             !thought.text().trim().is_empty(),
         ),
-        Step::Tool(tool) => (status_icon(tool, cx), has_details(tool)),
+        Step::Tool(tool) => (
+            status_icon(tool, cx),
+            has_details(tool) || !images.is_empty(),
+        ),
     };
     let facts = match step {
         Step::Tool(tool) => line_facts(tool, cx),
@@ -374,7 +388,7 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
                                 .text_color(cx.theme().muted_foreground)
                                 // Built only when open: a folded step
                                 // copies none of its text.
-                                .child(details_body(step, ix, diff, cx)),
+                                .child(details_body(step, state, cx)),
                         )
                     }),
             )
@@ -383,8 +397,11 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
 }
 
 /// What an open step shows: a thought's text, or a tool's command, notes,
-/// output and diff.
-fn details_body(step: Step<'_>, ix: usize, diff: Option<&DiffView>, cx: &App) -> AnyElement {
+/// output, images and diff.
+fn details_body(step: Step<'_>, state: StepState<'_>, cx: &App) -> AnyElement {
+    let StepState {
+        ix, images, diff, ..
+    } = state;
     match step {
         Step::Thought(thought) => part(
             "output",
@@ -409,6 +426,9 @@ fn details_body(step: Step<'_>, ix: usize, diff: Option<&DiffView>, cx: &App) ->
             .children(notes(tool, cx))
             .when_some(output(tool, ix, diff, cx), |this, output| {
                 this.child(part("output", ix, output))
+            })
+            .when(!images.is_empty(), |this| {
+                this.child(tool_images(tool, ix, images))
             })
             .when_some(diff, |this, diff| this.child(diff.render(cx)))
             .into_any_element(),
@@ -735,7 +755,7 @@ fn output(tool: &ToolCall, ix: usize, diff: Option<&DiffView>, cx: &App) -> Opti
             .iter()
             .filter_map(|content| match content {
                 ToolContent::Text(text) => Some(monospace(text, cx).into_any_element()),
-                ToolContent::Diff { .. } => None,
+                ToolContent::Diff { .. } | ToolContent::Image(_) => None,
             })
             .collect(),
     };
@@ -758,10 +778,32 @@ fn output(tool: &ToolCall, ix: usize, diff: Option<&DiffView>, cx: &App) -> Opti
                         .child(monospace(patch, cx))
                         .into_any_element(),
                 ),
-                ToolContent::Text(_) => None,
+                ToolContent::Text(_) | ToolContent::Image(_) => None,
             }),
     );
     (!parts.is_empty()).then(|| v_flex().gap_2().children(parts).into_any_element())
+}
+
+/// The images step `ix`, a call of `tool`, made, as tiles in a row that
+/// wraps; each opens in the lightbox, captioned with the call, when
+/// clicked.
+fn tool_images(tool: &ToolCall, ix: usize, images: &[Preview]) -> AnyElement {
+    let caption = SharedString::from(tool.label().to_owned());
+    let tiles = images.iter().enumerate().filter_map(|(n, preview)| {
+        let image = preview.image()?;
+        let id = SharedString::from(format!("step-{ix}-image-{n}"));
+        Some(lightbox::opens(
+            id,
+            image,
+            caption.clone(),
+            image.tile(IMAGE_HEIGHT),
+        ))
+    });
+    h_flex()
+        .flex_wrap()
+        .gap_2()
+        .children(tiles)
+        .into_any_element()
 }
 
 /// Source code, highlighted as `language`. Kit highlights code only in a

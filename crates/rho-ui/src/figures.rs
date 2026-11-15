@@ -2,6 +2,7 @@
 //! colors and fonts. Each is a GPUI Kit Markdown plugin: a ` ```mermaid `
 //! fence becomes a diagram ([`pele`]), and `$$ … $$` and `$ … $` become
 //! formulas (`RaTeX`). Each draws an SVG that GPUI rasterizes as an image.
+//! Images by path are [`pictures`]'.
 //!
 //! What the text can't be drawn as stays as written: a diagram pele can't
 //! draw shows as its code block, a formula `RaTeX` can't lay out as its
@@ -16,10 +17,13 @@ use gpui_kit::component::text::{
 use gpui_kit::component::{h_flex, ActiveTheme as _, Theme};
 use gpui_kit::{base::TestSupportExt as _, InteractiveElement as _};
 
-use crate::pele;
+use crate::{
+    pele,
+    pictures::{self, Pictures},
+};
 use gpui_kit::{
-    div, img, px, size, AnyElement, App, Hsla, Image, ImageFormat, IntoElement, ParentElement as _,
-    Pixels, Rgba, SharedString, Size, Styled as _, Window,
+    div, img, px, size, AnyElement, App, Entity, Hsla, Image, ImageFormat, IntoElement,
+    ParentElement as _, Pixels, Rgba, SharedString, Size, Styled as _, Window,
 };
 use ratex_layout::{layout, to_display_list, validate_layout, LayoutOptions};
 use ratex_svg::{SvgColorSyntax, SvgOptions};
@@ -38,13 +42,17 @@ const MATH_SCALE: f32 = 1.21;
 /// of its own (`\color{red}`) keeps it.
 const INK: Color = Color::new(0., 0., 0., 0.);
 
-/// The plugins, for a [`gpui_kit::component::text::TextView`] showing a
-/// message.
-pub(crate) fn extensions() -> MarkdownExtensions {
+/// The plugins, for a [`gpui_kit::component::text::TextView`] showing
+/// message `entry` of a session whose images by path `pictures` reads.
+pub(crate) fn extensions(pictures: &Entity<Pictures>, entry: usize) -> MarkdownExtensions {
     MarkdownExtensions::default()
         .plugin(Diagrams)
         .plugin(DisplayMath)
         .plugin(InlineMath)
+        .plugin(pictures::Plugin {
+            pictures: pictures.clone(),
+            entry,
+        })
 }
 
 /// A drawn figure: its image and the size it shows at.

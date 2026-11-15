@@ -32,7 +32,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    folders::Reader,
+    folders::{find, FileRead, Reader},
     machines::Place,
     session_view::{SessionEvent, SessionView},
     workspaces::Workspaces,
@@ -58,12 +58,6 @@ const BINARY_PROBE: usize = 8000;
 /// first and is skipped.
 const LISTED: &[u8] = b"rho-ui-files\0";
 
-/// Printed before a file's bytes.
-const OPENED: &[u8] = b"rho-ui-file\0";
-
-/// Printed instead when the file isn't there.
-const GONE: &[u8] = b"rho-ui-file-gone\0";
-
 /// The POSIX `sh` script that lists the files under the folder given as
 /// its first argument, each path from that folder ended by a NUL, after
 /// [`LISTED`]. In a git work tree, first the tracked files missing from it,
@@ -82,20 +76,6 @@ if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
 else
   printf '/\0'
   find . ! -type d -print0 | head -c "$2"
-fi
-"#;
-
-/// The POSIX `sh` script that prints the file at the path given as its
-/// second argument, from the folder given as its first: [`OPENED`], then
-/// as many of its bytes as the third argument says. [`GONE`] if it isn't a
-/// file. Read with [`parse_file`].
-pub(super) const READ_SCRIPT: &str = r#"unset CDPATH
-cd -- "$1" || exit
-if [ -f "$2" ]; then
-  printf 'rho-ui-file\0'
-  head -c "$3" -- "$2"
-else
-  printf 'rho-ui-file-gone\0'
 fi
 "#;
 
@@ -291,17 +271,13 @@ impl FilesSurface {
             return;
         };
         let reader = self.workspaces.read(cx).reader(&place.machine);
-        let args = vec![
-            place.path.clone().into_os_string(),
-            OsString::from(path.as_ref()),
-            (FILE_LIMIT + 1).to_string().into(),
-        ];
+        let folder = place.path.clone();
         let executor = cx.background_executor().clone();
         open.load = cx.spawn(async move |this, cx| {
             let read = reader
-                .run_script(READ_SCRIPT, args, &executor)
+                .read_file(&folder, &path, FILE_LIMIT, &executor)
                 .await
-                .and_then(|output| parse_file(&output));
+                .map(Read::new);
             let _ = this.update(cx, |this, cx| this.file_read(&path, read, cx));
         });
         cx.notify();
@@ -583,13 +559,6 @@ async fn list(
         .await
 }
 
-/// Where `marker` first shows in `output`.
-fn find(output: &[u8], marker: &[u8]) -> Option<usize> {
-    output
-        .windows(marker.len())
-        .position(|window| window == marker)
-}
-
 /// The files [`LIST_SCRIPT`] printed, told to stop after `limit + 1`
 /// bytes.
 fn parse_listing(output: &[u8], limit: usize) -> Result<Listing, String> {
@@ -704,22 +673,17 @@ fn items(nodes: &[Node], expanded: &HashSet<SharedString>) -> Vec<TreeItem> {
         .collect()
 }
 
-/// The file [`READ_SCRIPT`] printed, told to stop after
-/// [`FILE_LIMIT`]` + 1` bytes.
-fn parse_file(output: &[u8]) -> Result<Read, String> {
-    if let Some(at) = find(output, OPENED) {
-        let bytes = &output[at + OPENED.len()..];
-        return Ok(if bytes.len() > FILE_LIMIT {
-            Read::TooLarge
-        } else if bytes[..bytes.len().min(BINARY_PROBE)].contains(&0) {
-            Read::Binary
-        } else {
-            Read::Text(String::from_utf8_lossy(bytes).into_owned())
-        });
-    }
-    match find(output, GONE) {
-        Some(_) => Ok(Read::Gone),
-        None => Err("The file script printed something else.".to_owned()),
+impl Read {
+    /// What the open file shows of `read`.
+    fn new(read: FileRead) -> Self {
+        match read {
+            FileRead::Bytes(bytes) if bytes[..bytes.len().min(BINARY_PROBE)].contains(&0) => {
+                Self::Binary
+            }
+            FileRead::Bytes(bytes) => Self::Text(String::from_utf8_lossy(&bytes).into_owned()),
+            FileRead::TooLarge => Self::TooLarge,
+            FileRead::Gone => Self::Gone,
+        }
     }
 }
 
@@ -825,6 +789,8 @@ mod tests {
     /// one over the limit, and one that isn't there apart.
     #[test]
     fn the_read_script_tells_text_from_the_rest() {
+        use crate::folders::{parse_read, READ_SCRIPT};
+
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.path().join("bin"), b"\x7fELF\0\0").unwrap();
@@ -833,7 +799,7 @@ mod tests {
         let read = |path: &str| {
             let limit = (FILE_LIMIT + 1).to_string();
             let args = [dir.path().as_os_str(), path.as_ref(), limit.as_ref()];
-            parse_file(&run_here(READ_SCRIPT, &args).unwrap())
+            parse_read(run_here(READ_SCRIPT, &args).unwrap(), FILE_LIMIT).map(Read::new)
         };
         assert_eq!(read("a.rs"), Ok(Read::Text("fn main() {}\n".to_owned())));
         assert_eq!(read("bin"), Ok(Read::Binary));

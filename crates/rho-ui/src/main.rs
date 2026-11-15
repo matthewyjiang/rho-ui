@@ -19,8 +19,10 @@ mod fold;
 mod folders;
 mod input_card;
 mod kinetic;
+mod lightbox;
 mod machines;
 mod pele;
+mod pictures;
 mod plan;
 mod project_picker;
 mod projects;
@@ -133,7 +135,11 @@ gpui_kit::assets::icon_assets!(
         PinOff,
         Circle,
         CircleDot,
-        Trash
+        Trash,
+        ZoomIn,
+        ZoomOut,
+        Scan,
+        ImageOff
     ]
 );
 

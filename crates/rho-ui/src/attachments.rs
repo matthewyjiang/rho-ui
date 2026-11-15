@@ -112,10 +112,14 @@ impl Preview {
     }
 }
 
-/// An image ready to draw: a GPUI image of its bytes, and its proportions.
+/// An image ready to draw: a GPUI image of its bytes, its size, and its
+/// proportions for a tile.
 #[derive(Clone, Debug)]
 pub(crate) struct ImagePreview {
     image: Arc<gpui_kit::Image>,
+    /// Its size in pixels, neither of them zero.
+    width: u32,
+    height: u32,
     /// Width over height, within [`ASPECT_RANGE`].
     aspect: f32,
     /// What it is, such as "PNG image, 1920 × 1080".
@@ -125,7 +129,7 @@ pub(crate) struct ImagePreview {
 impl ImagePreview {
     /// The preview of `image`; `None` when its header doesn't read as its
     /// format.
-    fn new(image: &Image) -> Option<Self> {
+    pub(crate) fn new(image: &Image) -> Option<Self> {
         let reader =
             image::ImageReader::with_format(Cursor::new(image.bytes()), decoder(image.format()));
         let (width, height) = reader.into_dimensions().ok()?;
@@ -145,9 +149,53 @@ impl ImagePreview {
                 gpui_format(format),
                 image.bytes().to_vec(),
             )),
+            width,
+            height,
             aspect,
             label: format!("{} image, {width} × {height}", format.name()).into(),
         })
+    }
+
+    /// The preview of a file's `bytes`, read as the image they are.
+    ///
+    /// # Errors
+    ///
+    /// Says why when they aren't an image rho shows, or one with no side
+    /// over `max_side` pixels.
+    pub(crate) fn from_file(bytes: Vec<u8>, max_side: u32) -> Result<Self, String> {
+        let format = match sniff(&bytes) {
+            Sniffed::Image(format) => format,
+            Sniffed::OtherImage(mime_type) => {
+                return Err(format!(
+                    "Rho shows PNG, JPEG, GIF and WebP images, and this is {mime_type}."
+                ))
+            }
+            Sniffed::NotImage => return Err("It isn't an image.".to_owned()),
+        };
+        let preview = Self::new(&Image::new(format, bytes))
+            .ok_or_else(|| format!("Its {} data doesn't read.", format.name()))?;
+        let (width, height) = preview.pixels();
+        if width.max(height) > max_side {
+            return Err(format!(
+                "It's {width} × {height} px, and rho-ui shows up to {max_side} px a side."
+            ));
+        }
+        Ok(preview)
+    }
+
+    /// The image, for GPUI to draw.
+    pub(crate) fn image(&self) -> Arc<gpui_kit::Image> {
+        Arc::clone(&self.image)
+    }
+
+    /// Its width and height in pixels.
+    pub(crate) fn pixels(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// What it is, such as "PNG image, 1920 × 1080".
+    pub(crate) fn label(&self) -> SharedString {
+        self.label.clone()
     }
 
     /// The image as a Kit image tile `height` rems tall and as wide as its

@@ -19,6 +19,9 @@
 //!   text "refuse" are refused, leaving the request open. "questions timeout"
 //!   asks the same with a five-minute timeout whose fallback picks Rust;
 //!   holding it drops the timeout.
+//! - The prompt "pictures" reads an image, whose call carries it, and
+//!   answers with two images by path, `plot.png` and `missing.png`, from
+//!   the session's folder.
 //! - The prompt "plan" asks to carry out a plan, and answers "you chose"
 //!   and the answer, with its feedback after a colon.
 //! - The prompt "background" starts a background process, `sleep 30`, and
@@ -776,6 +779,29 @@ impl FakeSession {
         });
     }
 
+    /// Reads an image with `read_file`, whose card is text and whose
+    /// content carries the image, as a rho 3 daemon's does.
+    fn read_image(&mut self, id: &str) {
+        let read = card(
+            ToolStatus::Completed,
+            ToolFamily::FileCommand,
+            ToolHeader::call("read_file", Some("plot.png".to_owned())),
+        );
+        self.tool(
+            &ToolCallId::new(id),
+            ("read_file(plot.png)", ToolKind::Read),
+            ToolStatus::Completed,
+            vec![
+                text("image/png image (173 bytes)"),
+                ToolContent::Image {
+                    mime_type: "image/png".to_owned(),
+                    data: TOOL_IMAGE.to_owned(),
+                },
+            ],
+            read,
+        );
+    }
+
     /// Finishes the turn as answered with `text`.
     fn answer(&mut self, message: &str, text: &str) {
         self.say(message, text);
@@ -793,6 +819,9 @@ impl FakeSession {
         );
     }
 }
+
+/// The image the prompt "pictures" reads: a 96x48 PNG, base64.
+const TOOL_IMAGE: &str = "iVBORw0KGgoAAAANSUhEUgAAAGAAAAAwCAIAAABhdOiYAAAAdElEQVR42u3aMQ0AIRAAQSCIeQlooUIBYlCAHGS9AkpCQmbbK0gmdx3xqytoX0IACBAgQIAAvVreDVZvp98uY9ogJwYIkAABAgQIECBAgAQIECBAgAABAiRAgAABAgQIECBAAgQI0L2ij+Q2CBAgQIAAvdoPYAgF9XG26YoAAAAASUVORK5CYII=";
 
 fn text(text: &str) -> ToolContent {
     ToolContent::Text {

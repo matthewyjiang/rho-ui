@@ -35,20 +35,22 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
-use rho_ui_core::{Delay, Entry, Notice, NoticeLevel, Row, Timeline};
+use rho_ui_core::{Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent};
 
 use crate::{
-    attachments::Preview,
+    attachments::{ImagePreview, Preview},
     figures,
     fold::Folding,
+    lightbox,
+    pictures::{PictureRead, Pictures},
     turn_times::TurnTimes,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
 
-/// How tall an image attached to a user message is, in rems: a
-/// screenshot's layout reads at this size, and two side by side fit the
-/// transcript's measure.
-const IMAGE_HEIGHT: f32 = 10.;
+/// How tall an image attached to a user message or made by a tool is, in
+/// rems: a screenshot's layout reads at this size, and two side by side
+/// fit the transcript's measure.
+pub(crate) const IMAGE_HEIGHT: f32 = 10.;
 
 /// A code block's padding above its code. Kit sets the language name in the
 /// top corner, its letters 10px to 17px down; this starts the code's letters
@@ -147,16 +149,20 @@ pub(crate) struct Transcript {
     delay: Option<Delay>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
-    /// Per entry: a user message's attachments, ready to draw.
+    /// Per entry: a user message's attachments, or a tool's images, ready
+    /// to draw.
     attachments: Vec<Vec<Preview>>,
+    /// The images the session's messages show by path.
+    pictures: Entity<Pictures>,
     /// Per entry: a message's text, or a notice's detail; `None` for
     /// anything else.
     markdown: Vec<Option<Markdown>>,
 }
 
 impl Transcript {
-    pub(crate) fn new(cx: &mut App) -> Self {
+    pub(crate) fn new(pictures: Entity<Pictures>, cx: &mut App) -> Self {
         Self {
+            pictures,
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             timeline: Timeline::default(),
             steps: Vec::new(),
@@ -173,6 +179,20 @@ impl Transcript {
 
     pub(crate) fn scroller(&self) -> &Entity<MessageScrollerState> {
         &self.scroller
+    }
+
+    /// What reads the images the session's messages show by path: it
+    /// says when each read ends ([`PictureRead`]).
+    pub(crate) fn pictures(&self) -> &Entity<Pictures> {
+        &self.pictures
+    }
+
+    /// A picture of message `entry` was read, or is read again, which
+    /// changes the message's height.
+    pub(crate) fn picture_read(&self, read: &PictureRead, cx: &mut App) {
+        if let Some(row) = self.timeline.row_of(read.entry) {
+            self.remeasure(row..row + 1, cx);
+        }
     }
 
     /// Places entries added since the last call in rows.
@@ -222,6 +242,8 @@ impl Transcript {
         self.details.truncate(from);
         self.attachments.truncate(from);
         self.markdown.truncate(from);
+        self.pictures
+            .update(cx, |pictures, _| pictures.forget_from(from));
         self.diffs.retain(|diff| diff.entry < from);
         self.worked.truncate(turns);
         self.took.truncate(turns);
@@ -319,6 +341,9 @@ impl Transcript {
     /// session replays, under its prompt: a turn the daemon began itself
     /// has none, and a prompt that never arrived leaves no turn to time.
     pub(crate) fn end_turn(&mut self, entries: &[Entry], cx: &mut App) {
+        // The turn may have written files its messages showed before
+        // they were there.
+        self.pictures.update(cx, Pictures::retry);
         let Some(Running { turn, since }) = self.running.take() else {
             return;
         };
@@ -518,7 +543,13 @@ impl Transcript {
                 message => {
                     let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
                     let text = self.text(*entry);
-                    render_message(message, *entry, text, attachments, phase, cx)
+                    let shown = Shown {
+                        text,
+                        attachments,
+                        pictures: &self.pictures,
+                        phase,
+                    };
+                    render_message(message, *entry, &shown, cx)
                 }
             },
             Row::Work(run) => {
@@ -532,6 +563,7 @@ impl Transcript {
                         start: run.start,
                         steps: self.steps[ix],
                         details: &self.details[run.clone()],
+                        images: &self.attachments[run.clone()],
                         diffs: &self.diffs,
                         phase,
                         on_fold,
@@ -646,14 +678,23 @@ pub(crate) enum Phase {
     Settled,
 }
 
-/// The previews of `entry`'s attachments, if it is a user message; an
-/// image whose header doesn't read is left out.
+/// The previews of `entry`'s attachments, if it is a user message, or of
+/// its images, if it is a tool call; an image whose header doesn't read is
+/// left out.
 fn previews(entry: &Entry) -> Vec<Preview> {
     match entry {
         Entry::User(message) => message
             .attachments()
             .iter()
             .filter_map(Preview::new)
+            .collect(),
+        Entry::Tool(tool) => tool
+            .content()
+            .iter()
+            .filter_map(|content| match content {
+                ToolContent::Image(image) => ImagePreview::new(image).map(Preview::Image),
+                ToolContent::Text(_) | ToolContent::Diff { .. } => None,
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -673,16 +714,31 @@ fn attachment_row(cells: impl Iterator<Item = AnyElement>) -> Option<impl IntoEl
     })
 }
 
-/// Attachment `n` of user message `ix`, drawn as `card`. Wrapped so UI
-/// tests can find it: Kit's Attachment does not register its ID with them.
+/// Attachment `n` of user message `ix`, drawn as `card`; an image opens in
+/// the lightbox when clicked. Wrapped so UI tests can find it: Kit's
+/// Attachment does not register its ID with them.
 fn attachment_cell(ix: usize, n: usize, preview: &Preview, card: Card) -> AnyElement {
     let id = SharedString::from(format!("user-{ix}-attachment-{n}"));
-    div()
-        .id(id.clone())
-        .test_support()
-        .aria_label(preview.label())
-        .child(card.id((ElementId::from(id), "card")))
-        .into_any_element()
+    let card = card.id((ElementId::from(id.clone()), "card"));
+    match preview.image() {
+        Some(image) => lightbox::opens(id, image, SharedString::default(), card).into_any_element(),
+        None => div()
+            .id(id)
+            .aria_label(preview.label())
+            .test_support()
+            .child(card)
+            .into_any_element(),
+    }
+}
+
+/// What a message row draws besides its entry.
+struct Shown<'a> {
+    /// The message's text, if it has any.
+    text: Option<&'a Entity<TextViewState>>,
+    /// A user message's attachments.
+    attachments: &'a [Preview],
+    pictures: &'a Entity<Pictures>,
+    phase: Phase,
 }
 
 /// The Markdown `entry` shows: a message's text, or a notice's detail.
@@ -695,18 +751,15 @@ fn markdown_text(entry: &Entry) -> Option<&str> {
     }
 }
 
-/// Builds the row for a user message or a reply: entry `ix`, whose text
-/// `text` holds.
-/// `attachments` are a user message's. Tool calls and thoughts are drawn
-/// by [`crate::work`].
-fn render_message(
-    entry: &Entry,
-    ix: usize,
-    text: Option<&Entity<TextViewState>>,
-    attachments: &[Preview],
-    phase: Phase,
-    cx: &App,
-) -> AnyElement {
+/// Builds the row for a user message or a reply: entry `ix`, with what
+/// `shown` holds. Tool calls and thoughts are drawn by [`crate::work`].
+fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyElement {
+    let Shown {
+        text,
+        attachments,
+        pictures,
+        phase,
+    } = *shown;
     let key = ElementId::named_usize("row", ix);
     match entry {
         Entry::User(_) => {
@@ -731,7 +784,7 @@ fn render_message(
                         .child(
                             TextView::new(text)
                                 .style(message_style())
-                                .markdown_extensions(figures::extensions())
+                                .markdown_extensions(figures::extensions(pictures, ix))
                                 .selectable(true),
                         ),
                 )
@@ -753,7 +806,7 @@ fn render_message(
             .children(text.map(|text| {
                 TextView::new(text)
                     .style(message_style())
-                    .markdown_extensions(figures::extensions())
+                    .markdown_extensions(figures::extensions(pictures, ix))
                     .selectable(true)
                     .stream_fade(phase == Phase::Live)
             }))

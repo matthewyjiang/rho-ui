@@ -2,7 +2,8 @@
 //! project of the folder typed, if it is there, and the folders the path
 //! can go on to, so the search browses folders on any machine. This
 //! machine's are read from its files; a remote machine's with
-//! [`REMOTE_SCRIPT`], over the ssh connection to its daemon.
+//! [`REMOTE_SCRIPT`], over the ssh connection to its daemon. Also how
+//! rho-ui runs scripts and reads files on any machine ([`Reader`]).
 
 use std::{
     ffi::{OsStr, OsString},
@@ -175,6 +176,89 @@ impl Reader {
             Reader::Unread => Err(UNREAD.to_owned()),
         }
     }
+}
+
+/// The POSIX `sh` script that prints the file at the path given as its
+/// second argument, from the folder given as its first: [`OPENED`], then
+/// as many of its bytes as the third argument says. [`GONE`] if it isn't a
+/// file. Read with [`parse_read`].
+pub(crate) const READ_SCRIPT: &str = r#"unset CDPATH
+cd -- "$1" || exit
+if [ -f "$2" ]; then
+  printf 'rho-ui-file\0'
+  head -c "$3" -- "$2"
+else
+  printf 'rho-ui-file-gone\0'
+fi
+"#;
+
+/// Printed before a file's bytes, so whatever a login file prints comes
+/// first and is skipped.
+const OPENED: &[u8] = b"rho-ui-file\0";
+
+/// Printed instead when the file isn't there.
+const GONE: &[u8] = b"rho-ui-file-gone\0";
+
+/// What [`Reader::read_file`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FileRead {
+    /// The file's bytes, no more than the limit asked.
+    Bytes(Vec<u8>),
+    /// It is larger than the limit asked.
+    TooLarge,
+    /// It isn't there, or isn't a file.
+    Gone,
+}
+
+impl Reader {
+    /// Reads the file at `path`, from `folder` when relative, if it holds
+    /// at most `limit` bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_script`], or if the script printed something else.
+    pub(crate) async fn read_file(
+        self,
+        folder: &Path,
+        path: &str,
+        limit: usize,
+        executor: &BackgroundExecutor,
+    ) -> Result<FileRead, String> {
+        let args = vec![
+            folder.as_os_str().to_owned(),
+            OsString::from(path),
+            (limit + 1).to_string().into(),
+        ];
+        let output = self.run_script(READ_SCRIPT, args, executor).await?;
+        parse_read(output, limit)
+    }
+}
+
+/// The file [`READ_SCRIPT`] printed, told to stop after `limit + 1` bytes.
+///
+/// # Errors
+///
+/// If it printed something else.
+pub(crate) fn parse_read(mut output: Vec<u8>, limit: usize) -> Result<FileRead, String> {
+    if let Some(at) = find(&output, OPENED) {
+        output.drain(..at + OPENED.len());
+        return Ok(if output.len() > limit {
+            FileRead::TooLarge
+        } else {
+            FileRead::Bytes(output)
+        });
+    }
+    match find(&output, GONE) {
+        Some(_) => Ok(FileRead::Gone),
+        None => Err("The file script printed something else.".to_owned()),
+    }
+}
+
+/// Where `marker` first shows in `output`.
+pub(crate) fn find(output: &[u8], marker: &[u8]) -> Option<usize> {
+    output
+        .windows(marker.len())
+        .position(|window| window == marker)
 }
 
 /// Why a script can't run on a machine that isn't connected.

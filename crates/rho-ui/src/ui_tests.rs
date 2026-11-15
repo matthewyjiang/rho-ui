@@ -19,7 +19,7 @@ use gpui_kit::test::{
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem,
     ElementId, ElementInputHandler, Entity, ExternalPaths, HeadlessAppContext, ImageFormat,
-    Modifiers, MouseButton, MouseExitEvent, Pixels, PlatformInput, Window, WindowBounds,
+    Modifiers, MouseButton, MouseExitEvent, Pixels, PlatformInput, Size, Window, WindowBounds,
     WindowOptions,
 };
 use rho_ui_core::{
@@ -2369,6 +2369,119 @@ fn a_reply_draws_its_diagram_and_formula_in_the_theme() {
         });
         ui.shot(appearance.name());
     }
+}
+
+/// A reply's images by path come from the session's folder, at their own
+/// size within the reply's column, and one that isn't there says so in its
+/// place. A tool's image shows in its details. A click opens a picture in
+/// the lightbox at its own size, under its caption; it zooms in and fits
+/// again, and Escape closes it.
+#[test]
+fn pictures_show_in_place_and_open_in_the_lightbox() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let folder = dir.path().canonicalize().expect("it resolves");
+    std::fs::write(
+        folder.join("plot.png"),
+        crate::attachments::png(640, 320, RED),
+    )
+    .expect("write the picture");
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "pictures",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::owning(["s1", "old"]),
+            projects: Projects::default(),
+            settings: Settings::default(),
+            remote_sockets: Vec::new(),
+            workspace: Some(folder),
+        },
+    );
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("pictures");
+    ui.wait_for_session("the reply", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(_)))
+    });
+    let reply = match ui.session().entries().last() {
+        Some(Entry::Agent(message)) => message.text().to_owned(),
+        other => panic!("the reply is last: {other:?}"),
+    };
+    // Each picture's row is named for where its paragraph starts.
+    let row = |alt: &str| -> &'static str {
+        let start = reply
+            .find(&format!("![{alt}"))
+            .expect("the reply holds the picture");
+        Box::leak(format!("image-{start}-0").into_boxed_str())
+    };
+    let (plot, chart) = (row("The plot"), row("A missing chart"));
+    ui.wait_until(
+        "the plot, and the chart that isn't there",
+        |window, _, _| is_visible(window, "picture") && is_visible(window, "picture-failed"),
+    );
+    ui.act(|window, _| {
+        let column = window.find(plot).bounds();
+        let shown = window.within(plot).find("picture").bounds();
+        assert!(
+            (shown.size.width - px(640.)).abs() < px(1.)
+                && (shown.size.height - px(320.)).abs() < px(1.),
+            "the plot shows at its own size: {shown:?}"
+        );
+        assert!(
+            shown.left() >= column.left() && shown.right() <= column.right(),
+            "inside the reply's column {column:?}: {shown:?}"
+        );
+        assert!(window.within(chart).try_find("picture-failed").is_some());
+    });
+    ui.shot("reply");
+
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.toggle_turn("worked-0");
+    ui.wait_until("the turn's working", |window, _, _| {
+        is_visible(window, "step-1")
+    });
+    ui.act(|window, cx| window.within("step-1").click("step-line", cx));
+    ui.wait_until("the tool's image", |window, _, _| {
+        is_visible(window, "step-1-image-0")
+    });
+    ui.shot("tool");
+
+    let shown = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                window.find("lightbox-picture").bounds().size
+            })
+            .expect("window is open")
+    };
+    let is_about = |size: Size<Pixels>, width: f32, height: f32| {
+        (size.width - px(width)).abs() < px(1.) && (size.height - px(height)).abs() < px(1.)
+    };
+    ui.act(|window, cx| window.within(plot).click("picture", cx));
+    ui.wait_until("the lightbox", |window, _, _| {
+        is_visible(window, "lightbox-picture") && is_visible(window, "lightbox-caption")
+    });
+    // The dialog fades in.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    let fitted = shown(&mut ui);
+    assert!(is_about(fitted, 640., 320.), "at its own size: {fitted:?}");
+    ui.shot("lightbox");
+    ui.click("lightbox-zoom-in");
+    let zoomed = shown(&mut ui);
+    assert!(is_about(zoomed, 960., 480.), "zoomed in: {zoomed:?}");
+    ui.shot("zoomed");
+    ui.act(|window, cx| window.press("0", cx));
+    let fitted = shown(&mut ui);
+    assert!(is_about(fitted, 640., 320.), "fitted again: {fitted:?}");
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the lightbox closed", |window, _, _| {
+        !is_visible(window, "lightbox")
+    });
 }
 
 /// Whether the session view shows an error: a failed turn, or a request

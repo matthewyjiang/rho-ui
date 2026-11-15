@@ -128,7 +128,7 @@ impl Image {
 
     /// The image a content block carries, if it is one this app can show:
     /// base64 of a format rho takes.
-    fn from_wire(mime_type: &str, data: &str) -> Option<Self> {
+    pub(crate) fn from_wire(mime_type: &str, data: &str) -> Option<Self> {
         let format = ImageFormat::from_mime_type(mime_type)?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data)

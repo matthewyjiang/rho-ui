@@ -115,6 +115,10 @@ $$
 It cost $5 and $10 to run.
 ";
 
+/// The reply to the prompt "pictures": an image in the session's folder,
+/// and one that isn't there.
+const PICTURES: &str = "Here is the plot:\n\n![The plot, a square on blue](plot.png)\n\nAnd the chart:\n\n![A missing chart](missing.png)\n";
+
 /// The turn's reply to `answer`.
 fn reply(answer: &InputAnswer) -> String {
     let chose = |name: &str, text: &Option<String>| match text {
@@ -370,6 +374,14 @@ impl Service for Fake {
             session.state(JobState::Running);
             session.publish(echo(&turn_id, &params));
             session.answer(&format!("m-{turn_id}"), FIGURES);
+            return Ok(SessionPromptResponse { turn: turn_id });
+        }
+        if prompt == "pictures" {
+            session.turn = Some(turn);
+            session.state(JobState::Running);
+            session.publish(echo(&turn_id, &params));
+            session.read_image(&format!("img-{turn_id}"));
+            session.answer(&format!("m-{turn_id}"), PICTURES);
             return Ok(SessionPromptResponse { turn: turn_id });
         }
         let (ask, timeout) =

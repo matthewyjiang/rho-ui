@@ -25,7 +25,7 @@ use crate::{
     daemon::SessionId,
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
-    prompt::{Attachment, Prompt},
+    prompt::{Attachment, Image, Prompt},
     tool_card::ToolCard,
 };
 
@@ -188,6 +188,8 @@ pub enum ToolKind {
 pub enum ToolContent {
     /// Output text, such as a command's stdout.
     Text(String),
+    /// An image the tool produced, such as `read_file`'s preview of one.
+    Image(Image),
     /// One changed file, with the change as a patch in git format.
     Diff {
         /// The file the change touches.
@@ -1376,7 +1378,12 @@ fn tool_content(
 ) -> Option<ToolContent> {
     match content {
         rho_protocol::ToolContent::Text { text } => Some(ToolContent::Text(text)),
-        rho_protocol::ToolContent::Image { .. } => Some(ToolContent::Text("[image]".to_owned())),
+        rho_protocol::ToolContent::Image { mime_type, data } => {
+            Some(Image::from_wire(&mime_type, &data).map_or_else(
+                || ToolContent::Text(format!("[{mime_type} image this app can't show]")),
+                ToolContent::Image,
+            ))
+        }
         rho_protocol::ToolContent::Diff {
             path,
             old_text,

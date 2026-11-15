@@ -58,6 +58,7 @@ use crate::{
     composer::{Composer, ComposerMode, ComposerState},
     input_card::{InputCard, InputCardEvent, Queue},
     machines::{Place, SessionKey},
+    pictures::{PictureRead, Pictures},
     plan::PlanList,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
@@ -168,8 +169,9 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let transcript = Transcript::new(cx);
         let cwd = workspace.read(cx).place().clone();
+        let pictures = cx.new(|_| Pictures::new(cwd.clone(), workspace.table().clone()));
+        let transcript = Transcript::new(pictures, cx);
         // A session about to attach may have run background work in an
         // earlier run of the app, which the daemon may no longer list.
         let recorded = if matches!(loading, Loading::Attaching) {
@@ -194,6 +196,11 @@ impl SessionView {
                 cx.subscribe_in(&settings, window, Self::on_settings_event),
                 // The jump-to-latest button follows the scroll position.
                 cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
+                // A picture a message shows was read.
+                cx.subscribe(transcript.pictures(), |this, _, read: &PictureRead, cx| {
+                    this.transcript.picture_read(read, cx);
+                    cx.notify();
+                }),
                 // The title bar shows the project, which can change.
                 cx.observe(workspace.table(), |_, _, cx| cx.notify()),
                 cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
