@@ -248,7 +248,7 @@ impl MessageProcessor {
         for message in parse_payload(payload) {
             match message.and_then(|message| self.apply(message, validation)) {
                 Ok(Applied::Changes(changes)) => processed.changes.extend(changes),
-                Ok(Applied::Answer(answer)) => processed.outbound.push(answer),
+                Ok(Applied::Answer(answer)) => processed.outbound.push(*answer),
                 Err(error) => processed.outbound.push(RendererMessage::Error(error)),
             }
         }
@@ -316,7 +316,7 @@ impl MessageProcessor {
                     .into_iter()
                     .collect(),
             )),
-            AgentMessage::CallRendererFunction(call) => Ok(Applied::Answer(refuse_call(&call))),
+            AgentMessage::CallRendererFunction(call) => Ok(Applied::Answer(Box::new(refuse_call(&call)))),
             // The renderer makes no calls to the agent, so there is nothing
             // to answer.
             AgentMessage::AgentFunctionResponse(_) => Ok(Applied::Changes(Vec::new())),
@@ -647,7 +647,7 @@ pub(crate) fn data_models<'a>(surfaces: impl Iterator<Item = &'a Surface>) -> Op
 /// What applying one message did.
 enum Applied {
     Changes(Vec<Change>),
-    Answer(RendererMessage),
+    Answer(Box<RendererMessage>),
 }
 
 /// Checks a component against its schema: a type its catalog declares,
