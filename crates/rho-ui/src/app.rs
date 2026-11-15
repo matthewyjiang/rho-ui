@@ -10,7 +10,11 @@
 //! views: each redraws only when it changes, so a hover in one never
 //! rebuilds the others.
 
-use std::{path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    path::PathBuf,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::component::{
     button::Button,
@@ -21,13 +25,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, App, AppContext as _, Context, DragMoveEvent, Entity, EntityId, FocusHandle,
+    div, AnyElement, App, AppContext as _, Context, DragMoveEvent, Entity, EntityId, FocusHandle,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, DaemonTarget, Detached,
-    Job, Prompt, Session, SessionId,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job,
+    PendingUpgrade, Prompt, Session, SessionId,
 };
 
 use crate::{
@@ -35,9 +39,11 @@ use crate::{
     draft::{DraftEvent, DraftView},
     kinetic::Kinetic,
     machines::{
-        Listing, Machine, MachineId, MachineStatus, Machines, Place, RemoteMachine, SessionKey,
+        Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach, RemoteMachine,
+        SessionKey,
     },
     projects::Projects,
+    rho_install::{render_setup, Installs, InstallsEvent, Offer},
     rho_settings::RhoSettings,
     right_panel::{
         PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, TerminalShortcut, MIN_PANE_REMS,
@@ -62,16 +68,24 @@ use crate::{
 /// home's history: measure again before polling faster.
 const JOB_POLL: Duration = Duration::from_secs(1);
 
+/// How often to ask a daemon for the upgrade it waits to run when its jobs
+/// stay the same. `rho/daemon/status` reads the daemon's settings and its
+/// credential store each time, a D-Bus call on Linux, so it isn't asked
+/// with every job poll. An upgrade appears when rho is replaced, which
+/// rho-ui asks after at once when it updates rho itself; one replaced from
+/// a terminal shows within this.
+const UPGRADE_POLL: Duration = Duration::from_secs(30);
+
 /// What the command line asked for.
 pub(crate) struct LaunchConfig {
     /// Where new sessions start on this machine. Resumed sessions keep
     /// their own directory.
     pub(crate) workspace: PathBuf,
-    /// How to reach this machine's daemon.
-    pub(crate) daemon: DaemonTarget,
-    /// How to reach a remote machine's: [`RemoteMachine::ssh_target`],
+    /// How to reach this machine's daemon and rho.
+    pub(crate) local: Reach,
+    /// How to reach a remote machine's: [`RemoteMachine::ssh_reach`],
     /// except in tests, which reach fake daemons.
-    pub(crate) remote: Rc<dyn Fn(&RemoteMachine) -> DaemonTarget>,
+    pub(crate) remote: Rc<dyn Fn(&RemoteMachine) -> Reach>,
     /// What the right panel's terminal runs on this machine.
     pub(crate) shell: TerminalShell,
 }
@@ -82,14 +96,19 @@ impl LaunchConfig {
         let local = Machine {
             id: MachineId::local(),
             label: settings.local_label.clone(),
-            target: self.daemon.clone(),
+            target: self.local.daemon.clone(),
+            rho: self.local.rho.clone(),
             clone_folder: settings.local_clone_folder.clone().into(),
         };
-        let remote = settings.machines.iter().map(|remote| Machine {
-            id: remote.id(),
-            label: remote.shown_label().to_owned().into(),
-            target: (self.remote)(remote),
-            clone_folder: remote.clone_folder.clone().into(),
+        let remote = settings.machines.iter().map(|remote| {
+            let Reach { daemon, rho } = (self.remote)(remote);
+            Machine {
+                id: remote.id(),
+                label: remote.shown_label().to_owned().into(),
+                target: daemon,
+                rho,
+                clone_folder: remote.clone_folder.clone().into(),
+            }
         });
         std::iter::once(local).chain(remote).collect()
     }
@@ -105,8 +124,10 @@ struct Connection {
     /// to requests made on an earlier one belong to sessions that are no
     /// longer open, and are dropped.
     epoch: u64,
-    /// The daemon said it is restarting in place, so the connection's end
-    /// is expected, and answered by connecting again.
+    /// The daemon may restart in place, so the connection's end is
+    /// expected, and answered by connecting again: it said it is
+    /// restarting, the user asked it to, rho was updated under it, or it
+    /// waits to upgrade.
     restarting: bool,
     /// Connects to the daemon, then pumps its events. Dropping or replacing
     /// it stops both.
@@ -117,6 +138,24 @@ struct Connection {
     jobs: Vec<Job>,
     /// The latest `list_sessions`; a newer refresh replaces it.
     sessions_task: Task<()>,
+    /// What to follow again once the daemon is back from restarting.
+    resume: Option<Resume>,
+}
+
+/// The sessions a daemon restarting in place left: attaching to one again
+/// carries on the turn the restart cut short, in a rho that resumes them.
+struct Resume {
+    /// The session on screen.
+    shown: Option<Shown>,
+    /// The others that had work under way.
+    working: Vec<SessionId>,
+}
+
+/// The session on screen as a daemon restarted, to open again.
+struct Shown {
+    id: SessionKey,
+    cwd: PathBuf,
+    title: Option<SharedString>,
 }
 
 impl Connection {
@@ -130,6 +169,7 @@ impl Connection {
             jobs_task: Task::ready(()),
             jobs: Vec::new(),
             sessions_task: Task::ready(()),
+            resume: None,
         }
     }
 }
@@ -169,6 +209,8 @@ pub(crate) struct RhoApp {
     connections: Vec<Connection>,
     /// rho's own settings on each connected machine, for Settings.
     rho_settings: Entity<RhoSettings>,
+    /// Each machine's rho, apart from its daemon: installing and updating.
+    installs: Entity<Installs>,
     /// The epoch the next connection gets; see [`Connection::epoch`].
     next_epoch: u64,
     workspaces: Entity<Workspaces>,
@@ -192,7 +234,7 @@ pub(crate) struct RhoApp {
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 5],
 }
 
 impl RhoApp {
@@ -213,10 +255,12 @@ impl RhoApp {
         let projects = cx.new(|_| projects);
         // Empty until `sync_machines` connects to each.
         let machines = cx.new(|_| Machines::default());
+        let installs = cx.new(|_| Installs::new(machines.clone()));
         let sidebar = cx.new(|cx| {
             SidebarView::new(
                 workspaces.clone(),
                 machines.clone(),
+                installs.clone(),
                 projects.clone(),
                 sidebar,
                 window,
@@ -244,6 +288,21 @@ impl RhoApp {
                 SidebarEvent::Resized => cx.notify(),
             },
         );
+        let installs_subscription = cx.subscribe_in(
+            &installs,
+            window,
+            |this, _, event: &InstallsEvent, window, cx| match event {
+                InstallsEvent::Installed(machine) => this.connect(machine, window, cx),
+                InstallsEvent::Updated(machine) => {
+                    this.expect_restart(machine);
+                    this.ask_upgrade(machine, cx);
+                }
+                InstallsEvent::Restart(machine) => {
+                    this.expect_restart(machine);
+                    this.restart_daemon(machine, window, cx);
+                }
+            },
+        );
         let shell = launch.shell.clone();
         let panel = cx.new(|_| RightPanel::new(workspaces.clone(), shell));
         let mut app = Self {
@@ -251,6 +310,7 @@ impl RhoApp {
             machines,
             connections: Vec::new(),
             rho_settings: cx.new(|_| RhoSettings::default()),
+            installs,
             next_epoch: 0,
             workspaces,
             projects,
@@ -264,6 +324,7 @@ impl RhoApp {
             focus_handle,
             _subscriptions: [
                 sidebar_subscription,
+                installs_subscription,
                 // With the system appearance, follow the desktop from light
                 // to dark and back.
                 cx.observe_window_appearance(window, |_, _, cx| {
@@ -385,6 +446,8 @@ impl RhoApp {
         self.forget_sessions(machine, window, cx);
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
+        self.installs
+            .update(cx, |installs, cx| installs.set_upgrade(machine, None, cx));
         self.next_epoch += 1;
         let epoch = self.next_epoch;
         let Some(target) = self
@@ -467,29 +530,51 @@ impl RhoApp {
         self.rho_settings.update(cx, |settings, cx| {
             settings.connected(machine, daemon.clone(), cx);
         });
+        self.installs
+            .update(cx, |installs, cx| installs.check(machine, cx));
         let jobs_task = cx.spawn({
             let (daemon, machine) = (daemon.clone(), machine.clone());
-            async move |this, cx| loop {
-                match daemon.active_jobs().await {
-                    Ok(jobs) => {
-                        let set = this.update(cx, |this, cx| this.set_jobs(&machine, &jobs, cx));
-                        if set.is_err() {
-                            return;
+            async move |this, cx| {
+                let mut asked_upgrade: Option<Instant> = None;
+                loop {
+                    let changed = match daemon.active_jobs().await {
+                        Ok(jobs) => {
+                            match this.update(cx, |this, cx| this.set_jobs(&machine, &jobs, cx)) {
+                                Ok(changed) => changed,
+                                Err(_) => return,
+                            }
+                        }
+                        // The event pump reports the connection's end.
+                        Err(DaemonError::Closed) => return,
+                        // One refused listing is no reason to stop asking, but
+                        // the sidebar says why its activity is stale.
+                        Err(error) => {
+                            let shown =
+                                this.update(cx, |this, cx| this.jobs_failed(&machine, &error, cx));
+                            if shown.is_err() {
+                                return;
+                            }
+                            false
+                        }
+                    };
+                    // What an upgrade waits on is the jobs, so it is asked
+                    // after when they change, and now and then besides.
+                    // On the executor's clock, which tests move.
+                    let now = cx.background_executor().now();
+                    let due = asked_upgrade.is_none_or(|at| now - at >= UPGRADE_POLL);
+                    if changed || due {
+                        asked_upgrade = Some(now);
+                        if let Ok(upgrade) = daemon.pending_upgrade().await {
+                            let set = this.update(cx, |this, cx| {
+                                this.set_upgrade(&machine, upgrade, cx);
+                            });
+                            if set.is_err() {
+                                return;
+                            }
                         }
                     }
-                    // The event pump reports the connection's end.
-                    Err(DaemonError::Closed) => return,
-                    // One refused listing is no reason to stop asking, but
-                    // the sidebar says why its activity is stale.
-                    Err(error) => {
-                        let shown =
-                            this.update(cx, |this, cx| this.jobs_failed(&machine, &error, cx));
-                        if shown.is_err() {
-                            return;
-                        }
-                    }
+                    cx.background_executor().timer(JOB_POLL).await;
                 }
-                cx.background_executor().timer(JOB_POLL).await;
             }
         });
         if let Some(connection) = self.connection_mut(machine) {
@@ -497,6 +582,7 @@ impl RhoApp {
             connection.daemon = Some(daemon);
         }
         self.refresh_sessions(machine, cx);
+        self.follow_again(machine, window, cx);
         // Drafts asked for a session while this machine connected.
         for draft in self.drafts_on(machine, cx) {
             let waits = {
@@ -520,11 +606,18 @@ impl RhoApp {
     ) {
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
+            // A later connection is no daemon coming back from a restart.
+            connection.resume = None;
         }
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
+        self.installs.update(cx, |installs, cx| {
+            installs.set_upgrade(machine, None, cx);
+            // A machine without rho can't connect: say so, and offer it.
+            installs.check(machine, cx);
+        });
         self.set_status(machine, MachineStatus::Failed(error.to_string().into()), cx);
         self.restart_drafts(machine, window, cx);
         cx.notify();
@@ -533,11 +626,11 @@ impl RhoApp {
     /// Shows which sessions have work under way in `machine`'s daemon. A
     /// change is also when the saved list goes stale: a session another
     /// client started appears, or one's turn ended. A listing also clears
-    /// why the last one was refused.
-    fn set_jobs(&mut self, machine: &MachineId, jobs: &[Job], cx: &mut Context<'_, Self>) {
+    /// why the last one was refused. Returns whether they changed.
+    fn set_jobs(&mut self, machine: &MachineId, jobs: &[Job], cx: &mut Context<'_, Self>) -> bool {
         self.set_listing_error(machine, Listing::Jobs, None, cx);
         let Some(connection) = self.connection_mut(machine) else {
-            return;
+            return false;
         };
         let same = connection.jobs.len() == jobs.len()
             && connection
@@ -546,12 +639,44 @@ impl RhoApp {
                 .zip(jobs)
                 .all(|(was, now)| was.is_same_work(now));
         if same {
-            return;
+            return false;
         }
         jobs.clone_into(&mut connection.jobs);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_jobs(machine, jobs, cx));
         self.refresh_sessions(machine, cx);
+        true
+    }
+
+    /// Records the upgrade `machine`'s daemon waits to run, from its
+    /// status. While one waits, the daemon may restart at any moment.
+    fn set_upgrade(
+        &mut self,
+        machine: &MachineId,
+        upgrade: Option<PendingUpgrade>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if upgrade.is_some() {
+            self.expect_restart(machine);
+        }
+        self.installs.update(cx, |installs, cx| {
+            installs.set_upgrade(machine, upgrade, cx);
+        });
+    }
+
+    /// Asks `machine`'s daemon now for the upgrade it waits to run, as
+    /// after rho was updated under it.
+    fn ask_upgrade(&self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        let Some(daemon) = self.daemon(machine).cloned() else {
+            return;
+        };
+        let machine = machine.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(upgrade) = daemon.pending_upgrade().await {
+                let _ = this.update(cx, |this, cx| this.set_upgrade(&machine, upgrade, cx));
+            }
+        })
+        .detach();
     }
 
     /// `machine`'s daemon refused to list its jobs, because of `error`. The
@@ -652,13 +777,50 @@ impl RhoApp {
     /// Opens Settings over the window, with rho's own settings on each
     /// machine.
     fn open_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        settings_view::open(&self.machines, &self.rho_settings, window, cx);
+        settings_view::open(
+            &self.machines,
+            &self.rho_settings,
+            &self.installs,
+            window,
+            cx,
+        );
+    }
+
+    /// Notes that `machine`'s daemon may restart in place, so its
+    /// connection's end is answered by connecting again; see
+    /// [`Self::disconnected`]. The next connection starts without it.
+    fn expect_restart(&mut self, machine: &MachineId) {
+        if let Some(connection) = self.connection_mut(machine) {
+            connection.restarting = true;
+        }
+    }
+
+    /// Restarts `machine`'s daemon now, into the newer rho it waits to
+    /// run. It detaches every session as restarting, so the connection
+    /// comes back on its own (see [`Self::disconnected`]).
+    fn restart_daemon(&self, machine: &MachineId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(daemon) = self.daemon(machine).cloned() else {
+            return;
+        };
+        let label = self.machines.read(cx).label(machine);
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = daemon.restart().await {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(
+                        Notification::error(error.to_string())
+                            .title(format!("Couldn't restart Rho on {label}")),
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
     }
 
     /// `machine`'s connection `epoch` ended. After the daemon said it was
-    /// restarting, that is expected, and answered by connecting again: the
-    /// daemon restarts in place on the same socket, and the handshake waits
-    /// until it answers.
+    /// restarting, or while rho was updated under it, that is expected,
+    /// and answered by connecting again: the daemon restarts in place on
+    /// the same socket, and the handshake waits until it answers.
     fn disconnected(
         &mut self,
         machine: &MachineId,
@@ -673,11 +835,79 @@ impl RhoApp {
             .connection(machine)
             .is_some_and(|connection| connection.restarting);
         if restarting {
+            let resume = self.resume(machine, cx);
+            if let Some(connection) = self.connection_mut(machine) {
+                connection.resume = Some(resume);
+            }
             self.connect(machine, window, cx);
         } else {
             self.forget_sessions(machine, window, cx);
             self.failed(machine, &DaemonError::Closed, window, cx);
         }
+    }
+
+    /// What `machine`'s daemon, about to restart, leaves to follow again:
+    /// the session on screen, and the others opened here whose work was
+    /// under way. Other clients' sessions are theirs to follow again.
+    fn resume(&self, machine: &MachineId, cx: &App) -> Resume {
+        let shown = match &self.pane {
+            Pane::Session(view) => {
+                let view = view.read(cx);
+                let live = view.live();
+                (live.id.machine == *machine && !view.is_subagent()).then_some(Shown {
+                    id: live.id,
+                    cwd: live.cwd,
+                    title: live.title,
+                })
+            }
+            Pane::Draft(_) | Pane::Empty => None,
+        };
+        let jobs = self
+            .connection(machine)
+            .map_or(&[][..], |connection| connection.jobs.as_slice());
+        let working = self
+            .sessions
+            .iter()
+            .filter(|open| open.id.machine == *machine && !open.view.read(cx).is_subagent())
+            .map(|open| open.id.id.clone())
+            .filter(|id| jobs.iter().any(|job| job.session() == id))
+            .filter(|id| shown.as_ref().is_none_or(|shown| shown.id.id != *id))
+            .collect();
+        Resume { shown, working }
+    }
+
+    /// Follows again what `machine`'s daemon left as it restarted: shows
+    /// the session that was on screen, and attaches to the others with
+    /// work under way just long enough for the daemon to carry it on.
+    fn follow_again(
+        &mut self,
+        machine: &MachineId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(Resume { shown, working }) = self
+            .connection_mut(machine)
+            .and_then(|connection| connection.resume.take())
+        else {
+            return;
+        };
+        // `connect` emptied the pane of this machine's session; one the
+        // user opened since stays.
+        if let Some(Shown { id, cwd, title }) = shown {
+            if matches!(self.pane, Pane::Empty) {
+                self.open_session(id, cwd, title, window, cx);
+            }
+        }
+        let Some(daemon) = self.daemon(machine).cloned() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            for id in working {
+                // One gone or failing is no reason to skip the rest.
+                let _ = daemon.resume(&id).await;
+            }
+        })
+        .detach();
     }
 
     /// Reads session `id` afresh after the daemon stopped sending its
@@ -1488,6 +1718,28 @@ impl RhoApp {
     }
 
     /// The main pane when no session is open.
+    /// The main pane: the session or draft on screen, else the empty one,
+    /// or while this machine has no rho, the offer to install it.
+    fn render_main(&self, style: StyleRefinement, cx: &mut Context<'_, Self>) -> AnyElement {
+        let setup = self
+            .installs
+            .read(cx)
+            .offer(&MachineId::local(), cx)
+            .filter(Offer::replaces_connection_error);
+        let on_this_machine = match &self.pane {
+            Pane::Empty => true,
+            Pane::Draft(view) => view.read(cx).request().0.machine.is_local(),
+            Pane::Session(_) => false,
+        };
+        match (&self.pane, setup) {
+            // This machine has no rho, so nothing here can work yet.
+            (_, Some(offer)) if on_this_machine => render_setup(&self.installs, &offer, cx),
+            (Pane::Session(view), _) => view.clone().cached(style).into_any_element(),
+            (Pane::Draft(view), _) => view.clone().cached(style).into_any_element(),
+            (Pane::Empty, _) => Self::render_no_session(cx).into_any_element(),
+        }
+    }
+
     fn render_no_session(cx: &mut Context<'_, Self>) -> impl IntoElement {
         Empty::new()
             .h_full()
@@ -1524,6 +1776,10 @@ impl RhoApp {
             Pane::Draft(view) => Some(view.clone()),
             Pane::Empty | Pane::Session(_) => None,
         }
+    }
+    /// What the views offer for `machine`'s rho, for UI tests.
+    pub(crate) fn rho_offer(&self, machine: &MachineId, cx: &App) -> Option<Offer> {
+        self.installs.read(cx).offer(machine, cx)
     }
     /// The user's projects, for UI tests.
     pub(crate) fn projects<'a>(&self, cx: &'a App) -> &'a [Place] {
@@ -1594,11 +1850,7 @@ impl Render for RhoApp {
         let sidebar_width = self.sidebar.read(cx).width();
         let rem = f32::from(window.rem_size());
         let row = f32::from(window.viewport_size().width) / rem;
-        let main = match &self.pane {
-            Pane::Session(view) => view.clone().cached(pane_style()).into_any_element(),
-            Pane::Draft(view) => view.clone().cached(pane_style()).into_any_element(),
-            Pane::Empty => Self::render_no_session(cx).into_any_element(),
-        };
+        let main = self.render_main(pane_style(), cx);
         root.child(
             h_flex()
                 .size_full()

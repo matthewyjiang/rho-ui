@@ -64,9 +64,19 @@ After rho-ui's own pages comes rho's: one page with a group for each category of
 
 Every machine's rho has its own `config.toml`. With remote machines, a Machine picker heads rho's page, set to this machine when Settings opens; picking another shows that machine's settings. A machine that is connecting or can't be reached says so in place of its settings.
 
-Last comes About: rho-ui's version, a link to its source and its license, then the version of Rho on each machine, or that it is connecting or can't be reached.
+Last comes About: rho-ui's version, a link to its source and its license, then the version of Rho on each machine, or that it is connecting or can't be reached, with what that machine's rho needs under it, as the sidebar offers it (see [Installing and updating rho](#installing-and-updating-rho)).
 
 rho-ui's own settings stay in its own file, not in rho's: the theme, scale and fonts must apply before the first frame, before any daemon answers, and the machines list is how rho-ui finds the remote daemons in the first place.
+
+## Installing and updating rho
+
+rho-ui checks each machine's rho when it connects to it, or fails to, by running `rho update --check --json` there, over ssh for a remote machine. A check that found rho is good for an hour, since each one asks GitHub, which allows 60 requests an hour from one address without a login. A `rho` given as plain `rho` that isn't on `PATH` falls back to `~/.local/bin/rho`, where rho's install script puts it, since a desktop session's or an ssh command's `PATH` often lacks that folder.
+
+- No rho on this machine, and so no daemon to connect to: the main pane offers Install Rho in place of the connection's error, which runs rho's install script (`https://matthewyjiang.github.io/rho/install.sh`) into `~/.local/bin`, or into the folder of a `--rho` path, then connects. A remote machine without rho gets the same offer at the bottom of the sidebar, into the folder of its rho path in Settings. A machine whose daemon answers has rho, wherever the check looked, so it is never offered an install.
+- A newer release: the sidebar's footer says so with Update, which runs `rho update`, so rho installs it the way it was installed. When that needs a terminal, as pacman's `sudo` does, the footer shows the command to copy instead.
+- After an update, the daemon still runs the old rho until nothing would be cut short. While it waits on work, the footer says how many things it waits for, with Restart now. rho-ui asks the daemon about a waiting upgrade when its jobs change, at once after it updates rho, and otherwise every 30 seconds, since the daemon's status reads its credential store each time. That restarts the daemon at once, stopping its background processes. Once it is back, rho-ui opens the session that was on screen again and attaches for a moment to every other session it had open with work under way: rho carries on a turn the restart cut short when a client that takes turns the daemon starts attaches to its session again. Sessions other clients follow, such as rho's terminal UI, are theirs to carry on.
+
+A rho from before `rho update --check` can't say whether a newer one is out, so rho-ui offers nothing for it; update it once with `rho update`.
 
 ## Machines
 

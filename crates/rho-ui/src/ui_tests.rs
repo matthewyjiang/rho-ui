@@ -24,17 +24,20 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     agent_settings::SettingValue,
-    fake_daemon::{subagent_result, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION},
+    fake_daemon::{
+        subagent_result, write_program, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION,
+    },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
-    Delay, Entry, RetryReason, RunState, Session, SessionId, ToolStatus,
+    Delay, Entry, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
 };
 
 use gpui_kit::component::ActiveTheme as _;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
-    machines::{MachineId, Place, RemoteMachine, SessionKey},
+    machines::{MachineId, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
+    rho_install::Offer,
     right_panel::{Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, UiScale},
     shelf::Shelves,
@@ -117,6 +120,29 @@ static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
     path
 });
 
+/// Writes a `rho` at `path` that answers as rho 3.1.0, with 3.2.0 out:
+/// `update --check --json` says whether an update is available with the
+/// `sh` expression `available`, and `update` creates `updated` beside it.
+fn write_fake_rho(path: &Path, available: &str) {
+    let script = format!(
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+case $1 in
+  --version) echo "rho 3.1.0" ;;
+  update)
+    if [ "$2" = --check ]; then
+      if {available}; then a=true; else a=false; fi
+      printf '{{"current":"3.1.0","latest":"3.2.0","update_available":%s,"method":"script","command":"rho update","needs_terminal":false}}
+' "$a"
+    else
+      touch "$dir/updated"
+    fi ;;
+esac
+"#
+    );
+    write_program(path, &script);
+}
+
 /// One app window and its context.
 struct Harness {
     cx: HeadlessAppContext,
@@ -152,9 +178,7 @@ impl Harness {
         let machines = Machines {
             shelves,
             projects,
-            settings: Settings::default(),
-            remote_sockets: Vec::new(),
-            workspace: None,
+            ..Machines::default()
         };
         Self::open_on(name, target, daemon, machines, state)
     }
@@ -186,9 +210,7 @@ impl Harness {
             Machines {
                 shelves,
                 projects,
-                settings: Settings::default(),
-                remote_sockets: Vec::new(),
-                workspace: None,
+                ..Machines::default()
             },
         )
     }
@@ -218,7 +240,9 @@ impl Harness {
             settings,
             remote_sockets,
             workspace,
+            rho,
         } = machines;
+        let rho = rho.map(|rho| RhoInstall::Here { rho });
         let mut cx = HeadlessAppContext::with_platform(
             text_system(),
             Arc::new(crate::Assets),
@@ -233,7 +257,10 @@ impl Harness {
         // without one gets a socket that isn't there.
         let launch = LaunchConfig {
             workspace: workspace.unwrap_or_else(std::env::temp_dir),
-            daemon: target.clone(),
+            local: Reach {
+                daemon: target.clone(),
+                rho: rho.clone(),
+            },
             remote: Rc::new(move |remote: &RemoteMachine| {
                 let socket = remote_sockets
                     .iter()
@@ -242,7 +269,10 @@ impl Harness {
                         || PathBuf::from("/nonexistent/rho.sock"),
                         |(_, socket)| socket.clone(),
                     );
-                DaemonTarget::Socket(socket)
+                Reach {
+                    daemon: DaemonTarget::Socket(socket),
+                    rho: rho.clone(),
+                }
             }),
             // Not the user's shell, whose files may print or ask things.
             shell: TerminalShell(TEST_SHELL.clone()),
@@ -652,6 +682,7 @@ impl Harness {
 }
 
 /// What [`Harness::open_with`] opens the app with besides its daemon.
+#[derive(Default)]
 struct Machines {
     shelves: Shelves,
     projects: Projects,
@@ -661,6 +692,10 @@ struct Machines {
     /// Where new sessions start on this machine; the temporary directory
     /// when `None`.
     workspace: Option<PathBuf>,
+    /// The `rho` every machine runs to check for updates, install or
+    /// update; with `None`, rho-ui leaves rho alone, as for any daemon
+    /// reached at a socket.
+    rho: Option<PathBuf>,
 }
 
 /// How [`Harness::send_from_elsewhere`] sends its message.
@@ -833,15 +868,17 @@ fn a_retried_response_replaces_the_discarded_one_and_the_plan_shows() {
             })
         )
     });
+    // The session's state can land after the frame drawn before it.
+    ui.wait_until("the header and the todo", |window, _, _| {
+        let label = |id| {
+            window
+                .try_find(id)
+                .and_then(|found| found.label().map(str::to_owned))
+        };
+        label("worked-0").is_some_and(|header| header.contains(" · rate limited, retrying in "))
+            && label("plan").as_deref() == Some("Todo 1 of 3")
+    });
     ui.act(|window, _| {
-        let header = window.find("worked-0").label().map(str::to_owned);
-        assert!(
-            header
-                .as_deref()
-                .is_some_and(|header| header.contains(" · rate limited, retrying in ")),
-            "the header says why the turn waits: {header:?}"
-        );
-        assert_eq!(window.find("plan").label(), Some("Todo 1 of 3"));
         assert!(!is_visible(window, "plan-0"), "the todo starts folded");
     });
     ui.shot("todo-folded");
@@ -864,8 +901,8 @@ fn a_retried_response_replaces_the_discarded_one_and_the_plan_shows() {
         session.state() == &RunState::Idle && session.delay().is_none()
     });
     assert_eq!(last_reply(&mut ui), "The whole answer");
-    ui.act(|window, _| {
-        assert!(!is_visible(window, "plan"), "every step is done");
+    ui.wait_until("the todo gone, every step done", |window, _, _| {
+        !is_visible(window, "plan")
     });
     ui.shot("answered");
 }
@@ -2190,24 +2227,98 @@ fn a_wheel_notch_glides() {
     );
 }
 
-/// A missing rho program leaves a clear error with a way to retry.
+/// With no rho on this machine, the main pane offers to install it in
+/// place of the connection's error, whose Retry couldn't help.
 #[test]
-fn a_missing_rho_shows_an_error_and_retry() {
+fn a_missing_rho_offers_its_install() {
     let target = DaemonTarget::Home {
         home: PathBuf::from("/nonexistent/rho-home"),
         rho: PathBuf::from("/nonexistent/rho"),
     };
-    let mut ui = Harness::open(
-        "missing",
-        target,
-        None,
-        Shelves::default(),
-        Projects::default(),
-    );
-    ui.wait_until("the retry button", |window, _, _| {
-        is_visible(window, "retry-local")
+    let machines = Machines {
+        rho: Some(PathBuf::from("/nonexistent/rho")),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_with("missing", target, None, machines);
+    ui.wait_until("the install offer", |window, cx, app| {
+        is_visible(window, "setup-install-rho")
+            && app.rho_offer(&MachineId::local(), cx) == Some(Offer::Install)
     });
-    ui.shot("error");
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "retry-local"),
+            "the install offer stands in for the connection's error"
+        );
+    });
+    ui.shot("install");
+}
+
+/// An update found by the check installs from the sidebar, and once the
+/// daemon finds the new program waiting on work, Restart now restarts it.
+/// rho-ui follows the session on screen again, and attaches once to the
+/// others it opened with work under way, so the daemon carries on their
+/// turns; other clients' sessions are left to them.
+#[test]
+fn an_update_installs_then_restarts_the_daemon_on_request() {
+    let dir = tempfile::tempdir().expect("a folder for the fake rho");
+    let rho = dir.path().join("rho");
+    write_fake_rho(&rho, r#"[ ! -e "$dir/updated" ]"#);
+    let script = Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    };
+    let daemon = FakeDaemon::start(script);
+    let machines = Machines {
+        shelves: Shelves::owning(["s1", "old"]),
+        rho: Some(rho),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_with("update", daemon.target(), Some(daemon), machines);
+    ui.wait_until("the update offer", |window, _, _| {
+        is_visible(window, "update-rho-local")
+    });
+    ui.shot("offered");
+
+    ui.click("update-rho-local");
+    ui.wait_until(
+        "the update installed and checked again",
+        |window, cx, app| {
+            app.rho_offer(&MachineId::local(), cx).is_none()
+                && !is_visible(window, "update-rho-local")
+        },
+    );
+    assert!(dir.path().join("updated").exists(), "rho update ran");
+
+    ui.wait_until("the job started elsewhere", |window, _, _| {
+        is_visible(window, "session-local-tui-1")
+    });
+    ui.click("session-local-tui-1");
+    ui.wait_for_daemon("tui-1 attached", |daemon| daemon.attaches(TUI_SESSION) == 1);
+    ui.click("session-local-s1");
+    ui.wait_for_daemon("s1 attached", |daemon| daemon.attaches("s1") == 1);
+    ui.fake().replace_program("3.2.0", 2);
+    // Its status is asked now and then, on the app's clock.
+    ui.cx.advance_clock(Duration::from_secs(31));
+    ui.wait_until("the restart offer", |window, _, _| {
+        is_visible(window, "restart-rho-local")
+    });
+    ui.shot("waiting");
+
+    ui.click("restart-rho-local");
+    ui.wait_for_daemon("the restart", |daemon| daemon.restarts() == 1);
+    ui.cx.advance_clock(Duration::from_secs(2));
+    ui.wait_until(
+        "the restarted daemon waits on nothing",
+        |window, cx, app| {
+            app.rho_offer(&MachineId::local(), cx).is_none()
+                && !is_visible(window, "restart-rho-local")
+        },
+    );
+    ui.wait_for_daemon("the sessions followed again", |daemon| {
+        daemon.attaches("s1") == 2 && daemon.attaches(TUI_SESSION) == 2
+    });
+    assert_eq!(ui.session().id().as_str(), "s1", "s1 is back on screen");
+    ui.shot("restarted");
 }
 
 /// A turn rho's terminal UI started shows in the sidebar as running, though
@@ -2542,10 +2653,8 @@ fn pictures_show_in_place_and_open_in_the_lightbox() {
         Some(daemon),
         Machines {
             shelves: Shelves::owning(["s1", "old"]),
-            projects: Projects::default(),
-            settings: Settings::default(),
-            remote_sockets: Vec::new(),
             workspace: Some(folder),
+            ..Machines::default()
         },
     );
     ui.wait_until("saved sessions", |window, _, _| {
@@ -2912,10 +3021,8 @@ fn the_diff_surface_follows_the_sessions_changes() {
         Some(daemon),
         Machines {
             shelves: Shelves::owning(["s1"]),
-            projects: Projects::default(),
-            settings: Settings::default(),
-            remote_sockets: Vec::new(),
             workspace: Some(repo.clone()),
+            ..Machines::default()
         },
     );
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
@@ -2961,10 +3068,8 @@ fn the_files_surface_opens_the_sessions_files() {
         Some(daemon),
         Machines {
             shelves: Shelves::owning(["s1"]),
-            projects: Projects::default(),
-            settings: Settings::default(),
-            remote_sockets: Vec::new(),
             workspace: Some(repo.clone()),
+            ..Machines::default()
         },
     );
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
@@ -4362,11 +4467,9 @@ fn a_typed_git_url_clones_into_the_clone_folder() {
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: Shelves::default(),
             projects: Projects::of(["/w/a"]),
             settings,
-            remote_sockets: Vec::new(),
-            workspace: None,
+            ..Machines::default()
         },
     );
     ui.wait_until("the sidebar", |window, _, _| {
@@ -4690,7 +4793,7 @@ fn machines_list_side_by_side() {
                 ("workstation".to_owned(), remote_socket),
                 ("gone".to_owned(), PathBuf::from("/nonexistent/rho.sock")),
             ],
-            workspace: None,
+            ..Machines::default()
         },
     );
     ui.wait_until("both machines' sessions, and Retry", |window, _, _| {
@@ -4867,10 +4970,8 @@ fn a_machine_added_in_settings_lists_its_sessions() {
         Some(local),
         Machines {
             shelves,
-            projects: Projects::default(),
-            settings: Settings::default(),
             remote_sockets: vec![("box".to_owned(), remote_socket)],
-            workspace: None,
+            ..Machines::default()
         },
     );
     ui.wait_until("this machine's sessions", |window, _, _| {

@@ -6393,6 +6393,7 @@ dependencies = [
  "regex",
  "rho-protocol",
  "rho-ui-core",
+ "serde",
  "serde_json",
  "similar",
  "smol",

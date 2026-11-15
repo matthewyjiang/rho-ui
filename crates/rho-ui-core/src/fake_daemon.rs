@@ -61,6 +61,12 @@
 //!   writes: "r0", "r1", ... A write against an older revision is refused
 //!   as a conflict, unless only its own writer wrote since.
 //!   [`FakeDaemon::edit_agent_setting`] changes one as a hand edit does.
+//! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
+//!   set, if any. `rho/daemon/restart` restarts in place, as rho does: it
+//!   counts ([`FakeDaemon::restarts`]), drops the upgrade, as the restarted
+//!   daemon runs the new program, detaches every attached session as
+//!   restarting, and closes every connection; new ones are served as
+//!   before. [`FakeDaemon::attaches`] counts each session's attaches.
 
 use std::{
     collections::BTreeMap,
@@ -76,7 +82,7 @@ use rho_protocol::{
     },
     methods::{
         BackgroundItem, BackgroundStatus, BackgroundWork, FastModeOptions, JobState, MessageId,
-        ModelChoice, ModelOptions, ModelRef, PermissionModeOptions, ReasoningLevel,
+        ModelChoice, ModelOptions, ModelRef, PendingUpgrade, PermissionModeOptions, ReasoningLevel,
         ReasoningOptions, Replay, Seq, SessionCommand, SessionId, SessionOptions, SteerId,
         StreamId, ToolCallId, ToolCallUpdate, TurnId,
     },
@@ -256,6 +262,7 @@ impl FakeDaemon {
         };
         let service = Arc::new(Fake {
             state: Mutex::new(State::new(script)),
+            restarted: tokio::sync::watch::Sender::new(0),
         });
         let serving = Arc::clone(&service);
         runtime.spawn(async move {
@@ -267,9 +274,12 @@ impl FakeDaemon {
             while let Ok((stream, _)) = listener.accept().await {
                 let (service, info) = (Arc::clone(&serving), info.clone());
                 tokio::spawn(async move {
-                    // Runs until the client leaves; the fake never stops
-                    // a connection itself.
-                    let _ = serve_connection(stream, &info, service, std::future::pending()).await;
+                    // Runs until the client leaves, or the daemon restarts.
+                    let mut restarted = service.restarted.subscribe();
+                    let restart = async move {
+                        let _ = restarted.changed().await;
+                    };
+                    let _ = serve_connection(stream, &info, service, restart).await;
                 });
             }
         });
@@ -302,6 +312,29 @@ impl FakeDaemon {
     /// How many open requests clients have held ([`rho_protocol::SESSION_HOLD`]).
     pub fn holds(&self) -> usize {
         self.service.lock().holds
+    }
+
+    /// Has the daemon find rho `version` installed over its program,
+    /// waiting for `waiting_for` things to end before it upgrades.
+    pub fn replace_program(&self, version: &str, waiting_for: u64) {
+        self.service.lock().upgrade = Some(PendingUpgrade {
+            version: version.to_owned(),
+            waiting_for,
+        });
+    }
+
+    /// How many times a client asked the daemon to restart.
+    pub fn restarts(&self) -> usize {
+        *self.service.restarted.borrow()
+    }
+
+    /// How many times clients attached to session `id`.
+    pub fn attaches(&self, id: &str) -> usize {
+        self.service
+            .lock()
+            .sessions
+            .get(id)
+            .map_or(0, |session| session.attaches)
     }
 
     /// The title session `id` has saved, if it has one.
@@ -561,6 +594,8 @@ struct FakeSession {
     /// Every event so far, which an attach replays.
     history: Vec<SessionEvent>,
     publishers: Vec<Publisher>,
+    /// How many times clients attached to it.
+    attaches: usize,
     live_seq: u64,
     /// Background work, as the last background event listed it.
     background: Vec<BackgroundWork>,
@@ -583,6 +618,7 @@ impl FakeSession {
             turn: None,
             history: Vec::new(),
             publishers: Vec::new(),
+            attaches: 0,
             live_seq: 0,
             background: Vec::new(),
             refused_busy: false,
@@ -1085,6 +1121,8 @@ struct State {
     worktrees: usize,
     /// How many requests clients held.
     holds: usize,
+    /// The upgrade `rho/daemon/status` reports.
+    upgrade: Option<PendingUpgrade>,
     /// The environment the latest `rho/session/new` carried.
     new_session_environment: Option<ClientEnvironment>,
     turns: u64,
@@ -1126,6 +1164,7 @@ impl State {
             new_sessions: 0,
             worktrees: 0,
             holds: 0,
+            upgrade: None,
             new_session_environment: None,
             turns: 0,
             steers: 0,

@@ -7,7 +7,7 @@
 use std::{fmt, path::PathBuf};
 
 use gpui_kit::SharedString;
-use rho_ui_core::{DaemonTarget, SessionId, SshTarget};
+use rho_ui_core::{DaemonTarget, RhoInstall, SessionId, SshTarget};
 
 /// Names a machine in the settings and the state database: [`LOCAL`] for
 /// this one, else the SSH host a remote machine is reached at.
@@ -59,6 +59,9 @@ pub(crate) struct Machine {
     /// What the sidebar calls it, as set in the settings.
     pub(crate) label: SharedString,
     pub(crate) target: DaemonTarget,
+    /// Its `rho` program, to check for updates, install or update; `None`
+    /// for a daemon reached at a socket alone, whose rho isn't rho-ui's.
+    pub(crate) rho: Option<RhoInstall>,
     /// Where projects are cloned on it, as set in the settings: absolute,
     /// or from its home directory. Empty means `$RHO_HOME/projects`, as
     /// that machine sees it; see [`crate::cloning`].
@@ -122,10 +125,23 @@ pub(crate) fn host_problem(host: &str) -> Option<&'static str> {
     }
 }
 
+/// How rho-ui reaches a machine: its daemon, and its `rho` program apart
+/// from the daemon.
+#[derive(Clone, Debug)]
+pub(crate) struct Reach {
+    pub(crate) daemon: DaemonTarget,
+    /// See [`Machine::rho`].
+    pub(crate) rho: Option<RhoInstall>,
+}
+
 impl RemoteMachine {
     /// How rho-ui reaches it: over ssh.
-    pub(crate) fn ssh_target(&self) -> DaemonTarget {
-        DaemonTarget::Ssh(SshTarget::new(self.host.clone()).with_rho(self.rho.clone()))
+    pub(crate) fn ssh_reach(&self) -> Reach {
+        let target = SshTarget::new(self.host.clone()).with_rho(self.rho.clone());
+        Reach {
+            daemon: DaemonTarget::Ssh(target.clone()),
+            rho: Some(RhoInstall::Ssh(target)),
+        }
     }
 }
 
@@ -385,10 +401,12 @@ mod tests {
         let remote = RemoteMachine::new("workstation");
         let id = remote.id();
         let mut machines = Machines::default();
+        let reach = remote.ssh_reach();
         machines.set(vec![Machine {
             id: id.clone(),
             label: "workstation".into(),
-            target: remote.ssh_target(),
+            target: reach.daemon,
+            rho: reach.rho,
             clone_folder: SharedString::default(),
         }]);
         let ready = || MachineStatus::Ready {

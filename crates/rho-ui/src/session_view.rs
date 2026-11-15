@@ -435,8 +435,10 @@ impl SessionView {
         let asked = !self.session.inputs().is_empty();
         match result {
             Ok(attached) => {
+                // A turn this client began meanwhile is already timed.
                 self.turn_began = attached
                     .turn_elapsed()
+                    .filter(|_| self.busy_since.is_none())
                     .and_then(|elapsed| Instant::now().checked_sub(elapsed));
                 self.session.attached(attached);
                 self.loading = Loading::Ready;
@@ -563,6 +565,15 @@ impl SessionView {
     ) {
         self.sending = true;
         self.error = None;
+        // A new session's attach may still be on its way, as when the first
+        // message goes at once; `after_change` then takes the state for
+        // history. The turn this prompt starts is the next one all the
+        // same: its echo can't come before it is sent.
+        if self.session.is_replaying() && self.busy_since.is_none() {
+            let now = Instant::now();
+            self.busy_since = Some(now);
+            self.transcript.expect_turn(now);
+        }
         self.after_change(window, cx);
 
         let daemon = self.daemon.clone();

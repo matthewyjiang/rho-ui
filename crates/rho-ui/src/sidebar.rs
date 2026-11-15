@@ -61,6 +61,7 @@ use crate::{
     badge::Badge,
     machines::{MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
+    rho_install::{render_offer, Installs},
     session_list::{
         Activity, DraftRow, Item, JobSession, LiveSession, Row, SavedSession, SessionList,
         SHELF_PAGE,
@@ -298,6 +299,8 @@ pub(crate) struct SidebarView {
     list: SessionList,
     workspaces: Entity<Workspaces>,
     machines: Entity<Machines>,
+    /// Each machine's rho, which the footer offers to install or update.
+    installs: Entity<Installs>,
     projects: Entity<Projects>,
     shelves: Shelves,
     layout: SidebarLayout,
@@ -314,18 +317,20 @@ pub(crate) struct SidebarView {
     /// The list's height in the last frame, which the gap above the
     /// shelves fills up to.
     viewport: Pixels,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 5],
     _tick: Task<()>,
 }
 
 impl EventEmitter<SidebarEvent> for SidebarView {}
 
 impl SidebarView {
-    /// The sidebar over `workspaces`, labelling rows from `machines` and
-    /// offering `projects` to filter by, as `state` last left it.
+    /// The sidebar over `workspaces`, labelling rows from `machines`,
+    /// offering what `installs` says each machine's rho needs, and
+    /// `projects` to filter by, as `state` last left it.
     pub(crate) fn new(
         workspaces: Entity<Workspaces>,
         machines: Entity<Machines>,
+        installs: Entity<Installs>,
         projects: Entity<Projects>,
         state: SidebarState,
         window: &mut Window,
@@ -349,6 +354,7 @@ impl SidebarView {
                 this.prune_filter(|filter| filter.keep_projects(&roots));
                 this.rebuild(cx);
             }),
+            cx.observe(&installs, |_, _, cx| cx.notify()),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -362,6 +368,7 @@ impl SidebarView {
             list,
             workspaces,
             machines,
+            installs,
             projects,
             shelves: state.shelves,
             layout: state.layout,
@@ -1280,9 +1287,32 @@ impl SidebarView {
             .into_any_element()
     }
 
+    /// What each machine's rho needs: installing, updating, or a restart
+    /// into the newer one its daemon waits to run. Without a session on
+    /// screen, the main pane offers this machine's install itself.
+    fn render_offers(&self, cx: &App) -> Vec<AnyElement> {
+        let machines = self.machines.read(cx);
+        let installs = self.installs.read(cx);
+        machines
+            .iter()
+            .filter_map(|machine| {
+                let offer = installs.offer(&machine.id, cx)?;
+                if machine.id.is_local()
+                    && self.active.is_none()
+                    && offer.replaces_connection_error()
+                {
+                    return None;
+                }
+                let tag = machines.tag(&machine.id);
+                let offer = render_offer(&self.installs, &machine.id, tag.as_deref(), &offer, cx);
+                Some(div().px_3().child(offer).into_any_element())
+            })
+            .collect()
+    }
+
     /// What isn't right with each machine, then why any remote machine's
-    /// repositories couldn't be read, then Settings and the local rho's
-    /// version.
+    /// repositories couldn't be read, then what each rho needs, then
+    /// Settings and the local rho's version.
     fn render_footer(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -1291,6 +1321,8 @@ impl SidebarView {
             Some(MachineStatus::Ready { version }) => Some(version.clone()),
             _ => None,
         };
+        let installs = self.installs.read(cx);
+        let offers = self.render_offers(cx);
         let mut troubles: Vec<AnyElement> = Vec::new();
         for (machine, status, refused) in machines.troubles() {
             let label = machines.label(machine);
@@ -1306,6 +1338,10 @@ impl SidebarView {
             }
             match status {
                 MachineStatus::Ready { .. } => {}
+                // Without rho there is nothing to reach: its offer says so.
+                _ if installs
+                    .offer(machine, cx)
+                    .is_some_and(|offer| offer.replaces_connection_error()) => {}
                 MachineStatus::Connecting => troubles.push(
                     h_flex()
                         .px_3()
@@ -1366,6 +1402,7 @@ impl SidebarView {
             .py_2()
             .gap_1()
             .children(troubles)
+            .children(offers)
             .child(
                 // The toggle's inset, so Settings stays put in the rail.
                 h_flex().px_3().gap_2().child(settings_button(cx)).children(

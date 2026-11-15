@@ -27,6 +27,7 @@ use gpui_kit::{
 
 use crate::{
     machines::Machines,
+    rho_install::Installs,
     rho_settings::RhoSettings,
     settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
 };
@@ -55,19 +56,22 @@ const CLOSE_ROOM_REMS: f32 = 3.;
 /// Opens settings in a dialog, unless a dialog is already open. The dialog
 /// owns the view: Escape, its close button, or a click outside drops it, and
 /// the keyboard goes back where it was. The dialog has no title or padding:
-/// the panel fills it, and the page title heads it. `machines` and
-/// `rho_settings` are the app's, for rho's own settings on each machine.
+/// the panel fills it, and the page title heads it. `machines`,
+/// `rho_settings` and `installs` are the app's, for rho's own settings on
+/// each machine and About's versions.
 pub(crate) fn open(
     machines: &Entity<Machines>,
     rho_settings: &Entity<RhoSettings>,
+    installs: &Entity<Installs>,
     window: &mut Window,
     cx: &mut App,
 ) {
     if window.has_active_dialog(cx) {
         return;
     }
-    let (machines, rho_settings) = (machines.clone(), rho_settings.clone());
-    let view = cx.new(|cx| SettingsView::new(machines, rho_settings, window, cx));
+    let (machines, rho_settings, installs) =
+        (machines.clone(), rho_settings.clone(), installs.clone());
+    let view = cx.new(|cx| SettingsView::new(machines, rho_settings, installs, window, cx));
     window.open_dialog(cx, move |dialog, window, _| {
         let view = view.clone();
         dialog
@@ -154,16 +158,20 @@ struct SettingsView {
     code_font: FontSelect,
     machines: MachineFields,
     rho: RhoFields,
-    _subscriptions: [Subscription; 2],
+    /// Each machine's rho, for About.
+    installs: Entity<Installs>,
+    _subscriptions: [Subscription; 3],
 }
 
 impl SettingsView {
     fn new(
         machines: Entity<Machines>,
         rho_settings: Entity<RhoSettings>,
+        installs: Entity<Installs>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        let installs_subscription = cx.observe(&installs, |_, _, cx| cx.notify());
         let fonts: Vec<Choice> = cx
             .text_system()
             .all_font_names()
@@ -180,7 +188,8 @@ impl SettingsView {
             code_font,
             machines: MachineFields::new(window, cx),
             rho: RhoFields::new(machines, rho_settings, window, cx),
-            _subscriptions: [ui_subscription, code_subscription],
+            installs,
+            _subscriptions: [ui_subscription, code_subscription, installs_subscription],
         };
         view.sync_machine_fields(window, cx);
         view.sync_rho_inputs(window, cx);
@@ -347,7 +356,7 @@ impl Render for SettingsView {
             );
         let machines = self.machines_page(cx);
         let rho = self.rho_page(window, cx);
-        let about = about::about_page(self.rho.machines.read(cx));
+        let about = about::about_page(&self.rho.machines, &self.installs, cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
         // corners, since the dialog has no padding to keep it inside.

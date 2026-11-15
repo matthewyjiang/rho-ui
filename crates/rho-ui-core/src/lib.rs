@@ -11,6 +11,7 @@ mod input;
 mod options;
 pub mod platform;
 mod prompt;
+mod rho_install;
 mod session;
 mod ssh;
 mod timeline;
@@ -21,7 +22,7 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached, Job,
-    JobActivity, SessionId, SessionSummary, Unsteered,
+    JobActivity, PendingUpgrade, SessionId, SessionSummary, Unsteered,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -35,6 +36,7 @@ pub use prompt::{
     check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
     ImageFormat, Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
 };
+pub use rho_install::{RhoCheck, RhoInstall, Update, INSTALL_DIR};
 pub use session::{
     Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,
     RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,

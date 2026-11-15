@@ -8,7 +8,7 @@ Sessions run in the rho daemon, so they keep running after you close the window,
 
 ## Requirements
 
-- rho 3 or later
+- rho 3 or later, which rho-ui offers to install on a machine without it
 - Linux or macOS (no Windows yet)
 - On Linux: Wayland or X11 with a working Vulkan driver, plus the system packages in GPUI Kit's [installation guide](https://gpui-kit.com/docs/installation/)
 
@@ -19,7 +19,7 @@ cargo run -p rho-ui -- [DIR] [--rho PROGRAM]
 ```
 
 - `DIR`: where new sessions start. Defaults to the current directory.
-- `PROGRAM`: the `rho` that starts the daemon if none runs. Defaults to `rho` on `PATH`.
+- `PROGRAM`: the `rho` that starts the daemon if none runs. Defaults to `rho` on `PATH`, else `~/.local/bin/rho`, where rho's install script puts it.
 
 The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 
