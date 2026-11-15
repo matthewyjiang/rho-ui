@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::functions::FunctionError;
-use crate::pointer::PointerError;
+use crate::pointer::{check_escapes, PointerError};
 use crate::template::{MAX_DEPTH, MAX_TEMPLATE_CHARS, MAX_TEMPLATE_PARTS};
 
 /// A dynamic value, parsed: a literal, a data binding or a function call.
@@ -228,7 +228,11 @@ fn unescape_key(key: &str) -> Result<String, ExpressionError> {
 
 fn parse_binding(map: &Map<String, Value>) -> Result<Expr, ExpressionError> {
     match map.get("@path") {
-        Some(Value::String(path)) if map.len() == 1 => Ok(Expr::Path(path.clone())),
+        Some(Value::String(path)) if map.len() == 1 => {
+            check_escapes(path)
+                .map_err(|_| ExpressionError::InvalidPathEscape { path: path.clone() })?;
+            Ok(Expr::Path(path.clone()))
+        }
         _ => Err(ExpressionError::MalformedBinding),
     }
 }

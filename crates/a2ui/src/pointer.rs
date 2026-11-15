@@ -28,6 +28,18 @@ pub enum PointerError {
         /// The decoded segment.
         segment: String,
     },
+    /// A `~` not followed by `0` or `1`.
+    #[error("invalid escape in path {path:?}: '~' must be followed by '0' or '1'")]
+    InvalidEscape {
+        /// The path as written.
+        path: String,
+    },
+    /// A path from the wire that is neither empty nor starts with `/`.
+    #[error("path {path:?} is not a JSON Pointer: it must start with '/'")]
+    NotAbsolute {
+        /// The path as written.
+        path: String,
+    },
 }
 
 impl Pointer {
@@ -56,6 +68,23 @@ impl Pointer {
             segments.push(segment);
         }
         Ok(Self { segments })
+    }
+
+    /// Parses a JSON Pointer as the wire writes one, in `updateDataModel`:
+    /// empty or starting with `/`, with every `~` escaping `0` or `1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PointerError::NotAbsolute`], [`PointerError::InvalidEscape`]
+    /// or, as [`Pointer::parse`] does, [`PointerError::ForbiddenSegment`].
+    pub fn from_wire(path: &str) -> Result<Self, PointerError> {
+        if !path.is_empty() && !path.starts_with('/') {
+            return Err(PointerError::NotAbsolute {
+                path: path.to_owned(),
+            });
+        }
+        check_escapes(path)?;
+        Self::parse(path)
     }
 
     /// The decoded segments, outermost first.
@@ -112,6 +141,20 @@ impl fmt::Display for Pointer {
         }
         Ok(())
     }
+}
+
+/// Checks that every `~` in `path` starts an RFC 6901 escape, `~0` or `~1`.
+pub(crate) fn check_escapes(path: &str) -> Result<(), PointerError> {
+    let mut rest = path;
+    while let Some(at) = rest.find('~') {
+        rest = &rest[at + 1..];
+        if !rest.starts_with(['0', '1']) {
+            return Err(PointerError::InvalidEscape {
+                path: path.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolves a data-binding path against the path of its scope.

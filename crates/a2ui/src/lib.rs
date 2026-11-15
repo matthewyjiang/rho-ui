@@ -16,6 +16,7 @@ mod data_model;
 mod expr;
 mod functions;
 mod ident;
+mod message;
 mod pointer;
 mod regex_dialect;
 mod schema;
@@ -32,6 +33,11 @@ pub use data_model::{DataError, DataModel, WatchId, MAX_LIST_INDEX};
 pub use expr::{Call, Expr, ExpressionError};
 pub use functions::{Args, Effect, Function, FunctionError, Functions};
 pub use ident::is_identifier;
+pub use message::{
+    parse_payload, ActionMessage, AgentMessage, CallRendererFunction, CreateSurface, ErrorCode,
+    ErrorMessage, ErrorTarget, FunctionFailure, FunctionResponse, Metadata, MetadataError,
+    RendererMessage, UpdateComponents, UpdateDataModel, WireComponent, PROTOCOL_VERSION,
+};
 pub use pointer::{resolve_path, Pointer, PointerError};
 pub use regex_dialect::RegexError;
 pub use schema::{agent_to_renderer, common_types};
