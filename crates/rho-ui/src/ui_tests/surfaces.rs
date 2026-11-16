@@ -91,8 +91,12 @@ fn a_form_sends_what_the_user_entered_and_stays_usable() {
     );
     // Kit's number input masks what it takes, so the text that is not
     // yet a number is a lone sign, in place of the "30" the form holds.
+    // Its text is centred, so the click lands mid-text: move to the end
+    // before deleting.
     ui.act(|window, cx| {
         window.click(timeout.clone(), cx);
+        window.press("right", cx);
+        window.press("right", cx);
         window.press("backspace", cx);
         window.press("backspace", cx);
         window.input("-", cx);
