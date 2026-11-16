@@ -22,34 +22,6 @@ Each tool call shows the card rho's terminal UI draws for it, which the daemon s
 
 A code block in a message or a notice names its language in its top corner, beside a button that copies its code in one click; the button shows a check for 2 seconds after.
 
-## Surfaces
-
-rho's `ui` tool shows you a form or a small panel, an [A2UI](https://a2ui.org) surface, and can wait for you to act on it. rho-ui draws the surface in the transcript, under the run of tool calls that holds its `ui` call. It stays there and stays usable after the call returns and after the turn's working folds. A later call that updates the surface moves it under that call, and a surface the agent deletes leaves the transcript. A session opened again, or attached again after it fell behind, draws its surfaces the same from the daemon's replay.
-
-Edits go to the surface's data model as you make them, so its checks update at once: a check that fails shows its message under the control, and a button whose own check fails is disabled, with the reason as its tooltip. Pressing a button whose action is an event sends it to the session, with what you entered, and returns the keyboard to the composer. A waiting `ui` call returns the action; otherwise the model reads it at its turn's next boundary, or in a turn rho starts for it. A button that opens a link opens it in your browser. If the session no longer has the surface, as it may not after its daemon was updated, the surface says so under itself and takes no more actions.
-
-Each component of the A2UI basic catalog has a form:
-
-| Component | Drawn as |
-| --- | --- |
-| `Text` | Markdown, as a reply's text is; a caption is small and muted |
-| `Row`, `Column`, `List` | Layout, placed as `justify` and `align` say. A row wraps when its children don't fit, and its inputs share its width. A row that says nothing lines its children up along its bottom edge, so a button sits level with the field beside it |
-| `Card` | A bordered panel, at most 36 rem wide |
-| `Button` | A button: filled for `primary`, outlined by default, and a link for `borderless` |
-| `CheckBox` | A checkbox |
-| `TextField` | A text box under its label: one line, several lines that grow with the text, a number box with steppers, or dots with a button to show them. Text that is not a number stays out of a number field's data |
-| `DateTimeInput` | A date picker, with the time of day beside the calendar when the field takes one, or a time field alone. Dates are kept as `2026-01-31`, times as `09:30`, both as `2026-01-31T09:30` |
-| `ChoicePicker` | Radio buttons for one choice, checkboxes for several, or a row of toggle chips. The `filterable` option is ignored |
-| `Slider` | A slider with its value beside it |
-| `Tabs` | A tab bar over the tab that shows |
-| `Modal` | A button that opens the content in a dialog |
-| `Icon` | The matching icon; a dashed square for a name without one |
-| `Divider` | A rule, across or upright |
-| `Image` | The picture, at the size and fit it asks for, when its URL is a `data:` URL; any other URL shows as its description |
-| `Video`, `AudioPlayer` | A chip with the description that opens the link in your browser |
-
-The controls are the app's own, so the keyboard reaches them as it reaches the rest of the app.
-
 Messages draw a ` ```mermaid ` block as a diagram and `$$ … $$` or `$ … $` as a formula, in the theme's colors and font, redrawn when the theme or text size changes. Diagrams come from [pele](https://github.com/obsidianmd/pele), Obsidian's Mermaid renderer, run in an embedded QuickJS; formulas from [RaTeX](https://github.com/erweixin/RaTeX). A diagram wider than the transcript scales down to fit. A diagram shows as its code until its closing fence arrives, so a streaming reply doesn't redraw it with every chunk. What can't be drawn stays as written: a diagram pele can't read shows as code, and so does one that takes over 1 s or 64 MiB to draw (rho-ui says so on stderr); a formula RaTeX can't lay out shows as its source, and dollar signs read as prices ("$5 and $10") stay prose.
 
 A paragraph of only images by path, such as `![The loss curve](out/loss.png)`, draws each image at its own size, scaled down to the transcript's width and to 24 rem tall. A relative path is from the session's folder, and the file is read on the session's machine, so a remote session's images come over its ssh connection. Each message reads its images once, so a file rewritten later still shows in an earlier reply as it was then. Images are read one at a time, as each read on a remote machine is a session on its shared ssh connection. An image that can't be shown says so in its place, with its path and why: it isn't a PNG, JPEG, GIF or WebP image, it is over 32 MiB or 4096 px a side (what rho's own `read_file` previews), or it is a web link, which rho-ui doesn't fetch. One that couldn't be read, because the file isn't there yet or the machine didn't answer, is read again when the turn ends, or when clicked. `data:` images are drawn by GPUI Kit's Markdown, as is an image inside a line of text, which Kit shows only from a `data:` URL. Images a tool returns, such as `read_file`'s preview of an image, show as tiles in the call's details.
@@ -111,6 +83,34 @@ Every machine's rho has its own `config.toml`. With remote machines, a Machine p
 Last comes About: rho-ui's version, a link to its source and its license, then the version of Rho on each machine, or that it is connecting or can't be reached, with what that machine's rho needs under it, as the sidebar offers it (see [Installing and updating rho](#installing-and-updating-rho)).
 
 rho-ui's own settings stay in its own file, not in rho's: the theme, scale and fonts must apply before the first frame, before any daemon answers, and the machines list is how rho-ui finds the remote daemons in the first place.
+
+## Surfaces
+
+rho's `ui` tool shows you a form or a small panel, an [A2UI](https://a2ui.org) surface, and can wait for you to act on it. rho-ui draws the surface in the transcript, under the run of tool calls that holds its `ui` call. It stays there and stays usable after the call returns and after the turn's working folds. A later call that updates the surface moves it under that call, and a surface the agent deletes leaves the transcript. A session opened again, or attached again after it fell behind, draws its surfaces the same from the daemon's replay.
+
+Edits go to the surface's data model as you make them, so its checks update at once: a check that fails shows its message under the control, and a button whose own check fails is disabled, with the reason as its tooltip. Pressing a button whose action is an event sends it to the session, with what you entered, and returns the keyboard to the composer. A waiting `ui` call returns the action; otherwise the model reads it at its turn's next boundary, or in a turn rho starts for it. A button that opens a link opens it in your browser. If the session no longer has the surface, as it may not after its daemon was updated, the surface says so under itself and takes no more actions.
+
+Each component of the A2UI basic catalog has a form:
+
+| Component | Drawn as |
+| --- | --- |
+| `Text` | Markdown, as a reply's text is; a caption is small and muted |
+| `Row`, `Column`, `List` | Layout, placed as `justify` and `align` say. A row wraps when its children don't fit, and its inputs share its width. A row that says nothing lines its children up along its bottom edge, so a button sits level with the field beside it |
+| `Card` | A bordered panel, at most 36 rem wide |
+| `Button` | A button: filled for `primary`, outlined by default, and a link for `borderless` |
+| `CheckBox` | A checkbox |
+| `TextField` | A text box under its label: one line, several lines that grow with the text, a number box with steppers, or dots with a button to show them. Text that is not a number stays out of a number field's data |
+| `DateTimeInput` | A date picker, with the time of day beside the calendar when the field takes one, or a time field alone. Dates are kept as `2026-01-31`, times as `09:30`, both as `2026-01-31T09:30` |
+| `ChoicePicker` | Radio buttons for one choice, checkboxes for several, or a row of toggle chips. The `filterable` option is ignored |
+| `Slider` | A slider with its value beside it |
+| `Tabs` | A tab bar over the tab that shows |
+| `Modal` | A button that opens the content in a dialog |
+| `Icon` | The matching icon; a dashed square for a name without one |
+| `Divider` | A rule, across or upright |
+| `Image` | The picture, at the size and fit it asks for, when its URL is a `data:` URL; any other URL shows as its description |
+| `Video`, `AudioPlayer` | A chip with the description that opens the link in your browser |
+
+The controls are the app's own, so the keyboard reaches them as it reaches the rest of the app.
 
 ## Installing and updating rho
 
