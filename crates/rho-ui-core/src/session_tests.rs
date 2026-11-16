@@ -10,6 +10,7 @@ use crate::{
     input::{Form, InputChoice},
     options::{ConfigCategory, ConfigChoice, ConfigKind},
     tool_card::{SearchLine, ToolBody, ToolFact},
+    Row, Timeline,
 };
 
 fn update(value: serde_json::Value) -> SessionUpdate {
@@ -73,6 +74,7 @@ fn texts(session: &Session) -> Vec<(&'static str, String)> {
             Entry::Thought(m) => ("thought", m.text().to_owned()),
             Entry::Tool(t) => ("tool", t.title().to_owned()),
             Entry::Notice(n) => ("notice", n.title().to_owned()),
+            Entry::Surface(shown) => ("surface", shown.surface().to_owned()),
             Entry::Wake => ("wake", String::new()),
         })
         .collect()
@@ -828,5 +830,46 @@ fn remembered_background_work_settles_once_the_attach_catches_up() {
     assert_eq!(
         ended(&session).last(),
         Some(&("still".to_owned(), BackgroundStatus::Ended))
+    );
+}
+
+/// `ui` calls as a rho daemon sends them: a surface takes its place after
+/// the call that showed it, once however often the call repeats it, out
+/// of the run of tool calls, so a view that folds the run keeps it
+/// showing.
+#[test]
+fn a_ui_calls_surface_is_placed_once_after_the_call() {
+    let mut session = session();
+    let mut placed = Vec::new();
+    for line in include_str!("../tests/fixtures/ui_surface.jsonl").lines() {
+        session.apply(update(serde_json::from_str(line).unwrap()));
+        placed.extend(
+            session
+                .take_placed_surfaces()
+                .into_iter()
+                .map(|placed| placed.shown().call().to_owned()),
+        );
+    }
+    assert_eq!(placed, ["toolu_ui_1", "toolu_ui_2"]);
+    assert_eq!(
+        texts(&session),
+        [
+            ("tool", "ui(merge)".to_owned()),
+            ("surface", "merge".to_owned()),
+            ("tool", "git merge fix".to_owned()),
+            ("tool", "ui(merge)".to_owned()),
+            ("surface", "merge".to_owned()),
+        ]
+    );
+    let mut timeline = Timeline::default();
+    timeline.sync(session.entries());
+    assert_eq!(
+        timeline.rows(),
+        [
+            Row::Work(0..1),
+            Row::Message(1),
+            Row::Work(2..4),
+            Row::Message(4),
+        ]
     );
 }

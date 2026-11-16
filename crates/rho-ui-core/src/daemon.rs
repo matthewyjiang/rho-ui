@@ -33,8 +33,8 @@ use rho_protocol::{
     SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
     SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
     SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
-    SessionSteerParams, SessionUnsteerParams, SettingChange, SignIn, StatusParams, TurnOutcome,
-    UnsteerOutcome,
+    SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn,
+    StatusParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
@@ -48,6 +48,7 @@ use crate::{
     prompt::{mebibytes, Prompt},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
     ssh::{self, SshLink, SshTarget},
+    surface::SurfaceAction,
 };
 
 mod auth;
@@ -129,6 +130,19 @@ impl From<ClientError> for DaemonError {
             other => Self::Unreachable(other.to_string()),
         }
     }
+}
+
+/// Why the daemon did not take an action on a surface
+/// ([`Daemon::surface_action`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SurfaceActionError {
+    /// The session does not have the surface as shown, so it takes no
+    /// action from it. Holds the daemon's message.
+    #[error("{0}")]
+    Stale(String),
+    /// The action did not reach the session; it can be sent again.
+    #[error(transparent)]
+    Failed(#[from] DaemonError),
 }
 
 /// A session ID. Only the daemon issues them.
@@ -545,10 +559,17 @@ fn writer() -> &'static ConfigWriter {
 /// runs on, and the daemon starts a turn of its own when that work
 /// finishes; and `sign_in: later`, so a session whose model has no
 /// credentials opens signed out, for the user to sign in from it.
+///
+/// This is the one place a session's setup is made, for `rho/session/new`
+/// and `rho/session/attach` alike. rho-ui draws the surfaces a session's
+/// `ui` tool shows (`surface.rs`), so it also asks for `surfaces: drawn`:
+/// a session it opens has the tool, and every attach counts it among the
+/// clients a waiting `ui` call can be answered in.
 fn session_setup() -> rho_protocol::SessionSetup {
     rho_protocol::SessionSetup {
         idle_wake: IdleWake::Turn,
         sign_in: SignIn::Later,
+        surfaces: rho_protocol::Surfaces::Drawn,
         ..Default::default()
     }
 }
@@ -919,6 +940,46 @@ impl Daemon {
             Ok(_) => Ok(()),
             Err(error) if error.error_code() == Some(ErrorCode::InputNotOpen) => Ok(()),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Hands session `id` what the user did on a surface its `ui` tool
+    /// showed ([`crate::surface::SurfaceStore::act`]). A `ui` call waiting
+    /// on the surface returns the action; otherwise the model reads it at
+    /// its turn's next boundary, or in a turn the daemon starts for it.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceActionError::Stale`] if the session has no such surface,
+    /// or no such action on it, as after the daemon reloaded the session
+    /// from a block it now reads differently: the surface shown is not
+    /// the session's. [`SurfaceActionError::Failed`] if the daemon refuses
+    /// for another reason or the connection is gone; the action can be
+    /// sent again.
+    pub async fn surface_action(
+        &self,
+        id: &SessionId,
+        action: &SurfaceAction,
+    ) -> Result<(), SurfaceActionError> {
+        let params = SessionSurfaceActionParams {
+            session: id.to_wire(),
+            surface: action.surface().to_owned(),
+            action: action.action.clone(),
+            data_model: action.data_model.clone(),
+        };
+        match self
+            .client
+            .request::<methods::SessionSurfaceAction>(&params)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // rho has no error code of its own for a surface the session
+            // does not have; it answers `InvalidParams`, which a request
+            // this client builds is not otherwise.
+            Err(error) if error.error_code() == Some(ErrorCode::InvalidParams) => Err(
+                SurfaceActionError::Stale(DaemonError::from(error).to_string()),
+            ),
+            Err(error) => Err(SurfaceActionError::Failed(error.into())),
         }
     }
 

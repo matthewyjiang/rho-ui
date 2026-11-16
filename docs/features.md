@@ -84,6 +84,34 @@ Last comes About: rho-ui's version, a link to its source and its license, then t
 
 rho-ui's own settings stay in its own file, not in rho's: the theme, scale and fonts must apply before the first frame, before any daemon answers, and the machines list is how rho-ui finds the remote daemons in the first place.
 
+## Surfaces
+
+rho's `ui` tool shows you a form or a small panel, an [A2UI](https://a2ui.org) surface, and can wait for you to act on it. rho-ui draws the surface in the transcript, under the run of tool calls that holds its `ui` call. It stays there and stays usable after the call returns and after the turn's working folds. A later call that updates the surface moves it under that call, and a surface the agent deletes leaves the transcript. A session opened again, or attached again after it fell behind, draws its surfaces the same from the daemon's replay.
+
+Edits go to the surface's data model as you make them, so its checks update at once: a check that fails shows its message under the control, and a button whose own check fails is disabled, with the reason as its tooltip. Pressing a button whose action is an event sends it to the session, with what you entered, and returns the keyboard to the composer. A waiting `ui` call returns the action; otherwise the model reads it at its turn's next boundary, or in a turn rho starts for it. A button that opens a link opens it in your browser. If the session no longer has the surface, as it may not after its daemon was updated, the surface says so under itself, with what rho said, and takes no more actions. A surface too large to draw, past 2,000 components, stops where it is cut off and says so. If rho-ui can't apply part of a surface, because its A2UI is newer, the surface says that too.
+
+Each component of the A2UI basic catalog has a form:
+
+| Component | Drawn as |
+| --- | --- |
+| `Text` | Markdown, as a reply's text is; a caption is small and muted |
+| `Row`, `Column`, `List` | Layout, placed as `justify` and `align` say. A row wraps when its children don't fit, and its inputs share its width. A row that says nothing lines its children up along its bottom edge, so a button sits level with the field beside it |
+| `Card` | A bordered group, at most 36 rem wide |
+| `Button` | A button: filled for `primary`, outlined by default, and a link for `borderless` |
+| `CheckBox` | A checkbox |
+| `TextField` | A text box under its label: one line, several lines that grow with the text, a number box with steppers, or dots with a button to show them. Text that is not a number stays out of a number field's data, and the form's buttons that send wait until it is fixed |
+| `DateTimeInput` | A date picker, with the time of day beside the calendar when the field takes one, or a time field alone. Dates are kept as `2026-01-31`, times as `09:30`, both as `2026-01-31T09:30` |
+| `ChoicePicker` | Radio buttons for one choice, checkboxes for several, or a row of toggle chips. The `filterable` option is ignored |
+| `Slider` | A slider with its value beside it |
+| `Tabs` | A tab bar over the tab that shows |
+| `Modal` | A button that opens the content in a dialog |
+| `Icon` | The matching icon; a dashed square for a name without one |
+| `Divider` | A rule, across or upright |
+| `Image` | The picture, at the size and fit it asks for, when its URL is a `data:` URL; an avatar is round. rho-ui loads no other URL, which shows as a chip, as a video's does |
+| `Video`, `AudioPlayer` | A chip with the description that opens an `http` or `https` link in your browser |
+
+The controls are the app's own, so the keyboard reaches them as it reaches the rest of the app.
+
 ## Installing and updating rho
 
 rho-ui checks each machine's rho when it connects to it, or fails to, by running `rho update --check --json` there, over ssh for a remote machine. A check that found rho is good for an hour, since each one asks GitHub, which allows 60 requests an hour from one address without a login. A `rho` given as plain `rho` that isn't on `PATH` falls back to `~/.local/bin/rho`, where rho's install script puts it (on Windows, `%LOCALAPPDATA%\Programs\rho\bin\rho.exe`, where its PowerShell installer does), since a desktop session's or an ssh command's `PATH` often lacks that folder.

@@ -26,6 +26,7 @@ use crate::{
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
     prompt::{Attachment, Image, Prompt},
+    surface::{PlacedSurface, SurfaceRef},
     tool_card::ToolCard,
 };
 
@@ -361,6 +362,13 @@ pub enum Entry {
     Tool(ToolCall),
     /// A notice from the agent.
     Notice(Notice),
+    /// A surface a `ui` tool call showed, placed after the call. Its
+    /// messages wait in [`Session::take_placed_surfaces`]. It draws only
+    /// while the [`SurfaceStore`](crate::surface::SurfaceStore) says the
+    /// surface is drawn under its call: a later call that shows the
+    /// surface again draws it instead, and a deleted surface draws
+    /// nowhere.
+    Surface(SurfaceRef),
     /// The daemon began a turn of its own, as it does when the session's
     /// background work finishes or a subagent asks its parent to act, to
     /// give the model the result. It opens that turn, as a prompt opens one. Only a turn followed live has
@@ -493,6 +501,9 @@ pub struct Session {
     /// files relative to it.
     workspace: Option<PathBuf>,
     sync: Sync,
+    /// The surfaces placed since [`Self::take_placed_surfaces`], with
+    /// their messages.
+    placed_surfaces: Vec<PlacedSurface>,
 }
 
 /// What [`Session`] follows of the turn under way, all of which goes when
@@ -549,6 +560,7 @@ impl Session {
             ended_turn: None,
             workspace: None,
             sync: Sync::Attaching(Vec::new()),
+            placed_surfaces: Vec::new(),
         }
     }
 
@@ -703,6 +715,14 @@ impl Session {
     /// drops what it built from there on and builds it again.
     pub fn take_removed(&mut self) -> Option<usize> {
         self.removed.take()
+    }
+
+    /// The surfaces placed since the last call, in order, with the
+    /// messages that show them: a view gives each to its
+    /// [`SurfaceStore`](crate::surface::SurfaceStore), which then draws
+    /// them. Each call's surface is placed once.
+    pub fn take_placed_surfaces(&mut self) -> Vec<PlacedSurface> {
+        std::mem::take(&mut self.placed_surfaces)
     }
 
     /// The session's background work: what still runs, and what ended
@@ -1037,7 +1057,7 @@ impl Session {
         let streamed = |entry: &Entry| match entry {
             Entry::Agent(_) | Entry::Thought(_) => true,
             Entry::Tool(tool) => tool.status == ToolStatus::Pending,
-            Entry::User(_) | Entry::Notice(_) | Entry::Wake => false,
+            Entry::User(_) | Entry::Notice(_) | Entry::Surface(_) | Entry::Wake => false,
         };
         let Some(first) = self.entries[start..].iter().position(streamed) else {
             return;
@@ -1289,16 +1309,48 @@ impl Session {
                 _ => tool.status,
             };
         }
+        let mut surface = None;
         if let Some(content) = update.content {
-            tool.content = content
-                .into_iter()
-                .filter_map(|content| tool_content(content, workspace.as_deref()))
-                .collect();
+            let mut kept = Vec::new();
+            for content in content {
+                match content {
+                    rho_protocol::ToolContent::Surface {
+                        surface: id,
+                        messages,
+                    } => surface = Some((id, messages)),
+                    content => kept.extend(tool_content(content, workspace.as_deref())),
+                }
+            }
+            tool.content = kept;
         }
         if let Some(display) = update.display {
             tool.card = Some(ToolCard::from_wire(display));
         }
+        if let Some((surface, messages)) = surface {
+            self.show_surface(update.id.as_str(), surface, messages);
+        }
         at
+    }
+
+    /// Places the surface call `call` carries after it. Every update of
+    /// the call repeats the surface; only the first places it.
+    fn show_surface(&mut self, call: &str, surface: String, messages: Vec<serde_json::Value>) {
+        let placed = self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Surface(shown) if shown.call == call));
+        if placed {
+            return;
+        }
+        let shown = SurfaceRef {
+            call: call.to_owned(),
+            surface,
+        };
+        self.placed_surfaces.push(PlacedSurface {
+            shown: shown.clone(),
+            messages,
+        });
+        self.entries.push(Entry::Surface(shown));
     }
 }
 

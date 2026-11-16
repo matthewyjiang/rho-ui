@@ -48,9 +48,9 @@ use gpui_kit::{
     Window,
 };
 use rho_ui_core::{
-    Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon, DaemonError, Entry,
-    InputId, JobActivity, Prompt, Run, RunState, Session, SessionId, SessionUpdate, SteerId,
-    TurnId, Unsteered,
+    surface::SurfaceAction, Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon,
+    DaemonError, Entry, InputId, JobActivity, Prompt, Run, RunState, Session, SessionId,
+    SessionUpdate, SteerId, SurfaceActionError, TurnId, Unsteered,
 };
 
 use crate::{
@@ -65,6 +65,7 @@ use crate::{
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
+    surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
     usage::UsageRing,
@@ -153,6 +154,8 @@ pub(crate) struct SessionView {
     reported: (String, Activity),
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
+    /// The surfaces the session's `ui` calls showed.
+    surfaces: Surfaces,
     /// Whether the agent's todo list above the composer is open.
     plan: Disclosure,
     focus_handle: FocusHandle,
@@ -246,6 +249,7 @@ impl SessionView {
             waiting_since: None,
             reported: (String::new(), Activity::Idle),
             error: None,
+            surfaces: Surfaces::default(),
             plan: Disclosure::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -523,6 +527,7 @@ impl SessionView {
             self.transcript.truncate(from, cx);
         }
         self.transcript.sync(self.session.entries(), cx);
+        self.surfaces.sync(&mut self.session, window, cx);
         self.transcript.set_delay(self.session.delay());
         self.sync_settings(window, cx);
         self.sync_card(window, cx);
@@ -976,6 +981,81 @@ impl SessionView {
         .detach();
     }
 
+    /// What the user did on a surface: the store takes it, and every
+    /// surface it changed draws again.
+    pub(crate) fn on_surface_event(
+        &mut self,
+        panel: &Entity<SurfacePanel>,
+        event: &SurfaceEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let surface = panel.read(cx).surface().to_owned();
+        let store = self.surfaces.store_mut();
+        match event {
+            SurfaceEvent::Write { binding, value } => {
+                store.write(&surface, binding, value.clone());
+            }
+            SurfaceEvent::Act { target, action } => {
+                let acted = store.act(&surface, target, action);
+                for url in &acted.open {
+                    cx.open_url(url);
+                }
+                if let Some(error) = acted.error {
+                    self.error = Some(format!("Couldn't run the form's action: {error}"));
+                }
+                if let Some(action) = acted.send {
+                    // The keyboard goes back to the composer, where the
+                    // reply is followed, as after an answered question.
+                    window.focus(&self.composer.focus_handle(cx), cx);
+                    self.send_surface_action(action, panel.downgrade(), window, cx);
+                }
+            }
+        }
+        self.surfaces.redraw(window, cx);
+        cx.notify();
+    }
+
+    /// The panel of `surface` changed, and may have changed height.
+    pub(crate) fn surface_resized(&self, surface: &str, cx: &mut Context<'_, Self>) {
+        self.transcript
+            .surface_changed(surface, self.session.entries(), cx);
+    }
+
+    /// Sends `action` to the session. A session that no longer has the
+    /// surface refuses it: unless a later call showed the surface since,
+    /// it then says it is out of date, with what the daemon said, and
+    /// takes no more.
+    fn send_surface_action(
+        &mut self,
+        action: SurfaceAction,
+        panel: WeakEntity<SurfacePanel>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        let _ = panel.update(cx, SurfacePanel::sending);
+        cx.spawn_in(window, async move |this, cx| {
+            let sent = daemon.surface_action(&id, &action).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let _ = panel.update(cx, SurfacePanel::sent);
+                match sent {
+                    Ok(()) => {}
+                    Err(SurfaceActionError::Stale(said)) => {
+                        this.surfaces.store_mut().mark_stale(&action, said);
+                        this.surfaces.redraw(window, cx);
+                    }
+                    Err(SurfaceActionError::Failed(error)) => {
+                        this.error = Some(format!("Couldn't send the form's action: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Shows the session's settings, changeable once the session is open,
     /// and offers its commands and skills in the composer.
     fn sync_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1068,6 +1148,7 @@ impl SessionView {
                             this.transcript.render_row(
                                 ix,
                                 this.session.entries(),
+                                &this.surfaces,
                                 &act,
                                 &content,
                                 cx,
@@ -1401,9 +1482,12 @@ const PROMPT_TITLE_CHARS: usize = 80;
 fn first_prompt(session: &Session) -> Option<String> {
     let text = session.entries().iter().find_map(|entry| match entry {
         Entry::User(message) => Some(message.text()),
-        Entry::Agent(_) | Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) | Entry::Wake => {
-            None
-        }
+        Entry::Agent(_)
+        | Entry::Thought(_)
+        | Entry::Tool(_)
+        | Entry::Notice(_)
+        | Entry::Surface(_)
+        | Entry::Wake => None,
     })?;
     let mut line: String = text
         .split_whitespace()

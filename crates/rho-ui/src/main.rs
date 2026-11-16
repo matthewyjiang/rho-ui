@@ -43,6 +43,7 @@ mod shelf;
 mod sidebar;
 mod sign_in;
 mod store;
+mod surface_view;
 mod themes;
 mod time;
 mod title_bar;
@@ -156,7 +157,37 @@ gpui_kit::assets::icon_assets!(
         MessageSquare,
         Link,
         Unlink,
-        KeyRound
+        KeyRound,
+        // The A2UI basic catalog's icons, for surfaces (`surface_view.rs`).
+        BellOff,
+        CalendarDays,
+        Camera,
+        CircleQuestionMark,
+        CreditCard,
+        FastForward,
+        Film,
+        House,
+        Image,
+        Lock,
+        LockOpen,
+        Mail,
+        MapPin,
+        Music,
+        Phone,
+        Printer,
+        Rewind,
+        Send,
+        Share2,
+        ShoppingCart,
+        SkipBack,
+        SquareDashed,
+        StarHalf,
+        Upload,
+        Volume,
+        Volume1,
+        Volume2,
+        VolumeX,
+        X
     ]
 );
 
