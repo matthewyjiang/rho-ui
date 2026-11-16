@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::{BackgroundExecutor, Context, Entity, SharedString, Task};
+use gpui_kit::{BackgroundExecutor, Context, Entity, EntityId, SharedString, Task};
 
 use rho_ui_core::SessionId;
 
@@ -98,36 +98,20 @@ impl PrLinks {
         if linked.contains(&id) {
             return;
         }
-        let repo = &id.repo;
         self.db.execute(
             "INSERT OR IGNORE INTO pr_links (machine, session_id, host, owner, name, number) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            (
-                session.machine.as_str(),
-                session.id.as_str(),
-                &repo.host,
-                &repo.owner,
-                &repo.name,
-                id.number,
-            ),
+            Self::row(session, &id),
         );
         linked.push(id);
     }
 
     /// Unlinks `id` from `session`.
     pub(crate) fn remove(&mut self, session: &SessionKey, id: &PrId) {
-        let repo = &id.repo;
         self.db.execute(
             "DELETE FROM pr_links WHERE machine = ?1 AND session_id = ?2 \
              AND host = ?3 AND owner = ?4 AND name = ?5 AND number = ?6",
-            (
-                session.machine.as_str(),
-                session.id.as_str(),
-                &repo.host,
-                &repo.owner,
-                &repo.name,
-                id.number,
-            ),
+            Self::row(session, id),
         );
         if let Some(linked) = self.links.get_mut(session) {
             linked.retain(|linked| linked != id);
@@ -135,6 +119,23 @@ impl PrLinks {
                 self.links.remove(session);
             }
         }
+    }
+
+    /// The `pr_links` row of `id` linked to `session`, in its columns'
+    /// order.
+    fn row<'a>(
+        session: &'a SessionKey,
+        id: &'a PrId,
+    ) -> (&'a str, &'a str, &'a str, &'a str, &'a str, u32) {
+        let repo = &id.repo;
+        (
+            session.machine.as_str(),
+            session.id.as_str(),
+            &repo.host,
+            &repo.owner,
+            &repo.name,
+            id.number,
+        )
     }
 }
 
@@ -393,6 +394,9 @@ pub(crate) struct PullRequests {
     forges: Entity<Forges>,
     workspaces: Entity<Workspaces>,
     on_screen: Option<Watch>,
+    /// The surface that asked for `on_screen`: two sessions may watch the
+    /// same target, and only the one that asked last can stop it.
+    shown_by: Option<EntityId>,
     found: HashMap<Target, Found>,
     details: HashMap<PrId, PrDetail>,
     default_branches: HashMap<RepoId, Option<String>>,
@@ -433,6 +437,7 @@ impl PullRequests {
             forges,
             workspaces,
             on_screen: None,
+            shown_by: None,
             found: HashMap::new(),
             details: HashMap::new(),
             default_branches: HashMap::new(),
@@ -503,10 +508,11 @@ impl PullRequests {
         })
     }
 
-    /// Watches `watch` for the Pull request surface on screen, in place of
-    /// what it watched. A target not read in the last [`POLL`] is read at
-    /// once.
-    pub(crate) fn show(&mut self, watch: Watch, cx: &mut Context<'_, Self>) {
+    /// Watches `watch` for `surface`, the Pull request surface on screen,
+    /// in place of what another watched. A target not read in the last
+    /// [`POLL`] is read at once.
+    pub(crate) fn show(&mut self, surface: EntityId, watch: Watch, cx: &mut Context<'_, Self>) {
+        self.shown_by = Some(surface);
         if self.on_screen.as_ref() == Some(&watch) {
             return;
         }
@@ -520,12 +526,13 @@ impl PullRequests {
         cx.notify();
     }
 
-    /// Stops watching `watch`, as its surface left the screen. Another
-    /// surface may show already, as tabs switch: what it watches stays.
-    pub(crate) fn hide(&mut self, watch: &Watch, cx: &mut Context<'_, Self>) {
-        if self.on_screen.as_ref() != Some(watch) {
+    /// Stops watching for `surface`, as it left the screen. Another surface
+    /// may show already, as tabs switch: what it watches stays.
+    pub(crate) fn hide(&mut self, surface: EntityId, cx: &mut Context<'_, Self>) {
+        if self.shown_by != Some(surface) {
             return;
         }
+        self.shown_by = None;
         self.on_screen = None;
         self.blocked = None;
         if !self.poll.is_running() {

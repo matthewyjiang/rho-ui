@@ -15,17 +15,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _,
 };
 
-use super::PullRequestSurface;
+use super::{PullRequestSurface, Shows};
 use crate::pull_requests::{PrDetail, PrState, PrSummary, Refresh, RepoId, Review};
-
-/// How the PR on screen is linked to the session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Linked {
-    /// Its head is the session's branch.
-    ByBranch,
-    /// The user linked it.
-    ByHand,
-}
 
 /// The strip above the PR: its repository and number, and the buttons to
 /// open it on the forge, to link another by hand, to unlink one linked so,
@@ -33,7 +24,7 @@ pub(crate) enum Linked {
 pub(super) fn toolbar(
     repo: Option<&RepoId>,
     pr: Option<&PrSummary>,
-    linked: Linked,
+    shows: &Shows,
     cx: &Context<'_, PullRequestSurface>,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -61,7 +52,7 @@ pub(super) fn toolbar(
                     .child(format!("#{}", pr.id.number)),
             )
         })
-        .when(linked == Linked::ByHand, |this| {
+        .when(matches!(shows, Shows::Linked(_)), |this| {
             this.child(div().flex_shrink_0().child("· linked"))
         })
         .child(div().flex_1())
@@ -83,7 +74,7 @@ pub(super) fn toolbar(
                 .tooltip("Link another pull request")
                 .on_click(cx.listener(|this, _, window, cx| this.start_linking(window, cx))),
         )
-        .when(linked == Linked::ByHand, |this| {
+        .when(matches!(shows, Shows::Linked(_)), |this| {
             this.child(
                 Button::new("pull-request-unlink")
                     .ghost()

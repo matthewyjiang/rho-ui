@@ -35,12 +35,12 @@ use gpui_kit::{
 };
 
 pub(crate) use self::header::state_look;
-pub(super) use self::link::LinkEvent;
+pub(super) use self::link::ShowLinked;
 use self::{
     actions::Acting,
     checks::{check_counts, checks},
     conversation::{open_threads, Posting},
-    header::{identity, toolbar, web_url, Linked},
+    header::{identity, toolbar, web_url},
     link::{link_button, LinkForm},
 };
 use crate::{
@@ -78,8 +78,6 @@ pub(super) struct PullRequestSurface {
     /// The session's folder, whose branch and origin it reads.
     workspace: WorkspaceRef,
     shows: Shows,
-    /// What it asked [`PullRequests`] to watch, while it shows.
-    watched: Option<Watch>,
     /// Whether it is on screen: the tab shown in a panel that shows.
     visibility: Visibility,
     /// The Markdown of the PR on screen, parsed once per text it has: its
@@ -116,10 +114,9 @@ impl PullRequestSurface {
             cx.observe(workspaces, |this, _, cx| this.watch(cx)),
         ];
         // Closing the tab stops the polling for it.
-        cx.on_release(|this, cx| {
-            if let Some(watch) = this.watched.take() {
-                this.prs.update(cx, |prs, cx| prs.hide(&watch, cx));
-            }
+        let surface = cx.entity_id();
+        cx.on_release(move |this, cx| {
+            this.prs.update(cx, |prs, cx| prs.hide(surface, cx));
         })
         .detach();
         let workspace = WorkspaceRef::new(workspaces, place, cx);
@@ -128,7 +125,6 @@ impl PullRequestSurface {
             session,
             workspace,
             shows,
-            watched: None,
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
             flipped: HashSet::new(),
@@ -213,14 +209,10 @@ impl PullRequestSurface {
                 machine: self.session.machine.clone(),
                 target,
             });
-        let left = std::mem::replace(&mut self.watched, watch.clone());
-        self.prs.update(cx, |prs, cx| {
-            if let Some(left) = left.filter(|left| watch.as_ref() != Some(left)) {
-                prs.hide(&left, cx);
-            }
-            if let Some(watch) = watch {
-                prs.show(watch, cx);
-            }
+        let surface = cx.entity_id();
+        self.prs.update(cx, |prs, cx| match watch {
+            Some(watch) => prs.show(surface, watch, cx),
+            None => prs.hide(surface, cx),
         });
         self.sync_texts(cx);
         cx.notify();
@@ -457,7 +449,7 @@ fn message(
         .into_any_element()
 }
 
-impl EventEmitter<LinkEvent> for PullRequestSurface {}
+impl EventEmitter<ShowLinked> for PullRequestSurface {}
 
 impl Render for PullRequestSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
@@ -495,10 +487,6 @@ impl Render for PullRequestSurface {
                 (pr, trouble, content)
             }
         };
-        let linked = match self.shows {
-            Shows::Branch => Linked::ByBranch,
-            Shows::Linked(_) => Linked::ByHand,
-        };
         v_flex()
             .id("pull-request")
             .test_support()
@@ -506,7 +494,7 @@ impl Render for PullRequestSurface {
             .child(toolbar(
                 target.as_ref().ok().map(Target::repo),
                 pr,
-                linked,
+                &self.shows,
                 cx,
             ))
             .children(self.link_form(cx))

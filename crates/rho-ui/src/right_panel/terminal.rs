@@ -1,7 +1,7 @@
 //! The Terminal surface: shells in the folder of the session its tab
-//! belongs to, on the session's machine. Ghostty's libghostty-vt keeps the screen: it
-//! parses what the shell prints and encodes keys the way the program in it
-//! asked. rho-ui runs the shell and draws the cells with GPUI.
+//! belongs to, on the session's machine. Ghostty's libghostty-vt keeps the
+//! screen: it parses what the shell prints and encodes keys the way the
+//! program in it asked. rho-ui runs the shell and draws the cells with GPUI.
 //!
 //! On this machine the shell is [`TerminalShell`], under a pseudo-terminal
 //! here; on a remote one it is the login shell there, under a
@@ -201,7 +201,11 @@ impl TerminalPane {
         match ended {
             Ok(()) => self.shell_exited(view, cx),
             Err(why) => {
-                if self.terminal.as_ref().is_some_and(|terminal| is_view(terminal, view)) {
+                if self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| is_view(terminal, view))
+                {
                     self.terminal = Some(Err(why));
                     self.follow_program(cx);
                     cx.notify();

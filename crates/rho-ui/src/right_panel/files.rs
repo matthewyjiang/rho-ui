@@ -231,9 +231,10 @@ impl FilesSurface {
 
     /// Reads the open file at `path` again.
     fn read_file(&mut self, path: SharedString, cx: &mut Context<'_, Self>) {
-        let (place, Some(open)) = (&self.place, &mut self.open) else {
+        let Some(open) = &mut self.open else {
             return;
         };
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
         let folder = place.path.clone();
         let executor = cx.background_executor().clone();

@@ -1,7 +1,8 @@
 //! Linking PRs to a session by hand, for those the branch doesn't find: a
 //! fork's, one from another branch, or one in another repository. Each link
 //! is kept in [`PrLinks`], so it outlasts restarts, until it is unlinked,
-//! and shows in a tab of its own ([`LinkEvent`]).
+//! and shows in a tab of its own, which [`super::super::RightPanel`] opens
+//! and closes as [`PrLinks`] changes.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -21,15 +22,10 @@ use gpui_kit::{
 use super::PullRequestSurface;
 use crate::pull_requests::{PrId, PrLinks};
 
-/// What [`super::RightPanel`] hears as the session's links change, to open
-/// and close their tabs.
+/// Asks [`super::super::RightPanel`] to show the tab of this PR, which the
+/// user just linked, or named when it was linked already.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::right_panel) enum LinkEvent {
-    /// The user linked this PR, or named one linked already: its tab shows.
-    Linked(PrId),
-    /// The PR the surface showed was unlinked: its tab closes.
-    Unlinked,
-}
+pub(in crate::right_panel) struct ShowLinked(pub(in crate::right_panel) PrId);
 
 /// The form to link a PR, while it is open.
 pub(super) struct LinkForm {
@@ -90,7 +86,7 @@ impl PullRequestSurface {
             Ok(id) => {
                 cx.update_global::<PrLinks, _>(|links, _| links.add(&key, id.clone()));
                 self.link_form = None;
-                cx.emit(LinkEvent::Linked(id));
+                cx.emit(ShowLinked(id));
                 cx.notify();
             }
             Err(why) => {
@@ -109,7 +105,6 @@ impl PullRequestSurface {
         };
         let (key, id) = (self.session.clone(), id.clone());
         cx.update_global::<PrLinks, _>(|links, _| links.remove(&key, &id));
-        cx.emit(LinkEvent::Unlinked);
     }
 
     /// The form, under the toolbar, while it is open.

@@ -3426,6 +3426,50 @@ fn pull_requests_link_by_hand() {
     assert_eq!(linked(&mut ui), Vec::<u32>::new());
 }
 
+/// Two sessions on one branch each have a Pull request tab of the same PR;
+/// switching between them, either way, leaves the one on screen polling,
+/// whatever order the panel tells their surfaces in.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn sessions_on_one_branch_each_watch_their_pr() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-two-sessions");
+    let active = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let app = ui.app.read(cx);
+            app.active_session().expect("a session").read(cx).live().id
+        })
+    };
+    let first = active(&mut ui);
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the second session's turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+    let second = active(&mut ui);
+    assert_ne!(first, second);
+    ui.click("open-surface-pull-request");
+    ui.wait_until("the second session's PR", |window, _, _| {
+        is_visible(window, "pull-request-check-1")
+    });
+    let watching = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let prs = ui.app.read(cx).pull_requests().read(cx);
+            prs.poster(cx).is_ok()
+        })
+    };
+    for session in [&first, &second, &first] {
+        let row = SharedString::from(format!("session-{session}"));
+        ui.act(|window, cx| window.click(row, cx));
+        ui.wait_until("its PR on screen", |window, _, _| {
+            is_visible(window, "pull-request-check-1")
+        });
+        assert_eq!(&active(&mut ui), session);
+        assert!(watching(&mut ui), "the PR on screen is watched");
+    }
+}
+
 /// The PR's conversation: its comments and reviews, its threads on the
 /// code, open ones open and resolved ones closed until clicked; and a
 /// comment posted through the session machine's gh, after which the PR
