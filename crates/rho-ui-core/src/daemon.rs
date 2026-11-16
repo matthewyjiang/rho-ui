@@ -29,11 +29,12 @@ use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
     ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobListParams,
-    Notifications, RestartParams, SessionAnswerParams, SessionAttachParams,
-    SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
-    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
-    SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
-    SessionUnsteerParams, SettingChange, StatusParams, TurnOutcome, UnsteerOutcome,
+    LoginId, LoginOutcome, LoginPrompt, Notifications, RestartParams, SessionAnswerParams,
+    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
+    SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
+    SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
+    SessionSteerParams, SessionUnsteerParams, SettingChange, SignIn, StatusParams, TurnOutcome,
+    UnsteerOutcome,
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
@@ -48,6 +49,8 @@ use crate::{
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
     ssh::{self, SshLink, SshTarget},
 };
+
+mod auth;
 
 /// How to reach the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,6 +287,22 @@ pub enum DaemonEvent {
     /// [`Daemon::agent_settings`] has read them; apply it with
     /// [`AgentSettings::apply`].
     AgentSettingsChanged(AgentSettingsChanged),
+    /// What the user must do to finish a login [`Daemon::login`] started:
+    /// open a page, and for a device code enter the code there.
+    LoginPrompt {
+        /// The login, as [`Daemon::login`] returned it.
+        login: LoginId,
+        /// The page to open, any code to enter there, and what to do.
+        prompt: LoginPrompt,
+    },
+    /// A login [`Daemon::login`] started ended, its last event. One that
+    /// succeeded signed the daemon in for every session.
+    LoginFinished {
+        /// The login, as [`Daemon::login`] returned it.
+        login: LoginId,
+        /// Whether it succeeded, failed (and why) or was cancelled.
+        outcome: LoginOutcome,
+    },
 }
 
 /// The daemon's event stream. It ends when the connection does.
@@ -331,8 +350,19 @@ impl DaemonEvents {
                         changed,
                     )));
                 }
-                // Logins, and other clients' settings, which this client
-                // does not use.
+                DaemonNotification::LoginPrompt(prompt) => {
+                    return Some(DaemonEvent::LoginPrompt {
+                        login: prompt.login,
+                        prompt: prompt.prompt,
+                    });
+                }
+                DaemonNotification::LoginFinished(finished) => {
+                    return Some(DaemonEvent::LoginFinished {
+                        login: finished.login,
+                        outcome: finished.outcome,
+                    });
+                }
+                // Other clients' settings, which this client does not use.
                 _ => {}
             }
         }
@@ -510,12 +540,15 @@ fn writer() -> &'static ConfigWriter {
     })
 }
 
-/// What every session this client opens gets: `idle_wake: turn`, as rho's
-/// terminal UI asks: a turn ends while the background work it started runs
-/// on, and the daemon starts a turn of its own when that work finishes.
+/// What every session this client opens gets, as rho's terminal UI asks:
+/// `idle_wake: turn`, so a turn ends while the background work it started
+/// runs on, and the daemon starts a turn of its own when that work
+/// finishes; and `sign_in: later`, so a session whose model has no
+/// credentials opens signed out, for the user to sign in from it.
 fn session_setup() -> rho_protocol::SessionSetup {
     rho_protocol::SessionSetup {
         idle_wake: IdleWake::Turn,
+        sign_in: SignIn::Later,
         ..Default::default()
     }
 }
@@ -635,9 +668,10 @@ impl Daemon {
     ///
     /// # Errors
     ///
-    /// Fails if the daemon cannot open the session, as when its model's
-    /// provider needs a sign-in, `cwd` is in no git repository for a new
-    /// worktree, or the connection is gone.
+    /// Fails if the daemon cannot open the session, as when `cwd` is in no
+    /// git repository for a new worktree, or the connection is gone. A
+    /// model with no credentials opens signed out, and its turns fail until
+    /// a sign-in; see [`crate::Session::auth`].
     pub async fn new_session(
         &self,
         cwd: &Path,

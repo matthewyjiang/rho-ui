@@ -676,6 +676,13 @@ impl Session {
         &self.config
     }
 
+    /// The auth profile the session's model runs on, once its settings
+    /// are known. The session opens whether or not it has credentials; the
+    /// daemon's [`crate::Daemon::auths`] says whether it is signed in.
+    pub fn auth(&self) -> Option<&str> {
+        self.config.iter().find_map(ConfigOption::auth)
+    }
+
     /// Slash commands and skills on offer.
     pub fn commands(&self) -> &[CommandInfo] {
         &self.commands

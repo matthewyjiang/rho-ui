@@ -64,6 +64,12 @@
 //!   writes: "r0", "r1", ... A write against an older revision is refused
 //!   as a conflict, unless only its own writer wrote since.
 //!   [`FakeDaemon::edit_agent_setting`] changes one as a hand edit does.
+//! - Sessions run on [`KEY_AUTH`], which takes an API key and is signed in
+//!   unless [`Script::signed_out`]; then a session opens only with
+//!   `sign_in: later`. [`LOGIN_AUTH`] takes a login, whose prompt follows
+//!   at once and which waits for [`FakeDaemon::approve_login`]. The key
+//!   [`REFUSED_KEY`] is refused. Credentials go to a file store the
+//!   config chose.
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
 //!   set, if any. `rho/daemon/restart` restarts in place, as rho does: it
 //!   counts ([`FakeDaemon::restarts`]), drops the upgrade, as the restarted
@@ -100,10 +106,13 @@ use tokio::runtime::Runtime;
 
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
 
+mod auth;
 mod config;
 mod listener;
 mod service;
 
+use auth::FakeAuth;
+pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY};
 use config::FakeConfig;
 use listener::Listener;
 use service::Fake;
@@ -239,6 +248,9 @@ pub struct Script {
     /// How many more saved sessions, `past-0` and on, each an hour older
     /// than the last and older than "old", to fill long lists.
     pub past_sessions: usize,
+    /// Whether [`KEY_AUTH`], which every session runs on, starts signed
+    /// out, so a session opens only with `sign_in: later`.
+    pub signed_out: bool,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -326,6 +338,20 @@ impl FakeDaemon {
     /// Where it listens: its Unix socket, or on Windows its named pipe.
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Whether auth profile `auth` has credentials.
+    pub fn signed_in(&self, auth: &str) -> bool {
+        self.service.lock().auth.is_signed_in(auth)
+    }
+
+    /// The provider approves the login under way, which then succeeds.
+    ///
+    /// # Panics
+    ///
+    /// If no login is under way.
+    pub fn approve_login(&self) {
+        self.service.lock().auth.approve();
     }
 
     /// The value of variable `name` in the environment the latest
@@ -612,7 +638,7 @@ impl Settings {
         SessionOptions {
             model: ModelOptions {
                 current: self.model.clone(),
-                auth: "fake-api-key".to_owned(),
+                auth: KEY_AUTH.to_owned(),
                 available: MODELS
                     .iter()
                     .map(|(name, label)| ModelChoice {
@@ -1243,6 +1269,7 @@ struct State {
     extra_jobs: Vec<JobSummary>,
     /// rho's own settings.
     config: FakeConfig,
+    auth: FakeAuth,
 }
 
 impl State {
@@ -1284,6 +1311,7 @@ impl State {
             steers: 0,
             extra_jobs: Vec::new(),
             config: FakeConfig::new(),
+            auth: FakeAuth::new(&script),
         };
         if script.tui_job == TuiJob::Running {
             let mut session = FakeSession::new("/w/a", Some("from the tui"), 1_767_398_400);
