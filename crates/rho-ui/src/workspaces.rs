@@ -2,9 +2,10 @@
 //! repositories say: one table shared by the sidebar rows and the session
 //! header, so both show the same workspace and branch. Read from `.git`
 //! files on the background executor, then re-read every [`REREAD`] to pick
-//! up branch switches. A remote machine's are read with `git` there, over
-//! the ssh connection to its daemon, and show their folder's name until
-//! then. A remote machine whose repositories can't be read says why at the
+//! up branch switches. A machine reached through a link, ssh or
+//! rho-ui-serve, has its read with `git` there, over that link, and they
+//! show their folder's name until then; in a browser, that is this machine
+//! too. A remote machine whose repositories can't be read says why at the
 //! foot of the sidebar until a read succeeds. The saved sessions say how
 //! recently each was used, which dates the projects in the new-session
 //! picker.
@@ -15,7 +16,7 @@ use std::{
 };
 
 use gpui_kit::{App, Context, Entity, SharedString, Task};
-use rho_ui_core::{platform, Daemon, SshLink};
+use rho_ui_core::{platform, Daemon, Link};
 
 use crate::{
     folders::Reader,
@@ -150,15 +151,23 @@ impl WorkspaceRef {
     }
 }
 
-/// A remote machine whose daemon has answered.
+/// A machine whose daemon answered through a link: a remote one, or in a
+/// browser, this one.
 struct Remote {
     machine: MachineId,
     /// Its home directory, as its daemon said.
     home: Option<PathBuf>,
     /// While its daemon is connected: how to read its repositories.
-    ssh: Option<SshLink>,
+    link: Option<Link>,
     /// Why its repositories couldn't be read, until a read succeeds.
     unread: Option<SharedString>,
+}
+
+/// Whether rho-ui reads `machine`'s files itself: this machine's, unless
+/// rho-ui runs in a browser, which reaches even this machine only through
+/// its link.
+pub(crate) fn reads_here(machine: &MachineId) -> bool {
+    machine.is_local() && cfg!(not(target_family = "wasm"))
 }
 
 /// Every workspace seen so far. Only ever appended to, so callers hold
@@ -193,25 +202,20 @@ impl Workspaces {
 
     /// The home directory of `machine`, which its paths show as `~`.
     pub(crate) fn home(&self, machine: &MachineId) -> Option<PathBuf> {
-        if machine.is_local() {
-            return platform::home_dir();
+        match self.remote(machine) {
+            Some(linked) => linked.home.clone(),
+            None if reads_here(machine) => platform::home_dir(),
+            None => None,
         }
-        self.remote(machine)?.home.clone()
     }
 
-    /// How to run a script on remote `machine`, while its daemon is
-    /// connected.
-    pub(crate) fn ssh(&self, machine: &MachineId) -> Option<SshLink> {
-        self.remote(machine)?.ssh.clone()
-    }
-
-    /// How to read files and run `git` on `machine`: here, or over its
-    /// ssh link while its daemon is connected.
+    /// How to read files and run `git` on `machine`: over its link while
+    /// its daemon is connected through one, else here for this machine.
     pub(crate) fn reader(&self, machine: &MachineId) -> Reader {
-        if machine.is_local() {
-            Reader::Here
-        } else {
-            self.ssh(machine).map_or(Reader::Unread, Reader::There)
+        match self.remote(machine) {
+            Some(linked) => linked.link.clone().map_or(Reader::Unread, Reader::There),
+            None if reads_here(machine) => Reader::Here,
+            None => Reader::Unread,
         }
     }
 
@@ -249,7 +253,7 @@ impl Workspaces {
         self.remotes.push(Remote {
             machine: machine.clone(),
             home,
-            ssh: daemon.ssh().cloned(),
+            link: daemon.link().cloned(),
             unread: None,
         });
         let theirs = (0..self.list.len()).filter(|&ix| self.list[ix].machine() == machine);
@@ -265,7 +269,7 @@ impl Workspaces {
             .iter_mut()
             .find(|remote| remote.machine == *machine)
         {
-            remote.ssh = None;
+            remote.link = None;
             remote.unread = None;
         }
     }
@@ -360,16 +364,16 @@ impl Workspaces {
     /// [`Self::connected`].
     fn read(&self, indices: Vec<usize>, cx: &mut Context<'_, Self>) {
         let mut local = Vec::new();
-        let mut by_link: Vec<(SshLink, Vec<usize>)> = Vec::new();
+        let mut by_link: Vec<(Link, Vec<usize>)> = Vec::new();
         for ix in indices {
             let machine = self.list[ix].machine();
-            if machine.is_local() {
-                local.push(ix);
-            } else if let Some(ssh) = self.remote(machine).and_then(|remote| remote.ssh.as_ref()) {
-                match by_link.iter_mut().find(|(known, _)| known == ssh) {
+            if let Some(link) = self.remote(machine).and_then(|remote| remote.link.as_ref()) {
+                match by_link.iter_mut().find(|(known, _)| known == link) {
                     Some((_, theirs)) => theirs.push(ix),
-                    None => by_link.push((ssh.clone(), vec![ix])),
+                    None => by_link.push((link.clone(), vec![ix])),
                 }
+            } else if reads_here(machine) {
+                local.push(ix);
             }
         }
         if !local.is_empty() {
@@ -410,13 +414,13 @@ impl Workspaces {
             .collect()
     }
 
-    /// Records why the repositories of the machines `ssh` reaches couldn't
+    /// Records why the repositories of the machines `link` reaches couldn't
     /// be read, or with `None` that they were. Each [`REREAD`] tries again,
     /// so stderr hears of a failure only when it changes.
-    fn set_unread(&mut self, ssh: &SshLink, why: Option<&str>, cx: &mut Context<'_, Self>) {
+    fn set_unread(&mut self, link: &Link, why: Option<&str>, cx: &mut Context<'_, Self>) {
         let mut changed = false;
         for remote in &mut self.remotes {
-            if remote.ssh.as_ref() == Some(ssh) && remote.unread.as_deref() != why {
+            if remote.link.as_ref() == Some(link) && remote.unread.as_deref() != why {
                 remote.unread = why.map(|why| SharedString::from(why.to_owned()));
                 changed = true;
             }

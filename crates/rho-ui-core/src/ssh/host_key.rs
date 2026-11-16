@@ -14,7 +14,8 @@ use russh::{
     Preferred,
 };
 
-use super::{config::Resolved, quote};
+use super::config::Resolved;
+use crate::link::quote;
 
 /// A key the `known_hosts` files list for the host, or the
 /// `RevokedHostKeys` file lists, and where.

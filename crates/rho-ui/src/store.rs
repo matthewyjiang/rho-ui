@@ -5,6 +5,7 @@
 
 use std::{fmt::Write as _, io, path::Path, rc::Rc};
 
+#[cfg(not(target_family = "wasm"))]
 use rho_ui_core::platform::{self, AppDir};
 use rusqlite::{Connection, Params, Row, TransactionBehavior};
 
@@ -170,7 +171,9 @@ impl std::fmt::Debug for StateDb {
 impl StateDb {
     /// Opens the database in the state folder, creating it if need
     /// be. When it can't, rho-ui runs on one in memory, remembering nothing
-    /// past this run, and says why on stderr.
+    /// past this run, and says why on stderr. A browser has no folder for
+    /// it, and runs on one in memory.
+    #[cfg(not(target_family = "wasm"))]
     #[expect(
         clippy::print_stderr,
         reason = "rho-ui has no log; stderr reaches the terminal or the journal"
@@ -191,6 +194,7 @@ impl StateDb {
     }
 
     /// Opens the database at `path`, making its directory if need be.
+    #[cfg(not(target_family = "wasm"))]
     fn open_at(path: &Path) -> rusqlite::Result<Self> {
         if let Some(dir) = path.parent() {
             // A directory that can't be made fails the open, which says so.

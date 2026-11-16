@@ -11,8 +11,10 @@ use std::{
     cmp::Reverse,
     collections::BTreeSet,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use web_time::Instant;
 
 use gpui_kit::{EntityId, SharedString};
 use rho_ui_core::JobActivity;

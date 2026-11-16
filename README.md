@@ -24,6 +24,15 @@ cargo run -p rho-ui -- [DIR] [--rho PROGRAM]
 
 The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 
+### In a browser
+
+```bash
+scripts/build-web.sh
+cargo run -p rho-ui-serve -- [--port PORT] [--bind ADDRESS]
+```
+
+Open the URL it prints, which holds its token. The page shows this machine's sessions, with the same views, terminal included, as the desktop app; rho-ui-serve, which listens on 127.0.0.1:8765 unless told, does on this machine what the browser can't. From another machine, tunnel to it, as with `ssh -L 8765:127.0.0.1:8765 HOST`. In a browser there are no remote machines yet, and nothing is remembered past the page. [Architecture](docs/architecture.md#in-a-browser) says how it works.
+
 ## Keys
 
 On macOS, Cmd takes the place of Ctrl in these, and the menu bar lists them, with Cmd+H to hide and Cmd+M to minimize.

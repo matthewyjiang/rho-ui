@@ -10,11 +10,9 @@
 //! its whole result. It shows its first [`NOTICE_LINES`] lines, with a
 //! button to show the rest.
 
-use std::{
-    ops::Range,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{ops::Range, rc::Rc, time::Duration};
+
+use web_time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{text::CodeBlock, TestSupportExt as _};

@@ -1,7 +1,9 @@
 //! Wall-clock helpers: Unix seconds, RFC 3339 parsing, compact ages and
 //! turn lengths.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Seconds since the Unix epoch, or 0 if the clock is before it.
 pub(crate) fn now_unix() -> i64 {

@@ -63,6 +63,7 @@ use libghostty_vt::{
     terminal::ScrollViewport,
     RenderState, Terminal,
 };
+#[cfg(not(target_family = "wasm"))]
 use portable_pty::CommandBuilder;
 use rho_ui_core::platform;
 
@@ -76,7 +77,16 @@ use crate::{folders::Reader, machines::Place, workspaces::Workspaces};
 /// app ([`platform::default_shell`]), a plain `sh` in tests, so they don't
 /// read the user's shell files.
 #[derive(Clone, Debug)]
-pub(crate) struct TerminalShell(pub(crate) PathBuf);
+pub(crate) struct TerminalShell(
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(
+            dead_code,
+            reason = "a browser runs no shell here, only through its link"
+        )
+    )]
+    pub(crate) PathBuf,
+);
 
 impl TerminalShell {
     /// The user's shell.
@@ -105,6 +115,13 @@ struct ShellExited;
 /// A pane of a [`TerminalTab`]: one terminal in its session's folder.
 struct TerminalPane {
     workspaces: Entity<Workspaces>,
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(
+            dead_code,
+            reason = "a browser runs no shell here, only through its link"
+        )
+    )]
     shell: TerminalShell,
     /// The session's folder, where the shell starts.
     place: Place,
@@ -177,12 +194,15 @@ impl TerminalPane {
         let grid = (80, 24);
         let couldnt = |why: String| SharedString::from(format!("Couldn't start: {why}"));
         let program = match reader {
+            #[cfg(not(target_family = "wasm"))]
             Reader::Here => {
                 let mut command = CommandBuilder::new(&self.shell.0);
                 command.cwd(&place.path);
                 Program::local(command, grid).map_err(couldnt)
             }
-            Reader::There(ssh) => Ok(Program::remote(&ssh, &place.path, grid)),
+            #[cfg(target_family = "wasm")]
+            Reader::Here => unreachable!("a browser reads no machine's files itself"),
+            Reader::There(link) => Ok(Program::remote(&link, &place.path, grid)),
             Reader::Unread => Err("The session's machine isn't connected.".into()),
         };
         let terminal = program.and_then(|program| TerminalView::new(program, cx).map_err(couldnt));

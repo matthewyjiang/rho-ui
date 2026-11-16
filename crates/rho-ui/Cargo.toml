@@ -19,17 +19,39 @@ ratex-types = "0.1.15"
 # The terminal surface's emulator: Ghostty's libghostty-vt 1.0.1, built
 # with Zig (see mise.toml). From git until a release with vt-1.0.1 is out.
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", default-features = false }
-# The terminal surface's pseudo-terminal.
-portable-pty = "0.9"
 rho-ui-core = { path = "../rho-ui-core" }
 # The channel from the terminal's reader thread to the UI.
 futures = "0.3"
-# Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
-rquickjs = "0.11"
+# The state database (store.rs). In a browser, rusqlite builds SQLite for
+# wasm itself (sqlite-wasm-rs), and rho-ui keeps it in memory.
 rusqlite = { version = "0.41", features = ["bundled"] }
+# `Instant` and `SystemTime` that work in a browser too, where std's panic,
+# as GPUI's executor's are; std's own elsewhere.
+web-time = "1"
 # Reads what forge CLIs such as gh print as JSON; see src/forge.rs.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# In a browser: the page's address, and the fonts it fetches (web.rs);
+# pele, drawn by the browser's own JavaScript (pele.rs); `log` says what
+# went wrong in the console, where GPUI's web platform sends it.
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+log = "0.4"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["History", "Location", "Response", "Storage", "Window"] }
+# rusqlite's SQLite in a browser: this feature gives it the clock, sleep
+# and randomness it links against, from the page.
+sqlite-wasm-rs = { version = "0.6", features = ["wasm-bindgen"] }
+
+# Off the browser: the terminal's pseudo-terminal, and QuickJS for Mermaid
+# diagrams, which a browser runs as JavaScript itself.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# The terminal surface's pseudo-terminal.
+portable-pty = "0.9"
+# Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
+rquickjs = "0.11"
 
 [lints]
 workspace = true

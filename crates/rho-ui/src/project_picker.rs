@@ -522,9 +522,10 @@ impl ProjectPicker {
     }
 
     /// Adds a project on the chosen machine: from the desktop's folder
-    /// chooser on this one, else by browsing from `~/` in the search.
+    /// chooser on this one, else, or in a browser, by browsing from `~/`
+    /// in the search.
     fn add_project(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.list.read(cx).delegate().current.machine.is_local() {
+        if workspaces::reads_here(&self.list.read(cx).delegate().current.machine) {
             Self::browse(window, cx);
         } else {
             self.search("~/", window, cx);

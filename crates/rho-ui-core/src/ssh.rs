@@ -5,7 +5,7 @@
 //! One ssh connection per host carries everything ([`connection`]):
 //! [`connect`] opens it, or takes the open one, runs a setup script on
 //! the machine that starts its daemon and reports where it listens and
-//! the login environment ([`setup`]), then opens a `direct-streamlocal`
+//! the login environment ([`crate::setup`]), then opens a `direct-streamlocal`
 //! channel to the daemon's socket, as `ssh -W` does, and speaks rho's
 //! protocol over it. Every script after that runs in a session channel
 //! of its own on the same connection ([`script`]). The terminals' login
@@ -29,25 +29,23 @@ mod config;
 mod connection;
 mod host_key;
 mod script;
-mod setup;
 mod shell;
 
-use std::{ffi::OsStr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use rho_protocol::{Client, ClientError, ClientHello, HelloResponse, Notifications};
-use russh::{client::Msg, ChannelStream};
+use rho_protocol::{Client, ClientHello, HelloResponse, Notifications};
 
 pub(crate) use config::Resolved;
 #[cfg(feature = "test-support")]
 pub(crate) use config::{AgentKeys, IdentityAgent};
 pub use connection::MAX_SHELLS;
 use connection::{Lease, Purpose};
-use script::ScriptError;
-pub use shell::{RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput};
 
 use crate::{
-    daemon::{on_io, DaemonError, Machine, HANDSHAKE_DEADLINE},
-    platform,
+    daemon::{handshake, DaemonError, Machine},
+    exec::on_io,
+    link::{Link, ScriptError},
+    setup,
 };
 
 /// A rho daemon on another machine, reached over ssh.
@@ -130,47 +128,22 @@ pub(crate) async fn connect(
     hello: ClientHello,
 ) -> Result<(Client, Notifications, HelloResponse, Machine), DaemonError> {
     let link = target.open_link().await?;
-    let connection = link.lease.connection();
-    let setup = setup::run(connection, &target.rho).await?;
+    let connection = Arc::clone(link.lease.connection());
+    let link = Link::Ssh(link);
+    let setup = setup::run(&link, &target.rho).await?;
     let stream = connection.daemon(&setup.socket).await?;
-    let (client, notifications, hello) =
-        handshake(connection.host(), &setup.socket, stream, hello).await?;
+    let (client, notifications, hello) = handshake(
+        stream,
+        hello,
+        &format!("on {} at {}", connection.host(), setup.socket),
+    )
+    .await?;
     let machine = Machine {
         environment: setup.environment,
         home: Some(setup.home),
-        ssh: Some(link),
+        link: Some(link),
     };
     Ok((client, notifications, hello, machine))
-}
-
-/// Completes rho's handshake as `hello` over `stream`, a channel to the
-/// daemon at `socket` on `host`, within [`HANDSHAKE_DEADLINE`]. The
-/// channel lives as long as the client.
-///
-/// # Errors
-///
-/// Fails if the daemon doesn't answer; a daemon that answers with another
-/// protocol version says which side to update.
-async fn handshake(
-    host: &str,
-    socket: &str,
-    stream: ChannelStream<Msg>,
-    hello: ClientHello,
-) -> Result<(Client, Notifications, HelloResponse), DaemonError> {
-    match tokio::time::timeout(HANDSHAKE_DEADLINE, Client::handshake(stream, hello)).await {
-        Err(_) => Err(DaemonError::Unreachable(format!(
-            "the Rho daemon on {host} at {socket} didn't answer the handshake within {} s",
-            HANDSHAKE_DEADLINE.as_secs()
-        ))),
-        Ok(Ok(connected)) => Ok(connected),
-        // The daemon answered; its message names the side to update.
-        Ok(Err(error @ (ClientError::VersionMismatch(_) | ClientError::Rpc { .. }))) => {
-            Err(error.into())
-        }
-        Ok(Err(error)) => Err(DaemonError::Unreachable(format!(
-            "couldn't reach the Rho daemon on {host} at {socket}: {error}"
-        ))),
-    }
 }
 
 /// Runs `work`, which reads files, on Tokio's blocking threads, so the
@@ -217,93 +190,24 @@ impl std::fmt::Debug for SshLink {
 }
 
 impl SshLink {
-    /// Runs the POSIX `sh` script `script` on the machine, with `args` as
-    /// its positional parameters, and returns what it wrote to stdout. It
-    /// runs only on the connection the daemon connection opened: once that
-    /// is gone this fails rather than connect again, which could ask the
-    /// user's key agent for another approval.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the connection is gone, the machine refuses a session, the
-    /// script exits with an error, or it runs past 60 s.
-    pub async fn run_script(
-        &self,
-        script: &str,
-        args: &[impl AsRef<OsStr>],
-    ) -> Result<Vec<u8>, DaemonError> {
-        self.spawn_script(script, args, Some(script::SCRIPT_DEADLINE))
-            .await
+    /// The host, as the user named it.
+    pub(crate) fn host(&self) -> &str {
+        self.lease.connection().host()
     }
 
-    /// [`Self::run_script`] with no deadline, for a script whose time the
-    /// network and the work set, such as a `git clone`: it ends when the
-    /// script does, the connection does, or the caller drops the future,
-    /// which closes the script's channel.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the connection is gone, the machine refuses a session, or
-    /// the script exits with an error.
-    pub async fn run_long_script(
+    /// Runs `input` with `sh -s` on the host, on the I/O runtime, within
+    /// `deadline` if any. It runs only on the connection the daemon
+    /// connection opened: once that is gone this fails rather than connect
+    /// again, which could ask the user's key agent for another approval.
+    /// Dropping the future stops the script.
+    pub(crate) async fn script(
         &self,
-        script: &str,
-        args: &[impl AsRef<OsStr>],
-    ) -> Result<Vec<u8>, DaemonError> {
-        self.spawn_script(script, args, None).await
-    }
-
-    /// Runs [`script::run`] on the I/O runtime, with `args` set as the
-    /// script's positional parameters, and words how it failed. Dropping
-    /// the future stops the script.
-    async fn spawn_script(
-        &self,
-        script: &str,
-        args: &[impl AsRef<OsStr>],
+        input: Vec<u8>,
         deadline: Option<Duration>,
-    ) -> Result<Vec<u8>, DaemonError> {
-        let mut input = b"set --".to_vec();
-        for arg in args {
-            input.push(b' ');
-            input.extend(quote_bytes(&platform::path_to_bytes(arg.as_ref())));
-        }
-        input.push(b'\n');
-        input.extend(script.as_bytes());
+    ) -> Result<Vec<u8>, ScriptError> {
         let lease = Arc::clone(&self.lease);
-        let ran = on_io(async move { script::run(lease.connection(), &input, deadline).await });
-        let host = self.lease.connection().host();
-        ran.await?.map_err(|error| {
-            let why = match error {
-                ScriptError::Session(error) => return error,
-                ScriptError::TimedOut(deadline) => {
-                    format!("a script on {host} ran past {} s", deadline.as_secs())
-                }
-                ScriptError::Cut => format!("the connection to {host} closed while a script ran"),
-                ScriptError::Refused => {
-                    format!("a script on {host} failed: sshd refused to run sh")
-                }
-                ScriptError::Failed(why) => format!("a script on {host} failed: {why}"),
-            };
-            DaemonError::Unreachable(why)
-        })
+        on_io(async move { script::run(lease.connection(), &input, deadline).await })
+            .await
+            .map_err(ScriptError::Session)?
     }
-}
-
-/// `text` as one single-quoted POSIX shell word.
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
-}
-
-/// [`quote`] for bytes, such as a path that needn't be UTF-8.
-fn quote_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut quoted = vec![b'\''];
-    for &byte in bytes {
-        if byte == b'\'' {
-            quoted.extend(br"'\''");
-        } else {
-            quoted.push(byte);
-        }
-    }
-    quoted.push(b'\'');
-    quoted
 }

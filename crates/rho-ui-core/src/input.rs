@@ -10,10 +10,9 @@
 //!   at the deadline unless a client holds it first
 //!   ([`crate::Daemon::hold`]).
 
-use std::{
-    collections::BTreeMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, time::Duration};
+
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use rho_protocol::{
     Ask, DefaultStyle, InputAnswer, InputAsker, InputTimeout, Operation, PermissionMode,

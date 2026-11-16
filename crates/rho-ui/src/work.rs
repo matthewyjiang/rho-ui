@@ -5,10 +5,9 @@
 //! is just that step's line. While the turn runs, the folded summary line
 //! shows the newest step instead.
 
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, time::Duration};
+
+use web_time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;

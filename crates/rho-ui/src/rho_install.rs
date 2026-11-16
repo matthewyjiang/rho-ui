@@ -4,10 +4,9 @@
 //! that for every machine; [`Installs::offer`] says what the views offer:
 //! the setup screen, the sidebar's footer, and Settings › About.
 
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Duration};
+
+use web_time::Instant;
 
 use gpui_kit::component::{
     alert::Alert,
@@ -202,6 +201,7 @@ impl Installs {
     /// of its program when `--rho` gave a path, else the installer's.
     fn local_install_dir(&self, cx: &App) -> String {
         match self.rho(&MachineId::local(), cx) {
+            #[cfg(not(target_family = "wasm"))]
             Some(RhoInstall::Here { rho }) if rho.components().count() > 1 => {
                 rho.parent().map_or_default(|dir| dir.display().to_string())
             }

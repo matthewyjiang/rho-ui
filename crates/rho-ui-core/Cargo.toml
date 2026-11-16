@@ -18,15 +18,35 @@ test-support = ["dep:portable-pty", "dep:tempfile", "tokio/time"]
 base64 = "0.22"
 # `platform::canonicalize`: a resolved path without Windows' `\\?\` prefix.
 dunce = "1"
-# This machine's hostname, for the `%l`, `%L` and `%C` tokens of an ssh
-# config's `IdentityFile` (`ssh/config.rs`). Already in the lock, under GPUI.
-gethostname = "1"
 # Highlights what a search matched, with the pattern rho's grep used.
 regex = "1"
 # `fake_sshd`'s pseudo-terminals, for a remote terminal's tests. rho-ui runs
 # its own terminals with it, so it is in the lock already.
 portable-pty = { version = "0.9", optional = true }
+# Polls rho-ui-serve's WebSockets (`server/ws.rs`), and joins a connection's
+# reads and writes.
+futures = "0.3"
 rho-protocol.workspace = true
+# Reads `rho update --check --json` (`rho_install.rs`) and a remote
+# machine's `rho daemon status --json` (`setup.rs`).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+tempfile = { version = "3", optional = true }
+thiserror = "2"
+# `Instant` and `SystemTime` that work in a browser too, where std's panic;
+# std's own elsewhere. Already in the lock, under GPUI.
+web-time = "1"
+# rho-protocol's stream traits and channels, everywhere; `macros` waits on
+# a script's input and output at once (`ssh/script.rs`).
+tokio = { version = "1.36", features = ["io-util", "macros", "sync"] }
+
+# Off the browser: the ssh client, this machine's daemon and programs, and
+# the runtime they run on.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# This machine's hostname, for the `%l`, `%L` and `%C` tokens of an ssh
+# config's `IdentityFile` (`ssh/config.rs`). Already in the lock, under GPUI.
+gethostname = "1"
 # Checks a hashed `known_hosts` entry, HMAC-SHA1 (`ssh/host_key.rs`), and
 # makes the `%C` token, SHA-1 (`ssh/config.rs`). russh's crypto backend
 # below, so no second copy.
@@ -40,21 +60,22 @@ ring = "0.17"
 # Windows), come without a feature. russh brings a Pageant client too, which
 # rho-ui doesn't use (`ssh/auth.rs` says why).
 russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
-# Reads `rho update --check --json` (`rho_install.rs`) and a remote
-# machine's `rho daemon status --json` (`ssh/setup.rs`).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-similar = "2"
-tempfile = { version = "3", optional = true }
-thiserror = "2"
 # The runtime rho-protocol's `Client` and russh need, for the daemon socket
 # and the ssh connection that carries a remote one; see `daemon.rs`.
-# `process` runs `ssh -G` to read the user's ssh config (`ssh/config.rs`);
-# `macros` waits on a script's input and output at once (`ssh/script.rs`).
-tokio = { version = "1.36", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+# `process` runs `ssh -G` to read the user's ssh config (`ssh/config.rs`).
+tokio = { version = "1.36", features = ["net", "process", "rt-multi-thread", "time"] }
+# A WebSocket to rho-ui-serve, off the browser (`server/ws.rs`): the same
+# version axum, which rho-ui-serve answers with, uses.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+
+# In a browser: its WebSocket and timer.
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "Event", "MessageEvent", "WebSocket", "Window"] }
 
 [dev-dependencies]
-futures = "0.3"
 rho-ui-core = { path = ".", features = ["test-support"] }
 smol = "2"
 tempfile = "3"

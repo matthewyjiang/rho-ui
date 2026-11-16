@@ -793,7 +793,9 @@ impl RenderOnce for Composer {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(attach)
+                    // A browser's file chooser gives the page's files, not
+                    // the machine's paths a prompt names; paste still works.
+                    .children(cfg!(not(target_family = "wasm")).then_some(attach))
                     .child(
                         h_flex()
                             .flex_1()

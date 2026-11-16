@@ -17,37 +17,44 @@
 //! any executor can await, and replies cross over on channels or task
 //! handles.
 
+#[cfg(not(target_family = "wasm"))]
+use std::process::Command;
 use std::{
-    future::Future,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
-    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobListParams,
-    LoginId, LoginOutcome, LoginPrompt, Notifications, RestartParams, SessionAnswerParams,
-    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
-    SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
-    SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
-    SessionSteerParams, SessionUnsteerParams, SettingChange, SignIn, StatusParams, TurnOutcome,
-    UnsteerOutcome,
+    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, HelloResponse, IdleWake,
+    JobListParams, LoginId, LoginOutcome, LoginPrompt, Notifications, RestartParams,
+    SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams,
+    SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionHoldParams,
+    SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
+    SessionRenameParams, SessionSteerParams, SessionUnsteerParams, SettingChange, SignIn,
+    StatusParams, TurnOutcome, UnsteerOutcome,
 };
-use tokio::{runtime::Runtime, task::JoinHandle};
+use tokio::io::{AsyncRead, AsyncWrite};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     agent_settings::{AgentSettings, AgentSettingsChanged},
     background::BackgroundId,
+    exec,
     input::{Answer, InputId},
     jobs::Jobs,
+    link::Link,
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
-    platform,
     prompt::{mebibytes, Prompt},
+    server::{self, ServerTarget},
     session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
-    ssh::{self, SshLink, SshTarget},
+};
+#[cfg(not(target_family = "wasm"))]
+use crate::{
+    platform,
+    ssh::{self, SshTarget},
 };
 
 mod auth;
@@ -58,6 +65,7 @@ pub enum DaemonTarget {
     /// The daemon of the rho home `home`, found where rho-protocol's
     /// `LocalDaemon` says it listens. When none runs there, `rho daemon
     /// start` through the program `rho` starts it.
+    #[cfg(not(target_family = "wasm"))]
     Home {
         /// The rho home, such as `~/.rho`.
         home: PathBuf,
@@ -65,13 +73,19 @@ pub enum DaemonTarget {
         rho: PathBuf,
     },
     /// A daemon already listening on this socket.
+    #[cfg(not(target_family = "wasm"))]
     Socket(PathBuf),
     /// The daemon of the default rho home on another machine, reached over
     /// ssh and started there when none runs. Its sessions run in that
     /// machine's login environment.
+    #[cfg(not(target_family = "wasm"))]
     Ssh(SshTarget),
+    /// The daemon of the default rho home on the machine of a rho-ui-serve,
+    /// as rho-ui's web build reaches it; see `server.rs`.
+    Server(ServerTarget),
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl DaemonTarget {
     /// The daemon of the rho home `rho` itself uses
     /// ([`platform::rho_home`]), started through the program `rho`; `None`
@@ -378,7 +392,7 @@ pub struct Daemon {
     /// What every request that carries an environment sends, which rho
     /// makes the session's whole process environment.
     environment: Arc<ClientEnvironment>,
-    ssh: Option<SshLink>,
+    link: Option<Link>,
 }
 
 /// The machine the daemon runs on, as the sessions this client opens see it.
@@ -388,17 +402,19 @@ pub(crate) struct Machine {
     pub(crate) environment: ClientEnvironment,
     /// The home directory there.
     pub(crate) home: Option<PathBuf>,
-    /// How to run commands there, for a remote machine.
-    pub(crate) ssh: Option<SshLink>,
+    /// How to run commands there, for a machine reached through ssh or
+    /// rho-ui-serve.
+    pub(crate) link: Option<Link>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Machine {
     /// This machine, as this process sees it.
     fn this_process() -> Self {
         Self {
             environment: ClientEnvironment::of_this_process(),
             home: platform::home_dir(),
-            ssh: None,
+            link: None,
         }
     }
 }
@@ -419,53 +435,6 @@ const _: () = {
     assert_send::<DaemonEvents>();
 };
 
-/// The runtime the connection's socket I/O runs on, made on first use and
-/// kept for the life of the process. One worker: the work is the daemon
-/// sockets' reads and writes, `LocalDaemon` waiting on `rho daemon start`,
-/// and for a daemon on another machine, the ssh connection that carries
-/// its socket and the scripts run there.
-pub(crate) fn io() -> &'static Runtime {
-    static IO: OnceLock<Runtime> = OnceLock::new();
-    IO.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("rho-ui-daemon-io")
-            .enable_io()
-            // The handshake's deadline, those on a remote machine's
-            // scripts, and the ssh connection's keepalives; see `ssh.rs`.
-            .enable_time()
-            .build()
-            .expect("the OS lets this process start a thread and an I/O driver")
-    })
-}
-
-/// Runs `future` on the I/O runtime and waits for it. Dropping the future
-/// this returns stops the task, and drops what the task holds, such as a
-/// half-open connection or a script's ssh channel, so a caller that stops
-/// waiting leaves nothing running.
-///
-/// # Errors
-///
-/// [`DaemonError::Closed`] if the task panicked.
-pub(crate) async fn on_io<F>(future: F) -> Result<F::Output, DaemonError>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let mut task = AbortOnDrop(io().spawn(future));
-    (&mut task.0).await.map_err(|_| DaemonError::Closed)
-}
-
-/// A task on the I/O runtime that stops when this is dropped.
-struct AbortOnDrop<T>(JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        // Does nothing to a task that has finished.
-        self.0.abort();
-    }
-}
-
 /// How long a daemon may take to answer the handshake once its socket
 /// connected, at a socket target or over an ssh channel. A daemon that accepts
 /// and never answers would otherwise hold the connection attempt forever.
@@ -476,18 +445,65 @@ impl<T> Drop for AbortOnDrop<T> {
 /// deadline, which covers a whole login and `rho daemon start`.
 pub(crate) const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 
+/// A daemon's stream: what [`handshake`] runs the connection's I/O on.
+/// Natively the I/O runtime runs it, so it must be `Send`; a browser runs
+/// it on the page's one thread.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) trait DaemonStream: AsyncRead + AsyncWrite + Send + 'static {}
+#[cfg(not(target_family = "wasm"))]
+impl<S: AsyncRead + AsyncWrite + Send + 'static> DaemonStream for S {}
+#[cfg(target_family = "wasm")]
+pub(crate) trait DaemonStream: AsyncRead + AsyncWrite + 'static {}
+#[cfg(target_family = "wasm")]
+impl<S: AsyncRead + AsyncWrite + 'static> DaemonStream for S {}
+
+/// Completes rho's handshake as `hello` over `stream`, to the daemon
+/// `where_` (in words for an error, such as `at /run/rho.sock`), within
+/// [`HANDSHAKE_DEADLINE`], and runs the connection's I/O with
+/// [`exec::spawn_io`]. Natively, call it on the I/O runtime.
+///
+/// # Errors
+///
+/// Fails if the daemon doesn't answer in time or the stream fails; a
+/// daemon that answers with another protocol version says which side to
+/// update.
+pub(crate) async fn handshake(
+    stream: impl DaemonStream,
+    hello: ClientHello,
+    where_: &str,
+) -> Result<(Client, Notifications, HelloResponse), DaemonError> {
+    let (handshake, io) = Client::handshake_with_io(stream, hello);
+    exec::spawn_io(io);
+    match exec::within(HANDSHAKE_DEADLINE, handshake).await {
+        Err(_) => Err(DaemonError::Unreachable(format!(
+            "the Rho daemon {where_} didn't answer the handshake within {} s",
+            HANDSHAKE_DEADLINE.as_secs()
+        ))),
+        Ok(Ok(connected)) => Ok(connected),
+        // The daemon answered; its message names the side to update.
+        Ok(Err(error @ (ClientError::VersionMismatch(_) | ClientError::Rpc { .. }))) => {
+            Err(error.into())
+        }
+        Ok(Err(error)) => Err(DaemonError::Unreachable(format!(
+            "couldn't reach the Rho daemon {where_}: {error}"
+        ))),
+    }
+}
+
 async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonError> {
     let hello = ClientHello::frontend(ClientInfo {
         name: "rho-ui".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
     });
     let (client, notifications, hello, machine) = match target {
+        #[cfg(not(target_family = "wasm"))]
         DaemonTarget::Home { home, rho } => {
             let rho = Command::new(crate::rho_install::find_rho(&rho));
             let (client, notifications, hello) =
                 platform::endpoint::connect_or_start(home, rho, hello).await?;
             (client, notifications, hello, Machine::this_process())
         }
+        #[cfg(not(target_family = "wasm"))]
         DaemonTarget::Socket(socket) => {
             let stream = platform::endpoint::connect(&socket)
                 .await
@@ -497,19 +513,13 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
                         socket.display()
                     ))
                 })?;
-            let (client, notifications, hello) =
-                tokio::time::timeout(HANDSHAKE_DEADLINE, Client::handshake(stream, hello))
-                    .await
-                    .map_err(|_| {
-                        DaemonError::Unreachable(format!(
-                            "the Rho daemon at {} didn't answer the handshake within {} s",
-                            socket.display(),
-                            HANDSHAKE_DEADLINE.as_secs()
-                        ))
-                    })??;
+            let where_ = format!("at {}", socket.display());
+            let (client, notifications, hello) = handshake(stream, hello, &where_).await?;
             (client, notifications, hello, Machine::this_process())
         }
+        #[cfg(not(target_family = "wasm"))]
         DaemonTarget::Ssh(target) => ssh::connect(&target, hello).await?,
+        DaemonTarget::Server(target) => server::connect(&target, hello).await?,
     };
     let info = DaemonInfo {
         version: hello.daemon.version,
@@ -520,7 +530,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         client: Arc::new(client),
         info: Arc::new(info),
         environment: Arc::new(machine.environment),
-        ssh: machine.ssh,
+        link: machine.link,
     };
     let events = DaemonEvents { notifications };
     Ok((daemon, events))
@@ -529,14 +539,19 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
 /// Names this process's settings writes (see `ConfigSetParams::writer`):
 /// a revision stays good for a writer while only its own writes followed
 /// it, so two quick changes from this app never conflict with each other.
-/// Unique to this run of the app: its process ID and when it first wrote.
+/// Unique to this run of the app: its process ID, or in a browser, which
+/// has none, a random number, and when it first wrote.
 fn writer() -> &'static ConfigWriter {
     static WRITER: OnceLock<ConfigWriter> = OnceLock::new();
     WRITER.get_or_init(|| {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
-        ConfigWriter::new(format!("rho-ui-{}-{nanos}", std::process::id()))
+        #[cfg(not(target_family = "wasm"))]
+        let run = std::process::id();
+        #[cfg(target_family = "wasm")]
+        let run = js_sys::Math::random().to_bits();
+        ConfigWriter::new(format!("rho-ui-{run}-{nanos}"))
     })
 }
 
@@ -569,7 +584,7 @@ impl Daemon {
     /// speaks another protocol version; the message then says which side
     /// to update.
     pub async fn connect(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonError> {
-        on_io(open(target)).await?
+        exec::on_io(open(target)).await?
     }
 
     /// Who answered `rho/hello`.
@@ -577,9 +592,10 @@ impl Daemon {
         &self.info
     }
 
-    /// The ssh link to the daemon's machine, for a remote one.
-    pub fn ssh(&self) -> Option<&SshLink> {
-        self.ssh.as_ref()
+    /// How to run scripts on the daemon's machine, for one reached through
+    /// ssh or rho-ui-serve.
+    pub fn link(&self) -> Option<&Link> {
+        self.link.as_ref()
     }
 
     /// Saved sessions in every workspace, newest first.

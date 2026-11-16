@@ -29,6 +29,7 @@ use rho_ui_core::{AuthKind, AuthStatus, AuthSummary, LoginPrompt};
 use crate::{
     auths::{login_page, opens_in_browser, Auths, Note},
     machines::MachineId,
+    workspaces,
 };
 
 /// A masked box for an API key.
@@ -121,6 +122,27 @@ pub(crate) fn controls(
     }
 }
 
+/// Why a login without a device code may not finish, for `machine`'s
+/// daemon reached through a link, a remote one or in a browser this
+/// machine's: it signs in with a device code where the provider has one
+/// (`Daemon::login`), and a provider without sends the browser back to the
+/// daemon's own machine, which a browser elsewhere can't reach. `None` for
+/// a daemon rho-ui reaches here.
+fn browser_elsewhere(machine: &MachineId) -> Option<String> {
+    if workspaces::reads_here(machine) {
+        return None;
+    }
+    let on = if machine.is_local() {
+        "the machine rho-ui-serve runs on".to_owned()
+    } else {
+        machine.to_string()
+    };
+    Some(format!(
+        "If the browser can't finish, this provider signs in only from a browser on {on}; use \
+         an API key instead."
+    ))
+}
+
 /// A login under way: until its prompt arrives, that it is starting;
 /// then what to do, the page with a button to copy it, any code to enter
 /// there, also to copy, and a spinner while it waits. Cancel stops it.
@@ -173,15 +195,9 @@ fn login_progress(
     } else {
         div().text_sm().child(shown).into_any_element()
     };
-    // A remote daemon signs in with a device code where the provider has
-    // one; a provider without sends the browser back to the daemon's own
-    // machine, which a browser here can't reach.
-    let elsewhere = (!machine.is_local() && prompt.user_code.is_none()).then(|| {
-        format!(
-            "If the browser can't finish, this provider signs in only from a browser on \
-             {machine}; use an API key instead."
-        )
-    });
+    let elsewhere = (prompt.user_code.is_none())
+        .then(|| browser_elsewhere(machine))
+        .flatten();
     v_flex()
         .id(SharedString::from(format!("{ids}-prompt")))
         .test_support()

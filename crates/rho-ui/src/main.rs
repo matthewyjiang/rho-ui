@@ -3,6 +3,9 @@
 //! `rho-ui [DIR] [--rho PROGRAM]` opens one window. DIR is the workspace for
 //! new sessions (default: the current directory); PROGRAM is the `rho` that
 //! starts the daemon when none runs (default: `rho` on `PATH`).
+//!
+//! Built for wasm, it is rho-ui's web build instead, which rho-ui-serve
+//! serves to a browser; `web.rs` starts it.
 
 mod app;
 #[cfg(target_os = "macos")]
@@ -51,30 +54,41 @@ mod turn_times;
 #[cfg(test)]
 mod ui_tests;
 mod usage;
+#[cfg(target_family = "wasm")]
+mod web;
 mod work;
 mod workspaces;
 
-use std::{borrow::Cow, path::PathBuf, rc::Rc};
+#[cfg(not(target_family = "wasm"))]
+use std::path::PathBuf;
+use std::{borrow::Cow, rc::Rc};
 
 use gpui_kit::component::input::{Copy, Enter, Paste};
+use gpui_kit::AppContext as _;
+#[cfg(not(target_family = "wasm"))]
+use gpui_kit::QuitMode;
 use gpui_kit::{
-    px, size, Action, App, AppContext as _, AssetSource, Axis, KeyBinding,
-    KeyBindingContextPredicate, NoAction, QuitMode, SharedString, TitlebarOptions, WindowBounds,
-    WindowOptions,
+    px, size, Action, App, AssetSource, Axis, KeyBinding, KeyBindingContextPredicate, NoAction,
+    SharedString, TitlebarOptions, WindowBounds, WindowOptions,
 };
+#[cfg(not(target_family = "wasm"))]
 use rho_ui_core::{DaemonTarget, RhoInstall};
 
 use crate::{
     app::{LaunchConfig, RhoApp},
     background_log::BackgroundLog,
-    machines::{Reach, RemoteMachine},
     project_picker::LastCheckout,
     projects::Projects,
-    right_panel::{Direction, PaneCommand, PanelLayout, TerminalShell, TerminalShortcut},
+    right_panel::{Direction, PaneCommand, PanelLayout, TerminalShortcut},
     settings::Settings,
     sidebar::SidebarState,
     store::StateDb,
     turn_times::TurnTimes,
+};
+#[cfg(not(target_family = "wasm"))]
+use crate::{
+    machines::{Reach, RemoteMachine},
+    right_panel::TerminalShell,
 };
 
 gpui_kit::actions!(
@@ -160,28 +174,39 @@ gpui_kit::assets::icon_assets!(
     ]
 );
 
-/// GPUI Kit's default icons plus [`ExtraIcons`], all borrowed from static
-/// storage.
-struct Assets;
+/// GPUI Kit's default icons plus [`ExtraIcons`]. Natively all are borrowed
+/// from static storage; in a browser, Kit's own come from the server, at
+/// `/assets/icons/`, as each is first drawn.
+struct Assets(gpui_kit::assets::Assets);
+
+impl Assets {
+    /// Kit's icons from `server`, the page's origin, in a browser; native
+    /// builds ignore it.
+    fn new(server: &str) -> Self {
+        Self(gpui_kit::assets::Assets::new(server.to_owned()))
+    }
+}
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
         match ExtraIcons.load(path)? {
             Some(icon) => Ok(Some(icon)),
-            None => gpui_kit::assets::Assets.load(path),
+            None => self.0.load(path),
         }
     }
 
     fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
-        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        let mut paths = self.0.list(path)?;
         paths.extend(ExtraIcons.list(path)?);
         Ok(paths)
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 const USAGE: &str = "usage: rho-ui [DIR] [--rho PROGRAM]";
 
 /// Parses `[DIR] [--rho PROGRAM]`. Returns the usage text on bad input.
+#[cfg(not(target_family = "wasm"))]
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, String> {
     let mut args = args.into_iter();
     let mut dir: Option<PathBuf> = None;
@@ -212,7 +237,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
     }
     let daemon = DaemonTarget::rho(&rho).ok_or("can't find the rho home: set RHO_HOME or HOME")?;
     Ok(LaunchConfig {
-        workspace,
+        workspace: Some(workspace),
         local: Reach {
             daemon,
             rho: Some(RhoInstall::Here { rho }),
@@ -222,6 +247,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
     })
 }
 
+#[cfg(target_family = "wasm")]
+fn main() {
+    web::main();
+}
+
+#[cfg(not(target_family = "wasm"))]
 #[expect(
     clippy::print_stderr,
     reason = "a command-line error goes to stderr before any window exists"
@@ -239,27 +270,32 @@ fn main() {
     // app running with none: rho-ui has one window and no menu bar or Dock
     // menu to open another.
     gpui_kit::application()
-        .with_assets(Assets)
+        .with_assets(Assets::new(""))
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx| {
-            let db = StateDb::open();
-            init(cx, &db);
-            // pele takes about 100 ms to load: started now, it's ready for the
-            // first diagram. Tests load it when they draw one, so the load
-            // doesn't slow the tests that time animations.
-            pele::start();
-            Settings::load().apply(cx);
-            let options = window_options(cx);
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| {
-                    let sidebar = SidebarState::load(&db, time::now_unix());
-                    let projects = Projects::load(&db);
-                    RhoApp::new(launch, sidebar, projects, window, cx)
-                })
-            })
-            .expect("failed to open the rho-ui window");
+            open_app(launch, &StateDb::open(), cx);
             cx.activate(true);
         });
+}
+
+/// Sets the app up and opens its window, remembering things in `db`: the
+/// desktop's start, and the browser's once its fonts are in.
+fn open_app(launch: LaunchConfig, db: &StateDb, cx: &mut App) {
+    init(cx, db);
+    // pele takes about 100 ms to load: started now, it's ready for the
+    // first diagram. Tests load it when they draw one, so the load doesn't
+    // slow the tests that time animations.
+    pele::start();
+    Settings::load().apply(cx);
+    let options = window_options(cx);
+    gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| {
+            let sidebar = SidebarState::load(db, time::now_unix());
+            let projects = Projects::load(db);
+            RhoApp::new(launch, sidebar, projects, window, cx)
+        })
+    })
+    .expect("failed to open the rho-ui window");
 }
 
 /// App-wide setup shared by `main` and the UI tests: GPUI Kit, the theme
@@ -465,7 +501,7 @@ mod tests {
                     last = Some(c);
                 }
                 let path = format!("icons/{stem}.svg");
-                !Assets.load(&path).is_ok_and(|icon| icon.is_some())
+                !Assets::new("").load(&path).is_ok_and(|icon| icon.is_some())
             })
             .collect();
         assert_eq!(missing, Vec::<&str>::new(), "add them to `ExtraIcons`");
@@ -482,7 +518,7 @@ mod tests {
         let launch = parse(&[workspace, "--rho", "/opt/rho/bin/rho"]).unwrap();
         assert_eq!(
             launch.workspace,
-            rho_ui_core::platform::canonicalize(&dir).unwrap()
+            Some(rho_ui_core::platform::canonicalize(&dir).unwrap())
         );
         // Both sides read the rho home from this process's environment.
         assert_eq!(

@@ -7,7 +7,9 @@
 use std::{fmt, path::PathBuf};
 
 use gpui_kit::SharedString;
-use rho_ui_core::{DaemonTarget, RhoInstall, SessionId, SshTarget};
+#[cfg(not(target_family = "wasm"))]
+use rho_ui_core::SshTarget;
+use rho_ui_core::{DaemonTarget, RhoInstall, SessionId};
 
 use crate::forge::CliPaths;
 
@@ -25,6 +27,10 @@ impl MachineId {
     }
 
     /// The remote machine reached at SSH host `host`.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "a browser reaches no ssh machines yet")
+    )]
     pub(crate) fn remote(host: &str) -> Self {
         Self(host.to_owned().into())
     }
@@ -102,11 +108,19 @@ impl RemoteMachine {
         }
     }
 
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "a browser reaches no ssh machines yet")
+    )]
     pub(crate) fn id(&self) -> MachineId {
         MachineId::remote(&self.host)
     }
 
     /// The label to show: the one set, else the host.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "a browser reaches no ssh machines yet")
+    )]
     pub(crate) fn shown_label(&self) -> &str {
         if self.label.is_empty() {
             &self.host
@@ -139,6 +153,7 @@ pub(crate) struct Reach {
     pub(crate) rho: Option<RhoInstall>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl RemoteMachine {
     /// How rho-ui reaches it: over ssh.
     pub(crate) fn ssh_reach(&self) -> Reach {

@@ -19,7 +19,12 @@ use crate::{
 /// The UI font when none is set.
 pub(crate) const DEFAULT_UI_FONT: &str = "Noto Sans";
 /// The code font when none is set.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) const DEFAULT_CODE_FONT: &str = "JetBrainsMono Nerd Font";
+/// The code font when none is set: in a browser, the one the page loads
+/// (`web.rs`).
+#[cfg(target_family = "wasm")]
+pub(crate) const DEFAULT_CODE_FONT: &str = "JetBrains Mono";
 
 /// GPUI Kit's base sizes, which the scale multiplies. The UI size is also
 /// the rem, so every rem-based length follows it.

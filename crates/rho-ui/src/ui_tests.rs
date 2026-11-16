@@ -10,8 +10,10 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use web_time::Instant;
 
 use gpui_kit::test::{
     ClickOptions, TestEventExt as _, TestInput, TestQueryExt as _, TestWindowExt as _,
@@ -273,7 +275,7 @@ impl Harness {
         }
         let mut cx = HeadlessAppContext::with_platform(
             text_system(),
-            Arc::new(crate::Assets),
+            Arc::new(crate::Assets::new("")),
             headless_renderer,
         );
         // The daemon's answers arrive on a socket: its I/O thread wakes
@@ -284,7 +286,7 @@ impl Harness {
         // A remote machine reaches its fake daemon, never ssh: a host
         // without one gets a socket that isn't there.
         let launch = LaunchConfig {
-            workspace: workspace.unwrap_or_else(std::env::temp_dir),
+            workspace: Some(workspace.unwrap_or_else(std::env::temp_dir)),
             local: Reach {
                 daemon: target.clone(),
                 rho: rho.clone(),

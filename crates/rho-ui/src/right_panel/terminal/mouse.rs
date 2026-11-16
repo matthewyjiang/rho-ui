@@ -5,7 +5,9 @@
 //! drag is past the top or bottom, the middle button pastes the primary
 //! selection, and the right button opens the pane's menu.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use gpui_kit::{
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
