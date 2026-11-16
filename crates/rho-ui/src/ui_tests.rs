@@ -26,6 +26,7 @@ use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{
         subagent_result, write_program, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION,
+        WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
     Delay, Entry, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
@@ -4235,6 +4236,50 @@ fn a_subagents_session_opens_nested_under_its_parent() {
     ui.wait_for_session("the subagent's session as saved", subagent_saved);
     ui.shot("reopened");
     restart_and_open_the_ended_run(ui, &parent);
+}
+
+/// The daemon's job list says what a session's background list can't: the
+/// Background surface nests a workflow's agent runs under it, a failed one
+/// with the daemon's reason. The list above the composer stays one row per
+/// piece of work.
+#[test]
+fn a_workflows_agent_runs_nest_under_it_with_why_one_failed() {
+    let mut ui = Harness::start("workflow-runs", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_session("s1 attached", |session| {
+        session.title() == Some("first") && !session.is_replaying()
+    });
+    ui.fake().start_workflow(&SessionId::from("s1"));
+    ui.wait_until("the workflow", |window, _, _| {
+        is_visible(window, "background-0")
+    });
+    // The next listing of the jobs, on the app's clock.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-background");
+    ui.wait_until("the workflow's agent runs", |window, _, _| {
+        is_visible(window, "panel-background-0-run-0")
+            && is_visible(window, "panel-background-0-run-1")
+    });
+    assert_eq!(
+        ui.label("panel-background-0-run-1-error").as_deref(),
+        Some(WORKFLOW_ERROR),
+        "the failed run says why, in the daemon's words"
+    );
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "panel-background-0-run-0-error"),
+            "the queued run hasn't failed"
+        );
+        assert!(
+            !is_visible(window, "background-0-run-0"),
+            "the list above the composer doesn't nest runs"
+        );
+    });
+    ui.shot("nested");
 }
 
 /// Whether `session` is the subagent's of

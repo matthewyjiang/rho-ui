@@ -61,6 +61,17 @@ impl BackgroundId {
         })
     }
 
+    /// A subagent's own session, once it opened one.
+    pub(crate) fn session(&self) -> Option<SessionId> {
+        match &self.0 {
+            rho_protocol::BackgroundItem::Subagent {
+                session: Some(session),
+                ..
+            } => Some(session.clone().into()),
+            _ => None,
+        }
+    }
+
     /// What names the work for its whole life: its kind, and the ID the
     /// daemon gave it within that kind. `None` for a kind this client does
     /// not know, which equals nothing.
@@ -148,13 +159,7 @@ impl BackgroundWork {
     /// A subagent's own session, once it opened one. Follow it with
     /// [`crate::Daemon::observe`]; only the subagent writes to it.
     pub fn session(&self) -> Option<SessionId> {
-        match &self.id.0 {
-            rho_protocol::BackgroundItem::Subagent {
-                session: Some(session),
-                ..
-            } => Some(session.clone().into()),
-            _ => None,
-        }
+        self.id.session()
     }
 
     /// What it shows as: a process's command line, a workflow's name, a

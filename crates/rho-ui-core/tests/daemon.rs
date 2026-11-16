@@ -366,7 +366,7 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
     });
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
-        let jobs = daemon.active_jobs().await.unwrap();
+        let jobs = daemon.jobs().await.unwrap().active;
         let [job] = jobs.as_slice() else {
             panic!("one job runs: {jobs:?}")
         };
@@ -407,7 +407,7 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
         );
         assert_eq!(session.pending_steers().count(), 0);
         assert_eq!(session.take_dropped_steers(), Vec::<String>::new());
-        assert!(daemon.active_jobs().await.unwrap().is_empty());
+        assert!(daemon.jobs().await.unwrap().active.is_empty());
 
         // Between turns nothing takes a steer.
         let refused = daemon.steer(session.id(), "too late").await.unwrap_err();
