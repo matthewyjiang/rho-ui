@@ -2,7 +2,7 @@
 //! sessions on, signed in first, then those that take an API key, then
 //! those that take an account's login, each signed in or out from here
 //! (see [`crate::sign_in`]); and the credential store Rho keeps them in,
-//! which can be chosen while no setting chose it, or Rho can't reach it.
+//! which can be changed here unless `RHO_CREDENTIAL_STORE` chooses it.
 //!
 //! Every machine's Rho has its own sign-ins. With more than one machine, a
 //! picker heads the page; this machine shows first. Opening the page, or
@@ -193,25 +193,14 @@ impl SettingsView {
         if let Some(store) = auths.store(&machine) {
             page = page.group(SettingGroup::new().item(self.store_item(&machine, store, cx)));
         }
-        let groups = [
-            ("Signed in", Some(AuthStatus::SignedIn), None),
-            ("API keys", None, Some(AuthKind::ApiKey)),
-            ("Accounts", None, Some(AuthKind::Login)),
-        ];
-        for (title, status, kind) in groups {
+        for group in Group::ALL {
             let items: Vec<SettingItem> = profiles
                 .iter()
-                .filter(|profile| match (status, kind) {
-                    (Some(status), _) => profile.status == status,
-                    (None, Some(kind)) => {
-                        profile.status != AuthStatus::SignedIn && profile.kind == kind
-                    }
-                    (None, None) => false,
-                })
+                .filter(|profile| Group::of(profile) == Some(group))
                 .map(|profile| self.profile_item(&machine, profile, cx))
                 .collect();
             if !items.is_empty() {
-                page = page.group(SettingGroup::new().title(title).items(items));
+                page = page.group(SettingGroup::new().title(group.title()).items(items));
             }
         }
         page
@@ -230,7 +219,10 @@ impl SettingsView {
                 "Nothing has chosen one, so Rho uses the OS keyring. Choose where new sign-ins go."
             }
             StoreSelectedBy::Environment => "RHO_CREDENTIAL_STORE chooses it; change it there.",
-            _ => "Chosen in Rho's config. Sign-ins saved before a change stay where they were.",
+            StoreSelectedBy::Config => {
+                "Chosen in Rho's config. Sign-ins saved before a change stay where they were."
+            }
+            _ => "Chosen by something this version of rho-ui doesn't know.",
         };
         let notes = [
             store
@@ -247,27 +239,35 @@ impl SettingsView {
             .chain(notes.into_iter().flatten())
             .collect::<Vec<_>>()
             .join("\n");
-        let field = if store.selected_by == StoreSelectedBy::Environment {
-            value(store_name(store.store), Tone::Plain)
-        } else {
-            let choices = [CredentialStoreKind::Os, CredentialStoreKind::File]
-                .map(|kind| (store_value(kind), SharedString::from(store_name(kind))));
-            let current = store_value(store.store);
-            let (auths, machine) = (self.providers.auths.clone(), machine.clone());
-            SettingField::dropdown(
-                choices.to_vec(),
-                move |_: &App| current.clone(),
-                move |chosen: SharedString, cx: &mut App| {
-                    let kind = if chosen == store_value(CredentialStoreKind::File) {
-                        CredentialStoreKind::File
-                    } else {
-                        CredentialStoreKind::Os
-                    };
-                    auths.update(cx, |auths, cx| auths.choose_store(&machine, kind, cx));
-                },
-            )
-            .w(rems(CONTROL_REMS))
-            .justify_between()
+        // A store or a choice this version doesn't know is shown, not
+        // changed.
+        let known = STORES.iter().find(|(kind, _, _)| *kind == store.store);
+        let changeable = matches!(
+            store.selected_by,
+            StoreSelectedBy::Default | StoreSelectedBy::Config
+        );
+        let field = match known {
+            Some(&(_, current, _)) if changeable => {
+                let choices = STORES
+                    .map(|(_, value, name)| (SharedString::from(value), SharedString::from(name)));
+                let (auths, machine) = (self.providers.auths.clone(), machine.clone());
+                SettingField::dropdown(
+                    choices.to_vec(),
+                    move |_: &App| SharedString::from(current),
+                    move |chosen: SharedString, cx: &mut App| {
+                        let Some(&(kind, _, _)) =
+                            STORES.iter().find(|(_, value, _)| *value == &*chosen)
+                        else {
+                            return;
+                        };
+                        auths.update(cx, |auths, cx| auths.choose_store(&machine, kind, cx));
+                    },
+                )
+                .w(rems(CONTROL_REMS))
+                .justify_between()
+            }
+            Some(&(_, _, name)) => value(name, Tone::Plain),
+            None => value("Another store", Tone::Plain),
         };
         SettingItem::new("Credential store", field).description(description)
     }
@@ -362,19 +362,40 @@ fn signed_in(
         .into_any_element()
 }
 
-/// A store's value in the dropdown.
-fn store_value(kind: CredentialStoreKind) -> SharedString {
-    match kind {
-        CredentialStoreKind::File => "file".into(),
-        _ => "os".into(),
-    }
+/// The stores the page offers: each one's value in the dropdown, and its
+/// name.
+const STORES: [(CredentialStoreKind, &str, &str); 2] = [
+    (CredentialStoreKind::Os, "os", "OS keyring"),
+    (CredentialStoreKind::File, "file", "File"),
+];
+
+/// The groups the page lists profiles in, in its order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Group {
+    SignedIn,
+    ApiKey,
+    Account,
 }
 
-/// A store as the page names it.
-fn store_name(kind: CredentialStoreKind) -> &'static str {
-    match kind {
-        CredentialStoreKind::Os => "OS keyring",
-        CredentialStoreKind::File => "File",
-        _ => "Another store",
+impl Group {
+    const ALL: [Group; 3] = [Group::SignedIn, Group::ApiKey, Group::Account];
+
+    /// The group `profile` is listed in; none for a profile signed out
+    /// that signs in some way this version doesn't know.
+    fn of(profile: &AuthSummary) -> Option<Self> {
+        match (profile.status, profile.kind) {
+            (AuthStatus::SignedIn, _) => Some(Self::SignedIn),
+            (_, AuthKind::ApiKey) => Some(Self::ApiKey),
+            (_, AuthKind::Login) => Some(Self::Account),
+            _ => None,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::SignedIn => "Signed in",
+            Self::ApiKey => "API keys",
+            Self::Account => "Accounts",
+        }
     }
 }

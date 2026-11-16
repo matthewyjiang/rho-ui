@@ -68,7 +68,7 @@
 //!   unless [`Script::signed_out`]; then a session opens only with
 //!   `sign_in: later`. [`LOGIN_AUTH`] takes a login, whose prompt follows
 //!   at once and which waits for [`FakeDaemon::approve_login`]. The key
-//!   [`REFUSED_KEY`] is refused. Credentials go to a file store the
+//!   [`REFUSED_KEY`] is refused, and [`UNCHECKED_KEY`] saved unchecked. Credentials go to a file store the
 //!   config chose.
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
 //!   set, if any. `rho/daemon/restart` restarts in place, as rho does: it
@@ -112,7 +112,7 @@ mod listener;
 mod service;
 
 use auth::FakeAuth;
-pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY};
+pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
 use config::FakeConfig;
 use listener::Listener;
 use service::Fake;

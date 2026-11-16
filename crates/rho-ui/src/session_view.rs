@@ -64,7 +64,7 @@ use crate::{
     plan::PlanList,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
-    sign_in::SignInCard,
+    sign_in::SignInSlot,
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
     usage::UsageRing,
@@ -128,7 +128,7 @@ pub(crate) struct SessionView {
     settings: Entity<SessionSettings>,
     /// The sign-in its model's auth profile needs, while it is signed out;
     /// see [`Self::with_sign_in`].
-    sign_in: Option<(Entity<SignInCard>, Subscription)>,
+    sign_in: Option<SignInSlot>,
     /// The oldest open request, while there is one, and its events.
     card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt is on its way to the daemon.
@@ -318,14 +318,19 @@ impl SessionView {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let machine = self.cwd.machine.clone();
-        let card = cx.new(|cx| {
-            let mut card = SignInCard::new(auths, machine, window, cx);
-            card.set_auth(self.session.auth(), cx);
-            card
-        });
-        let redraw = cx.observe(&card, |_, _, cx| cx.notify());
-        self.sign_in = Some((card, redraw));
+        self.sign_in = Some(SignInSlot::new(
+            auths,
+            machine,
+            Self::model_auth,
+            window,
+            cx,
+        ));
         self
+    }
+
+    /// The auth profile the session's model runs on, once known.
+    fn model_auth(&self) -> Option<&str> {
+        self.session.auth()
     }
 
     /// The session, and the machine it is on.
@@ -547,8 +552,8 @@ impl SessionView {
                 // A sign-out elsewhere fails the next turn: read whether
                 // the model's profile is still signed in.
                 if matches!(self.session.state(), RunState::Failed(_)) {
-                    if let Some((card, _)) = &self.sign_in {
-                        card.update(cx, SignInCard::refresh);
+                    if let Some(slot) = &self.sign_in {
+                        slot.refresh(cx);
                     }
                 }
                 cx.emit(SessionEvent::Saved);
@@ -986,9 +991,6 @@ impl SessionView {
         self.composer.update(cx, |composer, cx| {
             composer.set_commands(self.session.commands(), cx);
         });
-        if let Some((card, _)) = &self.sign_in {
-            card.update(cx, |card, cx| card.set_auth(self.session.auth(), cx));
-        }
     }
 
     fn on_settings_event(
@@ -1135,9 +1137,7 @@ impl SessionView {
             .children(
                 self.sign_in
                     .as_ref()
-                    .map(|(card, _)| card)
-                    .filter(|card| card.read(cx).is_shown(cx))
-                    .cloned(),
+                    .and_then(|slot| slot.card(self.session.auth(), cx)),
             )
             .when_some(self.card.as_ref(), |this, (card, _)| {
                 this.child(card.clone())

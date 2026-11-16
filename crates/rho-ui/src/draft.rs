@@ -40,7 +40,7 @@ use crate::{
     projects::Projects,
     session_list::NEW_SESSION,
     session_settings::{SessionSettings, SettingsEvent},
-    sign_in::SignInCard,
+    sign_in::SignInSlot,
     title_bar::TitleBar,
     workspaces::{WorkspaceRef, Workspaces},
 };
@@ -75,8 +75,8 @@ enum SessionState {
         settings: Entity<SessionSettings>,
         /// The sign-in its model's auth profile needs, while it is signed
         /// out.
-        sign_in: Entity<SignInCard>,
-        _subscriptions: [Subscription; 2],
+        sign_in: Box<SignInSlot>,
+        _subscription: Subscription,
     },
     /// Opening failed; `DraftView::error` says why.
     Failed,
@@ -305,6 +305,14 @@ impl DraftView {
         cx.notify();
     }
 
+    /// The auth profile the draft session's model runs on, once known.
+    fn session_auth(&self) -> Option<&str> {
+        match &self.state {
+            SessionState::Open { session, .. } => session.auth(),
+            SessionState::Opening | SessionState::Failed | SessionState::Started => None,
+        }
+    }
+
     /// Whether the draft still waits for the answer to `request`. An
     /// earlier request's session, such as one opened before the project
     /// changed, is not wanted: the app leaves it unfollowed, and the daemon
@@ -336,22 +344,20 @@ impl DraftView {
                 cx,
             )
         });
-        let sign_in = cx.new(|cx| {
-            let mut card =
-                SignInCard::new(self.auths.clone(), self.cwd.machine.clone(), window, cx);
-            card.set_auth(session.auth(), cx);
-            card
-        });
-        let subscriptions = [
-            cx.subscribe_in(&settings, window, Self::on_settings_event),
-            cx.observe(&sign_in, |_, _, cx| cx.notify()),
-        ];
+        let sign_in = Box::new(SignInSlot::new(
+            self.auths.clone(),
+            self.cwd.machine.clone(),
+            Self::session_auth,
+            window,
+            cx,
+        ));
+        let subscription = cx.subscribe_in(&settings, window, Self::on_settings_event);
         self.state = SessionState::Open {
             daemon,
             session: Box::new(session),
             settings,
             sign_in,
-            _subscriptions: subscriptions,
+            _subscription: subscription,
         };
         self.error = None;
         if std::mem::take(&mut self.queued) {
@@ -380,17 +386,13 @@ impl DraftView {
             (
                 Ok(attached),
                 SessionState::Open {
-                    session,
-                    settings,
-                    sign_in,
-                    ..
+                    session, settings, ..
                 },
             ) => {
                 session.attached(attached);
                 settings.update(cx, |settings, cx| {
                     settings.sync(session.config(), window, cx);
                 });
-                sign_in.update(cx, |card, cx| card.set_auth(session.auth(), cx));
                 self.composer.update(cx, |composer, cx| {
                     composer.set_commands(session.commands(), cx);
                 });
@@ -408,17 +410,13 @@ impl DraftView {
         cx: &mut Context<'_, Self>,
     ) {
         if let SessionState::Open {
-            session,
-            settings,
-            sign_in,
-            ..
+            session, settings, ..
         } = &mut self.state
         {
             session.apply(update);
             settings.update(cx, |settings, cx| {
                 settings.sync(session.config(), window, cx);
             });
-            sign_in.update(cx, |card, cx| card.set_auth(session.auth(), cx));
             self.composer.update(cx, |composer, cx| {
                 composer.set_commands(session.commands(), cx);
             });
@@ -435,12 +433,8 @@ impl DraftView {
         match event {
             SettingsEvent::Changed(options) => {
                 self.error = None;
-                if let SessionState::Open {
-                    session, sign_in, ..
-                } = &mut self.state
-                {
+                if let SessionState::Open { session, .. } = &mut self.state {
                     session.set_config(options.clone());
-                    sign_in.update(cx, |card, cx| card.set_auth(session.auth(), cx));
                 }
             }
             SettingsEvent::Failed(message) => self.error = Some(message.clone()),
@@ -523,11 +517,13 @@ impl Render for DraftView {
         };
         let (settings, sign_in) = match &self.state {
             SessionState::Open {
-                settings, sign_in, ..
-            } => (Some(settings), Some(sign_in)),
+                settings,
+                sign_in,
+                session,
+                ..
+            } => (Some(settings), sign_in.card(session.auth(), cx)),
             SessionState::Opening | SessionState::Failed | SessionState::Started => (None, None),
         };
-        let sign_in = sign_in.filter(|card| card.read(cx).is_shown(cx)).cloned();
         let mut composer = Composer::new(
             &self.composer,
             mode,

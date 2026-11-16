@@ -10,12 +10,13 @@
 //! session's turn fails, as one does after a sign-out elsewhere.
 //!
 //! A machine runs one login at a time from here. The daemon opens no
-//! browser: rho-ui opens the login's page when its prompt arrives, and
+//! browser: rho-ui opens the login's page, if it is a web page, when its
+//! prompt arrives (or not, after a Cancel made before the login answered), and
 //! shows the page and any code until the login ends.
 
 use std::collections::BTreeMap;
 
-use gpui_kit::{Context, SharedString};
+use gpui_kit::{App, Context, SharedString};
 use rho_ui_core::{
     AuthSummary, CredentialStoreKind, CredentialStoreStatus, Daemon, DaemonError, LoginId,
     LoginOutcome, LoginPrompt, UncheckedKey,
@@ -37,11 +38,52 @@ pub(crate) enum Profiles {
 pub(crate) struct Login {
     /// The auth profile it signs in to.
     pub(crate) auth: String,
-    /// The daemon's ID for it, once it answered. Its prompt may arrive
-    /// first: the login has only one.
-    id: Option<LoginId>,
+    phase: Phase,
+}
+
+/// How far a login has come.
+enum Phase {
+    /// `rho/auth/login` hasn't answered. Its prompt may still arrive
+    /// first, as the two reach the app by different paths; a login has
+    /// one prompt, so whichever arrives names it. `cancelled` holds a
+    /// Cancel made meanwhile, sent once the login has an ID.
+    Starting {
+        cancelled: bool,
+    },
+    Started(LoginId),
+    /// What the user must do arrived.
+    Prompted(LoginId, LoginPrompt),
+}
+
+impl Login {
     /// What the user must do, once the daemon says.
-    pub(crate) prompt: Option<LoginPrompt>,
+    pub(crate) fn prompt(&self) -> Option<&LoginPrompt> {
+        match &self.phase {
+            Phase::Prompted(_, prompt) => Some(prompt),
+            Phase::Starting { .. } | Phase::Started(_) => None,
+        }
+    }
+
+    /// Whether `login` is this one, as far as is known.
+    fn is(&self, login: &LoginId) -> bool {
+        match &self.phase {
+            Phase::Starting { .. } => true,
+            Phase::Started(id) | Phase::Prompted(id, _) => id == login,
+        }
+    }
+}
+
+/// The page a login's prompt opens: the one with its code filled in, when
+/// the provider gives one.
+pub(crate) fn login_page(prompt: &LoginPrompt) -> &str {
+    prompt.url_with_code.as_deref().unwrap_or(&prompt.url)
+}
+
+/// Whether rho-ui opens `url` in the browser itself: only a web page. A
+/// remote daemon names the page, and a `file:` or other URL could make
+/// the desktop do more than show a sign-in.
+pub(crate) fn opens_in_browser(url: &str) -> bool {
+    url.starts_with("https://")
 }
 
 /// What came of the user's last request for a profile, shown beside it
@@ -126,6 +168,15 @@ impl Auths {
         self.entry(machine)?.notes.get(auth)
     }
 
+    /// Forgets what came of the last request for `auth` on `machine`.
+    pub(crate) fn dismiss(&mut self, machine: &MachineId, auth: &str, cx: &mut Context<'_, Self>) {
+        if let Some(entry) = self.entry_mut(machine) {
+            if entry.notes.remove(auth).is_some() {
+                cx.notify();
+            }
+        }
+    }
+
     /// `machine` connected to `daemon`: reads its sign-ins, which replace
     /// any from an earlier connection.
     pub(crate) fn connected(
@@ -186,18 +237,15 @@ impl Auths {
         .detach();
     }
 
-    /// Saves `key` for API-key profile `auth` on `machine`.
+    /// Saves `key` for API-key profile `auth` on `machine`; the daemon
+    /// trims it.
     pub(crate) fn save_key(
         &mut self,
         machine: &MachineId,
         auth: &str,
-        key: &str,
+        key: String,
         cx: &mut Context<'_, Self>,
     ) {
-        let key = key.trim().to_owned();
-        if key.is_empty() {
-            return;
-        }
         self.request(machine, auth, cx, async move |daemon, auth| {
             daemon.save_key(&auth, &key).await
         });
@@ -270,8 +318,7 @@ impl Auths {
         entry.notes.remove(auth);
         entry.login = Some(Login {
             auth: auth.to_owned(),
-            id: None,
-            prompt: None,
+            phase: Phase::Starting { cancelled: false },
         });
         let daemon = entry.daemon.clone();
         let (id, auth) = (machine.clone(), auth.to_owned());
@@ -282,10 +329,16 @@ impl Auths {
                     return;
                 };
                 match started {
+                    // Its prompt may have arrived first and named it, or its
+                    // end, and closed it.
                     Ok(login) => {
-                        // Its end may have arrived first, and closed it.
                         if let Some(under_way) = entry.login.as_mut() {
-                            under_way.id = Some(login);
+                            if let Phase::Starting { cancelled } = under_way.phase {
+                                if cancelled {
+                                    stop(&entry.daemon, login.clone(), cx);
+                                }
+                                under_way.phase = Phase::Started(login);
+                            }
                         }
                     }
                     Err(error) => {
@@ -307,19 +360,14 @@ impl Auths {
         let Some(entry) = self.entry_mut(machine) else {
             return;
         };
-        let Some(login) = entry.login.as_ref() else {
+        let Some(login) = entry.login.as_mut() else {
             return;
         };
-        let Some(id) = login.id.clone() else {
-            // It hasn't started; its end follows its start, and closes it.
-            return;
-        };
-        let daemon = entry.daemon.clone();
-        cx.spawn(async move |_, _| {
-            // A login that already ended needs no stopping; its end closes it.
-            let _ = daemon.cancel_login(&id).await;
-        })
-        .detach();
+        match &mut login.phase {
+            // Sent once it has an ID.
+            Phase::Starting { cancelled } => *cancelled = true,
+            Phase::Started(id) | Phase::Prompted(id, _) => stop(&entry.daemon, id.clone(), cx),
+        }
     }
 
     /// Whether `login` is the one under way on `entry`, as far as is known.
@@ -327,11 +375,11 @@ impl Auths {
         entry
             .login
             .as_ref()
-            .is_some_and(|under_way| under_way.id.as_ref().is_none_or(|id| id == login))
+            .is_some_and(|under_way| under_way.is(login))
     }
 
     /// The prompt of `machine`'s login `login` arrived: shows it, and
-    /// opens its page.
+    /// opens its page, if it is a web page and the user hasn't cancelled.
     pub(crate) fn login_prompt(
         &mut self,
         machine: &MachineId,
@@ -345,12 +393,20 @@ impl Auths {
         if !Self::is_current(entry, &login) {
             return;
         }
-        let page = prompt.url_with_code.as_ref().unwrap_or(&prompt.url).clone();
-        if let Some(under_way) = entry.login.as_mut() {
-            under_way.id = Some(login);
-            under_way.prompt = Some(prompt);
+        let Some(under_way) = entry.login.as_mut() else {
+            return;
+        };
+        if let Phase::Starting { cancelled: true } = under_way.phase {
+            // Named only now, so stopped only now.
+            stop(&entry.daemon, login.clone(), cx);
+            under_way.phase = Phase::Started(login);
+            return;
         }
-        cx.open_url(&page);
+        let page = login_page(&prompt).to_owned();
+        under_way.phase = Phase::Prompted(login, prompt);
+        if opens_in_browser(&page) {
+            cx.open_url(&page);
+        }
         cx.notify();
     }
 
@@ -409,4 +465,14 @@ impl Auths {
         .detach();
         cx.notify();
     }
+}
+
+/// Asks `daemon` to stop login `login`. Its end follows, and closes it; a
+/// login that already ended needs no stopping.
+fn stop(daemon: &Daemon, login: LoginId, cx: &mut App) {
+    let daemon = daemon.clone();
+    cx.spawn(async move |_| {
+        let _ = daemon.cancel_login(&login).await;
+    })
+    .detach();
 }

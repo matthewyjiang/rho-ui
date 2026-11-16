@@ -8,7 +8,7 @@ use rho_protocol::{
     AuthLoginCancelResponse, AuthLoginParams, AuthLoginResponse, AuthLogoutParams,
     AuthLogoutResponse, AuthStatus, AuthSummary, CredentialStoreKind, CredentialStoreStatus,
     ErrorCode, LoginFlow, LoginId, LoginOutcome, LoginPrompt, LoginRelay, LoginStream, RpcError,
-    StoreSelectedBy,
+    StoreSelectedBy, UncheckedKey, UncheckedReason,
 };
 
 use super::Script;
@@ -22,6 +22,9 @@ pub const LOGIN_AUTH: &str = "fake-login";
 
 /// The key [`KEY_AUTH`]'s provider refuses.
 pub const REFUSED_KEY: &str = "refuse";
+
+/// A key [`KEY_AUTH`]'s provider can't be asked about, saved unchecked.
+pub const UNCHECKED_KEY: &str = "unchecked";
 
 /// The page a login's prompt opens.
 pub const LOGIN_URL: &str = "https://fake.example/login";
@@ -113,8 +116,12 @@ impl FakeAuth {
                 "the provider refused the key",
             ));
         }
+        let unchecked = (params.key.trim() == UNCHECKED_KEY).then(|| UncheckedKey {
+            reason: UncheckedReason::Unreachable,
+            message: "HTTP 404".to_owned(),
+        });
         self.signed_in.insert(auth);
-        Ok(AuthKeyResponse { unchecked: None })
+        Ok(AuthKeyResponse { unchecked })
     }
 
     pub(super) fn logout(&mut self, params: &AuthLogoutParams) -> AuthLogoutResponse {

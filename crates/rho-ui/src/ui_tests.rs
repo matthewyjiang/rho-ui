@@ -26,7 +26,7 @@ use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{
         subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
-        REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, WORKFLOW_ERROR,
+        REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
     Delay, Entry, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
@@ -5800,8 +5800,8 @@ fn rho_settings_write_and_follow_the_daemon() {
 
 /// A new session whose model has no credentials opens anyway, signed
 /// out, and offers its sign-in above the composer: a key the provider
-/// refuses says why and saves nothing; a good one signs the daemon in,
-/// and the card goes.
+/// refuses says why and saves nothing; one it couldn't check signs the
+/// daemon in, but the card stays to say so until dismissed.
 #[test]
 fn a_signed_out_session_signs_in_from_its_card() {
     let mut ui = Harness::start(
@@ -5831,13 +5831,18 @@ fn a_signed_out_session_signs_in_from_its_card() {
     ui.shot("refused");
 
     ui.click("sign-in-key");
-    ui.act(|window, cx| window.input("sk-good", cx));
+    ui.act(|window, cx| window.input(UNCHECKED_KEY, cx));
     ui.click("sign-in-save");
+    ui.wait_for_daemon("the key saved", |fake| fake.signed_in(KEY_AUTH));
+    ui.wait_until("the card saying it went unchecked", |window, _, _| {
+        is_visible(window, "sign-in-dismiss") && is_visible(window, "sign-in-note")
+    });
+    ui.shot("unchecked");
+
+    ui.click("sign-in-dismiss");
     ui.wait_until("the card gone", |window, _, _| {
         is_visible(window, "draft-view") && !is_visible(window, "sign-in-card")
     });
-    assert!(ui.fake().signed_in(KEY_AUTH));
-    ui.shot("signed-in");
 }
 
 /// Settings → Providers signs in with an account's login, showing the
