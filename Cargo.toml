@@ -18,11 +18,11 @@ rho-protocol = "1.2.0"
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 
 # `ToolContent::Surface` and `rho/session/surface_action` are not in a
-# released rho-protocol yet: this is rho's `claude/a2ui-ui-tool` branch
+# released rho-protocol yet: this is rho's `main` with the `ui` tool
 # (rho PR #1977). Drop this patch, and set the version above, once the
 # rho-protocol that has them is on crates.io.
 [patch.crates-io]
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "8d51b4eb709c3d9dcd677f9a1b420dff548e9fe6" }
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "c99b141ae65e54097d6a6909cfad84db1f36243e" }
 
 # From BeautifulRust lints/lints.toml (https://github.com/morganlinton/BeautifulRust),
 # matching the rust-best-practices skill in .agents/skills. CI-strict form:

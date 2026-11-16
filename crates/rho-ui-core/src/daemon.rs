@@ -612,12 +612,13 @@ fn writer() -> &'static ConfigWriter {
 ///
 /// This is the one place a session's setup is made, for `rho/session/new`
 /// and `rho/session/attach` alike. rho-ui draws the surfaces a session's
-/// `ui` tool shows (`surface.rs`), so it leaves `surfaces` out of
-/// `without`; if rho makes surfaces something a client asks for, the ask
-/// goes here.
+/// `ui` tool shows (`surface.rs`), so it asks for them: a session it opens
+/// has the tool, and every attach counts it among the clients a waiting
+/// `ui` call can be answered in.
 fn session_setup() -> rho_protocol::SessionSetup {
     rho_protocol::SessionSetup {
         idle_wake: IdleWake::Turn,
+        surfaces: rho_protocol::Surfaces::Drawn,
         ..Default::default()
     }
 }
