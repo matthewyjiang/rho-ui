@@ -138,6 +138,13 @@ impl Image {
         Some(Self::new(format, bytes))
     }
 
+    /// The image a `data:` URL holds, such as
+    /// `data:image/png;base64,iVBORw0…`, if it is one this app can show.
+    pub fn from_data_url(url: &str) -> Option<Self> {
+        let (header, data) = url.strip_prefix("data:")?.split_once(',')?;
+        Self::from_wire(header.strip_suffix(";base64")?, data)
+    }
+
     fn to_wire(&self) -> ContentBlock {
         ContentBlock::Image {
             mime_type: self.format.mime_type().to_owned(),

@@ -45,6 +45,15 @@
 //!   next "busy" is taken like any prompt. The prompt "deleting" is
 //!   refused as busy with no turn under way, as a session being deleted
 //!   refuses it.
+//! - The prompt "ui" calls the `ui` tool, which shows [`surface::form`] and
+//!   waits: the call stays in progress, carrying the surface. An action on
+//!   the surface ([`FakeDaemon::surface_actions`] lists them) finishes the
+//!   call and the turn answers "you sent" and the event's name; the event
+//!   [`surface::REFUSED_EVENT`] is refused instead, as a session refuses
+//!   an action on a surface it does not have. The prompt "gallery" shows
+//!   [`surface::gallery`] without waiting, and answers at once.
+//!   [`FakeDaemon::fall_behind`] detaches a session's clients as fallen
+//!   behind; attaching again replays the calls with their surfaces.
 //! - With [`Script::tui_job`], the session "tui-1" has a turn under way, as
 //!   one rho's terminal UI started: it is listed, its job runs, and a steer
 //!   is read at once, answered, and ends the turn. The steer "wait" is
@@ -92,12 +101,14 @@ use rho_protocol::{
     Publisher, Question, RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent,
     Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
 };
+use serde_json::{json, Value};
 use tokio::{net::UnixListener, runtime::Runtime};
 
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
 
 mod config;
 mod service;
+pub mod surface;
 
 use config::FakeConfig;
 use service::Fake;
@@ -198,6 +209,17 @@ pub struct Script {
     /// How many more saved sessions, `past-0` and on, each an hour older
     /// than the last and older than "old", to fill long lists.
     pub past_sessions: usize,
+}
+
+/// An action a client sent with `rho/session/surface_action`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SentAction {
+    /// The surface it was sent for.
+    pub surface: String,
+    /// A2UI's `action` message, whole.
+    pub action: serde_json::Value,
+    /// The surface's data model, when the client attached it.
+    pub data_model: Option<serde_json::Value>,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -409,6 +431,29 @@ impl FakeDaemon {
         session.answer(&format!("m-{turn}-2"), "The whole answer");
     }
 
+    /// Every action clients sent `session` with
+    /// `rho/session/surface_action`, the refused ones too, oldest first.
+    pub fn surface_actions(&self, session: &UiSessionId) -> Vec<SentAction> {
+        self.service
+            .lock()
+            .sessions
+            .get(session.as_str())
+            .map(|session| session.surface_actions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Detaches every client of `session` as fallen behind, as rho's
+    /// daemon does to one that left too many events unread. Attaching
+    /// again replays the session.
+    pub fn fall_behind(&self, session: &UiSessionId) {
+        let mut state = self.service.lock();
+        if let Some(session) = state.sessions.get_mut(session.as_str()) {
+            for publisher in session.publishers.drain(..) {
+                publisher.close(DetachReason::Lagged);
+            }
+        }
+    }
+
     /// Ends `session`'s oldest running subagent: its own session answers
     /// and ends its run, which detaches whoever observes it, and the
     /// daemon starts a turn of its own in `session` to tell the model.
@@ -604,6 +649,8 @@ struct FakeSession {
     /// A subagent's session, which only its run writes: observed, never
     /// attached to.
     subagent: bool,
+    /// The actions clients sent on its surfaces.
+    surface_actions: Vec<SentAction>,
 }
 
 impl FakeSession {
@@ -623,6 +670,7 @@ impl FakeSession {
             background: Vec::new(),
             refused_busy: false,
             subagent: false,
+            surface_actions: Vec::new(),
         }
     }
 
@@ -858,6 +906,26 @@ impl FakeSession {
                 },
             ],
             read,
+        );
+    }
+
+    /// Publishes `ui` call `id` in `status`, carrying the `messages` that
+    /// show `surface`, as every update of a real daemon's call does.
+    fn ui(&mut self, id: &ToolCallId, status: ToolStatus, surface: &str, messages: Vec<Value>) {
+        let header = ToolHeader::call("ui", Some(surface.to_owned()));
+        let mut content = vec![ToolContent::Surface {
+            surface: surface.to_owned(),
+            messages,
+        }];
+        if status == ToolStatus::Completed {
+            content.insert(0, text(&json!({"surfaceId": surface}).to_string()));
+        }
+        self.tool(
+            id,
+            (&format!("ui({surface})"), ToolKind::Other),
+            status,
+            content,
+            card(status, ToolFamily::Form, header),
         );
     }
 

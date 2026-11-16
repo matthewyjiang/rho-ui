@@ -783,7 +783,7 @@ fn markdown_text(entry: &Entry) -> Option<&str> {
         Entry::User(message) => Some(message.text()).filter(|text| !text.is_empty()),
         Entry::Agent(message) => Some(message.text()),
         Entry::Notice(notice) => notice.description(),
-        Entry::Thought(_) | Entry::Tool(_) | Entry::Wake => None,
+        Entry::Thought(_) | Entry::Tool(_) | Entry::Surface(_) | Entry::Wake => None,
     }
 }
 
@@ -858,6 +858,8 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
             .into_any_element(),
         // The timeline puts these in work rows, never message rows, and
         // the transcript draws notices itself.
-        Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) => div().into_any_element(),
+        Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) | Entry::Surface(_) => {
+            div().into_any_element()
+        }
     }
 }

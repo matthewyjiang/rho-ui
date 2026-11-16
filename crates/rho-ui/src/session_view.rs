@@ -1328,9 +1328,12 @@ const PROMPT_TITLE_CHARS: usize = 80;
 fn first_prompt(session: &Session) -> Option<String> {
     let text = session.entries().iter().find_map(|entry| match entry {
         Entry::User(message) => Some(message.text()),
-        Entry::Agent(_) | Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) | Entry::Wake => {
-            None
-        }
+        Entry::Agent(_)
+        | Entry::Thought(_)
+        | Entry::Tool(_)
+        | Entry::Notice(_)
+        | Entry::Surface(_)
+        | Entry::Wake => None,
     })?;
     let mut line: String = text
         .split_whitespace()

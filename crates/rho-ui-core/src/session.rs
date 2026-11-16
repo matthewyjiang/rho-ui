@@ -26,6 +26,7 @@ use crate::{
     input::{InputId, InputRequest},
     options::{commands, config_options, CommandInfo, ConfigOption},
     prompt::{Attachment, Image, Prompt},
+    surface::SurfaceRef,
     tool_card::ToolCard,
 };
 
@@ -361,6 +362,13 @@ pub enum Entry {
     Tool(ToolCall),
     /// A notice from the agent.
     Notice(Notice),
+    /// A surface a `ui` tool call showed, placed after the call, with the
+    /// messages that show it: give each to a
+    /// [`SurfaceStore`](crate::surface::SurfaceStore), in order. It draws
+    /// only while the store says the surface is drawn under its call: a
+    /// later call that shows the surface again draws it instead, and a
+    /// deleted surface draws nowhere.
+    Surface(SurfaceRef),
     /// The daemon began a turn of its own, as it does when the session's
     /// background work finishes or a subagent asks its parent to act, to
     /// give the model the result. It opens that turn, as a prompt opens one. Only a turn followed live has
@@ -1030,7 +1038,7 @@ impl Session {
         let streamed = |entry: &Entry| match entry {
             Entry::Agent(_) | Entry::Thought(_) => true,
             Entry::Tool(tool) => tool.status == ToolStatus::Pending,
-            Entry::User(_) | Entry::Notice(_) | Entry::Wake => false,
+            Entry::User(_) | Entry::Notice(_) | Entry::Surface(_) | Entry::Wake => false,
         };
         let Some(first) = self.entries[start..].iter().position(streamed) else {
             return;
@@ -1282,16 +1290,45 @@ impl Session {
                 _ => tool.status,
             };
         }
+        let mut surface = None;
         if let Some(content) = update.content {
             tool.content = content
                 .into_iter()
-                .filter_map(|content| tool_content(content, workspace.as_deref()))
+                .filter_map(|content| match content {
+                    rho_protocol::ToolContent::Surface {
+                        surface: id,
+                        messages,
+                    } => {
+                        surface = Some((id, messages));
+                        None
+                    }
+                    content => tool_content(content, workspace.as_deref()),
+                })
                 .collect();
         }
         if let Some(display) = update.display {
             tool.card = Some(ToolCard::from_wire(display));
         }
+        if let Some((surface, messages)) = surface {
+            self.show_surface(update.id.as_str(), surface, messages);
+        }
         at
+    }
+
+    /// Places the surface call `call` carries after it. Every update of
+    /// the call repeats the surface; only the first places it.
+    fn show_surface(&mut self, call: &str, surface: String, messages: Vec<serde_json::Value>) {
+        let placed = self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Surface(shown) if shown.call == call));
+        if !placed {
+            self.entries.push(Entry::Surface(SurfaceRef {
+                call: call.to_owned(),
+                surface,
+                messages: messages.into(),
+            }));
+        }
     }
 }
 

@@ -14,6 +14,7 @@ mod prompt;
 mod rho_install;
 mod session;
 mod ssh;
+pub mod surface;
 mod timeline;
 mod tool_card;
 
@@ -22,7 +23,7 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached, Job,
-    JobActivity, PendingUpgrade, SessionId, SessionSummary, Unsteered,
+    JobActivity, PendingUpgrade, SessionId, SessionSummary, SurfaceActionError, Unsteered,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,

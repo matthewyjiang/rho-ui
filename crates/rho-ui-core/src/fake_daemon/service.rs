@@ -23,11 +23,12 @@ use rho_protocol::{
     SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
     SessionCancelResponse, SessionChange, SessionEvent, SessionHoldParams, SessionHoldResponse,
     SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
-    SessionSteerParams, SessionSteerResponse, SessionWorktree, SettingsService, StoreSelectedBy,
-    Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
+    SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
+    SessionSurfaceActionResponse, SessionWorktree, SettingsService, StoreSelectedBy, Subscription,
+    ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
-use super::{shell_card, shell_output, FakeSession, State, Turn};
+use super::{shell_card, shell_output, surface, FakeSession, SentAction, State, Turn, TOOL_IMAGE};
 
 #[derive(Debug)]
 pub(super) struct Fake {
@@ -237,6 +238,55 @@ impl FakeSession {
     }
 }
 
+/// What a prompt that calls the `ui` tool shows.
+#[derive(Clone, Copy)]
+enum Shown {
+    /// The form, which the call waits on.
+    Form,
+    /// The gallery, which the call shows without waiting.
+    Gallery,
+}
+
+impl Shown {
+    /// What `prompt` shows, if it calls the `ui` tool.
+    fn by(prompt: &str) -> Option<Self> {
+        match prompt {
+            "ui" => Some(Self::Form),
+            "gallery" => Some(Self::Gallery),
+            _ => None,
+        }
+    }
+}
+
+impl FakeSession {
+    /// Runs `turn`, which calls the `ui` tool to show `shown`: the form's
+    /// call stays in progress until an action comes; the gallery's is
+    /// done, and the turn answers at once.
+    fn show_surface(&mut self, turn: Turn, echo: SessionEvent, shown: Shown) {
+        let (call, id) = (turn.tool.clone(), turn.id.clone());
+        self.turn = Some(turn);
+        self.state(JobState::Running);
+        self.publish(echo);
+        match shown {
+            Shown::Form => self.ui(
+                &call,
+                ToolStatus::InProgress,
+                surface::FORM_SURFACE,
+                surface::form(),
+            ),
+            Shown::Gallery => {
+                self.ui(
+                    &call,
+                    ToolStatus::Completed,
+                    surface::GALLERY_SURFACE,
+                    surface::gallery(TOOL_IMAGE),
+                );
+                self.answer(&format!("m-{id}"), "Here is every component.");
+            }
+        }
+    }
+}
+
 /// The methods rho-ui sends, plus those every `Service` must answer (the
 /// handshake hooks, status, stop, restart, and the job list). Every other
 /// one answers rho-protocol's default, not served.
@@ -388,6 +438,10 @@ impl Service for Fake {
             session.answer(&format!("m-{turn_id}"), FIGURES);
             return Ok(SessionPromptResponse { turn: turn_id });
         }
+        if let Some(shown) = Shown::by(&prompt) {
+            session.show_surface(turn, echo(&turn_id, &params), shown);
+            return Ok(SessionPromptResponse { turn: turn_id });
+        }
         if prompt == "pictures" {
             session.turn = Some(turn);
             session.state(JobState::Running);
@@ -532,6 +586,45 @@ impl Service for Fake {
         }
         session.answer(&format!("m-{turn_id}"), &reply(&params.answer));
         Ok(SessionAnswerResponse {})
+    }
+
+    async fn surface_action(
+        &self,
+        params: SessionSurfaceActionParams,
+    ) -> Result<SessionSurfaceActionResponse, RpcError> {
+        let mut state = self.lock();
+        let session = state.session(&params.session)?;
+        session.surface_actions.push(SentAction {
+            surface: params.surface.clone(),
+            action: params.action.clone(),
+            data_model: params.data_model,
+        });
+        let name = params.action["action"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if name == surface::REFUSED_EVENT {
+            return Err(RpcError::new(
+                ErrorCode::InvalidParams,
+                format!("the session has no surface {}", params.surface),
+            ));
+        }
+        // The prompt "ui" left its call waiting on the form.
+        let waiting = session
+            .turn
+            .as_ref()
+            .filter(|_| params.surface == surface::FORM_SURFACE)
+            .map(|turn| (turn.tool.clone(), turn.id.clone()));
+        if let Some((call, turn)) = waiting {
+            session.ui(
+                &call,
+                ToolStatus::Completed,
+                surface::FORM_SURFACE,
+                surface::form(),
+            );
+            session.answer(&format!("m-{turn}"), &format!("you sent {name}"));
+        }
+        Ok(SessionSurfaceActionResponse {})
     }
 
     async fn hold_session(
