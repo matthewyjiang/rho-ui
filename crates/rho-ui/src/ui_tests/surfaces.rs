@@ -147,9 +147,8 @@ fn a_form_sends_what_the_user_entered_and_stays_usable() {
     widen(&mut ui, &session);
 
     ui.act(|window, cx| window.click(control("deploy", "stale"), cx));
-    let stale = element_id("deploy", Part::Stale);
-    ui.wait_until("the form to say it is out of date", |window, _, _| {
-        is_visible(window, stale.clone())
+    ui.wait_for_daemon("the refused action", |fake| {
+        fake.surface_actions(&session).len() == 3
     });
     let names: Vec<_> = ui
         .fake()
@@ -158,6 +157,11 @@ fn a_form_sends_what_the_user_entered_and_stays_usable() {
         .map(|sent| sent.action["action"]["name"].clone())
         .collect();
     assert_eq!(names, ["deploy", "deploy", REFUSED_EVENT]);
+    // The line is the panel's last, which can sit below the window.
+    let stale = element_id("deploy", Part::Stale);
+    ui.wait_until("the form to say it is out of date", |window, _, _| {
+        is_drawn(window, &stale)
+    });
     ui.act(|window, _| {
         assert!(
             !is_enabled(window, &deploy),
