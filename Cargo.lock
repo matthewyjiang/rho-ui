@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "a2ui"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "fancy-regex 0.16.2",
- "jsonschema",
- "serde_json",
- "serde_yaml_ng",
- "thiserror 2.0.20",
- "unicode-ident",
-]
-
-[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7179,6 +7166,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-a2ui"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a36ec76d0a9a87ea54223aca1269de8cd6cb041cc4099c7beacb76e07aac6997"
+dependencies = [
+ "chrono",
+ "fancy-regex 0.16.2",
+ "jsonschema",
+ "serde_json",
+ "thiserror 2.0.20",
+ "unicode-ident",
+]
+
+[[package]]
 name = "rho-protocol"
 version = "1.2.0"
 source = "git+https://github.com/matthewyjiang/rho?rev=c99b141ae65e54097d6a6909cfad84db1f36243e#c99b141ae65e54097d6a6909cfad84db1f36243e"
@@ -7219,7 +7220,6 @@ dependencies = [
 name = "rho-ui-core"
 version = "0.1.0"
 dependencies = [
- "a2ui",
  "base64",
  "chrono",
  "dunce",
@@ -7227,6 +7227,7 @@ dependencies = [
  "gethostname",
  "portable-pty",
  "regex",
+ "rho-a2ui",
  "rho-protocol",
  "rho-ui-core",
  "ring",
@@ -7949,19 +7950,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "serde_yaml_ng"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]
@@ -9155,12 +9143,6 @@ dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
 ]
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
