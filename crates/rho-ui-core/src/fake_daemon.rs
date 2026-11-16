@@ -35,6 +35,9 @@
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
 //!   whole result as a card, [`subagent_result`], and the parent's daemon
 //!   turn tells the model, as for a process.
+//! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
+//!   in a session. Its two agent nodes are in the job list only: one
+//!   queued second in line, one failed with the error [`WORKFLOW_ERROR`].
 //! - The prompt "flaky" sets a plan of three steps, one done, one under
 //!   way and one to do, then streams half an answer that the provider
 //!   discards, and waits 30 s to retry, rate limited. The turn runs on
@@ -81,10 +84,11 @@ use rho_protocol::{
         ToolHeader,
     },
     methods::{
-        BackgroundItem, BackgroundStatus, BackgroundWork, FastModeOptions, JobState, MessageId,
-        ModelChoice, ModelOptions, ModelRef, PendingUpgrade, PermissionModeOptions, ReasoningLevel,
-        ReasoningOptions, Replay, Seq, SessionCommand, SessionId, SessionOptions, SteerId,
-        StreamId, ToolCallId, ToolCallUpdate, TurnId,
+        BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, JobId, JobKind,
+        JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef, PendingUpgrade,
+        PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions, Replay, Seq,
+        SessionCommand, SessionId, SessionOptions, SteerId, StreamId, ToolCallId, ToolCallUpdate,
+        TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
@@ -110,6 +114,12 @@ pub const TUI_SESSION: &str = "tui-1";
 /// The task of the subagent the prompt "subagent" starts: its title in
 /// the parent's background work, and its session's first message.
 pub const SUBAGENT_TASK: &str = "Read the parser";
+
+/// The name of the workflow [`FakeDaemon::start_workflow`] starts.
+pub const WORKFLOW_NAME: &str = "review";
+
+/// Why the workflow [`WORKFLOW_NAME`]'s second agent node failed.
+pub const WORKFLOW_ERROR: &str = "provider refused the request";
 
 /// The whole result the subagent [`SUBAGENT_TASK`] returns, in Markdown:
 /// as long as an explorer's report, with headings, a list and code.
@@ -409,6 +419,86 @@ impl FakeDaemon {
         if session.turn.is_none() {
             session.wake(turn, &told);
         }
+    }
+
+    /// Starts the workflow [`WORKFLOW_NAME`] in `session`, as the
+    /// session's background work, with its two agent nodes in the job
+    /// list: one queued second in line, and one failed with
+    /// [`WORKFLOW_ERROR`].
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `session`: the test has a bug.
+    pub fn start_workflow(&self, session: &UiSessionId) {
+        let mut state = self.service.lock();
+        let run = format!("wf-{}", state.extra_jobs.len());
+        let parent = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        parent.background.push(BackgroundWork {
+            item: BackgroundItem::Workflow { run: run.clone() },
+            title: WORKFLOW_NAME.to_owned(),
+            status: BackgroundStatus::Running,
+            exit_code: None,
+        });
+        parent.report_background();
+        let cwd = parent.cwd.clone();
+        let job = |id: String, kind, state, parent: String| JobSummary {
+            id: JobId::new(id),
+            kind,
+            state,
+            workspace: cwd.clone(),
+            parent: Some(JobId::new(parent)),
+            grant: None,
+            grant_limit: None,
+            session: None,
+            run: None,
+            workflow_run: None,
+            result_pending: false,
+            created_at: 0,
+            updated_at: 0,
+            error: None,
+            queue: None,
+            live: None,
+            worktree: None,
+            worktree_stale: false,
+        };
+        let drive = format!("job-{run}");
+        let workflow = JobSummary {
+            workflow_run: Some(run.clone()),
+            ..job(
+                drive.clone(),
+                JobKind::Workflow,
+                JobState::Running,
+                format!("job-{session}"),
+            )
+        };
+        let queued = JobSummary {
+            run: Some(format!("{run}-a")),
+            queue: Some(QueuePlace {
+                budget: Budget::AgentConcurrency,
+                limit: 10,
+                position: 2,
+            }),
+            ..job(
+                format!("{drive}-a"),
+                JobKind::Subagent,
+                JobState::Queued,
+                drive.clone(),
+            )
+        };
+        let failed = JobSummary {
+            run: Some(format!("{run}-b")),
+            error: Some(WORKFLOW_ERROR.to_owned()),
+            ..job(
+                format!("{drive}-b"),
+                JobKind::Subagent,
+                JobState::Failed,
+                drive,
+            )
+        };
+        state.extra_jobs.extend([workflow, queued, failed]);
     }
 
     /// Retries the request the prompt "flaky" left waiting, and answers.
@@ -1149,6 +1239,8 @@ struct State {
     new_session_environment: Option<ClientEnvironment>,
     turns: u64,
     steers: u64,
+    /// Jobs of runs no session writes, listed after the sessions' own.
+    extra_jobs: Vec<JobSummary>,
     /// rho's own settings.
     config: FakeConfig,
 }
@@ -1190,6 +1282,7 @@ impl State {
             new_session_environment: None,
             turns: 0,
             steers: 0,
+            extra_jobs: Vec::new(),
             config: FakeConfig::new(),
         };
         if script.tui_job == TuiJob::Running {

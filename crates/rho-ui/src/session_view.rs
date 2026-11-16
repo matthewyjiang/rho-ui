@@ -49,8 +49,8 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon, DaemonError, Entry,
-    InputId, JobActivity, Prompt, RunState, Session, SessionId, SessionUpdate, SteerId, TurnId,
-    Unsteered,
+    InputId, JobActivity, Prompt, Run, RunState, Session, SessionId, SessionUpdate, SteerId,
+    TurnId, Unsteered,
 };
 
 use crate::{
@@ -130,6 +130,9 @@ pub(crate) struct SessionView {
     sending: bool,
     /// Background work the user asked to stop that still runs.
     stopping: Vec<BackgroundId>,
+    /// The subagent and workflow runs the session started, as the daemon's
+    /// job list last said; see [`Self::set_runs`].
+    runs: Vec<Run>,
     /// What the background log holds of the session's work.
     recorded: Recorded,
     /// The first prompt was accepted, so the session is saved.
@@ -230,6 +233,7 @@ impl SessionView {
             card: None,
             sending: false,
             stopping: Vec::new(),
+            runs: Vec::new(),
             recorded,
             busy_since: None,
             turn_began: None,
@@ -676,12 +680,13 @@ impl SessionView {
         }
         let daemon = self.daemon.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let jobs = daemon.active_jobs().await;
+            let jobs = daemon.jobs().await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let id = this.session.id();
                 // Only a turn under way or waiting for a person refuses one.
                 let listed = jobs.is_ok_and(|jobs| {
-                    jobs.iter()
+                    jobs.active
+                        .iter()
                         .any(|job| job.session() == id && job.activity() != JobActivity::Background)
                 });
                 // The turn's events may have come in meanwhile.
@@ -762,6 +767,16 @@ impl SessionView {
             }
         })
         .detach();
+    }
+
+    /// Takes the session's runs from a listing of the daemon's jobs, which
+    /// says what its background list lacks: where a queued run waits, why
+    /// a failed one failed, and a workflow's agent nodes.
+    pub(crate) fn set_runs(&mut self, runs: Vec<Run>, cx: &mut Context<'_, Self>) {
+        if self.runs != runs {
+            self.runs = runs;
+            cx.notify();
+        }
     }
 
     /// Takes back a steer the model has not read, into the composer.
@@ -1155,6 +1170,7 @@ impl SessionView {
     fn render_background(&self, cx: &mut Context<'_, Self>) -> Option<BackgroundList> {
         let list = BackgroundList::new(
             self.session.background(),
+            &self.runs,
             Self::open_handler(cx.entity().downgrade()),
         )?;
         if self.is_subagent() {
@@ -1175,6 +1191,7 @@ impl SessionView {
         let surface = BackgroundSurface::new(
             this.session.background(),
             this.session.ended_background(),
+            &this.runs,
             Self::open_handler(view.downgrade()),
         );
         if this.is_subagent() {
@@ -1225,6 +1242,7 @@ impl SessionView {
         }
         bar.trailing(BackgroundHistory::new(
             self.session.ended_background(),
+            &self.runs,
             Self::open_handler(cx.entity().downgrade()),
         ))
     }

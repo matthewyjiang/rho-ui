@@ -10,6 +10,7 @@ pub mod fake_daemon;
 #[cfg(feature = "test-support")]
 pub mod fake_sshd;
 mod input;
+mod jobs;
 mod options;
 pub mod platform;
 mod prompt;
@@ -23,13 +24,14 @@ pub use agent_settings::{AgentSettings, AgentSettingsChanged};
 pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
 pub use completion::{Completion, Edit};
 pub use daemon::{
-    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached, Job,
-    JobActivity, PendingUpgrade, SessionId, SessionSummary, Unsteered,
+    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached,
+    PendingUpgrade, SessionId, SessionSummary, Unsteered,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
     Questions, Suggestion, SuggestionStyle, TextBox, Timeout,
 };
+pub use jobs::{Job, JobActivity, Jobs, Run, RunStatus, Runs};
 pub use options::{
     CommandInfo, CommandKind, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue,
     FAST_MODE_ID,

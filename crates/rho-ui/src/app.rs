@@ -31,7 +31,7 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job, JobActivity,
-    PendingUpgrade, Prompt, Session, SessionId,
+    Jobs, PendingUpgrade, Prompt, Session, SessionId,
 };
 
 use crate::{
@@ -547,7 +547,7 @@ impl RhoApp {
             async move |this, cx| {
                 let mut asked_upgrade: Option<Instant> = None;
                 loop {
-                    let changed = match daemon.active_jobs().await {
+                    let changed = match daemon.jobs().await {
                         Ok(jobs) => {
                             match this.update(cx, |this, cx| this.set_jobs(&machine, &jobs, cx)) {
                                 Ok(changed) => changed,
@@ -633,27 +633,38 @@ impl RhoApp {
         cx.notify();
     }
 
-    /// Shows which sessions have work under way in `machine`'s daemon. A
-    /// change is also when the saved list goes stale: a session another
-    /// client started appears, or one's turn ended. A listing also clears
-    /// why the last one was refused. Returns whether they changed.
-    fn set_jobs(&mut self, machine: &MachineId, jobs: &[Job], cx: &mut Context<'_, Self>) -> bool {
+    /// Shows which sessions have work under way in `machine`'s daemon, and
+    /// gives each of its open sessions the runs it started. A change in
+    /// the sessions with work is also when the saved list goes stale: a
+    /// session another client started appears, or one's turn ended. A
+    /// listing also clears why the last one was refused. Returns whether
+    /// the sessions with work changed.
+    fn set_jobs(&mut self, machine: &MachineId, jobs: &Jobs, cx: &mut Context<'_, Self>) -> bool {
         self.set_listing_error(machine, Listing::Jobs, None, cx);
+        for open in self
+            .sessions
+            .iter()
+            .filter(|open| open.id.machine == *machine)
+        {
+            let runs = jobs.runs.of(&open.id.id);
+            open.view.update(cx, |view, cx| view.set_runs(runs, cx));
+        }
+        let active = jobs.active.as_slice();
         let Some(connection) = self.connection_mut(machine) else {
             return false;
         };
-        let same = connection.jobs.len() == jobs.len()
+        let same = connection.jobs.len() == active.len()
             && connection
                 .jobs
                 .iter()
-                .zip(jobs)
+                .zip(active)
                 .all(|(was, now)| was.is_same_work(now));
         if same {
             return false;
         }
-        jobs.clone_into(&mut connection.jobs);
+        active.clone_into(&mut connection.jobs);
         self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, jobs, cx));
+            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, active, cx));
         self.refresh_sessions(machine, cx);
         true
     }

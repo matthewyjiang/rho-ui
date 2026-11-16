@@ -763,7 +763,7 @@ impl Service for Fake {
             }),
         });
         JobListResponse {
-            jobs: jobs.collect(),
+            jobs: jobs.chain(state.extra_jobs.iter().cloned()).collect(),
         }
     }
 }

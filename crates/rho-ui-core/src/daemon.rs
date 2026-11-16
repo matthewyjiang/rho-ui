@@ -18,7 +18,6 @@
 //! handles.
 
 use std::{
-    collections::HashSet,
     future::Future,
     path::{Path, PathBuf},
     process::Command,
@@ -29,13 +28,12 @@ use std::{
 use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
-    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobId,
-    JobKind, JobListParams, JobState, JobSummary, Notifications, RestartParams,
-    SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams,
-    SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionHoldParams,
-    SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
-    SessionRenameParams, SessionSteerParams, SessionUnsteerParams, SettingChange, StatusParams,
-    TurnOutcome, UnsteerOutcome,
+    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobListParams,
+    Notifications, RestartParams, SessionAnswerParams, SessionAttachParams,
+    SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams, SessionDeleteParams,
+    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
+    SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
+    SessionUnsteerParams, SettingChange, StatusParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
@@ -43,6 +41,7 @@ use crate::{
     agent_settings::{AgentSettings, AgentSettingsChanged},
     background::BackgroundId,
     input::{Answer, InputId},
+    jobs::Jobs,
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
     platform,
     prompt::{mebibytes, Prompt},
@@ -221,110 +220,6 @@ impl SessionSummary {
     /// When the session was last saved, in Unix seconds.
     pub fn updated_at(&self) -> u64 {
         self.updated_at
-    }
-}
-
-/// What a session's job is doing, from `rho/job/list`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JobActivity {
-    /// A turn runs, or waits for a slot.
-    Working,
-    /// The session waits for a person: an approval or a question.
-    Waiting,
-    /// No turn runs, but subagents or workflow runs a turn started still
-    /// do. The daemon's job list doesn't show background processes, so a
-    /// session with only those has no job.
-    Background,
-}
-
-/// A session with work under way in the daemon, whichever client started it.
-#[derive(Clone, Debug)]
-pub struct Job {
-    session: SessionId,
-    cwd: PathBuf,
-    title: Option<String>,
-    activity: JobActivity,
-    turn_elapsed: Option<Duration>,
-}
-
-impl Job {
-    /// The session the job runs. Pass to [`Daemon::attach`] to follow it.
-    pub fn session(&self) -> &SessionId {
-        &self.session
-    }
-
-    /// The workspace the job runs in.
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
-    }
-
-    /// The session's title, once it has one.
-    pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
-    }
-
-    /// What the job is doing.
-    pub fn activity(&self) -> JobActivity {
-        self.activity
-    }
-
-    /// How long the turn under way has run, when the daemon says. It grows
-    /// between two listings of the same job.
-    pub fn turn_elapsed(&self) -> Option<Duration> {
-        self.turn_elapsed
-    }
-
-    /// Whether `other` is this job as an earlier or later listing would
-    /// show it: everything but [`Self::turn_elapsed`] is the same. Two
-    /// listings that differ only in elapsed time changed nothing to show.
-    pub fn is_same_work(&self, other: &Job) -> bool {
-        self.session == other.session
-            && self.cwd == other.cwd
-            && self.title == other.title
-            && self.activity == other.activity
-    }
-
-    /// The sessions with work under way among `jobs`, a whole listing.
-    fn from_list(jobs: Vec<JobSummary>) -> Vec<Self> {
-        // A subagent or workflow run names the job that started it.
-        let started: HashSet<JobId> = jobs
-            .iter()
-            .filter(|job| job.kind != JobKind::Session && job.state.in_progress())
-            .filter_map(|job| job.parent.clone())
-            .collect();
-        jobs.into_iter()
-            .filter_map(|job| Self::from_wire(job, &started))
-            .collect()
-    }
-
-    /// The job as the sidebar needs it, or `None` for one that is not a
-    /// session with work under way. `started` holds the jobs whose
-    /// subagent or workflow runs are under way.
-    fn from_wire(job: JobSummary, started: &HashSet<JobId>) -> Option<Self> {
-        // A subagent's or workflow's session belongs to the session that
-        // started it, and can't be attached to.
-        if job.kind != JobKind::Session {
-            return None;
-        }
-        let live = job.live.as_ref();
-        let asks = live.is_some_and(|live| !live.inputs.is_empty());
-        let activity = match job.state {
-            JobState::WaitingForInput => JobActivity::Waiting,
-            // A subagent's question waits whether or not a turn runs.
-            _ if asks => JobActivity::Waiting,
-            JobState::Running | JobState::Queued => JobActivity::Working,
-            _ if started.contains(&job.id) => JobActivity::Background,
-            _ => return None,
-        };
-        Some(Self {
-            session: job.session?.into(),
-            cwd: job.workspace,
-            turn_elapsed: live
-                .and_then(|live| live.turn_elapsed_ms)
-                .map(Duration::from_millis),
-            title: job.live.and_then(|live| live.title),
-            activity,
-        })
     }
 }
 
@@ -714,21 +609,21 @@ impl Daemon {
         Ok(())
     }
 
-    /// The sessions with work under way in the daemon, whichever client
-    /// started them: a turn running or queued, a request waiting for a
-    /// person, or subagents or workflow runs still under way after the
-    /// turn that started them. Nothing pushes changes to this list; ask
-    /// again to refresh.
+    /// Lists the daemon's jobs: the sessions with work under way,
+    /// whichever client started them (a turn running or queued, a request
+    /// waiting for a person, or subagents or workflow runs still under way
+    /// after the turn that started them), and the runs each session
+    /// started. Nothing pushes changes to this list; ask again to refresh.
     ///
     /// # Errors
     ///
     /// Fails if the daemon rejects the request or the connection is gone.
-    pub async fn active_jobs(&self) -> Result<Vec<Job>, DaemonError> {
+    pub async fn jobs(&self) -> Result<Jobs, DaemonError> {
         let list = self
             .client
             .request::<methods::JobList>(&JobListParams {})
             .await?;
-        Ok(Job::from_list(list.jobs))
+        Ok(Jobs::from_list(list.jobs))
     }
 
     /// Opens a new session in `cwd`, or in a new worktree of the
@@ -1163,101 +1058,5 @@ impl Daemon {
             .request::<methods::SessionDelete>(&params)
             .await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    fn summary(
-        id: &str,
-        kind: &str,
-        state: &str,
-        parent: Option<&str>,
-        live: &serde_json::Value,
-    ) -> JobSummary {
-        let summary = json!({"id": id, "kind": kind, "state": state, "parent": parent,
-            "workspace": "/w", "session": format!("s-{id}"), "created_at": 0, "updated_at": 0,
-            "live": live});
-        serde_json::from_value(summary).expect("a valid job summary")
-    }
-
-    fn job(kind: &str, state: &str, live: &serde_json::Value) -> Option<Job> {
-        Job::from_list(vec![summary("j1", kind, state, None, live)]).pop()
-    }
-
-    fn live(elapsed_ms: u64, inputs: &serde_json::Value) -> serde_json::Value {
-        json!({"title": "t", "model": {"provider": "p", "model": "m"},
-            "turn_elapsed_ms": elapsed_ms, "inputs": inputs})
-    }
-
-    #[test]
-    fn only_sessions_with_work_under_way_are_jobs_to_show() {
-        let none = json!([]);
-        let activity = |job: Option<Job>| job.map(|job| job.activity());
-        assert_eq!(
-            activity(job("session", "running", &live(5, &none))),
-            Some(JobActivity::Working)
-        );
-        assert_eq!(
-            activity(job("session", "queued", &live(5, &none))),
-            Some(JobActivity::Working)
-        );
-        assert_eq!(
-            activity(job("session", "waiting_for_input", &live(5, &none))),
-            Some(JobActivity::Waiting)
-        );
-        assert_eq!(activity(job("session", "completed", &live(5, &none))), None);
-        assert_eq!(activity(job("session", "idle", &json!(null))), None);
-        assert_eq!(
-            activity(job("subagent", "running", &live(5, &none))),
-            None,
-            "a subagent's session can't be attached to"
-        );
-
-        // A subagent's question keeps its parent waiting between turns.
-        let asks = json!([{"id": 1, "asker": "subagent", "ask": {"kind": "question",
-            "title": "Which?", "questions": []}}]);
-        assert_eq!(
-            activity(job("session", "completed", &live(5, &asks))),
-            Some(JobActivity::Waiting)
-        );
-    }
-
-    /// A session whose turn ended while a subagent or workflow run it
-    /// started goes on waits on that run, and only while it runs.
-    #[test]
-    fn a_session_waits_on_the_runs_its_turn_started() {
-        let cases = [
-            ("subagent", "running", Some(JobActivity::Background)),
-            ("subagent", "queued", Some(JobActivity::Background)),
-            ("workflow", "running", Some(JobActivity::Background)),
-            ("subagent", "completed", None),
-        ];
-        for (kind, state, want) in cases {
-            let jobs = vec![
-                summary("j1", "session", "completed", None, &live(5, &json!([]))),
-                summary("j2", kind, state, Some("j1"), &serde_json::Value::Null),
-            ];
-            let activities: Vec<_> = Job::from_list(jobs).iter().map(Job::activity).collect();
-            assert_eq!(activities, Vec::from_iter(want), "a {state} {kind}");
-        }
-    }
-
-    /// The daemon reports a running turn's elapsed time anew at each
-    /// listing. If that alone made a job look changed, the sidebar would
-    /// reload the session list at every poll while anything runs.
-    #[test]
-    fn elapsed_time_alone_does_not_change_a_job() {
-        let at = |ms| job("session", "running", &live(ms, &json!([]))).expect("a running job");
-        let (earlier, later) = (at(1_000), at(2_000));
-        assert_ne!(earlier.turn_elapsed(), later.turn_elapsed());
-        assert!(earlier.is_same_work(&later));
-
-        let waiting = job("session", "waiting_for_input", &live(2_000, &json!([])));
-        assert!(!earlier.is_same_work(&waiting.expect("a waiting job")));
     }
 }
