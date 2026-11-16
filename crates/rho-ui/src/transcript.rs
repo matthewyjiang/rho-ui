@@ -18,12 +18,12 @@ use std::{
 };
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{text::CodeBlock, TestSupportExt as _};
 use gpui_kit::component::{
     alert::{Alert, AlertVariant},
     attachment::Attachment as Card,
     bubble::{Bubble, BubbleVariant},
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
@@ -32,8 +32,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, transparent_white, AnyElement, App, AppContext as _, ElementId, Entity,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    div, px, rems, transparent_white, AnyElement, App, AppContext as _, ClipboardItem, ElementId,
+    Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
@@ -56,15 +56,14 @@ use crate::{
 /// fit the transcript's measure.
 pub(crate) const IMAGE_HEIGHT: f32 = 10.;
 
-/// A code block's padding above its code. Kit sets the language name in the
-/// top corner, its letters 10px to 17px down; this starts the code's letters
-/// about 4px under them, so the name sits in the padding rather than reading
-/// as a line of the block, as Kit's own 28px makes it.
-const CODE_BLOCK_PAD_TOP: f32 = 19.;
+/// A code block's padding above its code. Kit puts [`code_actions`] in the
+/// top corner, 8px down; its copy button is 20px tall, its icon 12px to 24px
+/// down. This starts the code's letters about 4px under the icon, so the
+/// corner sits in the padding rather than over the first line.
+const CODE_BLOCK_PAD_TOP: f32 = 26.;
 
-/// A code block's padding below its code: 2px more than above, as a line's
-/// letters sit about 2px lower in its box than its bottom, so the code is as
-/// far from both edges.
+/// A code block's padding below its code, as far from its last line's
+/// letters as Kit's corner leaves the first line's under the icon.
 const CODE_BLOCK_PAD_BOTTOM: f32 = 21.;
 
 /// How many lines of a notice's detail show until it is opened. Kit caps
@@ -87,6 +86,68 @@ fn message_style() -> TextViewStyle {
             .pb(px(CODE_BLOCK_PAD_BOTTOM)),
         ..TextViewStyle::default()
     }
+}
+
+/// How long a code block's copy button shows a check after it copies, as
+/// Kit's own `Clipboard` does.
+const COPIED_FOR: Duration = Duration::from_secs(2);
+
+/// A code block's corner in a message or notice: its language, and a button
+/// that copies its code. Kit drops its own language name once a block has
+/// actions, so this sets it, as Kit does.
+fn code_actions(block: &CodeBlock, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    let copied = window.use_keyed_state("copy-code-copied", cx, |_, _| false);
+    let shows_check = *copied.read(cx);
+    let code = block.code();
+    // Not Kit's `Clipboard`: that is a ghost button, whose hover is the
+    // theme's accent, the color Kit fills a code block with, so hovering it
+    // showed nothing. This is its button and behavior, with a hover the
+    // block shows.
+    let hover = cx.theme().secondary_active;
+    let copy = Button::new("copy-code")
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .foreground(cx.theme().secondary_foreground)
+                .hover(hover)
+                .active(hover),
+        )
+        .xsmall()
+        .icon(if shows_check {
+            Lucide::Check
+        } else {
+            Lucide::Copy
+        })
+        .tooltip("Copy code")
+        .accessibility_label("Copy code")
+        .when(!shows_check, |button| {
+            button.on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+                copied.update(cx, |copied, cx| {
+                    *copied = true;
+                    cx.notify();
+                });
+                let copied = copied.clone();
+                cx.spawn(async move |cx| {
+                    cx.background_executor().timer(COPIED_FOR).await;
+                    copied.update(cx, |copied, cx| {
+                        *copied = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            })
+        });
+    h_flex()
+        .gap_1()
+        .children(block.lang().filter(|lang| !lang.is_empty()).map(|lang| {
+            div()
+                .font_family(cx.theme().font_family.clone())
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(lang)
+        }))
+        .child(copy)
 }
 
 /// What a click in the transcript asks for.
@@ -671,6 +732,7 @@ impl Transcript {
         let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
         let mut text = TextView::new(detail)
             .style(message_style().paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)))
+            .code_block_actions(code_actions)
             .selectable(true);
         if !open {
             text = text.max_lines(NOTICE_LINES);
@@ -875,6 +937,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                         .child(
                             TextView::new(text)
                                 .style(message_style())
+                                .code_block_actions(code_actions)
                                 .markdown_extensions(figures::extensions(pictures, ix))
                                 .selectable(true),
                         ),
@@ -897,6 +960,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
             .children(text.map(|text| {
                 TextView::new(text)
                     .style(message_style())
+                    .code_block_actions(code_actions)
                     .markdown_extensions(figures::extensions(pictures, ix))
                     .selectable(true)
                     .stream_fade(phase == Phase::Live)

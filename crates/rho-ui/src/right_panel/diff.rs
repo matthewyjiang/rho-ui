@@ -1,12 +1,13 @@
 //! The Diff surface: the uncommitted changes in the repository of the
-//! session on screen, staged or not, with its untracked files, as `git` on
-//! the session's machine reports them, drawn with Kit's diff view. It reads
-//! them when it opens, when another session comes on screen, when the
-//! session's turn ends, and on Refresh, and parses them off the UI thread.
+//! session its tab belongs to, staged or not, with its untracked files, as
+//! `git` on the session's machine reports them, drawn with Kit's diff view.
+//! It reads them when it opens, when its session comes back on screen or
+//! its turn ends ([`super::RightPanel`] says when), and on Refresh, and
+//! parses them off the UI thread.
 //! A patch over [`PATCH_LIMIT`] shows the whole files that fit, and says
 //! where it stopped.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
@@ -20,14 +21,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, AppContext as _, BackgroundExecutor, Context, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window,
+    Styled as _, Task, Window,
 };
+
+use rho_ui_core::platform;
 
 use super::message;
 use crate::{
-    folders::{find, Reader},
+    folders::{find, Deadline, Reader},
+    local,
     machines::Place,
-    session_view::{SessionEvent, SessionView},
     workspaces::Workspaces,
 };
 
@@ -50,11 +53,21 @@ const PATCH_LIMIT: usize = 8 << 20;
 /// the file before.
 const FILE_START: &[u8] = b"\ndiff --git ";
 
+/// `git diff` as [`SCRIPT`] runs it, for a patch Kit's diff view reads.
+const DIFF: &[&str] = &[
+    "-c",
+    "core.quotepath=off",
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+];
+
 /// The POSIX `sh` script that prints the changes in the repository of the
 /// folder given as its argument: from its top, every change to tracked
 /// files against `HEAD` (against the empty tree before the first commit),
 /// then each untracked file that isn't ignored, as a new file. After
-/// [`CHANGES`], or [`NO_GIT`] outside a repository. Read with [`parse`].
+/// [`CHANGES`], or [`NO_GIT`] outside a repository. Read with [`parse`];
+/// [`diff_here`] does the same here.
 /// GNU `xargs` runs its command once even with no files, so the command
 /// skips an empty name; `git diff --no-index` exits 1 when the files
 /// differ, which is every time here.
@@ -74,7 +87,7 @@ git ls-files -z --others --exclude-standard |
     [ $? -le 1 ]' sh
 "#;
 
-/// The patch [`SCRIPT`] printed, whole files only.
+/// A repository's changes, whole files only, as [`cut`] keeps them.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Patch {
     text: String,
@@ -102,13 +115,11 @@ enum Status {
     Ready,
 }
 
-/// The Diff surface of [`super::RightPanel`]: it follows the session the
-/// panel shows.
+/// The Diff surface of [`super::RightPanel`], for one session.
 pub(super) struct DiffSurface {
     workspaces: Entity<Workspaces>,
-    /// The session's folder, with the subscription that reads it again when
-    /// its turn ends.
-    session: Option<(Place, Subscription)>,
+    /// The session's folder.
+    place: Place,
     state: Entity<DiffState>,
     status: Status,
     /// The patch on screen, so a read that finds the same changes leaves
@@ -121,56 +132,25 @@ pub(super) struct DiffSurface {
 impl DiffSurface {
     pub(super) fn new(
         workspaces: Entity<Workspaces>,
-        session: Option<&Entity<SessionView>>,
+        place: Place,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let mut this = Self {
             workspaces,
-            session: None,
+            place,
             state: cx.new(|cx| DiffState::new([], cx)),
             status: Status::Loading,
             patch: Patch::default(),
             load: Task::ready(()),
         };
-        this.set_session(session, cx);
+        this.reload(cx);
         this
-    }
-
-    /// Shows the changes where `session` works, or nothing without one. A
-    /// session in the folder already showing keeps the changes as they
-    /// are until the new read comes.
-    pub(super) fn set_session(
-        &mut self,
-        session: Option<&Entity<SessionView>>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let before = self.session.take().map(|(place, _)| place);
-        self.session = session.map(|view| {
-            let live = view.read(cx).live();
-            let place = Place::new(live.id.machine, live.cwd);
-            let ended = cx.subscribe(view, |this, _, event: &SessionEvent, cx| {
-                if matches!(event, SessionEvent::Saved) {
-                    this.reload(cx);
-                }
-            });
-            (place, ended)
-        });
-        if before.as_ref() != self.session.as_ref().map(|(place, _)| place) {
-            self.status = Status::Loading;
-            self.patch = Patch::default();
-            self.state.update(cx, |state, cx| state.set_files([], cx));
-        }
-        self.reload(cx);
     }
 
     /// Reads the session's changes again, keeping what shows until they
     /// come.
-    fn reload(&mut self, cx: &mut Context<'_, Self>) {
-        let Some((place, _)) = &self.session else {
-            self.load = Task::ready(());
-            cx.notify();
-            return;
-        };
+    pub(super) fn reload(&mut self, cx: &mut Context<'_, Self>) {
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
         let cwd = place.path.clone();
         let executor = cx.background_executor().clone();
@@ -305,9 +285,6 @@ fn file_header(file: &DiffFile, _: &mut Window, cx: &mut App) -> impl IntoElemen
 
 impl Render for DiffSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        if self.session.is_none() {
-            return message("Open a session to see its changes.", None);
-        }
         match &self.status {
             Status::Loading => message(
                 "Reading the changes…",
@@ -356,14 +333,22 @@ async fn read(
     cwd: PathBuf,
     executor: BackgroundExecutor,
 ) -> Result<Changes, String> {
-    let output = reader
-        .run_script(SCRIPT, vec![cwd.into_os_string()], &executor)
+    let args = vec![cwd.as_os_str().to_owned()];
+    let patch = reader
+        .query(
+            &executor,
+            move || diff_here(&cwd, PATCH_LIMIT),
+            SCRIPT,
+            args,
+            Deadline::Script,
+            |output| parse(&output, PATCH_LIMIT),
+        )
         .await?;
+    let Some(patch) = patch else {
+        return Ok(Changes::NotGit);
+    };
     executor
         .spawn(async move {
-            let Some(patch) = parse(&output, PATCH_LIMIT)? else {
-                return Ok(Changes::NotGit);
-            };
             let files = DiffFile::parse(&patch.text)
                 .map_err(|error| format!("Couldn't read git's diff: {error}"))?;
             Ok(Changes::Patch(patch, files))
@@ -371,23 +356,72 @@ async fn read(
         .await
 }
 
+/// The changes in the repository of `cwd` on this machine, as [`SCRIPT`]
+/// finds them, or `None` outside one. Past `limit` bytes, it keeps the
+/// whole files that fit. Blocks; call it off the UI thread.
+///
+/// # Errors
+///
+/// Says why, in git's words, if git can't diff the repository or one of
+/// its untracked files.
+fn diff_here(cwd: &Path, limit: usize) -> Result<Option<Patch>, String> {
+    // Not a folder, no git, or not in a repository, as the script tells.
+    let Ok(top) = local::line(&mut local::git(cwd, &["rev-parse", "--show-toplevel"])) else {
+        return Ok(None);
+    };
+    let top = platform::path_from_bytes(&top);
+    let base = base(&top)?;
+    let mut patch = local::stdout(local::git(&top, DIFF).args([base.as_str(), "--"]))?;
+    let untracked = ["ls-files", "-z", "--others", "--exclude-standard"];
+    let untracked = local::stdout(&mut local::git(&top, &untracked)).unwrap_or_default();
+    for name in untracked
+        .split(|&byte| byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        // Past this, more files can't change what `cut` keeps.
+        if patch.len() >= limit + FILE_START.len() {
+            break;
+        }
+        let mut command = local::git(&top, DIFF);
+        command
+            .args(["--no-index", "--", "/dev/null"])
+            .arg(platform::path_from_bytes(name));
+        let output = local::run(&mut command)?;
+        // 1 says the files differ, which they do every time here.
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            return Err(local::failure(&command, &output));
+        }
+        patch.extend(output.stdout);
+    }
+    Ok(Some(cut(&patch, limit)))
+}
+
+/// What [`diff_here`] diffs the repository at `top` against: `HEAD`, or
+/// before the first commit the empty tree.
+///
+/// # Errors
+///
+/// Says why, in git's words, if git can't hash the empty tree.
+fn base(top: &Path) -> Result<String, String> {
+    if local::succeeds(&mut local::git(
+        top,
+        &["rev-parse", "-q", "--verify", "HEAD"],
+    )) {
+        return Ok("HEAD".to_owned());
+    }
+    // Hashed from an empty stdin, as the script hashes `/dev/null`.
+    let empty = local::line(&mut local::git(
+        top,
+        &["hash-object", "-t", "tree", "--stdin"],
+    ))?;
+    Ok(String::from_utf8_lossy(&empty).into_owned())
+}
+
 /// The patch [`SCRIPT`] printed, or `None` if it found no repository. Past
 /// `limit` bytes, it keeps the whole files that fit.
 fn parse(output: &[u8], limit: usize) -> Result<Option<Patch>, String> {
     if let Some(at) = find(output, CHANGES) {
-        let mut patch = &output[at + CHANGES.len()..];
-        let cut = patch.len() > limit;
-        if cut {
-            // Up to the newline ending the last file within the limit,
-            // whose end is the next file's start.
-            let end = patch[..(limit + FILE_START.len() - 1).min(patch.len())]
-                .windows(FILE_START.len())
-                .rposition(|window| window == FILE_START)
-                .map_or(0, |at| at + 1);
-            patch = &patch[..end];
-        }
-        let text = String::from_utf8_lossy(patch).into_owned();
-        return Ok(Some(Patch { text, cut }));
+        return Ok(Some(cut(&output[at + CHANGES.len()..], limit)));
     }
     match find(output, NO_GIT) {
         Some(_) => Ok(None),
@@ -395,43 +429,38 @@ fn parse(output: &[u8], limit: usize) -> Result<Option<Patch>, String> {
     }
 }
 
+/// The whole files of `patch` within `limit` bytes.
+fn cut(mut patch: &[u8], limit: usize) -> Patch {
+    let cut = patch.len() > limit;
+    if cut {
+        // Up to the newline ending the last file within the limit,
+        // whose end is the next file's start.
+        let end = patch[..(limit + FILE_START.len() - 1).min(patch.len())]
+            .windows(FILE_START.len())
+            .rposition(|window| window == FILE_START)
+            .map_or(0, |at| at + 1);
+        patch = &patch[..end];
+    }
+    let text = String::from_utf8_lossy(patch).into_owned();
+    Patch { text, cut }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
-
-    use crate::folders::run_here;
-
     use super::*;
 
-    /// [`SCRIPT`] finds every kind of uncommitted change from any folder of
-    /// the repository, staged or not, untracked files included and ignored
-    /// ones left out, and says when a folder is in no repository.
-    #[test]
-    fn the_script_lists_uncommitted_changes() {
+    /// Finds every kind of uncommitted change from any folder of the
+    /// repository, staged or not, untracked files included and ignored ones
+    /// left out, and says when a folder is in no repository. `read` reads
+    /// the changes at a folder.
+    fn lists_uncommitted_changes(read: impl Fn(&Path) -> Option<Patch>) {
         let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| {
-            let status = Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .current_dir(&dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
+        let dir = dir.path();
+        let git = |args: &[&str]| local::test::git(dir, args);
         let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
-        let changes = |folder: &PathBuf| {
-            let patch = parse(&run_here(SCRIPT, &[folder]).unwrap(), PATCH_LIMIT).unwrap();
-            let files = DiffFile::parse(&patch.expect("a repository").text).unwrap();
+        let changes = |folder: &Path| {
+            let patch = read(folder).expect("a repository");
+            let files = DiffFile::parse(&patch.text).unwrap();
             let mut paths: Vec<String> = files.iter().map(|f| f.path().to_string()).collect();
             paths.sort();
             paths
@@ -442,7 +471,7 @@ mod tests {
         write("src/staged.rs", "fn a() {}\n");
         write(".gitignore", "target/\n");
         assert_eq!(
-            changes(&dir),
+            changes(dir),
             [".gitignore", "src/staged.rs"],
             "before the first commit, every file is new"
         );
@@ -456,12 +485,25 @@ mod tests {
         std::fs::create_dir(dir.join("target")).unwrap();
         write("target/out.o", "ignored\n");
         let expected = ["it's new.md", "kept.txt", "src/staged.rs"];
-        assert_eq!(changes(&dir), expected);
+        assert_eq!(changes(dir), expected);
         assert_eq!(changes(&dir.join("src")), expected, "from a subfolder");
 
         let plain = tempfile::tempdir().unwrap();
-        let output = run_here(SCRIPT, &[plain.path()]).unwrap();
-        assert_eq!(parse(&output, PATCH_LIMIT), Ok(None));
+        assert_eq!(read(plain.path()), None, "no repository");
+    }
+
+    #[test]
+    fn diffing_here_lists_uncommitted_changes() {
+        lists_uncommitted_changes(|folder| diff_here(folder, PATCH_LIMIT).unwrap());
+    }
+
+    /// [`SCRIPT`], which reads a remote machine's changes, lists the same.
+    #[cfg(unix)]
+    #[test]
+    fn the_script_lists_uncommitted_changes() {
+        lists_uncommitted_changes(|folder| {
+            parse(&local::test::sh(SCRIPT, &[folder]).unwrap(), PATCH_LIMIT).unwrap()
+        });
     }
 
     /// What a login file prints before the marker is skipped, and a patch

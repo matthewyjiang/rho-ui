@@ -2,14 +2,18 @@
 //! dialog over the window. Built from GPUI Kit's `Settings` component: pages
 //! on the left with a search, groups of items on the right. Each change
 //! applies at once and is saved. rho-ui's own settings come first, kept in
-//! its settings file: Appearance, and the Machines page in [`machines`].
-//! Then come rho's own, a page per category its daemon describes, saved in
-//! that machine's `config.toml`: see [`rho`]. Last, [`about`] shows the
-//! versions of rho-ui and of Rho on each machine.
+//! its settings file: Appearance, the Machines page in [`machines`], and
+//! the forge CLIs on each machine in [`source_control`]. Then come rho's
+//! own: each machine's sign-ins to providers, in [`providers`], and a page
+//! per category its daemon describes, saved in that machine's
+//! `config.toml`: see [`rho`]. Last, [`about`] shows the versions of
+//! rho-ui and of Rho on each machine.
 
 mod about;
 mod machines;
+mod providers;
 mod rho;
+mod source_control;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
@@ -20,19 +24,24 @@ use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
 };
 use gpui_kit::{
-    div, rems, size, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size, StyleRefinement,
-    Styled as _, Subscription, Window,
+    div, rems, size, App, AppContext as _, Context, Entity, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
+    StyleRefinement, Styled as _, Subscription, WeakEntity, Window,
 };
 
 use crate::{
-    machines::Machines,
+    auths::Auths,
+    forge::Forges,
+    machines::{MachineId, MachineStatus, Machines},
     rho_install::Installs,
     rho_settings::RhoSettings,
     settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
+    workspaces::Workspaces,
 };
 use machines::MachineFields;
+use providers::ProvidersFields;
 use rho::RhoFields;
+use source_control::SourceControlFields;
 
 /// How much of the window the dialog takes in each direction, so a large
 /// window gets a large dialog: 900 x 600 px in the default 1200 x 800 window.
@@ -46,8 +55,9 @@ const MIN_HEIGHT_REMS: f32 = 24.;
 /// The widest dialog, 1024 px at 100%: wider only spreads each label further
 /// from its control.
 const MAX_WIDTH_REMS: f32 = 64.;
-/// The page list on the panel's left.
-const PAGES_REMS: f32 = 11.;
+/// The page list on the panel's left: room for "Source control" beside
+/// its icon and submenu caret.
+const PAGES_REMS: f32 = 12.;
 /// Every control's width, so they line up in one column.
 const CONTROL_REMS: f32 = 14.;
 /// Room on the right of the page title for the dialog's close button.
@@ -56,22 +66,13 @@ const CLOSE_ROOM_REMS: f32 = 3.;
 /// Opens settings in a dialog, unless a dialog is already open. The dialog
 /// owns the view: Escape, its close button, or a click outside drops it, and
 /// the keyboard goes back where it was. The dialog has no title or padding:
-/// the panel fills it, and the page title heads it. `machines`,
-/// `rho_settings` and `installs` are the app's, for rho's own settings on
-/// each machine and About's versions.
-pub(crate) fn open(
-    machines: &Entity<Machines>,
-    rho_settings: &Entity<RhoSettings>,
-    installs: &Entity<Installs>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+/// the panel fills it, and the page title heads it. `app` holds what the
+/// pages read of each machine.
+pub(crate) fn open(app: AppState, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
-    let (machines, rho_settings, installs) =
-        (machines.clone(), rho_settings.clone(), installs.clone());
-    let view = cx.new(|cx| SettingsView::new(machines, rho_settings, installs, window, cx));
+    let view = cx.new(|cx| SettingsView::new(app, window, cx));
     window.open_dialog(cx, move |dialog, window, _| {
         let view = view.clone();
         dialog
@@ -92,6 +93,21 @@ fn dialog_size(window: &Window) -> Size<Pixels> {
         (viewport.width * VIEWPORT_SHARE).clamp(rem * MIN_WIDTH_REMS, rem * MAX_WIDTH_REMS),
         (viewport.height * VIEWPORT_SHARE).max(rem * MIN_HEIGHT_REMS),
     )
+}
+
+/// What Settings reads of each machine, from the app.
+pub(crate) struct AppState {
+    pub(crate) machines: Entity<Machines>,
+    /// rho's own settings on each machine.
+    pub(crate) rho_settings: Entity<RhoSettings>,
+    /// The auth profiles each machine's rho can sign in to.
+    pub(crate) auths: Entity<Auths>,
+    /// Each machine's home folder, which paths show as `~`.
+    pub(crate) workspaces: Entity<Workspaces>,
+    /// The forge CLIs on each machine.
+    pub(crate) forges: Entity<Forges>,
+    /// Each machine's rho, for About: installing and updating.
+    pub(crate) installs: Entity<Installs>,
 }
 
 /// One choice in a font Select.
@@ -116,6 +132,12 @@ impl SelectItem for Choice {
 
     fn value(&self) -> &SharedString {
         &self.value
+    }
+
+    /// Each row draws its name in its own font, as a preview. The trigger
+    /// keeps the UI font, so a symbol font's name stays readable there.
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div().font_family(self.value.clone()).child(self.title())
     }
 }
 
@@ -156,21 +178,27 @@ impl FontRole {
 struct SettingsView {
     ui_font: FontSelect,
     code_font: FontSelect,
+    /// Every machine, which the machine-scoped pages pick from.
+    machine_list: Entity<Machines>,
     machines: MachineFields,
     rho: RhoFields,
+    source_control: SourceControlFields,
+    providers: ProvidersFields,
     /// Each machine's rho, for About.
     installs: Entity<Installs>,
     _subscriptions: [Subscription; 3],
 }
 
 impl SettingsView {
-    fn new(
-        machines: Entity<Machines>,
-        rho_settings: Entity<RhoSettings>,
-        installs: Entity<Installs>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) -> Self {
+    fn new(app: AppState, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        let AppState {
+            machines,
+            rho_settings,
+            auths,
+            workspaces,
+            forges,
+            installs,
+        } = app;
         let installs_subscription = cx.observe(&installs, |_, _, cx| cx.notify());
         let fonts: Vec<Choice> = cx
             .text_system()
@@ -187,7 +215,10 @@ impl SettingsView {
             ui_font,
             code_font,
             machines: MachineFields::new(window, cx),
-            rho: RhoFields::new(machines, rho_settings, window, cx),
+            source_control: SourceControlFields::new(&machines, workspaces, forges, cx),
+            providers: ProvidersFields::new(&machines, auths, cx),
+            rho: RhoFields::new(&machines, rho_settings, window, cx),
+            machine_list: machines,
             installs,
             _subscriptions: [ui_subscription, code_subscription, installs_subscription],
         };
@@ -266,6 +297,104 @@ fn page_header() -> StyleRefinement {
         .pr(rems(CLOSE_ROOM_REMS))
         .text_lg()
         .font_weight(FontWeight::SEMIBOLD)
+}
+
+/// The machine a page shows, for pages that differ by machine: the one
+/// picked, while it is still on the list, else this one.
+struct PickedMachine(MachineId);
+
+impl PickedMachine {
+    /// This machine, until the user picks another.
+    fn new() -> Self {
+        Self(MachineId::local())
+    }
+
+    fn shown(&self, machines: &Machines) -> MachineId {
+        if machines.get(&self.0).is_some() {
+            self.0.clone()
+        } else {
+            MachineId::local()
+        }
+    }
+
+    /// Picks `machine`; returns whether that changed the pick.
+    fn pick(&mut self, machine: MachineId) -> bool {
+        if self.0 == machine {
+            return false;
+        }
+        self.0 = machine;
+        true
+    }
+}
+
+/// Why `machine`'s daemon can't be asked yet, as a page says it.
+fn unreachable_note(machines: &Machines, machine: &MachineId) -> Option<String> {
+    let label = machines.label(machine);
+    match machines.status(machine) {
+        None | Some(MachineStatus::Connecting) => Some(format!("Connecting to {label}…")),
+        Some(MachineStatus::Failed(why)) => Some(format!("Can't reach {label}: {why}")),
+        Some(MachineStatus::Ready { .. }) => None,
+    }
+}
+
+/// The picker of the machine a page shows, among `machines`, set to
+/// `shown`; `pick` shows another. `description` says why the page differs
+/// by machine.
+fn machine_picker(
+    machines: &Machines,
+    shown: &MachineId,
+    description: &'static str,
+    view: WeakEntity<SettingsView>,
+    pick: fn(&mut SettingsView, MachineId, &mut Context<'_, SettingsView>),
+) -> SettingItem {
+    let options: Vec<(SharedString, SharedString)> = machines
+        .iter()
+        .map(|machine| {
+            let id = SharedString::from(machine.id.as_str().to_owned());
+            (id, machine.label.clone())
+        })
+        .collect();
+    let shown = SharedString::from(shown.as_str().to_owned());
+    SettingItem::new(
+        "Machine",
+        SettingField::dropdown(
+            options,
+            move |_: &App| shown.clone(),
+            move |id: SharedString, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| pick(this, MachineId::from(&*id), cx));
+            },
+        )
+        .w(rems(CONTROL_REMS))
+        .justify_between(),
+    )
+    .description(description)
+}
+
+/// How a value reads: muted when it stands in for one not known yet.
+#[derive(Clone, Copy)]
+enum Tone {
+    Plain,
+    Muted,
+}
+
+impl Tone {
+    fn color(self, cx: &App) -> Hsla {
+        match self {
+            Tone::Plain => cx.theme().foreground,
+            Tone::Muted => cx.theme().muted_foreground,
+        }
+    }
+}
+
+/// A value to read, not change.
+fn value(text: impl Into<SharedString>, tone: Tone) -> SettingField<SharedString> {
+    let text = text.into();
+    SettingField::render(move |_, _, cx| {
+        div()
+            .text_sm()
+            .text_color(tone.color(cx))
+            .child(text.clone())
+    })
 }
 
 /// Applies and saves a change to the current settings.
@@ -355,8 +484,10 @@ impl Render for SettingsView {
                 ]),
             );
         let machines = self.machines_page(cx);
+        let source_control = self.source_control_page(window, cx);
+        let providers = self.providers_page(window, cx);
         let rho = self.rho_page(window, cx);
-        let about = about::about_page(&self.rho.machines, &self.installs, cx);
+        let about = about::about_page(&self.machine_list, &self.installs, cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
         // corners, since the dialog has no padding to keep it inside.
@@ -375,6 +506,8 @@ impl Render for SettingsView {
                     .with_group_variant(GroupBoxVariant::Fill)
                     .page(appearance)
                     .page(machines)
+                    .page(source_control)
+                    .page(providers)
                     .page(rho)
                     .page(about),
             )

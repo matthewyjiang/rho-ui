@@ -49,11 +49,13 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     surface::{SurfaceAction, SurfaceStore},
-    Answer, Attached, Attachment, BackgroundId, Daemon, DaemonError, Entry, InputId, Prompt,
-    RunState, Session, SessionId, SessionUpdate, SteerId, SurfaceActionError, TurnId, Unsteered,
+    Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon, DaemonError, Entry,
+    InputId, JobActivity, Prompt, Run, RunState, Session, SessionId, SessionUpdate, SteerId,
+    SurfaceActionError, TurnId, Unsteered,
 };
 
 use crate::{
+    auths::Auths,
     background::{BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler},
     background_log::{BackgroundLog, Recorded},
     composer::{Composer, ComposerMode, ComposerState},
@@ -63,6 +65,7 @@ use crate::{
     plan::PlanList,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
+    sign_in::SignInSlot,
     surface_view::{Standing, SurfaceEvent, SurfacePanel},
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
@@ -125,12 +128,18 @@ pub(crate) struct SessionView {
     transcript: Transcript,
     composer: Entity<ComposerState>,
     settings: Entity<SessionSettings>,
+    /// The sign-in its model's auth profile needs, while it is signed out;
+    /// see [`Self::with_sign_in`].
+    sign_in: Option<SignInSlot>,
     /// The oldest open request, while there is one, and its events.
     card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt is on its way to the daemon.
     sending: bool,
     /// Background work the user asked to stop that still runs.
     stopping: Vec<BackgroundId>,
+    /// The subagent and workflow runs the session started, as the daemon's
+    /// job list last said; see [`Self::set_runs`].
+    runs: Vec<Run>,
     /// What the background log holds of the session's work.
     recorded: Recorded,
     /// The first prompt was accepted, so the session is saved.
@@ -236,9 +245,11 @@ impl SessionView {
             transcript,
             composer,
             settings,
+            sign_in: None,
             card: None,
             sending: false,
             stopping: Vec::new(),
+            runs: Vec::new(),
             recorded,
             busy_since: None,
             turn_began: None,
@@ -308,6 +319,31 @@ impl SessionView {
             _above: renamed,
             ..view
         }
+    }
+
+    /// Offers the sign-in the session's model needs, above the composer,
+    /// while its auth profile is signed out on its machine, as `auths`
+    /// says. A subagent's session has no composer, so it gets none.
+    pub(crate) fn with_sign_in(
+        mut self,
+        auths: Entity<Auths>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let machine = self.cwd.machine.clone();
+        self.sign_in = Some(SignInSlot::new(
+            auths,
+            machine,
+            Self::model_auth,
+            window,
+            cx,
+        ));
+        self
+    }
+
+    /// The auth profile the session's model runs on, once known.
+    fn model_auth(&self) -> Option<&str> {
+        self.session.auth()
     }
 
     /// The session, and the machine it is on.
@@ -408,9 +444,16 @@ impl SessionView {
     }
 
     fn activity(&self) -> Activity {
+        let running = || {
+            self.session
+                .background()
+                .iter()
+                .any(|work| work.status() == BackgroundStatus::Running)
+        };
         match (self.waiting_since, self.busy_since) {
             (Some(since), _) => Activity::Waiting(since),
             (None, Some(since)) => Activity::Working(since),
+            (None, None) if running() => Activity::Background,
             (None, None) => Activity::Idle,
         }
     }
@@ -521,6 +564,13 @@ impl SessionView {
             (false, Some(_), _) => {
                 self.busy_since = None;
                 self.transcript.end_turn(self.session.entries(), cx);
+                // A sign-out elsewhere fails the next turn: read whether
+                // the model's profile is still signed in.
+                if matches!(self.session.state(), RunState::Failed(_)) {
+                    if let Some(slot) = &self.sign_in {
+                        slot.refresh(cx);
+                    }
+                }
                 cx.emit(SessionEvent::Saved);
             }
             _ => {}
@@ -683,10 +733,15 @@ impl SessionView {
         }
         let daemon = self.daemon.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let jobs = daemon.active_jobs().await;
+            let jobs = daemon.jobs().await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let id = this.session.id();
-                let listed = jobs.is_ok_and(|jobs| jobs.iter().any(|job| job.session() == id));
+                // Only a turn under way or waiting for a person refuses one.
+                let listed = jobs.is_ok_and(|jobs| {
+                    jobs.active
+                        .iter()
+                        .any(|job| job.session() == id && job.activity() != JobActivity::Background)
+                });
                 // The turn's events may have come in meanwhile.
                 if listed || this.session.has_turn_since(sent_after.as_ref()) {
                     this.hold(prompt, sent_after, window, cx);
@@ -765,6 +820,16 @@ impl SessionView {
             }
         })
         .detach();
+    }
+
+    /// Takes the session's runs from a listing of the daemon's jobs, which
+    /// says what its background list lacks: where a queued run waits, why
+    /// a failed one failed, and a workflow's agent nodes.
+    pub(crate) fn set_runs(&mut self, runs: Vec<Run>, cx: &mut Context<'_, Self>) {
+        if self.runs != runs {
+            self.runs = runs;
+            cx.notify();
+        }
     }
 
     /// Takes back a steer the model has not read, into the composer.
@@ -1220,6 +1285,11 @@ impl SessionView {
                     ),
                 )
             })
+            .children(
+                self.sign_in
+                    .as_ref()
+                    .and_then(|slot| slot.card(self.session.auth(), cx)),
+            )
             .when_some(self.card.as_ref(), |this, (card, _)| {
                 this.child(card.clone())
             })
@@ -1294,6 +1364,7 @@ impl SessionView {
     fn render_background(&self, cx: &mut Context<'_, Self>) -> Option<BackgroundList> {
         let list = BackgroundList::new(
             self.session.background(),
+            &self.runs,
             Self::open_handler(cx.entity().downgrade()),
         )?;
         if self.is_subagent() {
@@ -1314,6 +1385,7 @@ impl SessionView {
         let surface = BackgroundSurface::new(
             this.session.background(),
             this.session.ended_background(),
+            &this.runs,
             Self::open_handler(view.downgrade()),
         );
         if this.is_subagent() {
@@ -1364,6 +1436,7 @@ impl SessionView {
         }
         bar.trailing(BackgroundHistory::new(
             self.session.ended_background(),
+            &self.runs,
             Self::open_handler(cx.entity().downgrade()),
         ))
     }

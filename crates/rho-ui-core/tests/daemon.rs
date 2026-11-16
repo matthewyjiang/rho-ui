@@ -9,13 +9,13 @@ use rho_ui_core::{
     agent_settings::{SettingChange, SettingKey, SettingValue},
     fake_daemon::{
         surface::{FORM_SURFACE, REFUSED_EVENT},
-        FakeDaemon, Script, TuiJob, TUI_SESSION,
+        FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
     },
     surface::{Node, SurfaceStore, SurfaceTree},
-    AgentSettings, Answer, Attachment, BackgroundKind, BackgroundStatus, Checkout, ChoiceKind,
-    ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonTarget,
-    Detached, Entry, Form, Image, ImageFormat, JobActivity, Prompt, RunState, Session,
-    SurfaceActionError, ToolStatus, Unsteered, MAX_PROMPT_ATTACHMENT_BYTES,
+    AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus, Checkout,
+    ChoiceKind, ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
+    DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity, LoginOutcome, Prompt,
+    RunState, Session, SurfaceActionError, ToolStatus, Unsteered, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -169,6 +169,85 @@ fn last_reply(session: &Session) -> &str {
         Some(Entry::Agent(reply)) => reply.text(),
         other => panic!("the transcript ends in {other:?}"),
     }
+}
+
+/// The next event that isn't a session's.
+async fn next_login(events: &mut DaemonEvents) -> DaemonEvent {
+    loop {
+        match next(events).await {
+            DaemonEvent::Update { .. } => {}
+            other => return other,
+        }
+    }
+}
+
+/// A session whose model has no credentials still opens, signed out, and
+/// a login started through the daemon reaches this client: its prompt,
+/// then how it ended, whether approved or cancelled.
+#[test]
+fn a_signed_out_session_opens_and_a_login_is_relayed() {
+    let fake = FakeDaemon::start(Script {
+        signed_out: true,
+        ..Script::default()
+    });
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let session = new_session(&daemon).await;
+        assert_eq!(session.auth(), Some(KEY_AUTH));
+
+        // The fake is this machine's, so the login opens the browser: no
+        // code to enter.
+        let cancelled = daemon.login(LOGIN_AUTH).await.expect("a login starts");
+        match next_login(&mut events).await {
+            DaemonEvent::LoginPrompt { login, prompt } => {
+                assert_eq!(
+                    (login, prompt.url, prompt.user_code),
+                    (cancelled.clone(), LOGIN_URL.to_owned(), None)
+                );
+            }
+            other => panic!("expected the login's prompt, got {other:?}"),
+        }
+        daemon
+            .cancel_login(&cancelled)
+            .await
+            .expect("the login stops");
+        match next_login(&mut events).await {
+            DaemonEvent::LoginFinished { login, outcome } => {
+                assert_eq!((login, outcome), (cancelled, LoginOutcome::Cancelled));
+            }
+            other => panic!("expected the login to end, got {other:?}"),
+        }
+
+        let approved = daemon
+            .login(LOGIN_AUTH)
+            .await
+            .expect("a second login starts");
+        assert!(matches!(
+            next_login(&mut events).await,
+            DaemonEvent::LoginPrompt { .. }
+        ));
+        fake.approve_login();
+        match next_login(&mut events).await {
+            DaemonEvent::LoginFinished { login, outcome } => {
+                assert_eq!((login, outcome), (approved, LoginOutcome::Succeeded));
+            }
+            other => panic!("expected the login to end, got {other:?}"),
+        }
+        let signed_in: Vec<_> = daemon
+            .auths()
+            .await
+            .expect("the fake lists its profiles")
+            .into_iter()
+            .map(|auth| (auth.auth, auth.status))
+            .collect();
+        assert_eq!(
+            signed_in,
+            [
+                (KEY_AUTH.to_owned(), AuthStatus::SignedOut),
+                (LOGIN_AUTH.to_owned(), AuthStatus::SignedIn)
+            ]
+        );
+    });
 }
 
 #[test]
@@ -370,7 +449,7 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
     });
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
-        let jobs = daemon.active_jobs().await.unwrap();
+        let jobs = daemon.jobs().await.unwrap().active;
         let [job] = jobs.as_slice() else {
             panic!("one job runs: {jobs:?}")
         };
@@ -411,7 +490,7 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
         );
         assert_eq!(session.pending_steers().count(), 0);
         assert_eq!(session.take_dropped_steers(), Vec::<String>::new());
-        assert!(daemon.active_jobs().await.unwrap().is_empty());
+        assert!(daemon.jobs().await.unwrap().active.is_empty());
 
         // Between turns nothing takes a steer.
         let refused = daemon.steer(session.id(), "too late").await.unwrap_err();
@@ -468,6 +547,10 @@ fn a_prompt_past_the_message_limit_is_refused_and_the_connection_lives() {
 /// A rho that isn't there fails the connection with a reason that names
 /// it, so the user knows which path to fix.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "rho-ui can't start a daemon on Windows until rho-protocol's LocalDaemon is released there"
+)]
 fn a_missing_rho_fails_the_connection_with_a_reason() {
     // A home with no daemon, so the connection must start one.
     let target = DaemonTarget::Home {
@@ -681,7 +764,9 @@ fn a_replay_rebuilds_a_surface_once() {
                 DaemonEvent::Update { update, .. } => {
                     session.apply(update);
                 }
-                other @ DaemonEvent::AgentSettingsChanged(_) => {
+                other @ (DaemonEvent::AgentSettingsChanged(_)
+                | DaemonEvent::LoginPrompt { .. }
+                | DaemonEvent::LoginFinished { .. }) => {
                     panic!("unexpected event: {other:?}")
                 }
             }

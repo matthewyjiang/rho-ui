@@ -56,7 +56,7 @@ use rho_ui_core::Checkout;
 use crate::{
     badge::Badge,
     cloning::{self, Source},
-    folders::{self, Reader, Typed},
+    folders::{self, PathStyle, Reader, Typed},
     machines::{MachineId, MachineStatus, Machines, Place},
     projects::Projects,
     repo,
@@ -1083,7 +1083,7 @@ impl ListDelegate for ProjectList {
         let machine = self.current.machine.clone();
         let workspaces = self.workspaces.read(cx);
         let home = workspaces.home(&machine);
-        let typed = Typed::parse(query, home.as_deref());
+        let typed = Typed::parse(query, home.as_deref(), PathStyle::of(&machine));
         self.found
             .retain(|row| matches!((row, &typed), (Row::Next(folder), Some(typed)) if typed.leads_to(&folder.root.path)));
         // A git URL: the machine's checkout of it, else a clone of it.

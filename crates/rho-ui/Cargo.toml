@@ -27,8 +27,9 @@ futures = "0.3"
 # Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
 rquickjs = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }
-# The values a surface's controls write to its data model
-# (`surface_view.rs`).
+# Reads what forge CLIs such as gh print as JSON; see src/forge.rs. The
+# values a surface's controls write to its data model (`surface_view.rs`).
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [lints]
@@ -47,3 +48,8 @@ tempfile = "3"
 # on others. Same version as GPUI Kit pins, so features unify.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui-apple = { package = "gpui-pre-apple", version = "=0.3.12", features = ["font-kit"] }
+
+# GPUI has no offscreen renderer for Windows, so there the UI tests draw with
+# its wgpu one, on Mesa lavapipe as on Linux. Same version as GPUI Kit pins.
+[target.'cfg(windows)'.dev-dependencies]
+gpui-wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12", features = ["test-support"] }

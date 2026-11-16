@@ -1,37 +1,53 @@
-//! Reaching a rho daemon on another machine over ssh.
+//! Reaching a rho daemon on another machine over ssh, with an ssh client
+//! in this process (russh), so Windows reaches Unix machines as Linux and
+//! macOS do.
 //!
-//! One ssh master connection per host carries everything: [`connect`]
-//! starts it (or reuses a live one), runs a setup script on the machine
-//! that starts its daemon and reports where it listens and the login
-//! environment, then forwards stdio to the daemon's socket with `ssh -W`.
-//! A new ssh connection costs a key signature, which an agent such as
-//! 1Password's asks the user to approve, so all but the first ride the
-//! master. Measured with OpenSSH 10.6 to localhost: the master took about
-//! 2 s, each call through it about 5 ms.
+//! One ssh connection per host carries everything ([`connection`]):
+//! [`connect`] opens it, or takes the open one, runs a setup script on
+//! the machine that starts its daemon and reports where it listens and
+//! the login environment ([`setup`]), then opens a `direct-streamlocal`
+//! channel to the daemon's socket, as `ssh -W` does, and speaks rho's
+//! protocol over it. Every script after that runs in a session channel
+//! of its own on the same connection ([`script`]). The terminals' login
+//! shells, under a pseudo-terminal there ([`shell`]), run on a second
+//! connection, made when the first terminal opens, so they never take the sessions
+//! scripts need; [`MAX_SHELLS`] at most. A new connection costs a key
+//! signature, which an agent such as 1Password's asks the user to
+//! approve, so the user approves once per host, and once more for its
+//! terminals, while the app uses the host and the link stays up; a
+//! connection nothing uses closes 10 minutes later.
+//!
+//! The connection follows the user's ssh config as `ssh -G` resolves it
+//! ([`config`]), checks the host's key against `known_hosts` and
+//! `RevokedHostKeys` without ever adding to them ([`host_key`]), and
+//! signs in with the key agent's keys and certificates, or key files
+//! that need no passphrase and their certificates ([`auth`]). The files
+//! are read on Tokio's blocking threads, not the I/O runtime's one worker.
 
-use std::{
-    collections::HashMap,
-    ffi::{OsStr, OsString},
-    io,
-    path::{Path, PathBuf},
-    process::{Output, Stdio},
-    sync::{Arc, Mutex, OnceLock},
-    time::Duration,
-};
+mod auth;
+mod config;
+mod connection;
+mod host_key;
+mod script;
+mod setup;
+mod shell;
 
-use rho_protocol::{
-    Client, ClientEnvironment, ClientError, ClientHello, DaemonEndpoint, HelloResponse,
-    Notifications,
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{ChildStderr, Command},
-};
+use std::{ffi::OsStr, sync::Arc, time::Duration};
+
+use rho_protocol::{Client, ClientError, ClientHello, HelloResponse, Notifications};
+use russh::{client::Msg, ChannelStream};
+
+pub(crate) use config::Resolved;
+#[cfg(feature = "test-support")]
+pub(crate) use config::{AgentKeys, IdentityAgent};
+pub use connection::MAX_SHELLS;
+use connection::{Lease, Purpose};
+use script::ScriptError;
+pub use shell::{RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput};
 
 use crate::{
     daemon::{on_io, DaemonError, Machine, HANDSHAKE_DEADLINE},
-    platform::{self, MAX_SOCKET_PATH_BYTES},
-    rho_install::find_rho_sh,
+    platform,
 };
 
 /// A rho daemon on another machine, reached over ssh.
@@ -39,19 +55,31 @@ use crate::{
 pub struct SshTarget {
     host: String,
     rho: String,
-    ssh: PathBuf,
+    /// How to reach the host, when not as the user's ssh config says: a
+    /// test's own server.
+    route: Option<Box<Resolved>>,
 }
 
 impl SshTarget {
     /// The daemon on `host`, any destination ssh accepts (`user@host`, or a
-    /// `Host` alias from `~/.ssh/config`). It runs the program `rho` there
-    /// and the local program `ssh` here; change them with [`Self::with_rho`]
-    /// and [`Self::with_ssh`].
+    /// `Host` alias from `~/.ssh/config`). It runs the program `rho` there;
+    /// change it with [`Self::with_rho`].
     pub fn new(host: impl Into<String>) -> Self {
         Self {
             host: host.into(),
             rho: "rho".to_owned(),
-            ssh: PathBuf::from("ssh"),
+            route: None,
+        }
+    }
+
+    /// The daemon on `host`, reached as `route` says rather than as the
+    /// user's ssh config does: `fake_sshd`'s server.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn routed(host: String, route: Resolved) -> Self {
+        Self {
+            host,
+            rho: "rho".to_owned(),
+            route: Some(Box::new(route)),
         }
     }
 
@@ -64,20 +92,13 @@ impl SshTarget {
         self
     }
 
-    /// Runs `ssh` here instead of the `ssh` on PATH.
-    #[must_use]
-    pub fn with_ssh(mut self, ssh: impl Into<PathBuf>) -> Self {
-        self.ssh = ssh.into();
-        self
-    }
-
     /// The `rho` program it runs on the machine; see [`Self::with_rho`].
     pub(crate) fn rho(&self) -> &str {
         &self.rho
     }
 
-    /// The link to the machine, opening its master connection if none
-    /// runs, for scripts to run there whether or not its daemon answers.
+    /// The link to the machine, opening its connection if none is open,
+    /// for scripts to run there whether or not its daemon answers.
     ///
     /// # Errors
     ///
@@ -95,24 +116,10 @@ impl SshTarget {
                 "{host:?} is not an ssh destination"
             )));
         }
-        let control = platform::private_socket_dir("ssh")
-            .map_err(|error| {
-                DaemonError::Unreachable(format!(
-                    "couldn't make a private directory for ssh's control socket: {error}"
-                ))
-            })
-            .and_then(|dir| {
-                // Named by the ssh program too, so a test's fake ssh never
-                // touches the app's master for the same host.
-                let key = format!("{}\0{host}", self.ssh.display());
-                control_path(&dir, &key).map_err(DaemonError::Unreachable)
-            })?;
-        let ssh = SshLink {
-            target: self.clone(),
-            control,
-        };
-        ssh.ensure_master().await?;
-        Ok(ssh)
+        let lease = connection::shared(host, self.route.as_deref(), Purpose::Daemon).await?;
+        Ok(SshLink {
+            lease: Arc::new(lease),
+        })
     }
 }
 
@@ -122,56 +129,122 @@ pub(crate) async fn connect(
     target: &SshTarget,
     hello: ClientHello,
 ) -> Result<(Client, Notifications, HelloResponse, Machine), DaemonError> {
-    let host = &target.host;
-    let ssh = target.open_link().await?;
-    let setup = ssh.setup().await?;
-    let endpoint = DaemonEndpoint::locate(&setup.rho_home, setup.xdg_runtime_dir.as_deref())
-        .map_err(|error| DaemonError::Unreachable(format!("on {host}: {error}")))?;
-    let (client, notifications, hello) = ssh.bridge(&endpoint.socket, hello).await?;
+    let link = target.open_link().await?;
+    let connection = link.lease.connection();
+    let setup = setup::run(connection, &target.rho).await?;
+    let stream = connection.daemon(&setup.socket).await?;
+    let (client, notifications, hello) =
+        handshake(connection.host(), &setup.socket, stream, hello).await?;
     let machine = Machine {
         environment: setup.environment,
         home: Some(setup.home),
-        ssh: Some(ssh),
+        ssh: Some(link),
     };
     Ok((client, notifications, hello, machine))
 }
 
-/// The ssh commands to one remote machine, all through one control
-/// socket: the daemon connection's own, then [`Self::run_script`]'s.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Completes rho's handshake as `hello` over `stream`, a channel to the
+/// daemon at `socket` on `host`, within [`HANDSHAKE_DEADLINE`]. The
+/// channel lives as long as the client.
+///
+/// # Errors
+///
+/// Fails if the daemon doesn't answer; a daemon that answers with another
+/// protocol version says which side to update.
+async fn handshake(
+    host: &str,
+    socket: &str,
+    stream: ChannelStream<Msg>,
+    hello: ClientHello,
+) -> Result<(Client, Notifications, HelloResponse), DaemonError> {
+    match tokio::time::timeout(HANDSHAKE_DEADLINE, Client::handshake(stream, hello)).await {
+        Err(_) => Err(DaemonError::Unreachable(format!(
+            "the Rho daemon on {host} at {socket} didn't answer the handshake within {} s",
+            HANDSHAKE_DEADLINE.as_secs()
+        ))),
+        Ok(Ok(connected)) => Ok(connected),
+        // The daemon answered; its message names the side to update.
+        Ok(Err(error @ (ClientError::VersionMismatch(_) | ClientError::Rpc { .. }))) => {
+            Err(error.into())
+        }
+        Ok(Err(error)) => Err(DaemonError::Unreachable(format!(
+            "couldn't reach the Rho daemon on {host} at {socket}: {error}"
+        ))),
+    }
+}
+
+/// Runs `work`, which reads files, on Tokio's blocking threads, so the
+/// I/O runtime's one worker, which every daemon socket shares, never
+/// waits on the disk. Call it on the I/O runtime.
+///
+/// # Errors
+///
+/// [`DaemonError::Closed`] if `work` panicked.
+async fn read_files<T, F>(work: F) -> Result<T, DaemonError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| DaemonError::Closed)
+}
+
+/// The ssh connection to one remote machine, shared by its daemon
+/// connection and every script run there; its terminals open one of their
+/// own through it ([`Self::open_shell`]). The connection stays open while
+/// any link to it does, and 10 minutes after. Links are equal when they
+/// share a connection.
+#[derive(Clone)]
 pub struct SshLink {
-    target: SshTarget,
-    control: PathBuf,
+    lease: Arc<Lease>,
+}
+
+impl PartialEq for SshLink {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.lease.connection(), other.lease.connection())
+    }
+}
+
+impl Eq for SshLink {}
+
+impl std::fmt::Debug for SshLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshLink")
+            .field("host", &self.lease.connection().host())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SshLink {
     /// Runs the POSIX `sh` script `script` on the machine, with `args` as
     /// its positional parameters, and returns what it wrote to stdout. It
-    /// runs only through the master the daemon connection opened: once that
+    /// runs only on the connection the daemon connection opened: once that
     /// is gone this fails rather than connect again, which could ask the
     /// user's key agent for another approval.
     ///
     /// # Errors
     ///
-    /// Fails if no master runs, ssh cannot run, the script exits with an
-    /// error, or it runs past 60 s.
+    /// Fails if the connection is gone, the machine refuses a session, the
+    /// script exits with an error, or it runs past 60 s.
     pub async fn run_script(
         &self,
         script: &str,
         args: &[impl AsRef<OsStr>],
     ) -> Result<Vec<u8>, DaemonError> {
-        self.spawn_script(script, args, Some(SCRIPT_DEADLINE)).await
+        self.spawn_script(script, args, Some(script::SCRIPT_DEADLINE))
+            .await
     }
 
     /// [`Self::run_script`] with no deadline, for a script whose time the
     /// network and the work set, such as a `git clone`: it ends when the
     /// script does, the connection does, or the caller drops the future,
-    /// which kills the script's ssh.
+    /// which closes the script's channel.
     ///
     /// # Errors
     ///
-    /// Fails if no master runs, ssh cannot run, or the script exits with
-    /// an error.
+    /// Fails if the connection is gone, the machine refuses a session, or
+    /// the script exits with an error.
     pub async fn run_long_script(
         &self,
         script: &str,
@@ -180,9 +253,9 @@ impl SshLink {
         self.spawn_script(script, args, None).await
     }
 
-    /// Runs [`Self::run`] on the I/O runtime, which ssh's pipes need, with
-    /// `args` set as the script's positional parameters. Dropping the
-    /// future stops the script and kills its ssh.
+    /// Runs [`script::run`] on the I/O runtime, with `args` set as the
+    /// script's positional parameters, and words how it failed. Dropping
+    /// the future stops the script.
     async fn spawn_script(
         &self,
         script: &str,
@@ -196,441 +269,25 @@ impl SshLink {
         }
         input.push(b'\n');
         input.extend(script.as_bytes());
-        let link = self.clone();
-        on_io(async move { link.run(&input, deadline).await }).await?
-    }
-
-    async fn run(&self, input: &[u8], deadline: Option<Duration>) -> Result<Vec<u8>, DaemonError> {
-        let host = &self.target.host;
-        if !self.master_alive().await? {
-            return Err(DaemonError::Unreachable(format!(
-                "no ssh connection to {host}"
-            )));
-        }
-        let ran = self.sh(input);
-        let output = match deadline {
-            Some(deadline) => tokio::time::timeout(deadline, ran).await.map_err(|_| {
-                DaemonError::Unreachable(format!(
-                    "a script on {host} ran past {} s",
-                    deadline.as_secs()
-                ))
-            })?,
-            None => ran.await,
-        }?;
-        if output.status.success() {
-            Ok(output.stdout)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(DaemonError::Unreachable(format!(
-                "a script on {host} failed: {}",
-                or_status(stderr.trim(), output.status)
-            )))
-        }
-    }
-
-    /// The program and arguments of an `ssh` that runs the user's login
-    /// shell in `dir` on the machine, in a terminal of its own (`-tt`), for
-    /// a terminal emulator to run under a pseudo-terminal here. Like
-    /// [`Self::run_script`], it rides the master the daemon connection
-    /// opened, and fails rather than connect again.
-    ///
-    /// sshd hands the command line, `cd -- 'dir' && exec "$SHELL" -l`, to
-    /// the user's login shell to parse, so this assumes a POSIX one, such
-    /// as sh, bash or zsh, unlike [`setup_script`], which `sh` reads. fish
-    /// reads `\\` and `\'` inside single quotes, so there a `dir` holding a
-    /// backslash goes wrong.
-    pub fn terminal_command(&self, dir: &Path) -> (PathBuf, Vec<OsString>) {
-        let mut remote = b"cd -- ".to_vec();
-        remote.extend(quote_bytes(&platform::path_to_bytes(dir.as_os_str())));
-        remote.extend(br#" && exec "$SHELL" -l"#);
-        let mut args = self.session_options();
-        args.extend([
-            "-tt".into(),
-            self.target.host.clone().into(),
-            platform::path_from_bytes(&remote).into_os_string(),
-        ]);
-        (self.target.ssh.clone(), args)
-    }
-
-    /// `ssh` with the options every call takes.
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.target.ssh);
-        command.args(self.options(&[]));
-        command
-    }
-
-    /// `ssh` that rides the master, with [`MULTIPLEXED`].
-    fn multiplexed(&self) -> Command {
-        let mut command = Command::new(&self.target.ssh);
-        command.args(self.options(&MULTIPLEXED));
-        command
-    }
-
-    /// The `-o` options of a session on the machine, a script's or a
-    /// terminal's: it rides the master ([`MULTIPLEXED`]) and forwards
-    /// neither the user's key agent nor X11.
-    fn session_options(&self) -> Vec<OsString> {
-        self.options(&[MULTIPLEXED.as_slice(), NO_FORWARDING.as_slice()].concat())
-    }
-
-    /// The `-o` options every call takes, then `extra`'s. `BatchMode`: the
-    /// app has no terminal to type a password or accept a host key in. An
-    /// agent still signs, and an unknown host key fails at once with ssh's
-    /// message, which the user sees.
-    fn options(&self, extra: &[&str]) -> Vec<OsString> {
-        let control = format!("ControlPath={}", self.control.display());
-        [control.as_str(), "BatchMode=yes"]
-            .iter()
-            .chain(extra)
-            .flat_map(|&option| [OsString::from("-o"), OsString::from(option)])
-            .collect()
-    }
-
-    /// Whether the host's master runs, as `ssh -O check` finds it.
-    async fn master_alive(&self) -> Result<bool, DaemonError> {
-        let host = &self.target.host;
-        let status = self
-            .command()
-            .args(["-O", "check", host])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|error| self.cannot_run(&error))?;
-        Ok(status.success())
-    }
-
-    /// Runs `sh -s` on the machine through the master, feeds it `input`,
-    /// and waits for it to exit. Dropping the future kills ssh, so a
-    /// deadline around this covers writing the input too.
-    async fn sh(&self, input: &[u8]) -> Result<Output, DaemonError> {
-        let host = &self.target.host;
-        let mut child = Command::new(&self.target.ssh)
-            .args(self.session_options())
-            .args(["-T", "-o", "ClearAllForwardings=yes", host, "sh", "-s"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| self.cannot_run(&error))?;
-        let mut stdin = child.stdin.take().expect("ssh's stdin is piped");
-        // A failed write means ssh exited, and its stderr says why.
-        let _ = stdin.write_all(input).await;
-        drop(stdin);
-        child
-            .wait_with_output()
-            .await
-            .map_err(|error| self.cannot_run(&error))
-    }
-
-    fn cannot_run(&self, error: &io::Error) -> DaemonError {
-        DaemonError::Unreachable(format!(
-            "couldn't run {}: {error}",
-            self.target.ssh.display()
-        ))
-    }
-
-    /// Makes sure a master connection to the host runs, starting one if
-    /// none does.
-    ///
-    /// The master runs as its own process (`-f`) with no pipes to this
-    /// one: a master forked from a command whose output is piped keeps the
-    /// pipes open, so waiting for that output would never end. Its stderr
-    /// goes to a file, read when it fails, and removed either way.
-    async fn ensure_master(&self) -> Result<(), DaemonError> {
-        // One at a time per host, so two connections to a host never both
-        // start a master: the second would find the socket taken and stay
-        // a stray connection. Other hosts don't wait on this one's
-        // approval or timeout.
-        let lock = master_lock(&self.control);
-        let _one_at_a_time = lock.lock().await;
-        let host = &self.target.host;
-        if self.master_alive().await? {
-            return Ok(());
-        }
-        // A master that died without cleanup leaves its socket, which
-        // would make the new one give up multiplexing.
-        match std::fs::remove_file(&self.control) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(DaemonError::Unreachable(format!(
-                    "couldn't remove the stale ssh control socket {}: {error}",
-                    self.control.display()
-                )))
-            }
-        }
-        let log_path = self.control.with_extension("log");
-        let log = std::fs::File::create(&log_path).map_err(|error| {
-            DaemonError::Unreachable(format!("couldn't create {}: {error}", log_path.display()))
-        })?;
-        // ControlPersist=600: the master outlives this connection by ten
-        // minutes, so a retry or reconnect within them needs no new
-        // connection, and no new approval from the user's key agent.
-        // ConnectTimeout bounds reaching the host, not signing in: a host
-        // that doesn't answer would otherwise wait out the kernel's SYN
-        // retries (tcp_syn_retries = 6 here, about 127 s). A whole first
-        // connect to localhost, sign-in included, took 2.6 s, so 15 s is
-        // far past any host that answers.
-        let status = self
-            .command()
-            .args(["-o", "ControlMaster=yes", "-o", "ControlPersist=600"])
-            .args(["-o", "ConnectTimeout=15"])
-            // A link that died, as when the laptop sleeps or changes
-            // networks, ends the master within 15 s x 3, and with it every
-            // `ssh -W`, so the app sees the connection close and offers
-            // Retry, instead of TCP retrying for many minutes.
-            .args([
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=3",
-            ])
-            // Errors only: a server's sign-in banner isn't one, and would
-            // fill the app's error message.
-            .args(["-o", "LogLevel=ERROR"])
-            .args(["-N", "-f", host])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            // A connection given up while ssh still signs in stops it, so
-            // its master can't race the next attempt's for the socket. Once
-            // signed in, ssh has forked the master and exited.
-            .kill_on_drop(true)
-            .status()
-            .await
-            .map_err(|error| self.cannot_run(&error));
-        // Read only if it failed, so not kept: a running master writes on
-        // to the unlinked file, freed when it exits.
-        let said = match status {
-            Ok(status) if !status.success() => std::fs::read_to_string(&log_path).ok(),
-            _ => None,
-        };
-        let _ = std::fs::remove_file(&log_path);
-        let status = status?;
-        if status.success() {
-            return Ok(());
-        }
-        let said = said.unwrap_or_default();
-        Err(DaemonError::Unreachable(format!(
-            "couldn't start an ssh connection to {host}: {}",
-            or_status(said.trim(), status)
-        )))
-    }
-
-    /// Runs [`setup_script`] on the host and reads what it reports.
-    async fn setup(&self) -> Result<Setup, DaemonError> {
-        let host = &self.target.host;
-        let script = setup_script(&self.target.rho);
-        let output = tokio::time::timeout(SETUP_DEADLINE, self.sh(script.as_bytes()))
-            .await
-            .map_err(|_| {
-                DaemonError::Unreachable(format!(
-                    "{host} didn't finish starting rho within {} s: check that a login shell \
-                     there starts without waiting for input",
-                    SETUP_DEADLINE.as_secs()
-                ))
-            })??;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            let said = or_status(stderr.trim(), output.status);
-            // 255 is ssh's own failure; anything else is the script's.
-            return Err(DaemonError::Unreachable(
-                if output.status.code() == Some(255) {
-                    format!("couldn't run a command on {host} over ssh: {said}")
-                } else {
-                    format!("couldn't start the Rho daemon on {host}: {said}")
-                },
-            ));
-        }
-        parse_setup(&String::from_utf8_lossy(&output.stdout)).map_err(|problem| {
-            DaemonError::Unreachable(format!("couldn't read {host}'s Rho setup: {problem}"))
+        let lease = Arc::clone(&self.lease);
+        let ran = on_io(async move { script::run(lease.connection(), &input, deadline).await });
+        let host = self.lease.connection().host();
+        ran.await?.map_err(|error| {
+            let why = match error {
+                ScriptError::Session(error) => return error,
+                ScriptError::TimedOut(deadline) => {
+                    format!("a script on {host} ran past {} s", deadline.as_secs())
+                }
+                ScriptError::Cut => format!("the connection to {host} closed while a script ran"),
+                ScriptError::Refused => {
+                    format!("a script on {host} failed: sshd refused to run sh")
+                }
+                ScriptError::Failed(why) => format!("a script on {host} failed: {why}"),
+            };
+            DaemonError::Unreachable(why)
         })
     }
-
-    /// Forwards stdio to `socket` on the host with `ssh -W`, and completes
-    /// the handshake over it within [`HANDSHAKE_DEADLINE`]. The ssh process
-    /// lives as long as the connection: dropping the client closes its
-    /// stdin, and it exits. Dropping the future before then kills it.
-    async fn bridge(
-        &self,
-        socket: &Path,
-        hello: ClientHello,
-    ) -> Result<(Client, Notifications, HelloResponse), DaemonError> {
-        let host = &self.target.host;
-        let mut child = self
-            .multiplexed()
-            .arg("-W")
-            .arg(socket)
-            .arg(host)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| self.cannot_run(&error))?;
-        let stdin = child.stdin.take().expect("ssh's stdin is piped");
-        let stdout = child.stdout.take().expect("ssh's stdout is piped");
-        let stderr = child.stderr.take().expect("ssh's stderr is piped");
-        let said = tokio::spawn(read_stderr(stderr));
-        let handshake = Client::handshake(tokio::io::join(stdout, stdin), hello);
-        let Ok(handshake) = tokio::time::timeout(HANDSHAKE_DEADLINE, handshake).await else {
-            let _ = child.kill().await;
-            return Err(DaemonError::Unreachable(format!(
-                "the Rho daemon on {host} at {} didn't answer the handshake within {} s",
-                socket.display(),
-                HANDSHAKE_DEADLINE.as_secs()
-            )));
-        };
-        match handshake {
-            Ok(connected) => {
-                tokio::spawn(async move {
-                    // Reaps ssh once the connection ends.
-                    let _ = child.wait().await;
-                });
-                Ok(connected)
-            }
-            // The daemon answered; its message names the side to update.
-            Err(error @ (ClientError::VersionMismatch(_) | ClientError::Rpc { .. })) => {
-                let _ = child.kill().await;
-                Err(error.into())
-            }
-            Err(error) => {
-                // ssh wrote why before it closed its end, so its stderr is
-                // complete once it is gone.
-                let _ = child.kill().await;
-                let said = said.await.unwrap_or_default();
-                let said = if said.is_empty() {
-                    error.to_string()
-                } else {
-                    said
-                };
-                Err(DaemonError::Unreachable(format!(
-                    "couldn't reach the Rho daemon on {host} at {}: {said}",
-                    socket.display()
-                )))
-            }
-        }
-    }
 }
-
-/// `said`, or when it is empty, how the command exited.
-fn or_status(said: &str, status: std::process::ExitStatus) -> String {
-    if said.is_empty() {
-        format!("ssh exited with {status}")
-    } else {
-        said.to_owned()
-    }
-}
-
-/// How much of ssh's stderr an error message keeps. ssh's error for a host
-/// it cannot resolve measured 79 bytes, so this holds dozens of lines.
-const STDERR_KEPT: usize = 4096;
-
-/// Reads ssh's stderr to its end, keeping the first [`STDERR_KEPT`] bytes
-/// and dropping the rest, so ssh never blocks on a full pipe. When it
-/// drops some, the text ends saying how much ssh wrote.
-async fn read_stderr(mut stderr: ChildStderr) -> String {
-    let mut kept = Vec::new();
-    let mut dropped = 0;
-    let mut buffer = [0; 1024];
-    while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
-        let keep = read.min(STDERR_KEPT.saturating_sub(kept.len()));
-        kept.extend_from_slice(&buffer[..keep]);
-        dropped += read - keep;
-    }
-    let said = String::from_utf8_lossy(&kept);
-    let said = said.trim();
-    if dropped == 0 {
-        said.to_owned()
-    } else {
-        format!(
-            "{said} [ssh wrote {} bytes; this shows the first {STDERR_KEPT}]",
-            kept.len() + dropped
-        )
-    }
-}
-
-/// The `-o` options of an ssh that rides the master and never becomes one,
-/// nor connects on its own. When the master refuses a session, as at
-/// sshd's `MaxSessions` (10 by default), ssh would otherwise make a
-/// connection of its own, which may ask the user's key agent for an
-/// approval and counts against sshd's `MaxStartups`. `ProxyCommand=false`
-/// makes that connection fail at once, before it reaches the network; the
-/// master ignores it.
-const MULTIPLEXED: [&str; 2] = ["ControlMaster=no", "ProxyCommand=false"];
-
-/// The `-o` options that keep a session on the machine from forwarding the
-/// user's key agent or X11 to it.
-const NO_FORWARDING: [&str; 2] = ["ForwardAgent=no", "ForwardX11=no"];
-
-/// What ssh adds to the control path while it binds the master's socket:
-/// a dot and 16 random letters (`muxserver_listen` in OpenSSH's mux.c).
-const MASTER_SUFFIX_BYTES: usize = 17;
-
-/// The lock that keeps one master starting at a time for the control
-/// socket `control`, one per socket for the life of the process.
-fn master_lock(control: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("the master locks' mutex is never held across a panic");
-    Arc::clone(locks.entry(control.to_path_buf()).or_default())
-}
-
-/// The control socket for `key`, the ssh program and host, in `dir`, named
-/// by a hash of `key`.
-///
-/// # Errors
-///
-/// Fails, saying the limit, when the path is too long for a socket.
-fn control_path(dir: &Path, key: &str) -> Result<PathBuf, String> {
-    let path = dir.join(format!("{:016x}", fnv1a(key.as_bytes())));
-    let len = path.as_os_str().len() + MASTER_SUFFIX_BYTES;
-    if len > MAX_SOCKET_PATH_BYTES {
-        return Err(format!(
-            "ssh's control socket {} would take {len} bytes while ssh binds it, over the \
-             {MAX_SOCKET_PATH_BYTES}-byte limit for Unix socket paths; point XDG_RUNTIME_DIR \
-             at a shorter directory",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
-/// 64-bit FNV-1a: stable across Rust releases, unlike `DefaultHasher`, so
-/// every rho-ui build finds the master another one started.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
-/// How long the setup script may take on the host. Through the master,
-/// a whole connect to localhost, setup included, took 29 ms with the
-/// daemon running; `rho daemon start` with none running took 20 ms (5
-/// runs), and `zsh -l -c env` over a fresh ssh connection 2.1 s. 30 s is
-/// far past those: it catches a login profile that waits for input or a
-/// home directory that hangs.
-const SETUP_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How long [`SshLink::run_script`] waits: a tripwire for a script stuck on
-/// a hung disk. rho-ui's longest, reading the git repositories of every
-/// workspace, took 1.3 s for 133 worktrees (about 10 ms each), so this
-/// leaves room for thousands.
-const SCRIPT_DEADLINE: Duration = Duration::from_secs(60);
-
-/// The line the setup script prints before the login environment, so
-/// whatever a login profile prints comes before it and is skipped.
-const ENV_MARKER: &str = "rho-ui-login-environment-4f1c9a";
-
-/// The line the setup script prints before what it reports, so whatever
-/// the shell ssh runs it from prints first (bash reads `.bashrc` for an
-/// ssh command, zsh reads `.zshenv`) is skipped.
-const SETUP_MARKER: &str = "rho-ui-setup-7d2e40";
 
 /// `text` as one single-quoted POSIX shell word.
 fn quote(text: &str) -> String {
@@ -649,310 +306,4 @@ fn quote_bytes(bytes: &[u8]) -> Vec<u8> {
     }
     quoted.push(b'\'');
     quoted
-}
-
-/// The POSIX sh script [`SshLink::setup`] feeds `sh -s` on the host, so the
-/// user's login shell, which may be zsh or fish, never parses it. It
-/// finds `rho` as [`find_rho_sh`] says and starts the daemon through it,
-/// as `rho daemon start` does locally,
-/// then prints, after [`SETUP_MARKER`], the canonical rho home,
-/// `XDG_RUNTIME_DIR` (maybe empty), `HOME`, and after [`ENV_MARKER`], the
-/// login shell's `env`. `env -0`
-/// would be easier to read, but macOS and the BSDs lack it.
-fn setup_script(rho: &str) -> String {
-    let rho = quote(rho);
-    format!(
-        r#"rho={rho}
-{find_rho}if ! command -v "$rho" >/dev/null 2>&1; then
-  echo "there is no program $rho; a non-interactive ssh command's PATH may lack it, so set this machine's Rho path in Settings to an absolute path" >&2
-  exit 127
-fi
-"$rho" daemon start </dev/null >/dev/null || exit
-home=${{RHO_HOME:-$HOME/.rho}}
-home=$(CDPATH= cd -P -- "$home" && pwd -P) || exit
-printf '\n%s\n%s\n%s\n%s\n' {SETUP_MARKER} "$home" "${{XDG_RUNTIME_DIR-}}" "$HOME"
-exec "${{SHELL:-/bin/sh}}" -l -c 'printf "\n%s\n" {ENV_MARKER}; env'
-"#,
-        find_rho = find_rho_sh!(),
-    )
-}
-
-/// What the setup script reported.
-#[derive(Debug)]
-struct Setup {
-    /// The rho home's canonical path, which names its socket.
-    rho_home: PathBuf,
-    xdg_runtime_dir: Option<PathBuf>,
-    /// The machine's `HOME`.
-    home: PathBuf,
-    /// The login environment, for sessions to run in.
-    environment: ClientEnvironment,
-}
-
-/// Reads [`setup_script`]'s output.
-///
-/// # Errors
-///
-/// Fails, saying what is missing, when the output is cut short.
-fn parse_setup(output: &str) -> Result<Setup, &'static str> {
-    let (_, output) = output
-        .rsplit_once(&format!("\n{SETUP_MARKER}\n"))
-        .ok_or("it printed nothing it should")?;
-    let mut lines = output.splitn(4, '\n');
-    let mut line = || lines.next().ok_or("it printed less than it should");
-    let rho_home = line()?;
-    let xdg_runtime_dir = line()?;
-    let home = line()?;
-    let login = line()?;
-    if rho_home.is_empty() || home.is_empty() {
-        return Err("it printed no rho home or no HOME");
-    }
-    let (_, env) = login.split_once(&format!("\n{ENV_MARKER}\n")).ok_or(
-        "its login shell printed no environment; check that `$SHELL -l -c env` works there",
-    )?;
-    Ok(Setup {
-        rho_home: PathBuf::from(rho_home),
-        xdg_runtime_dir: Some(xdg_runtime_dir)
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from),
-        home: PathBuf::from(home),
-        environment: parse_env(env),
-    })
-}
-
-/// Variables of the setup's own ssh session, wrong for any other.
-const SETUP_SESSION_VARS: [&str; 3] = ["SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"];
-
-/// Reads `env`'s output: `NAME=value` lines, where a line that does not
-/// start with a word and `=` continues the value before it, which held a
-/// newline. Entries whose name isn't a variable's, such as the
-/// `BASH_FUNC_name%%=() {` lines of functions bash exports, are dropped
-/// with the lines that continue them. A value whose own lines look like
-/// `NAME=value` reads wrong; `env` gives no way to tell.
-fn parse_env(output: &str) -> ClientEnvironment {
-    let mut vars: Vec<(String, String)> = Vec::new();
-    let output = output.strip_suffix('\n').unwrap_or(output);
-    for line in output.split('\n') {
-        match line.split_once('=') {
-            Some((name, value)) if !name.is_empty() && !name.contains(char::is_whitespace) => {
-                vars.push((name.to_owned(), value.to_owned()));
-            }
-            _ => {
-                if let Some((_, value)) = vars.last_mut() {
-                    value.push('\n');
-                    value.push_str(line);
-                }
-            }
-        }
-    }
-    vars.into_iter()
-        .filter(|(name, _)| is_name(name) && !SETUP_SESSION_VARS.contains(&name.as_str()))
-        .collect()
-}
-
-/// Whether `name` is a shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-// They run shell scripts, as the host does.
-#[cfg(all(test, unix))]
-mod tests {
-    use std::{os::unix::ffi::OsStrExt as _, process::Command};
-
-    use super::*;
-    use crate::fake_daemon::write_program;
-
-    fn vars(environment: ClientEnvironment) -> Vec<(String, String)> {
-        environment.into_iter().collect()
-    }
-
-    /// Starting a master keeps no log file, whether it starts or fails:
-    /// each ssh program and host names its own, so kept ones would pile
-    /// up. A failure still says what ssh wrote.
-    #[test]
-    fn starting_a_master_leaves_no_log() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let io = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .expect("a runtime");
-        for (name, master, said) in [
-            ("ok", "exit 0", None),
-            (
-                "fails",
-                "echo 'Permission denied.' >&2; exit 255",
-                Some("Permission denied."),
-            ),
-        ] {
-            let program = dir.path().join(format!("ssh-{name}"));
-            write_program(
-                &program,
-                &format!("#!/bin/sh\ncase \"$*\" in *-O*) exit 255 ;; esac\n{master}\n"),
-            );
-            let target = SshTarget::new("box").with_ssh(&program);
-            let ssh = SshLink {
-                target,
-                control: dir.path().join(format!("{name}.sock")),
-            };
-            let result = io.block_on(ssh.ensure_master());
-            match said {
-                None => result.expect("the master starts"),
-                Some(said) => {
-                    let error = result.expect_err("the master fails").to_string();
-                    assert!(error.ends_with(said), "{error}");
-                }
-            }
-        }
-        let logs: Vec<PathBuf> = std::fs::read_dir(dir.path())
-            .expect("read the directory")
-            .filter_map(|entry| Some(entry.ok()?.path()))
-            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
-            .collect();
-        assert_eq!(logs, Vec::<PathBuf>::new());
-    }
-
-    /// A script gets its arguments as they are, quotes and bytes that
-    /// aren't UTF-8 too, and runs only through a live master: without one
-    /// it fails rather than make a connection of its own.
-    #[test]
-    fn scripts_get_their_arguments_verbatim_and_need_the_master() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let args = [
-            OsStr::new("it's"),
-            OsStr::from_bytes(b"a b\xff"),
-            OsStr::new(""),
-        ];
-        let script = r#"for arg do printf '%s\0' "$arg"; done"#;
-        for (name, master) in [("up", "exit 0"), ("down", "exit 255")] {
-            let program = dir.path().join(format!("ssh-{name}"));
-            // Stands in for the host: runs what it is sent with this sh.
-            write_program(
-                &program,
-                &format!("#!/bin/sh\ncase \"$*\" in *-O*) {master} ;; esac\nexec sh -s\n"),
-            );
-            let link = SshLink {
-                target: SshTarget::new("box").with_ssh(&program),
-                control: dir.path().join(format!("{name}.sock")),
-            };
-            let ran = futures::executor::block_on(link.run_script(script, &args));
-            if name == "up" {
-                let printed = ran.expect("the script runs");
-                let got: Vec<&[u8]> = printed.split(|&byte| byte == 0).collect();
-                assert_eq!(got, [&b"it's"[..], b"a b\xff", b"", b""]);
-            } else {
-                let error = ran.expect_err("no master, no script").to_string();
-                assert_eq!(error, "no ssh connection to box");
-            }
-        }
-    }
-
-    /// Runs the setup script's first lines, up to starting rho, in `sh` with
-    /// a stub `rho` that prints the path it ran as.
-    #[test]
-    fn the_script_quotes_the_rho_program_and_expands_a_leading_tilde() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let home = dir.path();
-        let odd = "it's rho";
-        for path in [home.join(odd), home.join("bin/rho")] {
-            std::fs::create_dir_all(path.parent().expect("a parent")).expect("the parent");
-            write_program(&path, "#!/bin/sh\necho \"ran $0\" >&2\nexit 3\n");
-        }
-        for (rho, ran) in [
-            (home.join(odd).display().to_string(), home.join(odd)),
-            ("~/bin/rho".to_owned(), home.join("bin/rho")),
-        ] {
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(setup_script(&rho))
-                .env("HOME", home)
-                .output()
-                .expect("sh runs");
-            assert_eq!(output.status.code(), Some(3), "rho {rho:?}");
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert_eq!(
-                stderr.trim(),
-                format!("ran {}", ran.display()),
-                "rho {rho:?}"
-            );
-        }
-
-        let missing = Command::new("sh")
-            .arg("-c")
-            .arg(setup_script("no-such-rho-program"))
-            .output()
-            .expect("sh runs");
-        assert_eq!(missing.status.code(), Some(127));
-    }
-
-    #[test]
-    fn env_output_reads_multiline_values_and_drops_the_setup_sessions_vars() {
-        let env = "HOME=/home/me\nNOTE=one\n two\n\nSSH_CONNECTION=1 2 3 4\n_X=a=b\n\
-                   BASH_FUNC_which%%=() {  ( alias;\n eval ${which_declare} ) | /usr/bin/which\n}\n\
-                   PATH=/bin\n";
-        assert_eq!(
-            vars(parse_env(env)),
-            [
-                ("HOME".to_owned(), "/home/me".to_owned()),
-                ("NOTE".to_owned(), "one\n two\n".to_owned()),
-                ("PATH".to_owned(), "/bin".to_owned()),
-                ("_X".to_owned(), "a=b".to_owned()),
-            ],
-            "an exported bash function goes, body and all"
-        );
-        assert_eq!(vars(parse_env("")), []);
-    }
-
-    #[test]
-    fn setup_output_skips_what_the_login_profile_prints() {
-        let output = format!(
-            "from .bashrc\n\n{SETUP_MARKER}\n/srv/rho\n\n/home/me\nWelcome!\nNOT=a var\n{ENV_MARKER}\nPATH=/bin\nSSH_TTY=/dev/pts/1\n"
-        );
-        let setup = parse_setup(&output).expect("a full setup");
-        assert_eq!(setup.rho_home, Path::new("/srv/rho"));
-        assert_eq!(setup.xdg_runtime_dir, None);
-        assert_eq!(setup.home, Path::new("/home/me"));
-        assert_eq!(
-            vars(setup.environment),
-            [("PATH".to_owned(), "/bin".to_owned())]
-        );
-
-        let quiet = format!("\n{SETUP_MARKER}\n/r\n/run/user/7\n/h\n\n{ENV_MARKER}\nA=1\n");
-        let setup = parse_setup(&quiet).expect("a full setup");
-        assert_eq!(
-            setup.xdg_runtime_dir.as_deref(),
-            Some(Path::new("/run/user/7"))
-        );
-
-        assert!(parse_setup(&format!("\n{SETUP_MARKER}\n/r\n\n/h\nno marker\n")).is_err());
-        assert!(parse_setup(&format!("\n{SETUP_MARKER}\n/r\n")).is_err());
-        assert!(parse_setup("/r\n\n/h\n").is_err(), "no setup marker");
-    }
-
-    #[test]
-    fn a_control_path_leaves_room_for_the_suffix_ssh_binds_with() {
-        let host = "workstation";
-        let short = control_path(Path::new("/run/user/1000/rho-ui/ssh"), host)
-            .expect("a short directory fits");
-        assert_eq!(short.file_name().map(std::ffi::OsStr::len), Some(16));
-        assert_eq!(
-            short,
-            control_path(Path::new("/run/user/1000/rho-ui/ssh"), host).expect("fits"),
-            "one host, one path"
-        );
-
-        // "/", the directory's name, "/", 16 hex digits, and ssh's 17.
-        let long = PathBuf::from(format!("/{}", "d".repeat(MAX_SOCKET_PATH_BYTES - 34)));
-        let error = control_path(&long, host).expect_err("too long");
-        assert!(
-            error.contains(&format!("{MAX_SOCKET_PATH_BYTES}-byte")),
-            "{error}"
-        );
-        let fits = PathBuf::from(format!("/{}", "d".repeat(MAX_SOCKET_PATH_BYTES - 35)));
-        assert!(control_path(&fits, host).is_ok());
-    }
 }

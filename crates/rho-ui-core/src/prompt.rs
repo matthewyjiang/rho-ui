@@ -8,10 +8,15 @@
 //! the file's URI, and echoes it that way, so [`Prompt::from_wire`] reads
 //! those fences back as files.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::Engine as _;
 use rho_protocol::ContentBlock;
+
+use crate::platform;
 
 /// The most a prompt's attachments can come to once encoded: the daemon
 /// reads a message as one line of at most [`rho_protocol::MAX_LINE_BYTES`].
@@ -167,7 +172,7 @@ impl AttachedFile {
     /// The file at `path`, an absolute one, sent whole as `text`.
     pub fn with_text(path: &Path, text: impl Into<Arc<str>>) -> Self {
         Self {
-            uri: file_uri(path),
+            uri: platform::file_uri(path),
             text: Some(text.into()),
         }
     }
@@ -175,7 +180,7 @@ impl AttachedFile {
     /// The file at `path`, an absolute one, sent as a link to it.
     pub fn linked(path: &Path) -> Self {
         Self {
-            uri: file_uri(path),
+            uri: platform::file_uri(path),
             text: None,
         }
     }
@@ -186,8 +191,8 @@ impl AttachedFile {
     }
 
     /// Its path, for a file on this machine.
-    pub fn path(&self) -> Option<&Path> {
-        self.uri.strip_prefix("file://").map(Path::new)
+    pub fn path(&self) -> Option<PathBuf> {
+        platform::file_uri_path(&self.uri)
     }
 
     /// Its name: the last part of its path.
@@ -237,10 +242,6 @@ impl AttachedFile {
             },
         }
     }
-}
-
-fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
 }
 
 /// Something attached to a prompt.

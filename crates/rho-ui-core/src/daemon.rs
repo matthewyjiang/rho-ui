@@ -10,10 +10,12 @@
 //! while let Some(event) = events.recv().await { /* route by session id */ }
 //! ```
 //!
-//! rho-protocol's `Client` reads and writes the socket in Tokio tasks, so
-//! this module keeps one small Tokio runtime for that I/O. Nothing else runs
-//! on it: every method here returns a plain future that any executor can
-//! await, and replies cross over on channels or task handles.
+//! rho-protocol's `Client` reads and writes the socket in Tokio tasks, and
+//! the ssh client that carries a remote daemon's socket (`ssh.rs`) runs on
+//! Tokio too, so this module keeps one small Tokio runtime for that I/O.
+//! Nothing else runs on it: every method here returns a plain future that
+//! any executor can await, and replies cross over on channels or task
+//! handles.
 
 use std::{
     future::Future,
@@ -26,12 +28,12 @@ use std::{
 use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
-    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobKind,
-    JobListParams, JobState, JobSummary, Notifications, RestartParams, SessionAnswerParams,
+    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobListParams,
+    LoginId, LoginOutcome, LoginPrompt, Notifications, RestartParams, SessionAnswerParams,
     SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
     SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
     SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
-    SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams, SettingChange,
+    SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn,
     StatusParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
@@ -40,6 +42,7 @@ use crate::{
     agent_settings::{AgentSettings, AgentSettingsChanged},
     background::BackgroundId,
     input::{Answer, InputId},
+    jobs::Jobs,
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
     platform,
     prompt::{mebibytes, Prompt},
@@ -47,6 +50,8 @@ use crate::{
     ssh::{self, SshLink, SshTarget},
     surface::SurfaceAction,
 };
+
+mod auth;
 
 /// How to reach the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,91 +240,6 @@ impl SessionSummary {
     }
 }
 
-/// What a session's job is doing, from `rho/job/list`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JobActivity {
-    /// A turn runs, or waits for a slot.
-    Working,
-    /// The session waits for a person: an approval or a question.
-    Waiting,
-}
-
-/// A session with work under way in the daemon, whichever client started it.
-#[derive(Clone, Debug)]
-pub struct Job {
-    session: SessionId,
-    cwd: PathBuf,
-    title: Option<String>,
-    activity: JobActivity,
-    turn_elapsed: Option<Duration>,
-}
-
-impl Job {
-    /// The session the job runs. Pass to [`Daemon::attach`] to follow it.
-    pub fn session(&self) -> &SessionId {
-        &self.session
-    }
-
-    /// The workspace the job runs in.
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
-    }
-
-    /// The session's title, once it has one.
-    pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
-    }
-
-    /// What the job is doing.
-    pub fn activity(&self) -> JobActivity {
-        self.activity
-    }
-
-    /// How long the turn under way has run, when the daemon says. It grows
-    /// between two listings of the same job.
-    pub fn turn_elapsed(&self) -> Option<Duration> {
-        self.turn_elapsed
-    }
-
-    /// Whether `other` is this job as an earlier or later listing would
-    /// show it: everything but [`Self::turn_elapsed`] is the same. Two
-    /// listings that differ only in elapsed time changed nothing to show.
-    pub fn is_same_work(&self, other: &Job) -> bool {
-        self.session == other.session
-            && self.cwd == other.cwd
-            && self.title == other.title
-            && self.activity == other.activity
-    }
-
-    /// The job as the sidebar needs it, or `None` for one that is not a
-    /// session with work under way.
-    fn from_wire(job: JobSummary) -> Option<Self> {
-        // A subagent's or workflow's session belongs to the session that
-        // started it, and can't be attached to.
-        if job.kind != JobKind::Session {
-            return None;
-        }
-        let live = job.live.as_ref();
-        let asks = live.is_some_and(|live| !live.inputs.is_empty());
-        let activity = match job.state {
-            JobState::WaitingForInput => JobActivity::Waiting,
-            // A subagent's question waits whether or not a turn runs.
-            _ if asks => JobActivity::Waiting,
-            JobState::Running | JobState::Queued => JobActivity::Working,
-            _ => return None,
-        };
-        Some(Self {
-            session: job.session?.into(),
-            cwd: job.workspace,
-            turn_elapsed: live
-                .and_then(|live| live.turn_elapsed_ms)
-                .map(Duration::from_millis),
-            title: job.live.and_then(|live| live.title),
-            activity,
-        })
-    }
-}
-
 /// What became of a steer [`Daemon::unsteer`] asked to withdraw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsteered {
@@ -381,6 +301,22 @@ pub enum DaemonEvent {
     /// [`Daemon::agent_settings`] has read them; apply it with
     /// [`AgentSettings::apply`].
     AgentSettingsChanged(AgentSettingsChanged),
+    /// What the user must do to finish a login [`Daemon::login`] started:
+    /// open a page, and for a device code enter the code there.
+    LoginPrompt {
+        /// The login, as [`Daemon::login`] returned it.
+        login: LoginId,
+        /// The page to open, any code to enter there, and what to do.
+        prompt: LoginPrompt,
+    },
+    /// A login [`Daemon::login`] started ended, its last event. One that
+    /// succeeded signed the daemon in for every session.
+    LoginFinished {
+        /// The login, as [`Daemon::login`] returned it.
+        login: LoginId,
+        /// Whether it succeeded, failed (and why) or was cancelled.
+        outcome: LoginOutcome,
+    },
 }
 
 /// The daemon's event stream. It ends when the connection does.
@@ -428,8 +364,19 @@ impl DaemonEvents {
                         changed,
                     )));
                 }
-                // Logins, and other clients' settings, which this client
-                // does not use.
+                DaemonNotification::LoginPrompt(prompt) => {
+                    return Some(DaemonEvent::LoginPrompt {
+                        login: prompt.login,
+                        prompt: prompt.prompt,
+                    });
+                }
+                DaemonNotification::LoginFinished(finished) => {
+                    return Some(DaemonEvent::LoginFinished {
+                        login: finished.login,
+                        outcome: finished.outcome,
+                    });
+                }
+                // Other clients' settings, which this client does not use.
                 _ => {}
             }
         }
@@ -487,9 +434,10 @@ const _: () = {
 };
 
 /// The runtime the connection's socket I/O runs on, made on first use and
-/// kept for the life of the process. One worker: the work is one socket's
-/// reads and writes, and `LocalDaemon` waiting on `rho daemon start`, or
-/// the ssh commands that reach a daemon on another machine.
+/// kept for the life of the process. One worker: the work is the daemon
+/// sockets' reads and writes, `LocalDaemon` waiting on `rho daemon start`,
+/// and for a daemon on another machine, the ssh connection that carries
+/// its socket and the scripts run there.
 pub(crate) fn io() -> &'static Runtime {
     static IO: OnceLock<Runtime> = OnceLock::new();
     IO.get_or_init(|| {
@@ -497,8 +445,8 @@ pub(crate) fn io() -> &'static Runtime {
             .worker_threads(1)
             .thread_name("rho-ui-daemon-io")
             .enable_io()
-            // The handshake's deadline, and those on a remote machine's
-            // scripts; see `ssh.rs`.
+            // The handshake's deadline, those on a remote machine's
+            // scripts, and the ssh connection's keepalives; see `ssh.rs`.
             .enable_time()
             .build()
             .expect("the OS lets this process start a thread and an I/O driver")
@@ -507,8 +455,8 @@ pub(crate) fn io() -> &'static Runtime {
 
 /// Runs `future` on the I/O runtime and waits for it. Dropping the future
 /// this returns stops the task, and drops what the task holds, such as a
-/// half-open connection or an ssh process (spawned `kill_on_drop`), so a
-/// caller that stops waiting leaves nothing running.
+/// half-open connection or a script's ssh channel, so a caller that stops
+/// waiting leaves nothing running.
 ///
 /// # Errors
 ///
@@ -533,7 +481,7 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 /// How long a daemon may take to answer the handshake once its socket
-/// connected, at a socket target or over `ssh -W`. A daemon that accepts
+/// connected, at a socket target or over an ssh channel. A daemon that accepts
 /// and never answers would otherwise hold the connection attempt forever.
 /// The default local target has none: rho-protocol's `LocalDaemon` does
 /// that handshake itself, with no deadline, until rho-protocol adds one.
@@ -606,18 +554,21 @@ fn writer() -> &'static ConfigWriter {
     })
 }
 
-/// What every session this client opens gets: `idle_wake: turn`, as rho's
-/// terminal UI asks: a turn ends while the background work it started runs
-/// on, and the daemon starts a turn of its own when that work finishes.
+/// What every session this client opens gets, as rho's terminal UI asks:
+/// `idle_wake: turn`, so a turn ends while the background work it started
+/// runs on, and the daemon starts a turn of its own when that work
+/// finishes; and `sign_in: later`, so a session whose model has no
+/// credentials opens signed out, for the user to sign in from it.
 ///
 /// This is the one place a session's setup is made, for `rho/session/new`
 /// and `rho/session/attach` alike. rho-ui draws the surfaces a session's
-/// `ui` tool shows (`surface.rs`), so it asks for them: a session it opens
-/// has the tool, and every attach counts it among the clients a waiting
-/// `ui` call can be answered in.
+/// `ui` tool shows (`surface.rs`), so it also asks for `surfaces: drawn`:
+/// a session it opens has the tool, and every attach counts it among the
+/// clients a waiting `ui` call can be answered in.
 fn session_setup() -> rho_protocol::SessionSetup {
     rho_protocol::SessionSetup {
         idle_wake: IdleWake::Turn,
+        sign_in: SignIn::Later,
         surfaces: rho_protocol::Surfaces::Drawn,
         ..Default::default()
     }
@@ -626,7 +577,10 @@ fn session_setup() -> rho_protocol::SessionSetup {
 impl Daemon {
     /// Connects to the daemon, starting it first if `target` says how.
     /// Dropping the future gives up the attempt: whatever it started to
-    /// reach the daemon, such as ssh, stops with it.
+    /// reach the daemon, such as an ssh connection still signing in or the
+    /// setup script on the machine, stops with it. An ssh connection that
+    /// signed in stays for 10 minutes, for the next attempt to reach that
+    /// machine.
     ///
     /// # Errors
     ///
@@ -709,19 +663,21 @@ impl Daemon {
         Ok(())
     }
 
-    /// The sessions with work under way in the daemon, whichever client
-    /// started them: a turn running or queued, or a request waiting for a
-    /// person. Nothing pushes changes to this list; ask again to refresh.
+    /// Lists the daemon's jobs: the sessions with work under way,
+    /// whichever client started them (a turn running or queued, a request
+    /// waiting for a person, or subagents or workflow runs still under way
+    /// after the turn that started them), and the runs each session
+    /// started. Nothing pushes changes to this list; ask again to refresh.
     ///
     /// # Errors
     ///
     /// Fails if the daemon rejects the request or the connection is gone.
-    pub async fn active_jobs(&self) -> Result<Vec<Job>, DaemonError> {
+    pub async fn jobs(&self) -> Result<Jobs, DaemonError> {
         let list = self
             .client
             .request::<methods::JobList>(&JobListParams {})
             .await?;
-        Ok(list.jobs.into_iter().filter_map(Job::from_wire).collect())
+        Ok(Jobs::from_list(list.jobs))
     }
 
     /// Opens a new session in `cwd`, or in a new worktree of the
@@ -733,9 +689,10 @@ impl Daemon {
     ///
     /// # Errors
     ///
-    /// Fails if the daemon cannot open the session, as when its model's
-    /// provider needs a sign-in, `cwd` is in no git repository for a new
-    /// worktree, or the connection is gone.
+    /// Fails if the daemon cannot open the session, as when `cwd` is in no
+    /// git repository for a new worktree, or the connection is gone. A
+    /// model with no credentials opens signed out, and its turns fail until
+    /// a sign-in; see [`crate::Session::auth`].
     pub async fn new_session(
         &self,
         cwd: &Path,
@@ -1193,70 +1150,5 @@ impl Daemon {
             .request::<methods::SessionDelete>(&params)
             .await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    fn job(kind: &str, state: &str, live: &serde_json::Value) -> Option<Job> {
-        let summary = serde_json::from_value(json!({"id": "j1", "kind": kind, "state": state,
-            "workspace": "/w", "session": "s1", "created_at": 0, "updated_at": 0, "live": live}));
-        Job::from_wire(summary.expect("a valid job summary"))
-    }
-
-    fn live(elapsed_ms: u64, inputs: &serde_json::Value) -> serde_json::Value {
-        json!({"title": "t", "model": {"provider": "p", "model": "m"},
-            "turn_elapsed_ms": elapsed_ms, "inputs": inputs})
-    }
-
-    #[test]
-    fn only_sessions_with_work_under_way_are_jobs_to_show() {
-        let none = json!([]);
-        let activity = |job: Option<Job>| job.map(|job| job.activity());
-        assert_eq!(
-            activity(job("session", "running", &live(5, &none))),
-            Some(JobActivity::Working)
-        );
-        assert_eq!(
-            activity(job("session", "queued", &live(5, &none))),
-            Some(JobActivity::Working)
-        );
-        assert_eq!(
-            activity(job("session", "waiting_for_input", &live(5, &none))),
-            Some(JobActivity::Waiting)
-        );
-        assert_eq!(activity(job("session", "completed", &live(5, &none))), None);
-        assert_eq!(activity(job("session", "idle", &json!(null))), None);
-        assert_eq!(
-            activity(job("subagent", "running", &live(5, &none))),
-            None,
-            "a subagent's session can't be attached to"
-        );
-
-        // A subagent's question keeps its parent waiting between turns.
-        let asks = json!([{"id": 1, "asker": "subagent", "ask": {"kind": "question",
-            "title": "Which?", "questions": []}}]);
-        assert_eq!(
-            activity(job("session", "completed", &live(5, &asks))),
-            Some(JobActivity::Waiting)
-        );
-    }
-
-    /// The daemon reports a running turn's elapsed time anew at each
-    /// listing. If that alone made a job look changed, the sidebar would
-    /// reload the session list at every poll while anything runs.
-    #[test]
-    fn elapsed_time_alone_does_not_change_a_job() {
-        let at = |ms| job("session", "running", &live(ms, &json!([]))).expect("a running job");
-        let (earlier, later) = (at(1_000), at(2_000));
-        assert_ne!(earlier.turn_elapsed(), later.turn_elapsed());
-        assert!(earlier.is_same_work(&later));
-
-        let waiting = job("session", "waiting_for_input", &live(2_000, &json!([])));
-        assert!(!earlier.is_same_work(&waiting.expect("a waiting job")));
     }
 }

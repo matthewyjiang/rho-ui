@@ -30,19 +30,22 @@ use gpui_kit::{
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job,
-    PendingUpgrade, Prompt, Session, SessionId,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job, JobActivity,
+    Jobs, PendingUpgrade, Prompt, Session, SessionId,
 };
 
 use crate::{
+    auths::Auths,
     background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
+    forge::Forges,
     kinetic::Kinetic,
     machines::{
         Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach, RemoteMachine,
         SessionKey,
     },
     projects::Projects,
+    pull_requests::{Focus, PullRequests},
     rho_install::{render_setup, Installs, InstallsEvent, Offer},
     rho_settings::RhoSettings,
     right_panel::{
@@ -52,7 +55,7 @@ use crate::{
     session_view::{Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
-    sidebar::{ResizeSidebar, SidebarEvent, SidebarState, SidebarView},
+    sidebar::{ResizeSidebar, SidebarEvent, SidebarModels, SidebarState, SidebarView},
     workspaces::{WorkspaceRef, Workspaces},
     NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
 };
@@ -209,8 +212,15 @@ pub(crate) struct RhoApp {
     connections: Vec<Connection>,
     /// rho's own settings on each connected machine, for Settings.
     rho_settings: Entity<RhoSettings>,
+    /// The auth profiles of each connected machine, for Settings and the
+    /// sessions that need a sign-in.
+    auths: Entity<Auths>,
     /// Each machine's rho, apart from its daemon: installing and updating.
     installs: Entity<Installs>,
+    /// The forge CLIs on each machine, for Settings and pull requests.
+    forges: Entity<Forges>,
+    /// The pull requests the right panel shows.
+    prs: Entity<PullRequests>,
     /// The epoch the next connection gets; see [`Connection::epoch`].
     next_epoch: u64,
     workspaces: Entity<Workspaces>,
@@ -234,7 +244,7 @@ pub(crate) struct RhoApp {
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
-    _subscriptions: [Subscription; 5],
+    _subscriptions: [Subscription; 6],
 }
 
 impl RhoApp {
@@ -256,16 +266,17 @@ impl RhoApp {
         // Empty until `sync_machines` connects to each.
         let machines = cx.new(|_| Machines::default());
         let installs = cx.new(|_| Installs::new(machines.clone()));
+        let forges = cx.new(|_| Forges::new(workspaces.clone()));
+        let prs = cx.new(|cx| PullRequests::new(forges.clone(), workspaces.clone(), cx));
         let sidebar = cx.new(|cx| {
-            SidebarView::new(
-                workspaces.clone(),
-                machines.clone(),
-                installs.clone(),
-                projects.clone(),
-                sidebar,
-                window,
-                cx,
-            )
+            let models = SidebarModels {
+                workspaces: workspaces.clone(),
+                machines: machines.clone(),
+                installs: installs.clone(),
+                projects: projects.clone(),
+                prs: prs.clone(),
+            };
+            SidebarView::new(models, sidebar, window, cx)
         });
         let sidebar_subscription = cx.subscribe_in(
             &sidebar,
@@ -304,13 +315,16 @@ impl RhoApp {
             },
         );
         let shell = launch.shell.clone();
-        let panel = cx.new(|_| RightPanel::new(workspaces.clone(), shell));
+        let panel = cx.new(|cx| RightPanel::new(workspaces.clone(), shell, prs.clone(), cx));
         let mut app = Self {
             launch,
             machines,
             connections: Vec::new(),
             rho_settings: cx.new(|_| RhoSettings::default()),
+            auths: cx.new(|_| Auths::default()),
             installs,
+            forges,
+            prs,
             next_epoch: 0,
             workspaces,
             projects,
@@ -337,17 +351,12 @@ impl RhoApp {
                 cx.observe_global_in::<Settings>(window, |this, window, cx| {
                     this.sync_machines(window, cx);
                 }),
-                // The right panel shown or hidden: lay it out, and redraw
-                // the pane's title bar, which offers the toggle while it
-                // is hidden.
-                cx.observe_global_in::<PanelLayout>(window, |this, _, cx| {
-                    match &this.pane {
-                        Pane::Session(view) => view.update(cx, |_, cx| cx.notify()),
-                        Pane::Draft(view) => view.update(cx, |_, cx| cx.notify()),
-                        Pane::Empty => {}
-                    }
-                    cx.notify();
+                // Pull requests wait while the window is unfocused.
+                cx.observe_window_activation(window, |this, window, cx| {
+                    let focus = Focus::of(window);
+                    this.prs.update(cx, |prs, cx| prs.set_focus(focus, cx));
                 }),
+                cx.observe_global_in::<PanelLayout>(window, Self::panel_toggled),
             ],
         };
         app.sync_machines(window, cx);
@@ -385,6 +394,10 @@ impl RhoApp {
         for gone in old {
             self.rho_settings
                 .update(cx, |settings, cx| settings.forget(&gone.machine, cx));
+            self.auths
+                .update(cx, |auths, cx| auths.forget(&gone.machine, cx));
+            self.forges
+                .update(cx, |forges, cx| forges.forget(&gone.machine, cx));
             self.forget_sessions(&gone.machine, window, cx);
             self.drop_drafts(&gone.machine, window, cx);
             self.sidebar
@@ -446,6 +459,7 @@ impl RhoApp {
         self.forget_sessions(machine, window, cx);
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
+        self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.installs
             .update(cx, |installs, cx| installs.set_upgrade(machine, None, cx));
         self.next_epoch += 1;
@@ -518,6 +532,10 @@ impl RhoApp {
             };
             window.push_notification(Notification::warning(notice.to_owned()).title(title), cx);
         }
+        // Its CLIs may have changed while it was away; check them afresh
+        // when next asked.
+        self.forges
+            .update(cx, |forges, cx| forges.forget(machine, cx));
         if !machine.is_local() {
             self.workspaces.update(cx, |workspaces, cx| {
                 workspaces.connected(machine, &daemon, cx);
@@ -530,6 +548,8 @@ impl RhoApp {
         self.rho_settings.update(cx, |settings, cx| {
             settings.connected(machine, daemon.clone(), cx);
         });
+        self.auths
+            .update(cx, |auths, cx| auths.connected(machine, daemon.clone(), cx));
         self.installs
             .update(cx, |installs, cx| installs.check(machine, cx));
         let jobs_task = cx.spawn({
@@ -537,7 +557,7 @@ impl RhoApp {
             async move |this, cx| {
                 let mut asked_upgrade: Option<Instant> = None;
                 loop {
-                    let changed = match daemon.active_jobs().await {
+                    let changed = match daemon.jobs().await {
                         Ok(jobs) => {
                             match this.update(cx, |this, cx| this.set_jobs(&machine, &jobs, cx)) {
                                 Ok(changed) => changed,
@@ -611,6 +631,7 @@ impl RhoApp {
         }
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
+        self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
         self.installs.update(cx, |installs, cx| {
@@ -623,27 +644,38 @@ impl RhoApp {
         cx.notify();
     }
 
-    /// Shows which sessions have work under way in `machine`'s daemon. A
-    /// change is also when the saved list goes stale: a session another
-    /// client started appears, or one's turn ended. A listing also clears
-    /// why the last one was refused. Returns whether they changed.
-    fn set_jobs(&mut self, machine: &MachineId, jobs: &[Job], cx: &mut Context<'_, Self>) -> bool {
+    /// Shows which sessions have work under way in `machine`'s daemon, and
+    /// gives each of its open sessions the runs it started. A change in
+    /// the sessions with work is also when the saved list goes stale: a
+    /// session another client started appears, or one's turn ended. A
+    /// listing also clears why the last one was refused. Returns whether
+    /// the sessions with work changed.
+    fn set_jobs(&mut self, machine: &MachineId, jobs: &Jobs, cx: &mut Context<'_, Self>) -> bool {
         self.set_listing_error(machine, Listing::Jobs, None, cx);
+        for open in self
+            .sessions
+            .iter()
+            .filter(|open| open.id.machine == *machine)
+        {
+            let runs = jobs.runs.of(&open.id.id);
+            open.view.update(cx, |view, cx| view.set_runs(runs, cx));
+        }
+        let active = jobs.active.as_slice();
         let Some(connection) = self.connection_mut(machine) else {
             return false;
         };
-        let same = connection.jobs.len() == jobs.len()
+        let same = connection.jobs.len() == active.len()
             && connection
                 .jobs
                 .iter()
-                .zip(jobs)
+                .zip(active)
                 .all(|(was, now)| was.is_same_work(now));
         if same {
             return false;
         }
-        jobs.clone_into(&mut connection.jobs);
+        active.clone_into(&mut connection.jobs);
         self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, jobs, cx));
+            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, active, cx));
         self.refresh_sessions(machine, cx);
         true
     }
@@ -771,19 +803,31 @@ impl RhoApp {
                 self.rho_settings
                     .update(cx, |settings, cx| settings.changed(machine, changed, cx));
             }
+            DaemonEvent::LoginPrompt { login, prompt } => {
+                self.auths.update(cx, |auths, cx| {
+                    auths.login_prompt(machine, login, prompt, cx);
+                });
+            }
+            DaemonEvent::LoginFinished { login, outcome } => {
+                self.auths.update(cx, |auths, cx| {
+                    auths.login_finished(machine, &login, outcome, cx);
+                });
+            }
         }
     }
 
     /// Opens Settings over the window, with rho's own settings on each
     /// machine.
     fn open_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        settings_view::open(
-            &self.machines,
-            &self.rho_settings,
-            &self.installs,
-            window,
-            cx,
-        );
+        let app = settings_view::AppState {
+            machines: self.machines.clone(),
+            rho_settings: self.rho_settings.clone(),
+            auths: self.auths.clone(),
+            workspaces: self.workspaces.clone(),
+            forges: self.forges.clone(),
+            installs: self.installs.clone(),
+        };
+        settings_view::open(app, window, cx);
     }
 
     /// Notes that `machine`'s daemon may restart in place, so its
@@ -870,7 +914,11 @@ impl RhoApp {
             .iter()
             .filter(|open| open.id.machine == *machine && !open.view.read(cx).is_subagent())
             .map(|open| open.id.id.clone())
-            .filter(|id| jobs.iter().any(|job| job.session() == id))
+            // Work in the background goes on, or not, with nobody attached.
+            .filter(|id| {
+                jobs.iter()
+                    .any(|job| job.session() == id && job.activity() != JobActivity::Background)
+            })
             .filter(|id| shown.as_ref().is_none_or(|shown| shown.id.id != *id))
             .collect();
         Resume { shown, working }
@@ -1012,7 +1060,9 @@ impl RhoApp {
         }
         let cwd = self.new_session_cwd(cx);
         let (workspaces, projects, machines) = (&self.workspaces, &self.projects, &self.machines);
-        let view = cx.new(|cx| DraftView::new(cwd, workspaces, projects, machines, window, cx));
+        let auths = self.auths.clone();
+        let view =
+            cx.new(|cx| DraftView::new(cwd, workspaces, projects, machines, auths, window, cx));
         let subscriptions = [
             cx.subscribe_in(
                 &view,
@@ -1510,6 +1560,22 @@ impl RhoApp {
         cx.notify();
     }
 
+    /// The right panel shown or hidden: lays it out, and redraws the pane's
+    /// title bar, which offers the toggle while it is hidden.
+    fn panel_toggled(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Hidden with the keyboard in it, the panel would take the keyboard
+        // away, and the app's shortcuts with it: give it to the pane.
+        if !PanelLayout::get(cx) && self.panel.read(cx).has_keyboard(window, cx) {
+            self.focus_pane(window, cx);
+        }
+        match &self.pane {
+            Pane::Session(view) => view.update(cx, |_, cx| cx.notify()),
+            Pane::Draft(view) => view.update(cx, |_, cx| cx.notify()),
+            Pane::Empty => {}
+        }
+        cx.notify();
+    }
+
     /// Puts the keyboard in the main pane's composer, unless a dialog such
     /// as settings is open: it keeps the keyboard until it closes.
     fn focus_pane(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1540,6 +1606,7 @@ impl RhoApp {
         self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
         let workspace = WorkspaceRef::new(&self.workspaces, cwd, cx);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
+        let auths = self.auths.clone();
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon,
@@ -1550,6 +1617,7 @@ impl RhoApp {
                 window,
                 cx,
             )
+            .with_sign_in(auths, window, cx)
         });
         self.insert_session(id, view.clone(), window, cx);
         view.update(cx, |view, cx| view.submit(prompt, window, cx));
@@ -1588,6 +1656,7 @@ impl RhoApp {
         let cwd = Place::new(id.machine.clone(), cwd);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
+        let auths = self.auths.clone();
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon.clone(),
@@ -1598,6 +1667,7 @@ impl RhoApp {
                 window,
                 cx,
             )
+            .with_sign_in(auths, window, cx)
         });
         self.insert_session(id.clone(), view.clone(), window, cx);
         self.show(Pane::Session(view), window, cx);
@@ -1763,6 +1833,14 @@ impl RhoApp {
 
 #[cfg(test)]
 impl RhoApp {
+    /// The pull requests the right panel reads, for UI tests.
+    pub(crate) fn pull_requests(&self) -> &Entity<PullRequests> {
+        &self.prs
+    }
+    /// The forge CLIs found on each machine, for UI tests.
+    pub(crate) fn forges(&self) -> &Entity<Forges> {
+        &self.forges
+    }
     /// The session the main pane shows, for UI tests.
     pub(crate) fn active_session(&self) -> Option<Entity<SessionView>> {
         match &self.pane {

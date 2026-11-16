@@ -8,6 +8,7 @@ mod app;
 #[cfg(target_os = "macos")]
 mod app_menu;
 mod attachments;
+mod auths;
 mod background;
 mod background_log;
 mod badge;
@@ -17,15 +18,18 @@ mod draft;
 mod figures;
 mod fold;
 mod folders;
+mod forge;
 mod input_card;
 mod kinetic;
 mod lightbox;
+mod local;
 mod machines;
 mod pele;
 mod pictures;
 mod plan;
 mod project_picker;
 mod projects;
+mod pull_requests;
 mod repo;
 mod rho_install;
 mod rho_settings;
@@ -37,6 +41,7 @@ mod settings;
 mod settings_view;
 mod shelf;
 mod sidebar;
+mod sign_in;
 mod store;
 mod surface_view;
 mod themes;
@@ -142,6 +147,17 @@ gpui_kit::assets::icon_assets!(
         ZoomOut,
         Scan,
         ImageOff,
+        Hourglass,
+        GitPullRequest,
+        GitPullRequestDraft,
+        GitPullRequestClosed,
+        GitMerge,
+        CircleMinus,
+        CircleSlash,
+        MessageSquare,
+        Link,
+        Unlink,
+        KeyRound,
         // The A2UI basic catalog's icons, for surfaces (`surface_view.rs`).
         BellOff,
         CalendarDays,
@@ -220,8 +236,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
         None => std::env::current_dir()
             .map_err(|error| format!("can't read the current directory: {error}"))?,
     };
-    let workspace = dir
-        .canonicalize()
+    let workspace = rho_ui_core::platform::canonicalize(&dir)
         .map_err(|error| format!("can't open {}: {error}", dir.display()))?;
     if !workspace.is_dir() {
         return Err(format!("{} is not a directory", workspace.display()));
@@ -289,6 +304,7 @@ fn init(cx: &mut App, db: &StateDb) {
     cx.set_global(BackgroundLog::new(db));
     cx.set_global(PanelLayout::load(db));
     cx.set_global(LastCheckout::load(db));
+    cx.set_global(pull_requests::PrLinks::load(db));
     cx.on_action(|_: &Quit, cx| cx.quit());
     // `secondary` is Cmd on macOS and Ctrl elsewhere.
     cx.bind_keys([
@@ -492,10 +508,12 @@ mod tests {
 
     #[test]
     fn rho_program_follows_its_flag() {
-        let launch = parse(&["/tmp", "--rho", "/opt/rho/bin/rho"]).unwrap();
+        let dir = std::env::temp_dir();
+        let workspace = dir.to_str().expect("a UTF-8 temporary directory");
+        let launch = parse(&[workspace, "--rho", "/opt/rho/bin/rho"]).unwrap();
         assert_eq!(
             launch.workspace,
-            PathBuf::from("/tmp").canonicalize().unwrap()
+            rho_ui_core::platform::canonicalize(&dir).unwrap()
         );
         // Both sides read the rho home from this process's environment.
         assert_eq!(
@@ -509,14 +527,16 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(&["/tmp"]).unwrap().local.daemon,
+            parse(&[workspace]).unwrap().local.daemon,
             DaemonTarget::rho("rho").unwrap()
         );
     }
 
     #[test]
     fn rejects_extra_positional_and_missing_program() {
-        assert!(parse(&["/tmp", "/var"]).is_err());
+        let dir = std::env::temp_dir();
+        let workspace = dir.to_str().expect("a UTF-8 temporary directory");
+        assert!(parse(&[workspace, workspace]).is_err());
         assert!(parse(&["--rho"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
     }

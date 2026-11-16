@@ -1,16 +1,15 @@
-//! The Files surface: the files in the folder of the session on screen,
-//! as a tree, and any one of them opened read-only, its syntax
+//! The Files surface: the files in the folder of the session its tab
+//! belongs to, as a tree, and any one of them opened read-only, its syntax
 //! highlighted. In a git repository it lists what git sees: tracked files
 //! that are there, and untracked ones `.gitignore` doesn't leave out;
 //! outside one, every file under the folder. It reads them on the
-//! session's machine when it opens, when another session comes on screen,
-//! when the session's turn ends, and on Refresh, and the open file with
-//! them.
+//! session's machine when it opens, when its session comes back on screen
+//! or its turn ends ([`super::RightPanel`] says when), and on Refresh, and
+//! the open file with them.
 
 use std::{
     collections::{BTreeMap, HashSet},
-    ffi::OsString,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use gpui_kit::assets::IconName as Lucide;
@@ -30,11 +29,13 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window,
 };
 
+use rho_ui_core::platform;
+
 use super::message;
 use crate::{
-    folders::{find, FileRead, Reader},
+    folders::{find, Deadline, FileRead, Reader},
+    local,
     machines::Place,
-    session_view::{SessionEvent, SessionView},
     workspaces::Workspaces,
 };
 
@@ -65,7 +66,8 @@ const LISTED: &[u8] = b"rho-ui-files\0";
 /// tracked and untracked files git doesn't ignore, those missing among
 /// them. Outside one, `/` and then every file below the folder, each path
 /// starting `./`. The list stops after as many bytes as the second
-/// argument says. Read with [`parse_listing`].
+/// argument says. Read with [`parse_listing`]; [`list_here`] does the same
+/// here.
 pub(super) const LIST_SCRIPT: &str = r#"unset CDPATH
 cd -- "$1" || exit
 printf 'rho-ui-files\0'
@@ -79,7 +81,7 @@ else
 fi
 "#;
 
-/// The files [`LIST_SCRIPT`] found.
+/// The files a folder holds, as [`listing`] makes them.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Listing {
     /// Each file's path from the folder, in the order listed.
@@ -134,13 +136,11 @@ struct OpenFile {
     load: Task<()>,
 }
 
-/// The Files surface of [`super::RightPanel`]: it follows the session the
-/// panel shows.
+/// The Files surface of [`super::RightPanel`], for one session.
 pub(super) struct FilesSurface {
     workspaces: Entity<Workspaces>,
-    /// The session's folder, with the subscription that reads it again when
-    /// its turn ends.
-    session: Option<(Place, Subscription)>,
+    /// The session's folder.
+    place: Place,
     tree: Entity<TreeState>,
     /// The folders opened in the tree, which a new list keeps open.
     expanded: HashSet<SharedString>,
@@ -161,7 +161,7 @@ pub(super) struct FilesSurface {
 impl FilesSurface {
     pub(super) fn new(
         workspaces: Entity<Workspaces>,
-        session: Option<&Entity<SessionView>>,
+        place: Place,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let tree = cx.new(|cx| TreeState::new(cx));
@@ -173,7 +173,7 @@ impl FilesSurface {
         });
         let mut this = Self {
             workspaces,
-            session: None,
+            place,
             tree,
             expanded: HashSet::new(),
             status: Status::Loading,
@@ -183,55 +183,19 @@ impl FilesSurface {
             editor: None,
             _expansions: expansions,
         };
-        this.set_session(session, cx);
+        this.reload(cx);
         this
-    }
-
-    /// Shows the files where `session` works, or nothing without one. A
-    /// session in the folder already showing keeps the tree as it is.
-    pub(super) fn set_session(
-        &mut self,
-        session: Option<&Entity<SessionView>>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let before = self.session.take().map(|(place, _)| place);
-        self.session = session.map(|view| {
-            let live = view.read(cx).live();
-            let place = Place::new(live.id.machine, live.cwd);
-            let ended = cx.subscribe(view, |this, _, event: &SessionEvent, cx| {
-                if matches!(event, SessionEvent::Saved) {
-                    this.reload(cx);
-                }
-            });
-            (place, ended)
-        });
-        if before.as_ref() != self.session.as_ref().map(|(place, _)| place) {
-            self.status = Status::Loading;
-            self.listing = Listing::default();
-            self.expanded.clear();
-            self.open = None;
-            self.tree
-                .update(cx, |tree, cx| tree.set_items(Vec::new(), cx));
-        }
-        self.reload(cx);
     }
 
     /// Reads the file list again, and the open file, keeping what shows
     /// until they come.
-    fn reload(&mut self, cx: &mut Context<'_, Self>) {
-        let Some((place, _)) = &self.session else {
-            self.load = Task::ready(());
-            cx.notify();
-            return;
-        };
+    pub(super) fn reload(&mut self, cx: &mut Context<'_, Self>) {
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
-        let args = vec![
-            place.path.clone().into_os_string(),
-            (LIST_LIMIT + 1).to_string().into(),
-        ];
+        let folder = place.path.clone();
         let executor = cx.background_executor().clone();
         self.load = cx.spawn(async move |this, cx| {
-            let read = list(reader, args, executor).await;
+            let read = list(reader, folder, executor).await;
             let _ = this.update(cx, |this, cx| this.listed(read, cx));
         });
         if let Some(path) = self.open.as_ref().map(|open| open.path.clone()) {
@@ -267,9 +231,10 @@ impl FilesSurface {
 
     /// Reads the open file at `path` again.
     fn read_file(&mut self, path: SharedString, cx: &mut Context<'_, Self>) {
-        let (Some((place, _)), Some(open)) = (&self.session, &mut self.open) else {
+        let Some(open) = &mut self.open else {
             return;
         };
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
         let folder = place.path.clone();
         let executor = cx.background_executor().clone();
@@ -335,9 +300,9 @@ impl FilesSurface {
             );
         }
         let folder = self
-            .session
-            .as_ref()
-            .and_then(|(place, _)| place.path.file_name())
+            .place
+            .path
+            .file_name()
             .map_or_default(|name| name.to_string_lossy().into_owned());
         let theme = cx.theme();
         h_flex()
@@ -494,9 +459,6 @@ fn refresh_button(cx: &Context<'_, FilesSurface>) -> Button {
 
 impl Render for FilesSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        if self.session.is_none() {
-            return message("Open a session to see its files.", None);
-        }
         if let Some(file) = self.render_file(window, cx) {
             return file;
         }
@@ -533,21 +495,108 @@ fn language(path: &str) -> String {
         .map_or_default(|token| token.to_string_lossy().into_owned())
 }
 
-/// Lists the files with `reader` and [`LIST_SCRIPT`]'s `args`, and sorts
-/// them into a tree, both on `executor`.
+/// Lists the files in `folder` with `reader`, up to [`LIST_LIMIT`], and
+/// sorts them into a tree, both on `executor`.
 async fn list(
     reader: Reader,
-    args: Vec<OsString>,
+    folder: PathBuf,
     executor: BackgroundExecutor,
 ) -> Result<(Listing, Vec<Node>), String> {
-    let output = reader.run_script(LIST_SCRIPT, args, &executor).await?;
+    let args = vec![
+        folder.as_os_str().to_owned(),
+        (LIST_LIMIT + 1).to_string().into(),
+    ];
+    let listing = reader
+        .query(
+            &executor,
+            move || list_here(&folder, LIST_LIMIT),
+            LIST_SCRIPT,
+            args,
+            Deadline::Script,
+            |output| parse_listing(&output, LIST_LIMIT),
+        )
+        .await?;
     executor
         .spawn(async move {
-            let listing = parse_listing(&output, LIST_LIMIT)?;
             let nodes = nodes(&listing.paths);
             Ok((listing, nodes))
         })
         .await
+}
+
+/// Lists the files in `folder` on this machine, as [`LIST_SCRIPT`] does,
+/// reading no more than `limit + 1` bytes of paths. Blocks; call it off
+/// the UI thread.
+///
+/// # Errors
+///
+/// Says why if `folder` isn't one, or git can't list the work tree's
+/// missing files.
+fn list_here(folder: &Path, limit: usize) -> Result<Listing, String> {
+    if !folder.is_dir() {
+        return Err(format!("{} isn't a folder.", folder.display()));
+    }
+    let git = |args: &[&str]| local::git(folder, args);
+    let inside = local::line(&mut git(&["rev-parse", "--is-inside-work-tree"]))
+        .is_ok_and(|line| line == b"true");
+    if !inside {
+        return Ok(listing(&[], &walk(folder, limit + 1), limit));
+    }
+    let missing = local::stdout(&mut git(&["ls-files", "-z", "--deleted"]))?;
+    let mut listed = git(&[
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]);
+    let present = local::head(&mut listed, limit + 1)?;
+    Ok(listing(&missing, &present, limit))
+}
+
+/// The path from `folder` of every file under it that isn't a folder, each
+/// ended by a NUL and `/` between its parts, as `find . ! -type d` lists
+/// them, until there are `count` bytes or more. It goes in `find`'s order,
+/// depth first, each folder's entries in the order the system reads them,
+/// so a list cut at its limit keeps the same files here as on a remote
+/// machine. Like `find`, it doesn't follow symlinks, and skips folders it
+/// can't read.
+fn walk(folder: &Path, count: usize) -> Vec<u8> {
+    /// The entries of `dir`, in the order read: each one's path, its path
+    /// from the folder walked (`prefix` and its name), and whether it is a
+    /// folder.
+    fn entries(dir: &Path, prefix: &[u8]) -> Vec<(PathBuf, Vec<u8>, bool)> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let entries = entries.flatten().map(|entry| {
+            let mut path = prefix.to_vec();
+            path.extend(platform::path_to_bytes(&entry.file_name()));
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            (entry.path(), path, is_dir)
+        });
+        entries.collect()
+    }
+
+    let mut listed = Vec::new();
+    // The entries left to visit, the next one on top. A folder's go on
+    // reversed, so they come off in the order read, and before the entries
+    // that follow the folder.
+    let mut unvisited = entries(folder, &[]);
+    unvisited.reverse();
+    while let Some((dir, mut path, is_dir)) = unvisited.pop() {
+        if is_dir {
+            path.push(b'/');
+            unvisited.extend(entries(&dir, &path).into_iter().rev());
+        } else {
+            listed.extend(path);
+            listed.push(0);
+            if listed.len() >= count {
+                break;
+            }
+        }
+    }
+    listed
 }
 
 /// The files [`LIST_SCRIPT`] printed, told to stop after `limit + 1`
@@ -559,17 +608,26 @@ fn parse_listing(output: &[u8], limit: usize) -> Result<Listing, String> {
     // No path ends with `/`, so the first `/` ending a field is the
     // separator, and one that starts the output is too.
     let split = find(rest, b"/\0").ok_or_else(printed)?;
-    let missing: HashSet<&[u8]> = fields(&rest[..split]).into_iter().collect();
-    let mut present = &rest[split + 2..];
+    Ok(listing(&rest[..split], &rest[split + 2..], limit))
+}
+
+/// The files of `present`, NUL-ended paths of which the first `limit` bytes
+/// count, less those in `missing`, NUL-ended too: the tracked files gone
+/// from the work tree, which git lists among those present. A leading `./`
+/// is dropped.
+fn listing(missing: &[u8], present: &[u8], limit: usize) -> Listing {
+    let missing: HashSet<&[u8]> = fields(missing).into_iter().collect();
     let cut = present.len() > limit;
-    if cut {
+    let present = if cut {
         // Drop the path the limit cut short.
-        let end = present
+        let end = present[..=limit]
             .iter()
             .rposition(|&byte| byte == 0)
             .map_or(0, |at| at + 1);
-        present = &present[..end];
-    }
+        &present[..end]
+    } else {
+        present
+    };
     let paths = fields(present)
         .into_iter()
         .filter(|path| !missing.contains(path))
@@ -578,7 +636,7 @@ fn parse_listing(output: &[u8], limit: usize) -> Result<Listing, String> {
             String::from_utf8_lossy(path).into_owned()
         })
         .collect();
-    Ok(Listing { paths, cut })
+    Listing { paths, cut }
 }
 
 /// The NUL-ended fields of `bytes`, leaving out empty ones.
@@ -680,43 +738,23 @@ impl Read {
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
-
-    use crate::folders::run_here;
-
     use super::*;
 
-    /// [`LIST_SCRIPT`] lists what git sees in a work tree, from any folder
-    /// of it: tracked files that are there and untracked ones not ignored.
-    /// Outside one it lists every file, and it stops at its limit with
-    /// whole paths only.
-    #[test]
-    fn the_list_script_lists_what_git_sees() {
+    /// Lists what git sees in a work tree, from any folder of it: tracked
+    /// files that are there and untracked ones not ignored. Outside one it
+    /// lists every file, and it stops at its limit with whole paths only.
+    /// `read` lists a folder, given the limit.
+    fn lists_what_git_sees(read: impl Fn(&Path, usize) -> Listing) {
         let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(["-c", "commit.gpgsign=false"])
-                .args(args)
-                .current_dir(&dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
+        let dir = dir.path();
+        let git = |args: &[&str]| local::test::git(dir, args);
         let write = |path: &str| {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "x\n").unwrap();
         };
         let list = |folder: &Path, limit: usize| {
-            let output = run_here(
-                LIST_SCRIPT,
-                &[folder.as_os_str(), (limit + 1).to_string().as_ref()],
-            );
-            let mut listing = parse_listing(&output.unwrap(), limit).unwrap();
+            let mut listing = read(folder, limit);
             listing.paths.sort();
             listing
         };
@@ -761,6 +799,24 @@ mod tests {
         assert_eq!(list(&repo, 20), listing(&[".gitignore", "new.md"], true));
     }
 
+    #[test]
+    fn listing_here_lists_what_git_sees() {
+        lists_what_git_sees(|folder, limit| list_here(folder, limit).unwrap());
+    }
+
+    /// [`LIST_SCRIPT`], which lists a remote machine's files, lists the
+    /// same.
+    #[cfg(unix)]
+    #[test]
+    fn the_list_script_lists_what_git_sees() {
+        lists_what_git_sees(|folder, limit| {
+            let most = (limit + 1).to_string();
+            let output =
+                local::test::sh(LIST_SCRIPT, &[folder.as_os_str(), most.as_ref()]).unwrap();
+            parse_listing(&output, limit).unwrap()
+        });
+    }
+
     /// Folders come before files, and names sort ignoring case.
     #[test]
     fn the_tree_puts_folders_first_by_name() {
@@ -776,26 +832,43 @@ mod tests {
         assert_eq!(names(src[0].children.as_deref().unwrap()), ["src/a/b.rs"]);
     }
 
-    /// [`READ_SCRIPT`] reads a text file whole, and tells a binary file,
-    /// one over the limit, and one that isn't there apart.
-    #[test]
-    fn the_read_script_tells_text_from_the_rest() {
-        use crate::folders::{parse_read, READ_SCRIPT};
-
+    /// Reads a text file whole, and tells a binary file, one over the
+    /// limit, and one that isn't there apart, and fails in a folder that
+    /// isn't there. `read` reads a file from a folder, given the limit.
+    fn tells_text_from_the_rest(read: impl Fn(&Path, &str, usize) -> Result<FileRead, String>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.path().join("bin"), b"\x7fELF\0\0").unwrap();
         std::fs::write(dir.path().join("big"), vec![b'x'; FILE_LIMIT + 1]).unwrap();
         std::fs::create_dir(dir.path().join("folder")).unwrap();
-        let read = |path: &str| {
-            let limit = (FILE_LIMIT + 1).to_string();
-            let args = [dir.path().as_os_str(), path.as_ref(), limit.as_ref()];
-            parse_read(run_here(READ_SCRIPT, &args).unwrap(), FILE_LIMIT).map(Read::new)
-        };
+        let read_in = |folder: &Path, path: &str| read(folder, path, FILE_LIMIT).map(Read::new);
+        let read = |path: &str| read_in(dir.path(), path);
         assert_eq!(read("a.rs"), Ok(Read::Text("fn main() {}\n".to_owned())));
         assert_eq!(read("bin"), Ok(Read::Binary));
         assert_eq!(read("big"), Ok(Read::TooLarge));
         assert_eq!(read("gone"), Ok(Read::Gone));
         assert_eq!(read("folder"), Ok(Read::Gone));
+        assert!(
+            read_in(&dir.path().join("gone"), "a.rs").is_err(),
+            "no folder"
+        );
+    }
+
+    #[test]
+    fn reading_here_tells_text_from_the_rest() {
+        tells_text_from_the_rest(crate::folders::read_here);
+    }
+
+    /// [`crate::folders::READ_SCRIPT`], which reads a remote machine's files,
+    /// tells them apart the same.
+    #[cfg(unix)]
+    #[test]
+    fn the_read_script_tells_text_from_the_rest() {
+        tells_text_from_the_rest(|folder, path, limit| {
+            let most = (limit + 1).to_string();
+            let args = [folder.as_os_str(), path.as_ref(), most.as_ref()];
+            local::test::sh(crate::folders::READ_SCRIPT, &args)
+                .and_then(|output| crate::folders::parse_read(output, limit))
+        });
     }
 }

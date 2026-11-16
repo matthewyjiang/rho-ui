@@ -61,7 +61,9 @@ use crate::{
     badge::Badge,
     machines::{MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
+    pull_requests::{PrLinks, PrSummary, PullRequests, Rollup, Target, Watch},
     rho_install::{render_offer, Installs},
+    right_panel::state_look,
     session_list::{
         Activity, DraftRow, Item, JobSession, LiveSession, Row, SavedSession, SessionList,
         SHELF_PAGE,
@@ -302,6 +304,8 @@ pub(crate) struct SidebarView {
     /// Each machine's rho, which the footer offers to install or update.
     installs: Entity<Installs>,
     projects: Entity<Projects>,
+    /// Each active row's PR, which its branch line marks.
+    prs: Entity<PullRequests>,
     shelves: Shelves,
     layout: SidebarLayout,
     saved_filter: SavedFilter,
@@ -317,25 +321,40 @@ pub(crate) struct SidebarView {
     /// The list's height in the last frame, which the gap above the
     /// shelves fills up to.
     viewport: Pixels,
-    _subscriptions: [Subscription; 5],
+    _subscriptions: [Subscription; 7],
     _tick: Task<()>,
+}
+
+/// The app's models the sidebar reads.
+pub(crate) struct SidebarModels {
+    pub(crate) workspaces: Entity<Workspaces>,
+    /// Labels each row's machine.
+    pub(crate) machines: Entity<Machines>,
+    /// What each machine's rho needs, which the footer offers.
+    pub(crate) installs: Entity<Installs>,
+    /// What the filter offers.
+    pub(crate) projects: Entity<Projects>,
+    /// Each active row's PR.
+    pub(crate) prs: Entity<PullRequests>,
 }
 
 impl EventEmitter<SidebarEvent> for SidebarView {}
 
 impl SidebarView {
-    /// The sidebar over `workspaces`, labelling rows from `machines`,
-    /// offering what `installs` says each machine's rho needs, and
-    /// `projects` to filter by, as `state` last left it.
+    /// The sidebar over `models`, as `state` last left it.
     pub(crate) fn new(
-        workspaces: Entity<Workspaces>,
-        machines: Entity<Machines>,
-        installs: Entity<Installs>,
-        projects: Entity<Projects>,
+        models: SidebarModels,
         state: SidebarState,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        let SidebarModels {
+            workspaces,
+            machines,
+            installs,
+            projects,
+            prs,
+        } = models;
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let subscriptions = [
             cx.subscribe_in(&search, window, |this, state, event: &InputEvent, _, cx| {
@@ -355,6 +374,9 @@ impl SidebarView {
                 this.rebuild(cx);
             }),
             cx.observe(&installs, |_, _, cx| cx.notify()),
+            cx.observe(&prs, |_, _, cx| cx.notify()),
+            // A PR linked or unlinked: the row follows another.
+            cx.observe_global::<PrLinks>(Self::rebuild),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -370,6 +392,7 @@ impl SidebarView {
             machines,
             installs,
             projects,
+            prs,
             shelves: state.shelves,
             layout: state.layout,
             saved_filter: state.filter,
@@ -576,7 +599,38 @@ impl SidebarView {
             let workspace = workspaces.get(ix);
             (workspace.name.as_ref(), workspace.root_path())
         });
+        // The active rows shown have their PRs read.
+        let links = cx.global::<PrLinks>();
+        let listed = self
+            .list
+            .items()
+            .iter()
+            .filter_map(|item| match *item {
+                Item::Session(ix) => Some(self.list.row_at(ix)),
+                _ => None,
+            })
+            .filter_map(|row| {
+                let workspace = workspaces.get(row.workspace);
+                let target = Target::of(&row.id, workspace, links).ok()?;
+                Some(Watch {
+                    machine: row.id.machine.clone(),
+                    target,
+                })
+            })
+            .collect();
+        self.prs.update(cx, |prs, cx| prs.set_listed(listed, cx));
         cx.notify();
+    }
+
+    /// The PR of `row`'s session, once found.
+    fn pr_of<'a>(
+        &self,
+        row: &Row,
+        workspace: &Workspace,
+        cx: &'a gpui_kit::App,
+    ) -> Option<&'a PrSummary> {
+        let target = Target::of(&row.id, workspace, cx.global::<PrLinks>()).ok()?;
+        self.prs.read(cx).pr(&target)
     }
 
     fn toggle(&mut self, which: Shelf, cx: &mut Context<'_, Self>) {
@@ -886,6 +940,9 @@ impl SidebarView {
             }))
             .child(branch_line(
                 workspace,
+                self.pr_of(row, workspace, cx).map(|pr| {
+                    pr_mark(format!("{}-pr", row.element_id).into(), pr, theme).into_any_element()
+                }),
                 machine.map(|label| (format!("{}-machine", row.element_id).into(), label)),
                 theme,
             ));
@@ -943,6 +1000,7 @@ impl SidebarView {
             )
             .child(branch_line(
                 workspace,
+                None,
                 machine.map(|label| (format!("{}-machine", draft.element_id).into(), label)),
                 theme,
             ))
@@ -1618,11 +1676,12 @@ impl Card {
     }
 }
 
-/// The branch, when the workspace is a git repository, and at the right the
-/// machine's label, when there is more than one machine, as its element ID
-/// and the label.
+/// The branch, when the workspace is a git repository, then the session's
+/// `pr` mark, and at the right the machine's label, when there is more than
+/// one machine, as its element ID and the label.
 fn branch_line(
     workspace: &Workspace,
+    pr: Option<AnyElement>,
     machine: Option<(SharedString, SharedString)>,
     theme: &Theme,
 ) -> gpui_kit::Div {
@@ -1636,6 +1695,7 @@ fn branch_line(
             this.child(Icon::new(Lucide::GitBranch).xsmall())
                 .child(div().truncate().child(branch))
         })
+        .children(pr)
         .child(div().flex_1())
         .when_some(machine, |this, (id, label)| {
             this.child(Icon::new(Lucide::Server).xsmall().flex_shrink_0())
@@ -1652,7 +1712,31 @@ fn branch_line(
         })
 }
 
-/// "Working 24m", "Waiting 9m", "Done", or the age: "3h", after a pin on a
+/// A row's PR: its state's icon and its number, with a red dot while its
+/// checks fail. `id` is its element ID.
+fn pr_mark(id: SharedString, pr: &PrSummary, theme: &Theme) -> impl IntoElement {
+    let (_, icon, color) = state_look(pr.state);
+    // As the surface's tag colors its text.
+    let color = color.scale(if theme.is_dark() { 300 } else { 600 });
+    let failing = pr.change.rollup == Rollup::Failing;
+    h_flex()
+        .id(id)
+        .test_support()
+        .aria_label(SharedString::from(format!(
+            "#{}{}",
+            pr.id.number,
+            if failing { ", checks failing" } else { "" }
+        )))
+        .flex_shrink_0()
+        .gap_0p5()
+        .child(Icon::new(icon).xsmall().text_color(color))
+        .child(format!("#{}", pr.id.number))
+        .when(failing, |this| {
+            this.child(div().size_1p5().rounded_full().bg(theme.red))
+        })
+}
+
+/// "Working 24m", "Needs you 9m", "Waiting" on background work, "Done", or the age: "3h", after a pin on a
 /// pinned row. Icons are static: an animated one would redraw the whole
 /// sidebar every frame. So Working gets a symmetric dashed circle, not a
 /// spinner frozen mid-turn.
@@ -1702,8 +1786,18 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
         Activity::Waiting(since) => busy(
             theme.warning,
             Icon::new(Lucide::CircleAlert),
-            label("Waiting", since),
+            label("Needs you", since),
         ),
+        Activity::Background => h_flex()
+            .id(SharedString::from(format!("{}-background", row.element_id)))
+            .test_support()
+            .aria_label("Waiting on background work")
+            .flex_shrink_0()
+            .gap_1()
+            .text_color(theme.muted_foreground)
+            .child(Icon::new(Lucide::Hourglass).xsmall())
+            .child("Waiting")
+            .into_any_element(),
         Activity::Idle if row.done => h_flex()
             .id(SharedString::from(format!("{}-done", row.element_id)))
             .test_support()

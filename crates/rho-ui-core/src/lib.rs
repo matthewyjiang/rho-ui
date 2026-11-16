@@ -7,7 +7,10 @@ mod completion;
 mod daemon;
 #[cfg(feature = "test-support")]
 pub mod fake_daemon;
+#[cfg(feature = "test-support")]
+pub mod fake_sshd;
 mod input;
+mod jobs;
 mod options;
 pub mod platform;
 mod prompt;
@@ -22,13 +25,14 @@ pub use agent_settings::{AgentSettings, AgentSettingsChanged};
 pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
 pub use completion::{Completion, Edit};
 pub use daemon::{
-    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached, Job,
-    JobActivity, PendingUpgrade, SessionId, SessionSummary, SurfaceActionError, Unsteered,
+    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached,
+    PendingUpgrade, SessionId, SessionSummary, SurfaceActionError, Unsteered,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
     Questions, Suggestion, SuggestionStyle, TextBox, Timeout,
 };
+pub use jobs::{Job, JobActivity, Jobs, Run, RunStatus, Runs};
 pub use options::{
     CommandInfo, CommandKind, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue,
     FAST_MODE_ID,
@@ -37,12 +41,21 @@ pub use prompt::{
     check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
     ImageFormat, Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
 };
-pub use rho_install::{RhoCheck, RhoInstall, Update, INSTALL_DIR};
+pub use rho_install::{RhoCheck, RhoInstall, Update};
+/// The auth profiles, logins and credential store [`Daemon`]'s sign-in
+/// methods speak of, as rho-protocol has them.
+pub use rho_protocol::{
+    AuthKind, AuthStatus, AuthSummary, CredentialStoreKind, CredentialStoreStatus, LoginId,
+    LoginOutcome, LoginPrompt, StoreSelectedBy, UncheckedKey, UncheckedReason,
+};
 pub use session::{
     Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,
     RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,
     ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
 };
-pub use ssh::{SshLink, SshTarget};
+pub use ssh::{
+    RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput, SshLink, SshTarget,
+    MAX_SHELLS,
+};
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};
 pub use tool_card::{SearchLine, ToolBody, ToolCard, ToolFact};

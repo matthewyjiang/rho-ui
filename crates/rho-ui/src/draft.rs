@@ -33,12 +33,14 @@ use rho_ui_core::{
 };
 
 use crate::{
+    auths::Auths,
     composer::{Composer, ComposerMode, ComposerState},
     machines::{Machines, Place, SessionKey},
     project_picker::{PickerEvent, ProjectPicker},
     projects::Projects,
     session_list::NEW_SESSION,
     session_settings::{SessionSettings, SettingsEvent},
+    sign_in::SignInSlot,
     title_bar::TitleBar,
     workspaces::{WorkspaceRef, Workspaces},
 };
@@ -71,6 +73,9 @@ enum SessionState {
         daemon: Daemon,
         session: Box<Session>,
         settings: Entity<SessionSettings>,
+        /// The sign-in its model's auth profile needs, while it is signed
+        /// out.
+        sign_in: Box<SignInSlot>,
         _subscription: Subscription,
     },
     /// Opening failed; `DraftView::error` says why.
@@ -83,6 +88,8 @@ pub(crate) struct DraftView {
     /// Where the session will work.
     cwd: Place,
     machines: Entity<Machines>,
+    /// Every machine's sign-ins, for the session's.
+    auths: Entity<Auths>,
     workspace: WorkspaceRef,
     picker: Entity<ProjectPicker>,
     composer: Entity<ComposerState>,
@@ -110,6 +117,7 @@ impl DraftView {
         workspaces: &Entity<Workspaces>,
         projects: &Entity<Projects>,
         machines: &Entity<Machines>,
+        auths: Entity<Auths>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -150,6 +158,7 @@ impl DraftView {
         Self {
             cwd,
             machines: machines.clone(),
+            auths,
             workspace,
             picker,
             composer,
@@ -296,6 +305,14 @@ impl DraftView {
         cx.notify();
     }
 
+    /// The auth profile the draft session's model runs on, once known.
+    fn session_auth(&self) -> Option<&str> {
+        match &self.state {
+            SessionState::Open { session, .. } => session.auth(),
+            SessionState::Opening | SessionState::Failed | SessionState::Started => None,
+        }
+    }
+
     /// Whether the draft still waits for the answer to `request`. An
     /// earlier request's session, such as one opened before the project
     /// changed, is not wanted: the app leaves it unfollowed, and the daemon
@@ -327,11 +344,19 @@ impl DraftView {
                 cx,
             )
         });
+        let sign_in = Box::new(SignInSlot::new(
+            self.auths.clone(),
+            self.cwd.machine.clone(),
+            Self::session_auth,
+            window,
+            cx,
+        ));
         let subscription = cx.subscribe_in(&settings, window, Self::on_settings_event);
         self.state = SessionState::Open {
             daemon,
             session: Box::new(session),
             settings,
+            sign_in,
             _subscription: subscription,
         };
         self.error = None;
@@ -490,9 +515,14 @@ impl Render for DraftView {
         } else {
             ComposerMode::Send
         };
-        let settings = match &self.state {
-            SessionState::Open { settings, .. } => Some(settings),
-            SessionState::Opening | SessionState::Failed | SessionState::Started => None,
+        let (settings, sign_in) = match &self.state {
+            SessionState::Open {
+                settings,
+                sign_in,
+                session,
+                ..
+            } => (Some(settings), sign_in.card(session.auth(), cx)),
+            SessionState::Opening | SessionState::Failed | SessionState::Started => (None, None),
         };
         let mut composer = Composer::new(
             &self.composer,
@@ -544,6 +574,7 @@ impl Render for DraftView {
                                 .small(),
                         )
                     })
+                    .children(sign_in)
                     .child(composer),
             )
     }

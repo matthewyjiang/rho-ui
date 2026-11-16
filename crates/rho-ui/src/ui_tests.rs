@@ -25,7 +25,8 @@ use gpui_kit::{
 use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{
-        subagent_result, write_program, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION,
+        subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
+        REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
     Delay, Entry, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
@@ -35,8 +36,10 @@ use gpui_kit::component::ActiveTheme as _;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    forge::ForgeCli,
     machines::{MachineId, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
+    pull_requests::{BranchId, CheckStatus, Found, Lookup, PrLinks, RepoId, Target},
     rho_install::Offer,
     right_panel::{Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, UiScale},
@@ -86,6 +89,19 @@ fn text_system() -> Arc<dyn gpui_kit::PlatformTextSystem> {
     Arc::new(gpui_apple::AppleTextSystem::new())
 }
 
+/// GPUI's offscreen renderer for this platform.
+#[cfg(not(windows))]
+use gpui_kit::platform::current_headless_renderer as headless_renderer;
+
+/// GPUI has no offscreen renderer for Windows; its wgpu one draws there,
+/// on Vulkan, which CI gives with Mesa lavapipe.
+#[cfg(windows)]
+fn headless_renderer() -> gpui_kit::Result<Option<Box<dyn gpui_kit::PlatformHeadlessRenderer>>> {
+    let renderer: Box<dyn gpui_kit::PlatformHeadlessRenderer> =
+        Box::new(gpui_wgpu::WgpuHeadlessRenderer::new()?);
+    Ok(Some(renderer))
+}
+
 /// `linux` off macOS, `macos` on it: the terminal's keys, as Ghostty's,
 /// differ by more than Cmd for Ctrl, so `secondary-` can't say them.
 const fn key(linux: &'static str, macos: &'static str) -> &'static str {
@@ -106,6 +122,7 @@ const WAIT: Duration = Duration::from_secs(10);
 /// `sh`, so the shell it runs keeps the name the terminal tab shows. Kept
 /// in `target/`, beside the screenshots, as a static is never dropped to
 /// clean up a temporary folder.
+#[cfg(unix)]
 static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell");
@@ -120,6 +137,11 @@ static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
         .expect("make the test shell executable");
     path
 });
+
+/// `cmd.exe`, the shell a Windows terminal runs; the tests that script a
+/// shell's output speak POSIX `sh` and are ignored there.
+#[cfg(windows)]
+static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| PathBuf::from("cmd.exe"));
 
 /// Writes a `rho` at `path` that answers as rho 3.1.0, with 3.2.0 out:
 /// `update --check --json` says whether an update is available with the
@@ -238,16 +260,22 @@ impl Harness {
         let Machines {
             shelves,
             projects,
-            settings,
+            mut settings,
             remote_sockets,
             workspace,
             rho,
         } = machines;
         let rho = rho.map(|rho| RhoInstall::Here { rho });
+        // Never the user's gh, which would ask GitHub about their account.
+        if settings.local_cli.get(ForgeCli::Gh).is_empty() {
+            settings
+                .local_cli
+                .set(ForgeCli::Gh, "/nonexistent/gh".to_owned());
+        }
         let mut cx = HeadlessAppContext::with_platform(
             text_system(),
             Arc::new(crate::Assets),
-            gpui_kit::platform::current_headless_renderer,
+            headless_renderer,
         );
         // The daemon's answers arrive on a socket: its I/O thread wakes
         // tasks, which the deterministic scheduler only accepts this way.
@@ -923,6 +951,12 @@ fn a_questionnaire_is_answered_one_question_at_a_time() {
             "one question at a time"
         );
         assert!(!is_visible(window, "input-timeout"), "no timeout was set");
+        // Both choices have a description; only Rust's wraps.
+        let height = |id| bounds(window, id).map(|b| b.size.height);
+        assert!(
+            height("question-lang-rust") > height("question-lang-go"),
+            "a long description wraps"
+        );
     });
     ui.shot("first");
 
@@ -1105,6 +1139,44 @@ fn a_sent_message_can_be_selected_and_copied() {
     assert_eq!(copied.as_deref(), Some("list files"));
 }
 
+/// One click on a code block's copy button puts its code, and only its
+/// code, on the clipboard.
+#[test]
+fn a_code_block_copies_in_one_click() {
+    let script = Script {
+        replay_turns: 1,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("copy-code", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-old")
+    });
+    ui.click("session-local-old");
+    ui.wait_for_session("the replayed reply", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(_)))
+    });
+    let reply = ui.cx.update(|cx| {
+        let view = ui.app.read(cx).active_session().expect("a session is open");
+        let last = view.read(cx).session().entries().len() - 1;
+        SharedString::from(format!("reply-{last}"))
+    });
+    ui.wait_until("the reply's code block", |window, _, _| {
+        window.try_find("copy-code").is_some()
+    });
+    ui.act(|window, cx| window.within(reply.clone()).hover("copy-code", cx));
+    ui.shot("hovered");
+    ui.act(|window, cx| window.within(reply.clone()).click("copy-code", cx));
+    ui.shot("copied");
+    let copied = ui
+        .cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(
+        copied.as_deref(),
+        Some("fn main() {\n    println!(\"hi\");\n}")
+    );
+}
+
 /// The current value of setting `id` on the active session.
 fn setting(session: &Session, id: &str) -> Option<String> {
     session
@@ -1198,6 +1270,7 @@ fn composer_settings_change_the_session() {
 /// A socket that takes the app's connection but passes it on to `daemon`
 /// only once the returned sender sends or drops, so a test can act while
 /// the app connects.
+#[cfg(unix)]
 fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::mpsc::Sender<()>) {
     use std::os::unix::net::{UnixListener, UnixStream};
     let DaemonTarget::Socket(real) = daemon.clone() else {
@@ -1226,6 +1299,8 @@ fn gated_socket(dir: &Path, daemon: &DaemonTarget) -> (DaemonTarget, std::sync::
 /// A new session asked for while this machine connects waits for the
 /// daemon, then opens, rather than failing as not connected.
 #[test]
+// The gate proxies a Unix socket.
+#[cfg(unix)]
 fn a_draft_opened_while_connecting_waits_for_the_daemon() {
     let daemon = FakeDaemon::start(Script::default());
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2260,6 +2335,7 @@ fn a_missing_rho_offers_its_install() {
 /// others it opened with work under way, so the daemon carries on their
 /// turns; other clients' sessions are left to them.
 #[test]
+#[cfg_attr(windows, ignore = "runs a fake rho written as a POSIX sh script")]
 fn an_update_installs_then_restarts_the_daemon_on_request() {
     let dir = tempfile::tempdir().expect("a folder for the fake rho");
     let rho = dir.path().join("rho");
@@ -2419,6 +2495,37 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
     ui.wait_until("the session open and the row seen", |window, _, app| {
         app.active_session().is_some() && !is_visible(window, "session-local-tui-1-done")
     });
+}
+
+/// A turn that ends off screen while the process it started runs on leaves
+/// the row waiting on that work; Done shows once the work and the daemon's
+/// turn about it have ended.
+#[test]
+fn a_turn_that_leaves_work_running_waits_before_done() {
+    let mut ui = Harness::start("background-waits", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_daemon("s1 attached", |daemon| daemon.attaches("s1") == 1);
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+
+    ui.send_from_elsewhere("s1", "background", Send::Prompt);
+    ui.wait_until("s1 waiting on its process", |window, _, _| {
+        is_visible(window, "session-local-s1-background")
+    });
+    ui.act(|window, _| {
+        assert!(!is_visible(window, "session-local-s1-done"), "not done yet");
+    });
+    ui.shot("waiting");
+
+    ui.fake().finish_background(&SessionId::from("s1"), 0);
+    ui.wait_until("the daemon's turn about the exit", |window, _, _| {
+        is_visible(window, "session-local-s1-busy")
+    });
+    ui.send_from_elsewhere("s1", "thanks", Send::Steer);
+    ui.wait_for_label("session-local-s1-done", "Done");
 }
 
 /// The sidebar collapses to a rail and opens again, with Ctrl+B or its
@@ -2641,7 +2748,7 @@ fn a_reply_draws_its_diagram_and_formula_in_the_theme() {
 #[test]
 fn pictures_show_in_place_and_open_in_the_lightbox() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let folder = dir.path().canonicalize().expect("it resolves");
+    let folder = rho_ui_core::platform::canonicalize(dir.path()).expect("it resolves");
     std::fs::write(
         folder.join("plot.png"),
         crate::attachments::png(640, 320, RED),
@@ -2849,8 +2956,9 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
 
 /// The right panel shows and hides with Ctrl+Alt+B or its toggle, and the
 /// state database remembers which. It lists its surfaces; the Background
-/// surface opens as a tab, follows the session on screen, and stops its
-/// work. Closing the last tab goes back to the list.
+/// surface opens as a tab and stops its work. Each session has its own
+/// tabs: another shows none, and coming back shows its own again. Closing
+/// the last tab goes back to the list.
 #[test]
 fn the_right_panel_opens_a_surface_that_follows_the_session() {
     let mut ui = Harness::start("right-panel", Script::default());
@@ -2912,14 +3020,23 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
     );
     ui.shot("stopped");
 
-    // Another session shows its own work: none.
+    // Another session has tabs of its own: none yet.
+    let key = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        app.active_session().expect("a session").read(cx).live().id
+    });
     ui.click("session-local-s1");
     ui.wait_for_session("the saved session", |session| {
         session.title() == Some("first")
     });
     ui.act(|window, _| {
-        assert!(is_visible(window, "panel-tab-background"), "the tab stays");
-        assert!(!is_visible(window, "panel-ended-0"), "s1 ran no work");
+        assert!(!is_visible(window, "panel-tab-background"), "not s1's tab");
+        assert!(is_visible(window, "panel-surface-list"));
+    });
+    let row = SharedString::from(format!("session-{key}"));
+    ui.act(|window, cx| window.click(row, cx));
+    ui.wait_until("the first session's tab again", |window, _, _| {
+        is_visible(window, "panel-tab-background") && is_visible(window, "panel-ended-0")
     });
 
     ui.act(|window, cx| window.hover("panel-tab-background", cx));
@@ -2941,6 +3058,10 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     let mut ui = Harness::start("panel-tabs", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_session("the saved session", |session| {
+        session.title() == Some("first")
     });
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.click("open-surface-background");
@@ -2989,13 +3110,495 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
 }
 
+/// What [`StubGh`]'s API answers: PR 12 on `feature`, a failed check and
+/// a passed one, a comment and an approval, an open thread and a resolved
+/// one.
+fn stub_answer() -> String {
+    let summary = |checks: serde_json::Value| {
+        serde_json::json!({
+            "number": 12, "title": "Add widgets", "url": "https://github.com/acme/widgets/pull/12",
+            "state": "OPEN", "isDraft": false, "isCrossRepository": false,
+            "updatedAt": "2026-11-15T00:00:00Z", "headRefOid": "abc",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": checks } }] },
+        })
+    };
+    let check = |name: &str, conclusion: &str| {
+        serde_json::json!({
+            "__typename": "CheckRun", "name": name, "status": "COMPLETED",
+            "conclusion": conclusion, "detailsUrl": null,
+            "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } },
+        })
+    };
+    // A comment and an approval; an open thread and a resolved one.
+    let post = |login: &str, at: &str, body: &str, url: &str| {
+        serde_json::json!({
+            "author": { "login": login }, "body": body, "createdAt": at, "url": url
+        })
+    };
+    let thread = |id: &str, resolved: bool, path: &str, line: u32, body: &str| {
+        let url = format!("https://github.com/acme/widgets/pull/12#{id}");
+        serde_json::json!({
+            "id": id, "isResolved": resolved, "isOutdated": false, "path": path, "line": line,
+            "comments": {
+                "totalCount": 1,
+                "nodes": [post("octocat", "2026-11-14T23:00:00Z", body, &url)],
+            },
+        })
+    };
+    let mut detail = summary(serde_json::json!({
+        "state": "FAILURE",
+        "contexts": {
+            "totalCount": 2,
+            "nodes": [check("linux", "SUCCESS"), check("macos", "FAILURE")],
+        },
+    }));
+    let extra = serde_json::json!({
+        "body": "Adds **widgets**.", "author": { "login": "octocat" },
+        "headRefName": "feature", "baseRefName": "main",
+        "additions": 10, "deletions": 2, "changedFiles": 3, "reviewDecision": "APPROVED",
+        "mergeable": "MERGEABLE", "repository": {
+            "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": false,
+            "viewerDefaultMergeMethod": "SQUASH",
+        },
+        "comments": { "totalCount": 1, "nodes": [post(
+            "hubot", "2026-11-14T22:00:00Z",
+            "Looks good, one nit on the error path.",
+            "https://github.com/acme/widgets/pull/12#c1",
+        )] },
+        "reviews": { "totalCount": 1, "nodes": [{
+            "author": { "login": "monalisa" }, "body": "Ship it.", "state": "APPROVED",
+            "submittedAt": "2026-11-14T23:30:00Z",
+            "url": "https://github.com/acme/widgets/pull/12#r1",
+        }] },
+        "reviewThreads": { "totalCount": 2, "nodes": [
+            thread("t1", false, "src/lib.rs", 7, "Should this be `pub(crate)`?"),
+            thread("t2", true, "src/widgets/render.rs", 42, "Typo."),
+        ] },
+    });
+    if let (Some(detail), serde_json::Value::Object(extra)) = (detail.as_object_mut(), extra) {
+        detail.extend(extra);
+    }
+    let mut linked = summary(serde_json::json!({ "state": "FAILURE" }));
+    linked["title"] = serde_json::json!("Linked widgets");
+    serde_json::json!({ "data": {
+        "rateLimit": { "remaining": 4999, "resetAt": "2026-11-15T01:00:00Z" },
+        "r0": {
+            "defaultBranchRef": { "name": "main" },
+            "b0": { "nodes": [summary(serde_json::json!({ "state": "FAILURE" }))] },
+            "p0": detail,
+            // The same PR linked by hand, by another title.
+            "l0": linked,
+        },
+    } })
+    .to_string()
+}
+
+/// A checkout of `acme/widgets` on GitHub, on branch `feature`, and a gh
+/// signed in to github.com whose API answers with PR 12 on `feature`, a
+/// failed check and a passed one, and counts its queries.
+struct StubGh {
+    _checkout: tempfile::TempDir,
+    repo: PathBuf,
+    bin: tempfile::TempDir,
+}
+
+impl StubGh {
+    fn new() -> Self {
+        let checkout = tempfile::tempdir().unwrap();
+        let repo = rho_ui_core::platform::canonicalize(checkout.path()).unwrap();
+        let git = |args: &[&str]| crate::local::test::git(&repo, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+
+        let bin = tempfile::tempdir().unwrap();
+        let queries = bin.path().join("queries");
+        let answer = stub_answer();
+        std::fs::write(bin.path().join("answer.json"), answer).unwrap();
+        let gh = bin.path().join("gh");
+        let script = format!(
+            "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
+             auth) echo '{{\"hosts\":{{\"github.com\":[{{\"state\":\"success\",\"active\":true,\"host\":\"github.com\",\"login\":\"octocat\"}}]}}}}' ;;\n  \
+             api) echo x >> '{}'; cat '{}' ;;\n  \
+             pr) printf '%s\\n' \"$@\" > '{}' ;;\nesac\n",
+            queries.display(),
+            bin.path().join("answer.json").display(),
+            bin.path().join("comment").display(),
+        );
+        write_program(&gh, &script);
+        StubGh {
+            _checkout: checkout,
+            repo,
+            bin,
+        }
+    }
+
+    fn program(&self) -> PathBuf {
+        self.bin.path().join("gh")
+    }
+
+    /// How many API queries it answered.
+    fn asked(&self) -> usize {
+        std::fs::read_to_string(self.bin.path().join("queries"))
+            .map_or(0, |text| text.lines().count())
+    }
+
+    /// The arguments of its last `gh pr ...`, one a line.
+    fn acted(&self) -> Option<String> {
+        std::fs::read_to_string(self.bin.path().join("comment")).ok()
+    }
+
+    /// Edits its API's answer.
+    fn edit_answer(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = self.bin.path().join("answer.json");
+        let mut answer = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        edit(&mut answer);
+        std::fs::write(&path, answer.to_string()).unwrap();
+    }
+}
+
+/// Opens the Pull request surface on `gh`'s checkout once the session's
+/// first turn ended, so that end reads nothing, and waits for PR 12 and
+/// its checks.
+fn open_pr_session(gh: &StubGh, name: &'static str) -> Harness {
+    let mut settings = Settings::default();
+    settings
+        .local_cli
+        .set(ForgeCli::Gh, gh.program().display().to_string());
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        name,
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::owning(["s1"]),
+            settings,
+            workspace: Some(gh.repo.clone()),
+            ..Machines::default()
+        },
+    );
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+    ui
+}
+
+/// Opens the Pull request surface over a session made by
+/// [`open_pr_session`].
+fn open_pr_surface(gh: &StubGh, name: &'static str) -> Harness {
+    let mut ui = open_pr_session(gh, name);
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-pull-request");
+    ui.wait_until("the PR and its checks", |window, _, _| {
+        is_visible(window, "pull-request-check-1")
+    });
+    ui
+}
+
+/// The Pull request surface shows the PR of the session's branch, read
+/// through gh: one query finds it, one more reads its detail, then one
+/// every 30 seconds while it shows, and none while the panel is hidden or
+/// GitHub's limit is nearly spent, which it says.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn the_pull_request_surface_shows_the_branchs_pr() {
+    let gh = StubGh::new();
+    let asked = || gh.asked();
+    let mut ui = open_pr_surface(&gh, "pull-request");
+    let branch = BranchId {
+        repo: RepoId::from_url("git@github.com:acme/widgets.git").unwrap(),
+        branch: "feature".into(),
+    };
+    let statuses = ui.cx.update(|cx| {
+        let prs = ui.app.read(cx).pull_requests().read(cx);
+        let Lookup::Found(Found::Pr(summary)) = prs.lookup(&Target::Branch(branch.clone())) else {
+            panic!("PR 12");
+        };
+        let detail = prs.detail(&summary.id).expect("its detail");
+        detail
+            .checks
+            .iter()
+            .map(|check| check.status)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(statuses, [CheckStatus::Failed, CheckStatus::Passed]);
+    assert_eq!(
+        ui.label("pull-request-title").as_deref(),
+        Some("Add widgets")
+    );
+    assert_eq!(asked(), 2, "one query found the PR, one read its detail");
+    ui.shot("pr");
+
+    // On screen, it reads again every 30 seconds; its checks done, the
+    // PR's detail isn't read again.
+    ui.cx.advance_clock(Duration::from_secs(30));
+    ui.wait_until("the next poll", |_, _, _| asked() == 3);
+    // A daemon reconnecting forgets the gh it found; the poll that finds
+    // it being checked again runs once it is.
+    let forges = ui.cx.update(|cx| ui.app.read(cx).forges().clone());
+    ui.cx.update(|cx| {
+        forges.update(cx, |forges, cx| forges.forget(&MachineId::local(), cx));
+    });
+    ui.cx.advance_clock(Duration::from_secs(30));
+    ui.wait_until("a poll after gh's check", |_, _, _| asked() == 4);
+
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.cx.advance_clock(Duration::from_secs(120));
+    ui.frame();
+    assert_eq!(asked(), 4, "a hidden panel polls nothing");
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.wait_until("a read as the panel shows", |_, _, _| asked() == 5);
+
+    // Down to GitHub's last points, polling waits for the limit to reset
+    // and says so over the PR it read.
+    gh.edit_answer(|answer| {
+        answer["data"]["rateLimit"] =
+            serde_json::json!({ "remaining": 10, "resetAt": "2099-01-01T00:00:00Z" });
+    });
+    ui.click("pull-request-refresh");
+    ui.wait_until("the pause", |window, _, _| {
+        is_visible(window, "pull-request-trouble") && is_visible(window, "pull-request-title")
+    });
+    assert_eq!(asked(), 6);
+    ui.shot("paused");
+    ui.cx.advance_clock(Duration::from_secs(120));
+    ui.frame();
+    assert_eq!(asked(), 6, "a paused poll asks nothing");
+}
+
+/// An active session's row marks its PR, failing checks and all, read for
+/// the sidebar by one query of summaries, then again every five minutes.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_sidebar_row_marks_its_pr() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_session(&gh, "pull-request-row");
+    let key = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        app.active_session().expect("a session").read(cx).live().id
+    });
+    let mark = SharedString::from(format!("session-{key}-pr"));
+    ui.wait_until("the row's PR", |window, _, _| {
+        is_visible(window, mark.clone())
+    });
+    assert_eq!(
+        ui.label(mark.clone()).as_deref(),
+        Some("#12, checks failing")
+    );
+    assert_eq!(gh.asked(), 1, "one query, without the PR's detail");
+    ui.shot("mark");
+
+    ui.cx.advance_clock(Duration::from_secs(300));
+    ui.wait_until("the next read", |_, _, _| gh.asked() == 2);
+}
+
+/// PRs linked by hand each open a tab beside the branch's, named for its
+/// number, and stay linked across a restart's read of the state database;
+/// closing a linked PR's tab, or Unlink, unlinks it. What names no PR says
+/// so.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn pull_requests_link_by_hand() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-link");
+    let key = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        app.active_session().expect("a session").read(cx).live().id
+    });
+    let linked = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let links = cx.global::<PrLinks>().get(&key);
+            links.iter().map(|id| id.number).collect::<Vec<_>>()
+        })
+    };
+    let link = |ui: &mut Harness, text: &str| {
+        ui.click("pull-request-link");
+        ui.act(|window, cx| {
+            window.press("secondary-a", cx);
+            window.input(text, cx);
+            window.press("enter", cx);
+        });
+    };
+    link(&mut ui, "widgets");
+    ui.wait_until("why that's no PR", |window, _, _| {
+        is_visible(window, "pull-request-link-error")
+    });
+    ui.shot("form");
+    ui.act(|window, cx| window.press("secondary-a", cx));
+
+    link(&mut ui, "acme/widgets#12");
+    ui.wait_until("the linked PR in a tab of its own", |window, _, _| {
+        is_visible(window, "panel-tab-pull-request-2")
+            && window
+                .try_find("pull-request-title")
+                .is_some_and(|title| title.label() == Some("Linked widgets"))
+    });
+    link(&mut ui, "acme/widgets#13");
+    ui.wait_until("a second linked PR's tab", |window, _, _| {
+        is_visible(window, "panel-tab-pull-request-3")
+    });
+    assert_eq!(ui.label("panel-tab-pull-request").as_deref(), Some("#12"));
+    assert_eq!(ui.label("panel-tab-pull-request-2").as_deref(), Some("#12"));
+    assert_eq!(ui.label("panel-tab-pull-request-3").as_deref(), Some("#13"));
+    assert_eq!(linked(&mut ui), [12, 13]);
+    let reloaded = PrLinks::load(&ui.state);
+    let reloaded: Vec<u32> = reloaded.get(&key).iter().map(|id| id.number).collect();
+    assert_eq!(reloaded, [12, 13], "a restart reads them back in order");
+    ui.shot("linked");
+
+    ui.click("panel-tab-pull-request");
+    ui.wait_until("the branch's PR, still first", |window, _, _| {
+        window
+            .try_find("pull-request-title")
+            .is_some_and(|title| title.label() == Some("Add widgets"))
+    });
+    ui.act(|window, cx| window.hover("panel-tab-pull-request-2", cx));
+    ui.click("close-panel-tab-pull-request-2");
+    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
+    assert_eq!(linked(&mut ui), [13], "closing its tab unlinked it");
+
+    ui.click("panel-tab-pull-request-3");
+    ui.click("pull-request-unlink");
+    ui.wait_until("the branch's PR again", |window, _, _| {
+        !is_visible(window, "panel-tab-pull-request-3")
+            && window
+                .try_find("pull-request-title")
+                .is_some_and(|title| title.label() == Some("Add widgets"))
+    });
+    assert_eq!(linked(&mut ui), Vec::<u32>::new());
+}
+
+/// Two sessions on one branch each have a Pull request tab of the same PR;
+/// switching between them, either way, leaves the one on screen polling,
+/// whatever order the panel tells their surfaces in.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn sessions_on_one_branch_each_watch_their_pr() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-two-sessions");
+    let active = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let app = ui.app.read(cx);
+            app.active_session().expect("a session").read(cx).live().id
+        })
+    };
+    let first = active(&mut ui);
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the second session's turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+    let second = active(&mut ui);
+    assert_ne!(first, second);
+    ui.click("open-surface-pull-request");
+    ui.wait_until("the second session's PR", |window, _, _| {
+        is_visible(window, "pull-request-check-1")
+    });
+    let watching = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let prs = ui.app.read(cx).pull_requests().read(cx);
+            prs.poster(cx).is_ok()
+        })
+    };
+    for session in [&first, &second, &first] {
+        let row = SharedString::from(format!("session-{session}"));
+        ui.act(|window, cx| window.click(row, cx));
+        ui.wait_until("its PR on screen", |window, _, _| {
+            is_visible(window, "pull-request-check-1")
+        });
+        assert_eq!(&active(&mut ui), session);
+        assert!(watching(&mut ui), "the PR on screen is watched");
+    }
+}
+
+/// The PR's conversation: its comments and reviews, its threads on the
+/// code, open ones open and resolved ones closed until clicked; and a
+/// comment posted through the session machine's gh, after which the PR
+/// is read again to show it.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_pull_request_conversation_takes_a_comment() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-conversation");
+    ui.act(|window, _| {
+        assert!(is_visible(window, "pull-request-post-1"), "the approval");
+        assert!(
+            is_visible(window, "pull-request-thread-0-0"),
+            "an open thread shows"
+        );
+        assert!(
+            !is_visible(window, "pull-request-thread-1-0"),
+            "a resolved one waits"
+        );
+    });
+    let to_the_end = |window: &mut Window, cx: &mut App| {
+        let down = gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-2000.)));
+        window.scroll("pull-request-body", down, cx);
+    };
+    ui.act(to_the_end);
+    ui.click("pull-request-thread-1");
+    ui.act(|window, _| assert!(is_visible(window, "pull-request-thread-1-0")));
+
+    ui.act(to_the_end);
+    ui.click("pull-request-comment-box");
+    ui.act(|window, cx| window.input("Thanks!", cx));
+    ui.shot("written");
+    ui.click("pull-request-comment");
+    ui.wait_until("the comment", |_, _, _| gh.acted().is_some());
+    assert_eq!(
+        gh.acted().as_deref(),
+        Some("pr\ncomment\n12\n--repo\ngithub.com/acme/widgets\n--body\nThanks!\n")
+    );
+    ui.wait_until("the PR read again", |_, _, _| gh.asked() == 3);
+
+    // Hidden with the keyboard in the comment box, the panel gives it
+    // back to the pane, where the shortcut that shows it again works.
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.act(|window, _| assert!(!is_visible(window, "pull-request-body")));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.wait_until("the panel again", |window, _, _| {
+        is_visible(window, "pull-request-body")
+    });
+}
+
+/// An open PR merges the way its repository and the viewer prefer, once
+/// confirmed, through `gh pr merge` without deleting the branch; then it is
+/// read again.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_pull_request_merges_once_confirmed() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-merge");
+    ui.shot("open");
+    ui.click("pull-request-merge");
+    ui.wait_until("the confirmation", |window, _, _| {
+        is_visible(window, "pull-request-merge-confirm")
+    });
+    assert_eq!(gh.acted(), None, "one click merges nothing");
+    ui.shot("confirm");
+    ui.click("pull-request-merge-confirm");
+    ui.wait_until("the merge", |_, _, _| gh.acted().is_some());
+    assert_eq!(
+        gh.acted().as_deref(),
+        Some(
+            "pr\nmerge\n12\n--repo\ngithub.com/acme/widgets\n--squash\n--match-head-commit\nabc\n"
+        )
+    );
+    ui.wait_until("the PR read again", |_, _, _| gh.asked() == 3);
+}
+
 /// The Diff surface shows the uncommitted changes where the session on
 /// screen works, read with this machine's `git`, and reads them again when
 /// the session's turn ends.
 #[test]
 fn the_diff_surface_follows_the_sessions_changes() {
     let repo = tempfile::tempdir().unwrap();
-    let repo = repo.path().canonicalize().unwrap();
+    let repo = rho_ui_core::platform::canonicalize(repo.path()).unwrap();
     let git = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -3026,12 +3629,13 @@ fn the_diff_surface_follows_the_sessions_changes() {
             ..Machines::default()
         },
     );
-    ui.act(|window, cx| window.press("secondary-alt-b", cx));
-    ui.click("open-surface-diff");
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     // The turn ends with its process running, which saves the session.
     ui.send("background");
+    ui.wait_for_session("the session", |_| true);
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-diff");
     ui.wait_until("the session's change", |window, cx, app| {
         app.diff_paths(cx) == Some(vec!["a.txt".to_owned()]) && is_visible(window, "diff-summary")
     });
@@ -3051,7 +3655,7 @@ fn the_diff_surface_follows_the_sessions_changes() {
 #[test]
 fn the_files_surface_opens_the_sessions_files() {
     let repo = tempfile::tempdir().unwrap();
-    let repo = repo.path().canonicalize().unwrap();
+    let repo = rho_ui_core::platform::canonicalize(repo.path()).unwrap();
     let status = std::process::Command::new("git")
         .args(["init", "-q", "-b", "main"])
         .current_dir(&repo)
@@ -3073,11 +3677,12 @@ fn the_files_surface_opens_the_sessions_files() {
             ..Machines::default()
         },
     );
-    ui.act(|window, cx| window.press("secondary-alt-b", cx));
-    ui.click("open-surface-files");
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.send("background");
+    ui.wait_for_session("the session", |_| true);
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-files");
     ui.wait_until("the folder's files", |window, _, _| {
         is_visible(window, "files-entry-src") && is_visible(window, "files-entry-README.md")
     });
@@ -3123,6 +3728,7 @@ fn the_files_surface_opens_the_sessions_files() {
 /// method's composing stays out of the shell until it commits; and a
 /// program that asks for the mouse gets a click as an escape sequence.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn the_terminal_surface_runs_a_shell() {
     let mut ui = Harness::with_terminal("terminal");
     ui.act(|window, cx| {
@@ -3219,6 +3825,7 @@ fn the_terminal_surface_runs_a_shell() {
 /// A selection dragged past the terminal's top or bottom scrolls and
 /// selects on while the pointer rests there.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn a_terminal_selection_scrolls_past_its_edges() {
     let mut ui = Harness::with_terminal("terminal-autoscroll");
     ui.input_method(|input, cx| input.commit_text("seq 200", cx));
@@ -3305,6 +3912,7 @@ fn a_terminal_selection_scrolls_past_its_edges() {
 /// else, with the keyboard elsewhere, the one under the pointer, and on
 /// nothing with neither, as when the pointer has left the window.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn terminal_tabs_split_and_name_their_programs() {
     const SPLIT_DOWN: &str = key("ctrl-shift-e", "cmd-shift-d");
     const CLOSE: &str = key("ctrl-shift-w", "cmd-w");
@@ -3429,6 +4037,7 @@ fn terminal_tabs_split_and_name_their_programs() {
 /// and the keyboard goes on to the pane left; the last pane's takes the
 /// tab with it.
 #[test]
+#[cfg_attr(windows, ignore = "scripts the POSIX sh test shell's output")]
 fn a_shell_that_exits_closes_its_pane() {
     let mut ui = Harness::with_terminal("terminal-exit");
     ui.act(|window, cx| window.press(key("ctrl-shift-o", "cmd-d"), cx));
@@ -3666,6 +4275,50 @@ fn a_subagents_session_opens_nested_under_its_parent() {
     ui.wait_for_session("the subagent's session as saved", subagent_saved);
     ui.shot("reopened");
     restart_and_open_the_ended_run(ui, &parent);
+}
+
+/// The daemon's job list says what a session's background list can't: the
+/// Background surface nests a workflow's agent runs under it, a failed one
+/// with the daemon's reason. The list above the composer stays one row per
+/// piece of work.
+#[test]
+fn a_workflows_agent_runs_nest_under_it_with_why_one_failed() {
+    let mut ui = Harness::start("workflow-runs", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_session("s1 attached", |session| {
+        session.title() == Some("first") && !session.is_replaying()
+    });
+    ui.fake().start_workflow(&SessionId::from("s1"));
+    ui.wait_until("the workflow", |window, _, _| {
+        is_visible(window, "background-0")
+    });
+    // The next listing of the jobs, on the app's clock.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-background");
+    ui.wait_until("the workflow's agent runs", |window, _, _| {
+        is_visible(window, "panel-background-0-run-0")
+            && is_visible(window, "panel-background-0-run-1")
+    });
+    assert_eq!(
+        ui.label("panel-background-0-run-1-error").as_deref(),
+        Some(WORKFLOW_ERROR),
+        "the failed run says why, in the daemon's words"
+    );
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "panel-background-0-run-0-error"),
+            "the queued run hasn't failed"
+        );
+        assert!(
+            !is_visible(window, "background-0-run-0"),
+            "the list above the composer doesn't nest runs"
+        );
+    });
+    ui.shot("nested");
 }
 
 /// Whether `session` is the subagent's of
@@ -4173,9 +4826,9 @@ fn attached_files_go_with_the_message() {
         );
     };
     assert_eq!(text.text(), Some("# Notes\n\nShip it.\n"));
-    assert_eq!(text.path(), Some(notes.as_path()));
+    assert_eq!(text.path(), Some(notes));
     assert_eq!(linked.text(), None, "a binary file goes by path");
-    assert_eq!(linked.path(), Some(report.as_path()));
+    assert_eq!(linked.path(), Some(report));
     ui.act(|window, _| {
         for n in 0..3 {
             let id = format!("user-0-attachment-{n}");
@@ -4343,7 +4996,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
 fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let dir = std::env::temp_dir().join(format!("rho-ui-projects-{}", std::process::id()));
     let (main, tree) = crate::repo::fake_worktree(&dir);
-    let main = main.canonicalize().expect("the checkout exists");
+    let main = rho_ui_core::platform::canonicalize(&main).expect("the checkout exists");
     let main_row: &'static str = format!("project-local:{}", main.display()).leak();
     let daemon = FakeDaemon::start(Script::default());
     let mut ui = Harness::open(
@@ -4438,7 +5091,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
 #[test]
 fn a_typed_git_url_clones_into_the_clone_folder() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let dir = dir.path().canonicalize().expect("it resolves");
+    let dir = rho_ui_core::platform::canonicalize(dir.path()).expect("it resolves");
     for args in [
         &["init", "-q", "-b", "main", "thing"][..],
         &["-C", "thing", "commit", "-q", "--allow-empty", "-m", "x"],
@@ -4589,7 +5242,9 @@ fn a_new_session_can_work_in_a_new_worktree() {
             let cwd = view.live().cwd;
             let plan = setting(view.session(), "mode").as_deref() == Some("plan");
             cwd.parent() == Some(Path::new("/rho/worktrees"))
-                && cwd.to_string_lossy().contains("/project-")
+                && cwd
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("project-"))
                 && plan
         })
     });
@@ -4831,8 +5486,9 @@ fn machines_list_side_by_side() {
     let draft_at = |path| draft_at(there.clone(), path);
     ui.click("new-session");
     ui.wait_until("the draft's session on the workstation", draft_at("/w/a"));
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     assert!(
-        remote.new_session_var("HOME").is_some(),
+        remote.new_session_var(home).is_some(),
         "the workstation opened it"
     );
 
@@ -5028,6 +5684,86 @@ fn a_machine_added_in_settings_lists_its_sessions() {
         .update(|cx| assert_eq!(cx.global::<Settings>().machines, []));
 }
 
+/// Settings → Source control shows the gh this machine runs, with the
+/// account it is signed in to. A new Program is saved and checked at once,
+/// and a token GitHub refused shows as signed out, with no sign-in to copy
+/// when the token comes from a variable.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn source_control_shows_this_machines_gh() {
+    let bin = tempfile::tempdir().unwrap();
+    let fake_gh = |name: &str, account: &str| {
+        let path = bin.path().join(name);
+        let script = format!(
+            "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
+             auth) echo '{{\"hosts\":{{\"github.com\":[{account}]}}}}' ;;\nesac\n"
+        );
+        write_program(&path, &script);
+        path.display().to_string()
+    };
+    let signed_in = fake_gh(
+        "gh",
+        r#"{"state":"success","active":true,"host":"github.com","login":"octocat","tokenSource":"keyring","scopes":"repo, workflow","gitProtocol":"ssh"}"#,
+    );
+    let refused = fake_gh(
+        "gh-refused",
+        r#"{"state":"error","error":"non-200 OK status code: 401 Unauthorized","active":true,"host":"github.com","login":"","tokenSource":"GH_TOKEN","gitProtocol":"https"}"#,
+    );
+    let mut settings = Settings::default();
+    settings.local_cli.set(ForgeCli::Gh, signed_in);
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "source-control",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: Shelves::owning(["s1"]),
+            settings,
+            ..Machines::default()
+        },
+    );
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Source control");
+    let account = "source-control-gh-account-0";
+    ui.wait_until("gh's account", |window, _, _| {
+        window
+            .try_find(account)
+            .is_some_and(|element| element.label() == Some("@octocat"))
+    });
+    assert_eq!(
+        ui.label("source-control-gh-status").as_deref(),
+        Some("gh 2.99.0")
+    );
+    ui.shot("signed-in");
+
+    ui.click("setting-gh-program");
+    ui.act(|window, cx| {
+        window.press("secondary-a", cx);
+        window.input(&refused, cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the refused token", |window, _, _| {
+        window
+            .try_find(account)
+            .is_some_and(|element| element.label() == Some("Not signed in"))
+    });
+    ui.act(|window, _| {
+        assert!(
+            window.try_find("source-control-gh-sign-in-0").is_none(),
+            "signing in again can't replace a token from GH_TOKEN, so nothing offers it"
+        );
+    });
+    ui.cx.update(|cx| {
+        assert_eq!(
+            cx.global::<Settings>()
+                .cli_path(&MachineId::local(), ForgeCli::Gh),
+            refused,
+            "the new Program is saved"
+        );
+    });
+    ui.shot("refused");
+}
+
 /// rho's own settings show as a page drawn from its daemon's schema. A
 /// switch flipped there changes the daemon's `config.toml`, and a hand
 /// edit of the file shows up on the open page.
@@ -5063,4 +5799,85 @@ fn rho_settings_write_and_follow_the_daemon() {
     fake.edit_agent_setting("general.auto_compact", SettingValue::Bool(true));
     ui.wait_until("the hand edit on the page", switch_is(true));
     ui.shot("edited");
+}
+
+/// A new session whose model has no credentials opens anyway, signed
+/// out, and offers its sign-in above the composer: a key the provider
+/// refuses says why and saves nothing; one it couldn't check signs the
+/// daemon in, but the card stays to say so until dismissed.
+#[test]
+fn a_signed_out_session_signs_in_from_its_card() {
+    let mut ui = Harness::start(
+        "sign-in-card",
+        Script {
+            signed_out: true,
+            ..Script::default()
+        },
+    );
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the sign-in card", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "sign-in-card")
+    });
+
+    ui.click("sign-in-key");
+    ui.act(|window, cx| {
+        window.input(REFUSED_KEY, cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "sign-in-note")
+    });
+    assert!(!ui.fake().signed_in(KEY_AUTH));
+    ui.shot("refused");
+
+    ui.click("sign-in-key");
+    ui.act(|window, cx| window.input(UNCHECKED_KEY, cx));
+    ui.click("sign-in-save");
+    ui.wait_for_daemon("the key saved", |fake| fake.signed_in(KEY_AUTH));
+    ui.wait_until("the card saying it went unchecked", |window, _, _| {
+        is_visible(window, "sign-in-dismiss") && is_visible(window, "sign-in-note")
+    });
+    ui.shot("unchecked");
+
+    ui.click("sign-in-dismiss");
+    ui.wait_until("the card gone", |window, _, _| {
+        is_visible(window, "draft-view") && !is_visible(window, "sign-in-card")
+    });
+}
+
+/// Settings → Providers signs in with an account's login, showing the
+/// login's page until the provider approves it, and signs out of a
+/// profile, which then takes a key again.
+#[test]
+fn providers_sign_in_with_a_login_and_out() {
+    let mut ui = Harness::start("providers", Script::default());
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Providers");
+    let login = "providers-fake-login-login";
+    ui.wait_until("the login's Sign in", |window, _, _| {
+        is_visible(window, login)
+    });
+    ui.shot("listed");
+
+    ui.click(login);
+    ui.wait_until("the login's page", |window, _, _| {
+        is_visible(window, "providers-fake-login-prompt")
+    });
+    ui.shot("login");
+    ui.fake().approve_login();
+    ui.wait_until("signed in", |window, _, _| {
+        is_visible(window, "providers-fake-login-logout")
+            && !is_visible(window, "providers-fake-login-prompt")
+    });
+    assert!(ui.fake().signed_in(LOGIN_AUTH));
+
+    ui.click("providers-fake-api-key-logout");
+    ui.wait_until("the key's box back", |window, _, _| {
+        is_visible(window, "providers-fake-api-key-save")
+    });
+    assert!(!ui.fake().signed_in(KEY_AUTH));
+    ui.shot("signed-out");
 }

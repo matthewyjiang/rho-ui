@@ -14,21 +14,25 @@ use rho_protocol::{
         SessionObserveParams, SessionRenameParams, SessionRenameResponse, SessionSummary,
         SessionUnsteerParams, SessionUnsteerResponse, SteerId,
     },
-    ApprovalAsk, ApprovalSource, Ask, BackgroundStatus, BuildId, ClientInfo, ConfigGetParams,
-    ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock,
-    CredentialStoreKind, CredentialStoreStatus, DaemonStatus, DetachReason, ErrorCode, InputAnswer,
-    InputAsker, InputRequest, InputRequestId, InputTimeout, Operation, PermissionMode,
-    PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
-    SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
-    SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
-    SessionCancelResponse, SessionChange, SessionEvent, SessionHoldParams, SessionHoldResponse,
-    SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
-    SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
-    SessionSurfaceActionResponse, SessionWorktree, SettingsService, StoreSelectedBy, Subscription,
-    ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
+    ApprovalAsk, ApprovalSource, Ask, AuthChooseStoreParams, AuthChooseStoreResponse,
+    AuthKeyParams, AuthKeyResponse, AuthListParams, AuthListResponse, AuthLoginCancelParams,
+    AuthLoginCancelResponse, AuthLoginParams, AuthLoginResponse, AuthLogoutParams,
+    AuthLogoutResponse, BackgroundStatus, BuildId, ClientInfo, ConfigGetParams, ConfigSchema,
+    ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus, DetachReason,
+    ErrorCode, InputAnswer, InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream,
+    Operation, PermissionMode, PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost,
+    RpcError, Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
+    SessionAttachResponse, SessionBackgroundStopParams, SessionBackgroundStopResponse,
+    SessionCancelParams, SessionCancelResponse, SessionChange, SessionEvent, SessionHoldParams,
+    SessionHoldResponse, SessionNewParams, SessionNewResponse, SessionPromptParams,
+    SessionPromptResponse, SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
+    SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription, ToolKind,
+    ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
-use super::{shell_card, shell_output, surface, FakeSession, SentAction, State, Turn, TOOL_IMAGE};
+use super::{
+    shell_card, shell_output, surface, FakeSession, SentAction, State, Turn, KEY_AUTH, TOOL_IMAGE,
+};
 
 #[derive(Debug)]
 pub(super) struct Fake {
@@ -310,6 +314,7 @@ impl Service for Fake {
     }
 
     async fn status(&self) -> DaemonStatus {
+        let state = self.lock();
         DaemonStatus {
             pid: std::process::id(),
             version: "9.9.9".to_owned(),
@@ -319,12 +324,8 @@ impl Service for Fake {
             jobs: 0,
             in_progress: 0,
             socket: PathBuf::new(),
-            credential_store: CredentialStoreStatus {
-                store: CredentialStoreKind::File,
-                selected_by: StoreSelectedBy::Config,
-                unreachable: None,
-            },
-            upgrade: self.lock().upgrade.clone(),
+            credential_store: state.auth.store(),
+            upgrade: state.upgrade.clone(),
         }
     }
 
@@ -343,6 +344,12 @@ impl Service for Fake {
 
     async fn new_session(&self, params: SessionNewParams) -> Result<SessionNewResponse, RpcError> {
         let mut state = self.lock();
+        if params.setup.sign_in == SignIn::Required && !state.auth.is_signed_in(KEY_AUTH) {
+            return Err(RpcError::new(
+                ErrorCode::SignInRequired,
+                format!("sign in to {KEY_AUTH} first"),
+            ));
+        }
         state.new_sessions += 1;
         state.new_session_environment = Some(params.environment.clone());
         let id = format!("new-{}", state.new_sessions);
@@ -819,6 +826,43 @@ impl Service for Fake {
         Ok(SessionDeleteResponse {})
     }
 
+    async fn list_auths(&self, _: AuthListParams) -> Result<AuthListResponse, RpcError> {
+        Ok(AuthListResponse {
+            auths: self.lock().auth.list(),
+        })
+    }
+
+    async fn save_auth_key(&self, params: AuthKeyParams) -> Result<AuthKeyResponse, RpcError> {
+        self.lock().auth.save_key(&params)
+    }
+
+    async fn logout_auth(&self, params: AuthLogoutParams) -> Result<AuthLogoutResponse, RpcError> {
+        Ok(self.lock().auth.logout(&params))
+    }
+
+    async fn login(
+        &self,
+        params: AuthLoginParams,
+    ) -> Result<(AuthLoginResponse, LoginStream), RpcError> {
+        self.lock().auth.login(&params)
+    }
+
+    async fn cancel_login(
+        &self,
+        params: AuthLoginCancelParams,
+    ) -> Result<AuthLoginCancelResponse, RpcError> {
+        self.lock().auth.cancel_login(&params)
+    }
+
+    async fn choose_store(
+        &self,
+        params: AuthChooseStoreParams,
+    ) -> Result<AuthChooseStoreResponse, RpcError> {
+        Ok(AuthChooseStoreResponse {
+            credential_store: self.lock().auth.choose_store(params.store),
+        })
+    }
+
     async fn list_jobs(&self) -> JobListResponse {
         let state = self.lock();
         let jobs = state.sessions.iter().map(|(id, session)| JobSummary {
@@ -856,7 +900,7 @@ impl Service for Fake {
             }),
         });
         JobListResponse {
-            jobs: jobs.collect(),
+            jobs: jobs.chain(state.extra_jobs.iter().cloned()).collect(),
         }
     }
 }

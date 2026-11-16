@@ -20,7 +20,7 @@ use rho_ui_core::{platform, Daemon, SshLink};
 use crate::{
     folders::Reader,
     machines::{MachineId, Place},
-    repo::{self, Repo},
+    repo::{self, Head, Repo},
 };
 
 /// How often branches are re-read. A branch switch shows within this long.
@@ -50,7 +50,7 @@ impl Workspace {
             name: repo.name.clone().into(),
             short_name: repo.short_name().to_owned().into(),
             initials: repo.initials().into(),
-            branch: repo.branch.clone().map(SharedString::from),
+            branch: repo.head.as_ref().map(|head| head.name().to_owned().into()),
             repo,
             last_used: 0,
         }
@@ -71,6 +71,11 @@ impl Workspace {
     /// Its repository's origin remote URL, which clones it elsewhere.
     pub(crate) fn origin(&self) -> Option<&str> {
         self.repo.origin.as_deref()
+    }
+
+    /// What is checked out, outside a git repository `None`.
+    pub(crate) fn head(&self) -> Option<&Head> {
+        self.repo.head.as_ref()
     }
 
     /// The folder of the project it belongs to, on its machine; see
@@ -99,7 +104,7 @@ impl Workspace {
         self.name = repo.name.clone().into();
         self.short_name = repo.short_name().to_owned().into();
         self.initials = repo.initials().into();
-        self.branch = repo.branch.clone().map(SharedString::from);
+        self.branch = repo.head.as_ref().map(|head| head.name().to_owned().into());
         self.repo = repo;
     }
 }
@@ -164,7 +169,7 @@ pub(crate) struct Workspaces {
     /// Workspaces [`Self::index`] added this effect cycle, read together
     /// at its end: a session list of a remote machine names many at once,
     /// and reading each alone would open an ssh session per workspace,
-    /// past the 10 that sshd's default `MaxSessions` allows on a master.
+    /// past the 10 that sshd's default `MaxSessions` allows on a connection.
     unread: Vec<usize>,
     _reread: Task<()>,
 }

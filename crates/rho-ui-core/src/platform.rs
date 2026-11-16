@@ -1,7 +1,9 @@
 //! What differs between the operating systems rho-ui runs on, in one
-//! place: where the user's home and rho-ui's own folders are, which shell
-//! a terminal runs, how a path becomes the bytes a database row or a
-//! remote shell takes, and how to reach a daemon's local endpoint.
+//! place: where the user's home, rho-ui's own folders and rho's install
+//! folder are, how a setting's `~` reads, which shell a terminal runs, how
+//! to run a program in the background, how a path becomes the bytes a
+//! database row or a remote shell takes, and how to reach a daemon's local
+//! endpoint.
 //!
 //! The rest of rho-ui, this crate and the app, asks here instead of
 //! reading variables or naming an OS itself. Each function says what it
@@ -10,7 +12,8 @@
 use std::{
     ffi::{OsStr, OsString},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
 /// The user's home directory: `$HOME`, else on Windows `%USERPROFILE%`,
@@ -50,6 +53,19 @@ fn rho_home_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| home_dir_from(var).map(|home| home.join(".rho")))
+}
+
+/// `path`, a setting, with a leading `~` as `home`, as `sh` reads one: `~`
+/// alone is `home`, and `~/x` is `x` in it, as is `~\x` on Windows, where
+/// `\` divides a path too. Anything else, `~user` among it, is kept as it
+/// is.
+#[must_use]
+pub fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Which of rho-ui's own folders [`app_dir`] names.
@@ -93,6 +109,86 @@ fn app_dir_from(which: AppDir, var: impl Fn(&str) -> Option<OsString>) -> Option
         .filter(|dir| dir.is_absolute())
         .or_else(|| home_dir_from(&var).map(|home| home.join(fallback)))?;
     Some(base.join("rho-ui"))
+}
+
+/// The `file://` URI of `path`, an absolute path on this machine:
+/// `file:///home/me/a.md` on Unix, and on Windows `file:///C:/Users/me/a.md`,
+/// with `/` for `\\`, as a URI names a Windows path. Its name is what follows
+/// the last `/`.
+#[must_use]
+pub fn file_uri(path: &Path) -> String {
+    if cfg!(windows) {
+        format!("file:///{}", path.display().to_string().replace('\\', "/"))
+    } else {
+        format!("file://{}", path.display())
+    }
+}
+
+/// The path of a `file://` URI that [`file_uri`] made, or `None` if `uri`
+/// isn't one. On Windows, with `\\` again for `/`.
+#[must_use]
+pub fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let path = uri.strip_prefix("file:///")?;
+        Some(PathBuf::from(path.replace('/', "\\")))
+    } else {
+        uri.strip_prefix("file://").map(PathBuf::from)
+    }
+}
+
+/// The folder rho's installer puts `rho` in when not told where. On Unix,
+/// `~/.local/bin`, as its `install.sh` does. On Windows,
+/// `%LOCALAPPDATA%\Programs\rho\bin`, as its `install.ps1` does; that adds
+/// the folder to the user's `PATH`, but not to that of programs already
+/// running. `None` when the variable that places it is unset.
+#[must_use]
+pub fn rho_install_dir() -> Option<PathBuf> {
+    rho_install_dir_from(|name| std::env::var_os(name))
+}
+
+fn rho_install_dir_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let local = var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())?;
+        return Some(local.join("Programs").join("rho").join("bin"));
+    }
+    home_dir_from(var).map(|home| home.join(".local").join("bin"))
+}
+
+/// A command for `program` that runs in the background of the app, as
+/// `git` and `rho` do for it: its stdin is empty, and on Windows it opens no
+/// console window, which would otherwise flash up for each one a GUI app
+/// starts.
+#[must_use]
+pub fn background_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// The process creation flag that starts a console program without a
+/// console window (`CREATE_NO_WINDOW` in the Win32 API).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `path` resolved, as [`std::fs::canonicalize`] does. On Windows, without
+/// the `\\?\` prefix that gives it, where the path reads the same without:
+/// git, the shells and the user all take `C:\code`, and few take
+/// `\\?\C:\code`. A rho home is the exception: rho names its daemon after
+/// the home's path as [`std::fs::canonicalize`] gives it. `clippy.toml`
+/// disallows std's, so each call to it says why.
+///
+/// # Errors
+///
+/// As [`std::fs::canonicalize`]: if `path` isn't there, or can't be read.
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    dunce::canonicalize(path)
 }
 
 /// The shell a terminal on this machine runs. On Unix, `$SHELL`, else
@@ -155,70 +251,6 @@ mod imp {
     }
 }
 
-/// Bytes `bind(2)` takes in a Unix socket path, as rho-protocol counts
-/// them: `sockaddr_un.sun_path` less its NUL.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) const MAX_SOCKET_PATH_BYTES: usize = 107;
-/// Bytes `bind(2)` takes in a Unix socket path, as rho-protocol counts
-/// them: `sockaddr_un.sun_path` less its NUL.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub(crate) const MAX_SOCKET_PATH_BYTES: usize = 103;
-
-/// A folder only this user can open, for sockets of rho-ui's named `leaf`,
-/// made if missing: `$XDG_RUNTIME_DIR/rho-ui/<leaf>`, else `rho-ui-<leaf>`
-/// in the temporary directory, named after the user too where users share
-/// it. macOS gives each user a temporary directory of their own (`$TMPDIR`,
-/// under `/var/folders`), and has no room for a name: with a 49-byte
-/// `$TMPDIR`, an ssh control socket there takes 93 of the
-/// [`MAX_SOCKET_PATH_BYTES`], and with a 12-letter user name in the
-/// folder's name it took 106.
-///
-/// # Errors
-///
-/// Fails if the folder can't be made, or other users can open it.
-#[cfg(unix)]
-pub(crate) fn private_socket_dir(leaf: &str) -> io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        Some(run) if run.is_absolute() => run.join("rho-ui").join(leaf),
-        _ if cfg!(target_os = "macos") => std::env::temp_dir().join(format!("rho-ui-{leaf}")),
-        _ => {
-            let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-            std::env::temp_dir().join(format!("rho-ui-{leaf}-{user}"))
-        }
-    };
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    let mode = std::fs::metadata(&dir)?.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(io::Error::other(format!(
-            "{} is open to other users (mode {:o})",
-            dir.display(),
-            mode & 0o777
-        )));
-    }
-    Ok(dir)
-}
-
-/// Windows has no folder for ssh's control sockets: Win32-OpenSSH can't
-/// share a connection (`ControlMaster`), which reaching a remote machine
-/// is built on.
-///
-/// # Errors
-///
-/// Always.
-#[cfg(windows)]
-pub(crate) fn private_socket_dir(_leaf: &str) -> io::Result<PathBuf> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "OpenSSH on Windows can't share a connection (ControlMaster), which rho-ui reaches \
-         remote machines through",
-    ))
-}
-
 /// The daemon's local endpoint: a Unix socket, or on Windows a named pipe.
 #[cfg(unix)]
 pub(crate) mod endpoint {
@@ -276,7 +308,7 @@ pub(crate) mod endpoint {
         process::Command,
     };
 
-    use rho_protocol::{Client, ClientHello, HelloResponse, Notifications};
+    use rho_protocol::{Client, ClientHello, CloseOnShutdown, HelloResponse, Notifications};
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
     use crate::DaemonError;
@@ -303,7 +335,10 @@ pub(crate) mod endpoint {
         )))
     }
 
-    /// Connects to the named pipe at `path`. Runs on the I/O runtime.
+    /// Connects to the named pipe at `path`. Runs on the I/O runtime. A
+    /// pipe can't close one direction alone, so the client's shutdown
+    /// closes it whole, as rho's own client does; else a dropped client
+    /// and the daemon would each wait for the other.
     ///
     /// # Errors
     ///
@@ -312,8 +347,8 @@ pub(crate) mod endpoint {
         clippy::unused_async,
         reason = "the same signature as on Unix, where connecting awaits"
     )]
-    pub(crate) async fn connect(path: &Path) -> io::Result<NamedPipeClient> {
-        ClientOptions::new().open(path)
+    pub(crate) async fn connect(path: &Path) -> io::Result<CloseOnShutdown<NamedPipeClient>> {
+        ClientOptions::new().open(path).map(CloseOnShutdown::new)
     }
 }
 
@@ -341,6 +376,22 @@ mod tests {
         assert_eq!(rho_home_from(env(&[("HOME", "")])), None);
     }
 
+    /// A leading `~` is the home directory, alone or as a path's first
+    /// part; `~user` and a `~` further in are kept.
+    #[test]
+    fn a_leading_tilde_is_home() {
+        let home = Path::new("/home/me");
+        let expand = |path: &str| expand_tilde(Path::new(path), home);
+        assert_eq!(expand("~"), home);
+        assert_eq!(expand("~/"), home);
+        assert_eq!(expand("~/code"), home.join("code"));
+        assert_eq!(expand("~me/code"), Path::new("~me/code"));
+        assert_eq!(expand("code/~"), Path::new("code/~"));
+        assert_eq!(expand("/srv/code"), Path::new("/srv/code"));
+        #[cfg(windows)]
+        assert_eq!(expand(r"~\code"), home.join("code"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_app_dirs_follow_xdg_and_take_no_relative_base() {
@@ -359,7 +410,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_finds_home_and_app_data() {
+    fn windows_finds_home_app_data_and_the_rho_install_dir() {
         let profile = [
             ("USERPROFILE", r"C:\Users\me"),
             ("APPDATA", r"C:\Users\me\AppData\Roaming"),
@@ -371,6 +422,11 @@ mod tests {
         assert_eq!(
             app_dir_from(AppDir::State, env(&profile)),
             Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\rho-ui\state"))
+        );
+        let local = [("LOCALAPPDATA", r"C:\Users\me\AppData\Local")];
+        assert_eq!(
+            rho_install_dir_from(env(&local)),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Local\Programs\rho\bin"))
         );
     }
 

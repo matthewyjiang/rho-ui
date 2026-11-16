@@ -188,21 +188,24 @@ fn busy_buttons(busy: Busy, cx: &Context<'_, SidebarView>) -> Vec<Button> {
             busy.waiting,
             Lucide::CircleAlert,
             theme.warning,
-            "waiting",
+            ["needs you", "need you"],
         ),
         (
             "rail-working",
             busy.working,
             Lucide::CircleDashed,
             theme.blue,
-            "working",
+            ["working", "working"],
         ),
     ]
     .into_iter()
     .filter(|&(_, count, ..)| count > 0)
-    .map(|(id, count, icon, color, doing)| {
-        let sessions = if count == 1 { "session" } else { "sessions" };
-        let label = format!("{count} {sessions} {doing}");
+    .map(|(id, count, icon, color, [one, many])| {
+        let label = if count == 1 {
+            format!("1 session {one}")
+        } else {
+            format!("{count} sessions {many}")
+        };
         Button::new(id)
             .ghost()
             .small()

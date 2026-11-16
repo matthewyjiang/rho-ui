@@ -1,0 +1,2 @@
+# Check out LF everywhere, so Windows runs the same fixtures and scripts.
+* text=auto eol=lf

@@ -1,9 +1,12 @@
 //! What a path typed in the project search names on one machine: the
 //! project of the folder typed, if it is there, and the folders the path
-//! can go on to, so the search browses folders on any machine. This
-//! machine's are read from its files; a remote machine's with
-//! [`REMOTE_SCRIPT`], over the ssh connection to its daemon. Also how
-//! rho-ui runs scripts and reads files on any machine ([`Reader`]).
+//! can go on to, so the search browses folders on any machine. A path
+//! follows its machine's rules ([`PathStyle`]): this machine's, Windows'
+//! on Windows, and a remote machine's POSIX ones whatever this machine
+//! is. This machine's folders are read from its files; a remote machine's
+//! with [`REMOTE_SCRIPT`], over the ssh connection to its daemon. Also
+//! [`Reader`], which every feature that reads a machine goes through, and
+//! the file read that the Files surface and pictures share.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -14,16 +17,109 @@ use std::{
 use gpui_kit::BackgroundExecutor;
 use rho_ui_core::{platform, DaemonError, SshLink};
 
-use crate::repo;
+use crate::{machines::MachineId, repo};
 
 /// How long a remote lookup waits for the next key before it runs. Kit
 /// drops a search's task when the next one starts, so a burst of keys runs
-/// one ssh script, not one a key: each takes two ssh sessions on the
-/// shared master, past sshd's default `MaxSessions` of 10 if a dozen ran
-/// at once. 150 ms is longer than the gap between keys at 80 words a
+/// one ssh script, not one a key: each takes an ssh session on the
+/// shared connection, past sshd's default `MaxSessions` of 10 if a dozen
+/// ran at once. 150 ms is longer than the gap between keys at 80 words a
 /// minute (about 400 keys a minute, 150 ms apart) and short enough to read
 /// as instant.
 const REMOTE_PAUSE: Duration = Duration::from_millis(150);
+
+/// The rules a machine's paths follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathStyle {
+    /// This machine's, as `std::path` has them: on Windows, `\` or `/`
+    /// between names, and absolute from a drive's root.
+    Native,
+    /// A remote machine's, which is Unix, whatever this machine is: `/`
+    /// between names, and absolute from `/`.
+    Posix,
+}
+
+impl PathStyle {
+    /// The rules `machine`'s paths follow.
+    pub(crate) fn of(machine: &MachineId) -> Self {
+        if machine.is_local() {
+            Self::Native
+        } else {
+            Self::Posix
+        }
+    }
+
+    fn is_separator(self, c: char) -> bool {
+        match self {
+            Self::Native => std::path::is_separator(c),
+            Self::Posix => c == '/',
+        }
+    }
+
+    fn is_absolute(self, text: &str) -> bool {
+        match self {
+            Self::Native => Path::new(text).is_absolute(),
+            Self::Posix => text.starts_with('/'),
+        }
+    }
+
+    /// `name`, which may hold separators, in `folder`.
+    fn join(self, folder: &Path, name: &OsStr) -> PathBuf {
+        match self {
+            Self::Native => folder.join(name),
+            Self::Posix => {
+                let mut bytes = platform::path_to_bytes(folder.as_os_str());
+                if !bytes.ends_with(b"/") {
+                    bytes.push(b'/');
+                }
+                bytes.extend(platform::path_to_bytes(name));
+                platform::path_from_bytes(&bytes)
+            }
+        }
+    }
+
+    /// `path` without `.` names, or separators repeated or at its end; on
+    /// Windows, this machine's with `\` between names.
+    fn tidy(self, path: &Path) -> PathBuf {
+        match self {
+            Self::Native => path.components().collect(),
+            Self::Posix => {
+                let bytes = platform::path_to_bytes(path.as_os_str());
+                let names: Vec<&[u8]> = bytes
+                    .split(|&byte| byte == b'/')
+                    .filter(|name| !matches!(*name, b"" | b"."))
+                    .collect();
+                let mut tidy = if bytes.starts_with(b"/") {
+                    vec![b'/']
+                } else {
+                    Vec::new()
+                };
+                tidy.extend(names.join(&b'/'));
+                platform::path_from_bytes(&tidy)
+            }
+        }
+    }
+
+    /// The folder `path` is in, and its last name; `None` at a root, or
+    /// after a last `..`, which names a folder but not by its name (as
+    /// `std::path`'s `file_name` has it), so the path is browsed itself.
+    fn split(self, path: &Path) -> Option<(PathBuf, OsString)> {
+        match self {
+            Self::Native => Some((path.parent()?.to_path_buf(), path.file_name()?.to_owned())),
+            Self::Posix => {
+                let bytes = platform::path_to_bytes(path.as_os_str());
+                let at = bytes.iter().rposition(|&byte| byte == b'/')?;
+                let (folder, name) = bytes.split_at(at);
+                let name = name.get(1..).filter(|name| !matches!(*name, b"" | b".."))?;
+                let folder: &[u8] = if folder.is_empty() { b"/" } else { folder };
+                Some((
+                    platform::path_from_bytes(folder),
+                    platform::path_from_bytes(name).into_os_string(),
+                ))
+            }
+        }
+    }
+}
 
 /// A typed path, split where the user is typing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,51 +127,59 @@ pub(crate) struct Typed {
     /// The folder the path names.
     pub(crate) path: PathBuf,
     /// The folder whose subfolders it can go on to: the path itself after
-    /// a trailing `/`, else its parent.
+    /// a trailing separator, else its parent.
     pub(crate) browse: PathBuf,
-    /// What follows the last `/`, which those subfolders' names start with.
+    /// What follows the last separator, which those subfolders' names
+    /// start with.
     pub(crate) prefix: String,
+    /// The rules of the machine it is on.
+    style: PathStyle,
 }
 
 impl Typed {
-    /// The path `text` names, if it is one: absolute, `~`, or under `~/`,
-    /// with `home` as the machine's home directory. Whether it exists is
-    /// for [`look`] to find out.
-    pub(crate) fn parse(text: &str, home: Option<&Path>) -> Option<Self> {
+    /// The path `text` names on a machine whose paths follow `style`, if
+    /// it is one: absolute, `~`, or under `~` and a separator (`~/`, and
+    /// on Windows here `~\` too), with `home` as the machine's home
+    /// directory. Whether it exists is for [`look`] to find out.
+    pub(crate) fn parse(text: &str, home: Option<&Path>, style: PathStyle) -> Option<Self> {
+        let under_home = text
+            .strip_prefix('~')
+            .and_then(|rest| rest.strip_prefix(|c: char| style.is_separator(c)));
         let path = if text == "~" {
             home?.to_path_buf()
-        } else if let Some(rest) = text.strip_prefix("~/") {
-            home?.join(rest)
+        } else if let Some(rest) = under_home {
+            style.join(home?, OsStr::new(rest))
+        } else if style.is_absolute(text) {
+            PathBuf::from(text)
         } else {
-            Some(Path::new(text))
-                .filter(|path| path.is_absolute())?
-                .to_path_buf()
+            return None;
         };
-        let at_folder = text.ends_with('/') || text == "~" || path.parent().is_none();
-        if at_folder {
-            return Some(Self {
+        let path = style.tidy(&path);
+        let at_folder = text == "~" || text.ends_with(|c: char| style.is_separator(c));
+        let split = if at_folder { None } else { style.split(&path) };
+        match split {
+            Some((browse, name)) => Some(Self {
+                path,
+                browse,
+                prefix: name.to_string_lossy().into_owned(),
+                style,
+            }),
+            None => Some(Self {
                 browse: path.clone(),
                 path,
                 prefix: String::new(),
-            });
+                style,
+            }),
         }
-        let browse = path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
-        let prefix = path
-            .file_name()
-            .map_or_default(|name| name.to_string_lossy().into_owned());
-        Some(Self {
-            path,
-            browse,
-            prefix,
-        })
     }
 
     /// Whether the path can go on to `folder`: it is in the browse folder,
     /// and its name starts with the prefix, ignoring case. A hidden folder
     /// only when the prefix starts with `.`.
     pub(crate) fn leads_to(&self, folder: &Path) -> bool {
-        folder.parent() == Some(&self.browse)
-            && folder.file_name().is_some_and(|name| self.matches(name))
+        self.style
+            .split(folder)
+            .is_some_and(|(parent, name)| parent == self.browse && self.matches(&name))
     }
 
     fn matches(&self, name: &OsStr) -> bool {
@@ -123,7 +227,12 @@ pub(crate) struct Lookup {
     pub(crate) next: Vec<PathBuf>,
 }
 
-/// How rho-ui reads a machine's files and runs scripts there.
+/// Where rho-ui reads a machine's files and runs `git`. A feature that
+/// reads a machine has two ways to, which [`Self::query`] picks between:
+/// here, with the files themselves and `git` run as a program (see
+/// [`crate::local`]); on a remote machine, which is Unix, with a POSIX `sh`
+/// script over its ssh link, whose output it parses. Both give the feature
+/// the same value.
 pub(crate) enum Reader {
     /// From this machine's files.
     Here,
@@ -133,50 +242,48 @@ pub(crate) enum Reader {
     Unread,
 }
 
-impl Reader {
-    /// Runs the POSIX `sh` script `script` on the machine, with `args` as
-    /// its positional parameters, and returns what it wrote to stdout:
-    /// here with `sh` on `executor`, there over ssh within
-    /// [`SshLink::run_script`]'s deadline.
-    ///
-    /// # Errors
-    ///
-    /// Says why, in the script's or ssh's words, if the machine isn't
-    /// connected or the script failed.
-    pub(crate) async fn run_script(
-        self,
-        script: &'static str,
-        args: Vec<OsString>,
-        executor: &BackgroundExecutor,
-    ) -> Result<Vec<u8>, String> {
-        match self {
-            Reader::Here => executor.spawn(async move { run_here(script, &args) }).await,
-            Reader::There(ssh) => ssh
-                .run_script(script, &args)
-                .await
-                .map_err(|error| error.to_string()),
-            Reader::Unread => Err(UNREAD.to_owned()),
-        }
-    }
+/// How long a remote machine's script in [`Reader::query`] may run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Deadline {
+    /// [`SshLink::run_script`]'s, for a script that reads.
+    Script,
+    /// None, for a script whose time the network and the work set, such as
+    /// a `git clone` (see [`SshLink::run_long_script`]).
+    Never,
+}
 
-    /// [`Self::run_script`] with no deadline, for a script whose time the
-    /// network and the work set, such as a `git clone`.
+/// Why a [`Reader::Unread`] machine can't be read.
+const UNREAD: &str = "The machine isn't connected.";
+
+impl Reader {
+    /// Finds something out on the machine: here by calling `here` on
+    /// `executor`; there by running the POSIX `sh` script `script` with
+    /// `args` as its positional parameters, within `deadline`, and reading
+    /// what it printed with `parse` on `executor`.
     ///
     /// # Errors
     ///
-    /// As [`Self::run_script`].
-    pub(crate) async fn run_long_script(
+    /// Says why, in ssh's words or those of `here` or `parse`, if the
+    /// machine isn't connected, the script fails, or either of those does.
+    pub(crate) async fn query<T: Send + 'static>(
         self,
+        executor: &BackgroundExecutor,
+        here: impl FnOnce() -> Result<T, String> + Send + 'static,
         script: &'static str,
         args: Vec<OsString>,
-        executor: &BackgroundExecutor,
-    ) -> Result<Vec<u8>, String> {
+        deadline: Deadline,
+        parse: impl FnOnce(Vec<u8>) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
         match self {
-            Reader::Here => executor.spawn(async move { run_here(script, &args) }).await,
-            Reader::There(ssh) => ssh
-                .run_long_script(script, &args)
-                .await
-                .map_err(|error| error.to_string()),
+            Reader::Here => executor.spawn(async move { here() }).await,
+            Reader::There(ssh) => {
+                let output = match deadline {
+                    Deadline::Script => ssh.run_script(script, &args).await,
+                    Deadline::Never => ssh.run_long_script(script, &args).await,
+                }
+                .map_err(|error| error.to_string())?;
+                executor.spawn(async move { parse(output) }).await
+            }
             Reader::Unread => Err(UNREAD.to_owned()),
         }
     }
@@ -185,7 +292,8 @@ impl Reader {
 /// The POSIX `sh` script that prints the file at the path given as its
 /// second argument, from the folder given as its first: [`OPENED`], then
 /// as many of its bytes as the third argument says. [`GONE`] if it isn't a
-/// file. Read with [`parse_read`].
+/// file. It fails if the folder isn't one. Read with [`parse_read`];
+/// [`read_here`] does the same here.
 pub(crate) const READ_SCRIPT: &str = r#"unset CDPATH
 cd -- "$1" || exit
 if [ -f "$2" ]; then
@@ -214,13 +322,27 @@ pub(crate) enum FileRead {
     Gone,
 }
 
+impl FileRead {
+    /// What a read that stopped after `limit + 1` bytes of a file found.
+    fn within(bytes: Vec<u8>, limit: usize) -> Self {
+        if bytes.len() > limit {
+            Self::TooLarge
+        } else {
+            Self::Bytes(bytes)
+        }
+    }
+}
+
 impl Reader {
     /// Reads the file at `path`, from `folder` when relative, if it holds
-    /// at most `limit` bytes.
+    /// at most `limit` bytes: here with [`read_here`], there with
+    /// [`READ_SCRIPT`].
     ///
     /// # Errors
     ///
-    /// As [`Self::run_script`], or if the script printed something else.
+    /// As [`Self::query`]: if the machine isn't connected, `folder` isn't
+    /// a folder, the file can't be read, or the script printed something
+    /// else.
     pub(crate) async fn read_file(
         self,
         folder: &Path,
@@ -233,9 +355,43 @@ impl Reader {
             OsString::from(path),
             (limit + 1).to_string().into(),
         ];
-        let output = self.run_script(READ_SCRIPT, args, executor).await?;
-        parse_read(output, limit)
+        let (folder, path) = (folder.to_path_buf(), path.to_owned());
+        self.query(
+            executor,
+            move || read_here(&folder, &path, limit),
+            READ_SCRIPT,
+            args,
+            Deadline::Script,
+            move |output| parse_read(output, limit),
+        )
+        .await
     }
+}
+
+/// Reads the file at `path`, from `folder` when relative, on this machine,
+/// as [`READ_SCRIPT`] does: no more than `limit + 1` of its bytes, or
+/// [`FileRead::Gone`] if it isn't a file. Blocks; call it off the UI
+/// thread.
+///
+/// # Errors
+///
+/// Says why if `folder` isn't a folder, or the file can't be read.
+pub(crate) fn read_here(folder: &Path, path: &str, limit: usize) -> Result<FileRead, String> {
+    use std::io::Read as _;
+
+    if !folder.is_dir() {
+        return Err(format!("{} isn't a folder.", folder.display()));
+    }
+    let path = folder.join(path);
+    if !path.is_file() {
+        return Ok(FileRead::Gone);
+    }
+    let couldnt = |error: std::io::Error| format!("Couldn't read {}: {error}", path.display());
+    let file = std::fs::File::open(&path).map_err(couldnt)?;
+    let mut bytes = Vec::new();
+    let most = u64::try_from(limit).map_or(u64::MAX, |limit| limit.saturating_add(1));
+    file.take(most).read_to_end(&mut bytes).map_err(couldnt)?;
+    Ok(FileRead::within(bytes, limit))
 }
 
 /// The file [`READ_SCRIPT`] printed, told to stop after `limit + 1` bytes.
@@ -246,11 +402,7 @@ impl Reader {
 pub(crate) fn parse_read(mut output: Vec<u8>, limit: usize) -> Result<FileRead, String> {
     if let Some(at) = find(&output, OPENED) {
         output.drain(..at + OPENED.len());
-        return Ok(if output.len() > limit {
-            FileRead::TooLarge
-        } else {
-            FileRead::Bytes(output)
-        });
+        return Ok(FileRead::within(output, limit));
     }
     match find(&output, GONE) {
         Some(_) => Ok(FileRead::Gone),
@@ -270,32 +422,6 @@ pub(crate) fn find(output: &[u8], marker: &[u8]) -> Option<usize> {
 pub(crate) fn after<'a>(output: &'a [u8], marker: &[u8]) -> Option<&'a [u8]> {
     let at = find(output, marker)?;
     output.get(at + marker.len()..)
-}
-
-/// Why a script can't run on a machine that isn't connected.
-const UNREAD: &str = "The machine isn't connected.";
-
-/// Runs the POSIX `sh` script `script` on this machine with `args`, and
-/// returns its stdout, or its stderr as the error if it fails. Blocks
-/// until it ends; call it off the UI thread.
-pub(crate) fn run_here(script: &str, args: &[impl AsRef<OsStr>]) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("Couldn't run sh: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(match stderr.trim() {
-            "" => format!("The script ended with {}.", output.status),
-            why => why.to_owned(),
-        })
-    }
 }
 
 /// Looks `typed` up with `reader`, doing file I/O on `executor`.
@@ -322,7 +448,7 @@ pub(crate) async fn look(
 /// Looks `typed` up on this machine. Does file I/O; call it off the UI
 /// thread.
 fn look_here(typed: &Typed) -> Lookup {
-    let found = match typed.path.canonicalize() {
+    let found = match platform::canonicalize(&typed.path) {
         Ok(dir) if dir.is_dir() => Some(Found::new(repo::inspect(&dir).root, &dir, &typed.path)),
         _ => None,
     };
@@ -420,64 +546,92 @@ fn next(typed: &Typed, names: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
     names.sort();
     names
         .into_iter()
-        .map(|(_, name)| typed.browse.join(name))
+        .map(|(_, name)| typed.style.join(&typed.browse, &name))
         .collect()
-}
-
-/// For tests: runs `git` in `dir` with `args`, as a user with a name who
-/// doesn't sign commits, and fails the test if it fails.
-#[cfg(test)]
-pub(crate) fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?}");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A typed path follows its machine's rules, a remote machine's POSIX
+    /// ones on any host, and browses its folder after a separator, else
+    /// its parent.
     #[test]
     fn a_typed_path_browses_its_folder_after_a_slash_else_its_parent() {
-        let home = Some(Path::new("/home/me"));
-        let parse = |text| Typed::parse(text, home).map(|t| (t.path, t.browse, t.prefix));
-        let typed = |path: &str, browse: &str, prefix: &str| {
-            Some((path.into(), browse.into(), prefix.to_owned()))
-        };
-        assert_eq!(parse("~/co"), typed("/home/me/co", "/home/me", "co"));
-        assert_eq!(
-            parse("~/code/"),
-            typed("/home/me/code/", "/home/me/code", "")
+        type Case = (
+            &'static str,
+            Option<(&'static str, &'static str, &'static str)>,
         );
-        assert_eq!(parse("~"), typed("/home/me", "/home/me", ""), "~ is home");
-        assert_eq!(parse("/srv/x"), typed("/srv/x", "/srv", "x"));
-        assert_eq!(parse("/"), typed("/", "/", ""));
-        assert_eq!(parse("rho-ui"), None, "a name is a search");
-        assert_eq!(Typed::parse("~/code", None), None, "no home, no ~");
+        let check = |cases: &[Case], home: &str, style| {
+            for &(text, want) in cases {
+                let got = Typed::parse(text, Some(Path::new(home)), style).map(|typed| {
+                    let shown = |path: &Path| path.display().to_string();
+                    (shown(&typed.path), shown(&typed.browse), typed.prefix)
+                });
+                let want = want.map(|(path, browse, prefix)| {
+                    (path.to_owned(), browse.to_owned(), prefix.to_owned())
+                });
+                assert_eq!(got, want, "{text:?} as {style:?}");
+            }
+        };
+        let remote: &[Case] = &[
+            ("~/co", Some(("/home/me/co", "/home/me", "co"))),
+            ("~/code/", Some(("/home/me/code", "/home/me/code", ""))),
+            ("~", Some(("/home/me", "/home/me", ""))),
+            ("/srv/x", Some(("/srv/x", "/srv", "x"))),
+            ("/srv//x/./", Some(("/srv/x", "/srv/x", ""))),
+            // A last `..` browses the folder it names, as `std::path` has it.
+            ("/srv/app/..", Some(("/srv/app/..", "/srv/app/..", ""))),
+            ("/", Some(("/", "/", ""))),
+            ("rho-ui", None),
+            (r"C:\code", None),
+            (r"~\x", None),
+        ];
+        check(remote, "/home/me", PathStyle::Posix);
+        #[cfg(windows)]
+        let (home, here): (&str, &[Case]) = (
+            r"C:\Users\me",
+            &[
+                (r"C:\code\", Some((r"C:\code", r"C:\code", ""))),
+                ("C:/code", Some((r"C:\code", r"C:\", "code"))),
+                (r"C:\code\..", Some((r"C:\code\..", r"C:\code\..", ""))),
+                (r"~\x", Some((r"C:\Users\me\x", r"C:\Users\me", "x"))),
+                ("~/x", Some((r"C:\Users\me\x", r"C:\Users\me", "x"))),
+                ("/srv/x", None),
+                ("rho-ui", None),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (home, here): (&str, &[Case]) = (
+            "/home/me",
+            &[
+                ("~/co", Some(("/home/me/co", "/home/me", "co"))),
+                ("/srv/app/..", Some(("/srv/app/..", "/srv/app/..", ""))),
+                ("/", Some(("/", "/", ""))),
+                (r"C:\code", None),
+                (r"~\x", None),
+            ],
+        );
+        check(here, home, PathStyle::Native);
+        assert_eq!(
+            Typed::parse("~/code", None, PathStyle::Posix),
+            None,
+            "no home, no ~"
+        );
     }
 
     /// [`REMOTE_SCRIPT`], run with this machine's `sh` and `git`, names
     /// what reading the files here does: a subfolder of a checkout, a
     /// linked worktree, a plain folder, a symlink to one and to a checkout,
     /// a prefix, a hidden folder, and a missing path.
+    // The script runs on remote machines, which are Unix.
+    #[cfg(unix)]
     #[test]
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| git(&dir, args);
+        let dir = platform::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| crate::local::test::git(&dir, args);
         git(&["init", "-q", "-b", "main", "project"]);
         git(&["-C", "project", "commit", "-q", "--allow-empty", "-m", "x"]);
         git(&[
@@ -490,7 +644,14 @@ mod tests {
         std::fs::write(dir.join("project-notes"), "a file").unwrap();
         std::os::unix::fs::symlink(&plain, dir.join("link")).unwrap();
         std::os::unix::fs::symlink(&main, dir.join("plink")).unwrap();
-        let at = |rest: &str| Typed::parse(&format!("{}/{rest}", dir.display()), None).unwrap();
+        let at = |rest: &str| {
+            Typed::parse(
+                &format!("{}/{rest}", dir.display()),
+                None,
+                PathStyle::Native,
+            )
+            .unwrap()
+        };
         let cases = [
             at("project/docs"),
             at("wt"),
@@ -503,16 +664,10 @@ mod tests {
         ];
         let looked: Vec<Lookup> = cases.iter().map(look_here).collect();
         for (typed, local) in cases.iter().zip(&looked) {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(REMOTE_SCRIPT)
-                .arg("sh")
-                .args([&typed.path, &typed.browse])
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
+            let output = crate::local::test::sh(REMOTE_SCRIPT, &[&typed.path, &typed.browse])
+                .expect("the script runs");
             // As a login file that prints would have it.
-            let output = [b"Welcome!\n".as_slice(), output.stdout.as_slice()].concat();
+            let output = [b"Welcome!\n".as_slice(), output.as_slice()].concat();
             let remote = parse_remote(typed, &output).expect("the script's fields");
             assert_eq!(&remote, local, "{typed:?}");
         }

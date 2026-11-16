@@ -1,6 +1,6 @@
 //! A scripted rho daemon for tests: rho-protocol's own server side on a real
-//! Unix socket, with no model behind it. rho-ui-core's daemon tests and
-//! rho-ui's headless UI tests both run it.
+//! Unix socket, or named pipe on Windows, with no model behind it.
+//! rho-ui-core's daemon tests and rho-ui's headless UI tests both run it.
 //!
 //! - `rho/session/new` returns "new-1", "new-2", ...
 //! - `rho/session/list` returns pages of two: new sessions that have had a
@@ -35,6 +35,9 @@
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
 //!   whole result as a card, [`subagent_result`], and the parent's daemon
 //!   turn tells the model, as for a process.
+//! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
+//!   in a session. Its two agent nodes are in the job list only: one
+//!   queued second in line, one failed with the error [`WORKFLOW_ERROR`].
 //! - The prompt "flaky" sets a plan of three steps, one done, one under
 //!   way and one to do, then streams half an answer that the provider
 //!   discards, and waits 30 s to retry, rate limited. The turn runs on
@@ -70,6 +73,12 @@
 //!   writes: "r0", "r1", ... A write against an older revision is refused
 //!   as a conflict, unless only its own writer wrote since.
 //!   [`FakeDaemon::edit_agent_setting`] changes one as a hand edit does.
+//! - Sessions run on [`KEY_AUTH`], which takes an API key and is signed in
+//!   unless [`Script::signed_out`]; then a session opens only with
+//!   `sign_in: later`. [`LOGIN_AUTH`] takes a login, whose prompt follows
+//!   at once and which waits for [`FakeDaemon::approve_login`]. The key
+//!   [`REFUSED_KEY`] is refused, and [`UNCHECKED_KEY`] saved unchecked. Credentials go to a file store the
+//!   config chose.
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
 //!   set, if any. `rho/daemon/restart` restarts in place, as rho does: it
 //!   counts ([`FakeDaemon::restarts`]), drops the upgrade, as the restarted
@@ -90,10 +99,11 @@ use rho_protocol::{
         ToolHeader,
     },
     methods::{
-        BackgroundItem, BackgroundStatus, BackgroundWork, FastModeOptions, JobState, MessageId,
-        ModelChoice, ModelOptions, ModelRef, PendingUpgrade, PermissionModeOptions, ReasoningLevel,
-        ReasoningOptions, Replay, Seq, SessionCommand, SessionId, SessionOptions, SteerId,
-        StreamId, ToolCallId, ToolCallUpdate, TurnId,
+        BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, JobId, JobKind,
+        JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef, PendingUpgrade,
+        PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions, Replay, Seq,
+        SessionCommand, SessionId, SessionOptions, SteerId, StreamId, ToolCallId, ToolCallUpdate,
+        TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
@@ -102,15 +112,20 @@ use rho_protocol::{
     Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
 };
 use serde_json::{json, Value};
-use tokio::{net::UnixListener, runtime::Runtime};
+use tokio::runtime::Runtime;
 
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
 
+mod auth;
 mod config;
+mod listener;
 mod service;
 pub mod surface;
 
+use auth::FakeAuth;
+pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
 use config::FakeConfig;
+use listener::Listener;
 use service::Fake;
 
 /// The session [`Script::tui_job`] runs.
@@ -119,6 +134,12 @@ pub const TUI_SESSION: &str = "tui-1";
 /// The task of the subagent the prompt "subagent" starts: its title in
 /// the parent's background work, and its session's first message.
 pub const SUBAGENT_TASK: &str = "Read the parser";
+
+/// The name of the workflow [`FakeDaemon::start_workflow`] starts.
+pub const WORKFLOW_NAME: &str = "review";
+
+/// Why the workflow [`WORKFLOW_NAME`]'s second agent node failed.
+pub const WORKFLOW_ERROR: &str = "provider refused the request";
 
 /// The whole result the subagent [`SUBAGENT_TASK`] returns, in Markdown:
 /// as long as an explorer's report, with headings, a list and code.
@@ -138,12 +159,26 @@ pub fn questions() -> Vec<Question> {
         label: label.to_owned(),
         description: None,
     };
+    let described = |value: &str, label: &str, description: &str| Choice {
+        description: Some(description.to_owned()),
+        ..choice(value, label)
+    };
     vec![
         Question {
             id: "lang".to_owned(),
             prompt: "Which language should the tool use?".to_owned(),
             header: Some("Language".to_owned()),
-            choices: vec![choice("rust", "Rust"), choice("go", "Go")],
+            // Rust's description is too long for one line of any window.
+            choices: vec![
+                described(
+                    "rust",
+                    "Rust",
+                    &"What the rest of the repo is written in, so it shares the lints, \
+                      the build and the release. "
+                        .repeat(4),
+                ),
+                described("go", "Go", "Quicker to build."),
+            ],
             selection: Selection::One,
             allow_other: true,
             help: None,
@@ -172,7 +207,7 @@ pub fn questions() -> Vec<Question> {
 }
 
 /// Writes the program `text` to `path`, runnable, from a child process,
-/// for tests that stand in a fake `ssh` or `rho`. A handle written through
+/// for tests that stand in a fake `rho` or the like. A handle written through
 /// this process would leak into the processes other tests spawn meanwhile,
 /// until they exec, and running the file then fails with "Text file busy"
 /// (ETXTBSY).
@@ -194,6 +229,21 @@ pub fn write_program(path: &Path, text: &str) {
     assert!(status.success(), "writing {} failed", path.display());
 }
 
+/// Where rho's daemon of the rho home `rho_home` listens when
+/// `XDG_RUNTIME_DIR` is unset: a Unix socket, or on Windows a named pipe.
+/// Makes the home and the daemon's runtime directory if missing.
+fn endpoint_of(rho_home: &Path) -> PathBuf {
+    std::fs::create_dir_all(rho_home).expect("the fake daemon makes its rho home");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "rho names its daemon after the rho home as std resolves it, prefix and all"
+    )]
+    let canonical = std::fs::canonicalize(rho_home).expect("the rho home resolves");
+    let endpoint = DaemonEndpoint::locate(&canonical, None).expect("a short rho home");
+    std::fs::create_dir_all(&endpoint.runtime_dir).expect("the daemon's runtime directory");
+    endpoint.socket
+}
+
 /// What the fake daemon holds when it starts.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Script {
@@ -209,6 +259,9 @@ pub struct Script {
     /// How many more saved sessions, `past-0` and on, each an hour older
     /// than the last and older than "old", to fill long lists.
     pub past_sessions: usize,
+    /// Whether [`KEY_AUTH`], which every session runs on, starts signed
+    /// out, so a session opens only with `sign_in: later`.
+    pub signed_out: bool,
 }
 
 /// An action a client sent with `rho/session/surface_action`.
@@ -232,19 +285,20 @@ pub enum TuiJob {
     Running,
 }
 
-/// A running fake daemon. Dropping it stops it and removes its socket.
+/// A running fake daemon. Dropping it stops it, and removes its rho home
+/// and the directory of its socket.
 #[derive(Debug)]
 pub struct FakeDaemon {
     socket: PathBuf,
     service: Arc<Fake>,
-    /// The directory of its socket, when the fake made it.
-    _dir: Option<tempfile::TempDir>,
+    /// Its rho home.
+    _dir: tempfile::TempDir,
     _runtime: Runtime,
 }
 
 impl FakeDaemon {
-    /// Starts a daemon holding `script`, listening on a socket in a
-    /// directory of its own.
+    /// Starts a daemon holding `script`, listening where rho's daemon of a
+    /// rho home of its own, a temporary directory, would.
     ///
     /// # Panics
     ///
@@ -252,35 +306,20 @@ impl FakeDaemon {
     /// thread: a test cannot go on without them.
     pub fn start(script: Script) -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory for the fake daemon");
-        let socket = dir.path().join("daemon.sock");
-        Self::serve(script, socket, Some(dir))
+        let socket = endpoint_of(dir.path());
+        Self::serve(script, socket, dir)
     }
 
-    /// Starts a daemon holding `script` where rho's daemon of the rho home
-    /// `rho_home` listens when `XDG_RUNTIME_DIR` is unset, making the home
-    /// if missing. The caller keeps the home.
-    ///
-    /// # Panics
-    ///
-    /// If the OS refuses the home, a socket in it, or a thread.
-    pub fn start_in_home(script: Script, rho_home: &Path) -> Self {
-        std::fs::create_dir_all(rho_home).expect("the fake daemon makes its rho home");
-        let canonical = std::fs::canonicalize(rho_home).expect("the rho home resolves");
-        let endpoint = DaemonEndpoint::locate(&canonical, None).expect("a short rho home");
-        std::fs::create_dir_all(&endpoint.runtime_dir).expect("the daemon's runtime directory");
-        Self::serve(script, endpoint.socket, None)
-    }
-
-    fn serve(script: Script, socket: PathBuf, dir: Option<tempfile::TempDir>) -> Self {
+    fn serve(script: Script, socket: PathBuf, dir: tempfile::TempDir) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_io()
             .enable_time()
             .build()
             .expect("a runtime for the fake daemon");
-        let listener = {
+        let mut listener = {
             let _guard = runtime.enter();
-            UnixListener::bind(&socket).expect("the fake daemon binds its socket")
+            Listener::bind(&socket).expect("the fake daemon binds its socket")
         };
         let service = Arc::new(Fake {
             state: Mutex::new(State::new(script)),
@@ -293,7 +332,7 @@ impl FakeDaemon {
                 pid: std::process::id(),
                 build: BuildId::of_this_crate(),
             };
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(stream) = listener.accept().await {
                 let (service, info) = (Arc::clone(&serving), info.clone());
                 tokio::spawn(async move {
                     // Runs until the client leaves, or the daemon restarts.
@@ -316,6 +355,25 @@ impl FakeDaemon {
     /// How a client reaches this daemon.
     pub fn target(&self) -> DaemonTarget {
         DaemonTarget::Socket(self.socket.clone())
+    }
+
+    /// Where it listens: its Unix socket, or on Windows its named pipe.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Whether auth profile `auth` has credentials.
+    pub fn signed_in(&self, auth: &str) -> bool {
+        self.service.lock().auth.is_signed_in(auth)
+    }
+
+    /// The provider approves the login under way, which then succeeds.
+    ///
+    /// # Panics
+    ///
+    /// If no login is under way.
+    pub fn approve_login(&self) {
+        self.service.lock().auth.approve();
     }
 
     /// The value of variable `name` in the environment the latest
@@ -409,6 +467,86 @@ impl FakeDaemon {
         if session.turn.is_none() {
             session.wake(turn, &told);
         }
+    }
+
+    /// Starts the workflow [`WORKFLOW_NAME`] in `session`, as the
+    /// session's background work, with its two agent nodes in the job
+    /// list: one queued second in line, and one failed with
+    /// [`WORKFLOW_ERROR`].
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `session`: the test has a bug.
+    pub fn start_workflow(&self, session: &UiSessionId) {
+        let mut state = self.service.lock();
+        let run = format!("wf-{}", state.extra_jobs.len());
+        let parent = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        parent.background.push(BackgroundWork {
+            item: BackgroundItem::Workflow { run: run.clone() },
+            title: WORKFLOW_NAME.to_owned(),
+            status: BackgroundStatus::Running,
+            exit_code: None,
+        });
+        parent.report_background();
+        let cwd = parent.cwd.clone();
+        let job = |id: String, kind, state, parent: String| JobSummary {
+            id: JobId::new(id),
+            kind,
+            state,
+            workspace: cwd.clone(),
+            parent: Some(JobId::new(parent)),
+            grant: None,
+            grant_limit: None,
+            session: None,
+            run: None,
+            workflow_run: None,
+            result_pending: false,
+            created_at: 0,
+            updated_at: 0,
+            error: None,
+            queue: None,
+            live: None,
+            worktree: None,
+            worktree_stale: false,
+        };
+        let drive = format!("job-{run}");
+        let workflow = JobSummary {
+            workflow_run: Some(run.clone()),
+            ..job(
+                drive.clone(),
+                JobKind::Workflow,
+                JobState::Running,
+                format!("job-{session}"),
+            )
+        };
+        let queued = JobSummary {
+            run: Some(format!("{run}-a")),
+            queue: Some(QueuePlace {
+                budget: Budget::AgentConcurrency,
+                limit: 10,
+                position: 2,
+            }),
+            ..job(
+                format!("{drive}-a"),
+                JobKind::Subagent,
+                JobState::Queued,
+                drive.clone(),
+            )
+        };
+        let failed = JobSummary {
+            run: Some(format!("{run}-b")),
+            error: Some(WORKFLOW_ERROR.to_owned()),
+            ..job(
+                format!("{drive}-b"),
+                JobKind::Subagent,
+                JobState::Failed,
+                drive,
+            )
+        };
+        state.extra_jobs.extend([workflow, queued, failed]);
     }
 
     /// Retries the request the prompt "flaky" left waiting, and answers.
@@ -545,7 +683,7 @@ impl Settings {
         SessionOptions {
             model: ModelOptions {
                 current: self.model.clone(),
-                auth: "fake-api-key".to_owned(),
+                auth: KEY_AUTH.to_owned(),
                 available: MODELS
                     .iter()
                     .map(|(name, label)| ModelChoice {
@@ -1195,8 +1333,11 @@ struct State {
     new_session_environment: Option<ClientEnvironment>,
     turns: u64,
     steers: u64,
+    /// Jobs of runs no session writes, listed after the sessions' own.
+    extra_jobs: Vec<JobSummary>,
     /// rho's own settings.
     config: FakeConfig,
+    auth: FakeAuth,
 }
 
 impl State {
@@ -1236,7 +1377,9 @@ impl State {
             new_session_environment: None,
             turns: 0,
             steers: 0,
+            extra_jobs: Vec::new(),
             config: FakeConfig::new(),
+            auth: FakeAuth::new(&script),
         };
         if script.tui_job == TuiJob::Running {
             let mut session = FakeSession::new("/w/a", Some("from the tui"), 1_767_398_400);

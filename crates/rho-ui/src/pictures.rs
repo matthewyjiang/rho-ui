@@ -56,7 +56,7 @@ pub(crate) struct Pictures {
     loads: HashMap<Key, Load>,
     /// Reads waiting their turn, with the path each reads. One runs at a
     /// time: on a remote machine each is an ssh session on the shared
-    /// master, which sshd's default `MaxSessions` holds to 10, and the
+    /// connection, which sshd's default `MaxSessions` holds to 10, and the
     /// Files surface and git need some too.
     queue: VecDeque<(Key, String)>,
     reading: bool,
@@ -191,8 +191,15 @@ impl Pictures {
 /// Says why when `src` is a link of another kind.
 fn file_path(src: &str) -> Result<String, String> {
     let path = match src.strip_prefix("file://") {
-        // `file://localhost/x` is `/x` on this host, as `file:///x` is.
-        Some(path) => path.strip_prefix("localhost").unwrap_or(path),
+        // `file://localhost/x` is `/x` on this host, as `file:///x` is,
+        // and `file:///C:/x` is Windows' `C:/x`.
+        Some(path) => {
+            let path = path.strip_prefix("localhost").unwrap_or(path);
+            match path.as_bytes() {
+                [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &path[1..],
+                _ => path,
+            }
+        }
         None => match scheme(src) {
             Some(scheme) => {
                 return Err(format!("Rho shows images from files, not {scheme}: links."))
@@ -430,12 +437,13 @@ mod tests {
     /// escapes; a link of another kind is refused with why.
     #[test]
     fn a_picture_names_a_file() {
-        let cases: [(&str, Result<&str, &str>); 9] = [
+        let cases: [(&str, Result<&str, &str>); 10] = [
             ("plot.png", Ok("plot.png")),
             ("out/my%20plot.png", Ok("out/my plot.png")),
             ("file:///tmp/a%25b.png", Ok("/tmp/a%b.png")),
             ("file://localhost/tmp/a.png", Ok("/tmp/a.png")),
             ("C:\\plots\\a.png", Ok("C:\\plots\\a.png")),
+            ("file:///C:/plots/a.png", Ok("C:/plots/a.png")),
             ("100%.png", Ok("100%.png")),
             ("100%+5.png", Ok("100%+5.png")),
             (

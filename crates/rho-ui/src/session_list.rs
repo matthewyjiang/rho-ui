@@ -32,6 +32,9 @@ pub(crate) enum Activity {
     /// The session waits for a person; the first request arrived at this
     /// moment.
     Waiting(Instant),
+    /// No turn runs, but background work a turn started does, such as a
+    /// subagent or a process: the session waits on it.
+    Background,
 }
 
 impl Activity {
@@ -160,12 +163,14 @@ impl Row {
     }
 
     /// Sets what the session is doing. A turn that stops working marks the
-    /// row Done; a new one clears it.
+    /// row Done, which shows once its background work ends too; a new turn
+    /// clears it.
     fn set_activity(&mut self, activity: Activity) {
-        if activity.is_idle() {
-            self.done |= matches!(self.activity, Activity::Working(_));
-        } else {
-            self.done = false;
+        match activity {
+            Activity::Idle | Activity::Background => {
+                self.done |= matches!(self.activity, Activity::Working(_));
+            }
+            Activity::Working(_) | Activity::Waiting(_) => self.done = false,
         }
         self.activity = activity;
     }
@@ -349,6 +354,7 @@ impl SessionList {
                         .unwrap_or(now),
                 ),
                 (JobActivity::Waiting, _) => Activity::Waiting(now),
+                (JobActivity::Background, _) => Activity::Background,
             }
         };
         self.jobs = others;
@@ -619,7 +625,8 @@ impl SessionList {
             match row.activity {
                 Activity::Waiting(_) => busy.waiting += 1,
                 Activity::Working(_) => busy.working += 1,
-                Activity::Idle => {}
+                // Nobody needs to look at work that runs by itself.
+                Activity::Background | Activity::Idle => {}
             }
         }
         busy
@@ -974,7 +981,8 @@ mod tests {
     }
 
     /// A turn that stops working marks its row Done until the session is
-    /// seen or works again; waiting on a person is not Done.
+    /// seen or works again; waiting on a person is not Done, and a turn
+    /// that leaves background work running waits on it before Done shows.
     #[test]
     fn a_finished_turn_is_done_until_seen() {
         let done = |list: &SessionList| list.row(&id("a")).is_some_and(|row| row.done);
@@ -1001,6 +1009,15 @@ mod tests {
         assert!(done(&list), "the daemon's list keeps Done");
         assert!(list.mark_seen(&id("a")));
         assert!(!done(&list));
+
+        list.set_live(live("a", None, Activity::Working(now)), 0, 9);
+        list.set_live(live("a", None, Activity::Background), 0, 10);
+        assert_eq!(
+            list.row(&id("a")).map(|row| row.activity),
+            Some(Activity::Background)
+        );
+        list.set_live(live("a", None, Activity::Idle), 0, 11);
+        assert!(done(&list), "done once the background work ends");
     }
 
     #[test]

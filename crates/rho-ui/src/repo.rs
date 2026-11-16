@@ -15,13 +15,29 @@ pub(crate) struct Repo {
     pub(crate) name: String,
     /// The origin remote's URL, which clones it on another machine.
     pub(crate) origin: Option<String>,
-    /// The checked-out branch, or a short commit hash when detached.
-    /// `None` outside a git repository.
-    pub(crate) branch: Option<String>,
+    /// What is checked out. `None` outside a git repository.
+    pub(crate) head: Option<Head>,
     /// The project the workspace belongs to: the repository's main checkout,
     /// so a linked worktree or a subfolder names the same project as the
     /// checkout itself. Outside a git repository, the folder.
     pub(crate) root: PathBuf,
+}
+
+/// What a checkout has checked out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Head {
+    Branch(String),
+    /// No branch: a commit, by its short hash.
+    Detached(String),
+}
+
+impl Head {
+    /// The branch, or the short hash, as the sidebar shows it.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Head::Branch(name) | Head::Detached(name) => name,
+        }
+    }
 }
 
 impl Repo {
@@ -64,7 +80,7 @@ pub(crate) fn folder(cwd: &Path) -> Repo {
     Repo {
         name: folder_name(cwd),
         origin: None,
-        branch: None,
+        head: None,
         root: cwd.to_path_buf(),
     }
 }
@@ -85,13 +101,13 @@ pub(crate) fn inspect(cwd: &Path) -> Repo {
     let Some((work_tree, git_dir)) = find_git_dir(cwd) else {
         return folder(cwd);
     };
-    let work_tree = work_tree.canonicalize().unwrap_or(work_tree);
-    let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+    let work_tree = platform::canonicalize(&work_tree).unwrap_or(work_tree);
+    let git_dir = platform::canonicalize(&git_dir).unwrap_or(git_dir);
     // A linked worktree keeps its config in the main repository's git dir.
     let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
         .ok()
         .map(|dir| git_dir.join(dir.trim()))
-        .and_then(|dir| dir.canonicalize().ok())
+        .and_then(|dir| platform::canonicalize(&dir).ok())
         .unwrap_or_else(|| git_dir.clone());
     let origin = std::fs::read_to_string(common_dir.join("config"))
         .ok()
@@ -118,7 +134,7 @@ fn checkout(
             .and_then(url_name)
             .unwrap_or_else(|| folder_name(&root)),
         origin,
-        branch: head.and_then(branch_name),
+        head: head.and_then(parse_head),
         root,
     }
 }
@@ -212,20 +228,17 @@ fn find_git_dir(start: &Path) -> Option<(PathBuf, PathBuf)> {
     })
 }
 
-/// `main` for `ref: refs/heads/main`, a short hash for a detached HEAD.
-fn branch_name(head: &str) -> Option<String> {
+/// Branch `main` for `ref: refs/heads/main`, a short hash for a detached
+/// HEAD.
+fn parse_head(head: &str) -> Option<Head> {
     let head = head.trim();
     match head.strip_prefix("ref:") {
         Some(reference) => {
             let reference = reference.trim();
-            Some(
-                reference
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(reference)
-                    .to_owned(),
-            )
+            let name = reference.strip_prefix("refs/heads/").unwrap_or(reference);
+            Some(Head::Branch(name.to_owned()))
         }
-        None => head.get(..7).map(str::to_owned),
+        None => head.get(..7).map(|hash| Head::Detached(hash.to_owned())),
     }
 }
 
@@ -290,7 +303,7 @@ mod tests {
         Repo {
             name: name.to_owned(),
             origin: None,
-            branch: None,
+            head: None,
             root: PathBuf::from("/"),
         }
     }
@@ -327,23 +340,24 @@ mod tests {
     #[test]
     fn head_gives_branch_or_short_hash() {
         assert_eq!(
-            branch_name("ref: refs/heads/feat/x\n").as_deref(),
-            Some("feat/x")
+            parse_head("ref: refs/heads/feat/x\n"),
+            Some(Head::Branch("feat/x".into()))
         );
         assert_eq!(
-            branch_name("0123456789abcdef\n").as_deref(),
-            Some("0123456")
+            parse_head("0123456789abcdef\n"),
+            Some(Head::Detached("0123456".into()))
         );
     }
 
-    /// A linked worktree: `.git` file pointing into the main repository. It
-    /// and any subfolder belong to the main checkout's project, at its
-    /// resolved path, as is the checkout reached through a symlink.
+    /// A checkout reached through a symlink belongs to the project at its
+    /// resolved path.
+    // Making a symlink on Windows needs Developer Mode or an administrator.
+    #[cfg(unix)]
     #[test]
-    fn linked_worktrees_use_the_main_repository() {
-        let root = std::env::temp_dir().join(format!("rho-ui-repo-test-{}", std::process::id()));
+    fn a_symlinked_checkout_uses_its_resolved_path() {
+        let root = std::env::temp_dir().join(format!("rho-ui-link-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let (main, tree) = fake_worktree(&root);
+        let (main, _) = fake_worktree(&root);
         let link = root.join("link");
         std::os::unix::fs::symlink(&main, &link).unwrap();
 
@@ -352,17 +366,29 @@ mod tests {
             Repo {
                 name: "project".into(),
                 origin: None,
-                branch: Some("main".into()),
-                root: main.canonicalize().unwrap(),
+                head: Some(Head::Branch("main".into())),
+                root: platform::canonicalize(&main).unwrap(),
             }
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A linked worktree: `.git` file pointing into the main repository. It
+    /// and any subfolder belong to the main checkout's project, at its
+    /// resolved path.
+    #[test]
+    fn linked_worktrees_use_the_main_repository() {
+        let root = std::env::temp_dir().join(format!("rho-ui-repo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (main, tree) = fake_worktree(&root);
+
         assert_eq!(
             inspect(&tree.join("src")),
             Repo {
                 name: "project".into(),
                 origin: None,
-                branch: Some("feature".into()),
-                root: main.canonicalize().unwrap(),
+                head: Some(Head::Branch("feature".into())),
+                root: platform::canonicalize(&main).unwrap(),
             }
         );
         std::fs::remove_dir_all(&root).unwrap();
@@ -372,11 +398,13 @@ mod tests {
     /// project as reading its `.git` files here does: a main checkout with
     /// an origin, a linked worktree of it, a detached checkout, a folder
     /// outside any repository, and one that isn't there.
+    // The script runs on remote machines, which are Unix.
+    #[cfg(unix)]
     #[test]
     fn the_remote_script_agrees_with_the_files() {
         let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path().canonicalize().unwrap();
-        let git = |args: &[&str]| folders::git(&dir, args);
+        let dir = platform::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| crate::local::test::git(&dir, args);
         git(&["init", "-q", "-b", "main", "main"]);
         git(&[
             "-C",
@@ -427,7 +455,7 @@ mod tests {
         let local: Vec<Repo> = dirs.iter().map(|dir| inspect(dir)).collect();
         assert_eq!(remote, local);
         assert_eq!(remote[1].name, "me/thing");
-        assert_eq!(remote[1].branch.as_deref(), Some("feat"));
+        assert_eq!(remote[1].head, Some(Head::Branch("feat".into())));
         assert_eq!(remote[1].root, dir.join("main"));
         assert_eq!(remote[3], folder(&dirs[3]));
     }
