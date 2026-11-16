@@ -3110,9 +3110,12 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
 }
 
-/// What [`StubGh`]'s API answers: PR 12 on `feature`, a failed check and
-/// a passed one, a comment and an approval, an open thread and a resolved
-/// one.
+/// The description of [`StubGh`]'s PR, with a diagram.
+const PR_BODY: &str = "Adds **widgets**.\n\n```mermaid\nflowchart LR\n  A --> B\n```\n";
+
+/// What [`StubGh`]'s API answers: PR 12 on `feature`, with a diagram in its
+/// description, a failed check and a passed one, a comment and an
+/// approval, an open thread and a resolved one.
 fn stub_answer() -> String {
     let summary = |checks: serde_json::Value| {
         serde_json::json!({
@@ -3153,7 +3156,7 @@ fn stub_answer() -> String {
         },
     }));
     let extra = serde_json::json!({
-        "body": "Adds **widgets**.", "author": { "login": "octocat" },
+        "body": PR_BODY, "author": { "login": "octocat" },
         "headRefName": "feature", "baseRefName": "main",
         "additions": 10, "deletions": 2, "changedFiles": 3, "reviewDecision": "APPROVED",
         "mergeable": "MERGEABLE", "repository": {
@@ -3331,6 +3334,24 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
         Some("Add widgets")
     );
     assert_eq!(asked(), 2, "one query found the PR, one read its detail");
+    // Its description draws its diagram, as a message does.
+    let diagram = SharedString::from(format!(
+        "diagram-{}",
+        PR_BODY.find("```mermaid").expect("a diagram")
+    ));
+    ui.wait_until("the description's diagram", |window, _, _| {
+        is_visible(window, diagram.clone())
+    });
+    ui.act(|window, _| {
+        let column = window.find("pull-request-body").bounds();
+        let shown = window.within(diagram.clone()).find("picture").bounds();
+        assert!(
+            shown.size.height > px(0.)
+                && shown.left() >= column.left()
+                && shown.right() <= column.right(),
+            "the diagram fits the surface {column:?}: {shown:?}"
+        );
+    });
     ui.shot("pr");
 
     // On screen, it reads again every 30 seconds; its checks done, the

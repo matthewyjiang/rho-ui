@@ -919,7 +919,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                             TextView::new(text)
                                 .style(message_style())
                                 .code_block_actions(code_actions)
-                                .markdown_extensions(figures::extensions(pictures, ix))
+                                .markdown_extensions(figures::message_extensions(pictures, ix))
                                 .selectable(true),
                         ),
                 )
@@ -942,7 +942,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                 TextView::new(text)
                     .style(message_style())
                     .code_block_actions(code_actions)
-                    .markdown_extensions(figures::extensions(pictures, ix))
+                    .markdown_extensions(figures::message_extensions(pictures, ix))
                     .selectable(true)
                     .stream_fade(phase == Phase::Live)
             }))

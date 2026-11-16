@@ -44,6 +44,7 @@ use self::{
     link::{link_button, LinkForm},
 };
 use crate::{
+    figures,
     machines::{Place, SessionKey},
     pull_requests::{
         Found, Lookup, NoTarget, PrDetail, PrId, PrSummary, PullRequests, Refresh, RepoId, Target,
@@ -274,28 +275,27 @@ impl PullRequestSurface {
         }
     }
 
-    /// `key`'s Markdown, as [`Self::texts`] holds it.
+    /// `key`'s Markdown, as [`Self::texts`] holds it, with its diagrams and
+    /// formulas drawn as a message's are.
     fn text(&self, key: &str) -> Option<AnyElement> {
         let (_, state) = self.texts.get(key)?;
-        Some(
-            div()
-                .text_sm()
-                // Its links are anyone's: only web ones open, as Kit opens
-                // links without a handler.
-                .child(TextView::new(state).on_link_click(|url, event, _, cx| {
-                    let opens = match event {
-                        ClickEvent::Mouse(click) => {
-                            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
-                        }
-                        ClickEvent::Keyboard(_) => true,
-                        ClickEvent::Touch(click) => !click.long_press,
-                    };
-                    if let Some(url) = web_url(url).filter(|_| opens) {
-                        cx.open_url(&url);
+        let view = TextView::new(state)
+            .markdown_extensions(figures::extensions())
+            // Its links are anyone's: only web ones open, as Kit opens
+            // links without a handler.
+            .on_link_click(|url, event, _, cx| {
+                let opens = match event {
+                    ClickEvent::Mouse(click) => {
+                        matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
                     }
-                }))
-                .into_any_element(),
-        )
+                    ClickEvent::Keyboard(_) => true,
+                    ClickEvent::Touch(click) => !click.long_press,
+                };
+                if let Some(url) = web_url(url).filter(|_| opens) {
+                    cx.open_url(&url);
+                }
+            });
+        Some(div().text_sm().child(view).into_any_element())
     }
 
     /// The PR: what it is, then once its detail is read, its checks and

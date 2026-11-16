@@ -1,8 +1,8 @@
-//! Mermaid diagrams and LaTeX formulas in messages, drawn in the theme's
-//! colors and fonts. Each is a GPUI Kit Markdown plugin: a ` ```mermaid `
-//! fence becomes a diagram ([`pele`]), and `$$ … $$` and `$ … $` become
-//! formulas (`RaTeX`). Each draws an SVG that GPUI rasterizes as an image.
-//! Images by path are [`pictures`]'.
+//! Mermaid diagrams and LaTeX formulas in messages and pull requests, drawn
+//! in the theme's colors and fonts. Each is a GPUI Kit Markdown plugin: a
+//! ` ```mermaid ` fence becomes a diagram ([`pele`]), and `$$ … $$` and
+//! `$ … $` become formulas (`RaTeX`). Each draws an SVG that GPUI
+//! rasterizes as an image. A message's images by path are [`pictures`]'.
 //!
 //! What the text can't be drawn as stays as written: a diagram pele can't
 //! draw shows as its code block, a formula `RaTeX` can't lay out as its
@@ -42,17 +42,23 @@ const MATH_SCALE: f32 = 1.21;
 /// of its own (`\color{red}`) keeps it.
 const INK: Color = Color::new(0., 0., 0., 0.);
 
-/// The plugins, for a [`gpui_kit::component::text::TextView`] showing
-/// message `entry` of a session whose images by path `pictures` reads.
-pub(crate) fn extensions(pictures: &Entity<Pictures>, entry: usize) -> MarkdownExtensions {
+/// The diagram and formula plugins, for a
+/// [`gpui_kit::component::text::TextView`] showing Markdown from outside a
+/// session, such as a pull request's description.
+pub(crate) fn extensions() -> MarkdownExtensions {
     MarkdownExtensions::default()
         .plugin(Diagrams)
         .plugin(DisplayMath)
         .plugin(InlineMath)
-        .plugin(pictures::Plugin {
-            pictures: pictures.clone(),
-            entry,
-        })
+}
+
+/// [`extensions`] and the plugin for images by path, for a `TextView`
+/// showing message `entry` of a session whose images `pictures` reads.
+pub(crate) fn message_extensions(pictures: &Entity<Pictures>, entry: usize) -> MarkdownExtensions {
+    extensions().plugin(pictures::Plugin {
+        pictures: pictures.clone(),
+        entry,
+    })
 }
 
 /// A drawn figure: its image and the size it shows at.
