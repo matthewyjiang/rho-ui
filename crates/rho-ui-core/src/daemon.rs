@@ -963,7 +963,7 @@ impl Daemon {
     ) -> Result<(), SurfaceActionError> {
         let params = SessionSurfaceActionParams {
             session: id.to_wire(),
-            surface: action.surface.clone(),
+            surface: action.surface().to_owned(),
             action: action.action.clone(),
             data_model: action.data_model.clone(),
         };
@@ -973,6 +973,9 @@ impl Daemon {
             .await
         {
             Ok(_) => Ok(()),
+            // rho has no error code of its own for a surface the session
+            // does not have; it answers `InvalidParams`, which a request
+            // this client builds is not otherwise.
             Err(error) if error.error_code() == Some(ErrorCode::InvalidParams) => Err(
                 SurfaceActionError::Stale(DaemonError::from(error).to_string()),
             ),

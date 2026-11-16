@@ -11,7 +11,7 @@ use rho_ui_core::{
         surface::{FORM_SURFACE, REFUSED_EVENT},
         FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
     },
-    surface::{Node, SurfaceStore, SurfaceTree},
+    surface::{Node, SurfaceStore},
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus, Checkout,
     ChoiceKind, ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
     DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity, LoginOutcome, Prompt,
@@ -647,34 +647,13 @@ fn surfaces(session: &Session) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// A store shown every surface `session`'s transcript places.
-fn store(session: &Session) -> SurfaceStore {
+/// A store shown every surface `session` placed.
+fn store(session: &mut Session) -> SurfaceStore {
     let mut store = SurfaceStore::default();
-    for entry in session.entries() {
-        if let Entry::Surface(shown) = entry {
-            store.show(shown);
-        }
+    for placed in session.take_placed_surfaces() {
+        store.show(placed);
     }
     store
-}
-
-/// The button of `tree`'s card whose component is `id`, to press.
-fn button<'a>(tree: &'a SurfaceTree, id: &str) -> &'a Node {
-    let Node::Card(form) = &tree.root else {
-        panic!("the form is a card: {:?}", tree.root);
-    };
-    let Node::Column { children, .. } = &**form else {
-        panic!("the card holds a column: {form:?}");
-    };
-    children
-        .iter()
-        .flat_map(|child| match &child.node {
-            Node::Row { children, .. } => children.as_slice(),
-            _ => &[],
-        })
-        .map(|child| &child.node)
-        .find(|node| matches!(node, Node::Button { target, .. } if target.component() == id))
-        .unwrap_or_else(|| panic!("the form has no button {id}"))
 }
 
 /// A `ui` call's surface takes one place in the transcript however often
@@ -690,16 +669,20 @@ fn a_surface_is_placed_once_and_its_actions_reach_the_session() {
         daemon.prompt(session.id(), &"ui".into()).await.unwrap();
         until(&mut events, &mut session, |s| !surfaces(s).is_empty()).await;
         assert_eq!(surfaces(&session), [("tool-1", FORM_SURFACE)]);
-        let mut shown = store(&session);
-        assert_eq!(shown.drawn_under(FORM_SURFACE), Some("tool-1"));
+        let mut shown = store(&mut session);
 
         let mut press = |id: &str| {
             let tree = shown.tree(FORM_SURFACE).unwrap();
-            let Node::Button { target, action, .. } = button(&tree, id) else {
-                unreachable!("`button` finds buttons");
-            };
-            let action = action.clone().expect("the button can be pressed");
-            let acted = shown.act(FORM_SURFACE, target, &action);
+            let button = tree
+                .root
+                .descendants()
+                .find_map(|node| match node {
+                    Node::Button(button) if button.target.component() == id => Some(button),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the form has no button {id}"));
+            let action = button.action.clone().expect("the button can be pressed");
+            let acted = shown.act(FORM_SURFACE, &button.target, &action);
             acted.send.expect("the button's action is an event")
         };
         let refused = press("stale");
@@ -747,7 +730,7 @@ fn a_replay_rebuilds_a_surface_once() {
             .into_iter()
             .map(|(call, surface)| (call.to_owned(), surface.to_owned()))
             .collect::<Vec<_>>();
-        let drawn = store(&session).tree("gallery");
+        let drawn = store(&mut session).tree("gallery");
         assert!(drawn.is_some(), "the gallery draws");
 
         fake.fall_behind(session.id());
@@ -779,6 +762,6 @@ fn a_replay_rebuilds_a_surface_once() {
             .map(|(call, surface)| (call.to_owned(), surface.to_owned()))
             .collect::<Vec<_>>();
         assert_eq!(replayed, live);
-        assert_eq!(store(&again).tree("gallery"), drawn);
+        assert_eq!(store(&mut again).tree("gallery"), drawn);
     });
 }

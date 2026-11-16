@@ -11,7 +11,6 @@
 //! button to show the rest.
 
 use std::{
-    collections::HashMap,
     ops::Range,
     rc::Rc,
     time::{Duration, Instant},
@@ -46,7 +45,7 @@ use crate::{
     fold::Folding,
     lightbox,
     pictures::{PictureRead, Pictures},
-    surface_view::SurfacePanel,
+    surface_view::Surfaces,
     turn_times::TurnTimes,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
@@ -222,9 +221,6 @@ pub(crate) struct Transcript {
     /// Per entry: a message's text, or a notice's detail; `None` for
     /// anything else.
     markdown: Vec<Option<Markdown>>,
-    /// The surfaces the session's `ui` calls showed, by surface ID. Each
-    /// draws at the entry of the call it is drawn under.
-    surfaces: HashMap<String, Entity<SurfacePanel>>,
 }
 
 impl Transcript {
@@ -242,7 +238,6 @@ impl Transcript {
             diffs: Vec::new(),
             attachments: Vec::new(),
             markdown: Vec::new(),
-            surfaces: HashMap::new(),
         }
     }
 
@@ -254,17 +249,6 @@ impl Transcript {
     /// says when each read ends ([`PictureRead`]).
     pub(crate) fn pictures(&self) -> &Entity<Pictures> {
         &self.pictures
-    }
-
-    /// The panel that draws surface `surface`, if the session view made
-    /// one.
-    pub(crate) fn surface(&self, surface: &str) -> Option<&Entity<SurfacePanel>> {
-        self.surfaces.get(surface)
-    }
-
-    /// Draws surface `surface` with `panel`, at its entries.
-    pub(crate) fn set_surface(&mut self, surface: String, panel: Entity<SurfacePanel>) {
-        self.surfaces.insert(surface, panel);
     }
 
     /// Surface `surface` changed: what it shows, or which of its entries
@@ -552,6 +536,7 @@ impl Transcript {
         &self,
         ix: usize,
         entries: &[Entry],
+        surfaces: &Surfaces,
         act: &ActionHandler,
         content: &RowContent,
         cx: &App,
@@ -561,11 +546,7 @@ impl Transcript {
         // turn's working, and does not fold with it. A surface that moved
         // under a later call, or was deleted, takes no room here.
         if let Some(shown) = self.surface_row(ix, entries) {
-            let panel = self
-                .surfaces
-                .get(shown.surface())
-                .filter(|panel| panel.read(cx).drawn_under() == Some(shown.call()))
-                .cloned();
+            let panel = surfaces.panel(shown).cloned();
             return measure
                 .when_some(panel, |this, panel| this.pb_3().child(panel))
                 .into_any_element();

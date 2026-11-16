@@ -28,7 +28,7 @@ futures = "0.3"
 rquickjs = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }
 # Reads what forge CLIs such as gh print as JSON; see src/forge.rs. The
-# values a surface's controls write to its data model (`surface_view.rs`).
+# values a surface's controls write to its data model (`surface_view/`).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -48,24 +48,41 @@ fn button(id: &str, label: &str, variant: &str, event: &str) -> [Value; 2] {
     ]
 }
 
+/// The check that the form's service has a name.
+fn named() -> Value {
+    json!([{
+        "condition": {"@call": "required", "args": {"value": {"@path": "/name"}}},
+        "message": "Name the service to deploy",
+    }])
+}
+
+/// The form's field for the service's name, which shows `placeholder`
+/// while empty.
+fn name_field(placeholder: &str) -> Value {
+    json!({"id": "name", "component": "TextField", "label": "Service",
+        "placeholder": placeholder, "value": {"@path": "/name"}, "@checks": named()})
+}
+
+/// The form's slider for how many replicas to run, up to `max`.
+fn replicas_slider(max: u32) -> Value {
+    json!({"id": "replicas", "component": "Slider", "label": "Replicas",
+        "min": 1, "max": max, "value": {"@path": "/replicas"}})
+}
+
 /// The surface of the prompt "ui": a form that deploys a service. Its
 /// Deploy button is disabled until the name is filled in, and sends the
 /// event `deploy` with the name and the environment; Cancel sends
 /// `cancel`, and Stale sends [`REFUSED_EVENT`].
 pub fn form() -> Vec<Value> {
-    let required = json!([{
-        "condition": {"@call": "required", "args": {"value": {"@path": "/name"}}},
-        "message": "Name the service to deploy",
-    }]);
     let mut all = vec![
         json!({"id": "root", "component": "Card", "child": "form"}),
         json!({"id": "form", "component": "Column", "children":
-            ["title", "hint", "name", "notes", "env", "notify", "replicas", "when", "actions"]}),
+            ["title", "hint", "name", "notes", "env", "notify", "replicas", "timeout", "when",
+                "actions"]}),
         text("title", "### Deploy a service"),
         json!({"id": "hint", "component": "Text", "variant": "caption",
             "text": "Rho waits for you to send this form."}),
-        json!({"id": "name", "component": "TextField", "label": "Service",
-            "placeholder": "api", "value": {"@path": "/name"}, "@checks": required}),
+        name_field("api"),
         json!({"id": "notes", "component": "TextField", "label": "Release notes",
             "variant": "longText", "value": {"@path": "/notes"}}),
         json!({"id": "env", "component": "ChoicePicker", "label": "Environment",
@@ -75,14 +92,15 @@ pub fn form() -> Vec<Value> {
         ]}),
         json!({"id": "notify", "component": "CheckBox", "label": "Notify the channel",
             "value": {"@path": "/notify"}}),
-        json!({"id": "replicas", "component": "Slider", "label": "Replicas",
-            "min": 1, "max": 10, "value": {"@path": "/replicas"}}),
+        replicas_slider(10),
+        json!({"id": "timeout", "component": "TextField", "label": "Timeout (s)",
+            "variant": "number", "value": {"@path": "/timeout"}}),
         json!({"id": "when", "component": "DateTimeInput", "label": "Not before",
             "enableDate": true, "value": {"@path": "/when"}}),
         json!({"id": "actions", "component": "Row", "justify": "end",
             "children": ["stale", "cancel", "deploy"]}),
         json!({"id": "deploy", "component": "Button", "child": "deploy_label",
-        "variant": "primary", "@checks": required,
+        "variant": "primary", "@checks": named(),
         "action": {"event": {"name": "deploy", "context": {
             "name": {"@path": "/name"},
             "env": {"@path": "/env"},
@@ -97,9 +115,18 @@ pub fn form() -> Vec<Value> {
         data(
             FORM_SURFACE,
             &json!({"name": "", "notes": "", "env": ["staging"], "notify": true,
-                "replicas": 3, "when": "2026-01-31"}),
+                "replicas": 3, "timeout": "30", "when": "2026-01-31"}),
         ),
     ]
+}
+
+/// What the prompt "widen" shows: the form of the prompt "ui", its name's
+/// placeholder now `web` and its replicas up to 20.
+pub fn widened() -> Vec<Value> {
+    vec![components(
+        FORM_SURFACE,
+        &json!([name_field("web"), replicas_slider(20)]),
+    )]
 }
 
 /// The surface of the prompt "gallery": every component of the basic

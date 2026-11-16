@@ -1,32 +1,34 @@
 //! A session's A2UI processor, and which call each surface is drawn under.
 //!
-//! A [`crate::Session`] places each `ui` call's surface in its transcript
-//! as an [`crate::Entry::Surface`]. Whoever draws the transcript keeps one
-//! store beside the session and shows it those entries, in order
-//! ([`SurfaceStore::show`]). The daemon checked every message before
-//! sending it, so the store trusts them, and applies each call's once.
-//! Nothing here outlasts the session's attachment: a client that fell
-//! behind attaches again with a new session and a new store, and the
-//! replay shows every call again, in order.
+//! A view keeps one store beside its [`crate::Session`], and shows it each
+//! surface the session places ([`crate::Session::take_placed_surfaces`]).
+//! The daemon checked every message before sending it, so the store
+//! trusts them; it keeps why the processor refused any anyway. Nothing
+//! here outlasts the session's attachment: a client that fell behind
+//! attaches again with a new session and a new store, and the replay
+//! shows every call again, in order.
 
-use std::{collections::BTreeSet, sync::Arc, time::SystemTime};
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::SystemTime,
+};
 
 use a2ui::{
-    Action, Catalog, Effect, Functions, Interaction, MessageProcessor, Pointer, RendererMessage,
-    UserActivation, Validation,
+    Action, Catalog, Change, Effect, Functions, Interaction, MessageProcessor, Pointer,
+    RendererMessage, UserActivation, Validation,
 };
 use serde_json::Value;
 
-use super::tree::{self, SurfaceTree, Target};
+use super::{
+    build,
+    tree::{SurfaceTree, Target},
+};
 
-/// A surface a `ui` call showed: the transcript's entry for it. Cheap to
-/// clone.
+/// A surface a `ui` call showed: the transcript's entry for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceRef {
     pub(crate) call: String,
     pub(crate) surface: String,
-    /// The A2UI messages the call carried, which show the surface.
-    pub(crate) messages: Arc<[Value]>,
 }
 
 impl SurfaceRef {
@@ -41,11 +43,27 @@ impl SurfaceRef {
     }
 }
 
+/// A surface a session just placed, with the A2UI messages its call
+/// carried, for [`SurfaceStore::show`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlacedSurface {
+    pub(crate) shown: SurfaceRef,
+    pub(crate) messages: Vec<Value>,
+}
+
+impl PlacedSurface {
+    /// The transcript's entry for it.
+    pub fn shown(&self) -> &SurfaceRef {
+        &self.shown
+    }
+}
+
 /// What the user did on a surface, for the daemon:
 /// [`crate::Daemon::surface_action`] sends it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceAction {
-    pub(crate) surface: String,
+    /// The surface, and the call it was drawn under when the user acted.
+    pub(crate) shown: SurfaceRef,
     pub(crate) action: Value,
     pub(crate) data_model: Option<Value>,
 }
@@ -53,7 +71,7 @@ pub struct SurfaceAction {
 impl SurfaceAction {
     /// The surface the user acted on.
     pub fn surface(&self) -> &str {
-        &self.surface
+        &self.shown.surface
     }
 }
 
@@ -74,14 +92,17 @@ pub struct Acted {
 #[derive(Debug)]
 pub struct SurfaceStore {
     processor: MessageProcessor,
-    /// The calls whose messages the processor has.
-    applied: BTreeSet<String>,
-    /// Each surface a call showed and the latest call that showed it, the
-    /// one whose card it is drawn under; most recently shown last.
-    shown: Vec<(String, String)>,
-    /// Surfaces the daemon refused an action on: the session no longer
-    /// has them as shown here.
-    stale: BTreeSet<String>,
+    /// The latest call that showed each surface: the one whose entry it is
+    /// drawn under.
+    drawn_under: HashMap<String, String>,
+    /// The surfaces the daemon refused an action on, with what it said:
+    /// the session no longer has them as shown here.
+    stale: HashMap<String, String>,
+    /// Why the processor refused messages of the latest call that showed
+    /// each surface, for the surfaces it refused any of.
+    refused: HashMap<String, Vec<String>>,
+    /// The surfaces that changed since [`Self::take_changed`].
+    changed: BTreeSet<String>,
 }
 
 impl Default for SurfaceStore {
@@ -92,73 +113,96 @@ impl Default for SurfaceStore {
             .expect("the basic catalog compiles");
         Self {
             processor,
-            applied: BTreeSet::new(),
-            shown: Vec::new(),
-            stale: BTreeSet::new(),
+            drawn_under: HashMap::new(),
+            stale: HashMap::new(),
+            refused: HashMap::new(),
+            changed: BTreeSet::new(),
         }
     }
 }
 
 impl SurfaceStore {
-    /// Applies the messages of `shown`, a transcript's entry, unless it
-    /// has that call's already, and says whether it applied them.
-    pub fn show(&mut self, shown: &SurfaceRef) -> bool {
-        self.apply(&shown.call, &shown.surface, &shown.messages)
-    }
-
-    /// Applies the `messages` call `call` carries about `surface`, unless
-    /// it has them already, and says whether it applied them. A message
-    /// the processor refuses is skipped: the daemon checked them all, so
-    /// one refused here means its A2UI is newer than this one.
-    pub fn apply(&mut self, call: &str, surface: &str, messages: &[Value]) -> bool {
-        if !self.applied.insert(call.to_owned()) {
-            return false;
+    /// Applies the messages of `placed`, whose call draws the surface from
+    /// now on, current again if it was stale.
+    pub fn show(&mut self, placed: PlacedSurface) {
+        let PlacedSurface { shown, messages } = placed;
+        let processed = self.processor.process(&Value::Array(messages));
+        for change in &processed.changes {
+            let (Change::SurfaceCreated { surface }
+            | Change::SurfaceDeleted { surface }
+            | Change::ComponentAdded { surface, .. }
+            | Change::ComponentUpdated { surface, .. }
+            | Change::ComponentRemoved { surface, .. }
+            | Change::DataUpdated { surface, .. }) = change;
+            self.changed.insert(surface.clone());
         }
-        let _ = self.processor.process(&Value::Array(messages.to_vec()));
-        self.shown.retain(|(shown, _)| shown != surface);
-        self.shown.push((surface.to_owned(), call.to_owned()));
-        self.stale.remove(surface);
-        true
+        let refused: Vec<String> = processed
+            .errors()
+            .map(|error| error.message().to_owned())
+            .collect();
+        if refused.is_empty() {
+            self.refused.remove(&shown.surface);
+        } else {
+            self.refused.insert(shown.surface.clone(), refused);
+        }
+        self.stale.remove(&shown.surface);
+        self.changed.insert(shown.surface.clone());
+        self.drawn_under.insert(shown.surface, shown.call);
     }
 
-    /// The call whose card `surface` is drawn under, while it exists.
+    /// Why the processor refused messages of the latest call that showed
+    /// `surface`, which draws without them: the daemon checked them all,
+    /// so one refused here means its A2UI is newer than this one.
+    pub fn refused(&self, surface: &str) -> &[String] {
+        self.refused.get(surface).map_or(&[], Vec::as_slice)
+    }
+
+    /// The call whose entry `surface` is drawn under, while it exists or
+    /// says why it can't be shown.
     pub fn drawn_under(&self, surface: &str) -> Option<&str> {
-        self.processor.surface(surface)?;
-        self.shown
-            .iter()
-            .find_map(|(shown, call)| (shown == surface).then_some(call.as_str()))
+        let shows = self.processor.surface(surface).is_some() || self.refused.contains_key(surface);
+        self.drawn_under
+            .get(surface)
+            .filter(|_| shows)
+            .map(String::as_str)
+    }
+
+    /// Whether the entry `shown` draws its surface.
+    pub fn draws(&self, shown: &SurfaceRef) -> bool {
+        self.drawn_under(&shown.surface) == Some(shown.call.as_str())
     }
 
     /// `surface` as it stands, or `None` when there is no such surface or
     /// it has no `root` yet.
     pub fn tree(&self, surface: &str) -> Option<SurfaceTree> {
-        tree::build(&self.processor, surface)
+        build::build(&self.processor, surface)
     }
 
-    /// Whether the daemon refused an action on `surface`, which then
-    /// takes no more.
-    pub fn is_stale(&self, surface: &str) -> bool {
-        self.stale.contains(surface)
+    /// What the daemon said when it refused an action on `surface`, which
+    /// then takes no more; `None` while the surface is current.
+    pub fn stale(&self, surface: &str) -> Option<&str> {
+        self.stale.get(surface).map(String::as_str)
     }
 
-    /// Records that the daemon refused an action on `surface`: the
-    /// session no longer has it as shown here. A later call that shows
-    /// the surface again makes it current.
-    pub fn mark_stale(&mut self, surface: &str) {
-        self.stale.insert(surface.to_owned());
-    }
-
-    /// The value at `binding` in `surface`'s data model.
-    pub fn read(&self, surface: &str, binding: &Pointer) -> Option<&Value> {
-        self.processor.surface(surface)?.data().get(binding)
+    /// Records that the daemon refused `action`, saying `message`: the
+    /// session no longer has its surface as shown here. A call that showed
+    /// the surface again since the user acted made it current, and it
+    /// stays so.
+    pub fn mark_stale(&mut self, action: &SurfaceAction, message: String) {
+        if self.draws(&action.shown) {
+            self.stale.insert(action.shown.surface.clone(), message);
+            self.changed.insert(action.shown.surface.clone());
+        }
     }
 
     /// Writes what the user entered at `binding`, as a two-way binding
     /// does. A write the data model refuses, as one through a value that
     /// is not a container, changes nothing.
     pub fn write(&mut self, surface: &str, binding: &Pointer, value: Value) {
-        if let Some(surface) = self.processor.surface_mut(surface) {
-            let _ = surface.set_data(binding, value);
+        if let Some(model) = self.processor.surface_mut(surface) {
+            if model.set_data(binding, value).is_ok() {
+                self.changed.insert(surface.to_owned());
+            }
         }
     }
 
@@ -177,12 +221,17 @@ impl SurfaceStore {
         let Some(dispatched) = self.processor.dispatch_action(&interaction, action) else {
             return Acted::default();
         };
+        self.changed.insert(surface.to_owned());
+        let shown = SurfaceRef {
+            call: self.drawn_under(surface).unwrap_or_default().to_owned(),
+            surface: surface.to_owned(),
+        };
         let mut acted = Acted::default();
         for message in &dispatched.outbound {
             match message {
                 RendererMessage::Action(_) => {
                     acted.send = Some(SurfaceAction {
-                        surface: surface.to_owned(),
+                        shown: shown.clone(),
                         action: message.to_json(),
                         data_model: dispatched.data_model.clone(),
                     });
@@ -200,5 +249,12 @@ impl SurfaceStore {
             }
         }
         acted
+    }
+
+    /// The surfaces that changed since the last call, by ID: messages,
+    /// edits and actions may change what any control of them shows, which
+    /// checks pass, and whether and where they are drawn.
+    pub fn take_changed(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.changed).into_iter().collect()
     }
 }

@@ -54,7 +54,8 @@
 //!   call and the turn answers "you sent" and the event's name; the event
 //!   [`surface::REFUSED_EVENT`] is refused instead, as a session refuses
 //!   an action on a surface it does not have. The prompt "gallery" shows
-//!   [`surface::gallery`] without waiting, and answers at once.
+//!   [`surface::gallery`] without waiting, and answers at once; "widen"
+//!   changes the form so ([`surface::widened`]).
 //!   [`FakeDaemon::fall_behind`] detaches a session's clients as fallen
 //!   behind; attaching again replays the calls with their surfaces.
 //! - With [`Script::tui_job`], the session "tui-1" has a turn under way, as
@@ -102,8 +103,8 @@ use rho_protocol::{
         BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, JobId, JobKind,
         JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef, PendingUpgrade,
         PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions, Replay, Seq,
-        SessionCommand, SessionId, SessionOptions, SteerId, StreamId, ToolCallId, ToolCallUpdate,
-        TurnId,
+        SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams, SteerId, StreamId,
+        ToolCallId, ToolCallUpdate, TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
@@ -262,17 +263,6 @@ pub struct Script {
     /// Whether [`KEY_AUTH`], which every session runs on, starts signed
     /// out, so a session opens only with `sign_in: later`.
     pub signed_out: bool,
-}
-
-/// An action a client sent with `rho/session/surface_action`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SentAction {
-    /// The surface it was sent for.
-    pub surface: String,
-    /// A2UI's `action` message, whole.
-    pub action: serde_json::Value,
-    /// The surface's data model, when the client attached it.
-    pub data_model: Option<serde_json::Value>,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -571,7 +561,7 @@ impl FakeDaemon {
 
     /// Every action clients sent `session` with
     /// `rho/session/surface_action`, the refused ones too, oldest first.
-    pub fn surface_actions(&self, session: &UiSessionId) -> Vec<SentAction> {
+    pub fn surface_actions(&self, session: &UiSessionId) -> Vec<SessionSurfaceActionParams> {
         self.service
             .lock()
             .sessions
@@ -788,7 +778,7 @@ struct FakeSession {
     /// attached to.
     subagent: bool,
     /// The actions clients sent on its surfaces.
-    surface_actions: Vec<SentAction>,
+    surface_actions: Vec<SessionSurfaceActionParams>,
 }
 
 impl FakeSession {

@@ -15,9 +15,9 @@ test-support = ["dep:portable-pty", "dep:tempfile", "tokio/time"]
 
 [dependencies]
 # The A2UI processor behind the surfaces a session's `ui` tool shows
-# (`surface.rs`).
-# rho's A2UI v1.0 core, released with rho: the same processor and catalog
-# the daemon checks a `ui` call's surface with. Named `a2ui` in the code.
+# (`surface.rs`): rho's A2UI v1.0 core, released with rho, the same
+# processor and catalog the daemon checks a `ui` call's surface with.
+# Named `a2ui` in the code.
 a2ui = { package = "rho-a2ui", version = "0.1.0" }
 # Prompt and user-message images travel base64-encoded.
 base64 = "0.22"
@@ -48,8 +48,9 @@ ring = "0.17"
 # Windows), come without a feature. russh brings a Pageant client too, which
 # rho-ui doesn't use (`ssh/auth.rs` says why).
 russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
-# Reads `rho update --check --json` (`rho_install.rs`) and a remote
-# machine's `rho daemon status --json` (`ssh/setup.rs`).
+# Reads `rho update --check --json` (`rho_install.rs`), a remote
+# machine's `rho daemon status --json` (`ssh/setup.rs`), and a surface's
+# enumerated properties (`surface/build.rs`).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"

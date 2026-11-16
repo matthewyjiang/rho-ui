@@ -30,9 +30,7 @@ use rho_protocol::{
     ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
-use super::{
-    shell_card, shell_output, surface, FakeSession, SentAction, State, Turn, KEY_AUTH, TOOL_IMAGE,
-};
+use super::{shell_card, shell_output, surface, FakeSession, State, Turn, KEY_AUTH, TOOL_IMAGE};
 
 #[derive(Debug)]
 pub(super) struct Fake {
@@ -249,6 +247,8 @@ enum Shown {
     Form,
     /// The gallery, which the call shows without waiting.
     Gallery,
+    /// The form, changed, which the call shows without waiting.
+    Widened,
 }
 
 impl Shown {
@@ -257,6 +257,7 @@ impl Shown {
         match prompt {
             "ui" => Some(Self::Form),
             "gallery" => Some(Self::Gallery),
+            "widen" => Some(Self::Widened),
             _ => None,
         }
     }
@@ -264,8 +265,8 @@ impl Shown {
 
 impl FakeSession {
     /// Runs `turn`, which calls the `ui` tool to show `shown`: the form's
-    /// call stays in progress until an action comes; the gallery's is
-    /// done, and the turn answers at once.
+    /// call stays in progress until an action comes; any other is done,
+    /// and the turn answers at once.
     fn show_surface(&mut self, turn: Turn, echo: SessionEvent, shown: Shown) {
         let (call, id) = (turn.tool.clone(), turn.id.clone());
         self.turn = Some(turn);
@@ -286,6 +287,15 @@ impl FakeSession {
                     surface::gallery(TOOL_IMAGE),
                 );
                 self.answer(&format!("m-{id}"), "Here is every component.");
+            }
+            Shown::Widened => {
+                self.ui(
+                    &call,
+                    ToolStatus::Completed,
+                    surface::FORM_SURFACE,
+                    surface::widened(),
+                );
+                self.answer(&format!("m-{id}"), "The form takes more now.");
             }
         }
     }
@@ -601,26 +611,23 @@ impl Service for Fake {
     ) -> Result<SessionSurfaceActionResponse, RpcError> {
         let mut state = self.lock();
         let session = state.session(&params.session)?;
-        session.surface_actions.push(SentAction {
-            surface: params.surface.clone(),
-            action: params.action.clone(),
-            data_model: params.data_model,
-        });
         let name = params.action["action"]["name"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        let shown = params.surface.clone();
+        session.surface_actions.push(params);
         if name == surface::REFUSED_EVENT {
             return Err(RpcError::new(
                 ErrorCode::InvalidParams,
-                format!("the session has no surface {}", params.surface),
+                format!("the session has no surface {shown}"),
             ));
         }
         // The prompt "ui" left its call waiting on the form.
         let waiting = session
             .turn
             .as_ref()
-            .filter(|_| params.surface == surface::FORM_SURFACE)
+            .filter(|_| shown == surface::FORM_SURFACE)
             .map(|turn| (turn.tool.clone(), turn.id.clone()));
         if let Some((call, turn)) = waiting {
             session.ui(

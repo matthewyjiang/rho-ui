@@ -9,7 +9,6 @@ use crate::{
     background::BackgroundId,
     input::{Form, InputChoice},
     options::{ConfigCategory, ConfigChoice, ConfigKind},
-    surface::{Node, SurfaceStore},
     tool_card::{SearchLine, ToolBody, ToolFact},
     Row, Timeline,
 };
@@ -835,26 +834,23 @@ fn remembered_background_work_settles_once_the_attach_catches_up() {
 }
 
 /// `ui` calls as a rho daemon sends them: a surface takes its place after
-/// the call that showed it, out of the run of tool calls, so a view that
-/// folds the run keeps it showing; a later call that updates the surface
-/// takes over drawing it.
+/// the call that showed it, once however often the call repeats it, out
+/// of the run of tool calls, so a view that folds the run keeps it
+/// showing.
 #[test]
-fn a_ui_calls_surface_follows_the_latest_call_that_showed_it() {
+fn a_ui_calls_surface_is_placed_once_after_the_call() {
     let mut session = session();
-    let mut store = SurfaceStore::default();
-    let mut drawn_under = Vec::new();
+    let mut placed = Vec::new();
     for line in include_str!("../tests/fixtures/ui_surface.jsonl").lines() {
         session.apply(update(serde_json::from_str(line).unwrap()));
-        for entry in session.entries() {
-            if let Entry::Surface(shown) = entry {
-                store.show(shown);
-            }
-        }
-        drawn_under.push(store.drawn_under("merge").map(str::to_owned));
+        placed.extend(
+            session
+                .take_placed_surfaces()
+                .into_iter()
+                .map(|placed| placed.shown().call().to_owned()),
+        );
     }
-    let first = Some("toolu_ui_1".to_owned());
-    let second = Some("toolu_ui_2".to_owned());
-    assert_eq!(drawn_under, [first.clone(), first.clone(), first, second]);
+    assert_eq!(placed, ["toolu_ui_1", "toolu_ui_2"]);
     assert_eq!(
         texts(&session),
         [
@@ -875,16 +871,5 @@ fn a_ui_calls_surface_follows_the_latest_call_that_showed_it() {
             Row::Work(2..4),
             Row::Message(4),
         ]
-    );
-    // The surface is the first call's, as the second changed it.
-    let tree = store.tree("merge").expect("the surface draws");
-    let Node::Column { children, .. } = &tree.root else {
-        panic!("the surface is a column: {:?}", tree.root);
-    };
-    assert!(
-        matches!(&children[0].node, Node::Text { text, .. }
-            if text == "Merged `fix` into `main`."),
-        "{:?}",
-        children[0].node
     );
 }

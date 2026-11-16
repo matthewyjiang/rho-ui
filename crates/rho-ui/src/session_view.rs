@@ -48,10 +48,9 @@ use gpui_kit::{
     Window,
 };
 use rho_ui_core::{
-    surface::{SurfaceAction, SurfaceStore},
-    Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon, DaemonError, Entry,
-    InputId, JobActivity, Prompt, Run, RunState, Session, SessionId, SessionUpdate, SteerId,
-    SurfaceActionError, TurnId, Unsteered,
+    surface::SurfaceAction, Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon,
+    DaemonError, Entry, InputId, JobActivity, Prompt, Run, RunState, Session, SessionId,
+    SessionUpdate, SteerId, SurfaceActionError, TurnId, Unsteered,
 };
 
 use crate::{
@@ -66,7 +65,7 @@ use crate::{
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
-    surface_view::{Standing, SurfaceEvent, SurfacePanel},
+    surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
     usage::UsageRing,
@@ -155,14 +154,8 @@ pub(crate) struct SessionView {
     reported: (String, Activity),
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
-    /// The surfaces the session's `ui` calls showed: its A2UI processor.
-    /// It goes with the view, which a session that fell behind replaces.
-    surfaces: SurfaceStore,
-    /// How many of the session's entries [`Self::sync_surfaces`] has
-    /// looked at for surfaces.
-    surfaces_seen: usize,
-    /// The surfaces' events.
-    surface_subscriptions: Vec<Subscription>,
+    /// The surfaces the session's `ui` calls showed.
+    surfaces: Surfaces,
     /// Whether the agent's todo list above the composer is open.
     plan: Disclosure,
     focus_handle: FocusHandle,
@@ -256,9 +249,7 @@ impl SessionView {
             waiting_since: None,
             reported: (String::new(), Activity::Idle),
             error: None,
-            surfaces: SurfaceStore::default(),
-            surfaces_seen: 0,
-            surface_subscriptions: Vec::new(),
+            surfaces: Surfaces::default(),
             plan: Disclosure::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -534,10 +525,9 @@ impl SessionView {
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if let Some(from) = self.session.take_removed() {
             self.transcript.truncate(from, cx);
-            self.surfaces_seen = self.surfaces_seen.min(from);
         }
         self.transcript.sync(self.session.entries(), cx);
-        self.sync_surfaces(window, cx);
+        self.surfaces.sync(&mut self.session, window, cx);
         self.transcript.set_delay(self.session.delay());
         self.sync_settings(window, cx);
         self.sync_card(window, cx);
@@ -991,76 +981,9 @@ impl SessionView {
         .detach();
     }
 
-    /// Brings the surfaces up to date with the `ui` calls that arrived
-    /// since the last call: a call's messages may create, change, move or
-    /// delete any surface, so every panel takes its surface as it stands.
-    fn sync_surfaces(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let mut arrived = Vec::new();
-        for entry in self.session.entries().iter().skip(self.surfaces_seen) {
-            if let Entry::Surface(shown) = entry {
-                if self.surfaces.show(shown) {
-                    arrived.push(shown.surface().to_owned());
-                }
-            }
-        }
-        self.surfaces_seen = self.session.entries().len();
-        if arrived.is_empty() {
-            return;
-        }
-        for surface in arrived {
-            if self.transcript.surface(&surface).is_none() {
-                let panel = cx.new(|_| SurfacePanel::new(surface.clone()));
-                self.surface_subscriptions.push(cx.subscribe_in(
-                    &panel,
-                    window,
-                    Self::on_surface_event,
-                ));
-                // A panel that redraws may have changed height: a check's
-                // message came or went, or another tab shows.
-                let changed = surface.clone();
-                self.surface_subscriptions
-                    .push(cx.observe(&panel, move |this, _, cx| {
-                        this.transcript
-                            .surface_changed(&changed, this.session.entries(), cx);
-                    }));
-                self.transcript.set_surface(surface, panel);
-            }
-        }
-        let shown: Vec<String> = self
-            .session
-            .entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::Surface(shown) => Some(shown.surface().to_owned()),
-                _ => None,
-            })
-            .collect();
-        for surface in shown {
-            self.show_surface(&surface, window, cx);
-        }
-    }
-
-    /// Gives surface `surface`'s panel the surface as the store has it.
-    fn show_surface(&mut self, surface: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(panel) = self.transcript.surface(surface).cloned() else {
-            return;
-        };
-        let store = &self.surfaces;
-        let (tree, drawn_under, standing) = (
-            store.tree(surface),
-            store.drawn_under(surface).map(str::to_owned),
-            if store.is_stale(surface) {
-                Standing::Stale
-            } else {
-                Standing::Current
-            },
-        );
-        panel.update(cx, |panel, cx| {
-            panel.show(tree, drawn_under.as_deref(), standing, window, cx);
-        });
-    }
-
-    fn on_surface_event(
+    /// What the user did on a surface: the store takes it, and every
+    /// surface it changed draws again.
+    pub(crate) fn on_surface_event(
         &mut self,
         panel: &Entity<SurfacePanel>,
         event: &SurfaceEvent,
@@ -1068,12 +991,13 @@ impl SessionView {
         cx: &mut Context<'_, Self>,
     ) {
         let surface = panel.read(cx).surface().to_owned();
+        let store = self.surfaces.store_mut();
         match event {
             SurfaceEvent::Write { binding, value } => {
-                self.surfaces.write(&surface, binding, value.clone());
+                store.write(&surface, binding, value.clone());
             }
             SurfaceEvent::Act { target, action } => {
-                let acted = self.surfaces.act(&surface, target, action);
+                let acted = store.act(&surface, target, action);
                 for url in &acted.open {
                     cx.open_url(url);
                 }
@@ -1088,14 +1012,19 @@ impl SessionView {
                 }
             }
         }
-        // The edit, or what the action's function wrote, may change what
-        // any control of the surface shows and which checks pass.
-        self.show_surface(&surface, window, cx);
+        self.surfaces.redraw(window, cx);
         cx.notify();
     }
 
+    /// The panel of `surface` changed, and may have changed height.
+    pub(crate) fn surface_resized(&self, surface: &str, cx: &mut Context<'_, Self>) {
+        self.transcript
+            .surface_changed(surface, self.session.entries(), cx);
+    }
+
     /// Sends `action` to the session. A session that no longer has the
-    /// surface refuses it: the surface then says it is out of date, and
+    /// surface refuses it: unless a later call showed the surface since,
+    /// it then says it is out of date, with what the daemon said, and
     /// takes no more.
     fn send_surface_action(
         &mut self,
@@ -1113,9 +1042,9 @@ impl SessionView {
                 let _ = panel.update(cx, SurfacePanel::sent);
                 match sent {
                     Ok(()) => {}
-                    Err(SurfaceActionError::Stale(_)) => {
-                        this.surfaces.mark_stale(action.surface());
-                        this.show_surface(action.surface(), window, cx);
+                    Err(SurfaceActionError::Stale(said)) => {
+                        this.surfaces.store_mut().mark_stale(&action, said);
+                        this.surfaces.redraw(window, cx);
                     }
                     Err(SurfaceActionError::Failed(error)) => {
                         this.error = Some(format!("Couldn't send the form's action: {error}"));
@@ -1219,6 +1148,7 @@ impl SessionView {
                             this.transcript.render_row(
                                 ix,
                                 this.session.entries(),
+                                &this.surfaces,
                                 &act,
                                 &content,
                                 cx,
