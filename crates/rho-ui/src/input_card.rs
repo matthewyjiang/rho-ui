@@ -35,7 +35,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, Questions,
@@ -473,11 +473,13 @@ impl InputCard {
                     )))
                     .test_support()
                     .w_full()
-                    .child(QuestionnaireChoice::new(
-                        state,
-                        item.clone(),
-                        choice.value.clone(),
-                    ))
+                    .child(
+                        // Kit's text column is a flex item as wide as its
+                        // unwrapped text; letting it shrink wraps a long
+                        // description instead of spilling out of the card.
+                        QuestionnaireChoice::new(state, item.clone(), choice.value.clone())
+                            .content_style(StyleRefinement::default().min_w_0()),
+                    )
             });
             QuestionnaireItem::new(state, item.clone())
                 .child(QuestionnaireTitle::new(state, item.clone()))

@@ -129,12 +129,26 @@ pub fn questions() -> Vec<Question> {
         label: label.to_owned(),
         description: None,
     };
+    let described = |value: &str, label: &str, description: &str| Choice {
+        description: Some(description.to_owned()),
+        ..choice(value, label)
+    };
     vec![
         Question {
             id: "lang".to_owned(),
             prompt: "Which language should the tool use?".to_owned(),
             header: Some("Language".to_owned()),
-            choices: vec![choice("rust", "Rust"), choice("go", "Go")],
+            // Rust's description is too long for one line of any window.
+            choices: vec![
+                described(
+                    "rust",
+                    "Rust",
+                    &"What the rest of the repo is written in, so it shares the lints, \
+                      the build and the release. "
+                        .repeat(4),
+                ),
+                described("go", "Go", "Quicker to build."),
+            ],
             selection: Selection::One,
             allow_other: true,
             help: None,

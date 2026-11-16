@@ -949,6 +949,12 @@ fn a_questionnaire_is_answered_one_question_at_a_time() {
             "one question at a time"
         );
         assert!(!is_visible(window, "input-timeout"), "no timeout was set");
+        // Both choices have a description; only Rust's wraps.
+        let height = |id| bounds(window, id).map(|b| b.size.height);
+        assert!(
+            height("question-lang-rust") > height("question-lang-go"),
+            "a long description wraps"
+        );
     });
     ui.shot("first");
 
