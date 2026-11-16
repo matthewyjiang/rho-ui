@@ -54,6 +54,7 @@ use rho_ui_core::{
 };
 
 use crate::{
+    added_dirs::{AddedDirs, DirsAccess},
     auths::Auths,
     background::{BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler},
     background_log::{BackgroundLog, Recorded},
@@ -130,10 +131,17 @@ pub(crate) struct SessionView {
     /// The sign-in its model's auth profile needs, while it is signed out;
     /// see [`Self::with_sign_in`].
     sign_in: Option<SignInSlot>,
+    /// The directories the session reaches besides its workspace, in the
+    /// title bar.
+    added_dirs: Entity<AddedDirs>,
     /// The oldest open request, while there is one, and its events.
     card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt is on its way to the daemon.
     sending: bool,
+    /// Steers, and messages refused as busy that wait on the job list,
+    /// whose answers haven't come: what they carry may go back in the
+    /// composer.
+    in_flight: usize,
     /// Background work the user asked to stop that still runs.
     stopping: Vec<BackgroundId>,
     /// The subagent and workflow runs the session started, as the daemon's
@@ -203,6 +211,15 @@ impl SessionView {
                 cx,
             )
         });
+        let added_dirs = new_added_dirs(
+            &daemon,
+            &session,
+            &cwd,
+            &workspace,
+            DirsAccess::Add,
+            window,
+            cx,
+        );
         let subscriptions =
             vec![
                 cx.subscribe_in(&settings, window, Self::on_settings_event),
@@ -239,8 +256,10 @@ impl SessionView {
             composer,
             settings,
             sign_in: None,
+            added_dirs,
             card: None,
             sending: false,
+            in_flight: 0,
             stopping: Vec::new(),
             runs: Vec::new(),
             recorded,
@@ -305,8 +324,19 @@ impl SessionView {
             window,
             cx,
         );
+        // Only its run changes a subagent's session.
+        let added_dirs = new_added_dirs(
+            &view.daemon,
+            &view.session,
+            &view.cwd,
+            &view.workspace,
+            DirsAccess::ListOnly,
+            window,
+            cx,
+        );
         Self {
             parent: Some(parent.downgrade()),
+            added_dirs,
             _above: renamed,
             ..view
         }
@@ -385,6 +415,30 @@ impl SessionView {
     /// Whether the attach failed, so the view shows only why.
     pub(crate) fn failed_to_attach(&self) -> bool {
         matches!(self.loading, Loading::Failed(_))
+    }
+
+    /// Whether the app may let the session go while it is off screen:
+    /// its attach has answered and caught up, no turn runs or waits on a
+    /// person, no message or change is on its way or held, no error waits
+    /// to be read, and nothing typed, a message or a key, would be lost. Opening it again
+    /// replays it. Background work that ended stays listed until the
+    /// daemon's own turn gives the model its result, so the session waits
+    /// for that turn too.
+    pub(crate) fn can_close(&self, cx: &App) -> bool {
+        let session = &self.session;
+        !matches!(self.loading, Loading::Attaching)
+            && !session.is_replaying()
+            && !session.state().is_busy()
+            && session.inputs().is_empty()
+            && session.background().is_empty()
+            && session.held().is_none()
+            && !self.sending
+            && self.in_flight == 0
+            && self.error.is_none()
+            && self.composer.read(cx).is_empty(cx)
+            && self.sign_in.as_ref().is_none_or(|slot| slot.is_empty(cx))
+            && self.settings.read(cx).is_settled()
+            && self.added_dirs.read(cx).is_settled(cx)
     }
 
     /// What the sidebar shows for this session.
@@ -675,9 +729,11 @@ impl SessionView {
         let daemon = self.daemon.clone();
         let id = self.session.id().clone();
         let ended = self.session.ended_turn().cloned();
+        self.in_flight += 1;
         cx.spawn_in(window, async move |this, cx| {
             let result = daemon.steer(&id, &text).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight -= 1;
                 match result {
                     Ok(steer) => {
                         this.session.steer_sent(steer, text);
@@ -722,9 +778,11 @@ impl SessionView {
             return;
         }
         let daemon = self.daemon.clone();
+        self.in_flight += 1;
         cx.spawn_in(window, async move |this, cx| {
             let jobs = daemon.jobs().await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight -= 1;
                 let id = this.session.id();
                 // Only a turn under way or waiting for a person refuses one.
                 let listed = jobs.is_ok_and(|jobs| {
@@ -1071,6 +1129,9 @@ impl SessionView {
         self.composer.update(cx, |composer, cx| {
             composer.set_commands(self.session.commands(), cx);
         });
+        self.added_dirs.update(cx, |dirs, cx| {
+            dirs.sync(self.session.added_dirs(), cx);
+        });
     }
 
     fn on_settings_event(
@@ -1342,7 +1403,8 @@ impl SessionView {
     }
 
     /// The project, which starts a new session in it, the sessions above
-    /// this one, each a link to it, and this one's title, with its ended background work at the right.
+    /// this one, each a link to it, and this one's title, with its added
+    /// directories and ended background work at the right.
     fn render_title_bar(&self, cx: &mut Context<'_, Self>) -> TitleBar {
         let mut above = Vec::new();
         let mut next = self.parent();
@@ -1364,10 +1426,16 @@ impl SessionView {
                 let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Show(target.clone())));
             });
         }
-        bar.trailing(BackgroundHistory::new(
+        let ended = BackgroundHistory::new(
             self.session.ended_background(),
             &self.runs,
             Self::open_handler(cx.entity().downgrade()),
+        );
+        bar.trailing(Some(
+            h_flex()
+                .gap_1()
+                .child(self.added_dirs.clone())
+                .children(ended),
         ))
     }
 
@@ -1445,6 +1513,22 @@ impl Render for SessionView {
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }
+}
+
+/// The added directories of `session`, which works in `cwd`; see
+/// [`AddedDirs::new`].
+fn new_added_dirs(
+    daemon: &Daemon,
+    session: &Session,
+    cwd: &Place,
+    workspace: &WorkspaceRef,
+    access: DirsAccess,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<AddedDirs> {
+    let (daemon, id, cwd) = (daemon.clone(), session.id().clone(), cwd.clone());
+    let workspaces = workspace.table().clone();
+    cx.new(|cx| AddedDirs::new(daemon, id, cwd, workspaces, access, window, cx))
 }
 
 /// A held message on one line: its text, and what is attached to it, such
