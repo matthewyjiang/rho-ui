@@ -146,7 +146,12 @@ fn a_form_sends_what_the_user_entered_and_stays_usable() {
 
     widen(&mut ui, &session);
 
-    ui.act(|window, cx| window.click(control("deploy", "stale"), cx));
+    // The form takes no action while one is on its way.
+    let refuse = control("deploy", "stale");
+    ui.wait_until("the second action answered", |window, _, _| {
+        is_enabled(window, &refuse)
+    });
+    ui.act(|window, cx| window.click(refuse.clone(), cx));
     ui.wait_for_daemon("the refused action", |fake| {
         fake.surface_actions(&session).len() == 3
     });
