@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::{BackgroundExecutor, Context, Entity, SharedString, Task};
+use gpui_kit::{BackgroundExecutor, Context, Entity, EntityId, SharedString, Task};
 
 use rho_ui_core::SessionId;
 
@@ -44,12 +44,12 @@ const INDEX_POLL: Duration = Duration::from_secs(300);
 /// point (measured), so this holds back 25 minutes of polling.
 pub(crate) const BUDGET_FLOOR: u32 = 50;
 
-/// The PR linked by hand to each session, which the Pull request surface
-/// shows in place of its branch's, kept in the state database's
-/// `pr_links` table. A global.
+/// The PRs linked by hand to each session, in the order linked, each shown
+/// in a Pull request tab of its own beside the branch's; kept in the state
+/// database's `pr_links` table. A global.
 #[derive(Debug)]
 pub(crate) struct PrLinks {
-    links: HashMap<SessionKey, PrId>,
+    links: HashMap<SessionKey, Vec<PrId>>,
     db: StateDb,
 }
 
@@ -58,8 +58,8 @@ impl gpui_kit::Global for PrLinks {}
 impl PrLinks {
     /// Loads every saved link.
     pub(crate) fn load(db: &StateDb) -> Self {
-        let links = db.query(
-            "SELECT machine, session_id, host, owner, name, number FROM pr_links",
+        let rows = db.query(
+            "SELECT machine, session_id, host, owner, name, number FROM pr_links ORDER BY rowid",
             [],
             |row| {
                 let machine = MachineId::from(row.get::<_, String>(0)?.as_str());
@@ -76,35 +76,66 @@ impl PrLinks {
                 Ok((SessionKey::new(machine, session), id))
             },
         );
+        let mut links: HashMap<SessionKey, Vec<PrId>> = HashMap::new();
+        for (session, id) in rows {
+            links.entry(session).or_default().push(id);
+        }
         Self {
-            links: links.into_iter().collect(),
+            links,
             db: db.clone(),
         }
     }
 
-    /// The PR linked to `session`, if one is.
-    pub(crate) fn get(&self, session: &SessionKey) -> Option<&PrId> {
-        self.links.get(session)
+    /// The PRs linked to `session`, in the order linked.
+    pub(crate) fn get(&self, session: &SessionKey) -> &[PrId] {
+        self.links.get(session).map_or(&[], Vec::as_slice)
     }
 
-    /// Links `link` to `session`, or with `None`, unlinks it.
-    pub(crate) fn set(&mut self, session: &SessionKey, link: Option<PrId>) {
-        let key = (session.machine.as_str(), session.id.as_str());
-        let Some(id) = link else {
-            self.db.execute(
-                "DELETE FROM pr_links WHERE machine = ?1 AND session_id = ?2",
-                key,
-            );
-            self.links.remove(session);
+    /// Links `id` to `session`, after those linked before; a PR linked
+    /// already stays where it is.
+    pub(crate) fn add(&mut self, session: &SessionKey, id: PrId) {
+        let linked = self.links.entry(session.clone()).or_default();
+        if linked.contains(&id) {
             return;
-        };
-        let repo = &id.repo;
+        }
         self.db.execute(
-            "INSERT OR REPLACE INTO pr_links (machine, session_id, host, owner, name, number) \
+            "INSERT OR IGNORE INTO pr_links (machine, session_id, host, owner, name, number) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            (key.0, key.1, &repo.host, &repo.owner, &repo.name, id.number),
+            Self::row(session, &id),
         );
-        self.links.insert(session.clone(), id);
+        linked.push(id);
+    }
+
+    /// Unlinks `id` from `session`.
+    pub(crate) fn remove(&mut self, session: &SessionKey, id: &PrId) {
+        self.db.execute(
+            "DELETE FROM pr_links WHERE machine = ?1 AND session_id = ?2 \
+             AND host = ?3 AND owner = ?4 AND name = ?5 AND number = ?6",
+            Self::row(session, id),
+        );
+        if let Some(linked) = self.links.get_mut(session) {
+            linked.retain(|linked| linked != id);
+            if linked.is_empty() {
+                self.links.remove(session);
+            }
+        }
+    }
+
+    /// The `pr_links` row of `id` linked to `session`, in its columns'
+    /// order.
+    fn row<'a>(
+        session: &'a SessionKey,
+        id: &'a PrId,
+    ) -> (&'a str, &'a str, &'a str, &'a str, &'a str, u32) {
+        let repo = &id.repo;
+        (
+            session.machine.as_str(),
+            session.id.as_str(),
+            &repo.host,
+            &repo.owner,
+            &repo.name,
+            id.number,
+        )
     }
 }
 
@@ -268,20 +299,12 @@ pub(crate) enum NoTarget {
 }
 
 impl Target {
-    /// What a session follows: the PR linked to it in `links`, else its
-    /// branch's in `workspace`.
+    /// The PR of the branch `workspace` is on.
     ///
     /// # Errors
     ///
-    /// When it has neither: why.
-    pub(crate) fn of(
-        session: &SessionKey,
-        workspace: &Workspace,
-        links: &PrLinks,
-    ) -> Result<Self, NoTarget> {
-        if let Some(id) = links.get(session) {
-            return Ok(Target::Pr(id.clone()));
-        }
+    /// When it is on none, or its repository is on no forge: why.
+    pub(crate) fn branch(workspace: &Workspace) -> Result<Self, NoTarget> {
         let branch = match workspace.head() {
             None => return Err(NoTarget::NotGit),
             Some(Head::Detached(hash)) => return Err(NoTarget::Detached(hash.clone())),
@@ -292,6 +315,23 @@ impl Target {
             .and_then(RepoId::from_url)
             .ok_or(NoTarget::NoForge)?;
         Ok(Target::Branch(BranchId { repo, branch }))
+    }
+
+    /// What a session's sidebar row marks: its [branch's](Self::branch)
+    /// PR, else the first PR linked to it in `links`.
+    ///
+    /// # Errors
+    ///
+    /// When it has neither: why it has no branch's.
+    pub(crate) fn of(
+        session: &SessionKey,
+        workspace: &Workspace,
+        links: &PrLinks,
+    ) -> Result<Self, NoTarget> {
+        Self::branch(workspace).or_else(|why| {
+            let first = links.get(session).first().ok_or(why)?;
+            Ok(Target::Pr(first.clone()))
+        })
     }
 }
 
@@ -354,6 +394,9 @@ pub(crate) struct PullRequests {
     forges: Entity<Forges>,
     workspaces: Entity<Workspaces>,
     on_screen: Option<Watch>,
+    /// The surface that asked for `on_screen`: two sessions may watch the
+    /// same target, and only the one that asked last can stop it.
+    shown_by: Option<EntityId>,
     found: HashMap<Target, Found>,
     details: HashMap<PrId, PrDetail>,
     default_branches: HashMap<RepoId, Option<String>>,
@@ -394,6 +437,7 @@ impl PullRequests {
             forges,
             workspaces,
             on_screen: None,
+            shown_by: None,
             found: HashMap::new(),
             details: HashMap::new(),
             default_branches: HashMap::new(),
@@ -464,21 +508,34 @@ impl PullRequests {
         })
     }
 
-    /// Watches `watch` for the Pull request surface, or nothing. A branch
-    /// not read in the last [`POLL`] is read at once.
-    pub(crate) fn set_on_screen(&mut self, watch: Option<Watch>, cx: &mut Context<'_, Self>) {
-        if self.on_screen == watch {
+    /// Watches `watch` for `surface`, the Pull request surface on screen,
+    /// in place of what another watched. A target not read in the last
+    /// [`POLL`] is read at once.
+    pub(crate) fn show(&mut self, surface: EntityId, watch: Watch, cx: &mut Context<'_, Self>) {
+        self.shown_by = Some(surface);
+        if self.on_screen.as_ref() == Some(&watch) {
             return;
         }
-        self.on_screen = watch;
         self.blocked = None;
-        if let Some(watch) = &self.on_screen {
-            if self.poll.is_running() && !self.poll.was_for(&watch.target) {
-                // One for this follows the one under way for another.
-                self.poll.again();
-            }
-            self.poll_when_due(cx);
-        } else if !self.poll.is_running() {
+        if self.poll.is_running() && !self.poll.was_for(&watch.target) {
+            // One for this follows the one under way for another.
+            self.poll.again();
+        }
+        self.on_screen = Some(watch);
+        self.poll_when_due(cx);
+        cx.notify();
+    }
+
+    /// Stops watching for `surface`, as it left the screen. Another surface
+    /// may show already, as tabs switch: what it watches stays.
+    pub(crate) fn hide(&mut self, surface: EntityId, cx: &mut Context<'_, Self>) {
+        if self.shown_by != Some(surface) {
+            return;
+        }
+        self.shown_by = None;
+        self.on_screen = None;
+        self.blocked = None;
+        if !self.poll.is_running() {
             // Nothing to poll for: a timer waiting for the next poll goes.
             self.poll.task = Task::ready(());
         }

@@ -1,9 +1,11 @@
-//! The Pull request surface: the PR whose head is the branch of the session
-//! on screen, as [`PullRequests`] reads it: what it is ([`header`]), its
-//! checks ([`checks`]), its description, and its threads on the code and
-//! conversation, with a box to comment in ([`conversation`]). It watches the
-//! branch only while it shows, so a hidden panel or another tab costs no
-//! queries; the session's turn ending reads it again, and so does Refresh.
+//! The Pull request surface: one of a session's PRs, as [`PullRequests`]
+//! reads it: the one whose head is its branch, or one linked by hand
+//! ([`link`]), each in a tab of its own ([`Shows`]). It shows what the PR is
+//! ([`header`]), its checks ([`checks`]), its description, and its threads
+//! on the code and conversation, with a box to comment in
+//! ([`conversation`]). It watches the PR only while it shows, so a hidden
+//! panel or another tab costs no queries; the session's turn ending reads
+//! it again, and so does Refresh.
 
 mod actions;
 mod checks;
@@ -27,25 +29,26 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, relative, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity,
-    Focusable as _, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    EventEmitter, Focusable as _, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, Render, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Window,
 };
 
 pub(crate) use self::header::state_look;
+pub(super) use self::link::ShowLinked;
 use self::{
     actions::Acting,
     checks::{check_counts, checks},
     conversation::{open_threads, Posting},
-    header::{identity, toolbar, web_url, Linked},
+    header::{identity, toolbar, web_url},
     link::{link_button, LinkForm},
 };
 use crate::{
     machines::{Place, SessionKey},
     pull_requests::{
-        Found, Lookup, NoTarget, PrDetail, PrId, PrLinks, PrSummary, PullRequests, Refresh, RepoId,
-        Target, Trouble, Watch, BUDGET_FLOOR,
+        Found, Lookup, NoTarget, PrDetail, PrId, PrSummary, PullRequests, Refresh, RepoId, Target,
+        Trouble, Watch, BUDGET_FLOOR,
     },
-    session_view::{SessionEvent, SessionView},
     time,
     workspaces::{WorkspaceRef, Workspaces},
 };
@@ -57,20 +60,24 @@ pub(super) enum Visibility {
     Hidden,
 }
 
-/// The session on screen, as the surface follows it.
-struct Followed {
-    key: SessionKey,
-    workspace: WorkspaceRef,
-    /// Reads the PR again when the session's turn ends.
-    _turns: Subscription,
+/// Which of its session's PRs a surface shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Shows {
+    /// The one whose head is the session's branch, or why there is none.
+    Branch,
+    /// One linked by hand, in [`crate::pull_requests::PrLinks`].
+    Linked(PrId),
 }
 
-/// The Pull request surface of [`super::RightPanel`]: it follows the
-/// session the panel shows.
+/// The Pull request surface of [`super::RightPanel`]: one PR of the
+/// session its tab belongs to.
 pub(super) struct PullRequestSurface {
     prs: Entity<PullRequests>,
-    workspaces: Entity<Workspaces>,
-    session: Option<Followed>,
+    /// Its session.
+    session: SessionKey,
+    /// The session's folder, whose branch and origin it reads.
+    workspace: WorkspaceRef,
+    shows: Shows,
     /// Whether it is on screen: the tab shown in a panel that shows.
     visibility: Visibility,
     /// The Markdown of the PR on screen, parsed once per text it has: its
@@ -92,8 +99,10 @@ pub(super) struct PullRequestSurface {
 impl PullRequestSurface {
     pub(super) fn new(
         prs: Entity<PullRequests>,
-        workspaces: Entity<Workspaces>,
-        session: Option<&Entity<SessionView>>,
+        workspaces: &Entity<Workspaces>,
+        session: SessionKey,
+        place: &Place,
+        shows: Shows,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let subscriptions = [
@@ -102,17 +111,20 @@ impl PullRequestSurface {
                 cx.notify();
             }),
             // A branch switch shows in the workspace once it is read again.
-            cx.observe(&workspaces, |this, _, cx| this.watch(cx)),
+            cx.observe(workspaces, |this, _, cx| this.watch(cx)),
         ];
         // Closing the tab stops the polling for it.
-        cx.on_release(|this, cx| {
-            this.prs.update(cx, |prs, cx| prs.set_on_screen(None, cx));
+        let surface = cx.entity_id();
+        cx.on_release(move |this, cx| {
+            this.prs.update(cx, |prs, cx| prs.hide(surface, cx));
         })
         .detach();
+        let workspace = WorkspaceRef::new(workspaces, place, cx);
         let mut this = Self {
             prs,
-            workspaces,
-            session: None,
+            session,
+            workspace,
+            shows,
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
             flipped: HashSet::new(),
@@ -122,47 +134,16 @@ impl PullRequestSurface {
             acting: Acting::Idle,
             _subscriptions: subscriptions,
         };
-        this.set_session(session, cx);
+        this.watch(cx);
         this
     }
 
-    /// Shows the PR of `session`'s branch, or nothing without one.
-    pub(super) fn set_session(
-        &mut self,
-        session: Option<&Entity<SessionView>>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let key = session.map(|view| view.read(cx).live().id);
-        if key.as_ref() != self.session.as_ref().map(|followed| &followed.key) {
-            // A form open for the last session doesn't link this one, nor
-            // does a merge asked for there, or a comment written there, go
-            // to this one's PR. One under way still finishes, unseen.
-            self.link_form = None;
-            if let Acting::Running(task) = std::mem::replace(&mut self.acting, Acting::Idle) {
-                task.detach();
-            }
-            if let Posting::Sending(task) = std::mem::replace(&mut self.posting, Posting::Idle) {
-                task.detach();
-            }
-            self.comment_box = None;
+    /// Reads the PR again as the session's turn ended, if it shows.
+    pub(super) fn turn_ended(&mut self, cx: &mut Context<'_, Self>) {
+        if self.visibility == Visibility::Shown {
+            self.prs
+                .update(cx, |prs, cx| prs.refresh(Refresh::Changed, cx));
         }
-        self.session = session.map(|view| {
-            let live = view.read(cx).live();
-            let place = Place::new(live.id.machine.clone(), live.cwd);
-            let workspace = WorkspaceRef::new(&self.workspaces, &place, cx);
-            let turns = cx.subscribe(view, |this, _, event: &SessionEvent, cx| {
-                if matches!(event, SessionEvent::Saved) && this.visibility == Visibility::Shown {
-                    this.prs
-                        .update(cx, |prs, cx| prs.refresh(Refresh::Changed, cx));
-                }
-            });
-            Followed {
-                key: live.id,
-                workspace,
-                _turns: turns,
-            }
-        });
-        self.watch(cx);
     }
 
     /// Shows the surface or hides it: only one on screen polls.
@@ -173,15 +154,37 @@ impl PullRequestSurface {
         }
     }
 
-    /// What the surface follows: the PR linked to the session, else its
+    /// The PR linked by hand that it shows, if it shows one.
+    pub(super) fn linked(&self) -> Option<&PrId> {
+        match &self.shows {
+            Shows::Branch => None,
+            Shows::Linked(id) => Some(id),
+        }
+    }
+
+    /// What its tab says: the PR's number, once its branch's is found.
+    pub(super) fn label(&self, cx: &App) -> SharedString {
+        let number = match &self.shows {
+            Shows::Linked(id) => Some(id.number),
+            Shows::Branch => self.target(cx).ok().and_then(|target| {
+                let pr = self.prs.read(cx).pr(&target)?;
+                Some(pr.id.number)
+            }),
+        };
+        number.map_or_else(
+            || "Pull request".into(),
+            |number| format!("#{number}").into(),
+        )
+    }
+
+    /// What the surface follows: the PR it links, else its session's
     /// branch's, in a repository on a forge; or why there is none.
     fn target(&self, cx: &App) -> Result<Target, SharedString> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| SharedString::from("Open a session to see its pull request."))?;
-        let workspace = session.workspace.read(cx);
-        Target::of(&session.key, workspace, cx.global::<PrLinks>()).map_err(|why| match why {
+        if let Shows::Linked(id) = &self.shows {
+            return Ok(Target::Pr(id.clone()));
+        }
+        let workspace = self.workspace.read(cx);
+        Target::branch(workspace).map_err(|why| match why {
             NoTarget::NotGit => "This session's folder isn't in a git repository.".into(),
             NoTarget::Detached(hash) => {
                 format!("This session's checkout is on no branch, at {hash}.").into()
@@ -192,7 +195,7 @@ impl PullRequestSurface {
 
     /// The repository of the session's origin remote, if it is on a forge.
     fn origin(&self, cx: &App) -> Option<RepoId> {
-        let workspace = self.session.as_ref()?.workspace.read(cx);
+        let workspace = self.workspace.read(cx);
         RepoId::from_url(workspace.origin()?)
     }
 
@@ -202,11 +205,15 @@ impl PullRequestSurface {
             .target(cx)
             .ok()
             .filter(|_| self.visibility == Visibility::Shown)
-            .and_then(|target| {
-                let machine = self.session.as_ref()?.key.machine.clone();
-                Some(Watch { machine, target })
+            .map(|target| Watch {
+                machine: self.session.machine.clone(),
+                target,
             });
-        self.prs.update(cx, |prs, cx| prs.set_on_screen(watch, cx));
+        let surface = cx.entity_id();
+        self.prs.update(cx, |prs, cx| match watch {
+            Some(watch) => prs.show(surface, watch, cx),
+            None => prs.hide(surface, cx),
+        });
         self.sync_texts(cx);
         cx.notify();
     }
@@ -442,13 +449,12 @@ fn message(
         .into_any_element()
 }
 
+impl EventEmitter<ShowLinked> for PullRequestSurface {}
+
 impl Render for PullRequestSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.ensure_comment_box(window, cx);
         let cx = &*cx;
-        if self.session.is_none() {
-            return message("Open a session to see its pull request.", None, None);
-        }
         let target = self.target(cx);
         let prs = self.prs.read(cx);
         let (pr, trouble, content) = match &target {
@@ -481,10 +487,6 @@ impl Render for PullRequestSurface {
                 (pr, trouble, content)
             }
         };
-        let linked = match target {
-            Ok(Target::Pr(_)) => Linked::ByHand,
-            _ => Linked::ByBranch,
-        };
         v_flex()
             .id("pull-request")
             .test_support()
@@ -492,7 +494,7 @@ impl Render for PullRequestSurface {
             .child(toolbar(
                 target.as_ref().ok().map(Target::repo),
                 pr,
-                linked,
+                &self.shows,
                 cx,
             ))
             .children(self.link_form(cx))

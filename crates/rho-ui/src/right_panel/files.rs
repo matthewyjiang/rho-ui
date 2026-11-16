@@ -1,11 +1,11 @@
-//! The Files surface: the files in the folder of the session on screen,
-//! as a tree, and any one of them opened read-only, its syntax
+//! The Files surface: the files in the folder of the session its tab
+//! belongs to, as a tree, and any one of them opened read-only, its syntax
 //! highlighted. In a git repository it lists what git sees: tracked files
 //! that are there, and untracked ones `.gitignore` doesn't leave out;
 //! outside one, every file under the folder. It reads them on the
-//! session's machine when it opens, when another session comes on screen,
-//! when the session's turn ends, and on Refresh, and the open file with
-//! them.
+//! session's machine when it opens, when its session comes back on screen
+//! or its turn ends ([`super::RightPanel`] says when), and on Refresh, and
+//! the open file with them.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -36,7 +36,6 @@ use crate::{
     folders::{find, Deadline, FileRead, Reader},
     local,
     machines::Place,
-    session_view::{SessionEvent, SessionView},
     workspaces::Workspaces,
 };
 
@@ -137,13 +136,11 @@ struct OpenFile {
     load: Task<()>,
 }
 
-/// The Files surface of [`super::RightPanel`]: it follows the session the
-/// panel shows.
+/// The Files surface of [`super::RightPanel`], for one session.
 pub(super) struct FilesSurface {
     workspaces: Entity<Workspaces>,
-    /// The session's folder, with the subscription that reads it again when
-    /// its turn ends.
-    session: Option<(Place, Subscription)>,
+    /// The session's folder.
+    place: Place,
     tree: Entity<TreeState>,
     /// The folders opened in the tree, which a new list keeps open.
     expanded: HashSet<SharedString>,
@@ -164,7 +161,7 @@ pub(super) struct FilesSurface {
 impl FilesSurface {
     pub(super) fn new(
         workspaces: Entity<Workspaces>,
-        session: Option<&Entity<SessionView>>,
+        place: Place,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let tree = cx.new(|cx| TreeState::new(cx));
@@ -176,7 +173,7 @@ impl FilesSurface {
         });
         let mut this = Self {
             workspaces,
-            session: None,
+            place,
             tree,
             expanded: HashSet::new(),
             status: Status::Loading,
@@ -186,47 +183,14 @@ impl FilesSurface {
             editor: None,
             _expansions: expansions,
         };
-        this.set_session(session, cx);
+        this.reload(cx);
         this
-    }
-
-    /// Shows the files where `session` works, or nothing without one. A
-    /// session in the folder already showing keeps the tree as it is.
-    pub(super) fn set_session(
-        &mut self,
-        session: Option<&Entity<SessionView>>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let before = self.session.take().map(|(place, _)| place);
-        self.session = session.map(|view| {
-            let live = view.read(cx).live();
-            let place = Place::new(live.id.machine, live.cwd);
-            let ended = cx.subscribe(view, |this, _, event: &SessionEvent, cx| {
-                if matches!(event, SessionEvent::Saved) {
-                    this.reload(cx);
-                }
-            });
-            (place, ended)
-        });
-        if before.as_ref() != self.session.as_ref().map(|(place, _)| place) {
-            self.status = Status::Loading;
-            self.listing = Listing::default();
-            self.expanded.clear();
-            self.open = None;
-            self.tree
-                .update(cx, |tree, cx| tree.set_items(Vec::new(), cx));
-        }
-        self.reload(cx);
     }
 
     /// Reads the file list again, and the open file, keeping what shows
     /// until they come.
-    fn reload(&mut self, cx: &mut Context<'_, Self>) {
-        let Some((place, _)) = &self.session else {
-            self.load = Task::ready(());
-            cx.notify();
-            return;
-        };
+    pub(super) fn reload(&mut self, cx: &mut Context<'_, Self>) {
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
         let folder = place.path.clone();
         let executor = cx.background_executor().clone();
@@ -267,9 +231,10 @@ impl FilesSurface {
 
     /// Reads the open file at `path` again.
     fn read_file(&mut self, path: SharedString, cx: &mut Context<'_, Self>) {
-        let (Some((place, _)), Some(open)) = (&self.session, &mut self.open) else {
+        let Some(open) = &mut self.open else {
             return;
         };
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
         let folder = place.path.clone();
         let executor = cx.background_executor().clone();
@@ -335,9 +300,9 @@ impl FilesSurface {
             );
         }
         let folder = self
-            .session
-            .as_ref()
-            .and_then(|(place, _)| place.path.file_name())
+            .place
+            .path
+            .file_name()
             .map_or_default(|name| name.to_string_lossy().into_owned());
         let theme = cx.theme();
         h_flex()
@@ -494,9 +459,6 @@ fn refresh_button(cx: &Context<'_, FilesSurface>) -> Button {
 
 impl Render for FilesSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        if self.session.is_none() {
-            return message("Open a session to see its files.", None);
-        }
         if let Some(file) = self.render_file(window, cx) {
             return file;
         }

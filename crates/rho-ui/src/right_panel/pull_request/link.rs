@@ -1,6 +1,8 @@
-//! Linking a PR to a session by hand, for one the branch doesn't find: a
-//! fork's, one from another branch, or one in another repository. The link
-//! is kept in [`PrLinks`], so it outlasts restarts, until it is unlinked.
+//! Linking PRs to a session by hand, for those the branch doesn't find: a
+//! fork's, one from another branch, or one in another repository. Each link
+//! is kept in [`PrLinks`], so it outlasts restarts, until it is unlinked,
+//! and shows in a tab of its own, which [`super::super::RightPanel`] opens
+//! and closes as [`PrLinks`] changes.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -19,6 +21,11 @@ use gpui_kit::{
 
 use super::PullRequestSurface;
 use crate::pull_requests::{PrId, PrLinks};
+
+/// Asks [`super::super::RightPanel`] to show the tab of this PR, which the
+/// user just linked, or named when it was linked already.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::right_panel) struct ShowLinked(pub(in crate::right_panel) PrId);
 
 /// The form to link a PR, while it is open.
 pub(super) struct LinkForm {
@@ -68,17 +75,19 @@ impl PullRequestSurface {
         cx.notify();
     }
 
-    /// Links the PR the form names to the session, or says why it can't.
+    /// Links the PR the form names to the session, beside those linked
+    /// already, or says why it can't.
     fn link(&mut self, cx: &mut Context<'_, Self>) {
-        let (Some(form), Some(session)) = (&self.link_form, &self.session) else {
+        let Some(form) = &self.link_form else {
             return;
         };
-        let (text, key) = (form.input.read(cx).value(), session.key.clone());
+        let (text, key) = (form.input.read(cx).value(), self.session.clone());
         match PrId::parse(&text, self.origin(cx).as_ref()) {
             Ok(id) => {
-                cx.update_global::<PrLinks, _>(|links, _| links.set(&key, Some(id)));
+                cx.update_global::<PrLinks, _>(|links, _| links.add(&key, id.clone()));
                 self.link_form = None;
-                self.watch(cx);
+                cx.emit(ShowLinked(id));
+                cx.notify();
             }
             Err(why) => {
                 if let Some(form) = &mut self.link_form {
@@ -89,13 +98,13 @@ impl PullRequestSurface {
         }
     }
 
-    /// Unlinks the session's PR, so its branch's shows again.
+    /// Unlinks the PR it shows, which closes its tab.
     pub(super) fn unlink(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(key) = self.session.as_ref().map(|session| session.key.clone()) else {
+        let Some(id) = self.linked() else {
             return;
         };
-        cx.update_global::<PrLinks, _>(|links, _| links.set(&key, None));
-        self.watch(cx);
+        let (key, id) = (self.session.clone(), id.clone());
+        cx.update_global::<PrLinks, _>(|links, _| links.remove(&key, &id));
     }
 
     /// The form, under the toolbar, while it is open.

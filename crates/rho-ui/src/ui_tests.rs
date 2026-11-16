@@ -2916,8 +2916,9 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
 
 /// The right panel shows and hides with Ctrl+Alt+B or its toggle, and the
 /// state database remembers which. It lists its surfaces; the Background
-/// surface opens as a tab, follows the session on screen, and stops its
-/// work. Closing the last tab goes back to the list.
+/// surface opens as a tab and stops its work. Each session has its own
+/// tabs: another shows none, and coming back shows its own again. Closing
+/// the last tab goes back to the list.
 #[test]
 fn the_right_panel_opens_a_surface_that_follows_the_session() {
     let mut ui = Harness::start("right-panel", Script::default());
@@ -2979,14 +2980,23 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
     );
     ui.shot("stopped");
 
-    // Another session shows its own work: none.
+    // Another session has tabs of its own: none yet.
+    let key = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        app.active_session().expect("a session").read(cx).live().id
+    });
     ui.click("session-local-s1");
     ui.wait_for_session("the saved session", |session| {
         session.title() == Some("first")
     });
     ui.act(|window, _| {
-        assert!(is_visible(window, "panel-tab-background"), "the tab stays");
-        assert!(!is_visible(window, "panel-ended-0"), "s1 ran no work");
+        assert!(!is_visible(window, "panel-tab-background"), "not s1's tab");
+        assert!(is_visible(window, "panel-surface-list"));
+    });
+    let row = SharedString::from(format!("session-{key}"));
+    ui.act(|window, cx| window.click(row, cx));
+    ui.wait_until("the first session's tab again", |window, _, _| {
+        is_visible(window, "panel-tab-background") && is_visible(window, "panel-ended-0")
     });
 
     ui.act(|window, cx| window.hover("panel-tab-background", cx));
@@ -3008,6 +3018,10 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     let mut ui = Harness::start("panel-tabs", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_session("the saved session", |session| {
+        session.title() == Some("first")
     });
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.click("open-surface-background");
@@ -3342,50 +3356,124 @@ fn a_sidebar_row_marks_its_pr() {
     ui.wait_until("the next read", |_, _, _| gh.asked() == 2);
 }
 
-/// A PR linked by hand takes the branch's place, also after a restart's
-/// read of the state database, until it is unlinked; what names no PR says
+/// PRs linked by hand each open a tab beside the branch's, named for its
+/// number, and stay linked across a restart's read of the state database;
+/// closing a linked PR's tab, or Unlink, unlinks it. What names no PR says
 /// so.
 #[test]
 #[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
-fn a_pull_request_links_by_hand() {
+fn pull_requests_link_by_hand() {
     let gh = StubGh::new();
     let mut ui = open_pr_surface(&gh, "pull-request-link");
-    ui.click("pull-request-link");
-    ui.act(|window, cx| {
-        window.input("widgets", cx);
-        window.press("enter", cx);
+    let key = ui.cx.update(|cx| {
+        let app = ui.app.read(cx);
+        app.active_session().expect("a session").read(cx).live().id
     });
+    let linked = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let links = cx.global::<PrLinks>().get(&key);
+            links.iter().map(|id| id.number).collect::<Vec<_>>()
+        })
+    };
+    let link = |ui: &mut Harness, text: &str| {
+        ui.click("pull-request-link");
+        ui.act(|window, cx| {
+            window.press("secondary-a", cx);
+            window.input(text, cx);
+            window.press("enter", cx);
+        });
+    };
+    link(&mut ui, "widgets");
     ui.wait_until("why that's no PR", |window, _, _| {
         is_visible(window, "pull-request-link-error")
     });
-    ui.act(|window, cx| {
-        window.press("secondary-a", cx);
-        window.input("acme/widgets#12", cx);
-    });
     ui.shot("form");
-    ui.act(|window, cx| window.press("enter", cx));
-    ui.wait_until("the linked PR", |window, _, _| {
-        window
-            .try_find("pull-request-title")
-            .is_some_and(|title| title.label() == Some("Linked widgets"))
+    ui.act(|window, cx| window.press("secondary-a", cx));
+
+    link(&mut ui, "acme/widgets#12");
+    ui.wait_until("the linked PR in a tab of its own", |window, _, _| {
+        is_visible(window, "panel-tab-pull-request-2")
+            && window
+                .try_find("pull-request-title")
+                .is_some_and(|title| title.label() == Some("Linked widgets"))
     });
-    let key = ui.cx.update(|cx| {
-        let app = ui.app.read(cx);
-        let view = app.active_session().expect("a session");
-        view.read(cx).live().id
+    link(&mut ui, "acme/widgets#13");
+    ui.wait_until("a second linked PR's tab", |window, _, _| {
+        is_visible(window, "panel-tab-pull-request-3")
     });
-    let linked = ui.cx.update(|cx| cx.global::<PrLinks>().get(&key).cloned());
-    assert_eq!(linked.map(|id| id.number), Some(12));
+    assert_eq!(ui.label("panel-tab-pull-request").as_deref(), Some("#12"));
+    assert_eq!(ui.label("panel-tab-pull-request-2").as_deref(), Some("#12"));
+    assert_eq!(ui.label("panel-tab-pull-request-3").as_deref(), Some("#13"));
+    assert_eq!(linked(&mut ui), [12, 13]);
+    let reloaded = PrLinks::load(&ui.state);
+    let reloaded: Vec<u32> = reloaded.get(&key).iter().map(|id| id.number).collect();
+    assert_eq!(reloaded, [12, 13], "a restart reads them back in order");
     ui.shot("linked");
 
-    ui.click("pull-request-unlink");
-    ui.wait_until("the branch's PR again", |window, _, _| {
+    ui.click("panel-tab-pull-request");
+    ui.wait_until("the branch's PR, still first", |window, _, _| {
         window
             .try_find("pull-request-title")
             .is_some_and(|title| title.label() == Some("Add widgets"))
     });
-    let linked = ui.cx.update(|cx| cx.global::<PrLinks>().get(&key).cloned());
-    assert_eq!(linked, None);
+    ui.act(|window, cx| window.hover("panel-tab-pull-request-2", cx));
+    ui.click("close-panel-tab-pull-request-2");
+    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
+    assert_eq!(linked(&mut ui), [13], "closing its tab unlinked it");
+
+    ui.click("panel-tab-pull-request-3");
+    ui.click("pull-request-unlink");
+    ui.wait_until("the branch's PR again", |window, _, _| {
+        !is_visible(window, "panel-tab-pull-request-3")
+            && window
+                .try_find("pull-request-title")
+                .is_some_and(|title| title.label() == Some("Add widgets"))
+    });
+    assert_eq!(linked(&mut ui), Vec::<u32>::new());
+}
+
+/// Two sessions on one branch each have a Pull request tab of the same PR;
+/// switching between them, either way, leaves the one on screen polling,
+/// whatever order the panel tells their surfaces in.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn sessions_on_one_branch_each_watch_their_pr() {
+    let gh = StubGh::new();
+    let mut ui = open_pr_surface(&gh, "pull-request-two-sessions");
+    let active = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let app = ui.app.read(cx);
+            app.active_session().expect("a session").read(cx).live().id
+        })
+    };
+    let first = active(&mut ui);
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the second session's turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+    let second = active(&mut ui);
+    assert_ne!(first, second);
+    ui.click("open-surface-pull-request");
+    ui.wait_until("the second session's PR", |window, _, _| {
+        is_visible(window, "pull-request-check-1")
+    });
+    let watching = |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let prs = ui.app.read(cx).pull_requests().read(cx);
+            prs.poster(cx).is_ok()
+        })
+    };
+    for session in [&first, &second, &first] {
+        let row = SharedString::from(format!("session-{session}"));
+        ui.act(|window, cx| window.click(row, cx));
+        ui.wait_until("its PR on screen", |window, _, _| {
+            is_visible(window, "pull-request-check-1")
+        });
+        assert_eq!(&active(&mut ui), session);
+        assert!(watching(&mut ui), "the PR on screen is watched");
+    }
 }
 
 /// The PR's conversation: its comments and reviews, its threads on the
@@ -3501,12 +3589,13 @@ fn the_diff_surface_follows_the_sessions_changes() {
             ..Machines::default()
         },
     );
-    ui.act(|window, cx| window.press("secondary-alt-b", cx));
-    ui.click("open-surface-diff");
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     // The turn ends with its process running, which saves the session.
     ui.send("background");
+    ui.wait_for_session("the session", |_| true);
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-diff");
     ui.wait_until("the session's change", |window, cx, app| {
         app.diff_paths(cx) == Some(vec!["a.txt".to_owned()]) && is_visible(window, "diff-summary")
     });
@@ -3548,11 +3637,12 @@ fn the_files_surface_opens_the_sessions_files() {
             ..Machines::default()
         },
     );
-    ui.act(|window, cx| window.press("secondary-alt-b", cx));
-    ui.click("open-surface-files");
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.send("background");
+    ui.wait_for_session("the session", |_| true);
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-files");
     ui.wait_until("the folder's files", |window, _, _| {
         is_visible(window, "files-entry-src") && is_visible(window, "files-entry-README.md")
     });
