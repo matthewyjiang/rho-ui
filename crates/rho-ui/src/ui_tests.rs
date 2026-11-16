@@ -1138,6 +1138,42 @@ fn a_sent_message_can_be_selected_and_copied() {
     assert_eq!(copied.as_deref(), Some("list files"));
 }
 
+/// One click on a code block's copy button puts its code, and only its
+/// code, on the clipboard.
+#[test]
+fn a_code_block_copies_in_one_click() {
+    let script = Script {
+        replay_turns: 1,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("copy-code", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-old")
+    });
+    ui.click("session-local-old");
+    ui.wait_for_session("the replayed reply", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(_)))
+    });
+    let reply = ui.cx.update(|cx| {
+        let view = ui.app.read(cx).active_session().expect("a session is open");
+        let last = view.read(cx).session().entries().len() - 1;
+        SharedString::from(format!("reply-{last}"))
+    });
+    ui.wait_until("the reply's code block", |window, _, _| {
+        window.try_find("copy-code").is_some()
+    });
+    ui.act(|window, cx| window.within(reply.clone()).click("copy-code", cx));
+    ui.shot("copied");
+    let copied = ui
+        .cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(
+        copied.as_deref(),
+        Some("fn main() {\n    println!(\"hi\");\n}")
+    );
+}
+
 /// The current value of setting `id` on the active session.
 fn setting(session: &Session, id: &str) -> Option<String> {
     session

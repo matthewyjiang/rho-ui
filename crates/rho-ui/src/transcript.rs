@@ -17,12 +17,13 @@ use std::{
 };
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{text::CodeBlock, TestSupportExt as _};
 use gpui_kit::component::{
     alert::{Alert, AlertVariant},
     attachment::Attachment as Card,
     bubble::{Bubble, BubbleVariant},
     button::{Button, ButtonVariants as _},
+    clipboard::Clipboard,
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
@@ -52,15 +53,14 @@ use crate::{
 /// fit the transcript's measure.
 pub(crate) const IMAGE_HEIGHT: f32 = 10.;
 
-/// A code block's padding above its code. Kit sets the language name in the
-/// top corner, its letters 10px to 17px down; this starts the code's letters
-/// about 4px under them, so the name sits in the padding rather than reading
-/// as a line of the block, as Kit's own 28px makes it.
-const CODE_BLOCK_PAD_TOP: f32 = 19.;
+/// A code block's padding above its code. Kit puts [`code_actions`] in the
+/// top corner, 8px down; its copy button is 20px tall, its icon 12px to 24px
+/// down. This starts the code's letters about 4px under the icon, so the
+/// corner sits in the padding rather than over the first line.
+const CODE_BLOCK_PAD_TOP: f32 = 26.;
 
-/// A code block's padding below its code: 2px more than above, as a line's
-/// letters sit about 2px lower in its box than its bottom, so the code is as
-/// far from both edges.
+/// A code block's padding below its code, as far from its last line's
+/// letters as Kit's corner leaves the first line's under the icon.
 const CODE_BLOCK_PAD_BOTTOM: f32 = 21.;
 
 /// How many lines of a notice's detail show until it is opened. Kit caps
@@ -83,6 +83,26 @@ fn message_style() -> TextViewStyle {
             .pb(px(CODE_BLOCK_PAD_BOTTOM)),
         ..TextViewStyle::default()
     }
+}
+
+/// A code block's corner in a message or notice: its language, and a button
+/// that copies its code. Kit drops its own language name once a block has
+/// actions, so this sets it, as Kit does.
+fn code_actions(block: &CodeBlock, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    h_flex()
+        .gap_1()
+        .children(block.lang().filter(|lang| !lang.is_empty()).map(|lang| {
+            div()
+                .font_family(cx.theme().font_family.clone())
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(lang)
+        }))
+        .child(
+            Clipboard::new("copy-code")
+                .value(block.code())
+                .tooltip("Copy code"),
+        )
 }
 
 /// What a click in the transcript asks for.
@@ -616,6 +636,7 @@ impl Transcript {
         let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
         let mut text = TextView::new(detail)
             .style(message_style().paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)))
+            .code_block_actions(code_actions)
             .selectable(true);
         if !open {
             text = text.max_lines(NOTICE_LINES);
@@ -820,6 +841,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                         .child(
                             TextView::new(text)
                                 .style(message_style())
+                                .code_block_actions(code_actions)
                                 .markdown_extensions(figures::extensions(pictures, ix))
                                 .selectable(true),
                         ),
@@ -842,6 +864,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
             .children(text.map(|text| {
                 TextView::new(text)
                     .style(message_style())
+                    .code_block_actions(code_actions)
                     .markdown_extensions(figures::extensions(pictures, ix))
                     .selectable(true)
                     .stream_fade(phase == Phase::Live)
