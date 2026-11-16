@@ -148,7 +148,6 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
         "surface-gallery-short",
         "surface-gallery-secret",
         "surface-gallery-agree",
-        "surface-gallery-one",
         "surface-gallery-many-docs",
         // A toggle group does not register itself; its chips do.
         "surface-gallery-chips-rust",
@@ -165,6 +164,8 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
         for id in inputs {
             let _found = window.find(id);
         }
+        // A radio group registers only its radios, by index under it.
+        let _medium = window.within("surface-gallery-one").find(1usize);
     });
     ui.wait_for_session("the turn to finish", |session| {
         session.state() == &RunState::Idle
