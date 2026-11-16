@@ -7204,6 +7204,7 @@ dependencies = [
  "gpui-pre-wgpu",
  "image",
  "libghostty-vt",
+ "markdown",
  "portable-pty",
  "ratex-layout",
  "ratex-parser",

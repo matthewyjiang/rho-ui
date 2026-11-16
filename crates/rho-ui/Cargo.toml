@@ -22,8 +22,12 @@ libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3
 # The terminal surface's pseudo-terminal.
 portable-pty = "0.9"
 rho-ui-core = { path = "../rho-ui-core" }
-# The channel from the terminal's reader thread to the UI.
+# The channel from the terminal's reader thread to the UI, and pele's
+# answers (src/pele.rs).
 futures = "0.3"
+# Finds a pull request's Mermaid fences to draw before Kit parses it, with
+# the parser and version Kit uses; see src/figures.rs.
+markdown = "1"
 # Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
 rquickjs = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }

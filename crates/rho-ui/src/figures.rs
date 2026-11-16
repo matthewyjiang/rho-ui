@@ -2,12 +2,13 @@
 //! in the theme's colors and fonts. Each is a GPUI Kit Markdown plugin: a
 //! ` ```mermaid ` fence becomes a diagram ([`pele`]), and `$$ … $$` and
 //! `$ … $` become formulas (`RaTeX`). Each draws an SVG that GPUI
-//! rasterizes as an image. A message's images by path are [`pictures`]'.
+//! rasterizes as an image.
 //!
 //! What the text can't be drawn as stays as written: a diagram pele can't
 //! draw shows as its code block, a formula `RaTeX` can't lay out as its
 //! source, and dollar signs that read as prices as prose.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gpui_kit::component::text::{
@@ -17,13 +18,10 @@ use gpui_kit::component::text::{
 use gpui_kit::component::{h_flex, ActiveTheme as _, Theme};
 use gpui_kit::{base::TestSupportExt as _, InteractiveElement as _};
 
-use crate::{
-    pele,
-    pictures::{self, Pictures},
-};
+use crate::pele;
 use gpui_kit::{
-    div, img, px, size, AnyElement, App, Entity, Hsla, Image, ImageFormat, IntoElement,
-    ParentElement as _, Pixels, Rgba, SharedString, Size, Styled as _, Window,
+    div, img, px, size, AnyElement, App, Hsla, Image, ImageFormat, IntoElement, ParentElement as _,
+    Pixels, Rgba, SharedString, Size, Styled as _, Window,
 };
 use ratex_layout::{layout, to_display_list, validate_layout, LayoutOptions};
 use ratex_svg::{SvgColorSyntax, SvgOptions};
@@ -43,22 +41,55 @@ const MATH_SCALE: f32 = 1.21;
 const INK: Color = Color::new(0., 0., 0., 0.);
 
 /// The diagram and formula plugins, for a
-/// [`gpui_kit::component::text::TextView`] showing Markdown from outside a
-/// session, such as a pull request's description.
+/// [`gpui_kit::component::text::TextView`] showing a message.
 pub(crate) fn extensions() -> MarkdownExtensions {
     MarkdownExtensions::default()
-        .plugin(Diagrams)
+        .plugin(Diagrams::Wait)
         .plugin(DisplayMath)
         .plugin(InlineMath)
 }
 
-/// [`extensions`] and the plugin for images by path, for a `TextView`
-/// showing message `entry` of a session whose images `pictures` reads.
-pub(crate) fn message_extensions(pictures: &Entity<Pictures>, entry: usize) -> MarkdownExtensions {
-    extensions().plugin(pictures::Plugin {
-        pictures: pictures.clone(),
-        entry,
-    })
+/// Diagrams drawn before their text is parsed, by source: `None` for one
+/// pele couldn't draw.
+pub(crate) type Drawings = HashMap<String, Option<Arc<pele::Drawing>>>;
+
+/// The diagram and formula plugins for Markdown whose diagrams are drawn
+/// before it is parsed, as `drawn` holds them; a diagram not in it shows as
+/// code. Kit parses again when `revision` changes, so change it whenever
+/// `drawn` does.
+pub(crate) fn drawn_extensions(drawn: Arc<Drawings>, revision: u64) -> MarkdownExtensions {
+    MarkdownExtensions::default()
+        .plugin(Diagrams::Drawn(drawn))
+        .plugin(DisplayMath)
+        .plugin(InlineMath)
+        .parser_revision(revision)
+}
+
+/// The sources of the closed ` ```mermaid ` fences in Markdown `text`, in
+/// order, read as Kit's parser reads them.
+pub(crate) fn diagram_sources(text: &str) -> Vec<String> {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_text = true;
+    options.constructs.math_flow = true;
+    let Ok(root) = markdown::to_mdast(text, &options) else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    let mut nodes = vec![&root];
+    while let Some(node) = nodes.pop() {
+        if let mdast::Node::Code(code) = node {
+            let fence = node
+                .position()
+                .and_then(|at| text.get(at.start.offset..at.end.offset));
+            if code.lang.as_deref() == Some("mermaid") && fence.is_some_and(is_closed) {
+                sources.push(code.value.clone());
+            }
+        }
+        if let Some(children) = node.children() {
+            nodes.extend(children.iter().rev());
+        }
+    }
+    sources
 }
 
 /// A drawn figure: its image and the size it shows at.
@@ -114,9 +145,9 @@ fn byte(channel: f32) -> u8 {
     (channel.clamp(0., 1.) * 255.).round() as u8
 }
 
-/// A block figure, centered, at its own size or scaled down to fit the
-/// message, keeping its proportions. `id` names its row, the message's
-/// width; the figure in it is `picture`.
+/// A block figure, centered, at its own size or scaled down to fit its
+/// text's column, keeping its proportions. `id` names its row, the
+/// column's width; the figure in it is `picture`.
 fn block(id: SharedString, drawn: Drawn) -> AnyElement {
     let Size { width, height } = drawn.size;
     h_flex()
@@ -137,7 +168,7 @@ fn block(id: SharedString, drawn: Drawn) -> AnyElement {
         .into_any_element()
 }
 
-/// The ID of the figure `node` became, from where it starts in the message.
+/// The ID of the figure `node` became, from where it starts in its text.
 fn figure_id(kind: &str, node: &MarkdownNode) -> SharedString {
     let start = node.source_range().map_or(0, |range| range.start);
     format!("{kind}-{start}").into()
@@ -159,7 +190,12 @@ fn is_closed(fence: &str) -> bool {
 }
 
 /// ` ```mermaid ` fences, drawn as diagrams by [`pele`].
-struct Diagrams;
+enum Diagrams {
+    /// Each drawn as it is parsed, waiting for pele.
+    Wait,
+    /// Drawn before the text is parsed; one not drawn shows as code.
+    Drawn(Arc<Drawings>),
+}
 
 /// pele's drawing of a diagram, the same in every theme, and its last
 /// drawing in one.
@@ -177,11 +213,13 @@ impl MarkdownPlugin for Diagrams {
         "mermaid"
     }
 
-    /// Kit parses off the UI thread, except for a short message, which
-    /// waits for pele per diagram: 0.2 to 1.3 ms to draw one, but up to
-    /// [`pele`]'s one-second limit for a runaway one. It waits rather than
-    /// giving up after a frame, because Kit never parses a finished
-    /// message again, so a diagram given up on would stay as code.
+    /// Kit parses off the UI thread, except for short text, up to 4 KiB.
+    /// A message waits for pele per diagram there: 0.2 to 1.3 ms to draw
+    /// one, but up to [`pele`]'s one-second limit for a runaway one. It
+    /// waits rather than giving up after a frame, because Kit never parses
+    /// a finished message again, so a diagram given up on would stay as
+    /// code. A pull request's text, which anyone who can comment on it
+    /// writes, never waits: its diagrams are [`Diagrams::Drawn`].
     fn parse(&self, node: &mdast::Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
         let mdast::Node::Code(code) = node else {
             return None;
@@ -195,8 +233,12 @@ impl MarkdownPlugin for Diagrams {
         if !is_closed(fence) {
             return None;
         }
+        let drawing = match self {
+            Self::Wait => pele::draw(&code.value)?,
+            Self::Drawn(drawn) => drawn.get(&code.value)?.clone()?,
+        };
         let data = Diagram {
-            drawing: pele::draw(&code.value)?,
+            drawing,
             memo: Memo::new(),
         };
         Some(
@@ -213,7 +255,7 @@ impl MarkdownPlugin for Diagrams {
         };
         let drawn = data.memo.get(DiagramStyle::new(cx.theme()), |style| {
             // pele draws at its own font size; the diagram scales to the
-            // theme's, which the transcript's text is set in.
+            // theme's.
             let scale = style.font_size / pele::FONT_SIZE;
             let drawing = &data.drawing;
             Some(Drawn {
@@ -487,6 +529,21 @@ mod tests {
         );
         assert!(is_formula("$x^2$", Some('.')));
         assert!(is_formula("$$\\frac{a}{b}$$", None));
+    }
+
+    /// The sources a PR's diagrams are drawn from are those the plugin
+    /// looks up: nested in a list too, and only closed fences.
+    #[test]
+    fn diagram_sources_are_the_closed_mermaid_fences() {
+        let text = "Intro\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\n\
+                    - item\n\n  ```mermaid\n  pie\n  ```\n\n\
+                    ~~~mermaid\nmindmap\n~~~~\n\n\
+                    ```rust\nfn main() {}\n```\n\n\
+                    ```mermaid\nsequenceDiagram";
+        assert_eq!(
+            diagram_sources(text),
+            ["flowchart TD\n  A --> B", "pie", "mindmap"]
+        );
     }
 
     #[test]

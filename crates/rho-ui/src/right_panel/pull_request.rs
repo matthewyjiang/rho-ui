@@ -10,6 +10,7 @@
 mod actions;
 mod checks;
 mod conversation;
+mod diagrams;
 mod header;
 mod link;
 
@@ -40,11 +41,11 @@ use self::{
     actions::Acting,
     checks::{check_counts, checks},
     conversation::{open_threads, Posting},
+    diagrams::Diagrams,
     header::{identity, toolbar, web_url},
     link::{link_button, LinkForm},
 };
 use crate::{
-    figures,
     machines::{Place, SessionKey},
     pull_requests::{
         Found, Lookup, NoTarget, PrDetail, PrId, PrSummary, PullRequests, Refresh, RepoId, Target,
@@ -84,6 +85,8 @@ pub(super) struct PullRequestSurface {
     /// The Markdown of the PR on screen, parsed once per text it has: its
     /// description under [`DESCRIPTION`], and each post under its URL.
     texts: HashMap<SharedString, (SharedString, Entity<TextViewState>)>,
+    /// The diagrams in those texts.
+    diagrams: Diagrams,
     /// The comment threads on the code the user opened or closed, by id:
     /// those resolved start closed, the rest open.
     flipped: HashSet<SharedString>,
@@ -128,6 +131,7 @@ impl PullRequestSurface {
             shows,
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
+            diagrams: Diagrams::new(),
             flipped: HashSet::new(),
             comment_box: None,
             posting: Posting::Idle,
@@ -239,7 +243,7 @@ impl PullRequestSurface {
     }
 
     /// Parses the Markdown of the PR on screen that changed, and drops
-    /// what it no longer has.
+    /// what it no longer has; when any changed, draws its diagrams.
     fn sync_texts(&mut self, cx: &mut Context<'_, Self>) {
         let wanted: Vec<(SharedString, SharedString)> = self
             .target(cx)
@@ -262,25 +266,34 @@ impl PullRequestSurface {
             })
             .unwrap_or_default();
         let mut parsed = std::mem::take(&mut self.texts);
+        let mut changed = false;
         for (key, text) in wanted {
             let state = match parsed.remove(&key) {
                 Some((shown, state)) if shown == text => state,
                 Some((_, state)) => {
+                    changed = true;
                     state.update(cx, |state, cx| state.set_text(&text, cx));
                     state
                 }
-                None => cx.new(|cx| TextViewState::markdown(&text, cx)),
+                None => {
+                    changed = true;
+                    cx.new(|cx| TextViewState::markdown(&text, cx))
+                }
             };
             self.texts.insert(key, (text, state));
+        }
+        if changed {
+            let texts = self.texts.values().map(|(text, _)| text.clone()).collect();
+            self.draw_diagrams(texts, cx);
         }
     }
 
     /// `key`'s Markdown, as [`Self::texts`] holds it, with its diagrams and
-    /// formulas drawn as a message's are.
+    /// formulas drawn.
     fn text(&self, key: &str) -> Option<AnyElement> {
         let (_, state) = self.texts.get(key)?;
         let view = TextView::new(state)
-            .markdown_extensions(figures::extensions())
+            .markdown_extensions(self.diagrams.extensions())
             // Its links are anyone's: only web ones open, as Kit opens
             // links without a handler.
             .on_link_click(|url, event, _, cx| {
