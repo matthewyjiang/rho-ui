@@ -316,7 +316,9 @@ impl MessageProcessor {
                     .into_iter()
                     .collect(),
             )),
-            AgentMessage::CallRendererFunction(call) => Ok(Applied::Answer(Box::new(refuse_call(&call)))),
+            AgentMessage::CallRendererFunction(call) => {
+                Ok(Applied::Answer(Box::new(refuse_call(&call))))
+            }
             // The renderer makes no calls to the agent, so there is nothing
             // to answer.
             AgentMessage::AgentFunctionResponse(_) => Ok(Applied::Changes(Vec::new())),
