@@ -6515,9 +6515,8 @@ dependencies = [
 
 [[package]]
 name = "rho-protocol"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b242a88207ce40912dc266c253f8dda6ff19733aea576b6db0d17b965583e12e"
+version = "1.2.0"
+source = "git+https://github.com/matthewyjiang/rho?rev=8d51b4eb709c3d9dcd677f9a1b420dff548e9fe6#8d51b4eb709c3d9dcd677f9a1b420dff548e9fe6"
 dependencies = [
  "schemars",
  "serde",
@@ -6525,6 +6524,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6552,7 +6552,9 @@ dependencies = [
 name = "rho-ui-core"
 version = "0.1.0"
 dependencies = [
+ "a2ui",
  "base64",
+ "chrono",
  "futures",
  "regex",
  "rho-protocol",

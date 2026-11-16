@@ -12,8 +12,14 @@ rust-version.workspace = true
 test-support = ["dep:tempfile", "tokio/time"]
 
 [dependencies]
+# The A2UI processor behind the surfaces a session's `ui` tool shows
+# (`surface.rs`).
+a2ui = { path = "../a2ui" }
 # Prompt and user-message images travel base64-encoded.
 base64 = "0.22"
+# Reads and writes a surface's date fields (`surface/field.rs`). The
+# version a2ui builds.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 # Highlights what a search matched, with the pattern rho's grep used.
 regex = "1"
 rho-protocol.workspace = true
