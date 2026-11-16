@@ -54,6 +54,7 @@ use rho_ui_core::{
 };
 
 use crate::{
+    auths::Auths,
     background::{BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler},
     background_log::{BackgroundLog, Recorded},
     composer::{Composer, ComposerMode, ComposerState},
@@ -63,6 +64,7 @@ use crate::{
     plan::PlanList,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
+    sign_in::SignInSlot,
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
     usage::UsageRing,
@@ -124,6 +126,9 @@ pub(crate) struct SessionView {
     transcript: Transcript,
     composer: Entity<ComposerState>,
     settings: Entity<SessionSettings>,
+    /// The sign-in its model's auth profile needs, while it is signed out;
+    /// see [`Self::with_sign_in`].
+    sign_in: Option<SignInSlot>,
     /// The oldest open request, while there is one, and its events.
     card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt is on its way to the daemon.
@@ -230,6 +235,7 @@ impl SessionView {
             transcript,
             composer,
             settings,
+            sign_in: None,
             card: None,
             sending: false,
             stopping: Vec::new(),
@@ -300,6 +306,31 @@ impl SessionView {
             _above: renamed,
             ..view
         }
+    }
+
+    /// Offers the sign-in the session's model needs, above the composer,
+    /// while its auth profile is signed out on its machine, as `auths`
+    /// says. A subagent's session has no composer, so it gets none.
+    pub(crate) fn with_sign_in(
+        mut self,
+        auths: Entity<Auths>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let machine = self.cwd.machine.clone();
+        self.sign_in = Some(SignInSlot::new(
+            auths,
+            machine,
+            Self::model_auth,
+            window,
+            cx,
+        ));
+        self
+    }
+
+    /// The auth profile the session's model runs on, once known.
+    fn model_auth(&self) -> Option<&str> {
+        self.session.auth()
     }
 
     /// The session, and the machine it is on.
@@ -518,6 +549,13 @@ impl SessionView {
             (false, Some(_), _) => {
                 self.busy_since = None;
                 self.transcript.end_turn(self.session.entries(), cx);
+                // A sign-out elsewhere fails the next turn: read whether
+                // the model's profile is still signed in.
+                if matches!(self.session.state(), RunState::Failed(_)) {
+                    if let Some(slot) = &self.sign_in {
+                        slot.refresh(cx);
+                    }
+                }
                 cx.emit(SessionEvent::Saved);
             }
             _ => {}
@@ -1096,6 +1134,11 @@ impl SessionView {
                     ),
                 )
             })
+            .children(
+                self.sign_in
+                    .as_ref()
+                    .and_then(|slot| slot.card(self.session.auth(), cx)),
+            )
             .when_some(self.card.as_ref(), |this, (card, _)| {
                 this.child(card.clone())
             })

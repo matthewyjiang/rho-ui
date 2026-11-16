@@ -93,6 +93,8 @@ pub struct ConfigOption {
     name: &'static str,
     category: ConfigCategory,
     kind: ConfigKind,
+    /// For the model, the auth profile it runs on.
+    auth: Option<String>,
 }
 
 impl ConfigOption {
@@ -114,6 +116,13 @@ impl ConfigOption {
     /// Its shape and current value.
     pub fn kind(&self) -> &ConfigKind {
         &self.kind
+    }
+
+    /// For the model, the auth profile the current model runs on, such as
+    /// `openai-codex`, which names how its use is billed; `None` for the
+    /// other options.
+    pub fn auth(&self) -> Option<&str> {
+        self.auth.as_deref()
     }
 
     /// The choice a [`ConfigKind::Select`] has selected.
@@ -264,6 +273,7 @@ fn select<T: Copy + PartialEq>(
             current: (*current).to_owned(),
             choices,
         },
+        auth: None,
     })
 }
 
@@ -293,6 +303,7 @@ pub(crate) fn config_options(options: &SessionOptions) -> Vec<ConfigOption> {
                 })
                 .collect(),
         },
+        auth: Some(options.model.auth.clone()),
     };
     let reasoning = options.reasoning.as_ref().and_then(|reasoning| {
         select(
@@ -309,6 +320,7 @@ pub(crate) fn config_options(options: &SessionOptions) -> Vec<ConfigOption> {
         name: "Fast mode",
         category: ConfigCategory::Other,
         kind: ConfigKind::Toggle(fast.enabled),
+        auth: None,
     });
     mode.into_iter()
         .chain([model])

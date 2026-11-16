@@ -41,6 +41,12 @@ pub use prompt::{
     ImageFormat, Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 pub use rho_install::{RhoCheck, RhoInstall, Update};
+/// The auth profiles, logins and credential store [`Daemon`]'s sign-in
+/// methods speak of, as rho-protocol has them.
+pub use rho_protocol::{
+    AuthKind, AuthStatus, AuthSummary, CredentialStoreKind, CredentialStoreStatus, LoginId,
+    LoginOutcome, LoginPrompt, StoreSelectedBy, UncheckedKey, UncheckedReason,
+};
 pub use session::{
     Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,
     RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,

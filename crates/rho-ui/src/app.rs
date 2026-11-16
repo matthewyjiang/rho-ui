@@ -35,6 +35,7 @@ use rho_ui_core::{
 };
 
 use crate::{
+    auths::Auths,
     background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
     forge::Forges,
@@ -211,6 +212,9 @@ pub(crate) struct RhoApp {
     connections: Vec<Connection>,
     /// rho's own settings on each connected machine, for Settings.
     rho_settings: Entity<RhoSettings>,
+    /// The auth profiles of each connected machine, for Settings and the
+    /// sessions that need a sign-in.
+    auths: Entity<Auths>,
     /// Each machine's rho, apart from its daemon: installing and updating.
     installs: Entity<Installs>,
     /// The forge CLIs on each machine, for Settings and pull requests.
@@ -317,6 +321,7 @@ impl RhoApp {
             machines,
             connections: Vec::new(),
             rho_settings: cx.new(|_| RhoSettings::default()),
+            auths: cx.new(|_| Auths::default()),
             installs,
             forges,
             prs,
@@ -389,6 +394,8 @@ impl RhoApp {
         for gone in old {
             self.rho_settings
                 .update(cx, |settings, cx| settings.forget(&gone.machine, cx));
+            self.auths
+                .update(cx, |auths, cx| auths.forget(&gone.machine, cx));
             self.forges
                 .update(cx, |forges, cx| forges.forget(&gone.machine, cx));
             self.forget_sessions(&gone.machine, window, cx);
@@ -452,6 +459,7 @@ impl RhoApp {
         self.forget_sessions(machine, window, cx);
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
+        self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.installs
             .update(cx, |installs, cx| installs.set_upgrade(machine, None, cx));
         self.next_epoch += 1;
@@ -540,6 +548,8 @@ impl RhoApp {
         self.rho_settings.update(cx, |settings, cx| {
             settings.connected(machine, daemon.clone(), cx);
         });
+        self.auths
+            .update(cx, |auths, cx| auths.connected(machine, daemon.clone(), cx));
         self.installs
             .update(cx, |installs, cx| installs.check(machine, cx));
         let jobs_task = cx.spawn({
@@ -621,6 +631,7 @@ impl RhoApp {
         }
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
+        self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
         self.installs.update(cx, |installs, cx| {
@@ -792,6 +803,16 @@ impl RhoApp {
                 self.rho_settings
                     .update(cx, |settings, cx| settings.changed(machine, changed, cx));
             }
+            DaemonEvent::LoginPrompt { login, prompt } => {
+                self.auths.update(cx, |auths, cx| {
+                    auths.login_prompt(machine, login, prompt, cx);
+                });
+            }
+            DaemonEvent::LoginFinished { login, outcome } => {
+                self.auths.update(cx, |auths, cx| {
+                    auths.login_finished(machine, &login, outcome, cx);
+                });
+            }
         }
     }
 
@@ -801,6 +822,7 @@ impl RhoApp {
         let app = settings_view::AppState {
             machines: self.machines.clone(),
             rho_settings: self.rho_settings.clone(),
+            auths: self.auths.clone(),
             workspaces: self.workspaces.clone(),
             forges: self.forges.clone(),
             installs: self.installs.clone(),
@@ -1038,7 +1060,9 @@ impl RhoApp {
         }
         let cwd = self.new_session_cwd(cx);
         let (workspaces, projects, machines) = (&self.workspaces, &self.projects, &self.machines);
-        let view = cx.new(|cx| DraftView::new(cwd, workspaces, projects, machines, window, cx));
+        let auths = self.auths.clone();
+        let view =
+            cx.new(|cx| DraftView::new(cwd, workspaces, projects, machines, auths, window, cx));
         let subscriptions = [
             cx.subscribe_in(
                 &view,
@@ -1582,6 +1606,7 @@ impl RhoApp {
         self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
         let workspace = WorkspaceRef::new(&self.workspaces, cwd, cx);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
+        let auths = self.auths.clone();
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon,
@@ -1592,6 +1617,7 @@ impl RhoApp {
                 window,
                 cx,
             )
+            .with_sign_in(auths, window, cx)
         });
         self.insert_session(id, view.clone(), window, cx);
         view.update(cx, |view, cx| view.submit(prompt, window, cx));
@@ -1630,6 +1656,7 @@ impl RhoApp {
         let cwd = Place::new(id.machine.clone(), cwd);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
+        let auths = self.auths.clone();
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon.clone(),
@@ -1640,6 +1667,7 @@ impl RhoApp {
                 window,
                 cx,
             )
+            .with_sign_in(auths, window, cx)
         });
         self.insert_session(id.clone(), view.clone(), window, cx);
         self.show(Pane::Session(view), window, cx);

@@ -4,12 +4,14 @@
 //! applies at once and is saved. rho-ui's own settings come first, kept in
 //! its settings file: Appearance, the Machines page in [`machines`], and
 //! the forge CLIs on each machine in [`source_control`]. Then come rho's
-//! own, a page per category its daemon describes, saved in that machine's
+//! own: each machine's sign-ins to providers, in [`providers`], and a page
+//! per category its daemon describes, saved in that machine's
 //! `config.toml`: see [`rho`]. Last, [`about`] shows the versions of
 //! rho-ui and of Rho on each machine.
 
 mod about;
 mod machines;
+mod providers;
 mod rho;
 mod source_control;
 
@@ -28,6 +30,7 @@ use gpui_kit::{
 };
 
 use crate::{
+    auths::Auths,
     forge::Forges,
     machines::{MachineId, MachineStatus, Machines},
     rho_install::Installs,
@@ -36,6 +39,7 @@ use crate::{
     workspaces::Workspaces,
 };
 use machines::MachineFields;
+use providers::ProvidersFields;
 use rho::RhoFields;
 use source_control::SourceControlFields;
 
@@ -96,6 +100,8 @@ pub(crate) struct AppState {
     pub(crate) machines: Entity<Machines>,
     /// rho's own settings on each machine.
     pub(crate) rho_settings: Entity<RhoSettings>,
+    /// The auth profiles each machine's rho can sign in to.
+    pub(crate) auths: Entity<Auths>,
     /// Each machine's home folder, which paths show as `~`.
     pub(crate) workspaces: Entity<Workspaces>,
     /// The forge CLIs on each machine.
@@ -177,6 +183,7 @@ struct SettingsView {
     machines: MachineFields,
     rho: RhoFields,
     source_control: SourceControlFields,
+    providers: ProvidersFields,
     /// Each machine's rho, for About.
     installs: Entity<Installs>,
     _subscriptions: [Subscription; 3],
@@ -187,6 +194,7 @@ impl SettingsView {
         let AppState {
             machines,
             rho_settings,
+            auths,
             workspaces,
             forges,
             installs,
@@ -208,6 +216,7 @@ impl SettingsView {
             code_font,
             machines: MachineFields::new(window, cx),
             source_control: SourceControlFields::new(&machines, workspaces, forges, cx),
+            providers: ProvidersFields::new(&machines, auths, cx),
             rho: RhoFields::new(&machines, rho_settings, window, cx),
             machine_list: machines,
             installs,
@@ -476,6 +485,7 @@ impl Render for SettingsView {
             );
         let machines = self.machines_page(cx);
         let source_control = self.source_control_page(window, cx);
+        let providers = self.providers_page(window, cx);
         let rho = self.rho_page(window, cx);
         let about = about::about_page(&self.machine_list, &self.installs, cx);
         let theme = cx.theme();
@@ -497,6 +507,7 @@ impl Render for SettingsView {
                     .page(appearance)
                     .page(machines)
                     .page(source_control)
+                    .page(providers)
                     .page(rho)
                     .page(about),
             )

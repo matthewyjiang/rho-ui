@@ -8,6 +8,7 @@ mod app;
 #[cfg(target_os = "macos")]
 mod app_menu;
 mod attachments;
+mod auths;
 mod background;
 mod background_log;
 mod badge;
@@ -40,6 +41,7 @@ mod settings;
 mod settings_view;
 mod shelf;
 mod sidebar;
+mod sign_in;
 mod store;
 mod themes;
 mod time;
@@ -153,7 +155,8 @@ gpui_kit::assets::icon_assets!(
         CircleSlash,
         MessageSquare,
         Link,
-        Unlink
+        Unlink,
+        KeyRound
     ]
 );
 

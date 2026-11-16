@@ -25,8 +25,8 @@ use gpui_kit::{
 use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{
-        subagent_result, write_program, FakeDaemon, Script, TuiJob, SUBAGENT_TASK, TUI_SESSION,
-        WORKFLOW_ERROR,
+        subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
+        REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
     Delay, Entry, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
@@ -5798,4 +5798,85 @@ fn rho_settings_write_and_follow_the_daemon() {
     fake.edit_agent_setting("general.auto_compact", SettingValue::Bool(true));
     ui.wait_until("the hand edit on the page", switch_is(true));
     ui.shot("edited");
+}
+
+/// A new session whose model has no credentials opens anyway, signed
+/// out, and offers its sign-in above the composer: a key the provider
+/// refuses says why and saves nothing; one it couldn't check signs the
+/// daemon in, but the card stays to say so until dismissed.
+#[test]
+fn a_signed_out_session_signs_in_from_its_card() {
+    let mut ui = Harness::start(
+        "sign-in-card",
+        Script {
+            signed_out: true,
+            ..Script::default()
+        },
+    );
+    ui.wait_until("saved sessions in the sidebar", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the sign-in card", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "sign-in-card")
+    });
+
+    ui.click("sign-in-key");
+    ui.act(|window, cx| {
+        window.input(REFUSED_KEY, cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "sign-in-note")
+    });
+    assert!(!ui.fake().signed_in(KEY_AUTH));
+    ui.shot("refused");
+
+    ui.click("sign-in-key");
+    ui.act(|window, cx| window.input(UNCHECKED_KEY, cx));
+    ui.click("sign-in-save");
+    ui.wait_for_daemon("the key saved", |fake| fake.signed_in(KEY_AUTH));
+    ui.wait_until("the card saying it went unchecked", |window, _, _| {
+        is_visible(window, "sign-in-dismiss") && is_visible(window, "sign-in-note")
+    });
+    ui.shot("unchecked");
+
+    ui.click("sign-in-dismiss");
+    ui.wait_until("the card gone", |window, _, _| {
+        is_visible(window, "draft-view") && !is_visible(window, "sign-in-card")
+    });
+}
+
+/// Settings → Providers signs in with an account's login, showing the
+/// login's page until the provider approves it, and signs out of a
+/// profile, which then takes a key again.
+#[test]
+fn providers_sign_in_with_a_login_and_out() {
+    let mut ui = Harness::start("providers", Script::default());
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Providers");
+    let login = "providers-fake-login-login";
+    ui.wait_until("the login's Sign in", |window, _, _| {
+        is_visible(window, login)
+    });
+    ui.shot("listed");
+
+    ui.click(login);
+    ui.wait_until("the login's page", |window, _, _| {
+        is_visible(window, "providers-fake-login-prompt")
+    });
+    ui.shot("login");
+    ui.fake().approve_login();
+    ui.wait_until("signed in", |window, _, _| {
+        is_visible(window, "providers-fake-login-logout")
+            && !is_visible(window, "providers-fake-login-prompt")
+    });
+    assert!(ui.fake().signed_in(LOGIN_AUTH));
+
+    ui.click("providers-fake-api-key-logout");
+    ui.wait_until("the key's box back", |window, _, _| {
+        is_visible(window, "providers-fake-api-key-save")
+    });
+    assert!(!ui.fake().signed_in(KEY_AUTH));
+    ui.shot("signed-out");
 }
