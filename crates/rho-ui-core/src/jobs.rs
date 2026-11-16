@@ -31,8 +31,8 @@ pub struct Jobs {
 impl Jobs {
     pub(crate) fn from_list(jobs: Vec<JobSummary>) -> Self {
         Self {
-            runs: Runs::from_list(&jobs),
-            active: Job::from_list(jobs),
+            active: Job::from_list(&jobs),
+            runs: Runs::from_list(jobs),
         }
     }
 }
@@ -61,7 +61,8 @@ pub struct Job {
 }
 
 impl Job {
-    /// The session the job runs. Pass to [`Daemon::attach`] to follow it.
+    /// The session the job runs. Pass to [`crate::Daemon::attach`] to
+    /// follow it.
     pub fn session(&self) -> &SessionId {
         &self.session
     }
@@ -98,14 +99,14 @@ impl Job {
     }
 
     /// The sessions with work under way among `jobs`, a whole listing.
-    fn from_list(jobs: Vec<JobSummary>) -> Vec<Self> {
+    fn from_list(jobs: &[JobSummary]) -> Vec<Self> {
         // A subagent or workflow run names the job that started it.
-        let started: HashSet<JobId> = jobs
+        let started: HashSet<&JobId> = jobs
             .iter()
             .filter(|job| job.kind != JobKind::Session && job.state.in_progress())
-            .filter_map(|job| job.parent.clone())
+            .filter_map(|job| job.parent.as_ref())
             .collect();
-        jobs.into_iter()
+        jobs.iter()
             .filter_map(|job| Self::from_wire(job, &started))
             .collect()
     }
@@ -113,7 +114,7 @@ impl Job {
     /// The job as the sidebar needs it, or `None` for one that is not a
     /// session with work under way. `started` holds the jobs whose
     /// subagent or workflow runs are under way.
-    fn from_wire(job: JobSummary, started: &HashSet<JobId>) -> Option<Self> {
+    fn from_wire(job: &JobSummary, started: &HashSet<&JobId>) -> Option<Self> {
         // A subagent's or workflow's session belongs to the session that
         // started it, and can't be attached to.
         if job.kind != JobKind::Session {
@@ -130,51 +131,111 @@ impl Job {
             _ => return None,
         };
         Some(Self {
-            session: job.session?.into(),
-            cwd: job.workspace,
+            session: job.session.clone()?.into(),
+            cwd: job.workspace.clone(),
             turn_elapsed: live
                 .and_then(|live| live.turn_elapsed_ms)
                 .map(Duration::from_millis),
-            title: job.live.and_then(|live| live.title),
+            title: live.and_then(|live| live.title.clone()),
             activity,
         })
     }
 }
 
-/// The subagent and workflow runs in a job listing, by the session that
-/// started them. The daemon keeps a record of every run, so ended ones are
-/// here too, with how they ended.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Runs(HashMap<SessionId, Vec<Run>>);
+/// The subagent and workflow runs in a job listing, to put together for the
+/// session that started them with [`Self::of`]. The daemon keeps a record
+/// of every run, so ended ones are here too, with how they ended.
+#[derive(Clone, Debug, Default)]
+pub struct Runs {
+    /// The whole listing, oldest first.
+    jobs: Vec<JobSummary>,
+    /// The subagent and workflow jobs each job started, as indices into
+    /// `jobs`, oldest first.
+    started: HashMap<JobId, Vec<usize>>,
+}
 
 impl Runs {
-    /// The runs `session` started, oldest first. A subagent's own session
-    /// has runs too, when the subagent delegates.
-    pub fn of(&self, session: &SessionId) -> &[Run] {
-        self.0.get(session).map_or(&[], Vec::as_slice)
+    fn from_list(jobs: Vec<JobSummary>) -> Self {
+        let mut started: HashMap<JobId, Vec<usize>> = HashMap::new();
+        for (ix, job) in jobs.iter().enumerate() {
+            if let (Some(parent), JobKind::Subagent | JobKind::Workflow) = (&job.parent, job.kind) {
+                started.entry(parent.clone()).or_default().push(ix);
+            }
+        }
+        Self { jobs, started }
     }
 
-    fn from_list(jobs: &[JobSummary]) -> Self {
-        let mut started: HashMap<&JobId, Vec<&JobSummary>> = HashMap::new();
-        for job in jobs {
-            if let (Some(parent), JobKind::Subagent | JobKind::Workflow) = (&job.parent, job.kind) {
-                started.entry(parent).or_default().push(job);
-            }
-        }
-        let mut runs: HashMap<SessionId, Vec<Run>> = HashMap::new();
-        for job in jobs {
-            let Some(session) = &job.session else {
+    /// The runs `session` started, oldest first, each with those it
+    /// started in turn. A subagent's own session has runs too, when the
+    /// subagent delegates.
+    pub fn of(&self, session: &SessionId) -> Vec<Run> {
+        let writers: Vec<&JobId> = self
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.session
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == session.as_str())
+            })
+            .map(|job| &job.id)
+            .collect();
+        let mut seen = writers.iter().copied().collect();
+        self.started_by(&writers, &mut seen)
+    }
+
+    /// The runs the jobs `parents` started. A workflow run driven more than
+    /// once has a job for each drive: they make one run, where the newest
+    /// drive is, holding the agent runs of every drive. `seen` holds the
+    /// jobs placed so far, so a daemon whose parents loop can't recurse
+    /// forever.
+    fn started_by<'a>(&'a self, parents: &[&JobId], seen: &mut HashSet<&'a JobId>) -> Vec<Run> {
+        let mut children: Vec<usize> = parents
+            .iter()
+            .filter_map(|parent| self.started.get(*parent))
+            .flatten()
+            .copied()
+            .collect();
+        children.sort_unstable();
+        let mut runs: Vec<(Run, Vec<&JobId>)> = Vec::new();
+        for job in children.into_iter().map(|ix| &self.jobs[ix]) {
+            if !seen.insert(&job.id) {
                 continue;
+            }
+            let id = match (job.kind, &job.run, &job.workflow_run) {
+                (JobKind::Subagent, Some(run), _) => BackgroundItem::Subagent {
+                    run: run.clone(),
+                    session: job.session.clone(),
+                },
+                (JobKind::Workflow, _, Some(run)) => BackgroundItem::Workflow { run: run.clone() },
+                // A run with no ID matches nothing the session lists.
+                _ => continue,
             };
-            let mut seen = HashSet::from([&job.id]);
-            let theirs = Run::started_by(&job.id, &started, &mut seen);
-            if !theirs.is_empty() {
-                runs.entry(session.clone().into())
-                    .or_default()
-                    .extend(theirs);
+            let id = BackgroundId(id);
+            let title = job.live.as_ref().and_then(|live| live.title.clone());
+            let status = RunStatus::of(job);
+            match runs.iter_mut().find(|(run, _)| run.id == id) {
+                Some((run, drives)) => {
+                    run.status = status;
+                    run.title = title.or_else(|| run.title.take());
+                    drives.push(&job.id);
+                }
+                None => runs.push((
+                    Run {
+                        id,
+                        title,
+                        status,
+                        runs: Vec::new(),
+                    },
+                    vec![&job.id],
+                )),
             }
         }
-        Self(runs)
+        runs.into_iter()
+            .map(|(mut run, drives)| {
+                run.runs = self.started_by(&drives, seen);
+                run
+            })
+            .collect()
     }
 }
 
@@ -216,11 +277,12 @@ impl Run {
         &self.id
     }
 
-    /// A subagent or a workflow.
+    /// A subagent or a workflow: [`Runs`] makes no other kind.
     pub fn kind(&self) -> BackgroundKind {
-        self.id
-            .key()
-            .map_or(BackgroundKind::Other, |(kind, _)| kind)
+        match self.id.0 {
+            BackgroundItem::Workflow { .. } => BackgroundKind::Workflow,
+            _ => BackgroundKind::Subagent,
+        }
     }
 
     /// A subagent's own session, once it opened one. Follow it with
@@ -244,41 +306,6 @@ impl Run {
     /// or a subagent's own subagents.
     pub fn runs(&self) -> &[Run] {
         &self.runs
-    }
-
-    /// The runs job `parent` started, each with those it started in turn.
-    /// `seen` holds the jobs placed so far, so a daemon whose parents
-    /// loop can't recurse forever.
-    fn started_by<'a>(
-        parent: &JobId,
-        started: &HashMap<&JobId, Vec<&'a JobSummary>>,
-        seen: &mut HashSet<&'a JobId>,
-    ) -> Vec<Self> {
-        let Some(jobs) = started.get(parent) else {
-            return Vec::new();
-        };
-        let mut runs = Vec::new();
-        for job in jobs {
-            if !seen.insert(&job.id) {
-                continue;
-            }
-            let id = match (job.kind, &job.run, &job.workflow_run) {
-                (JobKind::Subagent, Some(run), _) => BackgroundItem::Subagent {
-                    run: run.clone(),
-                    session: job.session.clone(),
-                },
-                (JobKind::Workflow, _, Some(run)) => BackgroundItem::Workflow { run: run.clone() },
-                // A run with no ID matches nothing the session lists.
-                _ => continue,
-            };
-            runs.push(Self {
-                id: BackgroundId(id),
-                title: job.live.as_ref().and_then(|live| live.title.clone()),
-                status: RunStatus::of(job),
-                runs: Self::started_by(&job.id, started, seen),
-            });
-        }
-        runs
     }
 }
 
@@ -319,7 +346,7 @@ mod tests {
     }
 
     fn job(kind: &str, state: &str, live: &serde_json::Value) -> Option<Job> {
-        Job::from_list(vec![summary("j1", kind, state, None, live)]).pop()
+        Job::from_list(&[summary("j1", kind, state, None, live)]).pop()
     }
 
     fn live(elapsed_ms: u64, inputs: &serde_json::Value) -> serde_json::Value {
@@ -375,15 +402,15 @@ mod tests {
                 summary("j1", "session", "completed", None, &live(5, &json!([]))),
                 summary("j2", kind, state, Some("j1"), &serde_json::Value::Null),
             ];
-            let activities: Vec<_> = Job::from_list(jobs).iter().map(Job::activity).collect();
+            let activities: Vec<_> = Job::from_list(&jobs).iter().map(Job::activity).collect();
             assert_eq!(activities, Vec::from_iter(want), "a {state} {kind}");
         }
     }
 
     /// Each session's runs nest as the daemon's parents say, and carry
     /// what the session's background list lacks: a queued run's place in
-    /// line and a failed one's error. A run whose parent isn't listed
-    /// belongs to no session.
+    /// line and a failed one's error. A workflow's drives make one run. A
+    /// run whose parent isn't listed belongs to no session.
     #[test]
     fn runs_nest_under_the_session_that_started_them() {
         let run = |id: &str, kind: &str, state: &str, parent: &str, more: serde_json::Value| {
@@ -394,10 +421,28 @@ mod tests {
                 .extend(more.as_object().expect("an object").clone());
             serde_json::from_value::<JobSummary>(job).expect("a valid job summary")
         };
+        // The workflow failed a node on its first drive and was driven
+        // again: one run, where the second drive is, with both drives'
+        // nodes.
+        let queue = json!({"budget": "agent_concurrency", "limit": 10, "position": 2});
         let jobs = vec![
             summary("j1", "session", "completed", None, &json!(null)),
             run(
-                "w",
+                "w1",
+                "workflow",
+                "failed",
+                "j1",
+                json!({"workflow_run": "wf"}),
+            ),
+            run(
+                "b",
+                "subagent",
+                "failed",
+                "w1",
+                json!({"run": "rb", "error": "boom"}),
+            ),
+            run(
+                "w2",
                 "workflow",
                 "running",
                 "j1",
@@ -407,28 +452,23 @@ mod tests {
                 "a",
                 "subagent",
                 "queued",
-                "w",
-                json!({"run": "ra", "session": "s-a",
-                "queue": {"budget": "agent_concurrency", "limit": 10, "position": 2}}),
-            ),
-            run(
-                "b",
-                "subagent",
-                "failed",
-                "w",
-                json!({"run": "rb", "error": "boom"}),
+                "w2",
+                json!({"run": "ra", "session": "s-a", "queue": queue}),
             ),
             run("c", "subagent", "running", "j1", json!({"run": "rc"})),
             run("x", "subagent", "running", "gone", json!({"run": "rx"})),
         ];
         let runs = Jobs::from_list(jobs).runs;
         let of_j1 = runs.of(&SessionId::from("s-j1"));
-        let ids: Vec<_> = of_j1.iter().map(|run| run.id().key()).collect();
+        let ids: Vec<_> = of_j1
+            .iter()
+            .map(|run| (run.id().key(), run.status().clone()))
+            .collect();
         assert_eq!(
             ids,
             [
-                Some((BackgroundKind::Workflow, "wf")),
-                Some((BackgroundKind::Subagent, "rc"))
+                (Some((BackgroundKind::Workflow, "wf")), RunStatus::Running),
+                (Some((BackgroundKind::Subagent, "rc")), RunStatus::Running)
             ]
         );
         let nodes: Vec<_> = of_j1[0]
@@ -440,14 +480,14 @@ mod tests {
             nodes,
             [
                 (
-                    RunStatus::Queued { position: Some(2) },
-                    Some(SessionId::from("s-a"))
-                ),
-                (
                     RunStatus::Failed {
                         error: Some("boom".to_owned())
                     },
                     None
+                ),
+                (
+                    RunStatus::Queued { position: Some(2) },
+                    Some(SessionId::from("s-a"))
                 ),
             ]
         );

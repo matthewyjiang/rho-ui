@@ -51,35 +51,47 @@ struct Row {
     error: Option<SharedString>,
     /// A subagent's session, which a click on the row opens.
     session: Option<SessionId>,
-    /// The runs it started, which only the surface shows.
-    runs: Vec<Row>,
+    /// The runs it started, which a nesting list shows under it.
+    runs: Vec<Run>,
 }
 
 impl Row {
     /// `work` as its session lists it, with what the job list says of it,
     /// `run`, if it is a run.
     fn new(work: &BackgroundWork, run: Option<&Run>, stop: Stop) -> Self {
-        let outcome = run.map(Run::status);
-        let failed = match work.status() {
-            // The job list keeps how a run ended after the session forgot.
-            BackgroundStatus::Ended => matches!(outcome, Some(RunStatus::Failed { .. })),
-            _ => failed(work),
-        };
-        Self {
+        let row = Self {
             kind: work.kind(),
             title: work.title().to_owned().into(),
-            status: status_label(work, outcome, stop).into(),
-            failed,
-            error: failed.then(|| error(outcome)).flatten(),
+            status: status_label(work, stop).into(),
+            failed: failed(work),
+            error: None,
             session: work.session(),
-            runs: run.map(Self::runs).unwrap_or_default(),
+            runs: run.map_or_else(Vec::new, |run| run.runs().to_vec()),
+        };
+        // The job list says more while a run waits for a slot, and how a
+        // run ended after the session forgot it.
+        let says_more = |status: &&RunStatus| match work.status() {
+            BackgroundStatus::Running => {
+                stop != Stop::Asked && matches!(status, RunStatus::Queued { .. })
+            }
+            BackgroundStatus::Ended => true,
+            _ => false,
+        };
+        match run.map(Run::status).filter(says_more) {
+            Some(status) => row.with_status(status),
+            // Where the session's list says it failed, the job list may
+            // say why.
+            None => Self {
+                error: run
+                    .filter(|_| row.failed)
+                    .and_then(|run| error(run.status())),
+                ..row
+            },
         }
     }
 
     /// A run only the job list names, as a workflow's agent node.
     fn of_run(run: &Run) -> Self {
-        let status = run.status();
-        let failed = matches!(status, RunStatus::Failed { .. });
         let title = run.title().unwrap_or(match run.kind() {
             BackgroundKind::Workflow => "Workflow",
             _ => "Subagent",
@@ -87,17 +99,67 @@ impl Row {
         Self {
             kind: run.kind(),
             title: title.to_owned().into(),
-            status: run_label(status).into(),
-            failed,
-            error: error(Some(status)),
+            status: SharedString::default(),
+            failed: false,
+            error: None,
             session: run.session(),
-            runs: Self::runs(run),
+            runs: run.runs().to_vec(),
+        }
+        .with_status(run.status())
+    }
+
+    /// The row as the job list's `status` says.
+    fn with_status(self, status: &RunStatus) -> Self {
+        Self {
+            status: run_label(status).into(),
+            failed: matches!(status, RunStatus::Failed { .. }),
+            error: error(status),
+            ..self
         }
     }
 
-    /// The rows of the runs `run` started.
-    fn runs(run: &Run) -> Vec<Self> {
-        run.runs().iter().map(Self::of_run).collect()
+    /// The row named `id`, with `trailing` at its end, and under it why it
+    /// failed; with `nest`, then the rows of the runs it started, named
+    /// `id-run-N`, each `depth` steps further in.
+    fn render_tree(
+        &self,
+        id: &str,
+        depth: u16,
+        trailing: Option<AnyElement>,
+        nest: Nest,
+        open: &OpenHandler,
+        cx: &App,
+    ) -> Vec<AnyElement> {
+        let indent = rems(0.75 + 1.25 * f32::from(depth));
+        let mut rows = vec![self
+            .render(id.to_owned().into(), open, cx)
+            .pl(indent)
+            .pr_3()
+            .children(trailing)
+            .into_any_element()];
+        if let Some(error) = self.error.clone() {
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("{id}-error")))
+                    .test_support()
+                    .aria_label(error.clone())
+                    // In line with the title, past the icon and the gap.
+                    .ml(indent)
+                    .pl(rems(1.25))
+                    .pr_3()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error)
+                    .into_any_element(),
+            );
+        }
+        if nest == Nest::Runs {
+            for (ix, run) in self.runs.iter().enumerate() {
+                let id = format!("{id}-run-{ix}");
+                rows.extend(Self::of_run(run).render_tree(&id, depth + 1, None, nest, open, cx));
+            }
+        }
+        rows
     }
 
     /// Icon, title and status, labelled "title: status" for UI tests. A
@@ -149,43 +211,11 @@ impl Row {
     }
 }
 
-impl Row {
-    /// Why the row's work failed, under its title, if the daemon said.
-    fn render_error(&self, id: &str, cx: &App) -> Option<ObservedElement<Stateful<Div>>> {
-        let error = self.error.clone()?;
-        Some(
-            div()
-                .id(SharedString::from(format!("{id}-error")))
-                .test_support()
-                .aria_label(error.clone())
-                // In line with the title, past the icon and the gap.
-                .pl(rems(1.25))
-                .text_xs()
-                .text_color(cx.theme().danger)
-                .child(error),
-        )
-    }
-
-    /// The rows of the runs this one started, each indented a step further
-    /// than the one that started it, named `id-run-N`.
-    fn render_runs(&self, id: &str, depth: f32, open: &OpenHandler, cx: &App) -> Vec<AnyElement> {
-        let mut rows = Vec::new();
-        for (ix, run) in self.runs.iter().enumerate() {
-            let id = format!("{id}-run-{ix}");
-            let indent = rems(0.75 + 1.25 * depth);
-            rows.push(
-                run.render(id.clone().into(), open, cx)
-                    .pl(indent)
-                    .pr_3()
-                    .into_any_element(),
-            );
-            if let Some(error) = run.render_error(&id, cx) {
-                rows.push(error.ml(indent).pr_3().into_any_element());
-            }
-            rows.extend(run.render_runs(&id, depth + 1., open, cx));
-        }
-        rows
-    }
+/// Whether a row lists the runs its work started under it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nest {
+    Runs,
+    None,
 }
 
 /// Whether a row offers to stop its work.
@@ -211,8 +241,7 @@ pub(crate) struct BackgroundList {
     on_open: OpenHandler,
     /// The list's element ID, and the start of its rows'.
     ids: &'static str,
-    /// Whether each row lists the runs it started under it.
-    nested: bool,
+    nest: Nest,
 }
 
 impl BackgroundList {
@@ -231,7 +260,7 @@ impl BackgroundList {
             stop: None,
             on_open,
             ids: "background",
-            nested: false,
+            nest: Nest::None,
         })
     }
 
@@ -240,7 +269,7 @@ impl BackgroundList {
     /// lists each row's runs under it.
     fn nested(mut self, ids: &'static str) -> Self {
         self.ids = ids;
-        self.nested = true;
+        self.nest = Nest::Runs;
         self
     }
 
@@ -267,33 +296,30 @@ impl RenderOnce for BackgroundList {
                 Some((asked, _)) if asked.contains(work.id()) => Stop::Asked,
                 Some(_) => Stop::Offered,
             };
-            let row = Row::new(work, run.as_ref(), state);
-            let id = format!("{ids}-{ix}");
-            rows.push(
-                row.render(id.clone().into(), &on_open, cx)
-                    .px_3()
-                    .map(|this| match offer {
-                        Some((_, on_stop)) => {
-                            let (on_stop, id) = (Rc::clone(on_stop), work.id().clone());
-                            this.child(
-                                Button::new(SharedString::from(format!("{ids}-stop-{ix}")))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Lucide::Square)
-                                    .tooltip("Stop")
-                                    .disabled(state == Stop::Asked)
-                                    .on_click(move |_, window, cx| on_stop(&id, window, cx)),
-                            )
-                        }
-                        // Keeps the status in the lane of the rows that can
-                        // stop: the size of an xsmall icon button.
-                        None => this.child(div().flex_shrink_0().size_5()),
-                    })
-                    .into_any_element(),
-            );
-            if self.nested {
-                rows.extend(row.render_runs(&id, 1., &on_open, cx));
-            }
+            let trailing = match offer {
+                Some((_, on_stop)) => {
+                    let (on_stop, id) = (Rc::clone(on_stop), work.id().clone());
+                    Button::new(SharedString::from(format!("{ids}-stop-{ix}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(Lucide::Square)
+                        .tooltip("Stop")
+                        .disabled(state == Stop::Asked)
+                        .on_click(move |_, window, cx| on_stop(&id, window, cx))
+                        .into_any_element()
+                }
+                // Keeps the status in the lane of the rows that can stop:
+                // the size of an xsmall icon button.
+                None => div().flex_shrink_0().size_5().into_any_element(),
+            };
+            rows.extend(Row::new(work, run.as_ref(), state).render_tree(
+                &format!("{ids}-{ix}"),
+                0,
+                Some(trailing),
+                self.nest,
+                &on_open,
+                cx,
+            ));
         }
         v_flex()
             .id(ids)
@@ -339,11 +365,9 @@ fn ended_rows(ended: &[BackgroundWork], runs: &[Run]) -> Rc<[Row]> {
         .collect()
 }
 
-/// What the job list says of `work`, if it is one of `runs`. A workflow
-/// run that was driven again has a job for each drive; the last is the
-/// one under way.
+/// What the job list says of `work`, if it is one of `runs`.
 fn run_of<'a>(runs: &'a [Run], work: &BackgroundWork) -> Option<&'a Run> {
-    runs.iter().rev().find(|run| run.id() == work.id())
+    runs.iter().find(|run| run.id() == work.id())
 }
 
 impl RenderOnce for BackgroundHistory {
@@ -378,13 +402,7 @@ impl RenderOnce for BackgroundHistory {
                             .gap_1()
                             .children(rows.iter().enumerate().flat_map(|(ix, row)| {
                                 let id = format!("background-ended-{ix}");
-                                let error = row.render_error(&id, cx);
-                                [
-                                    Some(row.render(id.into(), &on_open, cx).into_any_element()),
-                                    error.map(IntoElement::into_any_element),
-                                ]
-                                .into_iter()
-                                .flatten()
+                                row.render_tree(&id, 0, None, Nest::None, &on_open, cx)
                             })),
                     )
             })
@@ -468,16 +486,7 @@ impl RenderOnce for BackgroundSurface {
                         .child(v_flex().gap_1().children(ended.iter().enumerate().flat_map(
                             |(ix, row)| {
                                 let id = format!("panel-ended-{ix}");
-                                let mut rows = vec![row
-                                    .render(id.clone().into(), &on_open, cx)
-                                    .px_3()
-                                    .into_any_element()];
-                                rows.extend(
-                                    row.render_error(&id, cx)
-                                        .map(|error| error.ml_3().pr_3().into_any_element()),
-                                );
-                                rows.extend(row.render_runs(&id, 1., &on_open, cx));
-                                rows
+                                row.render_tree(&id, 0, None, Nest::Runs, &on_open, cx)
                             },
                         ))),
                 )
@@ -487,23 +496,17 @@ impl RenderOnce for BackgroundSurface {
 }
 
 /// How the work is doing, in words: "Running", "Exited 0", "Stopped".
-/// `outcome` is what the job list says of a run, which tells where a
-/// queued one waits, and how one ended that the session didn't see end.
-fn status_label(work: &BackgroundWork, outcome: Option<&RunStatus>, stop: Stop) -> String {
-    match (work.status(), work.exit_code(), outcome) {
-        (BackgroundStatus::Running, _, _) if stop == Stop::Asked => "Stopping…".to_owned(),
-        (BackgroundStatus::Running, _, Some(queued @ RunStatus::Queued { .. })) => {
-            run_label(queued)
-        }
-        (BackgroundStatus::Running, _, _) => "Running".to_owned(),
-        (BackgroundStatus::Completed | BackgroundStatus::Failed, Some(code), _) => {
+fn status_label(work: &BackgroundWork, stop: Stop) -> String {
+    match (work.status(), work.exit_code()) {
+        (BackgroundStatus::Running, _) if stop == Stop::Asked => "Stopping…".to_owned(),
+        (BackgroundStatus::Running, _) => "Running".to_owned(),
+        (BackgroundStatus::Completed | BackgroundStatus::Failed, Some(code)) => {
             format!("Exited {code}")
         }
-        (BackgroundStatus::Completed, None, _) => "Done".to_owned(),
-        (BackgroundStatus::Failed, None, _) => "Failed".to_owned(),
-        (BackgroundStatus::Cancelled, _, _) => "Stopped".to_owned(),
-        (BackgroundStatus::Ended, _, Some(outcome)) => run_label(outcome),
-        (BackgroundStatus::Ended, _, None) => "Ended".to_owned(),
+        (BackgroundStatus::Completed, None) => "Done".to_owned(),
+        (BackgroundStatus::Failed, None) => "Failed".to_owned(),
+        (BackgroundStatus::Cancelled, _) => "Stopped".to_owned(),
+        (BackgroundStatus::Ended, _) => "Ended".to_owned(),
     }
 }
 
@@ -523,9 +526,9 @@ fn run_label(status: &RunStatus) -> String {
 }
 
 /// Why a run failed, if the job list says it did and why.
-fn error(outcome: Option<&RunStatus>) -> Option<SharedString> {
-    match outcome {
-        Some(RunStatus::Failed { error: Some(error) }) => Some(error.clone().into()),
+fn error(status: &RunStatus) -> Option<SharedString> {
+    match status {
+        RunStatus::Failed { error: Some(error) } => Some(error.clone().into()),
         _ => None,
     }
 }

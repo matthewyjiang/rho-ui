@@ -649,22 +649,22 @@ impl RhoApp {
             let runs = jobs.runs.of(&open.id.id);
             open.view.update(cx, |view, cx| view.set_runs(runs, cx));
         }
-        let jobs = jobs.active.as_slice();
+        let active = jobs.active.as_slice();
         let Some(connection) = self.connection_mut(machine) else {
             return false;
         };
-        let same = connection.jobs.len() == jobs.len()
+        let same = connection.jobs.len() == active.len()
             && connection
                 .jobs
                 .iter()
-                .zip(jobs)
+                .zip(active)
                 .all(|(was, now)| was.is_same_work(now));
         if same {
             return false;
         }
-        jobs.clone_into(&mut connection.jobs);
+        active.clone_into(&mut connection.jobs);
         self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, jobs, cx));
+            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, active, cx));
         self.refresh_sessions(machine, cx);
         true
     }

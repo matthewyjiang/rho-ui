@@ -772,9 +772,9 @@ impl SessionView {
     /// Takes the session's runs from a listing of the daemon's jobs, which
     /// says what its background list lacks: where a queued run waits, why
     /// a failed one failed, and a workflow's agent nodes.
-    pub(crate) fn set_runs(&mut self, runs: &[Run], cx: &mut Context<'_, Self>) {
+    pub(crate) fn set_runs(&mut self, runs: Vec<Run>, cx: &mut Context<'_, Self>) {
         if self.runs != runs {
-            self.runs = runs.to_vec();
+            self.runs = runs;
             cx.notify();
         }
     }

@@ -431,7 +431,7 @@ impl FakeDaemon {
     /// If the daemon has no session `session`: the test has a bug.
     pub fn start_workflow(&self, session: &UiSessionId) {
         let mut state = self.service.lock();
-        let run = format!("wf-{}", state.runs.len());
+        let run = format!("wf-{}", state.extra_jobs.len());
         let parent = state
             .sessions
             .get_mut(session.as_str())
@@ -498,7 +498,7 @@ impl FakeDaemon {
                 drive,
             )
         };
-        state.runs.extend([workflow, queued, failed]);
+        state.extra_jobs.extend([workflow, queued, failed]);
     }
 
     /// Retries the request the prompt "flaky" left waiting, and answers.
@@ -1240,7 +1240,7 @@ struct State {
     turns: u64,
     steers: u64,
     /// Jobs of runs no session writes, listed after the sessions' own.
-    runs: Vec<JobSummary>,
+    extra_jobs: Vec<JobSummary>,
     /// rho's own settings.
     config: FakeConfig,
 }
@@ -1282,7 +1282,7 @@ impl State {
             new_session_environment: None,
             turns: 0,
             steers: 0,
-            runs: Vec::new(),
+            extra_jobs: Vec::new(),
             config: FakeConfig::new(),
         };
         if script.tui_job == TuiJob::Running {
