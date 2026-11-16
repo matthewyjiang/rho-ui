@@ -41,7 +41,7 @@ use self::{
     actions::Acting,
     checks::{check_counts, checks},
     conversation::{open_threads, Posting},
-    diagrams::Diagrams,
+    diagrams::DiagramState,
     header::{identity, toolbar, web_url},
     link::{link_button, LinkForm},
 };
@@ -86,7 +86,7 @@ pub(super) struct PullRequestSurface {
     /// description under [`DESCRIPTION`], and each post under its URL.
     texts: HashMap<SharedString, (SharedString, Entity<TextViewState>)>,
     /// The diagrams in those texts.
-    diagrams: Diagrams,
+    diagrams: DiagramState,
     /// The comment threads on the code the user opened or closed, by id:
     /// those resolved start closed, the rest open.
     flipped: HashSet<SharedString>,
@@ -131,7 +131,7 @@ impl PullRequestSurface {
             shows,
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
-            diagrams: Diagrams::new(),
+            diagrams: DiagramState::new(),
             flipped: HashSet::new(),
             comment_box: None,
             posting: Posting::Idle,
@@ -243,7 +243,9 @@ impl PullRequestSurface {
     }
 
     /// Parses the Markdown of the PR on screen that changed, and drops
-    /// what it no longer has; when any changed, draws its diagrams.
+    /// what it no longer has. Its diagrams are drawn while it shows: again
+    /// when any changed, and not while hidden, as a hidden tab's backlog
+    /// would hold up the diagrams of the PR on screen.
     fn sync_texts(&mut self, cx: &mut Context<'_, Self>) {
         let wanted: Vec<(SharedString, SharedString)> = self
             .target(cx)
@@ -267,6 +269,7 @@ impl PullRequestSurface {
             .unwrap_or_default();
         let mut parsed = std::mem::take(&mut self.texts);
         let mut changed = false;
+        let order = wanted.iter().map(|(_, text)| text.clone()).collect();
         for (key, text) in wanted {
             let state = match parsed.remove(&key) {
                 Some((shown, state)) if shown == text => state,
@@ -282,9 +285,12 @@ impl PullRequestSurface {
             };
             self.texts.insert(key, (text, state));
         }
-        if changed {
-            let texts = self.texts.values().map(|(text, _)| text.clone()).collect();
-            self.draw_diagrams(texts, cx);
+        match self.visibility {
+            Visibility::Hidden => self.diagrams.stop(),
+            Visibility::Shown if changed || self.diagrams.stopped() => {
+                self.draw_diagrams(order, cx);
+            }
+            Visibility::Shown => {}
         }
     }
 

@@ -7,33 +7,35 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use gpui_kit::component::text::MarkdownExtensions;
 use gpui_kit::{Context, SharedString, Task};
 
 use super::PullRequestSurface;
 use crate::{figures, pele};
 
-/// How many diagrams of one text, a description or a post, are drawn; the
-/// rest show as code. Each may take pele up to its one-second limit, so
-/// this bounds what one comment costs. Of the 329 newest PRs of rho and
-/// rho-ui, none has more than one diagram in its description.
-const DIAGRAM_LIMIT: usize = 10;
+/// How many different diagrams of one PR are drawn, its description's
+/// first; the rest show as code. Each may take pele up to its one-second
+/// limit, so this bounds what a PR's text costs each time it changes. Of
+/// the 329 newest PRs of rho and rho-ui, none has more than one diagram in
+/// its description.
+const DIAGRAM_LIMIT: usize = 20;
 
 /// The diagrams drawn for a surface's PR, and the drawing under way.
-pub(super) struct Diagrams {
+pub(super) struct DiagramState {
     drawn: Arc<figures::Drawings>,
-    /// Kit's parser revision, bumped whenever `drawn` changes, so the
-    /// text is parsed again with them.
+    /// Kit's parser revision, bumped whenever `drawn` gains a diagram, so
+    /// the text is parsed again with it.
     revision: u64,
-    _drawing: Option<Task<()>>,
+    drawing: Option<Task<()>>,
 }
 
-impl Diagrams {
+impl DiagramState {
     pub(super) fn new() -> Self {
         Self {
             drawn: Arc::default(),
             revision: 0,
-            _drawing: None,
+            drawing: None,
         }
     }
 
@@ -41,12 +43,22 @@ impl Diagrams {
     pub(super) fn extensions(&self) -> MarkdownExtensions {
         figures::drawn_extensions(Arc::clone(&self.drawn), self.revision)
     }
+
+    /// Drops the drawing under way, with the diagrams pele hasn't got to.
+    pub(super) fn stop(&mut self) {
+        self.drawing = None;
+    }
+
+    /// Whether no drawing runs or ran since the last [`Self::stop`].
+    pub(super) fn stopped(&self) -> bool {
+        self.drawing.is_none()
+    }
 }
 
 impl PullRequestSurface {
-    /// Draws the diagrams in `texts`, the PR's Markdown, that aren't drawn
-    /// yet, then parses its text again. A drawing under way is dropped,
-    /// with the diagrams pele hasn't got to.
+    /// Draws the diagrams in `texts`, the PR's Markdown in the order it
+    /// shows, that aren't drawn yet, taking in each batch as pele finishes
+    /// it. A drawing under way is dropped first; what it drew stays.
     pub(super) fn draw_diagrams(&mut self, texts: Vec<SharedString>, cx: &mut Context<'_, Self>) {
         let known = Arc::clone(&self.diagrams.drawn);
         let task = cx.spawn(async move |this, cx| {
@@ -54,67 +66,55 @@ impl PullRequestSurface {
                 .background_executor()
                 .spawn(async move { sources(&texts) })
                 .await;
+            let _ = this.update(cx, |this, _| {
+                // Only this PR's diagrams: those of one shown before go.
+                // What is drawn already doesn't change, so no parse waits.
+                let drawn = Arc::make_mut(&mut this.diagrams.drawn);
+                drawn.retain(|source, _| sources.contains(source));
+            });
             // Asked all at once: pele draws them in turn.
-            let asked: Vec<_> = sources
-                .iter()
-                .filter(|source| !known.contains_key(*source))
+            let drawings: FuturesUnordered<_> = sources
+                .into_iter()
+                .filter(|source| !known.contains_key(source))
                 .map(|source| {
                     let drawing = pele::ask(pele::Lane::PullRequests, source.clone());
-                    let source = source.clone();
                     async move { (source, drawing.await) }
                 })
                 .collect();
-            let fresh = futures::future::join_all(asked).await;
-            // Only this PR's diagrams: those of one shown before go.
-            let drawn: figures::Drawings = sources
-                .into_iter()
-                .filter_map(|source| {
-                    let drawing = known.get(&source)?.clone();
-                    Some((source, drawing))
-                })
-                .chain(fresh)
-                .collect();
-            let _ = this.update(cx, |this, cx| {
-                let old = &this.diagrams.drawn;
-                if drawn.len() != old.len() || drawn.keys().any(|key| !old.contains_key(key)) {
-                    this.diagrams.drawn = Arc::new(drawn);
+            // Each batch is what pele finished since the last was taken in,
+            // so a parse takes in as many as are ready.
+            let mut batches = drawings.ready_chunks(DIAGRAM_LIMIT);
+            while let Some(batch) = batches.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    Arc::make_mut(&mut this.diagrams.drawn).extend(batch);
                     this.diagrams.revision += 1;
                     cx.notify();
-                }
-            });
+                });
+            }
         });
-        self.diagrams = Diagrams {
-            drawn: Arc::clone(&self.diagrams.drawn),
-            revision: self.diagrams.revision,
-            _drawing: Some(task),
-        };
+        self.diagrams.drawing = Some(task);
     }
 }
 
-/// The diagram sources in `texts`, each once, up to [`DIAGRAM_LIMIT`] of
-/// each text.
+/// The different diagram sources in `texts`, in order, up to
+/// [`DIAGRAM_LIMIT`].
 #[expect(
     clippy::print_stderr,
     reason = "rho-ui has no log; stderr reaches the terminal or the journal"
 )]
 fn sources(texts: &[SharedString]) -> Vec<String> {
     let mut seen = HashSet::new();
-    let mut sources = Vec::new();
-    for text in texts {
-        let mut found = figures::diagram_sources(text);
-        if found.len() > DIAGRAM_LIMIT {
-            eprintln!(
-                "rho-ui: a pull request's text has {} Mermaid diagrams; the first \
-                 {DIAGRAM_LIMIT}, the limit, are drawn and the rest show as code",
-                found.len()
-            );
-            found.truncate(DIAGRAM_LIMIT);
-        }
-        for source in found {
-            if seen.insert(source.clone()) {
-                sources.push(source);
-            }
-        }
+    let sources: Vec<String> = texts
+        .iter()
+        .flat_map(|text| figures::diagram_sources(text))
+        .filter(|source| seen.insert(source.clone()))
+        .collect();
+    if sources.len() > DIAGRAM_LIMIT {
+        eprintln!(
+            "rho-ui: a pull request has {} Mermaid diagrams; the first {DIAGRAM_LIMIT}, \
+             the limit, are drawn and the rest show as code",
+            sources.len()
+        );
     }
-    sources
+    sources.into_iter().take(DIAGRAM_LIMIT).collect()
 }

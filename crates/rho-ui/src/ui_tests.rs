@@ -3343,10 +3343,13 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
         is_visible(window, diagram.clone())
     });
     ui.act(|window, _| {
+        let column = window.find("pull-request-body").bounds();
         let shown = window.within(diagram.clone()).find("picture").bounds();
         assert!(
-            shown.size.height > px(0.),
-            "the diagram is drawn: {shown:?}"
+            shown.size.height > px(0.)
+                && shown.left() >= column.left()
+                && shown.right() <= column.right(),
+            "the diagram fits the surface {column:?}: {shown:?}"
         );
     });
     ui.shot("pr");

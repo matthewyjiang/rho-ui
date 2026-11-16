@@ -43,8 +43,13 @@ const INK: Color = Color::new(0., 0., 0., 0.);
 /// The diagram and formula plugins, for a
 /// [`gpui_kit::component::text::TextView`] showing a message.
 pub(crate) fn extensions() -> MarkdownExtensions {
+    plugins(Diagrams::Wait)
+}
+
+/// `diagrams`, and the formula plugins.
+fn plugins(diagrams: Diagrams) -> MarkdownExtensions {
     MarkdownExtensions::default()
-        .plugin(Diagrams::Wait)
+        .plugin(diagrams)
         .plugin(DisplayMath)
         .plugin(InlineMath)
 }
@@ -58,15 +63,13 @@ pub(crate) type Drawings = HashMap<String, Option<Arc<pele::Drawing>>>;
 /// code. Kit parses again when `revision` changes, so change it whenever
 /// `drawn` does.
 pub(crate) fn drawn_extensions(drawn: Arc<Drawings>, revision: u64) -> MarkdownExtensions {
-    MarkdownExtensions::default()
-        .plugin(Diagrams::Drawn(drawn))
-        .plugin(DisplayMath)
-        .plugin(InlineMath)
-        .parser_revision(revision)
+    plugins(Diagrams::Ready(drawn)).parser_revision(revision)
 }
 
 /// The sources of the closed ` ```mermaid ` fences in Markdown `text`, in
-/// order, read as Kit's parser reads them.
+/// order, read as Kit's parser reads them: the options are those of Kit's
+/// `MarkdownExtensions::parse_options` (gpui-base `text/markdown_ext.rs`),
+/// so the sources are the ones [`Diagrams::Ready`] looks up.
 pub(crate) fn diagram_sources(text: &str) -> Vec<String> {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.math_text = true;
@@ -194,7 +197,7 @@ enum Diagrams {
     /// Each drawn as it is parsed, waiting for pele.
     Wait,
     /// Drawn before the text is parsed; one not drawn shows as code.
-    Drawn(Arc<Drawings>),
+    Ready(Arc<Drawings>),
 }
 
 /// pele's drawing of a diagram, the same in every theme, and its last
@@ -219,7 +222,7 @@ impl MarkdownPlugin for Diagrams {
     /// waits rather than giving up after a frame, because Kit never parses
     /// a finished message again, so a diagram given up on would stay as
     /// code. A pull request's text, which anyone who can comment on it
-    /// writes, never waits: its diagrams are [`Diagrams::Drawn`].
+    /// writes, never waits: its diagrams are [`Diagrams::Ready`].
     fn parse(&self, node: &mdast::Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
         let mdast::Node::Code(code) = node else {
             return None;
@@ -235,7 +238,7 @@ impl MarkdownPlugin for Diagrams {
         }
         let drawing = match self {
             Self::Wait => pele::draw(&code.value)?,
-            Self::Drawn(drawn) => drawn.get(&code.value)?.clone()?,
+            Self::Ready(drawn) => drawn.get(&code.value)?.clone()?,
         };
         let data = Diagram {
             drawing,
