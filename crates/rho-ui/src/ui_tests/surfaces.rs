@@ -83,7 +83,8 @@ fn a_form_sends_what_the_user_entered_and_stays_usable() {
             .is_some_and(|button| button.disabled() != Some(true))
     });
     ui.click("surface-deploy-notify");
-    ui.click("surface-deploy-env-production");
+    // A radio group names its radios by index: Production is the second.
+    ui.act(|window, cx| window.within("surface-deploy-env").click(1usize, cx));
     shots(&mut ui, "filled");
 
     ui.click("surface-deploy-deploy");
@@ -147,9 +148,9 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
         "surface-gallery-short",
         "surface-gallery-secret",
         "surface-gallery-agree",
-        "surface-gallery-one-m",
+        "surface-gallery-one",
         "surface-gallery-many-docs",
-        "surface-gallery-chips-rust",
+        "surface-gallery-chips",
         "surface-gallery-volume-value",
         "surface-gallery-primary",
         "surface-gallery-modal",
