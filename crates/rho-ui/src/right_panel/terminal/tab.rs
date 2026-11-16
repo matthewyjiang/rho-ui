@@ -19,7 +19,7 @@ use gpui_kit::{
 };
 
 use super::{ShellExited, TerminalPane, TerminalShell, TerminalView};
-use crate::{right_panel::TerminalShortcut, session_view::SessionView, workspaces::Workspaces};
+use crate::{machines::Place, right_panel::TerminalShortcut, workspaces::Workspaces};
 
 /// What a pane of a terminal tab does, from its menu or a shortcut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,8 +127,8 @@ struct Pane {
 pub(crate) struct TerminalTab {
     workspaces: Entity<Workspaces>,
     shell: TerminalShell,
-    /// The session on screen, which a new pane opens a terminal of.
-    session: Option<Entity<SessionView>>,
+    /// The session's folder, where each pane's shell starts.
+    place: Place,
     layout: Layout,
     panes: Vec<Pane>,
     /// The pane that last had a click or the keyboard: the one the tab is
@@ -144,11 +144,11 @@ pub(crate) struct TerminalTab {
 impl EventEmitter<Emptied> for TerminalTab {}
 
 impl TerminalTab {
-    /// A tab of one pane, with a terminal of `session` if there is one.
+    /// A tab of one pane, with a terminal in `place`, its session's folder.
     pub(crate) fn new(
         workspaces: Entity<Workspaces>,
         shell: TerminalShell,
-        session: Option<&Entity<SessionView>>,
+        place: Place,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -156,7 +156,7 @@ impl TerminalTab {
         let mut this = Self {
             workspaces,
             shell,
-            session: session.cloned(),
+            place,
             layout: Layout::Pane(first),
             panes: Vec::new(),
             active: first,
@@ -170,8 +170,8 @@ impl TerminalTab {
 
     fn new_pane(&self, id: PaneId, window: &Window, cx: &mut Context<'_, Self>) -> Pane {
         let (workspaces, shell) = (self.workspaces.clone(), self.shell.clone());
-        let session = self.session.as_ref();
-        let view = cx.new(|cx| TerminalPane::new(workspaces, shell, session, cx));
+        let place = self.place.clone();
+        let view = cx.new(|cx| TerminalPane::new(workspaces, shell, place, cx));
         let subscriptions = [
             cx.observe(&view, |_, _, cx| cx.notify()),
             cx.subscribe_in(&view, window, move |tab, _, _: &ShellExited, window, cx| {
@@ -190,25 +190,12 @@ impl TerminalTab {
         self.panes.iter().find(|pane| pane.id == id)
     }
 
-    /// Shows `session`'s terminals in every pane.
-    pub(crate) fn set_session(
-        &mut self,
-        session: Option<&Entity<SessionView>>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.session = session.cloned();
-        for pane in &self.panes {
-            pane.view
-                .update(cx, |pane, cx| pane.set_session(session, cx));
-        }
-    }
-
     /// The program the active pane runs, if it can be named.
     pub(crate) fn program(&self, cx: &App) -> Option<SharedString> {
         self.pane(self.active)?.view.read(cx).program().cloned()
     }
 
-    /// Pane `id`'s terminal of the session on screen, once it starts.
+    /// Pane `id`'s terminal, once it starts.
     fn terminal(&self, id: PaneId, cx: &App) -> Option<Entity<TerminalView>> {
         self.pane(id)?.view.read(cx).terminal().cloned()
     }
@@ -331,7 +318,7 @@ impl TerminalTab {
         }
     }
 
-    /// The active pane's terminal of the session on screen, for UI tests.
+    /// The active pane's terminal, for UI tests.
     #[cfg(test)]
     pub(crate) fn current(&self, cx: &App) -> Option<Entity<TerminalView>> {
         self.terminal(self.active, cx)

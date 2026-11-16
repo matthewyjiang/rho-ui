@@ -1,5 +1,5 @@
-//! The Terminal surface: shells in the folder of the session on screen,
-//! on the session's machine. Ghostty's libghostty-vt keeps the screen: it
+//! The Terminal surface: shells in the folder of the session its tab
+//! belongs to, on the session's machine. Ghostty's libghostty-vt keeps the screen: it
 //! parses what the shell prints and encodes keys the way the program in it
 //! asked. rho-ui runs the shell and draws the cells with GPUI.
 //!
@@ -10,13 +10,12 @@
 //! [`Program`] is either ([`program`] says how each runs).
 //!
 //! Each Terminal tab ([`TerminalTab`]) splits into panes ([`TerminalPane`]),
-//! side by side or one above another. In each pane, each session gets its
-//! own terminal, started the first time it is on screen there, and kept
-//! until the pane closes or its shell exits. When the shell of the session
-//! on screen exits, the pane closes ([`ShellExited`]), as a terminal
-//! window does, though a job it left running in the background still
-//! holds the pseudo-terminal open. A shell that couldn't start, or whose
-//! ssh connection went, leaves why in its place, with Restart.
+//! side by side or one above another. Each pane runs one terminal, started
+//! the first time the pane shows. When its shell exits, the pane closes
+//! ([`ShellExited`]), as a terminal window does, though a job it left
+//! running in the background still holds the pseudo-terminal open. A shell
+//! that couldn't start, or whose ssh connection went, leaves why in its
+//! place, with Restart.
 //!
 //! A tab is named for the program its shell runs now ([`TerminalView::program`]):
 //! the pseudo-terminal's foreground process on this machine, or the title
@@ -71,12 +70,7 @@ use self::mouse::{Mouse, Pressed, Released};
 use self::program::{Control, Input, Program, OUTPUT_QUEUE, TERM};
 pub(crate) use self::tab::{Direction, PaneCommand};
 pub(super) use self::tab::{Emptied, TerminalTab};
-use crate::{
-    folders::Reader,
-    machines::{Place, SessionKey},
-    session_view::SessionView,
-    workspaces::Workspaces,
-};
+use crate::{folders::Reader, machines::Place, workspaces::Workspaces};
 
 /// The program a terminal on this machine runs: the user's shell in the
 /// app ([`platform::default_shell`]), a plain `sh` in tests, so they don't
@@ -105,19 +99,19 @@ const SCROLLBACK_LINES: usize = 10_000;
 /// of a percent of a core; a tab's name lags the program by up to this.
 pub(crate) const PROGRAM_POLL: Duration = Duration::from_millis(500);
 
-/// Emitted when the shell of the session on screen exits, so the tab
-/// closes the pane.
+/// Emitted when the pane's shell exits, so the tab closes the pane.
 struct ShellExited;
 
-/// A pane of a [`TerminalTab`]: the terminal of the session on screen.
+/// A pane of a [`TerminalTab`]: one terminal in its session's folder.
 struct TerminalPane {
     workspaces: Entity<Workspaces>,
     shell: TerminalShell,
-    /// The session on screen.
-    session: Option<(SessionKey, Place)>,
-    /// Each session's terminal, or why it couldn't start.
-    terminals: Vec<(SessionKey, Result<Entity<TerminalView>, SharedString>)>,
-    /// The program the on-screen session's terminal runs, as last read.
+    /// The session's folder, where the shell starts.
+    place: Place,
+    /// The terminal, or why it couldn't start; `None` until the pane first
+    /// shows.
+    terminal: Option<Result<Entity<TerminalView>, SharedString>>,
+    /// The program the terminal runs, as last read.
     program: Option<SharedString>,
     /// Reads `program` every [`PROGRAM_POLL`]; dropped with the pane.
     _poll: Task<()>,
@@ -129,7 +123,7 @@ impl TerminalPane {
     fn new(
         workspaces: Entity<Workspaces>,
         shell: TerminalShell,
-        session: Option<&Entity<SessionView>>,
+        place: Place,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let poll = cx.spawn(async move |this, cx| loop {
@@ -138,37 +132,22 @@ impl TerminalPane {
                 break;
             }
         });
-        let mut this = Self {
+        Self {
             workspaces,
             shell,
-            session: None,
-            terminals: Vec::new(),
+            place,
+            terminal: None,
             program: None,
             _poll: poll,
-        };
-        this.set_session(session, cx);
-        this
+        }
     }
 
-    /// Shows `session`'s terminal, which the pane's next frame starts if it
-    /// has none.
-    fn set_session(&mut self, session: Option<&Entity<SessionView>>, cx: &mut Context<'_, Self>) {
-        self.session = session.map(|view| {
-            let live = view.read(cx).live();
-            (live.id.clone(), Place::new(live.id.machine, live.cwd))
-        });
-        self.follow_program(cx);
-        cx.notify();
-    }
-
-    /// The program the on-screen session's terminal runs, if it runs one
-    /// this can name.
+    /// The program the terminal runs, if it runs one this can name.
     fn program(&self) -> Option<&SharedString> {
         self.program.as_ref()
     }
 
-    /// Reads the program the on-screen session's terminal runs, and
-    /// redraws if it changed.
+    /// Reads the program the terminal runs, and redraws if it changed.
     fn follow_program(&mut self, cx: &mut Context<'_, Self>) {
         let program = self.terminal().and_then(|view| view.read(cx).program());
         if program != self.program {
@@ -177,31 +156,22 @@ impl TerminalPane {
         }
     }
 
-    /// The on-screen session's terminal, if it started.
+    /// The terminal, if it started.
     fn terminal(&self) -> Option<&Entity<TerminalView>> {
-        let (key, _) = self.session.as_ref()?;
-        self.terminals
-            .iter()
-            .find(|(known, _)| known == key)
-            .and_then(|(_, terminal)| terminal.as_ref().ok())
+        self.terminal.as_ref()?.as_ref().ok()
     }
 
-    /// Starts the shell of the session on screen if it has none: when the
-    /// pane shows or takes the keyboard, not for every pane of every tab a
-    /// session switch reaches.
+    /// Starts the shell if it hasn't been: when the pane shows or takes
+    /// the keyboard, not for every pane as the tab opens.
     fn start_if_new(&mut self, cx: &mut Context<'_, Self>) {
-        if let Some((key, _)) = &self.session {
-            if !self.terminals.iter().any(|(known, _)| known == key) {
-                self.start(cx);
-            }
+        if self.terminal.is_none() {
+            self.start(cx);
         }
     }
 
-    /// Starts the shell of the session on screen, in place of any it had.
+    /// Starts the shell, in place of any it had.
     fn start(&mut self, cx: &mut Context<'_, Self>) {
-        let Some((key, place)) = self.session.clone() else {
-            return;
-        };
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
         // The first frame sizes it to the panel.
         let grid = (80, 24);
@@ -216,8 +186,7 @@ impl TerminalPane {
             Reader::Unread => Err("The session's machine isn't connected.".into()),
         };
         let terminal = program.and_then(|program| TerminalView::new(program, cx).map_err(couldnt));
-        self.terminals.retain(|(known, _)| *known != key);
-        self.terminals.push((key, terminal));
+        self.terminal = Some(terminal);
     }
 
     /// Follows terminal `view`'s shell ending: [`Self::shell_exited`] when
@@ -232,12 +201,8 @@ impl TerminalPane {
         match ended {
             Ok(()) => self.shell_exited(view, cx),
             Err(why) => {
-                let failed = self
-                    .terminals
-                    .iter_mut()
-                    .find(|(_, terminal)| is_view(terminal, view));
-                if let Some((_, terminal)) = failed {
-                    *terminal = Err(why);
+                if self.terminal.as_ref().is_some_and(|terminal| is_view(terminal, view)) {
+                    self.terminal = Some(Err(why));
                     self.follow_program(cx);
                     cx.notify();
                 }
@@ -245,19 +210,14 @@ impl TerminalPane {
         }
     }
 
-    /// Follows terminal `view`'s shell exiting. The on-screen session's
-    /// closes the pane, keeping the terminal until then so its keyboard
-    /// goes on to the next pane; another session's terminal goes, and the
-    /// next time that session shows it starts a new shell.
+    /// Follows terminal `view`'s shell exiting: the pane closes, keeping
+    /// the terminal until then so its keyboard goes on to the next pane.
     fn shell_exited(&mut self, view: EntityId, cx: &mut Context<'_, Self>) {
         if self
             .terminal()
             .is_some_and(|terminal| terminal.entity_id() == view)
         {
             cx.emit(ShellExited);
-        } else {
-            self.terminals
-                .retain(|(_, terminal)| !is_view(terminal, view));
         }
     }
 }
@@ -293,20 +253,9 @@ fn restart(text: SharedString, cx: &Context<'_, TerminalPane>) -> AnyElement {
 impl Render for TerminalPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.start_if_new(cx);
-        let Some((key, _)) = &self.session else {
-            return Empty::new()
-                .h_full()
-                .header(
-                    EmptyHeader::new().description(
-                        EmptyDescription::new()
-                            .child("Open a session to open a terminal in its folder."),
-                    ),
-                )
-                .into_any_element();
-        };
-        match self.terminals.iter().find(|(known, _)| known == key) {
-            Some((_, Ok(terminal))) => terminal.clone().into_any_element(),
-            Some((_, Err(why))) => restart(why.clone(), cx),
+        match &self.terminal {
+            Some(Ok(terminal)) => terminal.clone().into_any_element(),
+            Some(Err(why)) => restart(why.clone(), cx),
             None => div().into_any_element(),
         }
     }

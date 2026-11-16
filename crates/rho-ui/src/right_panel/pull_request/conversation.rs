@@ -28,7 +28,9 @@ use crate::{
 pub(super) enum Posting {
     Idle,
     /// Posting it; dropping the task stops it.
-    Sending(Task<()>),
+    Sending {
+        _task: Task<()>,
+    },
     /// It wasn't posted, and why; the box still holds it.
     Failed(SharedString),
 }
@@ -69,7 +71,7 @@ impl PullRequestSurface {
             return;
         };
         let body = input.read(cx).value().trim().to_owned();
-        if body.is_empty() || matches!(self.posting, Posting::Sending(_)) {
+        if body.is_empty() || matches!(self.posting, Posting::Sending { .. }) {
             return;
         }
         let Some(id) = self.shown_pr(cx) else {
@@ -97,7 +99,7 @@ impl PullRequestSurface {
                 cx.notify();
             });
         });
-        self.posting = Posting::Sending(task);
+        self.posting = Posting::Sending { _task: task };
         cx.notify();
     }
 
@@ -106,7 +108,7 @@ impl PullRequestSurface {
     fn comment_form(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
         let (input, _) = self.comment_box.as_ref()?;
         let theme = cx.theme();
-        let sending = matches!(self.posting, Posting::Sending(_));
+        let sending = matches!(self.posting, Posting::Sending { .. });
         let empty = input.read(cx).value().trim().is_empty();
         let poster = self.prs.read(cx).poster(cx);
         let (note, color) = match (&self.posting, &poster) {

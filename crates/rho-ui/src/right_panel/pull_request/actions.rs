@@ -28,7 +28,9 @@ pub(super) enum Acting {
         head: String,
     },
     /// Doing it; dropping the task stops waiting for it.
-    Running(Task<()>),
+    Running {
+        _task: Task<()>,
+    },
     /// It wasn't done, and why.
     Failed(SharedString),
 }
@@ -56,14 +58,14 @@ impl PullRequestSurface {
                 cx.notify();
             });
         });
-        self.acting = Acting::Running(task);
+        self.acting = Acting::Running { _task: task };
         cx.notify();
     }
 
     /// Whether an action runs, or no machine's account can act: the
     /// comment box says why.
     fn busy(&self, cx: &Context<'_, Self>) -> bool {
-        matches!(self.acting, Acting::Running(_)) || self.prs.read(cx).poster(cx).is_err()
+        matches!(self.acting, Acting::Running { .. }) || self.prs.read(cx).poster(cx).is_err()
     }
 
     /// Asks to confirm a merge `method`'s way of the PR on screen's head.

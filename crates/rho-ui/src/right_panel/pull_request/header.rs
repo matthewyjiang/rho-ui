@@ -28,8 +28,8 @@ pub(crate) enum Linked {
 }
 
 /// The strip above the PR: its repository and number, and the buttons to
-/// open it on the forge, to read it again, and to link one by hand or
-/// unlink it.
+/// open it on the forge, to link another by hand, to unlink one linked so,
+/// and to read it again.
 pub(super) fn toolbar(
     repo: Option<&RepoId>,
     pr: Option<&PrSummary>,
@@ -75,19 +75,23 @@ pub(super) fn toolbar(
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             )
         })
-        .child(match linked {
-            Linked::ByBranch => Button::new("pull-request-link")
+        .child(
+            Button::new("pull-request-link")
                 .ghost()
                 .xsmall()
                 .icon(Lucide::Link)
-                .tooltip("Link a pull request")
+                .tooltip("Link another pull request")
                 .on_click(cx.listener(|this, _, window, cx| this.start_linking(window, cx))),
-            Linked::ByHand => Button::new("pull-request-unlink")
-                .ghost()
-                .xsmall()
-                .icon(Lucide::Unlink)
-                .tooltip("Unlink: follow the branch again")
-                .on_click(cx.listener(|this, _, _, cx| this.unlink(cx))),
+        )
+        .when(linked == Linked::ByHand, |this| {
+            this.child(
+                Button::new("pull-request-unlink")
+                    .ghost()
+                    .xsmall()
+                    .icon(Lucide::Unlink)
+                    .tooltip("Unlink, closing its tab")
+                    .on_click(cx.listener(|this, _, _, cx| this.unlink(cx))),
+            )
         })
         .when(repo.is_some(), |this| this.child(refresh_button(cx)))
 }

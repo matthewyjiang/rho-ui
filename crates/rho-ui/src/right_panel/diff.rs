@@ -1,8 +1,9 @@
 //! The Diff surface: the uncommitted changes in the repository of the
-//! session on screen, staged or not, with its untracked files, as `git` on
-//! the session's machine reports them, drawn with Kit's diff view. It reads
-//! them when it opens, when another session comes on screen, when the
-//! session's turn ends, and on Refresh, and parses them off the UI thread.
+//! session its tab belongs to, staged or not, with its untracked files, as
+//! `git` on the session's machine reports them, drawn with Kit's diff view.
+//! It reads them when it opens, when its session comes back on screen or
+//! its turn ends ([`super::RightPanel`] says when), and on Refresh, and
+//! parses them off the UI thread.
 //! A patch over [`PATCH_LIMIT`] shows the whole files that fit, and says
 //! where it stopped.
 
@@ -20,7 +21,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, AppContext as _, BackgroundExecutor, Context, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window,
+    Styled as _, Task, Window,
 };
 
 use rho_ui_core::platform;
@@ -30,7 +31,6 @@ use crate::{
     folders::{find, Deadline, Reader},
     local,
     machines::Place,
-    session_view::{SessionEvent, SessionView},
     workspaces::Workspaces,
 };
 
@@ -115,13 +115,11 @@ enum Status {
     Ready,
 }
 
-/// The Diff surface of [`super::RightPanel`]: it follows the session the
-/// panel shows.
+/// The Diff surface of [`super::RightPanel`], for one session.
 pub(super) struct DiffSurface {
     workspaces: Entity<Workspaces>,
-    /// The session's folder, with the subscription that reads it again when
-    /// its turn ends.
-    session: Option<(Place, Subscription)>,
+    /// The session's folder.
+    place: Place,
     state: Entity<DiffState>,
     status: Status,
     /// The patch on screen, so a read that finds the same changes leaves
@@ -134,56 +132,25 @@ pub(super) struct DiffSurface {
 impl DiffSurface {
     pub(super) fn new(
         workspaces: Entity<Workspaces>,
-        session: Option<&Entity<SessionView>>,
+        place: Place,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let mut this = Self {
             workspaces,
-            session: None,
+            place,
             state: cx.new(|cx| DiffState::new([], cx)),
             status: Status::Loading,
             patch: Patch::default(),
             load: Task::ready(()),
         };
-        this.set_session(session, cx);
+        this.reload(cx);
         this
-    }
-
-    /// Shows the changes where `session` works, or nothing without one. A
-    /// session in the folder already showing keeps the changes as they
-    /// are until the new read comes.
-    pub(super) fn set_session(
-        &mut self,
-        session: Option<&Entity<SessionView>>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let before = self.session.take().map(|(place, _)| place);
-        self.session = session.map(|view| {
-            let live = view.read(cx).live();
-            let place = Place::new(live.id.machine, live.cwd);
-            let ended = cx.subscribe(view, |this, _, event: &SessionEvent, cx| {
-                if matches!(event, SessionEvent::Saved) {
-                    this.reload(cx);
-                }
-            });
-            (place, ended)
-        });
-        if before.as_ref() != self.session.as_ref().map(|(place, _)| place) {
-            self.status = Status::Loading;
-            self.patch = Patch::default();
-            self.state.update(cx, |state, cx| state.set_files([], cx));
-        }
-        self.reload(cx);
     }
 
     /// Reads the session's changes again, keeping what shows until they
     /// come.
-    fn reload(&mut self, cx: &mut Context<'_, Self>) {
-        let Some((place, _)) = &self.session else {
-            self.load = Task::ready(());
-            cx.notify();
-            return;
-        };
+    pub(super) fn reload(&mut self, cx: &mut Context<'_, Self>) {
+        let place = &self.place;
         let reader = self.workspaces.read(cx).reader(&place.machine);
         let cwd = place.path.clone();
         let executor = cx.background_executor().clone();
@@ -318,9 +285,6 @@ fn file_header(file: &DiffFile, _: &mut Window, cx: &mut App) -> impl IntoElemen
 
 impl Render for DiffSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        if self.session.is_none() {
-            return message("Open a session to see its changes.", None);
-        }
         match &self.status {
             Status::Loading => message(
                 "Reading the changes…",
