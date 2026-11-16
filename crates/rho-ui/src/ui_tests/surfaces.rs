@@ -89,15 +89,22 @@ fn a_form_sends_what_the_user_entered_and_stays_usable() {
         control("deploy", "timeout"),
         element_id("deploy", Part::Problem(&Target::new("timeout"))),
     );
+    // Kit's number input masks what it takes, so the text that is not
+    // yet a number is a lone sign, in place of the "30" the form holds.
     ui.act(|window, cx| {
         window.click(timeout.clone(), cx);
-        window.input("x", cx);
+        window.press("backspace", cx);
+        window.press("backspace", cx);
+        window.input("-", cx);
     });
     ui.wait_until("the number field to refuse the text", |window, _, _| {
         is_visible(window, problem.clone()) && !is_enabled(window, &deploy)
     });
     shots(&mut ui, "not-a-number");
-    ui.act(|window, cx| window.press("backspace", cx));
+    ui.act(|window, cx| {
+        window.press("backspace", cx);
+        window.input("30", cx);
+    });
     ui.wait_until("the number field to take the text", |window, _, _| {
         !is_drawn(window, &problem) && is_enabled(window, &deploy)
     });
