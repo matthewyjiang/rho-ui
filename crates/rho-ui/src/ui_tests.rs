@@ -47,6 +47,7 @@ use crate::{
 };
 
 mod live;
+mod surfaces;
 
 /// Points the Vulkan loader at lavapipe before `main`, while the process has
 /// one thread and setting a variable races no one; a variable already set

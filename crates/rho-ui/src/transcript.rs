@@ -11,6 +11,7 @@
 //! button to show the rest.
 
 use std::{
+    collections::HashMap,
     ops::Range,
     rc::Rc,
     time::{Duration, Instant},
@@ -35,7 +36,9 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
-use rho_ui_core::{Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent};
+use rho_ui_core::{
+    surface::SurfaceRef, Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent,
+};
 
 use crate::{
     attachments::Preview,
@@ -43,6 +46,7 @@ use crate::{
     fold::Folding,
     lightbox,
     pictures::{PictureRead, Pictures},
+    surface_view::SurfacePanel,
     turn_times::TurnTimes,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
@@ -157,6 +161,9 @@ pub(crate) struct Transcript {
     /// Per entry: a message's text, or a notice's detail; `None` for
     /// anything else.
     markdown: Vec<Option<Markdown>>,
+    /// The surfaces the session's `ui` calls showed, by surface ID. Each
+    /// draws at the entry of the call it is drawn under.
+    surfaces: HashMap<String, Entity<SurfacePanel>>,
 }
 
 impl Transcript {
@@ -174,6 +181,7 @@ impl Transcript {
             diffs: Vec::new(),
             attachments: Vec::new(),
             markdown: Vec::new(),
+            surfaces: HashMap::new(),
         }
     }
 
@@ -185,6 +193,40 @@ impl Transcript {
     /// says when each read ends ([`PictureRead`]).
     pub(crate) fn pictures(&self) -> &Entity<Pictures> {
         &self.pictures
+    }
+
+    /// The panel that draws surface `surface`, if the session view made
+    /// one.
+    pub(crate) fn surface(&self, surface: &str) -> Option<&Entity<SurfacePanel>> {
+        self.surfaces.get(surface)
+    }
+
+    /// Draws surface `surface` with `panel`, at its entries.
+    pub(crate) fn set_surface(&mut self, surface: String, panel: Entity<SurfacePanel>) {
+        self.surfaces.insert(surface, panel);
+    }
+
+    /// Surface `surface` changed: what it shows, or which of its entries
+    /// draws it. Its rows are measured again.
+    pub(crate) fn surface_changed(&self, surface: &str, entries: &[Entry], cx: &mut App) {
+        for (ix, entry) in entries.iter().enumerate() {
+            if matches!(entry, Entry::Surface(shown) if shown.surface() == surface) {
+                if let Some(row) = self.timeline.row_of(ix) {
+                    self.remeasure(row..row + 1, cx);
+                }
+            }
+        }
+    }
+
+    /// The surface row `ix` is for, if it is a surface's row.
+    fn surface_row<'a>(&self, ix: usize, entries: &'a [Entry]) -> Option<&'a SurfaceRef> {
+        let Row::Message(entry) = self.timeline.rows().get(ix)? else {
+            return None;
+        };
+        match entries.get(*entry)? {
+            Entry::Surface(shown) => Some(shown),
+            _ => None,
+        }
     }
 
     /// A picture of message `entry` was read, or is read again, which
@@ -454,6 +496,19 @@ impl Transcript {
         cx: &App,
     ) -> AnyElement {
         let measure = div().w_full().max_w(rems(48.)).mx_auto();
+        // A surface stays usable after its turn: its row lies within the
+        // turn's working, and does not fold with it. A surface that moved
+        // under a later call, or was deleted, takes no room here.
+        if let Some(shown) = self.surface_row(ix, entries) {
+            let panel = self
+                .surfaces
+                .get(shown.surface())
+                .filter(|panel| panel.read(cx).drawn_under() == Some(shown.call()))
+                .cloned();
+            return measure
+                .when_some(panel, |this, panel| this.pb_3().child(panel))
+                .into_any_element();
+        }
         let Some(turn) = self.timeline.turn_of(ix) else {
             return measure
                 .pb_3()
@@ -857,7 +912,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
             .child("Rho continued on its own")
             .into_any_element(),
         // The timeline puts these in work rows, never message rows, and
-        // the transcript draws notices itself.
+        // the transcript draws notices and surfaces itself.
         Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) | Entry::Surface(_) => {
             div().into_any_element()
         }
