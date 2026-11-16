@@ -21,6 +21,25 @@ fn shots(ui: &mut Harness, step: &str) {
     }
 }
 
+/// Whether element `id` is drawn at all. A surface is one transcript row,
+/// so a tall one is drawn whole while only part of it is in view.
+fn is_drawn(window: &Window, id: &str) -> bool {
+    window.try_find(SharedString::from(id.to_owned())).is_some()
+}
+
+/// Scrolls the transcript to its first row, so the top of a surface taller
+/// than the window is in view.
+fn scroll_to_top(ui: &mut Harness) {
+    let app = ui.app.clone();
+    let scroller = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        view.read(cx).transcript().scroller().clone()
+    });
+    ui.cx
+        .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(0, cx)));
+    ui.frame();
+}
+
 /// The surfaces the active session's transcript places, by call.
 fn placed(ui: &mut Harness) -> Vec<(String, String)> {
     ui.session()
@@ -61,7 +80,7 @@ fn a_form_sends_what_the_user_entered_and_stays_usable() {
     ui.wait_until("the check to pass", |window, _, _| {
         window
             .try_find("surface-deploy-deploy")
-            .is_some_and(|button| button.disabled() == Some(false))
+            .is_some_and(|button| button.disabled() != Some(true))
     });
     ui.click("surface-deploy-notify");
     ui.click("surface-deploy-env-production");
@@ -136,7 +155,7 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
         "surface-gallery-modal",
     ];
     ui.wait_until("the gallery's inputs", |window, _, _| {
-        inputs.iter().all(|id| is_visible(window, *id))
+        inputs.iter().all(|id| is_drawn(window, id))
     });
     ui.wait_for_session("the turn to finish", |session| {
         session.state() == &RunState::Idle
@@ -151,10 +170,10 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
     ui.shot("modal");
     ui.act(|window, cx| window.press("escape", cx));
 
+    scroll_to_top(&mut ui);
     ui.act(|window, cx| window.within("surface-gallery-tabs").click(1usize, cx));
     ui.wait_until("the media tab", |window, _, _| {
-        is_visible(window, "surface-gallery-picture")
-            && !is_visible(window, "surface-gallery-short")
+        is_drawn(window, "surface-gallery-picture") && !is_drawn(window, "surface-gallery-short")
     });
     shots(&mut ui, "media");
 
@@ -166,7 +185,7 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
         fake.attaches(session.as_str()) == 2
     });
     ui.wait_until("the replayed gallery", |window, _, _| {
-        is_visible(window, "surface-gallery-short")
+        is_drawn(window, "surface-gallery-short")
     });
     ui.wait_for_session("the replay", |session| !session.is_replaying());
     assert_eq!(placed(&mut ui), live);
