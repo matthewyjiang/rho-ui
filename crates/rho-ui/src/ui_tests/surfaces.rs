@@ -150,13 +150,21 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
         "surface-gallery-agree",
         "surface-gallery-one",
         "surface-gallery-many-docs",
-        "surface-gallery-chips",
+        // A toggle group does not register itself; its chips do.
+        "surface-gallery-chips-rust",
         "surface-gallery-volume-value",
         "surface-gallery-primary",
         "surface-gallery-modal",
     ];
-    ui.wait_until("the gallery's inputs", |window, _, _| {
-        inputs.iter().all(|id| is_drawn(window, id))
+    ui.wait_until("the gallery", |window, _, _| {
+        is_drawn(window, "surface-gallery-short")
+    });
+    // Each input is drawn with the surface; `find` names one that is not,
+    // with every element that is.
+    ui.act(|window, _| {
+        for id in inputs {
+            let _found = window.find(id);
+        }
     });
     ui.wait_for_session("the turn to finish", |session| {
         session.state() == &RunState::Idle
