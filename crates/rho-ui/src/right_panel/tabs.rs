@@ -2,7 +2,7 @@
 //! in what order, which one shows, and the numbers new ones get. Each
 //! session has a [`TabSet`] of its own.
 
-use gpui_kit::{App, Entity, ScrollHandle, SharedString, Subscription};
+use gpui_kit::{App, Entity, ScrollHandle, SharedString, Subscription, WeakEntity};
 
 use super::{
     diff::DiffSurface, files::FilesSurface, pull_request::PullRequestSurface,
@@ -100,9 +100,9 @@ impl Tab {
 
 /// One session's open surfaces, which show while it is on screen.
 pub(super) struct TabSet {
-    /// The session's view: one made again for the same session, as after a
-    /// failed attach, takes its place.
-    pub(super) view: Entity<SessionView>,
+    /// The session's view while it is open: one made again for the same
+    /// session, as after the app let it go, takes its place.
+    pub(super) view: WeakEntity<SessionView>,
     /// The session's folder, where its surfaces read.
     pub(super) place: Place,
     /// Tells the surfaces when the view's turn ends; held, not read.
@@ -120,11 +120,11 @@ pub(super) struct TabSet {
 }
 
 impl TabSet {
-    pub(super) fn new(view: Entity<SessionView>, turns: Subscription, cx: &App) -> Self {
+    pub(super) fn new(view: &Entity<SessionView>, turns: Subscription, cx: &App) -> Self {
         let live = view.read(cx).live();
         Self {
             place: Place::new(live.id.machine, live.cwd),
-            view,
+            view: view.downgrade(),
             turns,
             tabs: Vec::new(),
             active: None,

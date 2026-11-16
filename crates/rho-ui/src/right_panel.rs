@@ -415,23 +415,27 @@ impl RightPanel {
         cx: &mut Context<'_, Self>,
     ) {
         let key = session.as_ref().map(|view| view.read(cx).live().id);
-        let unchanged =
-            self.on_screen() == key.as_ref() && self.set().map(|set| &set.view) == session.as_ref();
+        let unchanged = self.on_screen() == key.as_ref()
+            && self.set().map(|set| set.view.entity_id())
+                == session.as_ref().map(Entity::entity_id);
         if unchanged {
             return;
         }
         self.session = None;
         self.hovered = None;
         if let (Some(view), Some(key)) = (session, key) {
-            let stale = self.sets.get(&key).map(|set| set.view != view);
+            let stale = self
+                .sets
+                .get(&key)
+                .map(|set| set.view.entity_id() != view.entity_id());
             if stale != Some(false) {
                 let turns = Self::follow_turns(&key, &view, cx);
                 if let Some(set) = self.sets.get_mut(&key) {
                     // A view made again for the session.
-                    set.view = view.clone();
+                    set.view = view.downgrade();
                     set.turns = turns;
                 } else {
-                    let set = TabSet::new(view.clone(), turns, cx);
+                    let set = TabSet::new(&view, turns, cx);
                     self.sets.insert(key.clone(), set);
                 }
             }
@@ -1023,7 +1027,11 @@ impl RightPanel {
     /// What `tab`'s surface shows of `set`'s session.
     fn render_surface(set: &TabSet, tab: &Tab, cx: &App) -> AnyElement {
         match tab {
-            Tab::Background => SessionView::background_surface(&set.view, cx).into_any_element(),
+            // The session on screen is open.
+            Tab::Background => set.view.upgrade().map_or_else(
+                || div().into_any_element(),
+                |view| SessionView::background_surface(&view, cx).into_any_element(),
+            ),
             Tab::Diff(diff) => diff.clone().into_any_element(),
             Tab::Files(files) => files.clone().into_any_element(),
             Tab::PullRequest { view, .. } => view.clone().into_any_element(),

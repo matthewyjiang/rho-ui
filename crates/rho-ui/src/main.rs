@@ -4,6 +4,7 @@
 //! new sessions (default: the current directory); PROGRAM is the `rho` that
 //! starts the daemon when none runs (default: `rho` on `PATH`).
 
+mod added_dirs;
 mod app;
 #[cfg(target_os = "macos")]
 mod app_menu;
@@ -134,6 +135,7 @@ gpui_kit::assets::icon_assets!(
         SkipForward,
         FileDiff,
         FolderTree,
+        FolderPlus,
         Columns2,
         Rows2,
         ClipboardPaste,

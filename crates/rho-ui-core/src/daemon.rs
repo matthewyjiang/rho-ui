@@ -30,11 +30,11 @@ use rho_protocol::{
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
     ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, IdleWake, JobListParams,
     LoginId, LoginOutcome, LoginPrompt, Notifications, RestartParams, SessionAnswerParams,
-    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionConfigureParams,
-    SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
-    SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
-    SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn,
-    StatusParams, TurnOutcome, UnsteerOutcome,
+    SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams, SessionChange,
+    SessionConfigureParams, SessionDeleteParams, SessionDetachParams, SessionHoldParams,
+    SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
+    SessionRenameParams, SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams,
+    SettingChange, SignIn, StatusParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::{runtime::Runtime, task::JoinHandle};
 
@@ -1131,6 +1131,30 @@ impl Daemon {
         };
         self.client
             .request::<methods::SessionRename>(&params)
+            .await?;
+        Ok(())
+    }
+
+    /// Lets session `id`'s tools reach the directory `path`, an absolute
+    /// path on the daemon's machine, from its next turn on. The daemon
+    /// saves it with the session and sends every attached client the
+    /// session's options with it, which [`crate::Session::added_dirs`]
+    /// then lists. While a turn runs, the daemon adds it, and answers,
+    /// once the turn ends.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `path` is not a directory there, the session reaches it
+    /// already, or the connection is gone.
+    pub async fn add_directory(&self, id: &SessionId, path: &Path) -> Result<(), DaemonError> {
+        let params = SessionConfigureParams {
+            session: id.to_wire(),
+            change: SessionChange::AddDirectory {
+                path: path.to_path_buf(),
+            },
+        };
+        self.client
+            .request::<methods::SessionConfigure>(&params)
             .await?;
         Ok(())
     }

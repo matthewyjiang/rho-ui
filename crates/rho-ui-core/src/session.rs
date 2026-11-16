@@ -471,6 +471,8 @@ pub struct Session {
     usage: Option<Usage>,
     config: Vec<ConfigOption>,
     commands: Vec<CommandInfo>,
+    /// The directories the session's tools reach besides its workspace.
+    added_dirs: Vec<PathBuf>,
     plan: Vec<PlanItem>,
     /// Open requests, oldest first.
     inputs: Vec<InputRequest>,
@@ -548,6 +550,7 @@ impl Session {
             usage: None,
             config: Vec::new(),
             commands: Vec::new(),
+            added_dirs: Vec::new(),
             plan: Vec::new(),
             inputs: Vec::new(),
             steers: Vec::new(),
@@ -698,6 +701,12 @@ impl Session {
     /// Slash commands and skills on offer.
     pub fn commands(&self) -> &[CommandInfo] {
         &self.commands
+    }
+
+    /// The directories the session's tools reach besides its workspace,
+    /// which [`crate::Daemon::add_directory`] adds to.
+    pub fn added_dirs(&self) -> &[PathBuf] {
+        &self.added_dirs
     }
 
     /// The agent's current checklist.
@@ -1152,6 +1161,7 @@ impl Session {
     fn set_options(&mut self, options: SessionOptions) {
         self.config = config_options(&options);
         self.commands = commands(options.commands);
+        self.added_dirs = options.added_dirs;
     }
 
     /// Follows the job's state for whether a turn runs. How a turn ended

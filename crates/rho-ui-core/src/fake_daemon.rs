@@ -65,7 +65,9 @@
 //! - Settings are shaped like rho's: four permission modes, three models,
 //!   three reasoning levels, and fast mode. Every session offers the slash
 //!   commands `compact` and `prompt:review` and the skills `pstack` and
-//!   `prove-it-works`.
+//!   `prove-it-works`. A session adds a directory that is one on this
+//!   machine, once, and refuses others as rho does.
+//!   [`FakeDaemon::followers`] counts the clients following a session.
 //! - rho's own settings are two pages. "General" holds
 //!   `general.auto_compact` (on/off, on by default), `general.permission_mode`
 //!   (a choice of auto, plan or supervised) and, under "Models",
@@ -407,6 +409,18 @@ impl FakeDaemon {
             .map_or(0, |session| session.attaches)
     }
 
+    /// How many clients follow session `id` now, attached or observing:
+    /// a detach, or a client that leaves, ends its following.
+    pub fn followers(&self, id: &str) -> usize {
+        self.service.lock().sessions.get(id).map_or(0, |session| {
+            session
+                .publishers
+                .iter()
+                .filter(|publisher| !publisher.is_gone())
+                .count()
+        })
+    }
+
     /// The title session `id` has saved, if it has one.
     pub fn title(&self, id: &str) -> Option<String> {
         self.service.lock().sessions.get(id)?.title.clone()
@@ -657,6 +671,7 @@ struct Settings {
     model: ModelRef,
     reasoning: ReasoningLevel,
     fast: bool,
+    added_dirs: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -666,7 +681,22 @@ impl Settings {
             model: model("small"),
             reasoning: ReasoningLevel::Medium,
             fast: false,
+            added_dirs: Vec::new(),
         }
+    }
+
+    /// Adds `path` as rho does: refuses one that is not a directory, or
+    /// that the session reaches already.
+    fn add_directory(&mut self, path: PathBuf) -> Result<(), RpcError> {
+        let refuse = |why: String| Err(RpcError::new(ErrorCode::InvalidParams, why));
+        if !path.is_dir() {
+            return refuse(format!("{} is not a directory", path.display()));
+        }
+        if self.added_dirs.contains(&path) {
+            return refuse(format!("the session already reaches {}", path.display()));
+        }
+        self.added_dirs.push(path);
+        Ok(())
     }
 
     fn options(&self) -> SessionOptions {
@@ -726,7 +756,7 @@ impl Settings {
                     input_hint: None,
                 },
             ],
-            added_dirs: Vec::new(),
+            added_dirs: self.added_dirs.clone(),
         }
     }
 }

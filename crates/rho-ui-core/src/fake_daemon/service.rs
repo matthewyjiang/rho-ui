@@ -676,6 +676,7 @@ impl Service for Fake {
             SessionChange::Model { model, .. } => session.settings.model = model,
             SessionChange::Reasoning { level } => session.settings.reasoning = level,
             SessionChange::FastMode { enabled } => session.settings.fast = enabled,
+            SessionChange::AddDirectory { path } => session.settings.add_directory(path)?,
             _ => {
                 return Err(RpcError::new(
                     ErrorCode::MethodNotFound,
