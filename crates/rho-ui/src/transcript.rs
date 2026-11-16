@@ -22,8 +22,7 @@ use gpui_kit::component::{
     alert::{Alert, AlertVariant},
     attachment::Attachment as Card,
     bubble::{Bubble, BubbleVariant},
-    button::{Button, ButtonVariants as _},
-    clipboard::Clipboard,
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
@@ -32,8 +31,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, transparent_white, AnyElement, App, AppContext as _, ElementId, Entity,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    div, px, rems, transparent_white, AnyElement, App, AppContext as _, ClipboardItem, ElementId,
+    Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent};
@@ -85,10 +84,56 @@ fn message_style() -> TextViewStyle {
     }
 }
 
+/// How long a code block's copy button shows a check after it copies, as
+/// Kit's own `Clipboard` does.
+const COPIED_FOR: Duration = Duration::from_secs(2);
+
 /// A code block's corner in a message or notice: its language, and a button
 /// that copies its code. Kit drops its own language name once a block has
 /// actions, so this sets it, as Kit does.
-fn code_actions(block: &CodeBlock, _: &mut Window, cx: &mut App) -> impl IntoElement {
+fn code_actions(block: &CodeBlock, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    let copied = window.use_keyed_state("copy-code-copied", cx, |_, _| false);
+    let shows_check = *copied.read(cx);
+    let code = block.code();
+    // Not Kit's `Clipboard`: that is a ghost button, whose hover is the
+    // theme's accent, the color Kit fills a code block with, so hovering it
+    // showed nothing. This is its button and behavior, with a hover the
+    // block shows.
+    let hover = cx.theme().secondary_active;
+    let copy = Button::new("copy-code")
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .foreground(cx.theme().secondary_foreground)
+                .hover(hover)
+                .active(hover),
+        )
+        .xsmall()
+        .icon(if shows_check {
+            Lucide::Check
+        } else {
+            Lucide::Copy
+        })
+        .tooltip("Copy code")
+        .accessibility_label("Copy code")
+        .when(!shows_check, |button| {
+            button.on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+                copied.update(cx, |copied, cx| {
+                    *copied = true;
+                    cx.notify();
+                });
+                let copied = copied.clone();
+                cx.spawn(async move |cx| {
+                    cx.background_executor().timer(COPIED_FOR).await;
+                    copied.update(cx, |copied, cx| {
+                        *copied = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            })
+        });
     h_flex()
         .gap_1()
         .children(block.lang().filter(|lang| !lang.is_empty()).map(|lang| {
@@ -98,11 +143,7 @@ fn code_actions(block: &CodeBlock, _: &mut Window, cx: &mut App) -> impl IntoEle
                 .text_color(cx.theme().muted_foreground)
                 .child(lang)
         }))
-        .child(
-            Clipboard::new("copy-code")
-                .value(block.code())
-                .tooltip("Copy code"),
-        )
+        .child(copy)
 }
 
 /// What a click in the transcript asks for.

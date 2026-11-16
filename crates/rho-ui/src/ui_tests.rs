@@ -1163,6 +1163,8 @@ fn a_code_block_copies_in_one_click() {
     ui.wait_until("the reply's code block", |window, _, _| {
         window.try_find("copy-code").is_some()
     });
+    ui.act(|window, cx| window.within(reply.clone()).hover("copy-code", cx));
+    ui.shot("hovered");
     ui.act(|window, cx| window.within(reply.clone()).click("copy-code", cx));
     ui.shot("copied");
     let copied = ui
