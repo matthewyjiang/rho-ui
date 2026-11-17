@@ -5,7 +5,7 @@ rho-ui is a frontend of the rho daemon, like rho's terminal UI. It connects to t
 ```mermaid
 flowchart TD
     UI["rho-ui: GPUI Kit views"] --> Core["rho-ui-core: daemon connections, session state"]
-    Core -->|"Unix socket"| Local["rho daemon on this machine"]
+    Core -->|"Unix socket or named pipe"| Local["rho daemon on this machine"]
     Core -->|"ssh channel to its socket"| Remote["rho daemon on a remote machine"]
     TUI["rho's terminal UI"] -->|"same protocol"| Local
 ```
@@ -60,11 +60,11 @@ rho's own settings are not rho-ui's: they live in each machine's `config.toml`, 
 
 ## Dependencies
 
-rho-ui runs on Linux and macOS. What differs between operating systems lives in `rho-ui-core`'s `platform` module: the home, settings and state folders, the folder rho's installer puts `rho` in, the default shell, how to run a program such as `git` in the background (on Windows, without a console window), how a path becomes bytes for the database or a remote shell, and how to reach a daemon's local endpoint. The rest of rho-ui asks it rather than reading variables or naming an OS itself. Besides it, `rho_install.rs` runs rho's installer for the OS, a `sh` script on Unix and a PowerShell one on Windows, and only the key bindings in `main.rs` branch on the OS where they are bound, as GPUI Kit's do: app shortcuts use `secondary-` (Cmd on macOS, Ctrl elsewhere), and the terminal's own keys, for the clipboard, tabs and splits, are Ghostty's defaults on each platform, which differ by more than the modifier. On macOS, `app_menu.rs` sets the menu bar; each item names an action, and GPUI takes its shortcut from the keymap and greys it out where nothing handles it.
+rho-ui runs on Linux, macOS and Windows. What differs between operating systems lives in `rho-ui-core`'s `platform` module: the home, settings and state folders, the folder rho's installer puts `rho` in, the default shell, how to run a program such as `git` in the background (on Windows, without a console window), how a path becomes bytes for the database or a remote shell, and how to reach a daemon's local endpoint. The rest of rho-ui asks it rather than reading variables or naming an OS itself. Besides it, `rho_install.rs` runs rho's installer for the OS, a `sh` script on Unix and a PowerShell one on Windows, and only the key bindings in `main.rs` branch on the OS where they are bound, as GPUI Kit's do: app shortcuts use `secondary-` (Cmd on macOS, Ctrl elsewhere), and the terminal's own keys, for the clipboard, tabs and splits, are Ghostty's defaults on each platform, which differ by more than the modifier. On macOS, `app_menu.rs` sets the menu bar; each item names an action, and GPUI takes its shortcut from the keymap and greys it out where nothing handles it.
 
 What rho-ui does on this machine for the Files and Diff surfaces, pictures in messages, and cloning, it does with `git` run as a program (`local.rs`) and the files themselves, and it checks and updates rho by running `rho`, with no shell between. A remote machine, which is Unix, gets a POSIX `sh` script over ssh for each instead, parsed into the same value. `folders::Reader::query` picks between the two for each feature; the tests run each script against the same fixture as the Rust that reads this machine.
 
-rho-ui doesn't run on Windows yet. Remote machines work from Windows, through the ssh client in rho-ui's own process. One thing blocks the rest: rho-protocol's `LocalDaemon`, which finds or starts this machine's daemon, is Unix-only until a rho-protocol release adds Windows (rho's PR #1972).
+On Windows, rho-protocol's `LocalDaemon` (Windows since rho-protocol 1.2.0) reaches this machine's daemon on its named pipe, and remote machines work through the ssh client in rho-ui's own process, as on Linux and macOS.
 
 Neither crate is published to crates.io.
 
