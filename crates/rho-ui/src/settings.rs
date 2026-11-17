@@ -1,14 +1,19 @@
 //! rho-ui's own settings: light or dark, UI scale, fonts, the machines it
 //! connects to, and the forge CLIs' programs on each. They live in
 //! `settings` in rho-ui's config folder ([`AppDir::Config`]: by default
-//! `~/.config/rho-ui`), one `key = value` per line. The look applies to
-//! GPUI Kit's theme; the app follows the machines.
+//! `~/.config/rho-ui`), one `key = value` per line. In a browser they are
+//! that file on the server's machine, as `rho-ui serve` shares it. The
+//! look applies to GPUI Kit's theme; the app follows the machines.
 
-use std::{fmt::Write as _, io, path::PathBuf};
+#[cfg(not(target_family = "wasm"))]
+use std::io;
+use std::{fmt::Write as _, path::PathBuf};
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{px, App, Global, SharedString, WindowAppearance};
+#[cfg(not(target_family = "wasm"))]
 use rho_ui_core::platform::{self, AppDir};
+use rho_ui_core::server::{wire::StateWrite, StateWriter};
 
 use crate::{
     forge::{CliPaths, ForgeCli},
@@ -18,13 +23,9 @@ use crate::{
 
 /// The UI font when none is set.
 pub(crate) const DEFAULT_UI_FONT: &str = "Noto Sans";
-/// The code font when none is set.
-#[cfg(not(target_family = "wasm"))]
+/// The code font when none is set. A browser has it too: the page loads
+/// it (`web.rs`).
 pub(crate) const DEFAULT_CODE_FONT: &str = "JetBrainsMono Nerd Font";
-/// The code font when none is set: in a browser, the one the page loads
-/// (`web.rs`).
-#[cfg(target_family = "wasm")]
-pub(crate) const DEFAULT_CODE_FONT: &str = "JetBrains Mono";
 
 /// GPUI Kit's base sizes, which the scale multiplies. The UI size is also
 /// the rem, so every rem-based length follows it.
@@ -120,7 +121,7 @@ impl Appearance {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Settings {
     pub(crate) appearance: Appearance,
     pub(crate) ui_scale: UiScale,
@@ -135,8 +136,29 @@ pub(crate) struct Settings {
     pub(crate) local_cli: CliPaths,
     /// The remote machines, in the order added.
     pub(crate) machines: Vec<RemoteMachine>,
-    /// Where [`Self::save`] writes; `None` keeps changes in memory (tests).
-    file: Option<PathBuf>,
+    /// Where [`Self::save`] writes.
+    saved: Saved,
+}
+
+/// Where [`Settings::save`] writes.
+#[derive(Clone, Debug, Default)]
+enum Saved {
+    /// Nowhere: changes last until rho-ui quits (tests, and a file that
+    /// couldn't be read).
+    #[default]
+    Nowhere,
+    /// The settings file.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "a browser has no files")
+    )]
+    File(PathBuf),
+    /// In a browser, the settings file on the server's machine.
+    #[cfg_attr(
+        not(target_family = "wasm"),
+        expect(dead_code, reason = "only a browser shares them")
+    )]
+    Server(StateWriter),
 }
 
 impl Default for Settings {
@@ -150,7 +172,7 @@ impl Default for Settings {
             local_clone_folder: String::new(),
             local_cli: CliPaths::default(),
             machines: Vec::new(),
-            file: None,
+            saved: Saved::Nowhere,
         }
     }
 }
@@ -162,21 +184,22 @@ impl Settings {
     /// understand, keeps the defaults. A file that exists but can't be read
     /// keeps them too, and is never written over: changes then last only
     /// until the app quits.
+    #[cfg(not(target_family = "wasm"))]
     #[expect(
         clippy::print_stderr,
         reason = "rho-ui has no log; stderr reaches the terminal or the journal"
     )]
     pub(crate) fn load() -> Self {
-        let Some(path) = platform::app_dir(AppDir::Config).map(|dir| dir.join("settings")) else {
+        let Some(path) = Self::file() else {
             return Self::default();
         };
         match std::fs::read_to_string(&path) {
             Ok(text) => Self {
-                file: Some(path),
+                saved: Saved::File(path),
                 ..parse(&text)
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => Self {
-                file: Some(path),
+                saved: Saved::File(path),
                 ..Self::default()
             },
             Err(error) => {
@@ -196,10 +219,33 @@ impl Settings {
         reason = "rho-ui has no log; stderr reaches the terminal or the journal"
     )]
     pub(crate) fn save(&self) {
-        let Some(path) = &self.file else { return };
-        if let Err(error) = store::write_atomic(path, &self.to_text()) {
-            eprintln!("rho-ui: couldn't save {}: {error}", path.display());
+        match &self.saved {
+            Saved::Nowhere => {}
+            Saved::File(path) => {
+                if let Err(error) = store::write_atomic(path, &self.to_text()) {
+                    eprintln!("rho-ui: couldn't save {}: {error}", path.display());
+                }
+            }
+            Saved::Server(writer) => writer.write(StateWrite::Settings {
+                text: self.to_text(),
+            }),
         }
+    }
+
+    /// The settings the server's machine keeps, `text` (`None` if it
+    /// has none yet), saved back through `writer`: a browser's.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn shared(text: Option<&str>, writer: StateWriter) -> Self {
+        Self {
+            saved: Saved::Server(writer),
+            ..text.map(parse).unwrap_or_default()
+        }
+    }
+
+    /// Where the settings file is: `settings` in rho-ui's config folder.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn file() -> Option<PathBuf> {
+        platform::app_dir(AppDir::Config).map(|dir| dir.join("settings"))
     }
 
     /// The remote machine at `host`, if it is on the list.

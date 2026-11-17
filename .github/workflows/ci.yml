@@ -79,13 +79,10 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --no-fail-fast
       # The web build (docs/architecture.md, "In a browser"). One OS is
-      # enough: the target is the same everywhere. wasm_thread names a
-      # nightly feature even when unused; this lets that crate alone build.
+      # enough: the target is the same everywhere.
       - name: Clippy for the browser
         if: runner.os == 'Linux'
-        env:
-          RUSTC_BOOTSTRAP: wasm_thread
-        run: cargo clippy --locked --target wasm32-unknown-unknown -p rho-ui-core -p rho-ui -- -D warnings
+        run: cargo xtask clippy-web
 
       - name: Upload UI screenshots
         if: always()

@@ -1,5 +1,5 @@
 //! A machine rho-ui reaches through something, not directly: over ssh from
-//! the desktop app ([`SshLink`]), or through rho-ui-serve from a browser
+//! the desktop app ([`SshLink`]), or through `rho-ui serve` from a browser
 //! ([`ServerLink`]). Either way it runs the same POSIX `sh` scripts there,
 //! read by the same parsers, and reaches the daemon's socket there, which
 //! [`crate::setup`] starts and finds.
@@ -23,7 +23,7 @@ pub enum Link {
     /// Over ssh, from the desktop app.
     #[cfg(not(target_family = "wasm"))]
     Ssh(SshLink),
-    /// Through rho-ui-serve, from a browser.
+    /// Through `rho-ui serve`, from a browser.
     Server(ServerLink),
 }
 
@@ -34,7 +34,7 @@ impl Link {
         match self {
             #[cfg(not(target_family = "wasm"))]
             Self::Ssh(ssh) => ssh.host(),
-            Self::Server(server) => server.address(),
+            Self::Server(server) => server.name(),
         }
     }
 

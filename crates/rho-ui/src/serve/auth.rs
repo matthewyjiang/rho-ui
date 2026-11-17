@@ -25,7 +25,7 @@ use rho_ui_core::server::wire;
 
 /// The secret a page must hold: 32 random bytes, in hex.
 #[derive(Debug)]
-pub struct Token(String);
+pub(crate) struct Token(String);
 
 impl Token {
     /// A new token, from the operating system's random source.
@@ -33,7 +33,7 @@ impl Token {
     /// # Panics
     ///
     /// If the operating system has no random source to read.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut bytes = [0_u8; 32];
         getrandom::fill(&mut bytes).expect("the OS has a random source");
         let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
@@ -44,7 +44,7 @@ impl Token {
     }
 
     /// The token, for the URL the server prints.
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -92,14 +92,14 @@ pub(crate) async fn check(
     let Some(offered) = offered_protocols(headers).find(|offered| token.matches(offered)) else {
         return (
             StatusCode::UNAUTHORIZED,
-            "rho-ui-serve: open the URL it printed when it started, with its token",
+            "rho-ui serve: open the URL it printed when it started, with its token",
         )
             .into_response();
     };
     if !same_origin(headers) {
         return (
             StatusCode::FORBIDDEN,
-            "rho-ui-serve: a WebSocket from another site",
+            "rho-ui serve: a WebSocket from another site",
         )
             .into_response();
     }

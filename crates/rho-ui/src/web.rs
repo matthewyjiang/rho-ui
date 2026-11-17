@@ -1,36 +1,44 @@
-//! rho-ui in a browser: the page rho-ui-serve serves loads this build,
+//! rho-ui in a browser: the page `rho-ui serve` serves loads this build,
 //! which reaches the server's machine through the server, as the desktop
 //! app reaches a remote machine over ssh (`rho_ui_core::server`). That
-//! machine is the one rho-ui calls this machine.
+//! machine is the one rho-ui calls this machine. The remote machines the
+//! settings list, the server reaches over ssh for the page.
 //!
 //! A browser has no fonts GPUI can read, so the page's fonts come from the
-//! server, at `/fonts/` (`scripts/build-web.sh` puts them there), before
-//! the window opens. The state database lives in memory, and the
-//! settings aren't saved: nothing is remembered past the page.
+//! server, at `/fonts/` (`cargo xtask web` puts them there), before
+//! the window opens, and so do the desktop app's settings and state
+//! database, as the server shares them: the page keeps a copy, and sends
+//! its changes back.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, rc::Rc};
 
 use gpui_kit::AsyncApp;
 use js_sys::Uint8Array;
-use rho_ui_core::{DaemonTarget, RhoInstall, ServerTarget};
+use rho_ui_core::{server::wire::StateWrite, DaemonTarget, RhoInstall, ServerTarget};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::{
-    app::LaunchConfig, machines::Reach, open_app, right_panel::TerminalShell, store::StateDb,
+    app::LaunchConfig,
+    machines::{Reach, RemoteMachine},
+    open_app,
+    right_panel::TerminalShell,
+    settings::Settings,
+    store::StateDb,
     Assets,
 };
 
 /// The fonts the page loads, from the server's `/fonts/`: the default UI
 /// and code fonts (`settings.rs`), in the styles rho-ui draws.
-const FONTS: [&str; 7] = [
+const FONTS: [&str; 8] = [
     "NotoSans-Regular.ttf",
     "NotoSans-Bold.ttf",
     "NotoSans-Italic.ttf",
     "NotoSans-BoldItalic.ttf",
-    "JetBrainsMono-Regular.ttf",
-    "JetBrainsMono-Bold.ttf",
-    "JetBrainsMono-Italic.ttf",
+    "JetBrainsMonoNerdFont-Regular.ttf",
+    "JetBrainsMonoNerdFont-Bold.ttf",
+    "JetBrainsMonoNerdFont-Italic.ttf",
+    "JetBrainsMonoNerdFont-BoldItalic.ttf",
 ];
 
 /// Starts the web build: loads the fonts, then opens the window on the
@@ -44,7 +52,11 @@ pub(crate) fn main() {
         workspace: None,
         local: Reach {
             daemon: DaemonTarget::Server(server.clone()),
-            rho: Some(RhoInstall::Server(server)),
+            rho: Some(RhoInstall::Server(server.clone())),
+        },
+        remote: {
+            let server = server.clone();
+            Rc::new(move |remote: &RemoteMachine| remote.server_reach(&server))
         },
         shell: TerminalShell::from_env(),
     };
@@ -53,22 +65,43 @@ pub(crate) fn main() {
         .run(move |cx| {
             cx.spawn(async move |cx: &mut AsyncApp| {
                 let fonts = load_fonts().await;
+                let (db, settings) = shared_state(&server).await;
                 cx.update(|cx| {
                     if let Err(error) = cx.text_system().add_fonts(fonts) {
                         log::error!("rho-ui: the fonts didn't load: {error}");
                     }
-                    // A browser has no folder to keep it in.
-                    open_app(launch, &StateDb::in_memory(), cx);
+                    open_app(launch, &db, settings, cx);
                 });
             })
             .detach();
         });
 }
 
+/// The desktop app's state database and settings on the server's machine,
+/// which the page then writes back to. If they can't be had, ones in
+/// memory, which the page forgets, and the console says why.
+async fn shared_state(server: &ServerTarget) -> (StateDb, Settings) {
+    let shared = match server.open_state().await {
+        Ok(shared) => shared,
+        Err(error) => {
+            log::error!("rho-ui: {error}; nothing will be remembered");
+            return (StateDb::in_memory(), Settings::default());
+        }
+    };
+    let writer = shared.writer.clone();
+    let forward = move |sql| writer.write(StateWrite::Sql { sql });
+    let db = StateDb::from_image(&shared.database, forward).unwrap_or_else(|error| {
+        log::error!("rho-ui: the state database didn't load: {error}; nothing will be remembered");
+        StateDb::in_memory()
+    });
+    let settings = Settings::shared(shared.settings.as_deref(), shared.writer);
+    (db, settings)
+}
+
 /// The key the tab keeps the server's token under.
 const TOKEN_KEY: &str = "rho-ui-token";
 
-/// The server's token: from the address's `#token=`, as rho-ui-serve
+/// The server's token: from the address's `#token=`, as `rho-ui serve`
 /// prints it, which this then keeps for the tab and takes out of the
 /// address, so a reload still has it and the address bar doesn't show it;
 /// else the one the tab kept. Empty if neither, which the server refuses,
@@ -91,7 +124,7 @@ fn token(window: &web_sys::Window) -> String {
     storage
         .and_then(|storage| storage.get_item(TOKEN_KEY).ok().flatten())
         .unwrap_or_else(|| {
-            log::error!("rho-ui: no token: open the URL rho-ui-serve printed");
+            log::error!("rho-ui: no token: open the URL `rho-ui serve` printed");
             String::new()
         })
 }

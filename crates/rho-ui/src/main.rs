@@ -4,7 +4,7 @@
 //! new sessions (default: the current directory); PROGRAM is the `rho` that
 //! starts the daemon when none runs (default: `rho` on `PATH`).
 //!
-//! Built for wasm, it is rho-ui's web build instead, which rho-ui-serve
+//! Built for wasm, it is rho-ui's web build instead, which `rho-ui serve`
 //! serves to a browser; `web.rs` starts it.
 
 mod app;
@@ -37,6 +37,8 @@ mod repo;
 mod rho_install;
 mod rho_settings;
 mod right_panel;
+#[cfg(unix)]
+mod serve;
 mod session_list;
 mod session_settings;
 mod session_view;
@@ -203,7 +205,8 @@ impl AssetSource for Assets {
 }
 
 #[cfg(not(target_family = "wasm"))]
-const USAGE: &str = "usage: rho-ui [DIR] [--rho PROGRAM]";
+const USAGE: &str = "usage: rho-ui [DIR] [--rho PROGRAM]
+       rho-ui serve [--help]   rho-ui in a browser";
 
 /// Parses `[DIR] [--rho PROGRAM]`. Returns the usage text on bad input.
 #[cfg(not(target_family = "wasm"))]
@@ -257,12 +260,22 @@ fn main() {
     clippy::print_stderr,
     reason = "a command-line error goes to stderr before any window exists"
 )]
-fn main() {
-    let launch = match parse_args(std::env::args().skip(1)) {
+fn main() -> std::process::ExitCode {
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "serve") {
+        #[cfg(unix)]
+        return serve::main(args.skip(1));
+        #[cfg(not(unix))]
+        {
+            eprintln!("rho-ui serve runs on Unix only");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let launch = match parse_args(args) {
         Ok(launch) => launch,
         Err(message) => {
             eprintln!("{message}");
-            std::process::exit(2);
+            return std::process::ExitCode::from(2);
         }
     };
 
@@ -273,20 +286,22 @@ fn main() {
         .with_assets(Assets::new(""))
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx| {
-            open_app(launch, &StateDb::open(), cx);
+            open_app(launch, &StateDb::open(), Settings::load(), cx);
             cx.activate(true);
         });
+    std::process::ExitCode::SUCCESS
 }
 
-/// Sets the app up and opens its window, remembering things in `db`: the
-/// desktop's start, and the browser's once its fonts are in.
-fn open_app(launch: LaunchConfig, db: &StateDb, cx: &mut App) {
+/// Sets the app up with `settings` and opens its window, remembering
+/// things in `db`: the desktop's start, and the browser's once its fonts
+/// and state are in.
+fn open_app(launch: LaunchConfig, db: &StateDb, settings: Settings, cx: &mut App) {
     init(cx, db);
     // pele takes about 100 ms to load: started now, it's ready for the
     // first diagram. Tests load it when they draw one, so the load doesn't
     // slow the tests that time animations.
     pele::start();
-    Settings::load().apply(cx);
+    settings.apply(cx);
     let options = window_options(cx);
     gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| {

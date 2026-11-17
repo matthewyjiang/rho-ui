@@ -23,8 +23,9 @@ rho-ui-core = { path = "../rho-ui-core" }
 # The channel from the terminal's reader thread to the UI.
 futures = "0.3"
 # The state database (store.rs). In a browser, rusqlite builds SQLite for
-# wasm itself (sqlite-wasm-rs), and rho-ui keeps it in memory.
-rusqlite = { version = "0.41", features = ["bundled"] }
+# wasm itself (sqlite-wasm-rs), and rho-ui keeps a copy in memory of the
+# server's, which `serialize` moves between them.
+rusqlite = { version = "0.41", features = ["bundled", "serialize"] }
 # `Instant` and `SystemTime` that work in a browser too, where std's panic,
 # as GPUI's executor's are; std's own elsewhere.
 web-time = "1"
@@ -52,6 +53,22 @@ sqlite-wasm-rs = { version = "0.6", features = ["wasm-bindgen"] }
 portable-pty = "0.9"
 # Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
 rquickjs = "0.11"
+
+# `rho-ui serve` (src/serve.rs): HTTP and its WebSockets for the page, the
+# token, and the runtime it all runs on. `query` reads `/socket?path=`.
+[target.'cfg(unix)'.dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio", "ws"] }
+getrandom = "0.3"
+# `fs` reads the page's files, `net` listens and reaches the daemon's
+# socket, `process` runs scripts.
+tokio = { version = "1.36", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal"] }
+# The web build `cargo xtask dist` builds in, with the `web` feature.
+rust-embed = { version = "8", features = ["interpolate-folder-path"], optional = true }
+
+[features]
+# Builds the web build in target/web-gz, which `cargo xtask dist` makes,
+# into `rho-ui serve`.
+web = ["dep:rust-embed"]
 
 [lints]
 workspace = true

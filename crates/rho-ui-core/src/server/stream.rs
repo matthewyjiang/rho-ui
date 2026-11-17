@@ -1,4 +1,4 @@
-//! The daemon's socket as rho-ui-serve relays it, as the byte stream
+//! The daemon's socket as `rho-ui serve` relays it, as the byte stream
 //! rho-protocol's client reads and writes: each write goes as one binary
 //! message, and reads take the messages' bytes in order.
 
@@ -35,7 +35,7 @@ impl WsStream {
 fn closed() -> io::Error {
     io::Error::new(
         io::ErrorKind::BrokenPipe,
-        "rho-ui-serve closed the WebSocket",
+        "rho-ui serve closed the WebSocket",
     )
 }
 

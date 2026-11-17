@@ -80,7 +80,7 @@ impl Daemon {
     ///
     /// A daemon on this machine signs in in the browser, whose page
     /// redirects to a port the daemon listens on here. One on a remote
-    /// machine, or behind rho-ui-serve, signs in with a device code
+    /// machine, or behind `rho-ui serve`, signs in with a device code
     /// instead, which any browser can enter, as that redirect couldn't
     /// reach it; a provider with only the browser flow uses it anyway.
     ///

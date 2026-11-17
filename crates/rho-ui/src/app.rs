@@ -32,7 +32,6 @@ use rho_ui_core::{
     Jobs, PendingUpgrade, Prompt, Session, SessionId,
 };
 
-#[cfg(not(target_family = "wasm"))]
 use crate::machines::RemoteMachine;
 use crate::{
     auths::Auths,
@@ -85,9 +84,8 @@ pub(crate) struct LaunchConfig {
     /// How to reach this machine's daemon and rho.
     pub(crate) local: Reach,
     /// How to reach a remote machine's: [`RemoteMachine::ssh_reach`],
-    /// except in tests, which reach fake daemons. A browser reaches only
-    /// the server's machine, so settings name none there.
-    #[cfg(not(target_family = "wasm"))]
+    /// except in tests, which reach fake daemons, and in a browser, which
+    /// reaches it through the server ([`RemoteMachine::server_reach`]).
     pub(crate) remote: Rc<dyn Fn(&RemoteMachine) -> Reach>,
     /// What the right panel's terminal runs on this machine.
     pub(crate) shell: TerminalShell,
@@ -103,9 +101,6 @@ impl LaunchConfig {
             rho: self.local.rho.clone(),
             clone_folder: settings.local_clone_folder.clone().into(),
         };
-        #[cfg(target_family = "wasm")]
-        let remote = std::iter::empty();
-        #[cfg(not(target_family = "wasm"))]
         let remote = settings.machines.iter().map(|remote| {
             let Reach { daemon, rho } = (self.remote)(remote);
             Machine {

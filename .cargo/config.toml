@@ -1,0 +1,3 @@
+[alias]
+# rho-ui's build tasks (xtask/): `cargo xtask web`, `dist`, `clippy-web`.
+xtask = "run --quiet --package xtask --"

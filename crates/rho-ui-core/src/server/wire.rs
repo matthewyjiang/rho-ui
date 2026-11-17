@@ -1,4 +1,4 @@
-//! What rho-ui and rho-ui-serve say to each other. Each endpoint is a
+//! What rho-ui and `rho-ui serve` say to each other. Each endpoint is a
 //! WebSocket of its own, opened per use, as an ssh session channel is: one
 //! per script, daemon connection or shell.
 
@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 pub fn token_protocol(token: &str) -> String {
     format!("rho-ui-token.{token}")
 }
+
+/// The query key that names a remote machine: on [`SCRIPT`], [`SOCKET`]
+/// and [`SHELL`], `machine=HOST` does the work on ssh host `HOST` instead,
+/// which the server reaches as the desktop app on its machine would.
+pub const MACHINE: &str = "machine";
 
 /// Runs a POSIX `sh` script, as `sh -s` in the server's home. The client
 /// sends the script's input as one binary message; the server answers
@@ -39,7 +44,7 @@ pub struct ScriptEnd {
 #[serde(rename_all = "snake_case")]
 pub enum Ending {
     /// It exited with this status.
-    Exited(i32),
+    Exited(i64),
     /// A signal killed it; which, in words for people.
     Killed(String),
     /// `sh` didn't start: why, in words for people.
@@ -79,5 +84,36 @@ pub enum ShellControl {
     Took {
         /// How many.
         bytes: usize,
+    },
+}
+
+/// The desktop app's own state on the server's machine, for the page to
+/// share: its settings file and its state database. On open the server
+/// sends a [`StateSnapshot`] as JSON text, then the database's image, as
+/// SQLite serializes it, as one binary message. Text messages from the
+/// client are [`StateWrite`]s, which the server applies in order; it
+/// closes once the client has closed and it applied them all.
+pub const STATE: &str = "/state";
+
+/// What `/state` sends first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    /// The settings file's text; `None` if there is none yet.
+    pub settings: Option<String>,
+}
+
+/// A change the page made to the shared state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StateWrite {
+    /// One write to the database, as SQL with its values in it.
+    Sql {
+        /// The statement.
+        sql: String,
+    },
+    /// The settings file's new text.
+    Settings {
+        /// The text.
+        text: String,
     },
 }

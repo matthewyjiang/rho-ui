@@ -80,7 +80,7 @@ pub enum DaemonTarget {
     /// machine's login environment.
     #[cfg(not(target_family = "wasm"))]
     Ssh(SshTarget),
-    /// The daemon of the default rho home on the machine of a rho-ui-serve,
+    /// The daemon of the default rho home on the machine of a `rho-ui serve`,
     /// as rho-ui's web build reaches it; see `server.rs`.
     Server(ServerTarget),
 }
@@ -403,7 +403,7 @@ pub(crate) struct Machine {
     /// The home directory there.
     pub(crate) home: Option<PathBuf>,
     /// How to run commands there, for a machine reached through ssh or
-    /// rho-ui-serve.
+    /// `rho-ui serve`.
     pub(crate) link: Option<Link>,
 }
 
@@ -593,7 +593,7 @@ impl Daemon {
     }
 
     /// How to run scripts on the daemon's machine, for one reached through
-    /// ssh or rho-ui-serve.
+    /// ssh or `rho-ui serve`.
     pub fn link(&self) -> Option<&Link> {
         self.link.as_ref()
     }

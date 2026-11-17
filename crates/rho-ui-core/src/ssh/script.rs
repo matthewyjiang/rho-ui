@@ -44,7 +44,7 @@ pub(super) async fn run(
 /// # Errors
 ///
 /// Fails if the connection is gone, or the host refuses a session.
-async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, ScriptError> {
+pub(super) async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, ScriptError> {
     let (mut read, write) = connection.session().await.map_err(ScriptError::Session)?;
     let channel = write.channel();
     let mut send = pin!(async {

@@ -1,4 +1,4 @@
-//! One WebSocket to rho-ui-serve, as two halves: what sends bytes, and
+//! One WebSocket to `rho-ui serve`, as two halves: what sends bytes, and
 //! what receives messages. In a browser it is the browser's own
 //! `WebSocket`; elsewhere, tokio-tungstenite on the I/O runtime. Either
 //! offers the server's token as its subprotocol (`wire::token_protocol`).
@@ -24,6 +24,12 @@ impl Send {
     pub(crate) async fn send(&mut self, bytes: Vec<u8>) -> Result<(), Closed> {
         poll_fn(|cx| self.poll_send(cx, &bytes)).await?;
         poll_fn(|cx| self.poll_flush(cx)).await
+    }
+
+    /// Closes the WebSocket, as a close frame the server sees; the server
+    /// closes its side in turn.
+    pub(crate) async fn close(&mut self) {
+        let _ = poll_fn(|cx| self.poll_close(cx)).await;
     }
 }
 

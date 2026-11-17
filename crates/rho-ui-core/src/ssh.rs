@@ -34,6 +34,7 @@ mod shell;
 use std::{sync::Arc, time::Duration};
 
 use rho_protocol::{Client, ClientHello, HelloResponse, Notifications};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub(crate) use config::Resolved;
 #[cfg(feature = "test-support")]
@@ -44,7 +45,8 @@ use connection::{Lease, Purpose};
 use crate::{
     daemon::{handshake, DaemonError, Machine},
     exec::on_io,
-    link::{Link, ScriptError},
+    link::{Ending, Link, ScriptError},
+    server::wire,
     setup,
 };
 
@@ -101,7 +103,7 @@ impl SshTarget {
     /// # Errors
     ///
     /// Fails if ssh can't reach the machine.
-    pub(crate) async fn link(&self) -> Result<SshLink, DaemonError> {
+    pub async fn link(&self) -> Result<SshLink, DaemonError> {
         let target = self.clone();
         on_io(async move { target.open_link().await }).await?
     }
@@ -209,5 +211,59 @@ impl SshLink {
         on_io(async move { script::run(lease.connection(), &input, deadline).await })
             .await
             .map_err(ScriptError::Session)?
+    }
+
+    /// Runs `input` with `sh -s` on the host, as `rho-ui serve` runs a
+    /// browser's script there ([`wire::SCRIPT`]), and returns what it
+    /// printed and how it ended, in the server's words; `None` if the
+    /// connection went with no word of how. Dropping the future stops the
+    /// script.
+    pub async fn relay_script(&self, input: Vec<u8>) -> Option<(Vec<u8>, wire::ScriptEnd)> {
+        let lease = Arc::clone(&self.lease);
+        let ran = on_io(async move { script::sh(lease.connection(), &input).await }).await;
+        let not_started = |why: String| {
+            let end = wire::ScriptEnd {
+                ending: wire::Ending::NotStarted(why),
+                stderr: String::new(),
+            };
+            Some((Vec::new(), end))
+        };
+        let output = match ran {
+            Ok(Ok(output)) => output,
+            Ok(Err(ScriptError::Session(error))) | Err(error) => {
+                return not_started(error.to_string())
+            }
+            Ok(Err(_)) => unreachable!("`sh` fails only for want of a session"),
+        };
+        let ending = match output.ending {
+            Ending::Exited(code) => wire::Ending::Exited(code),
+            Ending::Killed(signal) => wire::Ending::Killed(signal),
+            Ending::NotStarted(why) => wire::Ending::NotStarted(why),
+            Ending::Refused => {
+                return not_started(format!("{}'s sshd wouldn't run sh", self.host()))
+            }
+            Ending::Cut => return None,
+        };
+        let end = wire::ScriptEnd {
+            ending,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+        Some((output.stdout, end))
+    }
+
+    /// A stream to the Unix socket at `path` on the host, such as the rho
+    /// daemon's, as `rho-ui serve` relays one for a browser
+    /// ([`wire::SOCKET`]).
+    ///
+    /// # Errors
+    ///
+    /// Fails if sshd won't forward to the socket, or nothing listens there.
+    pub async fn open_socket(
+        &self,
+        path: &str,
+    ) -> Result<impl AsyncRead + AsyncWrite + Send + Unpin + 'static, DaemonError> {
+        let lease = Arc::clone(&self.lease);
+        let path = path.to_owned();
+        on_io(async move { lease.connection().daemon(&path).await }).await?
     }
 }

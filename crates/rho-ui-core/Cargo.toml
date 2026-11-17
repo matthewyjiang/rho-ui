@@ -23,7 +23,7 @@ regex = "1"
 # `fake_sshd`'s pseudo-terminals, for a remote terminal's tests. rho-ui runs
 # its own terminals with it, so it is in the lock already.
 portable-pty = { version = "0.9", optional = true }
-# Polls rho-ui-serve's WebSockets (`server/ws.rs`), and joins a connection's
+# Polls `rho-ui serve`'s WebSockets (`server/ws.rs`), and joins a connection's
 # reads and writes.
 futures = "0.3"
 rho-protocol.workspace = true
@@ -64,8 +64,8 @@ russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa
 # and the ssh connection that carries a remote one; see `daemon.rs`.
 # `process` runs `ssh -G` to read the user's ssh config (`ssh/config.rs`).
 tokio = { version = "1.36", features = ["net", "process", "rt-multi-thread", "time"] }
-# A WebSocket to rho-ui-serve, off the browser (`server/ws.rs`): the same
-# version axum, which rho-ui-serve answers with, uses.
+# A WebSocket to `rho-ui serve`, off the browser (`server/ws.rs`): the same
+# version axum, which `rho-ui serve` answers with, uses.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 
 # In a browser: its WebSocket and timer.

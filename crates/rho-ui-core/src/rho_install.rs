@@ -29,7 +29,7 @@ use crate::{link::Link, server::ServerTarget, DaemonError};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RhoInstall {
     /// This machine, running `rho`: a name looked up on `PATH`, or a path.
-    /// Not in a browser, which reaches every machine through rho-ui-serve.
+    /// Not in a browser, which reaches every machine through `rho-ui serve`.
     #[cfg(not(target_family = "wasm"))]
     Here {
         /// The program.
@@ -38,7 +38,7 @@ pub enum RhoInstall {
     /// A remote machine, running its target's `rho` over ssh.
     #[cfg(not(target_family = "wasm"))]
     Ssh(SshTarget),
-    /// The machine of a rho-ui-serve, running its target's `rho` there.
+    /// The machine of a `rho-ui serve`, running its target's `rho` there.
     Server(ServerTarget),
 }
 

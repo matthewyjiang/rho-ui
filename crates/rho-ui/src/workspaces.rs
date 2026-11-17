@@ -3,7 +3,7 @@
 //! header, so both show the same workspace and branch. Read from `.git`
 //! files on the background executor, then re-read every [`REREAD`] to pick
 //! up branch switches. A machine reached through a link, ssh or
-//! rho-ui-serve, has its read with `git` there, over that link, and they
+//! `rho-ui serve`, has its read with `git` there, over that link, and they
 //! show their folder's name until then; in a browser, that is this machine
 //! too. A remote machine whose repositories can't be read says why at the
 //! foot of the sidebar until a read succeeds. The saved sessions say how

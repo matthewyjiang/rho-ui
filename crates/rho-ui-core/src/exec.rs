@@ -1,6 +1,6 @@
 //! Where rho-ui-core's I/O runs, and its one timer. Natively, on the I/O
 //! runtime ([`io`]): one Tokio worker for the daemon sockets, the ssh
-//! connections that carry remote ones, and rho-ui-serve's WebSockets,
+//! connections that carry remote ones, and `rho-ui serve`'s WebSockets,
 //! because `rho-protocol`'s client, russh and tokio-tungstenite need it.
 //! In a browser, on the page's executor, which its WebSockets and
 //! `setTimeout` need. Either way the futures callers get back are plain

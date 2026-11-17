@@ -1,4 +1,4 @@
-//! Reaching a machine through rho-ui-serve, as rho-ui's web build does: the
+//! Reaching a machine through `rho-ui serve`, as rho-ui's web build does: the
 //! browser can't run a program or reach a Unix socket, so the server, on
 //! that machine, does both for it, each over a WebSocket of its own
 //! ([`wire`] lists them). It is the same work an ssh server does for the
@@ -8,6 +8,7 @@
 //! runs as `sh -s` there.
 
 mod shell;
+mod state;
 mod stream;
 pub mod wire;
 mod ws;
@@ -16,6 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 use rho_protocol::{Client, ClientHello, HelloResponse, Notifications};
 
+pub use self::state::{SharedState, StateDone, StateWriter};
 pub(crate) use self::stream::WsStream;
 use self::ws::Frame;
 use crate::{
@@ -25,7 +27,7 @@ use crate::{
     setup,
 };
 
-/// A machine reached through rho-ui-serve.
+/// A machine reached through `rho-ui serve`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerTarget {
     /// Where the server listens, as `http://127.0.0.1:8765`.
@@ -33,6 +35,9 @@ pub struct ServerTarget {
     /// The token the server printed, which each WebSocket offers.
     token: String,
     rho: String,
+    /// The ssh host of the machine, when the server reaches a remote one
+    /// for the browser; `None` for the server's own.
+    machine: Option<String>,
 }
 
 impl ServerTarget {
@@ -44,7 +49,16 @@ impl ServerTarget {
             address: address.into(),
             token: token.into(),
             rho: "rho".to_owned(),
+            machine: None,
         }
+    }
+
+    /// The remote machine at ssh host `host` instead, which the server
+    /// reaches over ssh, as the desktop app on its machine would.
+    #[must_use]
+    pub fn with_machine(mut self, host: impl Into<String>) -> Self {
+        self.machine = Some(host.into());
+        self
     }
 
     /// Runs `rho` on the machine to start its daemon: a name looked up on
@@ -86,18 +100,37 @@ impl PartialEq for ServerLink {
 impl Eq for ServerLink {}
 
 impl ServerLink {
-    /// The server's address, as messages name the machine.
-    pub(crate) fn address(&self) -> &str {
-        &self.target.address
+    /// The machine, as messages name it: its ssh host, or the server's
+    /// address.
+    pub(crate) fn name(&self) -> &str {
+        self.target
+            .machine
+            .as_deref()
+            .unwrap_or(&self.target.address)
     }
 
-    /// The WebSocket URL of `endpoint`, one of [`wire`]'s, with `query`.
-    fn url(&self, endpoint: &str, query: &str) -> String {
+    /// The WebSocket URL of `endpoint`, one of [`wire`]'s, with `query`
+    /// and the machine's `machine=` ([`wire::MACHINE`]).
+    fn url(&self, endpoint: &str, query: &[(&str, &str)]) -> String {
         let address = &self.target.address;
         let address = address
             .strip_prefix("http")
             .map_or_else(|| address.clone(), |rest| format!("ws{rest}"));
-        format!("{address}{endpoint}{query}")
+        let machine = self
+            .target
+            .machine
+            .as_deref()
+            .map(|host| (wire::MACHINE, host));
+        let query: Vec<String> = query
+            .iter()
+            .copied()
+            .chain(machine)
+            .map(|(key, value)| format!("{key}={}", percent_encode(value)))
+            .collect();
+        match query.as_slice() {
+            [] => format!("{address}{endpoint}"),
+            _ => format!("{address}{endpoint}?{}", query.join("&")),
+        }
     }
 
     /// Runs `input` with `sh -s` there, within `deadline` if any, and
@@ -108,7 +141,7 @@ impl ServerLink {
         input: Vec<u8>,
         deadline: Option<Duration>,
     ) -> Result<Vec<u8>, ScriptError> {
-        let url = self.url(wire::SCRIPT, "");
+        let url = self.url(wire::SCRIPT, &[]);
         let token = self.target.token.clone();
         let ran = async move {
             let (mut send, mut receive) = ws::open(&url, &token)
@@ -125,11 +158,11 @@ impl ServerLink {
                         let end: wire::ScriptEnd =
                             serde_json::from_str(&json).map_err(|error| {
                                 ScriptError::Failed(format!(
-                                    "rho-ui-serve said something else: {error}"
+                                    "rho-ui serve said something else: {error}"
                                 ))
                             })?;
                         let ending = match end.ending {
-                            wire::Ending::Exited(code) => Ending::Exited(code.into()),
+                            wire::Ending::Exited(code) => Ending::Exited(code),
                             wire::Ending::Killed(signal) => Ending::Killed(signal),
                             wire::Ending::NotStarted(why) => Ending::NotStarted(why),
                         };
@@ -157,12 +190,11 @@ impl ServerLink {
 
     /// A stream to the Unix socket `socket` there, the daemon's.
     async fn socket(&self, socket: &str) -> Result<WsStream, DaemonError> {
-        let query = format!("?path={}", percent_encode(socket));
-        let url = self.url(wire::SOCKET, &query);
+        let url = self.url(wire::SOCKET, &[("path", socket)]);
         let (send, receive) = ws::open(&url, &self.target.token).await.map_err(|why| {
             DaemonError::Unreachable(format!(
                 "couldn't reach the Rho daemon's socket {socket} through {}: {why}",
-                self.address()
+                self.name()
             ))
         })?;
         Ok(WsStream::new(send, receive))
@@ -180,7 +212,7 @@ pub(crate) async fn connect(
     let link = Link::Server(server.clone());
     let setup = setup::run(&link, target.rho()).await?;
     let stream = server.socket(&setup.socket).await?;
-    let where_ = format!("at {} through {}", setup.socket, server.address());
+    let where_ = format!("at {} through {}", setup.socket, server.name());
     let (client, notifications, hello) = handshake(stream, hello, &where_).await?;
     let machine = Machine {
         environment: setup.environment,

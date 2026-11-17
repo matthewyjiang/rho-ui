@@ -1,7 +1,7 @@
 //! A login shell on a machine rho-ui reaches through a link, under a
 //! pseudo-terminal there: the right panel's terminal on a remote machine,
 //! or in a browser on this one. The handles here are the same whether ssh
-//! (`ssh/shell.rs`) or rho-ui-serve (`server/shell.rs`) runs it; a task of
+//! (`ssh/shell.rs`) or `rho-ui serve` (`server/shell.rs`) runs it; a task of
 //! the link's holds the other [`Ends`], and forwards between them and the
 //! shell.
 

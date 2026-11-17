@@ -1,0 +1,23 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+description = "rho-ui's build tasks: `cargo xtask web`, `dist` and `clippy-web`"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+# Gzips the web build that `dist` builds in.
+flate2 = "1"
+# Checks each downloaded font against its pinned hash.
+sha2 = "0.10"
+# Makes the wasm's JS glue. The same version as the `wasm-bindgen` the app
+# builds with, which the lock file keeps so: both pin one
+# `wasm-bindgen-shared`.
+wasm-bindgen-cli-support = "0.2.130"
+
+[lints]
+workspace = true

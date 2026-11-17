@@ -153,17 +153,24 @@ impl Key {
 /// write each change as it happens. Writes are best effort: a failed one
 /// loses one change and says so on stderr.
 ///
+/// In a browser it is a copy, in memory, of the one on the server's
+/// machine, as `rho-ui serve` shares it ([`Self::from_image`]), which sends
+/// each write on to that one.
+///
 /// Cloning shares the one connection. GPUI runs everything that touches it
 /// on the main thread.
 #[derive(Clone)]
 pub(crate) struct StateDb {
     connection: Rc<Connection>,
+    /// Where each write goes besides, as SQL with its values in it.
+    forward: Option<Rc<dyn Fn(String)>>,
 }
 
 impl std::fmt::Debug for StateDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateDb")
             .field("path", &self.connection.path())
+            .field("forwards", &self.forward.is_some())
             .finish()
     }
 }
@@ -179,11 +186,10 @@ impl StateDb {
         reason = "rho-ui has no log; stderr reaches the terminal or the journal"
     )]
     pub(crate) fn open() -> Self {
-        let Some(dir) = platform::app_dir(AppDir::State) else {
+        let Some(path) = Self::file() else {
             eprintln!("rho-ui: no state directory (set HOME); nothing will be remembered");
             return Self::in_memory();
         };
-        let path = dir.join("state.sqlite3");
         Self::open_at(&path).unwrap_or_else(|error| {
             eprintln!(
                 "rho-ui: can't open {}: {error}; nothing will be remembered",
@@ -193,52 +199,64 @@ impl StateDb {
         })
     }
 
+    /// Where the database is: `state.sqlite3` in the state folder.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn file() -> Option<std::path::PathBuf> {
+        platform::app_dir(AppDir::State).map(|dir| dir.join("state.sqlite3"))
+    }
+
     /// Opens the database at `path`, making its directory if need be.
     #[cfg(not(target_family = "wasm"))]
     fn open_at(path: &Path) -> rusqlite::Result<Self> {
+        Self::connect(path).map(Self::wrap)
+    }
+
+    /// A connection to the database at `path`, set up as [`Self::open`]
+    /// does: `rho-ui serve`'s, which shares it with a browser.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn connect(path: &Path) -> rusqlite::Result<Connection> {
         if let Some(dir) = path.parent() {
             // A directory that can't be made fails the open, which says so.
             let _ = std::fs::create_dir_all(dir);
         }
-        Connection::open(path).and_then(Self::new)
+        let mut connection = Connection::open(path)?;
+        set_up(&mut connection)?;
+        Ok(connection)
+    }
+
+    /// A copy in memory of the database whose `image` [`image`] made,
+    /// which sends each write to `forward` too, as SQL with its values in
+    /// it: a browser's, whose writes go to the server's.
+    #[cfg_attr(
+        not(any(target_family = "wasm", test)),
+        expect(dead_code, reason = "only a browser shares the database")
+    )]
+    pub(crate) fn from_image(
+        image: &[u8],
+        forward: impl Fn(String) + 'static,
+    ) -> rusqlite::Result<Self> {
+        let mut connection = Connection::open_in_memory()?;
+        connection.deserialize_read_exact(rusqlite::MAIN_DB, image, image.len(), false)?;
+        set_up(&mut connection)?;
+        Ok(Self {
+            forward: Some(Rc::new(forward)),
+            ..Self::wrap(connection)
+        })
     }
 
     /// A database in memory, gone when rho-ui quits.
     pub(crate) fn in_memory() -> Self {
-        Connection::open_in_memory()
-            .and_then(Self::new)
-            .expect("SQLite opens a database in memory")
+        let mut connection =
+            Connection::open_in_memory().expect("SQLite opens a database in memory");
+        set_up(&mut connection).expect("SQLite sets up a database in memory");
+        Self::wrap(connection)
     }
 
-    /// Sets up `connection`: [`PRAGMAS`], with WAL so a second rho-ui's
-    /// reads don't wait on writes, and the schema, made afresh when the
-    /// version differs.
-    fn new(mut connection: Connection) -> rusqlite::Result<Self> {
-        connection.execute_batch(PRAGMAS)?;
-        // Immediate: a second rho-ui starting at the same moment waits here,
-        // then finds the schema made.
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
-            let tables = transaction
-                .prepare(
-                    "SELECT name FROM sqlite_schema \
-                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-                )?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            // Writing to a String can't fail.
-            let mut batch = String::new();
-            for table in &tables {
-                let _ = write!(batch, "DROP TABLE \"{table}\";");
-            }
-            let _ = write!(batch, "{SCHEMA} PRAGMA user_version = {SCHEMA_VERSION};");
-            transaction.execute_batch(&batch)?;
-        }
-        transaction.commit()?;
-        Ok(Self {
+    fn wrap(connection: Connection) -> Self {
+        Self {
             connection: Rc::new(connection),
-        })
+            forward: None,
+        }
     }
 
     /// Runs one write. Best effort; see [`StateDb`].
@@ -250,9 +268,17 @@ impl StateDb {
         let written = self
             .connection
             .prepare_cached(sql)
-            .and_then(|mut statement| statement.execute(params));
-        if let Err(error) = written {
-            eprintln!("rho-ui: couldn't save state: {error}");
+            .and_then(|mut statement| {
+                statement.execute(params)?;
+                // The statement with its values in it, as SQLite writes them:
+                // integers, text quoted, blobs in hex. The schema has no REAL,
+                // which this would round to 15 digits.
+                Ok(statement.expanded_sql())
+            });
+        match (written, &self.forward) {
+            (Ok(Some(sql)), Some(forward)) => forward(sql),
+            (Ok(_), _) => {}
+            (Err(error), _) => eprintln!("rho-ui: couldn't save state: {error}"),
         }
     }
 
@@ -298,6 +324,49 @@ impl StateDb {
     }
 }
 
+/// Sets up `connection`: [`PRAGMAS`], with WAL so a second rho-ui's reads
+/// don't wait on writes, and the schema, made afresh when the version
+/// differs.
+fn set_up(connection: &mut Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(PRAGMAS)?;
+    // Immediate: a second rho-ui starting at the same moment waits here,
+    // then finds the schema made.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        let tables = transaction
+            .prepare(
+                "SELECT name FROM sqlite_schema \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Writing to a String can't fail.
+        let mut batch = String::new();
+        for table in &tables {
+            let _ = write!(batch, "DROP TABLE \"{table}\";");
+        }
+        let _ = write!(batch, "{SCHEMA} PRAGMA user_version = {SCHEMA_VERSION};");
+        transaction.execute_batch(&batch)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// `connection`'s database as one image, as SQLite serializes it, for
+/// [`StateDb::from_image`] to load: what `rho-ui serve` sends a browser.
+/// The image says rollback journal, not WAL, as one in memory can't use
+/// a WAL: bytes 18 and 19 of the header are the write and read versions,
+/// 1 for rollback and 2 for WAL.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn image(connection: &mut Connection) -> rusqlite::Result<Vec<u8>> {
+    let mut image = connection.serialize(rusqlite::MAIN_DB)?.to_vec();
+    if let Some(versions) = image.get_mut(18..20) {
+        versions.copy_from_slice(&[1, 1]);
+    }
+    Ok(image)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,11 +394,12 @@ mod tests {
 
     #[test]
     fn another_schema_version_starts_over() {
-        let connection = Connection::open_in_memory().expect("SQLite opens in memory");
+        let mut connection = Connection::open_in_memory().expect("SQLite opens in memory");
         connection
             .execute_batch("CREATE TABLE old (x); PRAGMA user_version = 99;")
             .expect("an old schema");
-        let db = StateDb::new(connection).expect("the schema applies");
+        set_up(&mut connection).expect("the schema applies");
+        let db = StateDb::wrap(connection);
         db.set(Key::SidebarLayout, "collapsed");
         assert_eq!(db.get(Key::SidebarLayout).as_deref(), Some("collapsed"));
         let old = db.query(
@@ -338,5 +408,45 @@ mod tests {
             |row| row.get::<_, String>(0),
         );
         assert!(old.is_empty(), "the old tables are gone");
+    }
+
+    /// A browser's copy starts as the server's database is, writes in its
+    /// WAL included, and each write it makes, sent on and applied there,
+    /// leaves both with the same rows: quotes, newlines and bytes that
+    /// aren't UTF-8 too.
+    #[test]
+    fn a_shared_copy_starts_as_the_database_and_its_writes_replay_there() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut server = StateDb::connect(&dir.path().join("state.sqlite3"))
+            .expect("the server's database opens");
+        server
+            .execute_batch("INSERT INTO kv (key, value) VALUES ('sidebar-layout', 'collapsed')")
+            .expect("a row in the WAL");
+        let sent = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let copy = StateDb::from_image(&image(&mut server).expect("an image"), {
+            let sent = Rc::clone(&sent);
+            move |sql| sent.borrow_mut().push(sql)
+        })
+        .expect("the copy loads");
+        assert_eq!(copy.get(Key::SidebarLayout).as_deref(), Some("collapsed"));
+
+        copy.set(Key::SidebarLayout, "it's\nopen");
+        copy.execute(
+            "INSERT INTO projects (machine, path) VALUES (?1, ?2)",
+            ("local", b"/w/\xff'a".as_slice()),
+        );
+        for sql in sent.borrow().iter() {
+            server
+                .execute_batch(sql)
+                .expect("the server applies the write");
+        }
+        let server = StateDb::wrap(server);
+        for db in [&copy, &server] {
+            assert_eq!(db.get(Key::SidebarLayout).as_deref(), Some("it's\nopen"));
+            let projects = db.query("SELECT machine, path FROM projects", [], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            });
+            assert_eq!(projects, [("local".to_owned(), b"/w/\xff'a".to_vec())]);
+        }
     }
 }

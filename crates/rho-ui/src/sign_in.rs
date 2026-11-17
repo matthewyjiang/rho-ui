@@ -133,7 +133,7 @@ fn browser_elsewhere(machine: &MachineId) -> Option<String> {
         return None;
     }
     let on = if machine.is_local() {
-        "the machine rho-ui-serve runs on".to_owned()
+        "the machine `rho-ui serve` runs on".to_owned()
     } else {
         machine.to_string()
     };

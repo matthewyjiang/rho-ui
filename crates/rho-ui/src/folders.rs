@@ -239,7 +239,7 @@ pub(crate) struct Lookup {
 pub(crate) enum Reader {
     /// From this machine's files.
     Here,
-    /// Through a remote machine's link: ssh, or rho-ui-serve.
+    /// Through a remote machine's link: ssh, or `rho-ui serve`.
     There(Link),
     /// Not at all: the remote machine isn't connected.
     Unread,

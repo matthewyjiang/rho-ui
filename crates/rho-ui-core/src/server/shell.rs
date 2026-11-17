@@ -1,4 +1,4 @@
-//! The login shell on a rho-ui-serve's machine, as [`super::wire::SHELL`]
+//! The login shell on the machine of a `rho-ui serve`, as [`super::wire::SHELL`]
 //! runs it: the right panel's terminal in a browser. A task on the I/O
 //! runtime, or the page's executor, opens the WebSocket, then forwards
 //! what the shell prints to [`crate::ShellOutput`], and what is typed and
@@ -9,7 +9,6 @@ use std::path::Path;
 use futures::StreamExt as _;
 
 use super::{
-    percent_encode,
     wire::{self, ShellControl},
     ws::{self, Frame},
     ServerLink,
@@ -44,14 +43,18 @@ impl ServerLink {
     /// Never: a [`ShellControl`] always encodes as JSON.
     pub fn open_shell(&self, dir: &Path, term: &str, columns: u16, rows: u16) -> RemoteShell {
         let dir = String::from_utf8_lossy(&platform::path_to_bytes(dir.as_os_str())).into_owned();
-        let query = format!(
-            "?dir={}&term={}&columns={columns}&rows={rows}",
-            percent_encode(&dir),
-            percent_encode(term)
+        let (columns, rows) = (columns.to_string(), rows.to_string());
+        let url = self.url(
+            wire::SHELL,
+            &[
+                ("dir", &dir),
+                ("term", term),
+                ("columns", &columns),
+                ("rows", &rows),
+            ],
         );
-        let url = self.url(wire::SHELL, &query);
         let token = self.target.token.clone();
-        let address = self.address().to_owned();
+        let address = self.name().to_owned();
         let (shell, ends) = remote_shell::channels(OUTPUT_QUEUE);
         spawn_io(async move {
             let Ends {
