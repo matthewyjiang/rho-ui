@@ -17,6 +17,10 @@
 //! does a message with attachments, as a steer carries only text, and any
 //! message after one waiting, which would otherwise overtake it.
 //!
+//! Text selected in the transcript gets an "Add to prompt" button where the
+//! drag ended, which quotes it above the composer's text box; see
+//! [`ComposerState::add_quote`].
+//!
 //! The session's running background work is listed above the box, with a
 //! button to stop each piece; what ended is behind a button in the title
 //! bar. The view records the work as it starts and ends, and a session
@@ -29,6 +33,7 @@ use web_time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{Positioner, TextSelection};
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants as _},
@@ -37,12 +42,13 @@ use gpui_kit::component::{
     input::InputEvent,
     message_scroller::MessageScroller,
     spinner::Spinner,
-    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _,
+    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, ThemeStyled as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    deferred, div, point, px, rems, Anchor, AnyElement, App, AppContext as _, Context, Entity,
+    EventEmitter, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, WeakEntity,
     Window,
 };
@@ -168,6 +174,8 @@ pub(crate) struct SessionView {
     surfaces: Surfaces,
     /// Whether the agent's todo list above the composer is open.
     plan: Disclosure,
+    /// Text selected in the transcript, offered to the composer as a quote.
+    selected: Option<Selected>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
     /// For a subagent's session, redraws the title bar as the sessions
@@ -178,6 +186,14 @@ pub(crate) struct SessionView {
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
+
+/// Text selected in the transcript, and where its drag ended.
+struct Selected {
+    text: String,
+    /// Where the pointer let go, in window coordinates: the button floats
+    /// above it.
+    at: Point<Pixels>,
+}
 
 impl SessionView {
     /// A saved session starts as [`Loading::Attaching`] until its replay
@@ -272,6 +288,7 @@ impl SessionView {
             error: None,
             surfaces: Surfaces::default(),
             plan: Disclosure::default(),
+            selected: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             _above: Vec::new(),
@@ -1168,6 +1185,66 @@ impl SessionView {
         self.after_change(window, cx);
     }
 
+    /// Offers what is selected in the window as a quote, once a press in the
+    /// transcript lets go: a click that selects nothing takes the offer back.
+    fn offer_quote(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let text = TextSelection::selected_text(window, cx);
+        self.selected = (!text.trim().is_empty()).then_some(Selected {
+            text,
+            at: event.position,
+        });
+        cx.notify();
+    }
+
+    /// Takes back the offer of a quote, as when the transcript scrolls away
+    /// from the button.
+    fn dismiss_quote(&mut self, cx: &mut Context<'_, Self>) {
+        if self.selected.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The "Add to prompt" button floating over the transcript, while text
+    /// selected there is offered.
+    fn render_add_to_prompt(&self, cx: &mut Context<'_, Self>) -> Option<impl IntoElement> {
+        let selected = self.selected.as_ref()?;
+        let text = selected.text.clone();
+        let button = Button::new("add-to-prompt")
+            .small()
+            .icon(Lucide::TextQuote)
+            .label("Add to prompt")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.selected = None;
+                TextSelection::clear(window, cx);
+                this.composer.update(cx, |composer, cx| {
+                    composer.add_quote(&text, cx);
+                    window.focus(&composer.focus_handle(cx), cx);
+                });
+                cx.notify();
+            }));
+        // Its bottom left corner 8px above the pointer, kept 8px inside the
+        // window.
+        let corner = selected.at - point(px(0.), px(8.));
+        Some(deferred(
+            Positioner::corner(Anchor::BottomLeft, corner)
+                .margin(px(8.))
+                .occlude()
+                .child(
+                    div()
+                        .id("add-to-prompt-popover")
+                        .popover_style(cx)
+                        .p_0p5()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_quote(cx)))
+                        .child(button),
+                ),
+        ))
+    }
+
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> AnyElement {
         // A replaying session may have entries already, but no rows yet.
         if !matches!(self.loading, Loading::Ready) || self.session.entries().is_empty() {
@@ -1217,6 +1294,19 @@ impl SessionView {
         div()
             .flex_1()
             .min_h_0()
+            // A subagent's session has no composer to quote into.
+            .when(!self.is_subagent(), |this| {
+                this.capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    if event.button == MouseButton::Left {
+                        this.offer_quote(event, window, cx);
+                    }
+                }))
+                // The list doesn't stop a scroll's propagation, so this
+                // sees each the user makes; following a streaming reply
+                // makes no scroll event, and leaves the button.
+                .on_scroll(cx.listener(|this, _, _, cx| this.dismiss_quote(cx)))
+            })
+            .children(self.render_add_to_prompt(cx))
             .child(
                 MessageScroller::new(
                     SharedString::from(format!("transcript-{}", self.session.id())),
