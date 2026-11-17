@@ -224,6 +224,10 @@ impl Assets {
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
+        #[cfg(target_family = "wasm")]
+        if let Some(font) = web::svg_font(path) {
+            return Ok(Some(font));
+        }
         match ExtraIcons.load(path)? {
             Some(icon) => Ok(Some(icon)),
             None => self.0.load(path),

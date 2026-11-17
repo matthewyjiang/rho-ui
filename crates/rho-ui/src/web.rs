@@ -41,6 +41,34 @@ const FONTS: [&str; 8] = [
     "JetBrainsMonoNerdFont-BoldItalic.ttf",
 ];
 
+/// The fonts GPUI's SVG renderer asks the assets for, in place of the
+/// system's, which a browser has none of: for a diagram's text. They are
+/// the page's own regular faces (`FONTS`), which a drawing names by family.
+const SVG_FONTS: [(&str, &str); 2] = [
+    (
+        "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+        "NotoSans-Regular.ttf",
+    ),
+    (
+        "fonts/lilex/Lilex-Regular.ttf",
+        "JetBrainsMonoNerdFont-Regular.ttf",
+    ),
+];
+
+thread_local! {
+    /// The page's fonts, by file name, once loaded: before the window
+    /// opens, so before any diagram is drawn.
+    static LOADED: std::cell::RefCell<std::collections::HashMap<&'static str, Cow<'static, [u8]>>> =
+        std::cell::RefCell::default();
+}
+
+/// The font GPUI's SVG renderer asks for at `path`, as [`SVG_FONTS`] says;
+/// `None` for any other path.
+pub(crate) fn svg_font(path: &str) -> Option<Cow<'static, [u8]>> {
+    let (_, file) = SVG_FONTS.iter().find(|(asked, _)| *asked == path)?;
+    LOADED.with_borrow(|loaded| loaded.get(file).cloned())
+}
+
 /// Starts the web build: loads the fonts, then opens the window on the
 /// page's canvas, with the server's machine as this machine.
 pub(crate) fn main() {
@@ -144,7 +172,12 @@ async fn load_fonts() -> Vec<Cow<'static, [u8]>> {
     let mut fonts = Vec::new();
     for font in FONTS {
         match fetch(&format!("/fonts/{font}")).await {
-            Ok(bytes) => fonts.push(Cow::Owned(bytes)),
+            Ok(bytes) => {
+                if SVG_FONTS.iter().any(|(_, file)| *file == font) {
+                    LOADED.with_borrow_mut(|loaded| loaded.insert(font, Cow::Owned(bytes.clone())));
+                }
+                fonts.push(Cow::Owned(bytes));
+            }
             Err(why) => log::error!("rho-ui: couldn't load the font {font}: {why}"),
         }
     }

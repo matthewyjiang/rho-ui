@@ -7,7 +7,7 @@
 
 use rho_ui_core::{
     fake_sshd::{ClientKey, FakeSshd, HostKey},
-    Daemon, DaemonError, DaemonTarget, Link, SshTarget,
+    Daemon, DaemonError, DaemonTarget, SshTarget,
 };
 use smol::block_on;
 
@@ -123,7 +123,7 @@ fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_terminals_connection() {
     use rho_ui_core::{
         fake_daemon::{FakeDaemon, Script},
         fake_sshd::TerminalEnd,
-        RemoteShell, ShellError,
+        Link, RemoteShell, ShellError,
     };
 
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -195,7 +195,7 @@ fn a_machine_runs_at_most_max_shells_and_a_dropped_control_hangs_up() {
     use rho_ui_core::{
         fake_daemon::{FakeDaemon, Script},
         fake_sshd::TerminalEnd,
-        RemoteShell, ShellError, MAX_SHELLS,
+        Link, RemoteShell, ShellError, MAX_SHELLS,
     };
 
     let dir = tempfile::tempdir().expect("a temporary directory");
