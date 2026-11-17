@@ -254,7 +254,8 @@ mod imp {
 }
 
 /// The daemon's local endpoint: a Unix socket, or on Windows a named pipe.
-#[cfg(unix)]
+/// A browser has neither, and reaches the daemon through `rho-ui serve`.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) mod endpoint {
     use std::{
         io,
@@ -262,16 +263,22 @@ pub(crate) mod endpoint {
         process::Command,
     };
 
+    #[cfg(windows)]
+    use rho_protocol::CloseOnShutdown;
     use rho_protocol::{
         Client, ClientHello, HelloResponse, LocalDaemon, LocalDaemonError, Notifications,
     };
+    #[cfg(windows)]
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+    #[cfg(unix)]
     use tokio::net::UnixStream;
 
     use crate::DaemonError;
 
     /// Connects to the daemon of the rho home `home` as `hello`, first
     /// starting it with `rho daemon start` through `rho` when none runs.
-    /// Runs on the I/O runtime.
+    /// Runs on the I/O runtime, whose timer `LocalDaemon` needs on Windows
+    /// to wait out a daemon pipe whose instances are all taken.
     ///
     /// # Errors
     ///
@@ -296,45 +303,9 @@ pub(crate) mod endpoint {
     /// # Errors
     ///
     /// Fails if nothing listens there.
+    #[cfg(unix)]
     pub(crate) async fn connect(path: &Path) -> io::Result<UnixStream> {
         UnixStream::connect(path).await
-    }
-}
-
-/// The daemon's local endpoint: a Unix socket, or on Windows a named pipe.
-#[cfg(windows)]
-pub(crate) mod endpoint {
-    use std::{
-        io,
-        path::{Path, PathBuf},
-        process::Command,
-    };
-
-    use rho_protocol::{Client, ClientHello, CloseOnShutdown, HelloResponse, Notifications};
-    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-
-    use crate::DaemonError;
-
-    /// Can't yet reach the daemon of the rho home `home`: rho-protocol's
-    /// `LocalDaemon`, which finds the daemon or starts it, is Unix-only.
-    ///
-    /// # Errors
-    ///
-    /// Always, saying so.
-    #[expect(
-        clippy::unused_async,
-        reason = "the same signature as on Unix, where it awaits"
-    )]
-    pub(crate) async fn connect_or_start(
-        home: PathBuf,
-        _rho: Command,
-        _hello: ClientHello,
-    ) -> Result<(Client, Notifications, HelloResponse), DaemonError> {
-        Err(DaemonError::Unreachable(format!(
-            "rho-ui can't yet find or start the Rho daemon of {} on Windows: \
-             rho-protocol's LocalDaemon is Unix-only",
-            home.display()
-        )))
     }
 
     /// Connects to the named pipe at `path`. Runs on the I/O runtime. A
@@ -345,6 +316,7 @@ pub(crate) mod endpoint {
     /// # Errors
     ///
     /// Fails if nothing listens there.
+    #[cfg(windows)]
     #[expect(
         clippy::unused_async,
         reason = "the same signature as on Unix, where connecting awaits"

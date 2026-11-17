@@ -52,6 +52,7 @@ use crate::{
 };
 
 mod live;
+mod surfaces;
 
 /// Points the Vulkan loader at lavapipe before `main`, while the process has
 /// one thread and setting a variable races no one; a variable already set
@@ -650,6 +651,15 @@ impl Harness {
             }
             window.input(text, cx);
         });
+    }
+
+    /// Whether this machine's session `id` is open in the app.
+    fn is_open(&mut self, id: &str) -> bool {
+        let (app, key) = (
+            self.app.clone(),
+            SessionKey::new(MachineId::local(), SessionId::from(id)),
+        );
+        self.cx.update(|cx| app.read(cx).is_open(&key))
     }
 
     /// What the active session's composer holds.
@@ -2498,25 +2508,39 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
     });
 }
 
-/// A turn that ends off screen while the process it started runs on leaves
-/// the row waiting on that work; Done shows once the work and the daemon's
-/// turn about it have ended.
+/// A session left off screen stays followed while something in it would
+/// be lost: a message being written, or background work, which the row
+/// waits on rather than showing Done. Once idle it is let go: the daemon
+/// sees no follower, the row keeps its Done, and opening it again replays
+/// it. A session with nothing under way is let go as soon as it is left.
 #[test]
-fn a_turn_that_leaves_work_running_waits_before_done() {
-    let mut ui = Harness::start("background-waits", Script::default());
+fn a_left_session_is_let_go_once_idle() {
+    let mut ui = Harness::start("let-go", Script::default());
     ui.wait_until("saved sessions", |window, _, _| {
         is_visible(window, "session-local-s1")
     });
     ui.click("session-local-s1");
-    ui.wait_for_daemon("s1 attached", |daemon| daemon.attaches("s1") == 1);
+    ui.wait_for_daemon("s1 attached", |daemon| daemon.followers("s1") == 1);
+    ui.type_in("half a thought");
+    ui.click("session-local-old");
+    ui.wait_for_daemon("old attached", |daemon| daemon.followers("old") == 1);
+    assert!(ui.is_open("s1"), "s1 holds a message being written");
+
+    ui.click("session-local-s1");
+    assert_eq!(ui.composer_text(), "half a thought", "the same view");
+    ui.focus_composer();
+    ui.act(|window, cx| window.press("secondary-a", cx));
+    ui.send("background");
+    ui.wait_for_session("the turn ended, its process running", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
-
-    ui.send_from_elsewhere("s1", "background", Send::Prompt);
-    ui.wait_until("s1 waiting on its process", |window, _, _| {
-        is_visible(window, "session-local-s1-background")
-    });
+    ui.wait_for_daemon("old let go", |daemon| daemon.followers("old") == 0);
+    assert!(ui.is_open("s1"), "s1 waits on its process");
     ui.act(|window, _| {
+        assert!(is_visible(window, "session-local-old"), "old's row stays");
+        assert!(is_visible(window, "session-local-s1-background"));
         assert!(!is_visible(window, "session-local-s1-done"), "not done yet");
     });
     ui.shot("waiting");
@@ -2527,6 +2551,60 @@ fn a_turn_that_leaves_work_running_waits_before_done() {
     });
     ui.send_from_elsewhere("s1", "thanks", Send::Steer);
     ui.wait_for_label("session-local-s1-done", "Done");
+    ui.wait_for_daemon("s1 let go", |daemon| daemon.followers("s1") == 0);
+    assert!(!ui.is_open("s1"));
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "session-local-s1-done"),
+            "Done outlives the view"
+        );
+    });
+
+    ui.click("session-local-s1");
+    ui.wait_for_daemon("s1 attached again", |daemon| {
+        daemon.attaches("s1") == 2 && daemon.followers("s1") == 1
+    });
+    ui.wait_for_session("the conversation replayed", |session| {
+        session.entries().len() > 1
+    });
+    ui.shot("reopened");
+}
+
+/// The title bar lists the directories a session reaches besides its
+/// workspace, and adds one: a path the daemon refuses says why and stays
+/// in the box to fix, and one it takes is listed, as the session has it.
+#[test]
+fn a_session_adds_a_directory_from_its_title_bar() {
+    let dir = tempfile::tempdir().expect("a directory to add");
+    let mut ui = Harness::start("added-dirs", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_for_daemon("s1 attached", |daemon| daemon.followers("s1") == 1);
+    ui.click("added-dirs-button");
+    let missing = dir.path().join("missing");
+    ui.act(|window, cx| {
+        window.input(&missing.to_string_lossy(), cx);
+        window.press("enter", cx);
+    });
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "added-dirs-error")
+    });
+    ui.shot("refused");
+
+    ui.act(|window, cx| {
+        window.press("secondary-a", cx);
+        window.input(&dir.path().to_string_lossy(), cx);
+        window.press("enter", cx);
+    });
+    ui.wait_for_session("the directory added", |session| {
+        session.added_dirs() == [dir.path()]
+    });
+    ui.wait_until("it is listed", |window, _, _| {
+        is_visible(window, "added-dir-0") && !is_visible(window, "added-dirs-error")
+    });
+    ui.shot("added");
 }
 
 /// The sidebar collapses to a rail and opens again, with Ctrl+B or its

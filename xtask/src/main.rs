@@ -245,7 +245,8 @@ fn gzip_tree(from: &Path, to: &Path) -> Result<()> {
 
 /// Clippy on what the web build compiles, warnings as errors.
 fn clippy_web() -> Result<()> {
-    run(&mut wasm_cargo(
+    let config = clippy_web_config()?;
+    run(wasm_cargo(
         "clippy",
         &[
             "--locked",
@@ -257,5 +258,33 @@ fn clippy_web() -> Result<()> {
             "-D",
             "warnings",
         ],
-    ))
+    )
+    .env("CLIPPY_CONF_DIR", config))
+}
+
+/// std's clock calls, which panic in a browser: `web_time` has the ones
+/// that don't. They are only banned for the web build, as `web_time` is
+/// std's own elsewhere, which clippy would flag too.
+const BROWSER_PANICS: &str = r#"
+    { path = "std::time::Instant::now", reason = "panics in a browser: use web_time::Instant" },
+    { path = "std::time::SystemTime::now", reason = "panics in a browser: use web_time::SystemTime" },"#;
+
+/// A folder holding the workspace's `clippy.toml` with [`BROWSER_PANICS`]
+/// added to its `disallowed-methods`, for clippy on the web build.
+fn clippy_web_config() -> Result<PathBuf> {
+    let base =
+        fs::read_to_string(root().join("clippy.toml")).context("couldn't read clippy.toml")?;
+    let list = "disallowed-methods = [";
+    ensure!(
+        base.contains(list),
+        "clippy.toml has no `{list}` for xtask to add the browser's bans to"
+    );
+    let dir = target_dir().join("clippy-web");
+    fs::create_dir_all(&dir).with_context(|| format!("couldn't make {}", dir.display()))?;
+    fs::write(
+        dir.join("clippy.toml"),
+        base.replacen(list, &format!("{list}{BROWSER_PANICS}"), 1),
+    )
+    .context("couldn't write the web build's clippy.toml")?;
+    Ok(dir)
 }

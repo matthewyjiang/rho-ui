@@ -310,6 +310,12 @@ impl SignInSlot {
 
     /// Reads whether the profiles are signed in again, as after a turn
     /// failed, which a sign-out elsewhere makes them do.
+    /// Whether its key box holds nothing typed, so dropping it loses
+    /// nothing; a login under way lives on in [`Auths`].
+    pub(crate) fn is_empty(&self, cx: &App) -> bool {
+        self.key.read(cx).value().trim().is_empty()
+    }
+
     pub(crate) fn refresh(&self, cx: &mut App) {
         self.auths
             .update(cx, |auths, cx| auths.refresh(&self.machine, cx));

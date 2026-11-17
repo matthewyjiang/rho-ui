@@ -47,12 +47,13 @@ use gpui_kit::{
     Window,
 };
 use rho_ui_core::{
-    Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon, DaemonError, Entry,
-    InputId, JobActivity, Prompt, Run, RunState, Session, SessionId, SessionUpdate, SteerId,
-    TurnId, Unsteered,
+    surface::SurfaceAction, Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon,
+    DaemonError, Entry, InputId, JobActivity, Prompt, Run, RunState, Session, SessionId,
+    SessionUpdate, SteerId, SurfaceActionError, TurnId, Unsteered,
 };
 
 use crate::{
+    added_dirs::{AddedDirs, DirsAccess},
     auths::Auths,
     background::{BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler},
     background_log::{BackgroundLog, Recorded},
@@ -64,6 +65,7 @@ use crate::{
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
+    surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
     transcript::{ActionHandler, RowContent, Transcript},
     usage::UsageRing,
@@ -128,10 +130,17 @@ pub(crate) struct SessionView {
     /// The sign-in its model's auth profile needs, while it is signed out;
     /// see [`Self::with_sign_in`].
     sign_in: Option<SignInSlot>,
+    /// The directories the session reaches besides its workspace, in the
+    /// title bar.
+    added_dirs: Entity<AddedDirs>,
     /// The oldest open request, while there is one, and its events.
     card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt is on its way to the daemon.
     sending: bool,
+    /// Steers, and messages refused as busy that wait on the job list,
+    /// whose answers haven't come: what they carry may go back in the
+    /// composer.
+    in_flight: usize,
     /// Background work the user asked to stop that still runs.
     stopping: Vec<BackgroundId>,
     /// The subagent and workflow runs the session started, as the daemon's
@@ -152,6 +161,8 @@ pub(crate) struct SessionView {
     reported: (String, Activity),
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
+    /// The surfaces the session's `ui` calls showed.
+    surfaces: Surfaces,
     /// Whether the agent's todo list above the composer is open.
     plan: Disclosure,
     focus_handle: FocusHandle,
@@ -199,6 +210,15 @@ impl SessionView {
                 cx,
             )
         });
+        let added_dirs = new_added_dirs(
+            &daemon,
+            &session,
+            &cwd,
+            &workspace,
+            DirsAccess::Add,
+            window,
+            cx,
+        );
         let subscriptions =
             vec![
                 cx.subscribe_in(&settings, window, Self::on_settings_event),
@@ -235,8 +255,10 @@ impl SessionView {
             composer,
             settings,
             sign_in: None,
+            added_dirs,
             card: None,
             sending: false,
+            in_flight: 0,
             stopping: Vec::new(),
             runs: Vec::new(),
             recorded,
@@ -245,6 +267,7 @@ impl SessionView {
             waiting_since: None,
             reported: (String::new(), Activity::Idle),
             error: None,
+            surfaces: Surfaces::default(),
             plan: Disclosure::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -300,8 +323,19 @@ impl SessionView {
             window,
             cx,
         );
+        // Only its run changes a subagent's session.
+        let added_dirs = new_added_dirs(
+            &view.daemon,
+            &view.session,
+            &view.cwd,
+            &view.workspace,
+            DirsAccess::ListOnly,
+            window,
+            cx,
+        );
         Self {
             parent: Some(parent.downgrade()),
+            added_dirs,
             _above: renamed,
             ..view
         }
@@ -380,6 +414,30 @@ impl SessionView {
     /// Whether the attach failed, so the view shows only why.
     pub(crate) fn failed_to_attach(&self) -> bool {
         matches!(self.loading, Loading::Failed(_))
+    }
+
+    /// Whether the app may let the session go while it is off screen:
+    /// its attach has answered and caught up, no turn runs or waits on a
+    /// person, no message or change is on its way or held, no error waits
+    /// to be read, and nothing typed, a message or a key, would be lost. Opening it again
+    /// replays it. Background work that ended stays listed until the
+    /// daemon's own turn gives the model its result, so the session waits
+    /// for that turn too.
+    pub(crate) fn can_close(&self, cx: &App) -> bool {
+        let session = &self.session;
+        !matches!(self.loading, Loading::Attaching)
+            && !session.is_replaying()
+            && !session.state().is_busy()
+            && session.inputs().is_empty()
+            && session.background().is_empty()
+            && session.held().is_none()
+            && !self.sending
+            && self.in_flight == 0
+            && self.error.is_none()
+            && self.composer.read(cx).is_empty(cx)
+            && self.sign_in.as_ref().is_none_or(|slot| slot.is_empty(cx))
+            && self.settings.read(cx).is_settled()
+            && self.added_dirs.read(cx).is_settled(cx)
     }
 
     /// What the sidebar shows for this session.
@@ -522,6 +580,7 @@ impl SessionView {
             self.transcript.truncate(from, cx);
         }
         self.transcript.sync(self.session.entries(), cx);
+        self.surfaces.sync(&mut self.session, window, cx);
         self.transcript.set_delay(self.session.delay());
         self.sync_settings(window, cx);
         self.sync_card(window, cx);
@@ -669,9 +728,11 @@ impl SessionView {
         let daemon = self.daemon.clone();
         let id = self.session.id().clone();
         let ended = self.session.ended_turn().cloned();
+        self.in_flight += 1;
         cx.spawn_in(window, async move |this, cx| {
             let result = daemon.steer(&id, &text).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight -= 1;
                 match result {
                     Ok(steer) => {
                         this.session.steer_sent(steer, text);
@@ -716,9 +777,11 @@ impl SessionView {
             return;
         }
         let daemon = self.daemon.clone();
+        self.in_flight += 1;
         cx.spawn_in(window, async move |this, cx| {
             let jobs = daemon.jobs().await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight -= 1;
                 let id = this.session.id();
                 // Only a turn under way or waiting for a person refuses one.
                 let listed = jobs.is_ok_and(|jobs| {
@@ -975,6 +1038,81 @@ impl SessionView {
         .detach();
     }
 
+    /// What the user did on a surface: the store takes it, and every
+    /// surface it changed draws again.
+    pub(crate) fn on_surface_event(
+        &mut self,
+        panel: &Entity<SurfacePanel>,
+        event: &SurfaceEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let surface = panel.read(cx).surface().to_owned();
+        let store = self.surfaces.store_mut();
+        match event {
+            SurfaceEvent::Write { binding, value } => {
+                store.write(&surface, binding, value.clone());
+            }
+            SurfaceEvent::Act { target, action } => {
+                let acted = store.act(&surface, target, action);
+                for url in &acted.open {
+                    cx.open_url(url);
+                }
+                if let Some(error) = acted.error {
+                    self.error = Some(format!("Couldn't run the form's action: {error}"));
+                }
+                if let Some(action) = acted.send {
+                    // The keyboard goes back to the composer, where the
+                    // reply is followed, as after an answered question.
+                    window.focus(&self.composer.focus_handle(cx), cx);
+                    self.send_surface_action(action, panel.downgrade(), window, cx);
+                }
+            }
+        }
+        self.surfaces.redraw(window, cx);
+        cx.notify();
+    }
+
+    /// The panel of `surface` changed, and may have changed height.
+    pub(crate) fn surface_resized(&self, surface: &str, cx: &mut Context<'_, Self>) {
+        self.transcript
+            .surface_changed(surface, self.session.entries(), cx);
+    }
+
+    /// Sends `action` to the session. A session that no longer has the
+    /// surface refuses it: unless a later call showed the surface since,
+    /// it then says it is out of date, with what the daemon said, and
+    /// takes no more.
+    fn send_surface_action(
+        &mut self,
+        action: SurfaceAction,
+        panel: WeakEntity<SurfacePanel>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let daemon = self.daemon.clone();
+        let id = self.session.id().clone();
+        let _ = panel.update(cx, SurfacePanel::sending);
+        cx.spawn_in(window, async move |this, cx| {
+            let sent = daemon.surface_action(&id, &action).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let _ = panel.update(cx, SurfacePanel::sent);
+                match sent {
+                    Ok(()) => {}
+                    Err(SurfaceActionError::Stale(said)) => {
+                        this.surfaces.store_mut().mark_stale(&action, said);
+                        this.surfaces.redraw(window, cx);
+                    }
+                    Err(SurfaceActionError::Failed(error)) => {
+                        this.error = Some(format!("Couldn't send the form's action: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Shows the session's settings, changeable once the session is open,
     /// and offers its commands and skills in the composer.
     fn sync_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -989,6 +1127,9 @@ impl SessionView {
         });
         self.composer.update(cx, |composer, cx| {
             composer.set_commands(self.session.commands(), cx);
+        });
+        self.added_dirs.update(cx, |dirs, cx| {
+            dirs.sync(self.session.added_dirs(), cx);
         });
     }
 
@@ -1067,6 +1208,7 @@ impl SessionView {
                             this.transcript.render_row(
                                 ix,
                                 this.session.entries(),
+                                &this.surfaces,
                                 &act,
                                 &content,
                                 cx,
@@ -1260,7 +1402,8 @@ impl SessionView {
     }
 
     /// The project, which starts a new session in it, the sessions above
-    /// this one, each a link to it, and this one's title, with its ended background work at the right.
+    /// this one, each a link to it, and this one's title, with its added
+    /// directories and ended background work at the right.
     fn render_title_bar(&self, cx: &mut Context<'_, Self>) -> TitleBar {
         let mut above = Vec::new();
         let mut next = self.parent();
@@ -1282,10 +1425,16 @@ impl SessionView {
                 let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Show(target.clone())));
             });
         }
-        bar.trailing(BackgroundHistory::new(
+        let ended = BackgroundHistory::new(
             self.session.ended_background(),
             &self.runs,
             Self::open_handler(cx.entity().downgrade()),
+        );
+        bar.trailing(Some(
+            h_flex()
+                .gap_1()
+                .child(self.added_dirs.clone())
+                .children(ended),
         ))
     }
 
@@ -1365,6 +1514,22 @@ impl Render for SessionView {
     }
 }
 
+/// The added directories of `session`, which works in `cwd`; see
+/// [`AddedDirs::new`].
+fn new_added_dirs(
+    daemon: &Daemon,
+    session: &Session,
+    cwd: &Place,
+    workspace: &WorkspaceRef,
+    access: DirsAccess,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<AddedDirs> {
+    let (daemon, id, cwd) = (daemon.clone(), session.id().clone(), cwd.clone());
+    let workspaces = workspace.table().clone();
+    cx.new(|cx| AddedDirs::new(daemon, id, cwd, workspaces, access, window, cx))
+}
+
 /// A held message on one line: its text, and what is attached to it, such
 /// as "look · 1 image, 2 files".
 fn held_summary(held: &Prompt) -> String {
@@ -1400,9 +1565,12 @@ const PROMPT_TITLE_CHARS: usize = 80;
 fn first_prompt(session: &Session) -> Option<String> {
     let text = session.entries().iter().find_map(|entry| match entry {
         Entry::User(message) => Some(message.text()),
-        Entry::Agent(_) | Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) | Entry::Wake => {
-            None
-        }
+        Entry::Agent(_)
+        | Entry::Thought(_)
+        | Entry::Tool(_)
+        | Entry::Notice(_)
+        | Entry::Surface(_)
+        | Entry::Wake => None,
     })?;
     let mut line: String = text
         .split_whitespace()

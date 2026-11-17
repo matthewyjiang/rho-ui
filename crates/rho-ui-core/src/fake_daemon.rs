@@ -48,6 +48,16 @@
 //!   next "busy" is taken like any prompt. The prompt "deleting" is
 //!   refused as busy with no turn under way, as a session being deleted
 //!   refuses it.
+//! - The prompt "ui" calls the `ui` tool, which shows [`surface::form`] and
+//!   waits: the call stays in progress, carrying the surface. An action on
+//!   the surface ([`FakeDaemon::surface_actions`] lists them) finishes the
+//!   call and the turn answers "you sent" and the event's name; the event
+//!   [`surface::REFUSED_EVENT`] is refused instead, as a session refuses
+//!   an action on a surface it does not have. The prompt "gallery" shows
+//!   [`surface::gallery`] without waiting, and answers at once; "widen"
+//!   changes the form so ([`surface::widened`]).
+//!   [`FakeDaemon::fall_behind`] detaches a session's clients as fallen
+//!   behind; attaching again replays the calls with their surfaces.
 //! - With [`Script::tui_job`], the session "tui-1" has a turn under way, as
 //!   one rho's terminal UI started: it is listed, its job runs, and a steer
 //!   is read at once, answered, and ends the turn. The steer "wait" is
@@ -55,7 +65,9 @@
 //! - Settings are shaped like rho's: four permission modes, three models,
 //!   three reasoning levels, and fast mode. Every session offers the slash
 //!   commands `compact` and `prompt:review` and the skills `pstack` and
-//!   `prove-it-works`.
+//!   `prove-it-works`. A session adds a directory that is one on this
+//!   machine, once, and refuses others as rho does.
+//!   [`FakeDaemon::followers`] counts the clients following a session.
 //! - rho's own settings are two pages. "General" holds
 //!   `general.auto_compact` (on/off, on by default), `general.permission_mode`
 //!   (a choice of auto, plan or supervised) and, under "Models",
@@ -93,8 +105,8 @@ use rho_protocol::{
         BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, JobId, JobKind,
         JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef, PendingUpgrade,
         PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions, Replay, Seq,
-        SessionCommand, SessionId, SessionOptions, SteerId, StreamId, ToolCallId, ToolCallUpdate,
-        TurnId,
+        SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams, SteerId, StreamId,
+        ToolCallId, ToolCallUpdate, TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
@@ -102,6 +114,7 @@ use rho_protocol::{
     Publisher, Question, RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent,
     Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
 };
+use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
@@ -110,6 +123,7 @@ mod auth;
 mod config;
 mod listener;
 mod service;
+pub mod surface;
 
 use auth::FakeAuth;
 pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
@@ -395,6 +409,18 @@ impl FakeDaemon {
             .map_or(0, |session| session.attaches)
     }
 
+    /// How many clients follow session `id` now, attached or observing:
+    /// a detach, or a client that leaves, ends its following.
+    pub fn followers(&self, id: &str) -> usize {
+        self.service.lock().sessions.get(id).map_or(0, |session| {
+            session
+                .publishers
+                .iter()
+                .filter(|publisher| !publisher.is_gone())
+                .count()
+        })
+    }
+
     /// The title session `id` has saved, if it has one.
     pub fn title(&self, id: &str) -> Option<String> {
         self.service.lock().sessions.get(id)?.title.clone()
@@ -547,6 +573,29 @@ impl FakeDaemon {
         session.answer(&format!("m-{turn}-2"), "The whole answer");
     }
 
+    /// Every action clients sent `session` with
+    /// `rho/session/surface_action`, the refused ones too, oldest first.
+    pub fn surface_actions(&self, session: &UiSessionId) -> Vec<SessionSurfaceActionParams> {
+        self.service
+            .lock()
+            .sessions
+            .get(session.as_str())
+            .map(|session| session.surface_actions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Detaches every client of `session` as fallen behind, as rho's
+    /// daemon does to one that left too many events unread. Attaching
+    /// again replays the session.
+    pub fn fall_behind(&self, session: &UiSessionId) {
+        let mut state = self.service.lock();
+        if let Some(session) = state.sessions.get_mut(session.as_str()) {
+            for publisher in session.publishers.drain(..) {
+                publisher.close(DetachReason::Lagged);
+            }
+        }
+    }
+
     /// Ends `session`'s oldest running subagent: its own session answers
     /// and ends its run, which detaches whoever observes it, and the
     /// daemon starts a turn of its own in `session` to tell the model.
@@ -622,6 +671,7 @@ struct Settings {
     model: ModelRef,
     reasoning: ReasoningLevel,
     fast: bool,
+    added_dirs: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -631,7 +681,22 @@ impl Settings {
             model: model("small"),
             reasoning: ReasoningLevel::Medium,
             fast: false,
+            added_dirs: Vec::new(),
         }
+    }
+
+    /// Adds `path` as rho does: refuses one that is not a directory, or
+    /// that the session reaches already.
+    fn add_directory(&mut self, path: PathBuf) -> Result<(), RpcError> {
+        let refuse = |why: String| Err(RpcError::new(ErrorCode::InvalidParams, why));
+        if !path.is_dir() {
+            return refuse(format!("{} is not a directory", path.display()));
+        }
+        if self.added_dirs.contains(&path) {
+            return refuse(format!("the session already reaches {}", path.display()));
+        }
+        self.added_dirs.push(path);
+        Ok(())
     }
 
     fn options(&self) -> SessionOptions {
@@ -691,7 +756,7 @@ impl Settings {
                     input_hint: None,
                 },
             ],
-            added_dirs: Vec::new(),
+            added_dirs: self.added_dirs.clone(),
         }
     }
 }
@@ -742,6 +807,8 @@ struct FakeSession {
     /// A subagent's session, which only its run writes: observed, never
     /// attached to.
     subagent: bool,
+    /// The actions clients sent on its surfaces.
+    surface_actions: Vec<SessionSurfaceActionParams>,
 }
 
 impl FakeSession {
@@ -761,6 +828,7 @@ impl FakeSession {
             background: Vec::new(),
             refused_busy: false,
             subagent: false,
+            surface_actions: Vec::new(),
         }
     }
 
@@ -996,6 +1064,26 @@ impl FakeSession {
                 },
             ],
             read,
+        );
+    }
+
+    /// Publishes `ui` call `id` in `status`, carrying the `messages` that
+    /// show `surface`, as every update of a real daemon's call does.
+    fn ui(&mut self, id: &ToolCallId, status: ToolStatus, surface: &str, messages: Vec<Value>) {
+        let header = ToolHeader::call("ui", Some(surface.to_owned()));
+        let mut content = vec![ToolContent::Surface {
+            surface: surface.to_owned(),
+            messages,
+        }];
+        if status == ToolStatus::Completed {
+            content.insert(0, text(&json!({"surfaceId": surface}).to_string()));
+        }
+        self.tool(
+            id,
+            (&format!("ui({surface})"), ToolKind::Other),
+            status,
+            content,
+            card(status, ToolFamily::Form, header),
         );
     }
 

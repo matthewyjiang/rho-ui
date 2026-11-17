@@ -408,7 +408,16 @@ impl SessionList {
     /// Forgets what an open session's view said about it, once the view is
     /// gone: its row shows what the daemon's jobs say again.
     pub(crate) fn close_live(&mut self, id: &SessionKey) {
+        let settled = self
+            .live
+            .iter()
+            .any(|live| live.id == *id && live.activity.is_idle());
         self.live.retain(|live| live.id != *id);
+        // The view saw the session settle, perhaps after the last poll of
+        // the jobs, which may still have it working: the next poll says.
+        if settled {
+            self.jobs.retain(|job| job.id != *id);
+        }
         if let Some(ix) = self.rows.iter().position(|row| row.id == *id) {
             let activity = self.activity(id);
             self.rows[ix].set_activity(activity);
@@ -1020,6 +1029,18 @@ mod tests {
         );
         list.set_live(live("a", None, Activity::Idle), 0, 11);
         assert!(done(&list), "done once the background work ends");
+
+        // A view let go as its turn ends knows more than the last poll,
+        // which still had the turn running.
+        list.set_live(live("a", None, Activity::Working(now)), 0, 12);
+        list.set_jobs(&here(), vec![job("a", JobActivity::Working, None)], now, 12);
+        list.set_live(live("a", None, Activity::Idle), 0, 13);
+        list.close_live(&id("a"));
+        assert!(done(&list), "Done outlives the view");
+        assert_eq!(
+            list.row(&id("a")).map(|row| row.activity),
+            Some(Activity::Idle)
+        );
     }
 
     #[test]

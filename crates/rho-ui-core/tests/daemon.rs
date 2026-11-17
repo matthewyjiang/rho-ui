@@ -7,11 +7,15 @@ use std::{path::Path, time::Duration};
 use futures::FutureExt;
 use rho_ui_core::{
     agent_settings::{SettingChange, SettingKey, SettingValue},
-    fake_daemon::{FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL, TUI_SESSION},
+    fake_daemon::{
+        surface::{FORM_SURFACE, REFUSED_EVENT},
+        FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
+    },
+    surface::{Node, SurfaceStore},
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus, Checkout,
     ChoiceKind, ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
-    DaemonTarget, Entry, Form, Image, ImageFormat, JobActivity, LoginOutcome, Prompt, RunState,
-    Session, Unsteered, MAX_PROMPT_ATTACHMENT_BYTES,
+    DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity, LoginOutcome, Prompt,
+    RunState, Session, SurfaceActionError, ToolStatus, Unsteered, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -628,5 +632,136 @@ fn background_work_is_listed_until_the_model_has_its_result() {
             session.state() == &RunState::Idle && session.background().is_empty()
         })
         .await;
+    });
+}
+
+/// The surfaces `session`'s transcript places, as (call, surface).
+fn surfaces(session: &Session) -> Vec<(&str, &str)> {
+    session
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Surface(shown) => Some((shown.call(), shown.surface())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A store shown every surface `session` placed.
+fn store(session: &mut Session) -> SurfaceStore {
+    let mut store = SurfaceStore::default();
+    for placed in session.take_placed_surfaces() {
+        store.show(placed);
+    }
+    store
+}
+
+/// A `ui` call's surface takes one place in the transcript however often
+/// the call repeats it, a pressed button's event reaches the session,
+/// which the waiting call returns, and an event the session refuses says
+/// the surface is stale instead of failing like a lost connection.
+#[test]
+fn a_surface_is_placed_once_and_its_actions_reach_the_session() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut session = new_session(&daemon).await;
+        daemon.prompt(session.id(), &"ui".into()).await.unwrap();
+        until(&mut events, &mut session, |s| !surfaces(s).is_empty()).await;
+        assert_eq!(surfaces(&session), [("tool-1", FORM_SURFACE)]);
+        let mut shown = store(&mut session);
+
+        let mut press = |id: &str| {
+            let tree = shown.tree(FORM_SURFACE).unwrap();
+            let button = tree
+                .root
+                .descendants()
+                .find_map(|node| match node {
+                    Node::Button(button) if button.target.component() == id => Some(button),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the form has no button {id}"));
+            let action = button.action.clone().expect("the button can be pressed");
+            let acted = shown.act(FORM_SURFACE, &button.target, &action);
+            acted.send.expect("the button's action is an event")
+        };
+        let refused = press("stale");
+        let error = daemon.surface_action(session.id(), &refused).await;
+        assert!(
+            matches!(error, Err(SurfaceActionError::Stale(_))),
+            "{error:?}"
+        );
+
+        let cancel = press("cancel");
+        daemon.surface_action(session.id(), &cancel).await.unwrap();
+        until(&mut events, &mut session, |s| !s.state().is_busy()).await;
+        let names: Vec<_> = fake
+            .surface_actions(session.id())
+            .iter()
+            .map(|sent| sent.action["action"]["name"].clone())
+            .collect();
+        assert_eq!(names, [REFUSED_EVENT, "cancel"]);
+        assert_eq!(last_reply(&session), "you sent cancel");
+        // The finished call repeated its surface: still one place.
+        let call = session.entries().iter().find_map(|entry| match entry {
+            Entry::Tool(tool) => Some(tool.status()),
+            _ => None,
+        });
+        assert_eq!(call, Some(ToolStatus::Done));
+        assert_eq!(surfaces(&session), [("tool-1", FORM_SURFACE)]);
+    });
+}
+
+/// A client the daemon detached as fallen behind attaches again with a
+/// new session, whose replay rebuilds the surface, once, where it was.
+#[test]
+fn a_replay_rebuilds_a_surface_once() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut session = new_session(&daemon).await;
+        daemon
+            .prompt(session.id(), &"gallery".into())
+            .await
+            .unwrap();
+        until(&mut events, &mut session, |s| !surfaces(s).is_empty()).await;
+        until(&mut events, &mut session, |s| !s.state().is_busy()).await;
+        let live = surfaces(&session)
+            .into_iter()
+            .map(|(call, surface)| (call.to_owned(), surface.to_owned()))
+            .collect::<Vec<_>>();
+        let drawn = store(&mut session).tree("gallery");
+        assert!(drawn.is_some(), "the gallery draws");
+
+        fake.fall_behind(session.id());
+        // What the turn published last may still be on its way.
+        loop {
+            match next(&mut events).await {
+                DaemonEvent::Detached {
+                    session: id,
+                    reason,
+                } => {
+                    assert_eq!((&id, reason), (session.id(), Detached::Behind));
+                    break;
+                }
+                DaemonEvent::Update { update, .. } => {
+                    session.apply(update);
+                }
+                other @ (DaemonEvent::AgentSettingsChanged(_)
+                | DaemonEvent::LoginPrompt { .. }
+                | DaemonEvent::LoginFinished { .. }) => {
+                    panic!("unexpected event: {other:?}")
+                }
+            }
+        }
+        let mut again = Session::new(session.id().clone());
+        again.attached(daemon.attach(again.id()).await.unwrap());
+        until(&mut events, &mut again, |s| !s.is_replaying()).await;
+        let replayed = surfaces(&again)
+            .into_iter()
+            .map(|(call, surface)| (call.to_owned(), surface.to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(replayed, live);
+        assert_eq!(store(&mut again).tree("gallery"), drawn);
     });
 }
