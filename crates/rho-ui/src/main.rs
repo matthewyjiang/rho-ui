@@ -66,15 +66,15 @@ mod workspaces;
 
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
-use std::{borrow::Cow, rc::Rc};
+use std::{borrow::Cow, rc::Rc, sync::Arc};
 
 use gpui_kit::component::input::{Copy, Enter, Paste};
 use gpui_kit::AppContext as _;
 #[cfg(not(target_family = "wasm"))]
 use gpui_kit::QuitMode;
 use gpui_kit::{
-    px, size, Action, App, AssetSource, Axis, KeyBinding, KeyBindingContextPredicate, NoAction,
-    SharedString, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size, Action, App, AssetSource, Axis, DevicePixels, KeyBinding, KeyBindingContextPredicate,
+    NoAction, SharedString, SvgSize, TitlebarOptions, WindowBounds, WindowOptions,
 };
 #[cfg(not(target_family = "wasm"))]
 use rho_ui_core::{DaemonTarget, RhoInstall};
@@ -496,8 +496,38 @@ fn window_options(cx: &App) -> WindowOptions {
             ..Default::default()
         }),
         app_id: Some("rho-ui".to_owned()),
+        icon: app_icon(cx),
         ..Default::default()
     }
+}
+
+/// `assets/icon.svg` rasterized for the window icon, which GPUI sets on X11
+/// only; Wayland takes the icon from the desktop entry named by `app_id`.
+/// `None`, with a log line, if the SVG doesn't render.
+#[expect(
+    clippy::print_stderr,
+    reason = "rho-ui has no log; stderr reaches the terminal or the journal"
+)]
+fn app_icon(cx: &App) -> Option<Arc<image::RgbaImage>> {
+    /// Big enough for a crisp dock or alt-tab icon; X11 scales it down.
+    const SIDE: i32 = 256;
+    let svgs = cx.svg_renderer();
+    let icon = svgs
+        .parse_svg(include_bytes!("../../../assets/icon.svg"))
+        .and_then(|svg| {
+            let side = DevicePixels(SIDE);
+            svgs.render_parsed(&svg, SvgSize::ExactSize(size(side, side)))
+        })
+        .inspect_err(|error| {
+            eprintln!("rho-ui: the app icon didn't render, so the window has none: {error}");
+        })
+        .ok()?;
+    // GPUI renders BGRA; the window icon takes RGBA.
+    let mut pixels = icon.as_bytes(0)?.to_vec();
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    image::RgbaImage::from_raw(SIDE.unsigned_abs(), SIDE.unsigned_abs(), pixels).map(Arc::new)
 }
 
 #[cfg(test)]

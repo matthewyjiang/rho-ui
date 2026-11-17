@@ -35,6 +35,18 @@ Open the URL it prints, which holds its token. `rho-ui serve`, which listens on 
 
 `cargo xtask dist` builds one `rho-ui` with the web build inside it, so `rho-ui serve` needs nothing beside it. [Architecture](docs/architecture.md#in-a-browser) says how it works.
 
+## Install on Linux
+
+To launch rho-ui from your desktop's app menu, with its icon in the dock and window list:
+
+```bash
+cargo install --path crates/rho-ui
+install -Dm644 assets/rho-ui.desktop ~/.local/share/applications/rho-ui.desktop
+install -Dm644 assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
+```
+
+Wayland looks up the icon through this desktop entry, whose name matches the window's app ID, `rho-ui`. An app launched from the menu doesn't get your shell's `PATH`, so if `rho` isn't somewhere like `/usr/local/bin`, edit `Exec=` to `rho-ui --rho /path/to/rho`.
+
 ## Keys
 
 On macOS, Cmd takes the place of Ctrl in these, and the menu bar lists them, with Cmd+H to hide and Cmd+M to minimize.
