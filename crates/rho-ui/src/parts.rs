@@ -11,7 +11,14 @@
 //!
 //! The parts cost time as a session opens: Kit parses a text under 4 KiB
 //! at once, where it parsed a long reply in the background. Opening a
-//! session with 198 KiB of such replies spent 26 ms parsing their parts.
+//! session with 198 KiB of such replies spent 26 ms parsing their parts. A
+//! Mermaid diagram is drawn as its text is parsed, so a long reply's
+//! diagrams are now drawn as the session opens too.
+//!
+//! Each part is a text of its own to Kit, so Select All in a reply selects
+//! the part the keyboard is in, and a selection goes when the part it
+//! started in scrolls out of the list's drawn range, as one always did
+//! when its row did.
 //!
 //! [`split`] says where a reply's Markdown parts, and [`Items`] which of
 //! the scroller's items each row takes.
@@ -33,16 +40,18 @@ const PART_BYTES: usize = 2048;
 /// paragraph gap apart whatever is around them, which leaves out a heading
 /// or a rule on either side: Kit spaces those by their neighbors. Nothing
 /// splits from an HTML block on, which may hold blank lines this doesn't
-/// follow, and a reply with a link's or a footnote's definition, which any
-/// part could refer to, stays whole.
+/// follow. A reply stays whole if it has a link's or a footnote's
+/// definition, which any part could refer to, or a carriage return that
+/// ends a line by itself, which this doesn't read as a line's end.
 ///
-/// As a reply streams in, its parts only grow and gain parts after them,
-/// but for a line that turns out not to start a part once more of it is
-/// written: a rule, the line under a heading, a list's next item, or a
-/// definition. Its part then joins the one before. So a line of `-` or `=`
-/// still being written counts as text; a reply that ends in one, with no
-/// line end, has it a few pixels closer to the text above than it would
-/// be whole.
+/// As a reply streams in, the parts before its last only grow. The line
+/// being written can move between the last two: a `-` or `*` reads as a
+/// list's next item until it turns out to be text, and starts a part then;
+/// a line that turns out a rule, or the line under a heading, joins its
+/// part to the one before. So a line of `-` or `=` still being written
+/// counts as text; a reply that ends in one, with no line end, has it a
+/// few pixels closer to the text above than it would be whole. Only a
+/// definition joins every part again.
 pub(crate) fn split(text: &str) -> Vec<&str> {
     // Where each part after the first starts.
     let mut starts: Vec<usize> = Vec::new();
@@ -56,7 +65,12 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
     let mut starts_part = false;
     // The line of text before the one being read.
     let mut above = "";
+    // Whether an HTML block has started, after which no part does.
+    let mut in_html = false;
     for (at, line) in lines(text) {
+        if line.contains('\r') {
+            return vec![text];
+        }
         let blank = line.trim_matches([' ', '\t']).is_empty();
         if let Some(open) = fence {
             // A fence in a list item or a quote ends with it, closed or not.
@@ -77,9 +91,7 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
         if is_definition(inner(line)) {
             return vec![text];
         }
-        if unindented(line).is_some_and(|rest| rest.starts_with('<')) {
-            break;
-        }
+        in_html |= unindented(line).is_some_and(|rest| rest.starts_with('<'));
         let written = at + line.len() < text.len();
         let item = item_indent(line);
         if line.starts_with([' ', '\t']) {
@@ -93,6 +105,7 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
             list = item.or(list.filter(|_| !after_blank));
             let start = starts.last().copied().unwrap_or(0);
             if after_blank
+                && !in_html
                 && !continues_list
                 && at - start >= PART_BYTES
                 && is_plain(above)
@@ -117,13 +130,15 @@ pub(crate) fn split(text: &str) -> Vec<&str> {
     parts.map(|(start, end)| &text[start..end]).collect()
 }
 
-/// `text`'s lines without their line ends, each with where it starts.
+/// `text`'s lines without their line ends, each with where it starts. A
+/// carriage return left in a line ends a line by itself.
 fn lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
     let mut at = 0;
     text.split_inclusive('\n').map(move |line| {
         let start = at;
         at += line.len();
-        (start, line.trim_end_matches(['\n', '\r']))
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        (start, line.strip_suffix('\r').unwrap_or(line))
     })
 }
 
@@ -249,6 +264,25 @@ fn is_plain(line: &str) -> bool {
     !is_heading(line) && !is_rule(line)
 }
 
+/// Where one of the scroller's items is in the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Place {
+    pub(crate) row: usize,
+    /// Which of the row's items it is.
+    pub(crate) part: usize,
+    /// Whether it is the row's last item.
+    pub(crate) ends_row: bool,
+}
+
+/// What a change to [`Items`] did, to do to the scroller's items too:
+/// `count` new ones took the place of `old`.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "the scroller's items must change as these did"]
+pub(crate) struct Edit {
+    pub(crate) old: Range<usize>,
+    pub(crate) count: usize,
+}
+
 /// Which of the scroller's items each transcript row takes: one, but a
 /// long reply's row one for each of its parts.
 #[derive(Debug, Default)]
@@ -263,21 +297,39 @@ impl Items {
         self.ends.last().copied().unwrap_or(0)
     }
 
-    /// Adds a row of `count` items at the end.
-    pub(crate) fn push(&mut self, count: usize) {
-        self.ends.push(self.len() + count);
+    /// Adds rows at the end, each of as many items as `counts` says.
+    pub(crate) fn extend(&mut self, counts: impl IntoIterator<Item = usize>) -> Edit {
+        let before = self.len();
+        for count in counts {
+            self.ends.push(self.len() + count);
+        }
+        Edit {
+            old: before..before,
+            count: self.len() - before,
+        }
     }
 
     /// Forgets the rows from `rows` on.
-    pub(crate) fn truncate(&mut self, rows: usize) {
+    pub(crate) fn truncate(&mut self, rows: usize) -> Edit {
+        let before = self.len();
         self.ends.truncate(rows);
+        Edit {
+            old: self.len()..before,
+            count: 0,
+        }
     }
 
-    /// Row `row` takes `count` items from now on. The rows after it move.
-    pub(crate) fn resize(&mut self, row: usize, count: usize) {
-        let had = self.of(row..row + 1).len();
+    /// Row `row` takes `count` items from now on: it gains or loses its
+    /// last ones, and the rows after it move.
+    pub(crate) fn resize(&mut self, row: usize, count: usize) -> Edit {
+        let had = self.of(row..row + 1);
         for end in self.ends.iter_mut().skip(row) {
-            *end = *end + count - had;
+            *end = *end + count - had.len();
+        }
+        let kept = count.min(had.len());
+        Edit {
+            old: had.start + kept..had.end,
+            count: count - kept,
         }
     }
 
@@ -290,16 +342,25 @@ impl Items {
         before(rows.start)..before(rows.end)
     }
 
-    /// The row item `item` is of, and which of the row's items it is.
-    pub(crate) fn locate(&self, item: usize) -> Option<(usize, usize)> {
+    /// Where item `item` is, if there is one.
+    pub(crate) fn locate(&self, item: usize) -> Option<Place> {
         let row = self.ends.partition_point(|&end| end <= item);
-        (row < self.ends.len()).then(|| (row, item - self.of(row..row + 1).start))
+        let end = *self.ends.get(row)?;
+        Some(Place {
+            row,
+            part: item - self.of(row..row + 1).start,
+            ends_row: item + 1 == end,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use markdown::mdast::Node;
+    use rho_ui_core::fake_daemon::report;
+
     use super::*;
+    use crate::figures::parse_options;
 
     /// A paragraph of at least `bytes` bytes, so a split may follow it.
     fn paragraph(bytes: usize) -> String {
@@ -326,6 +387,74 @@ mod tests {
         first_lines.collect()
     }
 
+    /// Long blocks that hold blank lines, each one top-level block.
+    fn blocks_with_blank_lines() -> Vec<String> {
+        let long = paragraph(PART_BYTES);
+        vec![
+            // Fences, closed only by one as long of their own character.
+            format!("```rust\n{long}\n\nfn main() {{}}\n~~~\n\nstill code\n```"),
+            format!("~~~~\n{long}\n\n~~~\n\nstill code\n~~~~"),
+            format!("$$\n{long}\n\nx = 1\n$$"),
+            // A list's items, and what an item holds.
+            format!("- {long}\n\n- next\n\n  more of it\n\n1. numbered"),
+            format!(" 1. {long}\n\n2. an item of the same list"),
+            format!("1. {long}\n\n   ```\n   code\n\n   more\n   ```"),
+            // A fence a quote holds ends with the quote.
+            format!("> ```\n> {long}"),
+        ]
+    }
+
+    /// A long paragraph, then a heading or a rule and a line under it.
+    fn headings_and_rules() -> Vec<String> {
+        let long = paragraph(PART_BYTES);
+        vec![
+            format!("{long}\n\n## Heading\n\nUnder it."),
+            format!("{long}\n\n---\n\nUnder it."),
+            format!("{long}\n\nHeading\n=======\n\nUnder it."),
+            format!("{long}\n\nA heading\nof two lines\n---\n\nUnder it."),
+        ]
+    }
+
+    /// Replies of long paragraphs that stay whole.
+    fn whole_replies() -> Vec<String> {
+        let long = paragraph(PART_BYTES);
+        vec![
+            // A definition: any part may refer to it.
+            format!("{long}\n\nSee [the docs][docs].\n\n{long}\n\n[docs]: https://example.com"),
+            format!("{long}\n\nA note.[^1]\n\n{long}\n\n[^1]: The note."),
+            format!("{long}\n\nSee [1].\n\n{long}\n\n- [1]: https://example.com"),
+            // One after HTML too, where nothing starts a part.
+            format!(
+                "{long}\n\nSee [the docs][docs]. {long}\n\n<br>\n\n[docs]: https://example.com"
+            ),
+            // A carriage return alone ends a line: here it opens a fence.
+            format!("Intro\r```\r{long}\n\nstill code\n```\n\nAfter.\n"),
+        ]
+    }
+
+    /// A reply with HTML in it: nothing after the HTML starts a part.
+    fn html_reply() -> String {
+        let long = paragraph(PART_BYTES);
+        format!("{long}\n\n{long}\n\n<details>\n\n{long}\n\n</details>\n\n{long}")
+    }
+
+    /// A reply of the blocks a model writes, each long.
+    fn mixed_reply() -> String {
+        reply(&[
+            "One ",
+            "**Bold** ",
+            "Intro:\n- item\n- item\n\nAfter the list ",
+            "```\ncode\n\n```\n\nAfter the code ",
+            "1. first\n\n2. second\n\nLast ",
+            // A `*` or a `1.` reads as a list's next item until more of
+            // its line is written.
+            "- item ",
+            "**Bold** after a list ",
+            "1. item ",
+            "1.5x faster ",
+        ])
+    }
+
     #[test]
     fn a_reply_splits_between_long_blocks() {
         let text = reply(&["One ", "Two ", "- a\n- b\n\nThree "]);
@@ -337,25 +466,14 @@ mod tests {
 
     #[test]
     fn a_block_that_holds_blank_lines_stays_whole() {
-        let long = paragraph(PART_BYTES);
-        for block in [
-            // Fences, closed only by one as long of their own character.
-            format!("```rust\n{long}\n\nfn main() {{}}\n~~~\n\nstill code\n```"),
-            format!("~~~~\n{long}\n\n~~~\n\nstill code\n~~~~"),
-            format!("$$\n{long}\n\nx = 1\n$$"),
-            // A list's items, and what an item holds.
-            format!("- {long}\n\n- next\n\n  more of it\n\n1. numbered"),
-            format!(" 1. {long}\n\n2. an item of the same list"),
-            format!("1. {long}\n\n   ```\n   code\n\n   more\n   ```"),
-            // A fence a quote holds ends with the quote.
-            format!("> ```\n> {long}"),
-        ] {
+        for block in blocks_with_blank_lines() {
             let text = format!("{block}\n\nAfter.\n");
             assert_eq!(first_lines(&text).len(), 2, "{block:?}");
             assert_eq!(split(&text)[1], "After.\n", "{block:?}");
         }
         // A fence on an item's own line closes on a line of its own, so
         // the fence after it is seen to open.
+        let long = paragraph(PART_BYTES);
         let fences =
             format!("- ```sh\n  {long}\n  ```\n\n```\n{long}\n\nstill code\n```\n\nAfter.\n");
         assert_eq!(first_lines(&fences), ["- ```sh", "```", "After."]);
@@ -363,13 +481,7 @@ mod tests {
 
     #[test]
     fn a_heading_or_a_rule_keeps_its_neighbors() {
-        let long = paragraph(PART_BYTES);
-        for joined in [
-            format!("{long}\n\n## Heading\n\nUnder it."),
-            format!("{long}\n\n---\n\nUnder it."),
-            format!("{long}\n\nHeading\n=======\n\nUnder it."),
-            format!("{long}\n\nA heading\nof two lines\n---\n\nUnder it."),
-        ] {
+        for joined in headings_and_rules() {
             let text = format!("{joined}\n\nAfter.\n");
             assert_eq!(
                 split(&text),
@@ -380,35 +492,80 @@ mod tests {
 
     #[test]
     fn a_reply_this_cannot_follow_stops_splitting() {
-        let long = paragraph(PART_BYTES);
-        // A definition: any part may refer to it.
-        for defined in [
-            format!("{long}\n\nSee [the docs][docs].\n\n{long}\n\n[docs]: https://example.com"),
-            format!("{long}\n\nA note.[^1]\n\n{long}\n\n[^1]: The note."),
-            format!("{long}\n\nSee [1].\n\n{long}\n\n- [1]: https://example.com"),
-        ] {
-            assert_eq!(split(&defined), [defined.as_str()]);
+        for whole in whole_replies() {
+            assert_eq!(split(&whole), [whole.as_str()]);
         }
-        // HTML: nothing after it starts a part.
-        let html = format!("{long}\n\n{long}\n\n<details>\n\n{long}\n\n</details>\n\n{long}");
-        assert_eq!(first_lines(&html).len(), 2);
+        assert_eq!(first_lines(&html_reply()).len(), 2);
     }
 
-    /// As a reply streams in, a part only grows, and parts come after it.
+    /// The parts start where Kit's parser starts a top-level block, with
+    /// no heading or rule beside the split and no HTML block before it, and
+    /// a reply the parser finds a definition in is whole.
     #[test]
-    fn a_streamed_reply_only_grows_its_parts() {
-        let text = reply(&[
-            "One ",
-            "**Bold** ",
-            "Intro:\n- item\n- item\n\nAfter the list ",
-            "```\ncode\n\n```\n\nAfter the code ",
-            "1. first\n\n2. second\n\nLast ",
-        ]);
+    fn a_reply_splits_where_the_parser_starts_a_block() {
+        let after = |blocks: Vec<String>| {
+            blocks
+                .into_iter()
+                .map(|block| format!("{block}\n\nAfter.\n"))
+        };
+        let samples = [mixed_reply(), html_reply(), report()]
+            .into_iter()
+            .chain(after(blocks_with_blank_lines()))
+            .chain(after(headings_and_rules()))
+            .chain(whole_replies());
+        let mut splits = 0;
+        for text in samples {
+            let root = markdown::to_mdast(&text, &parse_options()).expect("Markdown parses");
+            let blocks = root.children().expect("a root has children");
+            let start = |block: &Node| block.position().expect("a block has a place").start.offset;
+            let mut nodes = vec![&root];
+            let mut defines = false;
+            while let Some(node) = nodes.pop() {
+                defines |= matches!(node, Node::Definition(_) | Node::FootnoteDefinition(_));
+                nodes.extend(node.children().into_iter().flatten());
+            }
+            let parts = split(&text);
+            assert!(!defines || parts.len() == 1, "a definition: {text:?}");
+            let mut at = 0;
+            for part in &parts[..parts.len() - 1] {
+                at += part.len();
+                splits += 1;
+                let next = blocks.partition_point(|block| start(block) < at);
+                let indent = &text[at..blocks.get(next).map_or(at + 1, start)];
+                assert!(
+                    indent.bytes().all(|byte| byte == b' '),
+                    "byte {at} starts no block: {text:?}"
+                );
+                assert!(
+                    !matches!(
+                        (&blocks[next - 1], &blocks[next]),
+                        (Node::Heading(_) | Node::ThematicBreak(_), _)
+                            | (_, Node::Heading(_) | Node::ThematicBreak(_))
+                    ),
+                    "byte {at} is beside a heading or a rule: {text:?}"
+                );
+                assert!(
+                    !blocks[..=next]
+                        .iter()
+                        .any(|block| matches!(block, Node::Html(_))),
+                    "byte {at} is after HTML: {text:?}"
+                );
+            }
+        }
+        assert!(splits > 20, "the samples split: {splits} times");
+    }
+
+    /// As a reply streams in, the parts before the last only grow: only
+    /// the line being written moves, between the last two.
+    #[test]
+    fn a_streamed_reply_only_grows_the_parts_before_its_last() {
+        let text = mixed_reply();
         let mut before: Vec<&str> = Vec::new();
         for end in (0..=text.len()).filter(|end| text.is_char_boundary(*end)) {
             let parts = split(&text[..end]);
-            assert!(parts.len() >= before.len(), "the first {end} bytes");
-            for (part, was) in parts.iter().zip(&before) {
+            let settled = before.len().saturating_sub(1);
+            assert!(parts.len() >= settled, "the first {end} bytes");
+            for (part, was) in parts.iter().zip(&before[..settled]) {
                 assert!(
                     part.starts_with(was),
                     "the first {end} bytes: {was:?} became {part:?}"
@@ -416,30 +573,61 @@ mod tests {
             }
             before = parts;
         }
-        assert_eq!(before.len(), 5, "it split at each long block");
+        assert_eq!(before.len(), 9, "it split at each long block");
     }
 
     #[test]
     fn items_follow_rows_as_their_parts_change() {
         let mut items = Items::default();
-        for count in [1, 3, 1] {
-            items.push(count);
-        }
+        assert_eq!(
+            items.extend([1, 3, 1]),
+            Edit {
+                old: 0..0,
+                count: 5
+            }
+        );
         assert_eq!(items.len(), 5);
         assert_eq!(items.of(1..2), 1..4);
         assert_eq!(items.of(1..3), 1..5);
-        assert_eq!(items.locate(0), Some((0, 0)));
-        assert_eq!(items.locate(3), Some((1, 2)));
-        assert_eq!(items.locate(4), Some((2, 0)));
+        let place = |row, part, ends_row| {
+            Some(Place {
+                row,
+                part,
+                ends_row,
+            })
+        };
+        assert_eq!(items.locate(0), place(0, 0, true));
+        assert_eq!(items.locate(2), place(1, 1, false));
+        assert_eq!(items.locate(3), place(1, 2, true));
+        assert_eq!(items.locate(4), place(2, 0, true));
         assert_eq!(items.locate(5), None);
 
-        items.resize(1, 1);
+        // A row loses its last items, or gains items after them.
+        assert_eq!(
+            items.resize(1, 1),
+            Edit {
+                old: 2..4,
+                count: 0
+            }
+        );
         assert_eq!(items.of(1..2), 1..2);
-        assert_eq!(items.locate(2), Some((2, 0)));
-        items.resize(2, 4);
+        assert_eq!(items.locate(2), place(2, 0, true));
+        assert_eq!(
+            items.resize(2, 4),
+            Edit {
+                old: 3..3,
+                count: 3
+            }
+        );
         assert_eq!(items.len(), 6);
 
-        items.truncate(1);
+        assert_eq!(
+            items.truncate(1),
+            Edit {
+                old: 1..6,
+                count: 0
+            }
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items.of(1..3), 1..1, "rows that went take nothing");
     }

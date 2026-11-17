@@ -49,7 +49,7 @@ use crate::{
     figures,
     fold::Folding,
     lightbox,
-    parts::{self, Items},
+    parts::{self, Edit, Items, Place},
     pictures::{self, PictureRead, Pictures},
     surface_view::Surfaces,
     turn_times::TurnTimes,
@@ -179,11 +179,11 @@ pub(crate) enum Action {
 /// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
 
-/// Builds the content of the scroller's item `ix`:
+/// Builds the content of the scroller's item at a [`Place`]:
 /// [`Transcript::render_content`], reached through the session view, because
-/// a fold builds its rows only while they show, after
-/// [`Transcript::render_row`] returned.
-pub(crate) type RowContent = Rc<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
+/// a fold builds its content only while it shows, after
+/// [`Transcript::render_item`] returned.
+pub(crate) type ItemContent = Rc<dyn Fn(Place, &mut Window, &mut App) -> AnyElement>;
 
 /// The turn in progress.
 #[derive(Clone, Copy, Debug)]
@@ -315,16 +315,11 @@ impl Transcript {
             self.markdown.push(markdown);
         }
         let rows = self.timeline.rows().len();
-        let before = self.items.borrow().len();
-        for row in rows - synced.added..rows {
-            let count = self.item_count(row);
-            self.items.borrow_mut().push(count);
-        }
-        let added = self.items.borrow().len() - before;
-        if added > 0 {
-            self.scroller
-                .update(cx, |scroller, cx| scroller.append(added, cx));
-        }
+        let counts: Vec<usize> = (rows - synced.added..rows)
+            .map(|row| self.item_count(row))
+            .collect();
+        let added = self.items.borrow_mut().extend(counts);
+        self.splice(added, cx);
         let known = self.took.len();
         let turns = self.timeline.turns().len();
         let seen = self.attachments.len();
@@ -361,13 +356,8 @@ impl Transcript {
         self.diffs.retain(|diff| diff.entry < from);
         self.worked.truncate(turns);
         self.took.truncate(turns);
-        let before = self.items.borrow().len();
-        self.items.borrow_mut().truncate(rows);
-        let left = self.items.borrow().len();
-        if left < before {
-            self.scroller
-                .update(cx, |scroller, cx| scroller.splice(left..before, 0, cx));
-        }
+        let gone = self.items.borrow_mut().truncate(rows);
+        self.splice(gone, cx);
         // A run of work may have lost steps.
         if let Some(last) = rows.checked_sub(1) {
             self.remeasure(last..rows, cx);
@@ -456,19 +446,23 @@ impl Transcript {
         }
         self.markdown[ix].truncate(sources.len());
 
-        let had = self.items.borrow().of(row..row + 1);
         let count = self.item_count(row);
-        if count == had.len() {
-            return;
+        let resized = self.items.borrow_mut().resize(row, count);
+        self.splice(resized, cx);
+    }
+
+    /// Changes the scroller's items as [`Items`] changed.
+    fn splice(&self, edit: Edit, cx: &mut App) {
+        let Edit { old, count } = edit;
+        if !old.is_empty() || count > 0 {
+            self.scroller
+                .update(cx, |scroller, cx| scroller.splice(old, count, cx));
         }
-        self.items.borrow_mut().resize(row, count);
-        self.scroller.update(cx, |scroller, cx| {
-            if count > had.len() {
-                scroller.splice(had.end..had.end, count - had.len(), cx);
-            } else {
-                scroller.splice(had.start + count..had.end, 0, cx);
-            }
-        });
+        debug_assert_eq!(
+            self.scroller.read(cx).item_count(),
+            self.items.borrow().len(),
+            "the scroller has an item for each of the rows' items"
+        );
     }
 
     /// How many of the scroller's items `row` takes: one, but one for each
@@ -612,33 +606,30 @@ impl Transcript {
             .update(cx, |scroller, cx| scroller.remeasure_items(items, cx));
     }
 
-    /// The row the scroller's item `ix` is of, which of the row's items it
-    /// is, and whether it is the row's last.
-    fn locate(&self, ix: usize) -> Option<(usize, usize, bool)> {
-        let items = self.items.borrow();
-        let (row, part) = items.locate(ix)?;
-        Some((row, part, ix + 1 == items.of(row..row + 1).end))
-    }
-
-    /// The scroller's item `ix`: a row, or a part of a long reply's, at a
+    /// The scroller's item `item`: a row, or a part of a long reply's, at a
     /// readable measure on wide windows. A turn's working is open while the
     /// turn runs and folds once it finishes, so its rows are built through
     /// `content`; a folded row takes no space. The gap below each row is
     /// here, inside any fold, not in the scroller's row style (which the
     /// session view zeroes).
-    pub(crate) fn render_row(
+    pub(crate) fn render_item(
         &self,
-        ix: usize,
+        item: usize,
         entries: &[Entry],
         surfaces: &Surfaces,
         act: &ActionHandler,
-        content: &RowContent,
+        content: &ItemContent,
         cx: &App,
     ) -> AnyElement {
         let measure = div().w_full().max_w(rems(48.)).mx_auto();
-        let Some((row, part, ends_row)) = self.locate(ix) else {
+        let Some(place) = self.items.borrow().locate(item) else {
             return measure.into_any_element();
         };
+        let Place {
+            row,
+            part,
+            ends_row,
+        } = place;
         // A surface stays usable after its turn: its row lies within the
         // turn's working, and does not fold with it. A surface that moved
         // under a later call, or was deleted, takes no room here.
@@ -651,7 +642,7 @@ impl Transcript {
         let Some(turn) = self.timeline.turn_of(row) else {
             return measure
                 .when(ends_row, Styled::pb_3)
-                .child(self.render_content(ix, entries, act, cx))
+                .child(self.render_content(place, entries, act, cx))
                 .into_any_element();
         };
         let working = self.timeline.working(turn);
@@ -671,7 +662,7 @@ impl Transcript {
                     move |window, cx| {
                         div()
                             .when(ends_row, Styled::pb_3)
-                            .child(content(ix, window, cx))
+                            .child(content(place, window, cx))
                             .into_any_element()
                     },
                 ))
@@ -680,7 +671,7 @@ impl Transcript {
         let opens_turn = self.timeline.turns().get(turn) == Some(&row);
         measure
             .when(ends_row, Styled::pb_3)
-            .child(self.render_content(ix, entries, act, cx))
+            .child(self.render_content(place, entries, act, cx))
             .when(opens_turn, |this| {
                 this.child(self.render_header(turn, act, cx))
             })
@@ -731,18 +722,20 @@ impl Transcript {
         .into_any_element()
     }
 
-    /// The content of the scroller's item `ix`: a message, a part of a
-    /// long reply, or a run of work.
+    /// The content of the scroller's item at `place`: a message, a part of
+    /// a long reply, or a run of work.
     pub(crate) fn render_content(
         &self,
-        ix: usize,
+        place: Place,
         entries: &[Entry],
         act: &ActionHandler,
         cx: &App,
     ) -> AnyElement {
-        let Some((row, part, ends_row)) = self.locate(ix) else {
-            return div().into_any_element();
-        };
+        let Place {
+            row,
+            part,
+            ends_row,
+        } = place;
         let Some(drawn) = self.timeline.rows().get(row) else {
             return div().into_any_element();
         };
