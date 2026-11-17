@@ -1,5 +1,5 @@
-//! rho-ui's own settings: light or dark, UI scale, fonts, the machines it
-//! connects to, and the forge CLIs' programs on each. They live in
+//! rho-ui's own settings: light or dark, UI scale, fonts, whether scrolling
+//! glides, the machines it connects to, and the forge CLIs' programs on each. They live in
 //! `settings` in rho-ui's config folder ([`AppDir::Config`]: by default
 //! `~/.config/rho-ui`), one `key = value` per line. The look applies to
 //! GPUI Kit's theme; the app follows the machines.
@@ -115,10 +115,64 @@ impl Appearance {
     }
 }
 
+/// Whether a wheel notch glides and a touchpad swipe carries on
+/// ([`crate::kinetic`]).
+///
+/// A setting of its own because the desktop's switch says more than this:
+/// on Windows it is "Animation effects", which people turn off for speed,
+/// and which then stops scrolling from gliding in rho-ui too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SmoothScroll {
+    /// On, unless the desktop asks for reduced motion.
+    #[default]
+    System,
+    On,
+    Off,
+}
+
+impl SmoothScroll {
+    pub(crate) const CHOICES: [SmoothScroll; 3] =
+        [SmoothScroll::System, SmoothScroll::On, SmoothScroll::Off];
+
+    /// What the settings file calls it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            SmoothScroll::System => "system",
+            SmoothScroll::On => "on",
+            SmoothScroll::Off => "off",
+        }
+    }
+
+    /// What settings call it.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SmoothScroll::System => "System",
+            SmoothScroll::On => "On",
+            SmoothScroll::Off => "Off",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::CHOICES
+            .into_iter()
+            .find(|choice| choice.name() == name)
+    }
+
+    /// Whether scrolling glides now.
+    pub(crate) fn glides(self, cx: &App) -> bool {
+        match self {
+            SmoothScroll::System => !cx.reduce_motion(),
+            SmoothScroll::On => true,
+            SmoothScroll::Off => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub(crate) appearance: Appearance,
     pub(crate) ui_scale: UiScale,
+    pub(crate) smooth_scroll: SmoothScroll,
     pub(crate) ui_font: SharedString,
     pub(crate) code_font: SharedString,
     /// What the sidebar calls this machine.
@@ -139,6 +193,7 @@ impl Default for Settings {
         Self {
             appearance: Appearance::default(),
             ui_scale: UiScale::default(),
+            smooth_scroll: SmoothScroll::default(),
             ui_font: DEFAULT_UI_FONT.into(),
             code_font: DEFAULT_CODE_FONT.into(),
             local_label: LOCAL.into(),
@@ -232,9 +287,10 @@ impl Settings {
     /// `.<program>`.
     fn to_text(&self) -> String {
         let mut text = format!(
-            "appearance = {}\nui_scale = {}\nui_font = {}\ncode_font = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
+            "appearance = {}\nui_scale = {}\nsmooth_scroll = {}\nui_font = {}\ncode_font = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
             self.appearance.name(),
             self.ui_scale.percent(),
+            self.smooth_scroll.name(),
             self.ui_font,
             self.code_font,
             self.local_label,
@@ -315,6 +371,11 @@ fn parse(text: &str) -> Settings {
                     settings.ui_scale = scale;
                 }
             }
+            "smooth_scroll" => {
+                if let Some(smooth_scroll) = SmoothScroll::from_name(value) {
+                    settings.smooth_scroll = smooth_scroll;
+                }
+            }
             "ui_font" if !value.is_empty() => settings.ui_font = value.to_owned().into(),
             "code_font" if !value.is_empty() => settings.code_font = value.to_owned().into(),
             "local.label" if !value.is_empty() => settings.local_label = value.to_owned().into(),
@@ -378,6 +439,7 @@ mod tests {
     #[test]
     fn machines_survive_a_save_in_the_order_added() {
         let mut settings = Settings {
+            smooth_scroll: SmoothScroll::On,
             local_label: "laptop".into(),
             local_clone_folder: "~/code".to_owned(),
             ..Settings::default()
@@ -395,6 +457,7 @@ mod tests {
         settings.machines = vec![workstation, RemoteMachine::new("me@node0.example.edu")];
         let read = parse(&settings.to_text());
         assert_eq!(read.machines, settings.machines);
+        assert_eq!(read.smooth_scroll, SmoothScroll::On);
         assert_eq!(read.local_label, "laptop");
         assert_eq!(read.local_clone_folder, "~/code");
         assert_eq!(read.local_cli, settings.local_cli);
