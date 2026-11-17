@@ -1,17 +1,17 @@
-//! Starting the Rho daemon on a host and reading what the client needs of
-//! it: where its socket is, the host's home, and its login environment.
+//! Starting the Rho daemon on a machine rho-ui reaches through a [`Link`],
+//! and reading what the client needs of it: where its socket is, the
+//! machine's home, and its login environment.
 
 use std::{path::PathBuf, time::Duration};
 
 use rho_protocol::ClientEnvironment;
 use serde::Deserialize;
 
-use super::{
-    connection::Connection,
-    quote,
-    script::{self, ScriptError},
+use crate::{
+    daemon::DaemonError,
+    link::{quote, Link, ScriptError},
+    rho_install::find_rho_sh,
 };
-use crate::{daemon::DaemonError, rho_install::find_rho_sh};
 
 /// How long the setup script may take on the host. Over an ssh connection
 /// already open (OpenSSH's `ControlMaster`, measured before rho-ui had a
@@ -33,27 +33,28 @@ const SETUP_MARKER: &str = "rho-ui-setup-7d2e40";
 
 /// What the setup script reported.
 #[derive(Debug)]
-pub(super) struct Setup {
+pub(crate) struct Setup {
     /// The daemon's Unix socket on the host, as its own `rho daemon
     /// status` says: a path there, whatever this machine's paths are like.
-    pub(super) socket: String,
+    pub(crate) socket: String,
     /// The host's `HOME`.
-    pub(super) home: PathBuf,
+    pub(crate) home: PathBuf,
     /// The login environment, for sessions to run in.
-    pub(super) environment: ClientEnvironment,
+    pub(crate) environment: ClientEnvironment,
 }
 
-/// Runs [`setup_script`] on the connection's host, starting the daemon
-/// through `rho` there, and reads what it reports.
+/// Runs [`setup_script`] on `link`'s machine, starting the daemon through
+/// `rho` there, and reads what it reports.
 ///
 /// # Errors
 ///
 /// Fails, in the script's words, if rho isn't there or its daemon doesn't
 /// start, the login shell hangs, or the output is cut short.
-pub(super) async fn run(connection: &Connection, rho: &str) -> Result<Setup, DaemonError> {
-    let host = connection.host();
+pub(crate) async fn run(link: &Link, rho: &str) -> Result<Setup, DaemonError> {
+    let host = link.name();
     let script = setup_script(rho);
-    let stdout = script::run(connection, script.as_bytes(), Some(SETUP_DEADLINE))
+    let stdout = link
+        .script(script.into_bytes(), Some(SETUP_DEADLINE))
         .await
         .map_err(|error| {
             let why = match error {

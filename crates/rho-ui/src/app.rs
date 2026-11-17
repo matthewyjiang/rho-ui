@@ -10,11 +10,9 @@
 //! views: each redraws only when it changes, so a hover in one never
 //! rebuilds the others.
 
-use std::{
-    path::PathBuf,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{path::PathBuf, rc::Rc, time::Duration};
+
+use web_time::Instant;
 
 use gpui_kit::component::{
     button::Button,
@@ -34,16 +32,14 @@ use rho_ui_core::{
     Jobs, PendingUpgrade, Prompt, Session, SessionId,
 };
 
+use crate::machines::RemoteMachine;
 use crate::{
     auths::Auths,
     background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
     forge::Forges,
     kinetic::Kinetic,
-    machines::{
-        Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach, RemoteMachine,
-        SessionKey,
-    },
+    machines::{Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach, SessionKey},
     projects::Projects,
     pull_requests::{Focus, PullRequests},
     rho_install::{render_setup, Installs, InstallsEvent, Offer},
@@ -56,7 +52,7 @@ use crate::{
     settings::{Appearance, Settings},
     settings_view,
     sidebar::{ResizeSidebar, SidebarEvent, SidebarModels, SidebarState, SidebarView},
-    workspaces::{WorkspaceRef, Workspaces},
+    workspaces::{self, WorkspaceRef, Workspaces},
     NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
 };
 
@@ -81,13 +77,15 @@ const UPGRADE_POLL: Duration = Duration::from_secs(30);
 
 /// What the command line asked for.
 pub(crate) struct LaunchConfig {
-    /// Where new sessions start on this machine. Resumed sessions keep
-    /// their own directory.
-    pub(crate) workspace: PathBuf,
+    /// Where new sessions start on this machine; `None` in a browser,
+    /// where they start in its home. Resumed sessions keep their own
+    /// directory.
+    pub(crate) workspace: Option<PathBuf>,
     /// How to reach this machine's daemon and rho.
     pub(crate) local: Reach,
     /// How to reach a remote machine's: [`RemoteMachine::ssh_reach`],
-    /// except in tests, which reach fake daemons.
+    /// except in tests, which reach fake daemons, and in a browser, which
+    /// reaches it through the server ([`RemoteMachine::server_reach`]).
     pub(crate) remote: Rc<dyn Fn(&RemoteMachine) -> Reach>,
     /// What the right panel's terminal runs on this machine.
     pub(crate) shell: TerminalShell,
@@ -537,7 +535,7 @@ impl RhoApp {
         // when next asked.
         self.forges
             .update(cx, |forges, cx| forges.forget(machine, cx));
-        if !machine.is_local() {
+        if !workspaces::reads_here(machine) {
             self.workspaces.update(cx, |workspaces, cx| {
                 workspaces.connected(machine, &daemon, cx);
             });
@@ -1035,7 +1033,7 @@ impl RhoApp {
 
     /// Where a new session starts: in the project of the session or draft
     /// on screen, else where the last new session started, else the launch
-    /// directory.
+    /// directory, or in a browser this machine's home.
     fn new_session_cwd(&self, cx: &App) -> Place {
         match &self.pane {
             Pane::Session(view) => {
@@ -1048,7 +1046,14 @@ impl RhoApp {
                 .last_project
                 .clone()
                 .filter(|project| self.machines.read(cx).get(&project.machine).is_some())
-                .unwrap_or_else(|| Place::new(MachineId::local(), self.launch.workspace.clone())),
+                .unwrap_or_else(|| {
+                    let local = MachineId::local();
+                    let dir = self.launch.workspace.clone().unwrap_or_else(|| {
+                        let home = self.workspaces.read(cx).home(&local);
+                        home.unwrap_or_else(|| "/".into())
+                    });
+                    Place::new(local, dir)
+                }),
         }
     }
 

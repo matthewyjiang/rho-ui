@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rho-ui-core", "crates/rho-ui"]
+members = ["crates/rho-ui-core", "crates/rho-ui", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 # rho's daemon protocol: wire types and the client, released with rho 3.
+# 1.2 builds the client for the browser (`Client::handshake_with_io`).
 rho-protocol = "1.2.0"
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }

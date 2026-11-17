@@ -5,17 +5,23 @@ pub mod agent_settings;
 mod background;
 mod completion;
 mod daemon;
-#[cfg(feature = "test-support")]
+mod exec;
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub mod fake_daemon;
-#[cfg(feature = "test-support")]
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub mod fake_sshd;
 mod input;
 mod jobs;
+mod link;
 mod options;
 pub mod platform;
 mod prompt;
+mod remote_shell;
 mod rho_install;
+pub mod server;
 mod session;
+mod setup;
+#[cfg(not(target_family = "wasm"))]
 mod ssh;
 pub mod surface;
 mod timeline;
@@ -33,6 +39,7 @@ pub use input::{
     Questions, Suggestion, SuggestionStyle, TextBox, Timeout,
 };
 pub use jobs::{Job, JobActivity, Jobs, Run, RunStatus, Runs};
+pub use link::Link;
 pub use options::{
     CommandInfo, CommandKind, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue,
     FAST_MODE_ID,
@@ -41,6 +48,9 @@ pub use prompt::{
     check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
     ImageFormat, Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
 };
+pub use remote_shell::{
+    RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput,
+};
 pub use rho_install::{RhoCheck, RhoInstall, Update};
 /// The auth profiles, logins and credential store [`Daemon`]'s sign-in
 /// methods speak of, as rho-protocol has them.
@@ -48,14 +58,13 @@ pub use rho_protocol::{
     AuthKind, AuthStatus, AuthSummary, CredentialStoreKind, CredentialStoreStatus, LoginId,
     LoginOutcome, LoginPrompt, StoreSelectedBy, UncheckedKey, UncheckedReason,
 };
+pub use server::{ServerLink, ServerTarget};
 pub use session::{
     Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,
     RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,
     ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
 };
-pub use ssh::{
-    RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput, SshLink, SshTarget,
-    MAX_SHELLS,
-};
+#[cfg(not(target_family = "wasm"))]
+pub use ssh::{SshLink, SshTarget, MAX_SHELLS};
 pub use timeline::{any_failed, summary, thought_line, Row, Step, Summary, Synced, Timeline};
 pub use tool_card::{SearchLine, ToolBody, ToolCard, ToolFact};

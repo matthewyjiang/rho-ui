@@ -23,10 +23,9 @@
 //! opened again after a restart lists what ended from that record (see
 //! [`crate::background_log`]).
 
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, time::Duration};
+
+use web_time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;

@@ -15,7 +15,7 @@ use std::{
 };
 
 use gpui_kit::BackgroundExecutor;
-use rho_ui_core::{platform, DaemonError, SshLink};
+use rho_ui_core::{platform, DaemonError, Link};
 
 use crate::{machines::MachineId, repo};
 
@@ -40,9 +40,12 @@ pub(crate) enum PathStyle {
 }
 
 impl PathStyle {
-    /// The rules `machine`'s paths follow.
+    /// The rules `machine`'s paths follow: this platform's where rho-ui
+    /// reads them itself, else POSIX, as a machine reached through a link
+    /// is Unix. In a browser that is this machine too, whose paths std
+    /// can't read there (it finds no path absolute).
     pub(crate) fn of(machine: &MachineId) -> Self {
-        if machine.is_local() {
+        if crate::workspaces::reads_here(machine) {
             Self::Native
         } else {
             Self::Posix
@@ -236,8 +239,8 @@ pub(crate) struct Lookup {
 pub(crate) enum Reader {
     /// From this machine's files.
     Here,
-    /// Over the ssh connection to a remote machine's daemon.
-    There(SshLink),
+    /// Through a remote machine's link: ssh, or `rho-ui serve`.
+    There(Link),
     /// Not at all: the remote machine isn't connected.
     Unread,
 }
@@ -245,10 +248,10 @@ pub(crate) enum Reader {
 /// How long a remote machine's script in [`Reader::query`] may run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Deadline {
-    /// [`SshLink::run_script`]'s, for a script that reads.
+    /// [`Link::run_script`]'s, for a script that reads.
     Script,
     /// None, for a script whose time the network and the work set, such as
-    /// a `git clone` (see [`SshLink::run_long_script`]).
+    /// a `git clone` (see [`Link::run_long_script`]).
     Never,
 }
 
@@ -469,8 +472,8 @@ fn look_here(typed: &Typed) -> Lookup {
 /// # Errors
 ///
 /// Fails if the script can't run there, or prints something else.
-async fn look_there(ssh: &SshLink, typed: &Typed) -> Result<Lookup, DaemonError> {
-    let output = ssh
+async fn look_there(link: &Link, typed: &Typed) -> Result<Lookup, DaemonError> {
+    let output = link
         .run_script(REMOTE_SCRIPT, &[&typed.path, &typed.browse])
         .await?;
     parse_remote(typed, &output)

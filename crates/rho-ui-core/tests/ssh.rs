@@ -46,10 +46,10 @@ fn a_daemon_over_ssh_runs_sessions_in_the_machines_login_environment() {
         let (first, second) = futures::join!(connect(), connect());
         let (daemon, _events) = first.expect("the fake daemon answers over the fake sshd");
         let (other, _other_events) = second.expect("a second connect at once");
-        assert_eq!(daemon.ssh(), other.ssh(), "one connection for both");
+        assert_eq!(daemon.link(), other.link(), "one connection for both");
         drop(other);
         assert_eq!(daemon.info().home(), Some(home.as_path()));
-        let ssh = daemon.ssh().expect("a remote daemon's ssh link");
+        let ssh = daemon.link().expect("a remote daemon's ssh link");
         let args = [
             OsStr::new("it's"),
             OsStr::from_bytes(b"a b\xff"),
@@ -123,7 +123,7 @@ fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_terminals_connection() {
     use rho_ui_core::{
         fake_daemon::{FakeDaemon, Script},
         fake_sshd::TerminalEnd,
-        RemoteShell, ShellError,
+        Link, RemoteShell, ShellError,
     };
 
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -141,7 +141,9 @@ fn a_remote_shell_runs_under_a_pseudo_terminal_on_the_terminals_connection() {
         let (daemon, _events) = Daemon::connect(DaemonTarget::Ssh(sshd.target()))
             .await
             .expect("the fake daemon answers over the fake sshd");
-        let ssh = daemon.ssh().expect("a remote daemon's ssh link");
+        let Some(Link::Ssh(ssh)) = daemon.link() else {
+            panic!("a remote daemon's ssh link");
+        };
         let RemoteShell {
             mut output,
             input,
@@ -193,7 +195,7 @@ fn a_machine_runs_at_most_max_shells_and_a_dropped_control_hangs_up() {
     use rho_ui_core::{
         fake_daemon::{FakeDaemon, Script},
         fake_sshd::TerminalEnd,
-        RemoteShell, ShellError, MAX_SHELLS,
+        Link, RemoteShell, ShellError, MAX_SHELLS,
     };
 
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -205,7 +207,9 @@ fn a_machine_runs_at_most_max_shells_and_a_dropped_control_hangs_up() {
         let (daemon, _events) = Daemon::connect(DaemonTarget::Ssh(sshd.target()))
             .await
             .expect("the fake daemon answers over the fake sshd");
-        let ssh = daemon.ssh().expect("a remote daemon's ssh link");
+        let Some(Link::Ssh(ssh)) = daemon.link() else {
+            panic!("a remote daemon's ssh link");
+        };
         let open = || ssh.open_shell(&home, "xterm-256color", 80, 24);
         let mut shells = Vec::new();
         for _ in 0..MAX_SHELLS {

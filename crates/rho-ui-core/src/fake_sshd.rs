@@ -223,6 +223,12 @@ impl FakeSshd {
         SshTarget::routed(format!("fake-sshd-{}-{number}", self.port), route)
     }
 
+    /// The port it listens on, at 127.0.0.1: for an ssh config that
+    /// reaches it, as a program that runs `ssh -G` reads.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// The `known_hosts` file [`Self::target_with`] uses for `host_key`.
     pub fn known_hosts(&self, host_key: HostKey) -> PathBuf {
         self.dir.path().join(known_hosts_name(host_key))

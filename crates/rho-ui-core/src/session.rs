@@ -12,8 +12,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use web_time::Instant;
 
 use rho_protocol::{
     AnswerStop, CardTone, CompactionStatus, JobState, Resolution, SessionAttachResponse,

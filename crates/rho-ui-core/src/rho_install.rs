@@ -7,6 +7,7 @@
 //! which is Unix, each job is one POSIX `sh` script over ssh:
 //! [`CHECK_SCRIPT`], [`INSTALL_SCRIPT`] and [`UPDATE_SCRIPT`].
 
+#[cfg(not(target_family = "wasm"))]
 use std::{
     ffi::OsStr,
     io,
@@ -15,20 +16,30 @@ use std::{
 };
 
 use serde::Deserialize;
+#[cfg(not(target_family = "wasm"))]
 use tokio::sync::oneshot;
 
-use crate::{platform, ssh::SshTarget, DaemonError};
+#[cfg(not(target_family = "wasm"))]
+use crate::platform;
+#[cfg(not(target_family = "wasm"))]
+use crate::ssh::SshTarget;
+use crate::{link::Link, server::ServerTarget, DaemonError};
 
 /// Where a machine's `rho` program runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RhoInstall {
     /// This machine, running `rho`: a name looked up on `PATH`, or a path.
+    /// Not in a browser, which reaches every machine through `rho-ui serve`.
+    #[cfg(not(target_family = "wasm"))]
     Here {
         /// The program.
         rho: PathBuf,
     },
     /// A remote machine, running its target's `rho` over ssh.
+    #[cfg(not(target_family = "wasm"))]
     Ssh(SshTarget),
+    /// The machine of a `rho-ui serve`, running its target's `rho` there.
+    Server(ServerTarget),
 }
 
 /// What [`RhoInstall::check`] found.
@@ -78,14 +89,14 @@ impl RhoInstall {
     /// Fails if rho or the script can't run there, as when ssh can't reach
     /// the machine.
     pub async fn check(&self) -> Result<RhoCheck, DaemonError> {
-        let checked = match self {
-            Self::Here { rho } => {
-                let rho = rho.clone();
+        let checked = match self.place().await? {
+            #[cfg(not(target_family = "wasm"))]
+            Place::Here(rho) => {
+                let rho = rho.to_owned();
                 on_own_thread(move || check_here(&find_rho(&rho))).await?
             }
-            Self::Ssh(target) => {
-                let link = target.link().await?;
-                let output = link.run_script(CHECK_SCRIPT, &[target.rho()]).await?;
+            Place::There(link, rho) => {
+                let output = link.run_script(CHECK_SCRIPT, &[rho]).await?;
                 parse_check(&String::from_utf8_lossy(&output))
             }
         };
@@ -101,17 +112,13 @@ impl RhoInstall {
     ///
     /// Fails, with what the installer printed, if it fails or can't run.
     pub async fn install(&self) -> Result<(), DaemonError> {
-        match self {
-            Self::Here { rho } => {
-                let rho = rho.clone();
+        match self.place().await? {
+            #[cfg(not(target_family = "wasm"))]
+            Place::Here(rho) => {
+                let rho = rho.to_owned();
                 on_own_thread(move || install_here(&rho)).await?
             }
-            Self::Ssh(target) => {
-                let link = target.link().await?;
-                link.run_long_script(INSTALL_SCRIPT, &[target.rho()])
-                    .await
-                    .map(drop)
-            }
+            Place::There(link, rho) => link.run_long_script(INSTALL_SCRIPT, &[rho]).await.map(drop),
         }
     }
 
@@ -123,24 +130,50 @@ impl RhoInstall {
     ///
     /// Fails, with what rho printed, if it fails or can't run.
     pub async fn update(&self) -> Result<(), DaemonError> {
-        match self {
-            Self::Here { rho } => {
-                let rho = rho.clone();
+        match self.place().await? {
+            #[cfg(not(target_family = "wasm"))]
+            Place::Here(rho) => {
+                let rho = rho.to_owned();
                 on_own_thread(move || update_here(&find_rho(&rho))).await?
             }
-            Self::Ssh(target) => {
-                let link = target.link().await?;
-                link.run_long_script(UPDATE_SCRIPT, &[target.rho()])
-                    .await
-                    .map(drop)
-            }
+            Place::There(link, rho) => link.run_long_script(UPDATE_SCRIPT, &[rho]).await.map(drop),
         }
+    }
+
+    /// Where `rho` runs: here, or through the link to its machine, opened
+    /// if none is.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "only an ssh link waits to open"
+        )
+    )]
+    async fn place(&self) -> Result<Place<'_>, DaemonError> {
+        Ok(match self {
+            #[cfg(not(target_family = "wasm"))]
+            Self::Here { rho } => Place::Here(rho),
+            #[cfg(not(target_family = "wasm"))]
+            Self::Ssh(target) => Place::There(Link::Ssh(target.link().await?), target.rho()),
+            Self::Server(target) => Place::There(Link::Server(target.link()), target.rho()),
+        })
     }
 }
 
+/// Where a [`RhoInstall`]'s `rho` runs.
+enum Place<'a> {
+    /// This machine, running this program.
+    #[cfg(not(target_family = "wasm"))]
+    Here(&'a Path),
+    /// Another machine, running this program there.
+    There(Link, &'a str),
+}
+
+#[cfg(not(target_family = "wasm"))]
 /// Runs `job` on a thread of its own, and waits for it without blocking:
 /// it may wait minutes on the network, and isn't the daemon socket's work
-/// (see `daemon::io`).
+/// (see `exec::io`).
 ///
 /// # Errors
 ///
@@ -155,6 +188,7 @@ async fn on_own_thread<T: Send + 'static>(
     ran.await.map_err(|_| DaemonError::Closed)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Runs `command` here and returns how it ended and what it printed.
 /// Blocks until it ends.
 ///
@@ -168,6 +202,7 @@ fn output(command: &mut Command) -> Result<Output, DaemonError> {
     })
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Whether a program that ended as `output` says succeeded, else an error
 /// with what it printed in `said`, or how it ended if that is empty.
 fn succeeded(output: &Output, said: &[u8]) -> Result<(), DaemonError> {
@@ -186,11 +221,13 @@ fn succeeded(output: &Output, said: &[u8]) -> Result<(), DaemonError> {
 /// # Errors
 ///
 /// Fails, with what it wrote to stderr, if it fails or can't start.
+#[cfg(not(target_family = "wasm"))]
 fn run(command: &mut Command) -> Result<(), DaemonError> {
     let output = output(command)?;
     succeeded(&output, &output.stderr)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Runs `rho update` with the program `rho` here. Blocks until it ends.
 ///
 /// # Errors
@@ -205,6 +242,7 @@ fn update_here(rho: &Path) -> Result<(), DaemonError> {
     )
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// What the program `rho` here says of itself and of the newest release,
 /// read as [`parse_check`] reads [`CHECK_SCRIPT`]'s output. A program that
 /// isn't there is [`RhoCheck::Missing`]. Blocks while rho asks GitHub.
@@ -394,6 +432,7 @@ fn read_check(code: Option<i32>, version: &str, said: &str) -> Result<RhoCheck, 
     Ok(RhoCheck::Installed { current, update })
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// The program `rho` names on this machine: itself, its leading `~/` the
 /// home directory, unless it is plain `rho`, which `PATH` lacks, and rho's
 /// installer put one in its folder ([`platform::rho_install_dir`]): a
@@ -409,6 +448,7 @@ pub(crate) fn find_rho(rho: &Path) -> PathBuf {
     )
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn find_rho_in(
     rho: &Path,
     path: Option<&OsStr>,
@@ -432,6 +472,7 @@ fn find_rho_in(
         .unwrap_or(rho)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// `rho` with a leading `~` as `home` (see [`platform::expand_tilde`]),
 /// as `sh` reads the program's setting.
 fn expand_home(rho: &Path, home: Option<&Path>) -> PathBuf {

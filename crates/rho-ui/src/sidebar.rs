@@ -25,12 +25,9 @@
 //! The data lives in [`SessionList`] and [`Workspaces`], built when it
 //! changes, never per frame.
 
-use std::{
-    ops::Range,
-    path::PathBuf,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{ops::Range, path::PathBuf, rc::Rc, time::Duration};
+
+use web_time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;

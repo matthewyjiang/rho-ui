@@ -17,3 +17,7 @@ disallowed-methods = [
     { path = "std::fs::canonicalize", reason = "use rho_ui_core::platform::canonicalize, which leaves out Windows' \\\\?\\ prefix" },
     { path = "std::path::Path::canonicalize", reason = "use rho_ui_core::platform::canonicalize, which leaves out Windows' \\\\?\\ prefix" },
 ]
+
+# Names clippy's doc_markdown would otherwise want in backticks, as code.
+# `..` keeps clippy's own list.
+doc-valid-idents = ["WebSocket", "WebSockets", ".."]

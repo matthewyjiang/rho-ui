@@ -19,8 +19,10 @@
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use web_time::Instant;
 
 use gpui_kit::{
     canvas, App, DispatchPhase, InputEvent as _, IntoElement, MouseDownEvent, Pixels, Point,

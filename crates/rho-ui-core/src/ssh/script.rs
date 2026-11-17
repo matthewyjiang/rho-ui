@@ -6,71 +6,10 @@ use std::{pin::pin, time::Duration};
 use russh::{ChannelMsg, ChannelReadHalf, Sig};
 
 use super::connection::Connection;
-use crate::daemon::DaemonError;
-
-/// How long a script that has a deadline may run: a tripwire for a
-/// script stuck on a hung disk. rho-ui's longest, reading the git
-/// repositories of every workspace, took 1.3 s for 133 worktrees (about
-/// 10 ms each), so this leaves room for thousands.
-pub(super) const SCRIPT_DEADLINE: Duration = Duration::from_secs(60);
-
-/// Why a script didn't succeed. Callers word it for what the script did.
-#[derive(Debug)]
-pub(super) enum ScriptError {
-    /// It ran past its deadline, this one.
-    TimedOut(Duration),
-    /// The channel closed with no word of how the script ended, as when
-    /// the connection died.
-    Cut,
-    /// sshd wouldn't run `sh`.
-    Refused,
-    /// It exited with an error, or a signal killed it: why, in its own
-    /// words if it wrote any to stderr.
-    Failed(String),
-    /// It got no session channel: the connection is gone, or the host
-    /// refused one.
-    Session(DaemonError),
-}
-
-/// What a script printed, and how it ended.
-#[derive(Debug)]
-struct Output {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    ending: Ending,
-}
-
-/// How a script ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Ending {
-    /// It exited with this status.
-    Exited(u32),
-    /// A signal killed it; its name, as `SIGTERM`.
-    Killed(String),
-    /// sshd wouldn't run `sh`.
-    Refused,
-    /// The channel closed with no word of how, as when the connection
-    /// died.
-    Cut,
-}
-
-impl Output {
-    /// What it printed, if it exited 0; else why not.
-    fn result(self) -> Result<Vec<u8>, ScriptError> {
-        let status = match self.ending {
-            Ending::Exited(0) => return Ok(self.stdout),
-            Ending::Refused => return Err(ScriptError::Refused),
-            Ending::Cut => return Err(ScriptError::Cut),
-            Ending::Exited(code) => format!("it exited with status {code}"),
-            Ending::Killed(signal) => format!("it was killed by {signal}"),
-        };
-        let said = String::from_utf8_lossy(&self.stderr);
-        Err(ScriptError::Failed(match said.trim() {
-            "" => status,
-            said => said.to_owned(),
-        }))
-    }
-}
+use crate::{
+    link::{Ending, Output, ScriptError},
+    DaemonError,
+};
 
 /// Runs `input` with `sh -s` on the connection's host, within `deadline`
 /// if any, and returns what it printed. It runs only on a live
@@ -94,7 +33,8 @@ pub(super) async fn run(
             .await
             .map_err(|_| ScriptError::TimedOut(deadline))?,
         None => ran.await,
-    }?;
+    }
+    .map_err(ScriptError::Session)?;
     output.result()
 }
 
@@ -108,8 +48,8 @@ pub(super) async fn run(
 /// # Errors
 ///
 /// Fails if the connection is gone, or the host refuses a session.
-async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, ScriptError> {
-    let (mut read, write) = connection.session().await.map_err(ScriptError::Session)?;
+pub(super) async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, DaemonError> {
+    let (mut read, write) = connection.session().await?;
     let channel = write.channel();
     let mut send = pin!(async {
         channel.exec(true, "sh -s").await?;
@@ -140,7 +80,9 @@ async fn receive(read: &mut ChannelReadHalf) -> Output {
             ChannelMsg::Data { data } => output.stdout.extend_from_slice(&data),
             // Extended data of type 1 is stderr (RFC 4254 § 5.2).
             ChannelMsg::ExtendedData { data, ext: 1 } => output.stderr.extend_from_slice(&data),
-            ChannelMsg::ExitStatus { exit_status } => output.ending = Ending::Exited(exit_status),
+            ChannelMsg::ExitStatus { exit_status } => {
+                output.ending = Ending::Exited(exit_status.into());
+            }
             ChannelMsg::ExitSignal { signal_name, .. } => {
                 output.ending = Ending::Killed(signal(&signal_name));
             }

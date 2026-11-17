@@ -36,16 +36,21 @@
 //! [`ShellOutput`]'s [`OUTPUT_QUEUE`] packets (1 MiB). The reader must
 //! keep reading, as a terminal that draws what it reads does.
 
-use std::{convert::Infallible, path::Path, pin::pin, sync::Arc};
+use std::{path::Path, pin::pin, sync::Arc};
 
 use russh::{client::Msg, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::{
     connection::{self, Connection, Purpose},
-    quote_bytes, SshLink,
+    SshLink,
 };
-use crate::{daemon::io, platform};
+use crate::{
+    exec::io,
+    link::quote_bytes,
+    platform,
+    remote_shell::{self, Ends, RemoteShell, Request, ShellError},
+};
 
 /// Packets of output that wait for the reader, each at most 32 KiB
 /// (russh's default `maximum_packet_size`, the largest sshd sends this
@@ -59,108 +64,6 @@ const PSEUDO_TERMINAL: &str = "a pseudo-terminal (its sshd_config may say Permit
 
 /// The `exec` request, as its refusal names it.
 const LOGIN_SHELL: &str = "to run the login shell";
-
-/// A login shell on a remote machine, from [`SshLink::open_shell`]: what
-/// it prints, where to type, its terminal's size and life, and how it
-/// ended.
-#[derive(Debug)]
-pub struct RemoteShell {
-    /// What it prints. Dropping it hangs up on the shell.
-    pub output: ShellOutput,
-    /// What it reads; clones go to the same shell.
-    pub input: ShellInput,
-    /// The size of its terminal. Dropping it hangs up on the shell.
-    pub control: ShellControl,
-    /// How it ended.
-    pub ended: ShellEnded,
-}
-
-/// What a [`RemoteShell`] prints, as sshd sends it. Keep reading it: while
-/// it is full, the whole ssh connection waits (see the module docs).
-#[derive(Debug)]
-pub struct ShellOutput(mpsc::Receiver<Vec<u8>>);
-
-impl ShellOutput {
-    /// The next bytes the shell printed; `None` once its channel is gone.
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.0.recv().await
-    }
-}
-
-/// Types into a [`RemoteShell`], in the order called, and in order with
-/// its [`ShellControl`]'s resizes. Clones go to the same shell, and don't
-/// keep it running.
-#[derive(Clone, Debug)]
-pub struct ShellInput(mpsc::UnboundedSender<Request>);
-
-impl ShellInput {
-    /// Sends `bytes` to the shell, as typed. Does nothing once it is gone.
-    pub fn write(&self, bytes: Vec<u8>) {
-        let _ = self.0.send(Request::Write(bytes));
-    }
-}
-
-/// Sizes a [`RemoteShell`]'s terminal, and owns the shell's life: dropping
-/// it closes the shell's channel at once, without sending the input still
-/// queued, and sshd hangs up on the shell, as on a terminal closed.
-#[derive(Debug)]
-pub struct ShellControl {
-    requests: mpsc::UnboundedSender<Request>,
-    /// Never sent: the shell's task hangs up when it is dropped.
-    _owner: oneshot::Sender<Infallible>,
-}
-
-impl ShellControl {
-    /// Tells the shell its terminal is now `columns` by `rows`, as
-    /// `window-change`; sshd resizes the pseudo-terminal, which signals
-    /// the program in it. Does nothing once the shell is gone.
-    pub fn resize(&self, columns: u16, rows: u16) {
-        let _ = self.requests.send(Request::Resize { columns, rows });
-    }
-}
-
-/// Why a [`RemoteShell`] ended other than by exiting. Each holds why, in
-/// words for people.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ShellError {
-    /// It never ran: there is no connection, the machine has
-    /// [`MAX_SHELLS`](crate::MAX_SHELLS) open, or sshd refused a session,
-    /// the pseudo-terminal or the shell.
-    #[error("{0}")]
-    NotStarted(String),
-    /// It ran, then its connection went, or rho-ui lost its task.
-    #[error("{0}")]
-    Stopped(String),
-}
-
-/// How a [`RemoteShell`] ended.
-#[derive(Debug)]
-pub struct ShellEnded(oneshot::Receiver<Result<(), ShellError>>);
-
-impl ShellEnded {
-    /// Waits for the shell to end: it exited, a signal killed it, sshd
-    /// closed its channel, or its [`ShellControl`] or [`ShellOutput`]
-    /// went.
-    ///
-    /// # Errors
-    ///
-    /// [`ShellError::NotStarted`] if it couldn't start, and
-    /// [`ShellError::Stopped`] if its connection went while it ran.
-    pub async fn wait(self) -> Result<(), ShellError> {
-        self.0.await.unwrap_or_else(|_| {
-            Err(ShellError::Stopped(
-                "the task that ran it in rho-ui stopped unexpectedly".to_owned(),
-            ))
-        })
-    }
-}
-
-/// What a [`ShellInput`] or [`ShellControl`] asks of the shell.
-#[derive(Debug)]
-enum Request {
-    Write(Vec<u8>),
-    Resize { columns: u16, rows: u16 },
-}
 
 /// What the shell's channel sends in its first requests.
 struct Start<'a> {
@@ -200,10 +103,13 @@ impl SshLink {
         let mut env = vec![("COLORTERM".to_owned(), "truecolor".to_owned())];
         env.extend(locale());
         let term = term.to_owned();
-        let (printed, output) = mpsc::channel(OUTPUT_QUEUE);
-        let (input, mut requests) = mpsc::unbounded_channel();
-        let (owner, disowned) = oneshot::channel();
-        let (end, ended) = oneshot::channel();
+        let (shell, ends) = remote_shell::channels(OUTPUT_QUEUE);
+        let Ends {
+            printed,
+            mut requests,
+            disowned,
+            end,
+        } = ends;
         // The host and how the daemon's connection reached it, to reach it
         // again for the terminals.
         let daemon = Arc::clone(self.lease.connection());
@@ -239,15 +145,7 @@ impl SshLink {
             };
             let _ = end.send(ended);
         });
-        RemoteShell {
-            output: ShellOutput(output),
-            input: ShellInput(input.clone()),
-            control: ShellControl {
-                requests: input,
-                _owner: owner,
-            },
-            ended: ShellEnded(ended),
-        }
+        shell
     }
 }
 

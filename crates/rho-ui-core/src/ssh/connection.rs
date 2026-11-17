@@ -27,7 +27,7 @@ use super::{
     host_key::{self, KnownKey, Refusal, Verifier},
     read_files,
 };
-use crate::daemon::{io, DaemonError};
+use crate::{daemon::DaemonError, exec::io};
 
 /// How long reaching a host may take: the TCP connection and ssh's key
 /// exchange, not signing in, which may wait on the user to approve a key

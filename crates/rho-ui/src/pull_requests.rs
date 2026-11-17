@@ -6,8 +6,10 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use web_time::Instant;
 
 use gpui_kit::{BackgroundExecutor, Context, Entity, EntityId, SharedString, Task};
 

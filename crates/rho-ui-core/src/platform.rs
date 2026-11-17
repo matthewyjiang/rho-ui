@@ -207,7 +207,9 @@ pub fn default_shell() -> PathBuf {
 
 /// `path` as bytes, for a database row or a remote shell. On Unix, the
 /// path's own bytes, which needn't be UTF-8. On Windows, its UTF-8, with
-/// U+FFFD for an unpaired surrogate, which no file Explorer makes has.
+/// U+FFFD for an unpaired surrogate, which no file Explorer makes has; in
+/// a browser, its UTF-8 too, as the paths there come from the daemon's
+/// JSON, which is UTF-8 already.
 /// [`path_from_bytes`] reads it back.
 #[must_use]
 pub fn path_to_bytes(path: &OsStr) -> Vec<u8> {
@@ -238,7 +240,7 @@ mod imp {
     }
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 mod imp {
     use std::{ffi::OsStr, path::PathBuf};
 
@@ -252,6 +254,8 @@ mod imp {
 }
 
 /// The daemon's local endpoint: a Unix socket, or on Windows a named pipe.
+/// A browser has neither, and reaches the daemon through `rho-ui serve`.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) mod endpoint {
     use std::{
         io,

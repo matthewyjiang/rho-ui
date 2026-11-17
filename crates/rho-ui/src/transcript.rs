@@ -14,12 +14,9 @@
 //! each of its parts ([`crate::parts`]), so the scroller draws only the
 //! parts near the window.
 
-use std::{
-    cell::RefCell,
-    ops::Range,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
+
+use web_time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{text::CodeBlock, TestSupportExt as _};

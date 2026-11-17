@@ -10,10 +10,9 @@
 //! gives at the deadline. The user's first key or click in the card holds
 //! it ([`InputCardEvent::Hold`]), so it waits for them.
 
-use std::{
-    collections::BTreeMap,
-    time::{Duration, SystemTime},
-};
+use std::{collections::BTreeMap, time::Duration};
+
+use web_time::SystemTime;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;

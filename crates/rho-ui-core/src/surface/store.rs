@@ -13,6 +13,9 @@ use std::{
     time::SystemTime,
 };
 
+#[cfg(target_family = "wasm")]
+use web_time::web::SystemTimeExt as _;
+
 use a2ui::{
     Action, Catalog, Change, Effect, Functions, Interaction, MessageProcessor, Pointer,
     RendererMessage, UserActivation, Validation,
@@ -23,6 +26,15 @@ use super::{
     build,
     tree::{SurfaceTree, Target},
 };
+
+/// Now, as the std `SystemTime` a2ui takes. std's own `now` panics in a
+/// browser, so it comes from `web_time`, which is std's elsewhere.
+fn now() -> SystemTime {
+    let now = web_time::SystemTime::now();
+    #[cfg(target_family = "wasm")]
+    let now = now.to_std();
+    now
+}
 
 /// A surface a `ui` call showed: the transcript's entry for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,7 +228,7 @@ impl SurfaceStore {
             scope: target.scope.clone(),
             activation: UserActivation::Present,
             metadata: None,
-            at: SystemTime::now(),
+            at: now(),
         };
         let Some(dispatched) = self.processor.dispatch_action(&interaction, action) else {
             return Acted::default();

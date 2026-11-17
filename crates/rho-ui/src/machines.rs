@@ -1,5 +1,6 @@
 //! The machines rho-ui reaches: this one, whose daemon follows the rho home,
-//! and the remote machines the settings list, each reached over SSH. Every
+//! and the remote machines the settings list, each reached over SSH (from a
+//! browser, by the server over SSH). Every
 //! session, project and folder belongs to one machine, so the sidebar lists
 //! the sessions of all of them side by side, each labelled with its
 //! machine.
@@ -7,7 +8,11 @@
 use std::{fmt, path::PathBuf};
 
 use gpui_kit::SharedString;
-use rho_ui_core::{DaemonTarget, RhoInstall, SessionId, SshTarget};
+#[cfg(target_family = "wasm")]
+use rho_ui_core::ServerTarget;
+#[cfg(not(target_family = "wasm"))]
+use rho_ui_core::SshTarget;
+use rho_ui_core::{DaemonTarget, RhoInstall, SessionId};
 
 use crate::forge::CliPaths;
 
@@ -139,6 +144,7 @@ pub(crate) struct Reach {
     pub(crate) rho: Option<RhoInstall>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl RemoteMachine {
     /// How rho-ui reaches it: over ssh.
     pub(crate) fn ssh_reach(&self) -> Reach {
@@ -146,6 +152,22 @@ impl RemoteMachine {
         Reach {
             daemon: DaemonTarget::Ssh(target.clone()),
             rho: Some(RhoInstall::Ssh(target)),
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl RemoteMachine {
+    /// How a browser reaches it: through `server`, which reaches it over
+    /// ssh as the desktop app on the server's machine would.
+    pub(crate) fn server_reach(&self, server: &ServerTarget) -> Reach {
+        let target = server
+            .clone()
+            .with_machine(self.host.clone())
+            .with_rho(self.rho.clone());
+        Reach {
+            daemon: DaemonTarget::Server(target.clone()),
+            rho: Some(RhoInstall::Server(target)),
         }
     }
 }
