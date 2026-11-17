@@ -28,6 +28,7 @@ mod kinetic;
 mod lightbox;
 mod local;
 mod machines;
+mod parts;
 mod pele;
 mod pictures;
 mod plan;

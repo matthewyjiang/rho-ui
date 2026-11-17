@@ -66,15 +66,20 @@ pub(crate) fn drawn_extensions(drawn: Arc<Drawings>, revision: u64) -> MarkdownE
     plugins(Diagrams::Ready(drawn)).parser_revision(revision)
 }
 
-/// The sources of the closed ` ```mermaid ` fences in Markdown `text`, in
-/// order, read as Kit's parser reads them: the options are those of Kit's
-/// `MarkdownExtensions::parse_options` (gpui-base `text/markdown_ext.rs`),
-/// so the sources are the ones [`Diagrams::Ready`] looks up.
-pub(crate) fn diagram_sources(text: &str) -> Vec<String> {
+/// The options Kit's parser reads Markdown with: those of its
+/// `MarkdownExtensions::parse_options` (gpui-base `text/markdown_ext.rs`).
+pub(crate) fn parse_options() -> markdown::ParseOptions {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.math_text = true;
     options.constructs.math_flow = true;
-    let Ok(root) = markdown::to_mdast(text, &options) else {
+    options
+}
+
+/// The sources of the closed ` ```mermaid ` fences in Markdown `text`, in
+/// order, read as Kit's parser reads them, so the sources are the ones
+/// [`Diagrams::Ready`] looks up.
+pub(crate) fn diagram_sources(text: &str) -> Vec<String> {
+    let Ok(root) = markdown::to_mdast(text, &parse_options()) else {
         return Vec::new();
     };
     let mut sources = Vec::new();

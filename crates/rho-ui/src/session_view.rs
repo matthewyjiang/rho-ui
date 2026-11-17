@@ -67,7 +67,7 @@ use crate::{
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
-    transcript::{ActionHandler, RowContent, Transcript},
+    transcript::{ActionHandler, ItemContent, Transcript},
     usage::UsageRing,
     work::Disclosure,
     workspaces::WorkspaceRef,
@@ -1183,14 +1183,14 @@ impl SessionView {
                 });
             })
         };
-        let content: RowContent = {
+        let content: ItemContent = {
             let view = view.clone();
             let act = Rc::clone(&act);
-            Rc::new(move |ix, _, cx| match view.upgrade() {
+            Rc::new(move |place, _, cx| match view.upgrade() {
                 Some(view) => {
                     let this = view.read(cx);
                     this.transcript
-                        .render_content(ix, this.session.entries(), &act, cx)
+                        .render_content(place, this.session.entries(), &act, cx)
                 }
                 None => div().into_any_element(),
             })
@@ -1205,7 +1205,7 @@ impl SessionView {
                     move |ix, _, cx| match view.upgrade() {
                         Some(view) => {
                             let this = view.read(cx);
-                            this.transcript.render_row(
+                            this.transcript.render_item(
                                 ix,
                                 this.session.entries(),
                                 &this.surfaces,
@@ -1492,8 +1492,8 @@ impl SessionView {
         &self.transcript
     }
 
-    /// How far down the transcript is scrolled, in pixels from the top of
-    /// the first row on screen, for UI tests.
+    /// How far down the transcript is scrolled: the first of the scroller's
+    /// items on screen, and the pixels from its top, for UI tests.
     pub(crate) fn scroll_top(&self, cx: &App) -> (usize, f32) {
         let top = self.transcript.scroller().read(cx).logical_scroll_top();
         (top.item_ix, f32::from(top.offset_in_item))

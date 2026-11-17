@@ -35,7 +35,7 @@ use crate::{
     machines::{MachineId, MachineStatus, Machines},
     rho_install::Installs,
     rho_settings::RhoSettings,
-    settings::{Appearance, Settings, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
+    settings::{Appearance, Settings, SmoothScroll, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
     workspaces::Workspaces,
 };
 use machines::MachineFields;
@@ -412,8 +412,10 @@ fn set_font(role: FontRole, family: SharedString, cx: &mut App) {
     });
 }
 
-impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+impl SettingsView {
+    /// The Appearance page: the theme, the scale, the fonts, and whether
+    /// scrolling glides.
+    fn appearance_page(&self) -> SettingPage {
         let control =
             |field: SettingField<SharedString>| field.w(rems(CONTROL_REMS)).justify_between();
         let scales: Vec<(SharedString, SharedString)> = UiScale::CHOICES
@@ -427,7 +429,11 @@ impl Render for SettingsView {
             .into_iter()
             .map(|choice| (choice.name().into(), choice.label().into()))
             .collect();
-        let appearance = SettingPage::new("Appearance")
+        let scrolls: Vec<(SharedString, SharedString)> = SmoothScroll::CHOICES
+            .into_iter()
+            .map(|choice| (choice.name().into(), choice.label().into()))
+            .collect();
+        SettingPage::new("Appearance")
             .icon(IconName::Palette)
             .default_open(true)
             .resettable(true)
@@ -481,8 +487,35 @@ impl Render for SettingsView {
                         "Code font",
                         "The font for code blocks, tool output and diffs.",
                     ),
+                    SettingItem::new(
+                        "Smooth scrolling",
+                        control(
+                            SettingField::dropdown(
+                                scrolls,
+                                |cx: &App| cx.global::<Settings>().smooth_scroll.name().into(),
+                                |name: SharedString, cx: &mut App| {
+                                    if let Some(smooth_scroll) = SmoothScroll::from_name(&name) {
+                                        update(cx, |settings| {
+                                            settings.smooth_scroll = smooth_scroll;
+                                        });
+                                    }
+                                },
+                            )
+                            .default_value(SmoothScroll::default().name()),
+                        ),
+                    )
+                    .description(
+                        "Glide the mouse wheel, and carry a touchpad swipe on. System \
+                         follows your desktop's animations setting.",
+                    ),
                 ]),
-            );
+            )
+    }
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let appearance = self.appearance_page();
         let machines = self.machines_page(cx);
         let source_control = self.source_control_page(window, cx);
         let providers = self.providers_page(window, cx);

@@ -24,6 +24,8 @@
 //!   the session's folder.
 //! - The prompt "plan" asks to carry out a plan, and answers "you chose"
 //!   and the answer, with its feedback after a colon.
+//! - The prompt "report" answers with [`report`], a long reply that
+//!   streams in over several events.
 //! - The prompt "background" starts a background process, `sleep 30`, and
 //!   answers at once, leaving it running. Stopping it, or
 //!   [`FakeDaemon::finish_background`], ends it, and the daemon starts a
@@ -256,8 +258,8 @@ pub struct Script {
     pub tui_job: TuiJob,
     /// Whether "old"'s replay ends with an info card and a warning card.
     pub cards: bool,
-    /// Whether "old"'s replay ends with a reply over 4 KiB, which GPUI
-    /// Kit parses off the UI thread.
+    /// Whether "old"'s replay ends with a reply of one paragraph over
+    /// 4 KiB, which GPUI Kit parses off the UI thread.
     pub long_reply: bool,
     /// How many more saved sessions, `past-0` and on, each an hour older
     /// than the last and older than "old", to fill long lists.
@@ -1090,6 +1092,21 @@ impl FakeSession {
     /// Finishes the turn as answered with `text`.
     fn answer(&mut self, message: &str, text: &str) {
         self.say(message, text);
+        self.answered(text);
+    }
+
+    /// Finishes the turn as answered with `text`, which is ASCII and
+    /// streams in [`STREAM_CHUNK`] bytes at a time.
+    fn stream_answer(&mut self, message: &str, text: &str) {
+        for chunk in text.as_bytes().chunks(STREAM_CHUNK) {
+            let chunk = std::str::from_utf8(chunk).expect("a streamed reply is ASCII");
+            self.say(message, chunk);
+        }
+        self.answered(text);
+    }
+
+    /// Ends the turn, whose reply `text` is already said.
+    fn answered(&mut self, text: &str) {
         self.publish(SessionEvent::Usage {
             used_tokens: 2500,
             window_tokens: Some(10_000),
@@ -1152,6 +1169,27 @@ fn user_message(id: &str, text: &str) -> SessionEvent {
         }],
         steer: None,
     }
+}
+
+/// How much of a streamed reply one event carries, in bytes: less than a
+/// line of [`report`]'s prose, so its lines arrive unfinished.
+const STREAM_CHUNK: usize = 53;
+
+/// The reply to the prompt "report", 6.4 KiB: sections of a heading, a
+/// paragraph, a list, a code block that holds a blank line, and a table.
+pub fn report() -> String {
+    let sentence = "The walker visits each node once, and reports the ones it could not reach. ";
+    let sections: Vec<String> = (0..6)
+        .map(|n| {
+            format!(
+                "## Section {n}\n\n{}\n\n- first of {n}\n- second of {n}\n\n\
+                 ```rust\nfn section_{n}() {{\n    let found = walk(&tree);\n\n    report(found);\n}}\n```\n\n\
+                 | Node | Reached |\n| --- | --- |\n| `a{n}` | yes |\n| `b{n}` | no |\n\n",
+                sentence.repeat(12)
+            )
+        })
+        .collect();
+    sections.concat()
 }
 
 /// The replayed turns of "old", as a saved conversation holds them.
@@ -1373,10 +1411,12 @@ impl State {
             cards(&mut old);
         }
         if script.long_reply {
-            let paragraphs: Vec<String> = (0..60)
-                .map(|n| format!("Paragraph {n} of a long reply, which says a good deal about very little, and then says it again."))
+            // One paragraph: rho-ui draws a reply of several blocks in
+            // parts, each parsed as a text of its own.
+            let sentences: Vec<String> = (0..60)
+                .map(|n| format!("Sentence {n} of a long reply, which says a good deal about very little, and then says it again."))
                 .collect();
-            old.say("long", &paragraphs.join("\n\n"));
+            old.say("long", &sentences.join(" "));
         }
         sessions.insert("old".to_owned(), old);
         let mut updated = 1_767_225_600;

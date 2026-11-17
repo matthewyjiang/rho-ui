@@ -9,8 +9,12 @@
 //! A notice's detail is Markdown, and can be long: a subagent's card holds
 //! its whole result. It shows its first [`NOTICE_LINES`] lines, with a
 //! button to show the rest.
+//!
+//! A row is one of the scroller's items, but a long reply's row is one for
+//! each of its parts ([`crate::parts`]), so the scroller draws only the
+//! parts near the window.
 
-use std::{ops::Range, rc::Rc, time::Duration};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
 use web_time::Instant;
 
@@ -31,7 +35,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, rems, transparent_white, AnyElement, App, AppContext as _, ClipboardItem, ElementId,
     Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window,
 };
 use rho_ui_core::{
     surface::SurfaceRef, Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent,
@@ -42,6 +46,7 @@ use crate::{
     figures,
     fold::Folding,
     lightbox,
+    parts::{self, Edit, Items, Place},
     pictures::{self, PictureRead, Pictures},
     surface_view::Surfaces,
     turn_times::TurnTimes,
@@ -171,10 +176,11 @@ pub(crate) enum Action {
 /// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
 
-/// Builds row `ix`'s content: [`Transcript::render_content`], reached
-/// through the session view, because a fold builds its rows only while they
-/// show, after [`Transcript::render_row`] returned.
-pub(crate) type RowContent = Rc<dyn Fn(usize, &mut Window, &mut App) -> AnyElement>;
+/// Builds the content of the scroller's item at a [`Place`]:
+/// [`Transcript::render_content`], reached through the session view, because
+/// a fold builds its content only while it shows, after
+/// [`Transcript::render_item`] returned.
+pub(crate) type ItemContent = Rc<dyn Fn(Place, &mut Window, &mut App) -> AnyElement>;
 
 /// The turn in progress.
 #[derive(Clone, Copy, Debug)]
@@ -186,7 +192,8 @@ struct Running {
     since: Instant,
 }
 
-/// An entry's Markdown, parsed once and kept while the transcript lives.
+/// An entry's Markdown, or one part of a reply's, parsed once and kept
+/// while the transcript lives.
 ///
 /// Kit's `TextView::markdown` keeps its parse only while it is drawn in
 /// consecutive frames. A message the list scrolled out of its drawn range
@@ -195,9 +202,9 @@ struct Running {
 /// 15px, then 2,884px, and the transcript jumped as it scrolled up.
 struct Markdown {
     text: Entity<TextViewState>,
-    /// Remeasures the entry's row when the text lays out anew: its parse
-    /// arrived, or a notice's detail started or stopped being cut short,
-    /// which adds or drops its button.
+    /// Remeasures the text's item when it lays out anew: its parse arrived,
+    /// or a notice's detail started or stopped being cut short, which adds
+    /// or drops its button.
     _relayout: Subscription,
 }
 
@@ -205,6 +212,9 @@ struct Markdown {
 pub(crate) struct Transcript {
     scroller: Entity<MessageScrollerState>,
     timeline: Timeline,
+    /// Which of the scroller's items each row takes. Shared with each
+    /// [`Markdown`], which finds its item as the rows before it change.
+    items: Rc<RefCell<Items>>,
     /// Per row: whether a work row lists its steps.
     steps: Vec<Disclosure>,
     /// Per entry: whether a step shows its details, or a notice all of its
@@ -226,9 +236,9 @@ pub(crate) struct Transcript {
     attachments: Vec<Vec<Preview>>,
     /// The images the session's messages show by path.
     pictures: Entity<Pictures>,
-    /// Per entry: a message's text, or a notice's detail; `None` for
-    /// anything else.
-    markdown: Vec<Option<Markdown>>,
+    /// Per entry: a message's text, or a notice's detail, with one for each
+    /// part of a reply; none for anything else.
+    markdown: Vec<Vec<Markdown>>,
 }
 
 impl Transcript {
@@ -237,6 +247,7 @@ impl Transcript {
             pictures,
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             timeline: Timeline::default(),
+            items: Rc::default(),
             steps: Vec::new(),
             details: Vec::new(),
             worked: Vec::new(),
@@ -271,9 +282,9 @@ impl Transcript {
         }
     }
 
-    /// The surface row `ix` is for, if it is a surface's row.
-    fn surface_row<'a>(&self, ix: usize, entries: &'a [Entry]) -> Option<&'a SurfaceRef> {
-        let Row::Message(entry) = self.timeline.rows().get(ix)? else {
+    /// The surface row `row` is for, if it is a surface's row.
+    fn surface_row<'a>(&self, row: usize, entries: &'a [Entry]) -> Option<&'a SurfaceRef> {
+        let Row::Message(entry) = self.timeline.rows().get(row)? else {
             return None;
         };
         match entries.get(*entry)? {
@@ -296,21 +307,22 @@ impl Transcript {
         if let Some(row) = synced.grew {
             self.remeasure(row..row + 1, cx);
         }
-        if synced.added > 0 {
-            self.scroller
-                .update(cx, |scroller, cx| scroller.append(synced.added, cx));
+        for (ix, entry) in entries.iter().enumerate().skip(self.markdown.len()) {
+            let markdown = self.markdown(ix, entry, cx);
+            self.markdown.push(markdown);
         }
+        let rows = self.timeline.rows().len();
+        let counts: Vec<usize> = (rows - synced.added..rows)
+            .map(|row| self.item_count(row))
+            .collect();
+        let added = self.items.borrow_mut().extend(counts);
+        self.splice(added, cx);
         let known = self.took.len();
         let turns = self.timeline.turns().len();
         let seen = self.attachments.len();
         self.attachments
             .extend(entries.iter().skip(seen).map(previews));
-        for (ix, entry) in entries.iter().enumerate().skip(self.markdown.len()) {
-            let markdown = self.markdown(ix, entry, cx);
-            self.markdown.push(markdown);
-        }
-        self.steps
-            .resize(self.timeline.rows().len(), Disclosure::Folded);
+        self.steps.resize(rows, Disclosure::Folded);
         self.details.resize(entries.len(), Disclosure::Folded);
         self.worked.resize(turns, Disclosure::Folded);
         self.took.resize(turns, None);
@@ -330,7 +342,6 @@ impl Transcript {
     /// moved, as a discarded response's do; [`Self::sync`] builds what is
     /// there now.
     pub(crate) fn truncate(&mut self, from: usize, cx: &mut App) {
-        let before = self.timeline.rows().len();
         let rows = self.timeline.truncate(from);
         let turns = self.timeline.turns().len();
         self.steps.truncate(rows);
@@ -342,10 +353,8 @@ impl Transcript {
         self.diffs.retain(|diff| diff.entry < from);
         self.worked.truncate(turns);
         self.took.truncate(turns);
-        if rows < before {
-            self.scroller
-                .update(cx, |scroller, cx| scroller.splice(rows..before, 0, cx));
-        }
+        let gone = self.items.borrow_mut().truncate(rows);
+        self.splice(gone, cx);
         // A run of work may have lost steps.
         if let Some(last) = rows.checked_sub(1) {
             self.remeasure(last..rows, cx);
@@ -364,14 +373,8 @@ impl Transcript {
                 *attachments = previews(entry);
             }
         }
-        // A reply streams in.
-        if let (Some(Some(markdown)), Some(text)) = (
-            self.markdown.get(ix),
-            entries.get(ix).and_then(markdown_text),
-        ) {
-            markdown
-                .text
-                .update(cx, |state, cx| state.set_text(text, cx));
+        if let Some(entry) = entries.get(ix) {
+            self.set_markdown(ix, entry, cx);
         }
         if let Some(Entry::Tool(tool)) = entries.get(ix) {
             match self.diffs.iter_mut().find(|diff| diff.entry == ix) {
@@ -389,26 +392,89 @@ impl Transcript {
     }
 
     /// Entry `ix`'s Markdown, parsing from now, if it has any.
-    fn markdown(&self, ix: usize, entry: &Entry, cx: &mut App) -> Option<Markdown> {
-        let text = markdown_text(entry)?;
-        let row = self.timeline.row_of(ix)?;
-        let text = cx.new(|cx| TextViewState::markdown(text, cx));
-        let scroller = self.scroller.clone();
-        let relayout = cx.observe(&text, move |_, cx| {
-            scroller.update(cx, |scroller, cx| {
-                scroller.remeasure_items(row..row + 1, cx)
-            });
-        });
-        Some(Markdown {
-            text,
-            _relayout: relayout,
-        })
+    fn markdown(&self, ix: usize, entry: &Entry, cx: &mut App) -> Vec<Markdown> {
+        let Some(row) = self.timeline.row_of(ix) else {
+            return Vec::new();
+        };
+        let sources = markdown_parts(entry);
+        let parts = sources.iter().enumerate();
+        parts
+            .map(|(part, source)| self.part(row, part, source, cx))
+            .collect()
     }
 
-    /// Entry `ix`'s Markdown, if it has any, to draw with Kit's
-    /// `TextView::new`.
-    fn text(&self, ix: usize) -> Option<&Entity<TextViewState>> {
-        Some(&self.markdown.get(ix)?.as_ref()?.text)
+    /// Part `part` of the Markdown of `row`'s entry, parsing `source` from
+    /// now.
+    fn part(&self, row: usize, part: usize, source: &str, cx: &mut App) -> Markdown {
+        let text = cx.new(|cx| TextViewState::markdown(source, cx));
+        let scroller = self.scroller.clone();
+        let items = Rc::clone(&self.items);
+        let relayout = cx.observe(&text, move |_, cx| {
+            let item = items.borrow().of(row..row + 1).start + part;
+            scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(item..item + 1, cx)
+            });
+        });
+        Markdown {
+            text,
+            _relayout: relayout,
+        }
+    }
+
+    /// Shows entry `ix`'s Markdown as it is now. A reply that streams in
+    /// grows its last part, and its row takes an item more for each part
+    /// more.
+    fn set_markdown(&mut self, ix: usize, entry: &Entry, cx: &mut App) {
+        let (Some(row), Some(shown)) = (
+            self.timeline.row_of(ix),
+            self.markdown.get(ix).map(Vec::len),
+        ) else {
+            return;
+        };
+        let sources = markdown_parts(entry);
+        for (markdown, source) in self.markdown[ix].iter().zip(&sources) {
+            markdown
+                .text
+                .update(cx, |state, cx| state.set_text(source, cx));
+        }
+        for (part, source) in sources.iter().enumerate().skip(shown) {
+            let markdown = self.part(row, part, source, cx);
+            self.markdown[ix].push(markdown);
+        }
+        self.markdown[ix].truncate(sources.len());
+
+        let count = self.item_count(row);
+        let resized = self.items.borrow_mut().resize(row, count);
+        self.splice(resized, cx);
+    }
+
+    /// Changes the scroller's items as [`Items`] changed.
+    fn splice(&self, edit: Edit, cx: &mut App) {
+        let Edit { old, count } = edit;
+        if !old.is_empty() || count > 0 {
+            self.scroller
+                .update(cx, |scroller, cx| scroller.splice(old, count, cx));
+        }
+        debug_assert_eq!(
+            self.scroller.read(cx).item_count(),
+            self.items.borrow().len(),
+            "the scroller has an item for each of the rows' items"
+        );
+    }
+
+    /// How many of the scroller's items `row` takes: one, but one for each
+    /// part of a reply.
+    fn item_count(&self, row: usize) -> usize {
+        match self.timeline.rows().get(row) {
+            Some(Row::Message(entry)) => self.markdown.get(*entry).map_or(1, Vec::len).max(1),
+            Some(Row::Work(_)) | None => 1,
+        }
+    }
+
+    /// Part `part` of entry `ix`'s Markdown, if it has that part, to draw
+    /// with Kit's `TextView::new`. Only a reply has more than one.
+    fn text(&self, ix: usize, part: usize) -> Option<&Entity<TextViewState>> {
+        Some(&self.markdown.get(ix)?.get(part)?.text)
     }
 
     /// What holds up the running turn, if anything: its header says so.
@@ -530,66 +596,79 @@ impl Transcript {
         self.running.is_none_or(|running| turn < running.turn)
     }
 
+    /// Measures `rows` again.
     fn remeasure(&self, rows: Range<usize>, cx: &mut App) {
+        let items = self.items.borrow().of(rows);
         self.scroller
-            .update(cx, |scroller, cx| scroller.remeasure_items(rows, cx));
+            .update(cx, |scroller, cx| scroller.remeasure_items(items, cx));
     }
 
-    /// Row `ix`, at a readable measure on wide windows. A turn's working
-    /// is open while the turn runs and folds once it finishes, so its rows
-    /// are built through `content`; a folded row takes no space. The gap
-    /// below each row is here, inside any fold, not in the scroller's row
-    /// style (which the session view zeroes).
-    pub(crate) fn render_row(
+    /// The scroller's item `item`: a row, or a part of a long reply's, at a
+    /// readable measure on wide windows. A turn's working is open while the
+    /// turn runs and folds once it finishes, so its rows are built through
+    /// `content`; a folded row takes no space. The gap below each row is
+    /// here, inside any fold, not in the scroller's row style (which the
+    /// session view zeroes).
+    pub(crate) fn render_item(
         &self,
-        ix: usize,
+        item: usize,
         entries: &[Entry],
         surfaces: &Surfaces,
         act: &ActionHandler,
-        content: &RowContent,
+        content: &ItemContent,
         cx: &App,
     ) -> AnyElement {
         let measure = div().w_full().max_w(rems(48.)).mx_auto();
+        let Some(place) = self.items.borrow().locate(item) else {
+            return measure.into_any_element();
+        };
+        let Place {
+            row,
+            part,
+            ends_row,
+        } = place;
         // A surface stays usable after its turn: its row lies within the
         // turn's working, and does not fold with it. A surface that moved
         // under a later call, or was deleted, takes no room here.
-        if let Some(shown) = self.surface_row(ix, entries) {
+        if let Some(shown) = self.surface_row(row, entries) {
             let panel = surfaces.panel(shown).cloned();
             return measure
                 .when_some(panel, |this, panel| this.pb_3().child(panel))
                 .into_any_element();
         }
-        let Some(turn) = self.timeline.turn_of(ix) else {
+        let Some(turn) = self.timeline.turn_of(row) else {
             return measure
-                .pb_3()
-                .child(self.render_content(ix, entries, act, cx))
+                .when(ends_row, Styled::pb_3)
+                .child(self.render_content(place, entries, act, cx))
                 .into_any_element();
         };
         let working = self.timeline.working(turn);
-        if working.as_ref().is_some_and(|rows| rows.contains(&ix)) {
+        if working.as_ref().is_some_and(|rows| rows.contains(&row)) {
             let shows = if self.is_finished(turn) {
                 self.worked[turn]
             } else {
                 Disclosure::Open
             };
             let content = Rc::clone(content);
+            let id = ElementId::named_usize("working", row);
             return measure
                 .child(Folding::new(
-                    ElementId::named_usize("working", ix),
+                    // A reply's parts fold each on their own.
+                    ElementId::from((id, SharedString::from(part.to_string()))),
                     shows,
                     move |window, cx| {
                         div()
-                            .pb_3()
-                            .child(content(ix, window, cx))
+                            .when(ends_row, Styled::pb_3)
+                            .child(content(place, window, cx))
                             .into_any_element()
                     },
                 ))
                 .into_any_element();
         }
-        let opens_turn = self.timeline.turns().get(turn) == Some(&ix);
+        let opens_turn = self.timeline.turns().get(turn) == Some(&row);
         measure
-            .pb_3()
-            .child(self.render_content(ix, entries, act, cx))
+            .when(ends_row, Styled::pb_3)
+            .child(self.render_content(place, entries, act, cx))
             .when(opens_turn, |this| {
                 this.child(self.render_header(turn, act, cx))
             })
@@ -640,32 +719,39 @@ impl Transcript {
         .into_any_element()
     }
 
-    /// Row `ix`'s own content: a message, or a run of work.
+    /// The content of the scroller's item at `place`: a message, a part of
+    /// a long reply, or a run of work.
     pub(crate) fn render_content(
         &self,
-        ix: usize,
+        place: Place,
         entries: &[Entry],
         act: &ActionHandler,
         cx: &App,
     ) -> AnyElement {
-        let Some(row) = self.timeline.rows().get(ix) else {
+        let Place {
+            row,
+            part,
+            ends_row,
+        } = place;
+        let Some(drawn) = self.timeline.rows().get(row) else {
             return div().into_any_element();
         };
-        let turn = self.timeline.turn_of(ix);
+        let turn = self.timeline.turn_of(row);
         let running = turn.is_some() && turn == self.running.map(|running| running.turn);
-        let phase = if running && ix + 1 == self.timeline.rows().len() {
+        let phase = if running && ends_row && row + 1 == self.timeline.rows().len() {
             Phase::Live
         } else {
             Phase::Settled
         };
-        match row {
+        match drawn {
             Row::Message(entry) => match &entries[*entry] {
                 Entry::Notice(notice) => self.render_notice(*entry, notice, act, cx),
                 message => {
                     let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
-                    let text = self.text(*entry);
                     let shown = Shown {
-                        text,
+                        text: self.text(*entry, part),
+                        part,
+                        ends_message: ends_row,
                         attachments,
                         pictures: &self.pictures,
                         phase,
@@ -676,13 +762,13 @@ impl Transcript {
             Row::Work(run) => {
                 let act = Rc::clone(act);
                 let on_fold: FoldHandler = Rc::new(move |fold, window, cx| {
-                    act(Action::Fold { row: ix, fold }, window, cx);
+                    act(Action::Fold { row, fold }, window, cx);
                 });
                 work::render(
                     WorkRow {
                         entries: &entries[run.clone()],
                         start: run.start,
-                        steps: self.steps[ix],
+                        steps: self.steps[row],
                         details: &self.details[run.clone()],
                         images: &self.attachments[run.clone()],
                         diffs: &self.diffs,
@@ -712,7 +798,7 @@ impl Transcript {
             NoticeLevel::Warning => AlertVariant::Warning,
             NoticeLevel::Error => AlertVariant::Error,
         };
-        let Some(detail) = self.text(ix) else {
+        let Some(detail) = self.text(ix, 0) else {
             return Alert::new(key, SharedString::from(notice.title().to_owned()))
                 .with_variant(variant)
                 .small()
@@ -875,22 +961,28 @@ fn attachment_cell(ix: usize, n: usize, preview: &Preview, card: Card) -> AnyEle
 
 /// What a message row draws besides its entry.
 struct Shown<'a> {
-    /// The message's text, if it has any.
+    /// The message's text, if it has any: for a reply, its part `part`.
     text: Option<&'a Entity<TextViewState>>,
+    part: usize,
+    /// Whether no part of the message follows this one.
+    ends_message: bool,
     /// A user message's attachments.
     attachments: &'a [Preview],
     pictures: &'a Entity<Pictures>,
     phase: Phase,
 }
 
-/// The Markdown `entry` shows: a message's text, or a notice's detail.
-fn markdown_text(entry: &Entry) -> Option<&str> {
-    match entry {
+/// The Markdown `entry` shows, each part to draw as an item of its own: a
+/// reply's text in the parts [`parts::split`] gives, a user message's text
+/// or a notice's detail whole, in its bubble or card.
+fn markdown_parts(entry: &Entry) -> Vec<&str> {
+    let whole = match entry {
+        Entry::Agent(message) => return parts::split(message.text()),
         Entry::User(message) => Some(message.text()).filter(|text| !text.is_empty()),
-        Entry::Agent(message) => Some(message.text()),
         Entry::Notice(notice) => notice.description(),
         Entry::Thought(_) | Entry::Tool(_) | Entry::Surface(_) | Entry::Wake => None,
-    }
+    };
+    whole.into_iter().collect()
 }
 
 /// Builds the row for a user message or a reply: entry `ix`, with what
@@ -898,6 +990,8 @@ fn markdown_text(entry: &Entry) -> Option<&str> {
 fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyElement {
     let Shown {
         text,
+        part,
+        ends_message,
         attachments,
         pictures,
         phase,
@@ -942,19 +1036,30 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                 .content(content)
                 .into_any_element()
         }
-        Entry::Agent(_) => div()
-            .id(SharedString::from(format!("reply-{ix}")))
-            .test_support()
-            .w_full()
-            .children(text.map(|text| {
-                TextView::new(text)
-                    .style(message_style())
-                    .code_block_actions(code_actions)
-                    .markdown_extensions(message_extensions(pictures, ix))
-                    .selectable(true)
-                    .stream_fade(phase == Phase::Live)
-            }))
-            .into_any_element(),
+        Entry::Agent(_) => {
+            let style = message_style();
+            // The gap Kit would leave after the part's last block, were
+            // the reply one text.
+            let gap = style.paragraph_gap;
+            let id = match part {
+                0 => format!("reply-{ix}"),
+                part => format!("reply-{ix}-{part}"),
+            };
+            div()
+                .id(SharedString::from(id))
+                .test_support()
+                .w_full()
+                .when(!ends_message, |this| this.pb(gap))
+                .children(text.map(|text| {
+                    TextView::new(text)
+                        .style(style)
+                        .code_block_actions(code_actions)
+                        .markdown_extensions(message_extensions(pictures, ix))
+                        .selectable(true)
+                        .stream_fade(phase == Phase::Live)
+                }))
+                .into_any_element()
+        }
         Entry::Wake => h_flex()
             .id(SharedString::from(format!("wake-{ix}")))
             .test_support()
