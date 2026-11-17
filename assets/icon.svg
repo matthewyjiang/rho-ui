@@ -1,4 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#9333ea"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="26" font-weight="600" fill="#ffffff">RU</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffeedd"/>
+      <stop offset="1" stop-color="#ffd9c2"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <ellipse cx="262" cy="440" rx="120" ry="16" fill="#e8a888" opacity="0.45"/>
+  <g fill="#6b8fe0">
+    <circle cx="256" cy="214" r="118"/>
+    <path d="M170 214V396" stroke="#6b8fe0" stroke-width="64" stroke-linecap="round"/>
+  </g>
+  <ellipse cx="204" cy="238" rx="18" ry="11" fill="#ff8fab" opacity="0.75"/>
+  <ellipse cx="322" cy="238" rx="18" ry="11" fill="#ff8fab" opacity="0.75"/>
+  <g fill="#1e1b2e">
+    <circle cx="228" cy="204" r="16"/>
+    <circle cx="298" cy="204" r="16"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="223" cy="198" r="5.5"/>
+    <circle cx="293" cy="198" r="5.5"/>
+  </g>
+  <path d="M247 234Q263 250 279 234" fill="none" stroke="#1e1b2e" stroke-width="9" stroke-linecap="round"/>
 </svg>

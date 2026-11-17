@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rho
+GenericName=Coding Agent
+Comment=The desktop app for the rho coding agent
+Exec=rho-ui
+Icon=rho-ui
+Terminal=false
+Categories=Development;
+StartupWMClass=rho-ui
