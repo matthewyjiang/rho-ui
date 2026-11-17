@@ -7,6 +7,7 @@
 //! `SELECT_LAVAPIPE`); on macOS, on Metal.
 
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
@@ -559,6 +560,18 @@ impl Harness {
             result = Some(act(&mut TestInput::new(handler, window), cx));
         });
         result.expect("the input method ran")
+    }
+
+    /// Opens the fake daemon's saved session "old", and waits for its
+    /// replay of more than 20 entries to catch up.
+    fn open_old_session(&mut self) {
+        self.wait_until("saved sessions", |window, _, _| {
+            is_visible(window, "session-local-old")
+        });
+        self.click("session-local-old");
+        self.wait_for_session("the replayed history", |session| {
+            !session.is_replaying() && session.entries().len() > 20
+        });
     }
 
     /// Waits for the active session to satisfy `ready`.
@@ -2185,7 +2198,7 @@ fn a_replayed_session_builds_its_transcript_once() {
         })
         .expect("window is open");
     let app = ui.app.clone();
-    let counts: Rc<std::cell::RefCell<Vec<usize>>> = Rc::default();
+    let counts: Rc<RefCell<Vec<usize>>> = Rc::default();
     let _watch = ui.cx.update(|cx| {
         let view = app.read(cx).active_session().expect("a session is open");
         let scroller = view.read(cx).transcript().scroller().clone();
@@ -2224,13 +2237,7 @@ fn a_long_reply_scrolled_back_keeps_its_height() {
         ..Script::default()
     };
     let mut ui = Harness::start("long-reply", script);
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-local-old")
-    });
-    ui.click("session-local-old");
-    ui.wait_for_session("the replayed history", |session| {
-        !session.is_replaying() && session.entries().len() > 20
-    });
+    ui.open_old_session();
     let app = ui.app.clone();
     let (view, last) = ui.cx.update(|cx| {
         let view = app.read(cx).active_session().expect("a session is open");
@@ -2366,13 +2373,7 @@ fn a_wheel_notch_glides() {
         ..Script::default()
     };
     let mut ui = Harness::start("glide", script);
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-local-old")
-    });
-    ui.click("session-local-old");
-    ui.wait_for_session("the replayed history", |session| {
-        !session.is_replaying() && session.entries().len() > 20
-    });
+    ui.open_old_session();
     let top = |ui: &mut Harness| {
         let app = ui.app.clone();
         ui.cx.update(|cx| {
