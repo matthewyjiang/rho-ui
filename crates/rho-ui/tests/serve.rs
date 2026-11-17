@@ -23,7 +23,8 @@ use rho_ui_core::{
     fake_daemon::{write_program, FakeDaemon, Script},
     fake_sshd::{ClientKey, FakeSshd, HostKey},
     server::wire::{self, SettingsFile, StateWrite},
-    Checkout, Daemon, DaemonError, DaemonTarget, RemoteShell, ServerTarget, ShellError,
+    Checkout, Daemon, DaemonError, DaemonTarget, RemoteShell, ServerTarget, ShellError, ShellInput,
+    ShellOutput,
 };
 
 /// `rho-ui serve`, running until dropped.
@@ -118,6 +119,40 @@ fn after(limit: Duration) -> oneshot::Receiver<()> {
     passed
 }
 
+/// Reads all `output` a shell prints, typing `exit` once it printed
+/// `DONE-42`: exiting before then could lose output still on its way.
+///
+/// # Panics
+///
+/// If the output stops coming for [`SHELL_BOUND`].
+async fn read_until_exit(output: &mut ShellOutput, input: &ShellInput) -> Vec<u8> {
+    let read_all = async {
+        let mut printed = Vec::new();
+        let mut exited = false;
+        // Where the search for the marker starts: the bytes before it were
+        // searched. Searching them all again for each read is quadratic,
+        // which over macOS's 1 KiB reads of 3 MiB takes minutes.
+        let mut searched = 0;
+        while let Some(bytes) = output.recv().await {
+            printed.extend(bytes);
+            if !exited
+                && printed[searched..]
+                    .windows(7)
+                    .any(|window| window == b"DONE-42")
+            {
+                input.write(b"exit\n".to_vec());
+                exited = true;
+            }
+            searched = printed.len().saturating_sub(6);
+        }
+        printed
+    };
+    match select(pin!(read_all), after(SHELL_BOUND)).await {
+        Either::Left((printed, _)) => printed,
+        Either::Right(_) => panic!("the shell's output stopped coming"),
+    }
+}
+
 /// Gives the machine whose home is `home` a `rho` where the setup script
 /// looks for one not on PATH, `~/.local/bin`, whose `daemon status --json`
 /// names `fake`'s socket.
@@ -195,33 +230,18 @@ fn a_daemon_through_the_server_runs_sessions_scripts_and_shells_on_its_machine()
         // hangs. The shell exits only once all of it came, as output still
         // on its way when it hangs up can be lost.
         input.write(
-            b"stty size; pwd; head -c 3145728 /dev/zero | tr '\\0' '\\043'; echo DONE-$((6*7))\n"
+            b"echo \"size=$(stty size)\"; echo \"pwd=$(pwd)\"; head -c 3145728 /dev/zero | tr '\\0' '\\043'; echo DONE-$((6*7))\n"
                 .to_vec(),
         );
-        let read_all = async {
-            let mut printed = Vec::new();
-            let mut exited = false;
-            while let Some(bytes) = output.recv().await {
-                printed.extend(bytes);
-                if !exited && printed.windows(7).any(|window| window == b"DONE-42") {
-                    input.write(b"exit\n".to_vec());
-                    exited = true;
-                }
-            }
-            printed
-        };
-        let printed = match select(pin!(read_all), after(SHELL_BOUND)).await {
-            Either::Left((printed, _)) => printed,
-            Either::Right(_) => panic!("the shell's output stopped coming"),
-        };
+        let printed = read_until_exit(&mut output, &input).await;
         ended.wait().await.expect("the shell exits");
         drop(control);
-        // The terminal echoes the typed line too, so look for each answer
-        // on a line of its own.
+        // Each answer is labelled: the terminal echoes the typed line, and
+        // the prompt may share a line with what follows it.
         let printed = String::from_utf8_lossy(&printed);
-        assert!(printed.contains("\n30 100\r\n"), "{printed:?}");
+        assert!(printed.contains("size=30 100\r\n"), "{printed:?}");
         assert!(
-            printed.contains(&format!("\n{}\r\n", work.display())),
+            printed.contains(&format!("pwd={}\r\n", work.display())),
             "{printed:?}"
         );
         assert_eq!(printed.matches('#').count(), 3 * wire::SHELL_WINDOW);
@@ -416,33 +436,18 @@ fn a_remote_machine_through_the_server_runs_sessions_scripts_and_shells_there() 
         } = link.open_shell(&remote, "xterm-256color", 80, 24);
         control.resize(100, 30);
         // `HOME` tells the remote shell from one here in the same folder.
-        input.write(b"stty size; pwd; echo \"home=$HOME\"; echo DONE-$((6*7))\n".to_vec());
-        let read_all = async {
-            let mut printed = Vec::new();
-            let mut exited = false;
-            while let Some(bytes) = output.recv().await {
-                printed.extend(bytes);
-                if !exited && printed.windows(7).any(|window| window == b"DONE-42") {
-                    input.write(b"exit\n".to_vec());
-                    exited = true;
-                }
-            }
-            printed
-        };
-        let printed = match select(pin!(read_all), after(SHELL_BOUND)).await {
-            Either::Left((printed, _)) => printed,
-            Either::Right(_) => panic!("the remote shell's output stopped coming"),
-        };
+        input.write(b"echo \"size=$(stty size)\"; echo \"pwd=$(pwd)\"; echo \"home=$HOME\"; echo DONE-$((6*7))\n".to_vec());
+        let printed = read_until_exit(&mut output, &input).await;
         ended.wait().await.expect("the remote shell exits");
         drop(control);
         let printed = String::from_utf8_lossy(&printed);
-        assert!(printed.contains("\n30 100\r\n"), "{printed:?}");
+        assert!(printed.contains("size=30 100\r\n"), "{printed:?}");
         assert!(
-            printed.contains(&format!("\n{}\r\n", remote.display())),
+            printed.contains(&format!("pwd={}\r\n", remote.display())),
             "{printed:?}"
         );
         assert!(
-            printed.contains(&format!("\nhome={}\r\n", remote.display())),
+            printed.contains(&format!("home={}\r\n", remote.display())),
             "{printed:?}"
         );
         // A shell the machine won't start says why, as on the desktop,
