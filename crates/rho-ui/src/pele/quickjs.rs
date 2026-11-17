@@ -1,11 +1,13 @@
-//! pele in an embedded `QuickJS`, off the browser. One thread owns the
-//! engine, as a `QuickJS` runtime can't move between threads; [`draw`]
-//! asks it and waits. Model-written diagrams are untrusted, so each runs
-//! under [`MEMORY_LIMIT`] and [`TIME_LIMIT`]. A diagram that goes over
-//! either, or that pele can't read, is not drawn.
+//! pele in an embedded `QuickJS`, off the browser. One thread owns each
+//! engine, as a `QuickJS` runtime can't move between threads; [`draw`] and
+//! [`ask`] send it a diagram. There are two, one per [`Lane`]. Every
+//! diagram is untrusted, written by a model or by anyone who can comment
+//! on a PR, so each runs under [`MEMORY_LIMIT`] and [`TIME_LIMIT`]. A
+//! diagram that goes over either, or that pele can't read, is not drawn.
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, OnceLock,
@@ -14,9 +16,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::channel::oneshot;
 use rquickjs::{Context, Ctx, Function, Object, Runtime};
 
-use super::{narrow, Drawing, KEPT, PELE};
+use super::{narrow, Drawing, Lane, KEPT, PELE};
 
 /// The engine's heap. pele holds about 3 MiB once loaded, and drawing any
 /// of the diagram kinds rho's prompt allows adds little to it; this leaves
@@ -29,36 +32,50 @@ const TIME_LIMIT: Duration = Duration::from_secs(1);
 
 struct Request {
     source: String,
-    reply: mpsc::Sender<Option<Arc<Drawing>>>,
+    reply: oneshot::Sender<Option<Arc<Drawing>>>,
 }
 
-/// Starts the engine, which takes about 100 ms to load pele, so the first
-/// diagram doesn't wait for it. [`draw`] starts it too.
+/// Starts the messages' engine, which takes about 100 ms to load pele, so
+/// the first diagram doesn't wait for it. [`draw`] starts it too.
 pub(crate) fn start() {
-    engine();
+    engine(Lane::Messages);
 }
 
-fn engine() -> &'static mpsc::Sender<Request> {
-    static ENGINE: OnceLock<mpsc::Sender<Request>> = OnceLock::new();
-    ENGINE.get_or_init(|| {
+fn engine(lane: Lane) -> &'static mpsc::Sender<Request> {
+    static MESSAGES: OnceLock<mpsc::Sender<Request>> = OnceLock::new();
+    static PULL_REQUESTS: OnceLock<mpsc::Sender<Request>> = OnceLock::new();
+    let (engine, name) = match lane {
+        Lane::Messages => (&MESSAGES, "pele"),
+        Lane::PullRequests => (&PULL_REQUESTS, "pele-prs"),
+    };
+    engine.get_or_init(|| {
         let (requests, received) = mpsc::channel();
         thread::Builder::new()
-            .name("pele".to_owned())
+            .name(name.to_owned())
             .spawn(move || serve(&received))
             .expect("the OS starts a thread for the diagram engine");
         requests
     })
 }
 
-/// Draws Mermaid `source`, waiting for the engine; `None` when pele can't.
+/// Draws Mermaid `source` for a message, waiting for the engine; `None`
+/// when pele can't.
 pub(crate) fn draw(source: &str) -> Option<Arc<Drawing>> {
-    let (reply, answer) = mpsc::channel();
-    let request = Request {
-        source: source.to_owned(),
-        reply,
-    };
-    engine().send(request).ok()?;
-    answer.recv().ok()?
+    futures::executor::block_on(ask(Lane::Messages, source.to_owned()))
+}
+
+/// Asks `lane`'s engine to draw Mermaid `source`, without waiting; the
+/// future resolves to `None` when pele can't. Dropped before the engine
+/// gets to it, the diagram isn't drawn.
+pub(crate) fn ask(lane: Lane, source: String) -> impl Future<Output = Option<Arc<Drawing>>> {
+    let (reply, answer) = oneshot::channel();
+    let sent = engine(lane).send(Request { source, reply }).is_ok();
+    async move {
+        if !sent {
+            return None;
+        }
+        answer.await.ok()?
+    }
 }
 
 /// The engine's thread: loads pele, then draws what it is asked. If pele
@@ -71,6 +88,9 @@ fn serve(requests: &mpsc::Receiver<Request>) {
     for Request { source, reply } in requests {
         let drawing = if let Some(drawing) = kept.get(&source) {
             drawing.clone()
+        } else if reply.is_canceled() {
+            // No one waits for it any more: a PR's text that changed.
+            continue;
         } else {
             let drawing = engine.draw(&source).map(Arc::new);
             if kept.len() == KEPT {

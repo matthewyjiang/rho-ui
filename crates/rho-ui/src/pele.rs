@@ -21,14 +21,29 @@ mod quickjs;
 use std::collections::HashMap;
 
 #[cfg(target_family = "wasm")]
-pub(crate) use self::browser::{draw, start};
+pub(crate) use self::browser::{ask, draw, start};
 #[cfg(not(target_family = "wasm"))]
-pub(crate) use self::quickjs::{draw, start};
+pub(crate) use self::quickjs::{ask, draw, start};
 
 /// pele's browser build, which defines the global `pele`.
 const PELE: &str = include_str!("../vendor/pele/pele.global.js");
 
-/// How many drawings the engine keeps. A streaming reply is parsed again
+/// Whose diagrams an engine draws. Off the browser each lane has an engine
+/// of its own, so a backlog of diagrams in pull requests never delays a
+/// message's; a browser has one, on the page's thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Messages, parsed on the UI thread, which waits for each diagram.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "a browser has one engine, which needs no lane")
+    )]
+    Messages,
+    /// Pull requests, whose diagrams are drawn before their text is parsed.
+    PullRequests,
+}
+
+/// How many drawings each engine keeps. A streaming reply is parsed again
 /// with each chunk, so its finished diagrams are asked for again; a
 /// drawing is 2 to 4 KB, so this keeps every diagram of a long session in
 /// well under a megabyte.

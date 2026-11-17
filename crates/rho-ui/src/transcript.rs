@@ -24,7 +24,7 @@ use gpui_kit::component::{
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
-    text::{TextView, TextViewState, TextViewStyle},
+    text::{MarkdownExtensions, TextView, TextViewState, TextViewStyle},
     v_flex, ActiveTheme as _, Colorize as _, Icon, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -42,11 +42,21 @@ use crate::{
     figures,
     fold::Folding,
     lightbox,
-    pictures::{PictureRead, Pictures},
+    pictures::{self, PictureRead, Pictures},
     surface_view::Surfaces,
     turn_times::TurnTimes,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
+
+/// [`figures::extensions`] and the plugin for images by path, for a
+/// `TextView` showing message `entry` of a session whose images `pictures`
+/// reads.
+fn message_extensions(pictures: &Entity<Pictures>, entry: usize) -> MarkdownExtensions {
+    figures::extensions().plugin(pictures::Plugin {
+        pictures: pictures.clone(),
+        entry,
+    })
+}
 
 /// How tall an image attached to a user message or made by a tool is, in
 /// rems: a screenshot's layout reads at this size, and two side by side
@@ -917,7 +927,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                             TextView::new(text)
                                 .style(message_style())
                                 .code_block_actions(code_actions)
-                                .markdown_extensions(figures::extensions(pictures, ix))
+                                .markdown_extensions(message_extensions(pictures, ix))
                                 .selectable(true),
                         ),
                 )
@@ -940,7 +950,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                 TextView::new(text)
                     .style(message_style())
                     .code_block_actions(code_actions)
-                    .markdown_extensions(figures::extensions(pictures, ix))
+                    .markdown_extensions(message_extensions(pictures, ix))
                     .selectable(true)
                     .stream_fade(phase == Phase::Live)
             }))

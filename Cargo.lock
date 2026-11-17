@@ -7301,6 +7301,7 @@ dependencies = [
  "js-sys",
  "libghostty-vt",
  "log",
+ "markdown",
  "portable-pty",
  "ratex-layout",
  "ratex-parser",

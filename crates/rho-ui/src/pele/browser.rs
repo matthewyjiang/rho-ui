@@ -7,13 +7,14 @@
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
+    future::Future,
     sync::Arc,
 };
 
 use js_sys::{Function, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
 
-use super::{narrow, Drawing, KEPT, PELE};
+use super::{narrow, Drawing, Lane, KEPT, PELE};
 
 thread_local! {
     /// `pele.render` once pele has loaded, or `None` if it didn't; unset
@@ -51,6 +52,17 @@ fn render() -> Option<Function> {
             })
             .clone()
     })
+}
+
+/// Draws Mermaid `source` for `_lane`, as [`draw`] does, before it
+/// returns: the page has one engine, on its own thread, and pele draws a
+/// diagram in milliseconds.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the same signature as off the browser, whose engine takes the source"
+)]
+pub(crate) fn ask(_lane: Lane, source: String) -> impl Future<Output = Option<Arc<Drawing>>> {
+    std::future::ready(draw(&source))
 }
 
 /// Draws Mermaid `source`; `None` when pele can't.
