@@ -41,7 +41,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window,
 };
 use rho_ui_core::{
-    surface::SurfaceRef, Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent,
+    surface::SurfaceRef, Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent, UserMessage,
 };
 
 use crate::{
@@ -329,9 +329,12 @@ impl Transcript {
         self.details.resize(entries.len(), Disclosure::Folded);
         self.worked.resize(turns, Disclosure::Folded);
         self.took.resize(turns, None);
-        let times = cx.global::<TurnTimes>();
         for turn in known..turns {
-            self.took[turn] = self.prompt_id(turn, entries).and_then(|id| times.get(id));
+            let prompt = self.prompt(turn, entries);
+            self.took[turn] = prompt.and_then(|prompt| cx.global::<TurnTimes>().get(prompt.id()));
+            if prompt.is_some_and(UserMessage::is_steer) {
+                self.steered(turn, entries, cx);
+            }
         }
         // A finished turn that grows, as history replays, folds more rows.
         if let Some(newest) = turns.checked_sub(1) {
@@ -506,35 +509,59 @@ impl Transcript {
         self.remeasure(self.timeline.turn_rows(newest), cx);
     }
 
-    /// The running turn finished, and folds. Its time is saved for when the
-    /// session replays, under its prompt: a turn the daemon began itself
-    /// has none, and a prompt that never arrived leaves no turn to time.
+    /// The running turn finished, and folds.
     pub(crate) fn end_turn(&mut self, entries: &[Entry], cx: &mut App) {
         // The turn may have written files its messages showed before
         // they were there.
         self.pictures.update(cx, Pictures::retry);
-        let Some(Running { turn, since }) = self.running.take() else {
+        if let Some(running) = self.running.take() {
+            self.time(running, Instant::now(), entries, cx);
+        }
+    }
+
+    /// A steer opened `turn` while another ran. The daemon's replay can't
+    /// tell a steer from a prompt, so the steer opens a turn of its own, as
+    /// it will when the session replays: the turn it joined finishes there,
+    /// and the running one is the steer's, timed from now. Two steers the
+    /// model read at once leave the first one's turn at about 0s.
+    ///
+    /// A steer that came while the session was being attached arrives
+    /// before [`Self::resume_turn`], so the turn it joined goes untimed and
+    /// the steer's counts from the turn's start.
+    fn steered(&mut self, turn: usize, entries: &[Entry], cx: &mut App) {
+        let Some(joined) = self.running.filter(|running| running.turn < turn) else {
             return;
         };
-        let took = since.elapsed();
-        if turn >= self.took.len() {
+        let now = Instant::now();
+        self.time(joined, now, entries, cx);
+        self.running = Some(Running { turn, since: now });
+    }
+
+    /// Times `running`, which finished at `end`, and folds it. Its time is
+    /// saved for when the session replays, under its prompt: a turn the
+    /// daemon began itself has none, and a prompt that never arrived
+    /// leaves no turn to time.
+    fn time(&mut self, running: Running, end: Instant, entries: &[Entry], cx: &mut App) {
+        let Running { turn, since } = running;
+        let Some(slot) = self.took.get_mut(turn) else {
             return;
-        }
-        self.took[turn] = Some(took);
-        if let Some(prompt) = self.prompt_id(turn, entries) {
-            cx.global_mut::<TurnTimes>().record(prompt, took);
+        };
+        let took = end.saturating_duration_since(since);
+        *slot = Some(took);
+        if let Some(prompt) = self.prompt(turn, entries) {
+            cx.global_mut::<TurnTimes>().record(prompt.id(), took);
         }
         self.remeasure(self.timeline.turn_rows(turn), cx);
     }
 
-    /// The message ID of `turn`'s prompt.
-    fn prompt_id<'a>(&self, turn: usize, entries: &'a [Entry]) -> Option<&'a str> {
+    /// `turn`'s prompt, or steer.
+    fn prompt<'a>(&self, turn: usize, entries: &'a [Entry]) -> Option<&'a UserMessage> {
         let row = *self.timeline.turns().get(turn)?;
         let Row::Message(ix) = self.timeline.rows().get(row)? else {
             return None;
         };
         match entries.get(*ix)? {
-            Entry::User(prompt) => Some(prompt.id()),
+            Entry::User(prompt) => Some(prompt),
             _ => None,
         }
     }

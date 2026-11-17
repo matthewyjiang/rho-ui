@@ -64,6 +64,7 @@
 //!   one rho's terminal UI started: it is listed, its job runs, and a steer
 //!   is read at once, answered, and ends the turn. The steer "wait" is
 //!   never read: it stays queued until withdrawn or the turn is cancelled.
+//!   The steer "keep going" is read, and the turn runs on unanswered.
 //! - Settings are shaped like rho's: four permission modes, three models,
 //!   three reasoning levels, and fast mode. Every session offers the slash
 //!   commands `compact` and `prompt:review` and the skills `pstack` and
@@ -852,13 +853,19 @@ impl FakeSession {
     /// events, as rho's saved transcripts hold none (rho replays them only
     /// for a turn in progress, which the fake doesn't keep apart): the
     /// attach response lists the work as it is now, without work whose
-    /// result the model has.
+    /// result the model has. Nor does it mark steers, as rho's doesn't.
     fn follow(&mut self) -> (SessionAttachResponse, Publisher, Subscription) {
         let replay: Vec<SessionEvent> = self
             .history
             .iter()
             .filter(|event| !matches!(event, SessionEvent::Background { .. }))
             .cloned()
+            .map(|mut event| {
+                if let SessionEvent::UserMessage { steer, .. } = &mut event {
+                    *steer = None;
+                }
+                event
+            })
             .collect();
         // As the daemon numbers a reset's replay: 0 for all but the last.
         let last = replay.len().saturating_sub(1);

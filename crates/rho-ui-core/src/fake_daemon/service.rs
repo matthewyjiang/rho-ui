@@ -536,6 +536,9 @@ impl Service for Fake {
             }],
             steer: Some(id.clone()),
         });
+        if params.text == "keep going" {
+            return Ok(SessionSteerResponse { id });
+        }
         session.answer(&format!("m-{id}"), &format!("steered: {}", params.text));
         Ok(SessionSteerResponse { id })
     }
