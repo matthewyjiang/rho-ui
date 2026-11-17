@@ -10,6 +10,10 @@
 //! copied file. Each has a remove control on hover; Backspace in the empty
 //! text box removes the last.
 //!
+//! Text the user adds from the transcript (see [`ComposerState::add_quote`])
+//! shows as quotes above the text, each with a remove control, and goes
+//! before the text as Markdown block quotes.
+//!
 //! Typing a slash command at the start of the text, or a `$skill` anywhere
 //! in it, opens a menu of the session's names that complete it, floating
 //! above the box. Up and Down move the highlight, Tab completes, and Enter
@@ -54,8 +58,10 @@ const MAX_ROWS: usize = 8;
 pub(crate) struct ComposerState {
     input: Entity<TextareaState>,
     attachments: Vec<Item>,
-    /// Names the next attachment. Never reused, so a card keeps its
-    /// identity as others come and go.
+    /// Passages quoted from the transcript, in the order added.
+    quotes: Vec<Quote>,
+    /// Names the next attachment or quote. Never reused, so a card keeps
+    /// its identity as others come and go.
     next_id: u64,
     /// Why the last attachments were refused, one line each, until it is
     /// dismissed, or the next attachment or send.
@@ -79,6 +85,12 @@ struct Item {
     id: u64,
     attachment: Attachment,
     preview: Preview,
+}
+
+/// A passage quoted from the transcript.
+struct Quote {
+    id: u64,
+    text: String,
 }
 
 /// The open menu of names that complete the one at the cursor.
@@ -122,6 +134,7 @@ impl ComposerState {
         Self {
             input,
             attachments: Vec::new(),
+            quotes: Vec::new(),
             next_id: 0,
             refusal: None,
             commands: Vec::new(),
@@ -259,22 +272,51 @@ impl ComposerState {
         &self.input
     }
 
-    /// Whether the user has typed or attached nothing, not even whitespace.
+    /// Whether the user has typed, quoted or attached nothing, not even
+    /// whitespace.
     pub(crate) fn is_empty(&self, cx: &App) -> bool {
-        self.attachments.is_empty() && self.input.read(cx).value().is_empty()
+        self.attachments.is_empty()
+            && self.quotes.is_empty()
+            && self.input.read(cx).value().is_empty()
     }
 
-    /// Whether there is a message to send: more than whitespace, or an
-    /// attachment.
+    /// Whether there is a message to send: more than whitespace, a quote,
+    /// or an attachment.
     pub(crate) fn has_message(&self, cx: &App) -> bool {
-        !self.attachments.is_empty() || !self.input.read(cx).value().trim().is_empty()
+        !self.attachments.is_empty()
+            || !self.quotes.is_empty()
+            || !self.input.read(cx).value().trim().is_empty()
     }
 
-    /// The message as it stands: the text, trimmed, and the attachments.
+    /// The message as it stands: the quotes and the text, trimmed, and the
+    /// attachments.
     pub(crate) fn prompt(&self, cx: &App) -> Prompt {
-        let text = self.input.read(cx).value().trim().to_owned();
+        let typed = self.input.read(cx).value();
+        let quotes = self.quotes.iter().map(|quote| quote.text.as_str());
+        let text = with_quotes(quotes, typed.trim());
         let attachments = self.attachments.iter().map(|item| item.attachment.clone());
         Prompt::new(text, attachments.collect())
+    }
+
+    /// Quotes `text` above the composer's text box, after any quoted
+    /// already. Blank text adds nothing.
+    pub(crate) fn add_quote(&mut self, text: &str, cx: &mut Context<'_, Self>) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.next_id += 1;
+        self.quotes.push(Quote {
+            id: self.next_id,
+            text: text.to_owned(),
+        });
+        cx.notify();
+    }
+
+    /// Removes quote `id`.
+    fn remove_quote(&mut self, id: u64, cx: &mut Context<'_, Self>) {
+        self.quotes.retain(|quote| quote.id != id);
+        cx.notify();
     }
 
     /// Takes the message out, leaving the composer empty.
@@ -284,13 +326,15 @@ impl ComposerState {
             .update(cx, |input, cx| input.set_value("", window, cx));
         // Their decoded images stay: the transcript shows the same ones.
         self.attachments.clear();
+        self.quotes.clear();
         self.refusal = None;
         cx.notify();
         prompt
     }
 
-    /// Puts `prompt` back, as a send that failed does: its text above any
-    /// typed since, its attachments before any added since.
+    /// Puts `prompt` back, as a send that failed does: its text, quotes
+    /// and all, above any typed since, its attachments before any added
+    /// since.
     pub(crate) fn give_back(
         &mut self,
         prompt: Prompt,
@@ -568,6 +612,47 @@ impl Composer {
         )
     }
 
+    /// The quotes, each a muted passage of up to three lines with its
+    /// remove control.
+    fn render_quotes(&self, cx: &App) -> Option<impl IntoElement> {
+        let quotes = &self.state.read(cx).quotes;
+        if quotes.is_empty() {
+            return None;
+        }
+        let rows = quotes.iter().map(|quote| {
+            let (id, state) = (quote.id, self.state.clone());
+            h_flex()
+                .id(SharedString::from(format!("composer-quote-{id}")))
+                .test_support()
+                .aria_label(SharedString::from(quote.text.clone()))
+                .items_start()
+                .gap_2()
+                .pl_2()
+                .border_l_2()
+                .border_color(cx.theme().muted_foreground.opacity(0.5))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .line_clamp(3)
+                        .child(quote.text.clone()),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("composer-quote-{id}-remove")))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Remove quote")
+                        .on_click(move |_, _, cx| {
+                            state.update(cx, |state, cx| state.remove_quote(id, cx));
+                        }),
+                )
+        });
+        Some(v_flex().gap_1p5().children(rows))
+    }
+
     /// The button that opens the desktop's file chooser, off while the
     /// session is being created.
     fn render_attach(&self) -> Button {
@@ -733,6 +818,7 @@ fn offer_key(state: &Entity<ComposerState>, key: MenuKey, window: &mut Window, c
 
 impl RenderOnce for Composer {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let quotes = self.render_quotes(cx);
         let attachments = self.render_attachments(cx);
         let refusal = self.render_refusal(cx);
         let menu = self.render_menu(cx);
@@ -788,6 +874,7 @@ impl RenderOnce for Composer {
             })
             .relative()
             .children(menu)
+            .children(quotes)
             .children(attachments)
             .child(text_box)
             .child(
@@ -809,7 +896,48 @@ impl RenderOnce for Composer {
     }
 }
 
+/// `text` after `quotes`, each a Markdown block quote of its own, a blank
+/// line apart.
+fn with_quotes<'a>(quotes: impl IntoIterator<Item = &'a str>, text: &str) -> String {
+    let blocks = quotes.into_iter().map(|quote| {
+        quote
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    ">".to_owned()
+                } else {
+                    format!("> {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    blocks
+        .chain((!text.is_empty()).then(|| text.to_owned()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Whether `attachment` goes as its path, for the agent to read itself.
 fn by_path(attachment: &Attachment) -> bool {
     matches!(attachment, Attachment::File(file) if file.text().is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_quotes;
+
+    /// Each quote is a block quote of its own, every line marked, so a
+    /// blank line inside one doesn't end it.
+    #[test]
+    fn quotes_go_before_the_text_as_block_quotes() {
+        let cases: [(&[&str], &str, &str); 3] = [
+            (&[], "just text", "just text"),
+            (&["one\n\ntwo"], "why?", "> one\n>\n> two\n\nwhy?"),
+            (&["a", "b"], "", "> a\n\n> b"),
+        ];
+        for (quotes, text, sent) in cases {
+            assert_eq!(with_quotes(quotes.iter().copied(), text), sent);
+        }
+    }
 }

@@ -1114,9 +1114,10 @@ fn denials_and_plan_approvals_carry_text_for_the_model() {
 }
 
 /// A sent message renders as markdown; dragging across it selects the
-/// text, and copy puts it on the clipboard.
+/// text, which copy puts on the clipboard and "Add to prompt" quotes above
+/// the composer, leaving the text box as it was.
 #[test]
-fn a_sent_message_can_be_selected_and_copied() {
+fn a_sent_message_can_be_selected_copied_and_quoted() {
     let mut ui = Harness::start("select", Script::default());
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
         is_visible(window, "session-local-s1")
@@ -1146,6 +1147,32 @@ fn a_sent_message_can_be_selected_and_copied() {
         .cx
         .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
     assert_eq!(copied.as_deref(), Some("list files"));
+
+    ui.wait_until("the add to prompt button", |window, _, _| {
+        is_visible(window, "add-to-prompt")
+    });
+    ui.click("add-to-prompt");
+    ui.wait_until("the quote above the composer", |window, _, _| {
+        is_visible(window, "composer-quote-1") && !is_visible(window, "add-to-prompt")
+    });
+    assert_eq!(
+        ui.composer_text(),
+        "",
+        "the quote stays out of the text box"
+    );
+    ui.type_in("explain");
+    ui.shot("quoted");
+    let app = ui.app.clone();
+    let prompt = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        view.read(cx).composer_prompt(cx)
+    });
+    assert_eq!(prompt.text(), "> list files\n\nexplain");
+
+    ui.click("composer-quote-1-remove");
+    ui.wait_until("the quote removed", |window, _, _| {
+        !is_visible(window, "composer-quote-1")
+    });
 }
 
 /// One click on a code block's copy button puts its code, and only its
