@@ -329,17 +329,10 @@ impl Transcript {
         self.details.resize(entries.len(), Disclosure::Folded);
         self.worked.resize(turns, Disclosure::Folded);
         self.took.resize(turns, None);
-        let times = cx.global::<TurnTimes>();
         for turn in known..turns {
-            self.took[turn] = self
-                .prompt(turn, entries)
-                .and_then(|prompt| times.get(prompt.id()));
-        }
-        for turn in known..turns {
-            if self
-                .prompt(turn, entries)
-                .is_some_and(UserMessage::is_steer)
-            {
+            let prompt = self.prompt(turn, entries);
+            self.took[turn] = prompt.and_then(|prompt| cx.global::<TurnTimes>().get(prompt.id()));
+            if prompt.is_some_and(UserMessage::is_steer) {
                 self.steered(turn, entries, cx);
             }
         }
@@ -529,7 +522,12 @@ impl Transcript {
     /// A steer opened `turn` while another ran. The daemon's replay can't
     /// tell a steer from a prompt, so the steer opens a turn of its own, as
     /// it will when the session replays: the turn it joined finishes there,
-    /// and the running one is the steer's, timed from now.
+    /// and the running one is the steer's, timed from now. Two steers the
+    /// model read at once leave the first one's turn at about 0s.
+    ///
+    /// A steer that came while the session was being attached arrives
+    /// before [`Self::resume_turn`], so the turn it joined goes untimed and
+    /// the steer's counts from the turn's start.
     fn steered(&mut self, turn: usize, entries: &[Entry], cx: &mut App) {
         let Some(joined) = self.running.filter(|running| running.turn < turn) else {
             return;
