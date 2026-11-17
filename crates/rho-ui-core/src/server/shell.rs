@@ -72,15 +72,29 @@ impl ServerLink {
                 let (took, acks) = futures::channel::mpsc::unbounded();
                 let output = async move {
                     while let Some(frame) = receive.recv().await {
-                        if let Frame::Binary(bytes) = frame {
-                            let len = bytes.len();
-                            if printed.send(bytes).await.is_err() {
-                                // The reader went, and the terminal with it.
-                                return;
+                        match frame {
+                            Frame::Binary(bytes) => {
+                                let len = bytes.len();
+                                if printed.send(bytes).await.is_err() {
+                                    // The reader went, and the terminal with it.
+                                    return Ok(());
+                                }
+                                let _ = took.unbounded_send(ShellControl::Took { bytes: len });
                             }
-                            let _ = took.unbounded_send(ShellControl::Took { bytes: len });
+                            Frame::Text(json) => {
+                                return Err(match serde_json::from_str(&json) {
+                                    Ok(wire::ShellEnd::NotStarted(why)) => {
+                                        ShellError::NotStarted(why)
+                                    }
+                                    Ok(wire::ShellEnd::Stopped(why)) => ShellError::Stopped(why),
+                                    Err(error) => ShellError::Stopped(format!(
+                                        "rho-ui serve said something else: {error}"
+                                    )),
+                                })
+                            }
                         }
                     }
+                    Ok(())
                 };
                 let typed = futures::stream::poll_fn(|cx| requests.poll_recv(cx)).map(|request| {
                     match request {
@@ -110,10 +124,9 @@ impl ServerLink {
                 // The shell's output ending is how it ends; input that
                 // stops first only means the terminal stopped typing.
                 match futures::future::select(output, input).await {
-                    futures::future::Either::Left(((), _)) => {}
+                    futures::future::Either::Left((ended, _)) => ended,
                     futures::future::Either::Right(((), output)) => output.await,
                 }
-                Ok(())
             };
             futures::pin_mut!(ran, disowned);
             let ended = match futures::future::select(ran, disowned).await {

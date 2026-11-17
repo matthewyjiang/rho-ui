@@ -31,10 +31,15 @@ mod host_key;
 mod script;
 mod shell;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use rho_protocol::{Client, ClientHello, HelloResponse, Notifications};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub(crate) use config::Resolved;
 #[cfg(feature = "test-support")]
@@ -45,7 +50,7 @@ use connection::{Lease, Purpose};
 use crate::{
     daemon::{handshake, DaemonError, Machine},
     exec::on_io,
-    link::{Ending, Link, ScriptError},
+    link::{Link, ScriptError},
     server::wire,
     setup,
 };
@@ -220,40 +225,16 @@ impl SshLink {
     /// script.
     pub async fn relay_script(&self, input: Vec<u8>) -> Option<(Vec<u8>, wire::ScriptEnd)> {
         let lease = Arc::clone(&self.lease);
-        let ran = on_io(async move { script::sh(lease.connection(), &input).await }).await;
-        let not_started = |why: String| {
-            let end = wire::ScriptEnd {
-                ending: wire::Ending::NotStarted(why),
-                stderr: String::new(),
-            };
-            Some((Vec::new(), end))
-        };
-        let output = match ran {
-            Ok(Ok(output)) => output,
-            Ok(Err(ScriptError::Session(error))) | Err(error) => {
-                return not_started(error.to_string())
-            }
-            Ok(Err(_)) => unreachable!("`sh` fails only for want of a session"),
-        };
-        let ending = match output.ending {
-            Ending::Exited(code) => wire::Ending::Exited(code),
-            Ending::Killed(signal) => wire::Ending::Killed(signal),
-            Ending::NotStarted(why) => wire::Ending::NotStarted(why),
-            Ending::Refused => {
-                return not_started(format!("{}'s sshd wouldn't run sh", self.host()))
-            }
-            Ending::Cut => return None,
-        };
-        let end = wire::ScriptEnd {
-            ending,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        };
-        Some((output.stdout, end))
+        let ran = on_io(async move { script::sh(lease.connection(), &input).await })
+            .await
+            .and_then(|ran| ran);
+        crate::server::script_end(ran, self.host())
     }
 
     /// A stream to the Unix socket at `path` on the host, such as the rho
     /// daemon's, as `rho-ui serve` relays one for a browser
-    /// ([`wire::SOCKET`]).
+    /// ([`wire::SOCKET`]). It keeps the host's connection while open, as a
+    /// link does, so the scripts after it never sign in again.
     ///
     /// # Errors
     ///
@@ -264,6 +245,45 @@ impl SshLink {
     ) -> Result<impl AsyncRead + AsyncWrite + Send + Unpin + 'static, DaemonError> {
         let lease = Arc::clone(&self.lease);
         let path = path.to_owned();
-        on_io(async move { lease.connection().daemon(&path).await }).await?
+        let stream = on_io(async move { lease.connection().daemon(&path).await }).await??;
+        Ok(Leased {
+            stream,
+            _lease: Arc::clone(&self.lease),
+        })
+    }
+}
+
+/// A stream that keeps its host's connection while open
+/// ([`SshLink::open_socket`]).
+struct Leased<S> {
+    stream: S,
+    _lease: Arc<Lease>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Leased<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Leased<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 }

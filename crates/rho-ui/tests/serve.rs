@@ -22,8 +22,8 @@ use futures::{
 use rho_ui_core::{
     fake_daemon::{write_program, FakeDaemon, Script},
     fake_sshd::{ClientKey, FakeSshd, HostKey},
-    server::wire::{self, StateWrite},
-    Checkout, Daemon, DaemonError, DaemonTarget, RemoteShell, ServerTarget,
+    server::wire::{self, SettingsFile, StateWrite},
+    Checkout, Daemon, DaemonError, DaemonTarget, RemoteShell, ServerTarget, ShellError,
 };
 
 /// `rho-ui serve`, running until dropped.
@@ -306,7 +306,12 @@ fn the_page_shares_the_desktop_apps_settings_and_state() {
     let server = Server::start(&home);
 
     let shared = block_on(server.target().open_state()).expect("the state loads");
-    assert_eq!(shared.settings.as_deref(), Some("appearance = light\n"));
+    assert_eq!(
+        shared.settings,
+        SettingsFile::Text {
+            text: "appearance = light\n".to_owned()
+        }
+    );
     let mut copy = rusqlite::Connection::open_in_memory().expect("SQLite in memory");
     copy.deserialize_read_exact(
         rusqlite::MAIN_DB,
@@ -440,6 +445,16 @@ fn a_remote_machine_through_the_server_runs_sessions_scripts_and_shells_there() 
             printed.contains(&format!("\nhome={}\r\n", remote.display())),
             "{printed:?}"
         );
+        // A shell the machine won't start says why, as on the desktop,
+        // rather than closing as if it exited.
+        sshd.refuse_terminals();
+        let refused = link.open_shell(&remote, "xterm-256color", 80, 24);
+        match select(pin!(refused.ended.wait()), after(SHELL_BOUND)).await {
+            Either::Left((Err(ShellError::NotStarted(why)), _))
+                if why.contains("pseudo-terminal") => {}
+            Either::Left((other, _)) => panic!("not a refused pseudo-terminal: {other:?}"),
+            Either::Right(_) => panic!("the refused shell never ended"),
+        }
 
         daemon
             .new_session(&remote, Checkout::Local)
@@ -451,4 +466,32 @@ fn a_remote_machine_through_the_server_runs_sessions_scripts_and_shells_there() 
         2,
         "one connection for the daemon and scripts, one for terminals"
     );
+}
+
+/// A settings file that exists but can't be read, as one with bytes that
+/// aren't UTF-8, reaches the page as unreadable, and what the page saves
+/// never writes over it, as the desktop app never does.
+#[test]
+fn a_settings_file_the_server_cant_read_is_never_written_over() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let home = dir.path().join("home");
+    let config = home.join(".config/rho-ui");
+    std::fs::create_dir_all(&config).expect("a config folder");
+    let unreadable = b"appearance = light\nui_font = \xff\n";
+    std::fs::write(config.join("settings"), unreadable).expect("settings");
+    let server = Server::start(&home);
+
+    let shared = block_on(server.target().open_state()).expect("the state loads");
+    assert!(
+        matches!(&shared.settings, SettingsFile::Unreadable { why } if why.contains("settings")),
+        "{:?}",
+        shared.settings
+    );
+    shared.writer.write(StateWrite::Settings {
+        text: "appearance = dark\n".to_owned(),
+    });
+    drop(shared.writer);
+    block_on(shared.done.wait());
+    let settings = std::fs::read(config.join("settings")).expect("settings");
+    assert_eq!(settings, unreadable);
 }

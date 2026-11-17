@@ -28,7 +28,7 @@ The daemon keeps running after the app quits. Stop it with `rho daemon stop`.
 
 ```bash
 cargo xtask web                                  # the web build, into target/web
-cargo run -- serve [--port PORT] [--bind ADDRESS]
+cargo run -p rho-ui -- serve [--port PORT] [--bind ADDRESS]
 ```
 
 Open the URL it prints, which holds its token. `rho-ui serve`, which listens on 127.0.0.1:8765 unless told, does on this machine what the browser can't, so the page works as the desktop app here would: this machine's sessions and your remote machines', the same views, terminal included, and the same settings and remembered state, which the page and the desktop app share. From another machine, tunnel to it, as with `ssh -L 8765:127.0.0.1:8765 HOST`.

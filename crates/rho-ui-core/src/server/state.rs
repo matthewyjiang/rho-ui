@@ -9,7 +9,7 @@ use futures::{
 };
 
 use super::{
-    wire::{self, StateSnapshot, StateWrite},
+    wire::{self, SettingsFile, StateSnapshot, StateWrite},
     ws::{self, Frame},
     ServerTarget,
 };
@@ -22,8 +22,8 @@ use crate::{
 /// send changes to it.
 #[derive(Debug)]
 pub struct SharedState {
-    /// The settings file's text; `None` if there is none yet.
-    pub settings: Option<String>,
+    /// The settings file.
+    pub settings: SettingsFile,
     /// The state database's image, for SQLite to deserialize, in rollback
     /// journal mode, as an image in memory can't use a WAL.
     pub database: Vec<u8>,
@@ -47,6 +47,8 @@ impl StateWriter {
 }
 
 /// When the server is done with the shared state; see [`SharedState::done`].
+/// A browser holds its writer as long as the page is open, so there it
+/// resolves only when the connection went.
 #[derive(Debug)]
 pub struct StateDone(oneshot::Receiver<()>);
 
@@ -60,7 +62,8 @@ impl StateDone {
 
 impl ServerTarget {
     /// Loads the state on the server's machine, and keeps a connection to
-    /// send changes back on.
+    /// send changes back on. It is the server's own state, whatever
+    /// machine this target names.
     ///
     /// # Errors
     ///

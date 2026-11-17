@@ -36,7 +36,7 @@ use axum::{routing::get, Router};
 use rho_ui_core::{server::wire, DaemonError, SshLink, SshTarget};
 use serde::Deserialize;
 
-pub(crate) use self::{auth::Token, files::Web};
+use self::{auth::Token, files::Web};
 
 /// The port it listens on unless told: any free one would do, but one that
 /// stays put keeps a bookmark or a tunnel working across restarts.
@@ -109,9 +109,9 @@ async fn ssh(host: &str) -> Result<SshLink, DaemonError> {
 }
 
 /// The routes: the page's files, open to anyone, and the endpoints the
-/// page uses, behind the token.
-pub(crate) fn router(token: Arc<Token>, web: Web) -> Router {
-    let shared = Arc::new(state::Shared::open());
+/// page uses, behind the token, `shared` among them.
+fn router(token: Arc<Token>, web: Web, shared: Result<state::Shared, String>) -> Router {
+    let shared = shared.map(Arc::new);
     Router::new()
         .route(wire::SCRIPT, get(script::open))
         .route(wire::SOCKET, get(socket::open))
@@ -119,8 +119,8 @@ pub(crate) fn router(token: Arc<Token>, web: Web) -> Router {
         .route(
             wire::STATE,
             get(move |upgrade| {
-                let shared = Arc::clone(&shared);
-                async move { state::open(shared, upgrade) }
+                let opened = state::open(&shared, upgrade);
+                async move { opened }
             }),
         )
         .fallback_service(files::serve(web))
@@ -159,7 +159,11 @@ pub(crate) fn main(args: impl Iterator<Item = String>) -> ExitCode {
             "rho-ui serve: open http://{address}/#token={}",
             token.as_str()
         );
-        let served = axum::serve(listener, router(token, options.web))
+        let shared = state::Shared::open();
+        if let Err(why) = &shared {
+            eprintln!("rho-ui serve: {why}; the page won't share the desktop app's state");
+        }
+        let served = axum::serve(listener, router(token, options.web, shared))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })

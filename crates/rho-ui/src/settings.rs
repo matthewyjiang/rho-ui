@@ -13,7 +13,10 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{px, App, Global, SharedString, WindowAppearance};
 #[cfg(not(target_family = "wasm"))]
 use rho_ui_core::platform::{self, AppDir};
-use rho_ui_core::server::{wire::StateWrite, StateWriter};
+use rho_ui_core::server::{
+    wire::{SettingsFile, StateWrite},
+    StateWriter,
+};
 
 use crate::{
     forge::{CliPaths, ForgeCli},
@@ -193,20 +196,17 @@ impl Settings {
         let Some(path) = Self::file() else {
             return Self::default();
         };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Self {
-                saved: Saved::File(path),
-                ..parse(&text)
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Self {
+        match read(&path) {
+            SettingsFile::Missing => Self {
                 saved: Saved::File(path),
                 ..Self::default()
             },
-            Err(error) => {
-                eprintln!(
-                    "rho-ui: couldn't read {}: {error}; using the defaults, and not saving over it",
-                    path.display()
-                );
+            SettingsFile::Text { text } => Self {
+                saved: Saved::File(path),
+                ..parse(&text)
+            },
+            SettingsFile::Unreadable { why } => {
+                eprintln!("rho-ui: {why}; using the defaults, and not saving over it");
                 Self::default()
             }
         }
@@ -232,13 +232,24 @@ impl Settings {
         }
     }
 
-    /// The settings the server's machine keeps, `text` (`None` if it
-    /// has none yet), saved back through `writer`: a browser's.
+    /// The settings the server's machine keeps, `file`, saved back through
+    /// `writer`: a browser's. One that couldn't be read there keeps the
+    /// defaults, as [`Self::load`] does, and the console says why.
     #[cfg(target_family = "wasm")]
-    pub(crate) fn shared(text: Option<&str>, writer: StateWriter) -> Self {
-        Self {
-            saved: Saved::Server(writer),
-            ..text.map(parse).unwrap_or_default()
+    pub(crate) fn shared(file: SettingsFile, writer: StateWriter) -> Self {
+        match file {
+            SettingsFile::Missing => Self {
+                saved: Saved::Server(writer),
+                ..Self::default()
+            },
+            SettingsFile::Text { text } => Self {
+                saved: Saved::Server(writer),
+                ..parse(&text)
+            },
+            SettingsFile::Unreadable { why } => {
+                log::error!("rho-ui: {why}; using the defaults, and not saving over it");
+                Self::default()
+            }
         }
     }
 
@@ -343,6 +354,19 @@ impl Settings {
             }
         });
         cx.set_global(self);
+    }
+}
+
+/// Reads the settings file at `path`, telling a missing file from one
+/// that exists but can't be read, which nothing may write over.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn read(path: &std::path::Path) -> SettingsFile {
+    match std::fs::read_to_string(path) {
+        Ok(text) => SettingsFile::Text { text },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => SettingsFile::Missing,
+        Err(error) => SettingsFile::Unreadable {
+            why: format!("couldn't read {}: {error}", path.display()),
+        },
     }
 }
 

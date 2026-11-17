@@ -6,7 +6,10 @@ use std::{pin::pin, time::Duration};
 use russh::{ChannelMsg, ChannelReadHalf, Sig};
 
 use super::connection::Connection;
-use crate::link::{Ending, Output, ScriptError};
+use crate::{
+    link::{Ending, Output, ScriptError},
+    DaemonError,
+};
 
 /// Runs `input` with `sh -s` on the connection's host, within `deadline`
 /// if any, and returns what it printed. It runs only on a live
@@ -30,7 +33,8 @@ pub(super) async fn run(
             .await
             .map_err(|_| ScriptError::TimedOut(deadline))?,
         None => ran.await,
-    }?;
+    }
+    .map_err(ScriptError::Session)?;
     output.result()
 }
 
@@ -44,8 +48,8 @@ pub(super) async fn run(
 /// # Errors
 ///
 /// Fails if the connection is gone, or the host refuses a session.
-pub(super) async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, ScriptError> {
-    let (mut read, write) = connection.session().await.map_err(ScriptError::Session)?;
+pub(super) async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, DaemonError> {
+    let (mut read, write) = connection.session().await?;
     let channel = write.channel();
     let mut send = pin!(async {
         channel.exec(true, "sh -s").await?;

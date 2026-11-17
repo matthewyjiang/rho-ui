@@ -22,14 +22,13 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query,
     },
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use futures::{SinkExt as _, StreamExt as _};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use rho_ui_core::{
-    server::wire::{ShellControl, SHELL_WINDOW},
-    Link, RemoteShell, ShellInput, ShellOutput, SshLink,
+    server::wire::{ShellControl, ShellEnd, SHELL_WINDOW},
+    Link, RemoteShell, ShellEnded, ShellError, ShellInput, ShellOutput, SshLink,
 };
 use serde::Deserialize;
 use tokio::sync::{mpsc, Semaphore};
@@ -53,28 +52,35 @@ pub(crate) struct ShellQuery {
     machine: Option<String>,
 }
 
-/// Starts the shell before upgrading, so one that can't start here, or a
-/// remote machine that can't be reached, fails the WebSocket's handshake
-/// with why.
+/// Starts the shell, then relays it. One that can't start here, or on a
+/// remote machine that can't be reached, says why in a [`ShellEnd`].
 pub(crate) async fn open(Query(query): Query<ShellQuery>, upgrade: WebSocketUpgrade) -> Response {
     let shell = match &query.machine {
-        None => Shell::start(&query),
+        None => Shell::start(&query).map_err(|error| {
+            format!(
+                "rho-ui serve couldn't start a shell in {}: {error}",
+                query.dir.display()
+            )
+        }),
         Some(host) => super::ssh(host)
             .await
             .map(|link| Shell::remote(link, &query))
             .map_err(|error| error.to_string()),
     };
-    match shell {
-        Ok(shell) => upgrade.on_upgrade(move |socket| shell.relay(socket)),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "rho-ui serve couldn't start a shell in {}: {error}",
-                query.dir.display()
-            ),
-        )
-            .into_response(),
-    }
+    upgrade.on_upgrade(move |mut socket| async move {
+        match shell {
+            Ok(shell) => shell.relay(socket).await,
+            Err(why) => {
+                let _ = socket.send(end_message(&ShellEnd::NotStarted(why))).await;
+                let _ = socket.send(Message::Close(None)).await;
+            }
+        }
+    })
+}
+
+fn end_message(end: &ShellEnd) -> Message {
+    let json = serde_json::to_string(end).expect("a ShellEnd is plain JSON");
+    Message::Text(json.into())
 }
 
 /// A shell, under a pseudo-terminal here or on a remote machine, as the
@@ -82,14 +88,19 @@ pub(crate) async fn open(Query(query): Query<ShellQuery>, upgrade: WebSocketUpgr
 struct Shell {
     output: Output,
     keys: Keys,
-    hang_up: HangUp,
+    /// The shell here, to hang up on once the relay is done. One on a
+    /// remote machine hangs up as its control goes, with [`Keys`].
+    child: Option<Box<dyn Child + Send + Sync>>,
 }
 
 /// What the shell prints.
 enum Output {
     /// From the thread that reads the pseudo-terminal here.
     Here(mpsc::Receiver<Vec<u8>>),
-    There(ShellOutput),
+    There {
+        output: ShellOutput,
+        ended: ShellEnded,
+    },
 }
 
 impl Output {
@@ -97,7 +108,20 @@ impl Output {
     async fn recv(&mut self) -> Option<Vec<u8>> {
         match self {
             Self::Here(output) => output.recv().await,
-            Self::There(output) => output.recv().await,
+            Self::There { output, .. } => output.recv().await,
+        }
+    }
+
+    /// Once it is done printing, why it ended, if not by exiting: a remote
+    /// shell that couldn't start, or whose connection went.
+    async fn end(self) -> Option<ShellEnd> {
+        match self {
+            Self::Here(_) => None,
+            Self::There { ended, .. } => match ended.wait().await {
+                Ok(()) => None,
+                Err(ShellError::NotStarted(why)) => Some(ShellEnd::NotStarted(why)),
+                Err(ShellError::Stopped(why)) => Some(ShellEnd::Stopped(why)),
+            },
         }
     }
 }
@@ -114,6 +138,8 @@ enum Keys {
         input: ShellInput,
         /// Dropping it hangs up on the shell.
         control: rho_ui_core::ShellControl,
+        /// The ssh link to the machine, held while the shell runs.
+        _link: SshLink,
     },
 }
 
@@ -135,30 +161,6 @@ impl Keys {
                 let _ = master.resize(size(columns, rows));
             }
             Self::There { control, .. } => control.resize(columns, rows),
-        }
-    }
-}
-
-/// What ends the shell once the relay is done.
-enum HangUp {
-    Here(Box<dyn Child + Send + Sync>),
-    /// The ssh link to the machine, held while the shell runs. The shell
-    /// hangs up as [`Keys::There`]'s control goes.
-    There(SshLink),
-}
-
-impl HangUp {
-    fn hang_up(self) {
-        match self {
-            // A kill and a wait both block, a kill up to 200 ms for the
-            // shell to go, so a thread of its own reaps it.
-            Self::Here(mut child) => {
-                std::thread::spawn(move || {
-                    let _ = child.kill();
-                    child.wait()
-                });
-            }
-            Self::There(_link) => {}
         }
     }
 }
@@ -199,42 +201,47 @@ impl Shell {
                 master: pair.master,
                 input,
             },
-            hang_up: HangUp::Here(child),
+            child: Some(child),
         })
     }
 
     /// The login shell on the remote machine `link` reaches, in the
     /// query's folder, under a pseudo-terminal of its size there. One that
-    /// can't start there ends its output at once.
+    /// can't start there ends its output at once, and says why.
     fn remote(link: SshLink, query: &ShellQuery) -> Self {
         let RemoteShell {
             output,
             input,
             control,
-            ended: _,
+            ended,
         } = Link::Ssh(link.clone()).open_shell(&query.dir, &query.term, query.columns, query.rows);
         Self {
-            output: Output::There(output),
-            keys: Keys::There { input, control },
-            hang_up: HangUp::There(link),
+            output: Output::There { output, ended },
+            keys: Keys::There {
+                input,
+                control,
+                _link: link,
+            },
+            child: None,
         }
     }
 
-    /// Sends what the shell prints until it is done printing, then closes,
-    /// at most [`SHELL_WINDOW`] bytes ahead of what the client took; types
-    /// what comes in, and resizes on a [`ShellControl::Resize`]. The client
-    /// closing first hangs up on the shell.
+    /// Sends what the shell prints until it is done printing, then why it
+    /// ended if not by exiting, and closes, at most [`SHELL_WINDOW`] bytes
+    /// ahead of what the client took; types what comes in, and resizes on
+    /// a [`ShellControl::Resize`]. The client closing first hangs up on the
+    /// shell.
     async fn relay(self, socket: WebSocket) {
         let Self {
             mut output,
             keys,
-            hang_up,
+            child,
         } = self;
         let (mut send, mut receive) = socket.split();
         // A byte of the window each: taken as output goes, given back as
         // the client says it took it.
         let window = &Semaphore::new(SHELL_WINDOW);
-        let printed = async {
+        let printed = async move {
             while let Some(bytes) = output.recv().await {
                 let len = u32::try_from(bytes.len()).expect("a read is at most READ_BYTES");
                 let Ok(credit) = window.acquire_many(len).await else {
@@ -244,6 +251,9 @@ impl Shell {
                 if send.send(Message::Binary(bytes.into())).await.is_err() {
                     return;
                 }
+            }
+            if let Some(end) = output.end().await {
+                let _ = send.send(end_message(&end)).await;
             }
             let _ = send.send(Message::Close(None)).await;
         };
@@ -274,8 +284,15 @@ impl Shell {
             () = printed => {}
             () = typed => {}
         }
-        // Done either way: hang up on a shell still there.
-        hang_up.hang_up();
+        // Done either way: hang up on a shell still there. A kill and a
+        // wait both block, a kill up to 200 ms for the shell to go, so a
+        // thread of its own reaps it.
+        if let Some(mut child) = child {
+            std::thread::spawn(move || {
+                let _ = child.kill();
+                child.wait()
+            });
+        }
     }
 }
 

@@ -37,14 +37,17 @@ async fn run(socket: WebSocket, machine: Option<String>) {
     let Some(Ok(Message::Binary(input))) = receive.next().await else {
         return;
     };
-    let end = match machine {
-        None => run_here(&input, &mut send, &mut receive).await,
-        Some(host) => {
-            tokio::select! {
-                end = run_there(&host, input.to_vec(), &mut send) => end,
-                _ = receive.next() => return,
-            }
+    let ran = async {
+        match machine {
+            None => run_here(&input, &mut send).await,
+            Some(host) => run_there(&host, input.to_vec(), &mut send).await,
         }
+    };
+    // The client sends nothing more: whatever comes, or the end, means it
+    // went, and dropping `ran` stops the script.
+    let end = tokio::select! {
+        end = ran => end,
+        _ = receive.next() => return,
     };
     if let Some(end) = end {
         let json = serde_json::to_string(&end).expect("a ScriptEnd is plain JSON");
@@ -58,18 +61,9 @@ async fn run(socket: WebSocket, machine: Option<String>) {
 async fn run_here(
     input: &[u8],
     send: &mut (impl futures::Sink<Message> + Unpin),
-    receive: &mut (impl futures::Stream + Unpin),
 ) -> Option<ScriptEnd> {
     match start() {
-        Ok(child) => {
-            let ran = finish(child, input, send);
-            // The client sends nothing more: whatever comes, or the end,
-            // means it went, and dropping `ran` kills the script.
-            tokio::select! {
-                end = ran => end,
-                _ = receive.next() => None,
-            }
-        }
+        Ok(child) => finish(child, input, send).await,
         Err(error) => Some(not_started(format!("couldn't run sh: {error}"))),
     }
 }

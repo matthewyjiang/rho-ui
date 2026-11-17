@@ -58,8 +58,21 @@ pub enum Ending {
 /// as JSON; binary messages from the server are what it prints, at most
 /// [`SHELL_WINDOW`] bytes of it ahead of what the client said it took. The
 /// server closes when the shell exits, and hangs up on it when the client
-/// closes.
+/// closes. A shell that doesn't start, or whose machine's connection goes,
+/// ends with one text message from the server, a [`ShellEnd`] as JSON, as
+/// a failed handshake can't say why to a browser.
 pub const SHELL: &str = "/shell";
+
+/// Why a shell on [`SHELL`] ended other than by exiting.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellEnd {
+    /// It never ran: why, in words for people.
+    NotStarted(String),
+    /// It ran, then the connection to its machine went: why, in words for
+    /// people.
+    Stopped(String),
+}
 
 /// How many bytes of a [`SHELL`]'s output the server sends before the
 /// client says it took them. A browser can't hold back a WebSocket's
@@ -98,8 +111,27 @@ pub const STATE: &str = "/state";
 /// What `/state` sends first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
-    /// The settings file's text; `None` if there is none yet.
-    pub settings: Option<String>,
+    /// The settings file.
+    pub settings: SettingsFile,
+}
+
+/// The settings file, as read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SettingsFile {
+    /// There is none yet.
+    Missing,
+    /// Its text.
+    Text {
+        /// The text.
+        text: String,
+    },
+    /// It exists but couldn't be read, so nothing writes over it: why, in
+    /// words for people.
+    Unreadable {
+        /// Why.
+        why: String,
+    },
 }
 
 /// A change the page made to the shared state.

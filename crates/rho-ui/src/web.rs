@@ -94,7 +94,16 @@ async fn shared_state(server: &ServerTarget) -> (StateDb, Settings) {
         log::error!("rho-ui: the state database didn't load: {error}; nothing will be remembered");
         StateDb::in_memory()
     });
-    let settings = Settings::shared(shared.settings.as_deref(), shared.writer);
+    let settings = Settings::shared(shared.settings, shared.writer);
+    // The page holds its writer while open, so this ends only if the
+    // connection went.
+    let done = shared.done;
+    wasm_bindgen_futures::spawn_local(async move {
+        done.wait().await;
+        log::error!(
+            "rho-ui: the connection to rho-ui serve went; changes from now on aren't saved"
+        );
+    });
     (db, settings)
 }
 

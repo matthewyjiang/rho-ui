@@ -201,6 +201,39 @@ impl ServerLink {
     }
 }
 
+/// How `rho-ui serve` says a script it ran over ssh ended, `ran`, on the
+/// remote machine at `host`: the inverse of what [`ServerLink::script`]
+/// reads. `None` if the connection went with no word of how.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn script_end(
+    ran: Result<Output, DaemonError>,
+    host: &str,
+) -> Option<(Vec<u8>, wire::ScriptEnd)> {
+    let not_started = |why: String| {
+        let end = wire::ScriptEnd {
+            ending: wire::Ending::NotStarted(why),
+            stderr: String::new(),
+        };
+        Some((Vec::new(), end))
+    };
+    let output = match ran {
+        Ok(output) => output,
+        Err(error) => return not_started(error.to_string()),
+    };
+    let ending = match output.ending {
+        Ending::Exited(code) => wire::Ending::Exited(code),
+        Ending::Killed(signal) => wire::Ending::Killed(signal),
+        Ending::NotStarted(why) => wire::Ending::NotStarted(why),
+        Ending::Refused => return not_started(format!("{host}'s sshd wouldn't run sh")),
+        Ending::Cut => return None,
+    };
+    let end = wire::ScriptEnd {
+        ending,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    Some((output.stdout, end))
+}
+
 /// Connects to the daemon on `target`'s machine, starting it there first
 /// if none runs, and completes the handshake as `hello`. Runs on the I/O
 /// runtime.

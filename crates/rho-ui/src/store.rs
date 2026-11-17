@@ -272,7 +272,8 @@ impl StateDb {
                 statement.execute(params)?;
                 // The statement with its values in it, as SQLite writes them:
                 // integers, text quoted, blobs in hex. The schema has no REAL,
-                // which this would round to 15 digits.
+                // which this would round to 15 digits (see the test
+                // `no_column_holds_a_real_which_a_shared_copy_would_round`).
                 Ok(statement.expanded_sql())
             });
         match (written, &self.forward) {
@@ -358,7 +359,7 @@ fn set_up(connection: &mut Connection) -> rusqlite::Result<()> {
 /// The image says rollback journal, not WAL, as one in memory can't use
 /// a WAL: bytes 18 and 19 of the header are the write and read versions,
 /// 1 for rollback and 2 for WAL.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(unix, test))]
 pub(crate) fn image(connection: &mut Connection) -> rusqlite::Result<Vec<u8>> {
     let mut image = connection.serialize(rusqlite::MAIN_DB)?.to_vec();
     if let Some(versions) = image.get_mut(18..20) {
@@ -408,6 +409,22 @@ mod tests {
             |row| row.get::<_, String>(0),
         );
         assert!(old.is_empty(), "the old tables are gone");
+    }
+
+    /// A browser's copy sends its writes on as SQL that SQLite writes out
+    /// (`StateDb::execute`), which rounds a REAL to 15 digits: the server's
+    /// database would then hold another number than the page's.
+    #[test]
+    fn no_column_holds_a_real_which_a_shared_copy_would_round() {
+        let db = StateDb::in_memory();
+        let reals = db.query(
+            "SELECT m.name || '.' || c.name FROM sqlite_schema m, pragma_table_info(m.name) c \
+             WHERE m.type = 'table' AND (upper(c.type) LIKE '%REAL%' \
+             OR upper(c.type) LIKE '%FLOA%' OR upper(c.type) LIKE '%DOUB%')",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        assert!(reals.is_empty(), "REAL columns: {reals:?}");
     }
 
     /// A browser's copy starts as the server's database is, writes in its
