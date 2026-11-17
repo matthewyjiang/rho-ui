@@ -42,7 +42,7 @@ use crate::{
     pull_requests::{BranchId, CheckStatus, Found, Lookup, PrLinks, RepoId, Target},
     rho_install::Offer,
     right_panel::{Surface, TerminalShell, TerminalView, PROGRAM_POLL},
-    settings::{Appearance, Settings, UiScale},
+    settings::{Appearance, Settings, SmoothScroll, UiScale},
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
     store::{Key, StateDb},
@@ -2333,26 +2333,30 @@ fn a_wheel_notch_glides() {
         })
     };
     let position = point(px(700.), px(400.));
+    // Turns the wheel by `lines` over the transcript.
+    let wheel = |ui: &mut Harness, lines: f32| {
+        ui.act(|window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                ScrollEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0., lines)),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+    };
     let before = top(&mut ui);
-    ui.act(|window, cx| {
-        window.dispatch_event(
-            MouseMoveEvent {
-                position,
-                ..Default::default()
-            }
-            .to_platform_input(),
-            cx,
-        );
-        window.dispatch_event(
-            ScrollEvent {
-                position,
-                delta: ScrollDelta::Lines(point(0., 3.)),
-                ..Default::default()
-            }
-            .to_platform_input(),
-            cx,
-        );
-    });
+    wheel(&mut ui, 3.);
     assert_eq!(top(&mut ui), before, "the notch doesn't jump");
 
     // The glide runs on animation frames, which `wait_until` doesn't draw.
@@ -2377,22 +2381,41 @@ fn a_wheel_notch_glides() {
     // A high-resolution wheel's eighth of a notch glides too, rather than
     // passing through as a touchpad would.
     let before = top(&mut ui);
-    ui.act(|window, cx| {
-        window.dispatch_event(
-            ScrollEvent {
-                position,
-                delta: ScrollDelta::Lines(point(0., 0.375)),
-                ..Default::default()
-            }
-            .to_platform_input(),
-            cx,
-        );
-    });
+    wheel(&mut ui, 0.375);
     assert_eq!(
         top(&mut ui),
         before,
         "a fine wheel step doesn't jump either"
     );
+
+    // A desktop that asks for reduced motion, as Windows does with its
+    // animations off, stops the glide only while the setting follows it.
+    for (reduce_motion, smooth_scroll, glides) in [
+        (true, SmoothScroll::System, false),
+        (true, SmoothScroll::On, true),
+        (false, SmoothScroll::Off, false),
+    ] {
+        ui.cx.update(|cx| {
+            cx.set_reduce_motion(reduce_motion);
+            let mut settings = cx.global::<Settings>().clone();
+            settings.smooth_scroll = smooth_scroll;
+            settings.apply(cx);
+        });
+        // A click, here on the sidebar's empty part, stops the glide under
+        // way.
+        ui.act(|window, cx| {
+            let empty = point(px(120.), px(500.));
+            window.pointer_down(empty, MouseButton::Left, cx);
+            window.pointer_up(empty, MouseButton::Left, cx);
+        });
+        let before = top(&mut ui);
+        wheel(&mut ui, 3.);
+        assert_eq!(
+            top(&mut ui) == before,
+            glides,
+            "{smooth_scroll:?}, with reduced motion {reduce_motion}"
+        );
+    }
 }
 
 /// With no rho on this machine, the main pane offers to install it in

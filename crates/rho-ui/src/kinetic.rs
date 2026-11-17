@@ -8,6 +8,13 @@
 //! arriving its last speed carries on and decays. Both are replayed as
 //! ordinary scroll events, one per frame, so lists and text areas need no
 //! changes.
+//!
+//! Windows needs the wheel's glide too: GPUI reports a notch there as lines,
+//! at once. Its precision touchpads already carry on by themselves, through
+//! Direct Manipulation, and pass through here as pixels.
+//!
+//! [`SmoothScroll`](crate::settings::SmoothScroll) says whether any of this
+//! happens.
 
 use std::{
     cell::{Cell, RefCell},
@@ -19,6 +26,8 @@ use gpui_kit::{
     canvas, App, DispatchPhase, InputEvent as _, IntoElement, MouseDownEvent, Pixels, Point,
     ScrollDelta, ScrollEvent, ScrollSource, Styled as _, TouchPhase, Window,
 };
+
+use crate::settings::Settings;
 
 /// How a wheel notch's distance is spread over frames: the remainder decays
 /// with this time constant, so 95% lands within three of them (about
@@ -207,7 +216,7 @@ impl Kinetic {
             || self.replaying.get()
             || event.source == ScrollSource::Touch
             || modified
-            || cx.reduce_motion()
+            || !cx.global::<Settings>().smooth_scroll.glides(cx)
         {
             return;
         }
