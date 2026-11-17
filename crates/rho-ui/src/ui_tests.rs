@@ -2582,6 +2582,64 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
     ui.shot("steered");
 }
 
+/// Whether turn header `id` shows, counting up.
+fn working(window: &Window, id: &'static str) -> bool {
+    window
+        .try_find(id)
+        .filter(gpui_kit::test::ElementSnapshot::visible)
+        .and_then(|found| found.label().map(|label| label.starts_with("Working for ")))
+        .unwrap_or(false)
+}
+
+/// A steer opens a turn of its own, as the session's replay shows it: the
+/// turn it joined stops there, timed, and the running header moves under
+/// the steer, so one header counts up, not two.
+#[test]
+fn a_steer_moves_the_running_header_under_it() {
+    let script = Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    };
+    let mut ui = Harness::start_with("steer-turn", script, Shelves::default());
+    ui.wait_until("the running job", |window, _, _| {
+        is_visible(window, "session-local-tui-1")
+    });
+    ui.click("session-local-tui-1");
+    ui.wait_for_session("the turn under way", |session| {
+        session.state() == &RunState::Running
+    });
+    // Resumed, the header springs open on the test's clock.
+    ui.frame();
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the running header", |window, _, _| {
+        working(window, "worked-0")
+    });
+    ui.act(|window, cx| {
+        window.input("keep going", cx);
+        window.press("enter", cx);
+    });
+    ui.wait_for_session("the steer in the conversation", |session| {
+        matches!(session.entries().last(), Some(Entry::User(m)) if m.text() == "keep going")
+    });
+    ui.wait_until("one running header, under the steer", |window, _, _| {
+        working(window, "worked-1") && !working(window, "worked-0")
+    });
+    let joined = turn_took(&mut ui, 0).expect("the steered turn is timed");
+    assert!(
+        joined >= Duration::from_secs(90),
+        "the steered turn ran from its start, 90 s before the test: {joined:?}"
+    );
+    assert_eq!(turn_took(&mut ui, 1), None, "the steer's turn still runs");
+    ui.shot("steered");
+
+    ui.click("composer-stop");
+    ui.wait_for_session("the turn stopped", |session| !session.state().is_busy());
+    assert!(
+        turn_took(&mut ui, 1).is_some_and(|took| took < joined),
+        "the steer's turn is timed from the steer"
+    );
+}
+
 /// A turn that ends while its session is off screen leaves the row Done
 /// until the session is opened.
 #[test]

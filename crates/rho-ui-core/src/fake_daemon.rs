@@ -64,6 +64,7 @@
 //!   one rho's terminal UI started: it is listed, its job runs, and a steer
 //!   is read at once, answered, and ends the turn. The steer "wait" is
 //!   never read: it stays queued until withdrawn or the turn is cancelled.
+//!   The steer "keep going" is read, and the turn runs on unanswered.
 //! - Settings are shaped like rho's: four permission modes, three models,
 //!   three reasoning levels, and fast mode. Every session offers the slash
 //!   commands `compact` and `prompt:review` and the skills `pstack` and

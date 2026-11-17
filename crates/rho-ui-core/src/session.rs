@@ -259,6 +259,7 @@ impl ToolCall {
 pub struct UserMessage {
     id: String,
     prompt: Prompt,
+    steer: bool,
 }
 
 impl UserMessage {
@@ -275,6 +276,13 @@ impl UserMessage {
     /// Its images and files, in order.
     pub fn attachments(&self) -> &[Attachment] {
         self.prompt.attachments()
+    }
+
+    /// Whether it is a steer that applied while this client followed the
+    /// session live. The daemon's replay of a conversation does not mark
+    /// steers, so a replayed one reads as a prompt.
+    pub fn is_steer(&self) -> bool {
+        self.steer
     }
 }
 
@@ -936,6 +944,7 @@ impl Session {
                 content,
                 steer,
             } => {
+                let is_steer = steer.is_some();
                 if let Some(steer) = steer {
                     let steer = SteerId(steer.as_str().to_owned());
                     if self.withdraw_steer(&steer).is_none() {
@@ -945,6 +954,7 @@ impl Session {
                 Some(self.put_user(UserMessage {
                     id: message.as_str().to_owned(),
                     prompt: Prompt::from_wire(&content),
+                    steer: is_steer,
                 }))
             }
             SessionEvent::AgentMessageChunk { message, text } => {
