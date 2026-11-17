@@ -30,7 +30,9 @@ use rho_protocol::{
     ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
 };
 
-use super::{shell_card, shell_output, surface, FakeSession, State, Turn, KEY_AUTH, TOOL_IMAGE};
+use super::{
+    report, shell_card, shell_output, surface, FakeSession, State, Turn, KEY_AUTH, TOOL_IMAGE,
+};
 
 #[derive(Debug)]
 pub(super) struct Fake {
@@ -453,6 +455,13 @@ impl Service for Fake {
             session.state(JobState::Running);
             session.publish(echo(&turn_id, &params));
             session.answer(&format!("m-{turn_id}"), FIGURES);
+            return Ok(SessionPromptResponse { turn: turn_id });
+        }
+        if prompt == "report" {
+            session.turn = Some(turn);
+            session.state(JobState::Running);
+            session.publish(echo(&turn_id, &params));
+            session.stream_answer(&format!("m-{turn_id}"), &report());
             return Ok(SessionPromptResponse { turn: turn_id });
         }
         if let Some(shown) = Shown::by(&prompt) {

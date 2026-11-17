@@ -25,7 +25,7 @@ use gpui_kit::{
 use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{
-        subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
+        report, subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
         REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
@@ -2220,6 +2220,89 @@ fn a_long_reply_scrolled_back_keeps_its_height() {
         .update_window(ui.window, |_, window, cx| window.render_frame(cx))
         .expect("window is open");
     assert_eq!(height(&mut ui), Some(whole), "the reply comes back whole");
+}
+
+/// A long reply draws in parts, each one of the scroller's items, which it
+/// takes as it streams in. The turn after it shows under it all the same.
+#[test]
+fn a_long_reply_streams_in_as_parts() {
+    let mut ui = Harness::start("parts", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("report");
+    ui.wait_for_session("the report", |session| {
+        session.state() == &RunState::Idle
+            && matches!(session.entries().last(), Some(Entry::Agent(_)))
+    });
+    let entries = ui.session().entries().len();
+    assert!(
+        matches!(ui.session().entries().last(), Some(Entry::Agent(reply)) if reply.text() == report()),
+        "the whole report arrived"
+    );
+    let items = |ui: &mut Harness| {
+        let app = ui.app.clone();
+        ui.cx.update(|cx| {
+            let view = app.read(cx).active_session().expect("a session is open");
+            let scroller = view.read(cx).transcript().scroller().clone();
+            scroller.read(cx).item_count()
+        })
+    };
+    // The prompt is one item, and each of the report's parts another:
+    // streamed in, it parts where it does whole.
+    let parts = items(&mut ui) - 1;
+    assert!(parts > 2, "the report is in parts: {parts}");
+    assert_eq!(parts, crate::parts::split(&report()).len());
+    let end = SharedString::from(format!("reply-{}-{}", entries - 1, parts - 1));
+    ui.wait_until("the report's last part", |window, _, _| {
+        is_visible(window, end.clone())
+    });
+    ui.shot("report");
+
+    // A selection runs from one part into the next, as through one text:
+    // from the last line of the part before the last, to the end of the
+    // last part's first line.
+    let before = SharedString::from(format!("reply-{}-{}", entries - 1, parts - 2));
+    ui.act(|window, cx| {
+        let from = window.find(before.clone()).bounds();
+        let to = window.find(end.clone()).bounds();
+        window.drag(
+            gpui_kit::point(from.left() + px(1.), to.top() - px(20.)),
+            gpui_kit::point(to.right() - px(1.), to.top() + px(10.)),
+            cx,
+        );
+        window.press("secondary-c", cx);
+    });
+    ui.shot("selected");
+    let copied = ui
+        .cx
+        .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .expect("the selection was copied");
+    assert!(
+        copied.contains("could not reach.") && copied.ends_with("first of 5"),
+        "the end of one part and the start of the next: {copied:?}"
+    );
+
+    ui.send("figures");
+    ui.wait_for_session("the next reply", |session| {
+        session.state() == &RunState::Idle && session.entries().len() == entries + 2
+    });
+    assert_eq!(items(&mut ui), 1 + parts + 2, "a prompt and a short reply");
+    let prompt = SharedString::from(format!("user-{entries}"));
+    let reply = SharedString::from(format!("reply-{}", entries + 1));
+    ui.wait_until("the next turn under the report", |window, _, _| {
+        let top = |id: &SharedString| {
+            window
+                .try_find(id.clone())
+                .filter(gpui_kit::test::ElementSnapshot::visible)
+                .map(|element| element.bounds().top())
+        };
+        top(&prompt)
+            .zip(top(&reply))
+            .is_some_and(|(prompt, reply)| prompt < reply)
+    });
 }
 
 /// A wheel notch glides instead of jumping; `kinetic` owns how it eases.
