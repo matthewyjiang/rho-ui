@@ -240,6 +240,9 @@ fn a_daemon_through_the_server_runs_sessions_scripts_and_shells_on_its_machine()
         // the prompt may share a line with what follows it.
         let printed = String::from_utf8_lossy(&printed);
         assert!(printed.contains("size=30 100\r\n"), "{printed:?}");
+        // The folder as the shell resolves it: on macOS a temporary one is
+        // under `/var`, a link to `/private/var`.
+        let work = rho_ui_core::platform::canonicalize(&work).expect("the folder resolves");
         assert!(
             printed.contains(&format!("pwd={}\r\n", work.display())),
             "{printed:?}"
