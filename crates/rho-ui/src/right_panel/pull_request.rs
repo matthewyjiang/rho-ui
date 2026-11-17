@@ -10,6 +10,7 @@
 mod actions;
 mod checks;
 mod conversation;
+mod diagrams;
 mod header;
 mod link;
 
@@ -40,6 +41,7 @@ use self::{
     actions::Acting,
     checks::{check_counts, checks},
     conversation::{open_threads, Posting},
+    diagrams::DiagramState,
     header::{identity, toolbar, web_url},
     link::{link_button, LinkForm},
 };
@@ -83,6 +85,8 @@ pub(super) struct PullRequestSurface {
     /// The Markdown of the PR on screen, parsed once per text it has: its
     /// description under [`DESCRIPTION`], and each post under its URL.
     texts: HashMap<SharedString, (SharedString, Entity<TextViewState>)>,
+    /// The diagrams in those texts.
+    diagrams: DiagramState,
     /// The comment threads on the code the user opened or closed, by id:
     /// those resolved start closed, the rest open.
     flipped: HashSet<SharedString>,
@@ -127,6 +131,7 @@ impl PullRequestSurface {
             shows,
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
+            diagrams: DiagramState::new(),
             flipped: HashSet::new(),
             comment_box: None,
             posting: Posting::Idle,
@@ -238,7 +243,9 @@ impl PullRequestSurface {
     }
 
     /// Parses the Markdown of the PR on screen that changed, and drops
-    /// what it no longer has.
+    /// what it no longer has. Its diagrams are drawn while it shows: again
+    /// when any changed, and not while hidden, as a hidden tab's backlog
+    /// would hold up the diagrams of the PR on screen.
     fn sync_texts(&mut self, cx: &mut Context<'_, Self>) {
         let wanted: Vec<(SharedString, SharedString)> = self
             .target(cx)
@@ -261,41 +268,53 @@ impl PullRequestSurface {
             })
             .unwrap_or_default();
         let mut parsed = std::mem::take(&mut self.texts);
+        let mut changed = false;
+        let order = wanted.iter().map(|(_, text)| text.clone()).collect();
         for (key, text) in wanted {
             let state = match parsed.remove(&key) {
                 Some((shown, state)) if shown == text => state,
                 Some((_, state)) => {
+                    changed = true;
                     state.update(cx, |state, cx| state.set_text(&text, cx));
                     state
                 }
-                None => cx.new(|cx| TextViewState::markdown(&text, cx)),
+                None => {
+                    changed = true;
+                    cx.new(|cx| TextViewState::markdown(&text, cx))
+                }
             };
             self.texts.insert(key, (text, state));
         }
+        match self.visibility {
+            Visibility::Hidden => self.diagrams.stop(),
+            Visibility::Shown if changed || self.diagrams.stopped() => {
+                self.draw_diagrams(order, cx);
+            }
+            Visibility::Shown => {}
+        }
     }
 
-    /// `key`'s Markdown, as [`Self::texts`] holds it.
+    /// `key`'s Markdown, as [`Self::texts`] holds it, with its diagrams and
+    /// formulas drawn.
     fn text(&self, key: &str) -> Option<AnyElement> {
         let (_, state) = self.texts.get(key)?;
-        Some(
-            div()
-                .text_sm()
-                // Its links are anyone's: only web ones open, as Kit opens
-                // links without a handler.
-                .child(TextView::new(state).on_link_click(|url, event, _, cx| {
-                    let opens = match event {
-                        ClickEvent::Mouse(click) => {
-                            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
-                        }
-                        ClickEvent::Keyboard(_) => true,
-                        ClickEvent::Touch(click) => !click.long_press,
-                    };
-                    if let Some(url) = web_url(url).filter(|_| opens) {
-                        cx.open_url(&url);
+        let view = TextView::new(state)
+            .markdown_extensions(self.diagrams.extensions())
+            // Its links are anyone's: only web ones open, as Kit opens
+            // links without a handler.
+            .on_link_click(|url, event, _, cx| {
+                let opens = match event {
+                    ClickEvent::Mouse(click) => {
+                        matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
                     }
-                }))
-                .into_any_element(),
-        )
+                    ClickEvent::Keyboard(_) => true,
+                    ClickEvent::Touch(click) => !click.long_press,
+                };
+                if let Some(url) = web_url(url).filter(|_| opens) {
+                    cx.open_url(&url);
+                }
+            });
+        Some(div().text_sm().child(view).into_any_element())
     }
 
     /// The PR: what it is, then once its detail is read, its checks and
