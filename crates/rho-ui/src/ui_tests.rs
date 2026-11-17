@@ -1160,7 +1160,8 @@ fn a_sent_message_can_be_selected_copied_and_quoted() {
         "",
         "the quote stays out of the text box"
     );
-    ui.type_in("explain");
+    // The button put the keyboard in the composer.
+    ui.act(|window, cx| window.input("explain", cx));
     ui.shot("quoted");
     let app = ui.app.clone();
     let prompt = ui.cx.update(|cx| {

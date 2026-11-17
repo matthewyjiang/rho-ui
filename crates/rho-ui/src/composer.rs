@@ -299,12 +299,11 @@ impl ComposerState {
     }
 
     /// Quotes `text` above the composer's text box, after any quoted
-    /// already. Blank text adds nothing.
+    /// already; see [`trim_quote`]. Blank text adds nothing.
     pub(crate) fn add_quote(&mut self, text: &str, cx: &mut Context<'_, Self>) {
-        let text = text.trim();
-        if text.is_empty() {
+        let Some(text) = trim_quote(text) else {
             return;
-        }
+        };
         self.next_id += 1;
         self.quotes.push(Quote {
             id: self.next_id,
@@ -346,6 +345,13 @@ impl ComposerState {
             let typed = self.input.read(cx).value();
             let text = if typed.is_empty() {
                 text
+            } else if text
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with('>'))
+            {
+                // A blank line, or the typed text would join the quote.
+                format!("{text}\n\n{typed}")
             } else {
                 format!("{text}\n{typed}")
             };
@@ -847,9 +853,10 @@ impl RenderOnce for Composer {
         };
         let drop_into = self.state.clone();
         // Kit's remove control rides 6px, 0.375 rem at the default rem,
-        // above and right of each card, in room the card keeps for it. Above
-        // the cards, that room is part of the box's 0.75 rem padding.
-        let top = if attachments.is_some() {
+        // above and right of each card, in room the card keeps for it. When
+        // the cards come first, that room is part of the box's 0.75 rem
+        // padding.
+        let top = if quotes.is_none() && attachments.is_some() {
             rems(0.375)
         } else {
             rems(0.75)
@@ -896,8 +903,17 @@ impl RenderOnce for Composer {
     }
 }
 
-/// `text` after `quotes`, each a Markdown block quote of its own, a blank
-/// line apart.
+/// `text` without the blank lines around it, its first line keeping its
+/// indent, as code does; `None` if it is blank.
+fn trim_quote(text: &str) -> Option<&str> {
+    let first = text.find(|c: char| !c.is_whitespace())?;
+    let start = text[..first].rfind('\n').map_or(0, |newline| newline + 1);
+    Some(text[start..].trim_end())
+}
+
+/// `text` and `quotes`, each a Markdown block quote of its own, a blank
+/// line apart. The quotes go first, unless `text` is a slash command, which
+/// rho runs only from the start of a prompt.
 fn with_quotes<'a>(quotes: impl IntoIterator<Item = &'a str>, text: &str) -> String {
     let blocks = quotes.into_iter().map(|quote| {
         quote
@@ -912,10 +928,13 @@ fn with_quotes<'a>(quotes: impl IntoIterator<Item = &'a str>, text: &str) -> Str
             .collect::<Vec<_>>()
             .join("\n")
     });
-    blocks
-        .chain((!text.is_empty()).then(|| text.to_owned()))
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let text = (!text.is_empty()).then(|| text.to_owned());
+    let blocks: Vec<String> = if text.as_deref().is_some_and(|text| text.starts_with('/')) {
+        text.into_iter().chain(blocks).collect()
+    } else {
+        blocks.chain(text).collect()
+    };
+    blocks.join("\n\n")
 }
 
 /// Whether `attachment` goes as its path, for the agent to read itself.
@@ -925,19 +944,34 @@ fn by_path(attachment: &Attachment) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::with_quotes;
+    use super::{trim_quote, with_quotes};
 
     /// Each quote is a block quote of its own, every line marked, so a
-    /// blank line inside one doesn't end it.
+    /// blank line inside one doesn't end it; a slash command stays first.
     #[test]
     fn quotes_go_before_the_text_as_block_quotes() {
-        let cases: [(&[&str], &str, &str); 3] = [
+        let cases: [(&[&str], &str, &str); 4] = [
             (&[], "just text", "just text"),
             (&["one\n\ntwo"], "why?", "> one\n>\n> two\n\nwhy?"),
             (&["a", "b"], "", "> a\n\n> b"),
+            (&["a"], "/review", "/review\n\n> a"),
         ];
         for (quotes, text, sent) in cases {
             assert_eq!(with_quotes(quotes.iter().copied(), text), sent);
+        }
+    }
+
+    /// A selection loses the blank lines around it, not the indent of its
+    /// first line.
+    #[test]
+    fn a_quote_keeps_its_first_indent() {
+        let cases = [
+            ("  \n\n", None),
+            ("\n  let x = 1;\n  x\n\n", Some("  let x = 1;\n  x")),
+            ("plain ", Some("plain")),
+        ];
+        for (selected, quoted) in cases {
+            assert_eq!(trim_quote(selected), quoted, "{selected:?}");
         }
     }
 }

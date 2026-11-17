@@ -34,7 +34,7 @@ use std::{
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::base::TextSelection;
+use gpui_kit::base::{Positioner, TextSelection};
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants as _},
@@ -47,9 +47,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    anchored, deferred, div, point, px, rems, Anchor, AnyElement, App, AppContext as _, Context,
-    Entity, EventEmitter, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement,
-    MouseButton, MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString,
+    deferred, div, point, px, rems, Anchor, AnyElement, App, AppContext as _, Context, Entity,
+    EventEmitter, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, WeakEntity,
     Window,
 };
@@ -191,9 +191,6 @@ struct Selected {
     /// Where the pointer let go, in window coordinates: the button floats
     /// above it.
     at: Point<Pixels>,
-    /// [`SessionView::scroll_top`] then: once the transcript scrolls, the
-    /// button no longer sits by the text, so it goes.
-    scroll: (usize, f32),
 }
 
 impl SessionView {
@@ -1171,13 +1168,6 @@ impl SessionView {
         self.after_change(window, cx);
     }
 
-    /// How far down the transcript is scrolled: the first of the scroller's
-    /// items on screen, and the pixels from its top.
-    pub(crate) fn scroll_top(&self, cx: &App) -> (usize, f32) {
-        let top = self.transcript.scroller().read(cx).logical_scroll_top();
-        (top.item_ix, f32::from(top.offset_in_item))
-    }
-
     /// Offers what is selected in the window as a quote, once a press in the
     /// transcript lets go: a click that selects nothing takes the offer back.
     fn offer_quote(
@@ -1187,25 +1177,25 @@ impl SessionView {
         cx: &mut Context<'_, Self>,
     ) {
         let text = TextSelection::selected_text(window, cx);
-        let selected = (!self.is_subagent() && !text.trim().is_empty()).then(|| Selected {
+        self.selected = (!text.trim().is_empty()).then_some(Selected {
             text,
             at: event.position,
-            scroll: self.scroll_top(cx),
         });
-        if selected.is_some() || self.selected.is_some() {
-            self.selected = selected;
+        cx.notify();
+    }
+
+    /// Takes back the offer of a quote, as when the transcript scrolls away
+    /// from the button.
+    fn dismiss_quote(&mut self, cx: &mut Context<'_, Self>) {
+        if self.selected.take().is_some() {
             cx.notify();
         }
     }
 
-    /// The "Add to prompt" button over the transcript, while text selected
-    /// there is offered and the transcript hasn't scrolled since. GPUI Kit
-    /// has no popover placed at a point, so it floats in GPUI's `anchored`.
+    /// The "Add to prompt" button floating over the transcript, while text
+    /// selected there is offered.
     fn render_add_to_prompt(&self, cx: &mut Context<'_, Self>) -> Option<impl IntoElement> {
         let selected = self.selected.as_ref()?;
-        if selected.scroll != self.scroll_top(cx) {
-            return None;
-        }
         let text = selected.text.clone();
         let button = Button::new("add-to-prompt")
             .small()
@@ -1220,22 +1210,19 @@ impl SessionView {
                 });
                 cx.notify();
             }));
+        // Its bottom left corner 8px above the pointer, kept 8px inside the
+        // window.
+        let corner = selected.at - point(px(0.), px(8.));
         Some(deferred(
-            anchored()
-                .position(selected.at)
-                .anchor(Anchor::BottomLeft)
-                .offset(point(px(0.), px(-8.)))
-                .snap_to_window_with_margin(px(8.))
+            Positioner::corner(Anchor::BottomLeft, corner)
+                .margin(px(8.))
+                .occlude()
                 .child(
                     div()
                         .id("add-to-prompt-popover")
-                        .occlude()
                         .popover_style(cx)
                         .p_0p5()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.selected = None;
-                            cx.notify();
-                        }))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_quote(cx)))
                         .child(button),
                 ),
         ))
@@ -1289,11 +1276,18 @@ impl SessionView {
         div()
             .flex_1()
             .min_h_0()
-            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                if event.button == MouseButton::Left {
-                    this.offer_quote(event, window, cx);
-                }
-            }))
+            // A subagent's session has no composer to quote into.
+            .when(!self.is_subagent(), |this| {
+                this.capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    if event.button == MouseButton::Left {
+                        this.offer_quote(event, window, cx);
+                    }
+                }))
+                // The list doesn't stop a scroll's propagation, so this
+                // sees each the user makes; following a streaming reply
+                // makes no scroll event, and leaves the button.
+                .on_scroll(cx.listener(|this, _, _, cx| this.dismiss_quote(cx)))
+            })
             .children(self.render_add_to_prompt(cx))
             .child(
                 MessageScroller::new(
@@ -1587,6 +1581,13 @@ impl SessionView {
     /// The transcript, for UI tests.
     pub(crate) fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// How far down the transcript is scrolled: the first of the scroller's
+    /// items on screen, and the pixels from its top, for UI tests.
+    pub(crate) fn scroll_top(&self, cx: &App) -> (usize, f32) {
+        let top = self.transcript.scroller().read(cx).logical_scroll_top();
+        (top.item_ix, f32::from(top.offset_in_item))
     }
 }
 
