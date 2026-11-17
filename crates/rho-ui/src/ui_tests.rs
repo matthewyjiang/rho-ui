@@ -7,6 +7,7 @@
 //! `SELECT_LAVAPIPE`); on macOS, on Metal.
 
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
@@ -559,6 +560,18 @@ impl Harness {
             result = Some(act(&mut TestInput::new(handler, window), cx));
         });
         result.expect("the input method ran")
+    }
+
+    /// Opens the fake daemon's saved session "old", and waits for its
+    /// replay of more than 20 entries to catch up.
+    fn open_old_session(&mut self) {
+        self.wait_until("saved sessions", |window, _, _| {
+            is_visible(window, "session-local-old")
+        });
+        self.click("session-local-old");
+        self.wait_for_session("the replayed history", |session| {
+            !session.is_replaying() && session.entries().len() > 20
+        });
     }
 
     /// Waits for the active session to satisfy `ready`.
@@ -2163,6 +2176,57 @@ fn a_turn_started_elsewhere_is_its_own_turn_and_leaves_typing_alone() {
     assert_eq!(typed, "half a thought", "the message being typed is intact");
 }
 
+/// A saved session's replay goes into the session before any of its rows
+/// are built: the transcript doesn't grow row by row as history arrives,
+/// which drew every event and made a long session slow to open. It is
+/// built once, and opens at its end.
+#[test]
+fn a_replayed_session_builds_its_transcript_once() {
+    let script = Script {
+        replay_turns: 20,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("replay-once", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-old")
+    });
+    // Clicked without running tasks, so no event is applied before the
+    // scroller is watched.
+    ui.cx
+        .update_window(ui.window, |_, window, cx| {
+            window.click("session-local-old", cx);
+        })
+        .expect("window is open");
+    let app = ui.app.clone();
+    let counts: Rc<RefCell<Vec<usize>>> = Rc::default();
+    let _watch = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        let scroller = view.read(cx).transcript().scroller().clone();
+        let counts = Rc::clone(&counts);
+        cx.observe(&scroller, move |scroller, cx| {
+            counts.borrow_mut().push(scroller.read(cx).item_count());
+        })
+    });
+    ui.wait_for_session("the replayed history", |session| {
+        !session.is_replaying() && session.entries().len() > 20
+    });
+    let (built, last) = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        let view = view.read(cx);
+        let built = view.transcript().scroller().read(cx).item_count();
+        (built, view.session().entries().len() - 1)
+    });
+    let counts = counts.borrow().clone();
+    assert!(
+        !counts.is_empty() && counts.iter().all(|&count| count == built),
+        "the list went from empty to all {built} items at once: {counts:?}"
+    );
+    let reply = SharedString::from(format!("reply-{last}"));
+    ui.wait_until("the last reply", |window, _, _| {
+        is_visible(window, reply.clone())
+    });
+}
+
 /// A long reply scrolled away and back draws whole on the first frame it
 /// shows again, so the transcript above it doesn't jump.
 #[test]
@@ -2173,13 +2237,7 @@ fn a_long_reply_scrolled_back_keeps_its_height() {
         ..Script::default()
     };
     let mut ui = Harness::start("long-reply", script);
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-local-old")
-    });
-    ui.click("session-local-old");
-    ui.wait_for_session("the replayed history", |session| {
-        session.state() == &RunState::Idle && session.entries().len() > 20
-    });
+    ui.open_old_session();
     let app = ui.app.clone();
     let (view, last) = ui.cx.update(|cx| {
         let view = app.read(cx).active_session().expect("a session is open");
@@ -2315,13 +2373,7 @@ fn a_wheel_notch_glides() {
         ..Script::default()
     };
     let mut ui = Harness::start("glide", script);
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-local-old")
-    });
-    ui.click("session-local-old");
-    ui.wait_for_session("the replayed history", |session| {
-        session.state() == &RunState::Idle && session.entries().len() > 20
-    });
+    ui.open_old_session();
     let top = |ui: &mut Harness| {
         let app = ui.app.clone();
         ui.cx.update(|cx| {

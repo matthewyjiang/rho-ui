@@ -102,9 +102,12 @@ pub(crate) enum SessionEvent {
 
 /// Whether the session is usable yet.
 pub(crate) enum Loading {
-    /// A new session, or a saved one the daemon has attached.
+    /// A new session, or a saved one whose replay has caught up.
     Ready,
-    /// The attach to a saved session has not answered yet.
+    /// The attach to a saved session has not answered yet, or its replay
+    /// has not caught up: its rows wait for the whole replay. Only
+    /// `after_change` ends it, which the event that catches up and the
+    /// attach's answer both reach.
     Attaching,
     /// The attach failed.
     Failed(String),
@@ -178,8 +181,8 @@ pub(crate) struct SessionView {
 impl EventEmitter<SessionEvent> for SessionView {}
 
 impl SessionView {
-    /// A saved session starts as [`Loading::Attaching`] until
-    /// [`Self::attached`].
+    /// A saved session starts as [`Loading::Attaching`] until its replay
+    /// has caught up.
     pub(crate) fn new(
         daemon: Daemon,
         mut session: Session,
@@ -426,8 +429,7 @@ impl SessionView {
     /// for that turn too.
     pub(crate) fn can_close(&self, cx: &App) -> bool {
         let session = &self.session;
-        !matches!(self.loading, Loading::Attaching)
-            && !session.is_replaying()
+        !session.is_replaying()
             && !session.state().is_busy()
             && session.inputs().is_empty()
             && session.background().is_empty()
@@ -510,9 +512,16 @@ impl SessionView {
         cx: &mut Context<'_, Self>,
     ) {
         let asked = !self.session.inputs().is_empty();
+        let changed = self.session.apply(update);
+        // A saved session's history goes into the session alone, with no
+        // redraw per event; the event that catches up builds the
+        // transcript once, in `after_change`.
+        if self.session.is_replaying() && matches!(self.loading, Loading::Attaching) {
+            return;
+        }
         // The session names the entry it changed; only its row is remeasured.
         // A new entry gets its row in `after_change`.
-        if let Some(ix) = self.session.apply(update) {
+        if let Some(ix) = changed {
             self.transcript.changed(self.session.entries(), ix, cx);
         }
         // A turn that ended before reading a steer dropped it.
@@ -541,8 +550,8 @@ impl SessionView {
                     .turn_elapsed()
                     .filter(|_| self.busy_since.is_none())
                     .and_then(|elapsed| Instant::now().checked_sub(elapsed));
+                // Ready once the replay has caught up; see `after_change`.
                 self.session.attached(attached);
-                self.loading = Loading::Ready;
             }
             Err(error) => self.loading = Loading::Failed(error.to_string()),
         }
@@ -577,17 +586,26 @@ impl SessionView {
     /// Brings the scroller, settings, timers and sidebar up to date with
     /// `session`.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some(from) = self.session.take_removed() {
-            self.transcript.truncate(from, cx);
+        let replaying = self.session.is_replaying();
+        if !replaying && matches!(self.loading, Loading::Attaching) {
+            self.loading = Loading::Ready;
         }
-        self.transcript.sync(self.session.entries(), cx);
-        self.surfaces.sync(&mut self.session, window, cx);
-        self.transcript.set_delay(self.session.delay());
+        // A saved session's rows are built only once its replay is all
+        // there, so a long session opens at its end rather than drawing as
+        // it replays. A new one's replay is short, and builds as it comes.
+        if !matches!(self.loading, Loading::Attaching) {
+            if let Some(from) = self.session.take_removed() {
+                self.transcript.truncate(from, cx);
+            }
+            self.transcript.sync(self.session.entries(), cx);
+            self.surfaces.sync(&mut self.session, window, cx);
+            self.transcript.set_delay(self.session.delay());
+        }
         self.sync_settings(window, cx);
         self.sync_card(window, cx);
         // Until the attachment has caught up, the session's state is the
         // conversation's past: no turn starts or ends in it now.
-        if self.session.is_replaying() {
+        if replaying {
             cx.notify();
             return;
         }
@@ -1152,7 +1170,8 @@ impl SessionView {
     }
 
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> AnyElement {
-        if self.session.entries().is_empty() {
+        // A replaying session may have entries already, but no rows yet.
+        if !matches!(self.loading, Loading::Ready) || self.session.entries().is_empty() {
             let placeholder = Empty::new();
             return match &self.loading {
                 Loading::Attaching => placeholder.header(
