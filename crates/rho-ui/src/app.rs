@@ -53,6 +53,7 @@ use crate::{
     settings_view,
     sidebar::{ResizeSidebar, SidebarEvent, SidebarModels, SidebarState, SidebarView},
     workspaces::{self, WorkspaceRef, Workspaces},
+    worktrees::Worktrees,
     NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
 };
 
@@ -213,6 +214,8 @@ pub(crate) struct RhoApp {
     /// The auth profiles of each connected machine, for Settings and the
     /// sessions that need a sign-in.
     auths: Entity<Auths>,
+    /// The session worktrees of each connected machine, for Settings.
+    worktrees: Entity<Worktrees>,
     /// Each machine's rho, apart from its daemon: installing and updating.
     installs: Entity<Installs>,
     /// The forge CLIs on each machine, for Settings and pull requests.
@@ -321,6 +324,7 @@ impl RhoApp {
             connections: Vec::new(),
             rho_settings: cx.new(|_| RhoSettings::default()),
             auths: cx.new(|_| Auths::default()),
+            worktrees: cx.new(|_| Worktrees::default()),
             installs,
             forges,
             prs,
@@ -395,6 +399,8 @@ impl RhoApp {
                 .update(cx, |settings, cx| settings.forget(&gone.machine, cx));
             self.auths
                 .update(cx, |auths, cx| auths.forget(&gone.machine, cx));
+            self.worktrees
+                .update(cx, |worktrees, cx| worktrees.forget(&gone.machine, cx));
             self.forges
                 .update(cx, |forges, cx| forges.forget(&gone.machine, cx));
             self.forget_sessions(&gone.machine, window, cx);
@@ -459,6 +465,8 @@ impl RhoApp {
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
+        self.worktrees
+            .update(cx, |worktrees, cx| worktrees.forget(machine, cx));
         self.installs
             .update(cx, |installs, cx| installs.set_upgrade(machine, None, cx));
         self.next_epoch += 1;
@@ -549,6 +557,9 @@ impl RhoApp {
         });
         self.auths
             .update(cx, |auths, cx| auths.connected(machine, daemon.clone(), cx));
+        self.worktrees.update(cx, |worktrees, cx| {
+            worktrees.connected(machine, daemon.clone(), cx);
+        });
         self.installs
             .update(cx, |installs, cx| installs.check(machine, cx));
         let jobs_task = cx.spawn({
@@ -631,6 +642,8 @@ impl RhoApp {
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
+        self.worktrees
+            .update(cx, |worktrees, cx| worktrees.forget(machine, cx));
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
         self.installs.update(cx, |installs, cx| {
@@ -822,6 +835,8 @@ impl RhoApp {
             machines: self.machines.clone(),
             rho_settings: self.rho_settings.clone(),
             auths: self.auths.clone(),
+            worktrees: self.worktrees.clone(),
+            sidebar: self.sidebar.clone(),
             workspaces: self.workspaces.clone(),
             forges: self.forges.clone(),
             installs: self.installs.clone(),

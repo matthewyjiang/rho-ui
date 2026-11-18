@@ -59,6 +59,9 @@ use crate::{
 };
 
 mod auth;
+mod worktrees;
+
+pub use worktrees::ReportedWorktree;
 
 /// How to reach the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]

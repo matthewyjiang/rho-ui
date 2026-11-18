@@ -32,7 +32,7 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached,
-    PendingUpgrade, SessionId, SessionSummary, SurfaceActionError, Unsteered,
+    PendingUpgrade, ReportedWorktree, SessionId, SessionSummary, SurfaceActionError, Unsteered,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -58,6 +58,9 @@ pub use rho_protocol::{
     AuthKind, AuthStatus, AuthSummary, CredentialStoreKind, CredentialStoreStatus, LoginId,
     LoginOutcome, LoginPrompt, StoreSelectedBy, UncheckedKey, UncheckedReason,
 };
+/// What [`Daemon::check_worktrees`] and [`Daemon::prune_worktrees`] report
+/// of each session worktree, as rho-protocol has it.
+pub use rho_protocol::{SessionWorktree, WorktreeVerdict};
 pub use server::{ServerLink, ServerTarget};
 pub use session::{
     Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,

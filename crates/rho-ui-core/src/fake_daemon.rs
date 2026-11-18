@@ -108,14 +108,14 @@ use rho_protocol::{
         BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, JobId, JobKind,
         JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef, PendingUpgrade,
         PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions, Replay, Seq,
-        SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams, SteerId, StreamId,
-        ToolCallId, ToolCallUpdate, TurnId,
+        SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams, SessionWorktree,
+        SteerId, StreamId, ToolCallId, ToolCallUpdate, TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
     DetachReason, ErrorCode, InputRequest, PermissionMode, PlanEntry, PlanStatus, Published,
     Publisher, Question, RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent,
-    Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome,
+    Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome, WorktreeReport, WorktreeVerdict,
 };
 use serde_json::{json, Value};
 use tokio::runtime::Runtime;
@@ -432,6 +432,45 @@ impl FakeDaemon {
     /// How many worktrees the daemon has added for new sessions.
     pub fn worktrees(&self) -> usize {
         self.service.lock().worktrees
+    }
+
+    /// Puts a session worktree of "/w/a" on `branch` on disk, added for
+    /// `session` (one the daemon lists) or for a job it no longer lists,
+    /// which `rho/worktree/prune` finds to be `verdict`. A prune that isn't
+    /// a dry run removes it if that is [`WorktreeVerdict::Merged`].
+    pub fn add_session_worktree(
+        &self,
+        session: Option<&str>,
+        branch: &str,
+        verdict: WorktreeVerdict,
+    ) {
+        let mut state = self.service.lock();
+        // `rho/job/list` names each session's job so.
+        let job = JobId::new(match session {
+            Some(session) => format!("job-{session}"),
+            None => format!("job-gone-{}", state.session_worktrees.len()),
+        });
+        state.session_worktrees.push(WorktreeReport {
+            job,
+            worktree: SessionWorktree {
+                branch: branch.to_owned(),
+                // Spelled out, not joined, so it reads the same on Windows.
+                path: PathBuf::from(format!("/rho/worktrees/{}", branch.replace('/', "-"))),
+                origin: PathBuf::from("/w/a"),
+            },
+            verdict,
+            stale: false,
+        });
+    }
+
+    /// The branches of the session worktrees still on disk.
+    pub fn session_worktrees(&self) -> Vec<String> {
+        self.service
+            .lock()
+            .session_worktrees
+            .iter()
+            .map(|report| report.worktree.branch.clone())
+            .collect()
     }
 
     /// The value of agent setting `key` now: `None` for one that is unset
@@ -1390,6 +1429,8 @@ struct State {
     new_sessions: u64,
     /// How many sessions asked for a new worktree.
     worktrees: usize,
+    /// Session worktrees on disk, for `rho/worktree/prune`.
+    session_worktrees: Vec<WorktreeReport>,
     /// How many requests clients held.
     holds: usize,
     /// The upgrade `rho/daemon/status` reports.
@@ -1439,6 +1480,7 @@ impl State {
             sessions,
             new_sessions: 0,
             worktrees: 0,
+            session_worktrees: Vec::new(),
             holds: 0,
             upgrade: None,
             new_session_environment: None,

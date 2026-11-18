@@ -27,7 +27,8 @@ use rho_protocol::{
     SessionHoldResponse, SessionNewParams, SessionNewResponse, SessionPromptParams,
     SessionPromptResponse, SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
     SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription, ToolKind,
-    ToolStatus, TurnOutcome, UnsteerOutcome, PROTOCOL_VERSION,
+    ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse,
+    WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -881,6 +882,20 @@ impl Service for Fake {
         Ok(AuthChooseStoreResponse {
             credential_store: self.lock().auth.choose_store(params.store),
         })
+    }
+
+    async fn prune_worktrees(
+        &self,
+        params: WorktreePruneParams,
+    ) -> Result<WorktreePruneResponse, RpcError> {
+        let mut state = self.lock();
+        let worktrees = state.session_worktrees.clone();
+        if !params.dry_run {
+            state
+                .session_worktrees
+                .retain(|report| !matches!(report.verdict, WorktreeVerdict::Merged { .. }));
+        }
+        Ok(WorktreePruneResponse { worktrees })
     }
 
     async fn list_jobs(&self) -> JobListResponse {
