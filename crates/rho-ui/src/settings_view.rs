@@ -4,9 +4,10 @@
 //! applies at once and is saved. rho-ui's own settings come first, kept in
 //! its settings file: Appearance, the Machines page in [`machines`], and
 //! the forge CLIs on each machine in [`source_control`]. Then come rho's
-//! own: each machine's sign-ins to providers, in [`providers`], and a page
-//! per category its daemon describes, saved in that machine's
-//! `config.toml`: see [`rho`]. Last, [`about`] shows the versions of
+//! own: each machine's sign-ins to providers, in [`providers`], the
+//! worktrees it added for sessions, in [`worktrees`], and a page per
+//! category its daemon describes, saved in that machine's `config.toml`:
+//! see [`rho`]. Last, [`about`] shows the versions of
 //! rho-ui and of Rho on each machine.
 
 mod about;
@@ -14,6 +15,7 @@ mod machines;
 mod providers;
 mod rho;
 mod source_control;
+mod worktrees;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
@@ -36,12 +38,15 @@ use crate::{
     rho_install::Installs,
     rho_settings::RhoSettings,
     settings::{Appearance, Settings, SmoothScroll, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
+    sidebar::SidebarView,
     workspaces::Workspaces,
+    worktrees::Worktrees,
 };
 use machines::MachineFields;
 use providers::ProvidersFields;
 use rho::RhoFields;
 use source_control::SourceControlFields;
+use worktrees::WorktreesFields;
 
 /// How much of the window the dialog takes in each direction, so a large
 /// window gets a large dialog: 900 x 600 px in the default 1200 x 800 window.
@@ -102,6 +107,10 @@ pub(crate) struct AppState {
     pub(crate) rho_settings: Entity<RhoSettings>,
     /// The auth profiles each machine's rho can sign in to.
     pub(crate) auths: Entity<Auths>,
+    /// The worktrees each machine's rho added for sessions.
+    pub(crate) worktrees: Entity<Worktrees>,
+    /// The listed sessions, whose titles name their worktrees.
+    pub(crate) sidebar: Entity<SidebarView>,
     /// Each machine's home folder, which paths show as `~`.
     pub(crate) workspaces: Entity<Workspaces>,
     /// The forge CLIs on each machine.
@@ -184,6 +193,7 @@ struct SettingsView {
     rho: RhoFields,
     source_control: SourceControlFields,
     providers: ProvidersFields,
+    worktrees: WorktreesFields,
     /// Each machine's rho, for About.
     installs: Entity<Installs>,
     _subscriptions: [Subscription; 3],
@@ -195,6 +205,8 @@ impl SettingsView {
             machines,
             rho_settings,
             auths,
+            worktrees,
+            sidebar,
             workspaces,
             forges,
             installs,
@@ -217,6 +229,7 @@ impl SettingsView {
             machines: MachineFields::new(window, cx),
             source_control: SourceControlFields::new(&machines, workspaces, forges, cx),
             providers: ProvidersFields::new(&machines, auths, cx),
+            worktrees: WorktreesFields::new(&machines, worktrees, sidebar, cx),
             rho: RhoFields::new(&machines, rho_settings, window, cx),
             machine_list: machines,
             installs,
@@ -519,6 +532,7 @@ impl Render for SettingsView {
         let machines = self.machines_page(cx);
         let source_control = self.source_control_page(window, cx);
         let providers = self.providers_page(window, cx);
+        let worktrees = self.worktrees_page(cx);
         let rho = self.rho_page(window, cx);
         let about = about::about_page(&self.machine_list, &self.installs, cx);
         let theme = cx.theme();
@@ -541,6 +555,7 @@ impl Render for SettingsView {
                     .page(machines)
                     .page(source_control)
                     .page(providers)
+                    .page(worktrees)
                     .page(rho)
                     .page(about),
             )

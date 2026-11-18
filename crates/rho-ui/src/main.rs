@@ -63,6 +63,7 @@ mod usage;
 mod web;
 mod work;
 mod workspaces;
+mod worktrees;
 
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
@@ -121,6 +122,7 @@ gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
         GitBranch,
+        FolderGit2,
         Download,
         AlarmClock,
         Archive,

@@ -550,6 +550,11 @@ impl SidebarView {
         }
     }
 
+    /// Session `id`'s title, once it has one.
+    pub(crate) fn session_title(&self, id: &SessionKey) -> Option<SharedString> {
+        self.list.row(id)?.title.clone()
+    }
+
     /// The session on screen has no Done to show: its turn ended in view.
     fn mark_active_seen(&mut self) {
         if let Some(active) = &self.active {

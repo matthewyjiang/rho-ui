@@ -15,7 +15,8 @@ use rho_ui_core::{
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus, Checkout,
     ChoiceKind, ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
     DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity, LoginOutcome, Prompt,
-    RunState, Session, SurfaceActionError, ToolStatus, Unsteered, MAX_PROMPT_ATTACHMENT_BYTES,
+    RunState, Session, SessionId, SurfaceActionError, ToolStatus, Unsteered, WorktreeVerdict,
+    MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -411,6 +412,33 @@ fn cancel_withdraws_the_approval_and_ends_the_turn() {
         until(&mut events, &mut session, |s| !s.state().is_busy()).await;
         assert_eq!(session.state(), &RunState::Cancelled);
         assert_eq!(session.inputs(), []);
+    });
+}
+
+/// A worktree's report names the session it was added for, which the
+/// prune's own answer leaves out, and none for a job the daemon no longer
+/// lists.
+#[test]
+fn checked_worktrees_name_their_sessions() {
+    let fake = FakeDaemon::start(Script::default());
+    fake.add_session_worktree(Some("s1"), "rho/one", WorktreeVerdict::Dirty);
+    fake.add_session_worktree(None, "rho/gone", WorktreeVerdict::Dirty);
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let sessions: Vec<_> = daemon
+            .check_worktrees()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|worktree| (worktree.worktree.branch, worktree.session))
+            .collect();
+        assert_eq!(
+            sessions,
+            [
+                ("rho/one".to_owned(), Some(SessionId::from("s1"))),
+                ("rho/gone".to_owned(), None),
+            ]
+        );
     });
 }
 
