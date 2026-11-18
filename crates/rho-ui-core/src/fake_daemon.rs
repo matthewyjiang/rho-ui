@@ -454,7 +454,8 @@ impl FakeDaemon {
             job,
             worktree: SessionWorktree {
                 branch: branch.to_owned(),
-                path: Path::new("/rho/worktrees").join(branch.replace('/', "-")),
+                // Spelled out, not joined, so it reads the same on Windows.
+                path: PathBuf::from(format!("/rho/worktrees/{}", branch.replace('/', "-"))),
                 origin: PathBuf::from("/w/a"),
             },
             verdict,
