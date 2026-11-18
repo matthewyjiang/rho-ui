@@ -560,8 +560,9 @@ impl RhoApp {
         self.worktrees.update(cx, |worktrees, cx| {
             worktrees.connected(machine, daemon.clone(), cx);
         });
-        self.installs
-            .update(cx, |installs, cx| installs.check(machine, cx));
+        self.installs.update(cx, |installs, cx| {
+            installs.check(machine, Some(info.version()), cx);
+        });
         let jobs_task = cx.spawn({
             let (daemon, machine) = (daemon.clone(), machine.clone());
             async move |this, cx| {
@@ -649,7 +650,7 @@ impl RhoApp {
         self.installs.update(cx, |installs, cx| {
             installs.set_upgrade(machine, None, cx);
             // A machine without rho can't connect: say so, and offer it.
-            installs.check(machine, cx);
+            installs.check(machine, None, cx);
         });
         self.set_status(machine, MachineStatus::Failed(error.to_string().into()), cx);
         self.restart_drafts(machine, window, cx);

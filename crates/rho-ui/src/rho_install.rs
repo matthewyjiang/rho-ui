@@ -143,17 +143,15 @@ impl Installs {
     }
 
     /// Checks `machine`'s rho unless a check or change is under way, or a
-    /// check that found rho is fresh (see [`CHECK_EVERY`]).
-    pub(crate) fn check(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
-        let fresh = match self.states.get(machine) {
-            Some(State::Checking | State::Changing(_)) => true,
-            Some(State::Checked {
-                check: RhoCheck::Installed { .. },
-                at,
-            }) => at.elapsed() < CHECK_EVERY,
-            _ => false,
-        };
-        if !fresh {
+    /// check that found rho is fresh (see [`is_fresh`]). `running` is the
+    /// version its daemon runs, once one answers.
+    pub(crate) fn check(
+        &mut self,
+        machine: &MachineId,
+        running: Option<&str>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !is_fresh(self.states.get(machine), running) {
             self.run_check(machine, cx);
         }
     }
@@ -285,6 +283,21 @@ impl Installs {
                 cx.notify();
             }
         }
+    }
+}
+
+/// Whether `state` needs no new check: one or a change is under way, or a
+/// check found rho within [`CHECK_EVERY`] and the daemon, if `running`,
+/// runs the version it found. A daemon on another version means rho
+/// changed since, as when the user updated it in a terminal.
+fn is_fresh(state: Option<&State>, running: Option<&str>) -> bool {
+    match state {
+        Some(State::Checking | State::Changing(_)) => true,
+        Some(State::Checked {
+            check: RhoCheck::Installed { current, .. },
+            at,
+        }) => at.elapsed() < CHECK_EVERY && running.is_none_or(|running| running == current),
+        _ => false,
     }
 }
 
@@ -555,6 +568,25 @@ fn last_lines(why: &str) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recent check goes stale once the daemon runs another version than
+    /// it found, as after an update in a terminal; else it holds.
+    #[test]
+    fn a_daemon_on_another_version_makes_the_check_stale() {
+        let checked = State::Checked {
+            check: RhoCheck::Installed {
+                current: "3.2.0".to_owned(),
+                update: Update::InTerminal {
+                    latest: "3.3.0".to_owned(),
+                    command: "rho update".to_owned(),
+                },
+            },
+            at: Instant::now(),
+        };
+        assert!(is_fresh(Some(&checked), None));
+        assert!(is_fresh(Some(&checked), Some("3.2.0")));
+        assert!(!is_fresh(Some(&checked), Some("3.3.0")));
+    }
 
     /// A change under way or failed shows over everything; a pending
     /// upgrade over an update the check found; then what the check found,
