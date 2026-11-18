@@ -7,7 +7,7 @@
 //! one pass from here at a time.
 
 use gpui_kit::{Context, SharedString};
-use rho_ui_core::{Daemon, DaemonError, ReportedWorktree};
+use rho_ui_core::{Daemon, DaemonError, ReportedWorktree, WorktreeVerdict};
 
 use crate::machines::MachineId;
 
@@ -20,8 +20,11 @@ pub(crate) enum Listing {
     Failed(SharedString),
     /// What a prune would do with each worktree on disk.
     Checked(Vec<ReportedWorktree>),
-    /// What a prune did: the merged worktrees are gone.
-    Pruned(Vec<ReportedWorktree>),
+    /// What a prune did: how many worktrees it removed, and those it kept.
+    Pruned {
+        removed: usize,
+        kept: Vec<ReportedWorktree>,
+    },
 }
 
 /// A pass over a machine's worktrees.
@@ -36,6 +39,9 @@ pub(crate) enum Pass {
 /// One connected machine's session worktrees.
 struct MachineWorktrees {
     id: MachineId,
+    /// Which of the machine's connections this is, so a pass sent on an
+    /// earlier one doesn't answer for it.
+    connection: u64,
     daemon: Daemon,
     listing: Listing,
     /// The pass on its way to the daemon. What is listed stays until it
@@ -48,6 +54,7 @@ struct MachineWorktrees {
 #[derive(Default)]
 pub(crate) struct Worktrees {
     machines: Vec<MachineWorktrees>,
+    connections: u64,
 }
 
 impl Worktrees {
@@ -78,8 +85,10 @@ impl Worktrees {
         cx: &mut Context<'_, Self>,
     ) {
         self.forget(machine, cx);
+        self.connections += 1;
         self.machines.push(MachineWorktrees {
             id: machine.clone(),
+            connection: self.connections,
             daemon,
             listing: Listing::Unchecked,
             running: None,
@@ -116,7 +125,7 @@ impl Worktrees {
             return;
         }
         entry.running = Some(pass);
-        let daemon = entry.daemon.clone();
+        let (daemon, connection) = (entry.daemon.clone(), entry.connection);
         let id = machine.clone();
         cx.spawn(async move |this, cx| {
             let answer: Result<Vec<ReportedWorktree>, DaemonError> = match pass {
@@ -124,13 +133,16 @@ impl Worktrees {
                 Pass::Prune => daemon.prune_worktrees().await,
             };
             let _ = this.update(cx, |this, cx| {
-                let Some(entry) = this.entry_mut(&id) else {
+                let Some(entry) = this
+                    .entry_mut(&id)
+                    .filter(|entry| entry.connection == connection)
+                else {
                     return;
                 };
                 entry.running = None;
                 entry.listing = match (answer, pass) {
                     (Ok(reports), Pass::Check) => Listing::Checked(reports),
-                    (Ok(reports), Pass::Prune) => Listing::Pruned(reports),
+                    (Ok(reports), Pass::Prune) => pruned(reports),
                     (Err(error), _) => Listing::Failed(error.to_string().into()),
                 };
                 cx.notify();
@@ -138,5 +150,19 @@ impl Worktrees {
         })
         .detach();
         cx.notify();
+    }
+}
+
+/// What a prune that answered `reports` did: those reported merged are
+/// gone.
+fn pruned(reports: Vec<ReportedWorktree>) -> Listing {
+    let total = reports.len();
+    let kept: Vec<ReportedWorktree> = reports
+        .into_iter()
+        .filter(|report| !matches!(report.verdict, WorktreeVerdict::Merged { .. }))
+        .collect();
+    Listing::Pruned {
+        removed: total - kept.len(),
+        kept,
     }
 }

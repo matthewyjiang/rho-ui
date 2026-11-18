@@ -11,7 +11,8 @@ use super::{Daemon, DaemonError, SessionId};
 /// A session worktree on disk, and what a prune would do, or did, with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportedWorktree {
-    /// The session it was added for, while the daemon still lists its job.
+    /// The session it was added for, while the daemon still lists its
+    /// job; none too when the job list couldn't be read.
     pub session: Option<SessionId>,
     /// Its branch, where it is, and the checkout it was added from.
     pub worktree: SessionWorktree,
@@ -52,16 +53,16 @@ impl Daemon {
         &self,
         params: WorktreePruneParams,
     ) -> Result<Vec<ReportedWorktree>, DaemonError> {
-        let response = self
-            .client
-            .request::<methods::WorktreePrune>(&params)
-            .await?;
-        // A report names its worktree's job, not the session: the job list
-        // says which session each job is. Without it, worktrees go unnamed.
-        let sessions: HashMap<_, SessionId> = self
-            .client
-            .request::<methods::JobList>(&JobListParams {})
-            .await
+        // A report names its worktree's job, not the session (rho-protocol
+        // 1.2's `WorktreeReport` has no `session`): the job list says which
+        // session each job is. Without it, worktrees go unnamed.
+        let (response, jobs) = futures::future::join(
+            self.client.request::<methods::WorktreePrune>(&params),
+            self.client.request::<methods::JobList>(&JobListParams {}),
+        )
+        .await;
+        let response = response?;
+        let sessions: HashMap<_, SessionId> = jobs
             .map(|list| {
                 list.jobs
                     .into_iter()

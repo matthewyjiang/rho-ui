@@ -6251,15 +6251,17 @@ fn worktrees_prune_the_merged_ones() {
     );
     open_settings(&mut ui);
     open_settings_page(&mut ui, "Worktrees");
+    let row = |name: &str| format!("worktree-/rho/worktrees/rho-{name}");
     ui.wait_until("the worktrees listed", |window, _, _| {
-        [
-            "worktree-rho/merged",
-            "worktree-rho/dirty",
-            "worktree-rho/unmerged",
-        ]
-        .into_iter()
-        .all(|id| is_visible(window, id))
+        ["merged", "dirty", "unmerged"]
+            .into_iter()
+            .all(|name| is_visible(window, row(name)))
     });
+    // s1's worktree goes by its session's title; the others by branch.
+    assert_eq!(
+        ui.label(row("merged")).as_deref(),
+        Some("first: Merged into main")
+    );
     ui.shot("listed");
 
     ui.click("worktrees-remove");
@@ -6269,14 +6271,8 @@ fn worktrees_prune_the_merged_ones() {
     });
     assert_eq!(ui.fake().session_worktrees(), ["rho/dirty", "rho/unmerged"]);
     ui.act(|window, _| {
-        assert!(
-            !is_visible(window, "worktree-rho/merged"),
-            "the removed one leaves"
-        );
-        assert!(
-            is_visible(window, "worktree-rho/dirty"),
-            "the kept ones stay"
-        );
+        assert!(!is_visible(window, row("merged")), "the removed one leaves");
+        assert!(is_visible(window, row("dirty")), "the kept ones stay");
     });
     ui.shot("pruned");
 }

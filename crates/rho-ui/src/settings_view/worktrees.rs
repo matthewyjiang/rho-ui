@@ -8,7 +8,7 @@
 //! Every machine's Rho keeps its own worktrees. With more than one
 //! machine, a picker heads the page; this machine shows first.
 
-use std::path::Path;
+use std::{path::Path, rc::Rc};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -41,7 +41,7 @@ pub(super) struct WorktreesFields {
     /// The listed sessions, whose titles name their worktrees.
     sidebar: Entity<SidebarView>,
     machine: PickedMachine,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl WorktreesFields {
@@ -57,6 +57,8 @@ impl WorktreesFields {
         });
         let subscriptions = [
             cx.observe(&worktrees, |_, _, cx| cx.notify()),
+            // A session's title arriving.
+            cx.observe(&sidebar, |_, _, cx| cx.notify()),
             // A machine connecting: check it, if it is the one shown.
             cx.observe(machines, |this, _, cx| {
                 let machine = this.worktrees_machine(cx);
@@ -79,7 +81,7 @@ impl WorktreesFields {
 /// when there is something to remove.
 struct Summary {
     title: String,
-    about: String,
+    about: Option<String>,
     removable: bool,
 }
 
@@ -127,7 +129,7 @@ impl SettingsView {
             Some(Listing::Unchecked) | None => (
                 Summary {
                     title: "Checking worktrees…".to_owned(),
-                    about: String::new(),
+                    about: None,
                     removable: false,
                 },
                 Vec::new(),
@@ -135,16 +137,14 @@ impl SettingsView {
             Some(Listing::Failed(why)) => (
                 Summary {
                     title: "Couldn't check worktrees".to_owned(),
-                    about: why.to_string(),
+                    about: Some(why.to_string()),
                     removable: false,
                 },
                 Vec::new(),
             ),
             Some(Listing::Checked(all)) => (checked(all), all.iter().collect()),
-            Some(Listing::Pruned(all)) => {
-                // Those a prune reports merged are gone.
-                let kept: Vec<&ReportedWorktree> = all.iter().filter(|w| !is_merged(w)).collect();
-                (pruned(all.len() - kept.len(), kept.len()), kept)
+            Some(Listing::Pruned { removed, kept }) => {
+                (pruned(*removed, kept.len()), kept.iter().collect())
             }
         };
         page = page.group(SettingGroup::new().item(summary_item(
@@ -159,7 +159,7 @@ impl SettingsView {
             sidebar.session_title(&key)
         };
         for (project, mut worktrees) in by_project(shown) {
-            worktrees.sort_by_key(|worktree| Concern::of(&worktree.verdict));
+            worktrees.sort_by_key(|worktree| describe(&worktree.verdict).0);
             let items: Vec<SettingItem> = worktrees
                 .into_iter()
                 .map(|worktree| worktree_item(worktree, title(worktree)))
@@ -172,42 +172,50 @@ impl SettingsView {
 
 /// The summary of a check of `all`.
 fn checked(all: &[ReportedWorktree]) -> Summary {
-    let removable = all.iter().filter(|worktree| is_merged(worktree)).count();
+    let removable = all
+        .iter()
+        .filter(|worktree| matches!(worktree.verdict, WorktreeVerdict::Merged { .. }))
+        .count();
     let total = all.len();
     if total == 0 {
         return Summary {
             title: "No session worktrees".to_owned(),
-            about: "A session started in a new worktree adds one.".to_owned(),
+            about: Some("A session started in a new worktree adds one.".to_owned()),
             removable: false,
         };
     }
     if removable == 0 {
         return Summary {
             title: "Nothing to remove".to_owned(),
-            about: format!("All {total} are kept, for the reason beside each."),
+            about: Some(format!("All {total} are kept, for the reason beside each.")),
             removable: false,
         };
     }
     Summary {
         title: format!("{removable} of {} can be removed", count(total)),
-        about: "Closed, clean and merged. Their branches are kept.".to_owned(),
+        about: Some("Closed, clean and merged. Their branches are kept.".to_owned()),
         removable: true,
     }
 }
 
 /// The summary of a prune that removed `removed` worktrees and kept `kept`.
 fn pruned(removed: usize, kept: usize) -> Summary {
-    let title = match removed {
-        0 => "Nothing was removed".to_owned(),
-        n => format!("Removed {}", count(n)),
-    };
-    let about = match kept {
-        0 => "Their branches are kept.".to_owned(),
-        n => format!("Their branches are kept. {} stay.", count(n)),
+    let (title, about) = match removed {
+        0 => (
+            "Nothing was removed".to_owned(),
+            format!("{} stay.", count(kept)),
+        ),
+        n => (
+            format!("Removed {}", count(n)),
+            match kept {
+                0 => "Their branches are kept.".to_owned(),
+                kept => format!("Their branches are kept. {} stay.", count(kept)),
+            },
+        ),
     };
     Summary {
         title,
-        about,
+        about: Some(about),
         removable: false,
     }
 }
@@ -227,10 +235,10 @@ fn summary_item(
     machine: &MachineId,
     running: Option<Pass>,
 ) -> SettingItem {
-    let (worktrees, machine) = (worktrees.clone(), machine.clone());
+    let prune = run_pass(worktrees, machine, Pass::Prune);
     let removable = summary.removable;
     let field = SettingField::render(move |_, _, _| {
-        let (worktrees, machine) = (worktrees.clone(), machine.clone());
+        let prune = Rc::clone(&prune);
         div().when(removable, |this| {
             this.child(
                 Button::new("worktrees-remove")
@@ -239,25 +247,32 @@ fn summary_item(
                     .label("Remove")
                     .loading(running == Some(Pass::Prune))
                     .disabled(running.is_some())
-                    .on_click(move |_, _, cx| {
-                        worktrees.update(cx, |worktrees, cx| {
-                            worktrees.run(&machine, Pass::Prune, cx);
-                        });
-                    }),
+                    .on_click(move |_, _, cx| prune(cx)),
             )
         })
     });
     described(SettingItem::new(summary.title, field), summary.about)
 }
 
-/// `item`, with `description` under its title unless that is empty: an
-/// empty one still takes a line, which sets the title off its control.
-fn described(item: SettingItem, description: String) -> SettingItem {
-    if description.is_empty() {
-        item
-    } else {
-        item.description(description)
+/// `item`, with `description` under its title if there is one. Kit gives
+/// even an empty description a line, which sets the title off its control.
+fn described(item: SettingItem, description: Option<String>) -> SettingItem {
+    match description {
+        Some(description) => item.description(description),
+        None => item,
     }
+}
+
+/// Runs `pass` on `machine`'s worktrees, from a click.
+fn run_pass(
+    worktrees: &Entity<Worktrees>,
+    machine: &MachineId,
+    pass: Pass,
+) -> Rc<dyn Fn(&mut App)> {
+    let (worktrees, machine) = (worktrees.clone(), machine.clone());
+    Rc::new(move |cx| {
+        worktrees.update(cx, |worktrees, cx| worktrees.run(&machine, pass, cx));
+    })
 }
 
 /// Checks `machine`'s worktrees again; it spins while a check runs.
@@ -266,9 +281,9 @@ fn refresh_button(
     machine: &MachineId,
     running: Option<Pass>,
 ) -> impl Fn(&mut gpui_kit::Window, &mut App) -> Button + 'static {
-    let (worktrees, machine) = (worktrees.clone(), machine.clone());
+    let check = run_pass(worktrees, machine, Pass::Check);
     move |_, _| {
-        let (worktrees, machine) = (worktrees.clone(), machine.clone());
+        let check = Rc::clone(&check);
         Button::new("worktrees-refresh")
             .ghost()
             .xsmall()
@@ -276,16 +291,8 @@ fn refresh_button(
             .tooltip("Check again")
             .loading(running == Some(Pass::Check))
             .disabled(running.is_some())
-            .on_click(move |_, _, cx| {
-                worktrees.update(cx, |worktrees, cx| {
-                    worktrees.run(&machine, Pass::Check, cx);
-                });
-            })
+            .on_click(move |_, _, cx| check(cx))
     }
-}
-
-fn is_merged(worktree: &ReportedWorktree) -> bool {
-    matches!(worktree.verdict, WorktreeVerdict::Merged { .. })
 }
 
 /// `worktrees` by the project each was added from, in the order each
@@ -314,27 +321,19 @@ enum Concern {
     Unmerged,
     /// Its session is using it.
     InUse,
+    /// Kept for a reason this version of rho-ui doesn't know.
+    Other,
     /// A prune removes it.
     Removable,
 }
 
 impl Concern {
-    fn of(verdict: &WorktreeVerdict) -> Self {
-        match verdict {
-            WorktreeVerdict::Failed { .. } => Self::Failed,
-            WorktreeVerdict::Dirty => Self::Dirty,
-            WorktreeVerdict::Unmerged { .. } => Self::Unmerged,
-            WorktreeVerdict::Merged { .. } => Self::Removable,
-            _ => Self::InUse,
-        }
-    }
-
     /// The icon that flags it, for those that need the user.
     fn icon(self) -> Option<IconName> {
         match self {
             Self::Failed => Some(IconName::CircleX),
             Self::Dirty => Some(IconName::TriangleAlert),
-            Self::Unmerged | Self::InUse | Self::Removable => None,
+            Self::Unmerged | Self::InUse | Self::Other | Self::Removable => None,
         }
     }
 
@@ -344,8 +343,29 @@ impl Concern {
             Self::Failed => theme.danger,
             Self::Dirty => theme.warning,
             Self::Unmerged => theme.foreground,
-            Self::InUse | Self::Removable => theme.muted_foreground,
+            Self::InUse | Self::Other | Self::Removable => theme.muted_foreground,
         }
+    }
+}
+
+/// What `verdict` asks of the user, how the page says it, and git's error
+/// if it failed.
+fn describe(verdict: &WorktreeVerdict) -> (Concern, String, Option<String>) {
+    match verdict {
+        WorktreeVerdict::Failed { error } => (
+            Concern::Failed,
+            "Git failed".to_owned(),
+            Some(error.clone()),
+        ),
+        WorktreeVerdict::Dirty => (Concern::Dirty, "Uncommitted changes".to_owned(), None),
+        WorktreeVerdict::Unmerged { base } => {
+            (Concern::Unmerged, format!("Not merged into {base}"), None)
+        }
+        WorktreeVerdict::InUse => (Concern::InUse, "In use".to_owned(), None),
+        WorktreeVerdict::Merged { base } => {
+            (Concern::Removable, format!("Merged into {base}"), None)
+        }
+        _ => (Concern::Other, "Kept".to_owned(), None),
     }
 }
 
@@ -354,32 +374,27 @@ impl Concern {
 /// the page's search.
 fn worktree_item(worktree: &ReportedWorktree, title: Option<SharedString>) -> SettingItem {
     let branch = &worktree.worktree.branch;
-    let (verdict, error) = match &worktree.verdict {
-        WorktreeVerdict::Merged { base } => (format!("Merged into {base}"), None),
-        WorktreeVerdict::InUse => ("In use".to_owned(), None),
-        WorktreeVerdict::Dirty => ("Uncommitted changes".to_owned(), None),
-        WorktreeVerdict::Unmerged { base } => (format!("Not merged into {base}"), None),
-        WorktreeVerdict::Failed { error } => ("Git failed".to_owned(), Some(error.clone())),
-        _ => ("Kept".to_owned(), None),
-    };
-    let concern = Concern::of(&worktree.verdict);
+    let (concern, verdict, error) = describe(&worktree.verdict);
     let stale = worktree.stale.then(|| "Untouched for 14 days.".to_owned());
-    let description = title
+    let lines: Vec<String> = title
         .is_some()
         .then(|| branch.clone())
         .into_iter()
         .chain(stale)
         .chain(error)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let id = SharedString::from(format!("worktree-{branch}"));
+        .collect();
+    let description = (!lines.is_empty()).then(|| lines.join("\n"));
+    let title = title.unwrap_or_else(|| branch.clone().into());
+    // A worktree's path is unique on its machine; its branch need not be.
+    let id = SharedString::from(format!("worktree-{}", worktree.worktree.path.display()));
+    let label = SharedString::from(format!("{title}: {verdict}"));
     let verdict = SharedString::from(verdict);
     let field = SettingField::render(move |_, _, cx| {
         let color = concern.color(cx);
         h_flex()
             .id(id.clone())
             .test_support()
-            .aria_label(verdict.clone())
+            .aria_label(label.clone())
             .gap_1p5()
             .text_sm()
             .text_color(color)
@@ -392,7 +407,8 @@ fn worktree_item(worktree: &ReportedWorktree, title: Option<SharedString>) -> Se
         SharedString::from(branch.clone()),
         SharedString::from(worktree.worktree.path.display().to_string()),
     ];
-    let item =
-        SettingItem::new(title.unwrap_or_else(|| branch.clone().into()), field).keywords(keywords);
-    described(item, description)
+    described(
+        SettingItem::new(title, field).keywords(keywords),
+        description,
+    )
 }
