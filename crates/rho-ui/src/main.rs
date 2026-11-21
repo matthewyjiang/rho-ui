@@ -7,6 +7,11 @@
 //! Built for wasm, it is rho-ui's web build instead, which `rho-ui serve`
 //! serves to a browser; `web.rs` starts it.
 
+// A release on Windows is a GUI program, so starting it opens no console
+// window beside its own; its command-line errors then show nowhere. Debug
+// builds keep the console, for their logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod added_dirs;
 mod app;
 #[cfg(target_os = "macos")]

@@ -27,44 +27,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # GPUI's build dependencies, from GPUI Kit's installation guide, less
-      # what this app doesn't link (WebKit, ALSA, OpenSSL, zstd). The UI
-      # tests render on Mesa's lavapipe (mesa-vulkan-drivers).
-      - name: Install system packages
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libfontconfig-dev libwayland-dev libxkbcommon-x11-dev \
-            libx11-xcb-dev libvulkan1 mesa-vulkan-drivers
-
-      # GPUI has no offscreen renderer for Windows, so there the UI tests
-      # draw with its wgpu one on Mesa lavapipe, as on Linux. Windows has no
-      # Vulkan loader of its own: the runtime gives vulkan-1.dll, and the
-      # action registers lavapipe as the driver.
-      - name: Install Vulkan and lavapipe
-        if: runner.os == 'Windows'
-        # v1.8.1. The runtime is pinned so a run doesn't pick up a new one.
-        uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8
+      # GPUI's system packages, Rust and Zig, and lavapipe, which the UI
+      # tests render on (.github/actions/setup).
+      - uses: ./.github/actions/setup
         with:
-          vulkan_version: 1.4.363.0
-          install_runtime_only: true
-          install_lavapipe: true
-          # It reads release lists through GitHub's API, whose anonymous
-          # limit of 60 an hour a runner's shared address runs out of.
-          github_token: ${{ github.token }}
-      - name: Put the Vulkan loader on PATH
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (-not $env:VULKAN_SDK) { throw "the Vulkan step set no VULKAN_SDK" }
-          $loader = Get-ChildItem -Path $env:VULKAN_SDK -Recurse -Filter vulkan-1.dll |
-            Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
-          if (-not $loader) { throw "no x64 vulkan-1.dll under $env:VULKAN_SDK" }
-          $loader.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append
-
-      # Rust and Zig, at the versions mise.toml pins.
-      - uses: jdx/mise-action@v5
+          lavapipe: true
 
       # A cold build takes 8 to 13 minutes a step, almost all of it
       # dependencies, so keep them even when a test fails. rust-cache keys

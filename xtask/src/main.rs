@@ -4,7 +4,8 @@
 //!   `wasm32-unknown-unknown`, its JS glue, the page, and the fonts it
 //!   loads. `rho-ui serve` built without one serves this.
 //! - `dist`: a release `rho-ui` with the web build in it, gzipped, for
-//!   `rho-ui serve` to serve from anywhere.
+//!   `rho-ui serve` to serve from anywhere. On Windows, where there is no
+//!   `rho-ui serve`, just the release `rho-ui`.
 //! - `clippy-web`: clippy on the code the web build compiles, as CI runs it.
 //!
 //! The wasm build needs one thing stable Rust doesn't give:
@@ -32,6 +33,7 @@ const USAGE: &str = "usage: cargo xtask TASK
   web [--dev]   build the web build into target/web (--dev: unoptimized,
                 quicker to build); `cargo run -p rho-ui -- serve` serves it
   dist          build target/release/rho-ui with the web build in it
+                (on Windows, which has no `rho-ui serve`, without)
   clippy-web    run clippy on the web build's code, as CI does";
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
@@ -198,28 +200,31 @@ fn fonts(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Builds a release `rho-ui` with the web build in it: the web build,
-/// gzipped into `target/web-gz`, which its `web` feature builds in.
+/// Builds a release `rho-ui`, with the web build in it where `rho-ui serve`
+/// runs, on Unix: the web build, gzipped into `target/web-gz`, which its
+/// `web` feature builds in. Elsewhere it would be dead weight.
 fn dist() -> Result<()> {
-    web(Profile::Release)?;
-    let web = root().join("target/web");
-    let gz = root().join("target/web-gz");
-    if gz.exists() {
-        fs::remove_dir_all(&gz)?;
+    let mut build = cargo(&["build", "--release", "-p", "rho-ui"]);
+    if cfg!(unix) {
+        web(Profile::Release)?;
+        let web = root().join("target/web");
+        let gz = root().join("target/web-gz");
+        if gz.exists() {
+            fs::remove_dir_all(&gz)?;
+        }
+        gzip_tree(&web, &gz)?;
+        build.args(["--features", "web"]);
     }
-    gzip_tree(&web, &gz)?;
-    run(&mut cargo(&[
-        "build",
-        "--release",
-        "-p",
-        "rho-ui",
-        "--features",
-        "web",
-    ]))?;
-    println!(
-        "built {}; run `rho-ui serve` for the browser",
-        target_dir().join("release/rho-ui").display()
-    );
+    run(&mut build)?;
+    let binary = target_dir()
+        .join("release")
+        .join(format!("rho-ui{}", std::env::consts::EXE_SUFFIX));
+    let serve = if cfg!(unix) {
+        "; run `rho-ui serve` for the browser"
+    } else {
+        ""
+    };
+    println!("built {}{serve}", binary.display());
     Ok(())
 }
 

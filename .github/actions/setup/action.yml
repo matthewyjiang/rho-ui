@@ -1,0 +1,56 @@
+name: Set up the build
+description: >-
+  What building rho-ui needs on the runner: GPUI's system packages on Linux,
+  Vulkan on lavapipe if asked, then Rust and Zig at the versions mise.toml
+  pins. CI and Release share it.
+inputs:
+  lavapipe:
+    description: >-
+      Also install Mesa's lavapipe Vulkan driver, which the UI tests render
+      on, on Linux and Windows. A build without tests doesn't need it.
+    default: "false"
+runs:
+  using: composite
+  steps:
+    # GPUI's build dependencies, from GPUI Kit's installation guide, less
+    # what this app doesn't link (WebKit, ALSA, OpenSSL, zstd).
+    - name: Install system packages
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        LAVAPIPE: ${{ inputs.lavapipe }}
+      run: |
+        packages=(libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev)
+        if [ "$LAVAPIPE" = true ]; then
+          packages+=(libvulkan1 mesa-vulkan-drivers)
+        fi
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends "${packages[@]}"
+
+    # GPUI has no offscreen renderer for Windows, so there the UI tests
+    # draw with its wgpu one on Mesa lavapipe, as on Linux. Windows has no
+    # Vulkan loader of its own: the runtime gives vulkan-1.dll, and the
+    # action registers lavapipe as the driver.
+    - name: Install Vulkan and lavapipe
+      if: runner.os == 'Windows' && inputs.lavapipe == 'true'
+      # v1.8.1. The runtime is pinned so a run doesn't pick up a new one.
+      uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8
+      with:
+        vulkan_version: 1.4.363.0
+        install_runtime_only: true
+        install_lavapipe: true
+        # It reads release lists through GitHub's API, whose anonymous
+        # limit of 60 an hour a runner's shared address runs out of.
+        github_token: ${{ github.token }}
+    - name: Put the Vulkan loader on PATH
+      if: runner.os == 'Windows' && inputs.lavapipe == 'true'
+      shell: pwsh
+      run: |
+        if (-not $env:VULKAN_SDK) { throw "the Vulkan step set no VULKAN_SDK" }
+        $loader = Get-ChildItem -Path $env:VULKAN_SDK -Recurse -Filter vulkan-1.dll |
+          Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
+        if (-not $loader) { throw "no x64 vulkan-1.dll under $env:VULKAN_SDK" }
+        $loader.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append
+
+    # Rust and Zig: libghostty-vt's build script builds Ghostty with Zig.
+    - uses: jdx/mise-action@v5

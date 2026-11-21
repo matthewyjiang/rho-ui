@@ -1,0 +1,122 @@
+name: Release
+
+# A tag such as v0.1.0 builds rho-ui on each OS and publishes the builds as
+# that tag's GitHub release. A tag with a pre-release part, such as
+# v0.1.0-test.1, makes a draft instead, so trying this publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: x86_64-linux
+          - os: macos-15
+            platform: aarch64-macos
+          - os: windows-2025
+            platform: x86_64-windows
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      NAME: rho-ui-${{ github.ref_name }}-${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The About screen shows the crate's version, so a tag must name it.
+      - name: Check the tag against rho-ui's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/rho-ui/Cargo.toml)
+          case "$GITHUB_REF_NAME" in
+            "v$version" | "v$version"-*) ;;
+            *)
+              echo "::error::the tag $GITHUB_REF_NAME doesn't name rho-ui's version, $version (crates/rho-ui/Cargo.toml)"
+              exit 1
+              ;;
+          esac
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # GPUI's system packages, Rust and Zig (.github/actions/setup).
+      - uses: ./.github/actions/setup
+
+      # The release builds what Cargo.lock says, or fails.
+      - run: cargo fetch --locked
+      - run: cargo xtask dist
+
+      - name: Package for Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$NAME" dist
+          cp target/release/rho-ui assets/rho-ui.desktop assets/icon.svg LICENSE "$NAME/"
+          tar -czf "dist/$NAME.tar.gz" "$NAME"
+
+      # Rho.app, signed ad hoc only: README.md says how to open it.
+      - name: Package for macOS
+        if: runner.os == 'macOS'
+        run: |
+          app="$NAME/Rho.app/Contents"
+          mkdir -p "$app/MacOS" "$app/Resources" dist
+          cp target/release/rho-ui "$app/MacOS/"
+          sed "s/@VERSION@/$VERSION/" assets/Info.plist > "$app/Info.plist"
+          plutil -lint "$app/Info.plist"
+          icons="$RUNNER_TEMP/rho-ui.iconset"
+          mkdir -p "$icons"
+          for size in 16 32 128 256 512; do
+            sips -s format png -z "$size" "$size" assets/icon.svg --out "$icons/icon_${size}x${size}.png"
+            sips -s format png -z "$((size * 2))" "$((size * 2))" assets/icon.svg --out "$icons/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns -o "$app/Resources/rho-ui.icns" "$icons"
+          codesign --force --sign - "$NAME/Rho.app"
+          codesign --verify --strict "$NAME/Rho.app"
+          cp LICENSE "$NAME/"
+          ditto -c -k --keepParent "$NAME" "dist/$NAME.zip"
+
+      - name: Package for Windows
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p "$NAME" dist
+          cp target/release/rho-ui.exe LICENSE "$NAME/"
+          7z a -tzip "dist/$NAME.zip" "$NAME"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.NAME }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          draft=()
+          case "$TAG" in *-*) draft=(--draft) ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "rho-ui $TAG" --generate-notes "${draft[@]}" -- *

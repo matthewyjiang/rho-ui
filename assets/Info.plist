@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Rho.app's, as the release workflow bundles it on macOS, which puts the
+     version in for @VERSION@ (.github/workflows/release.yml). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Rho</string>
+  <key>CFBundleDisplayName</key>
+  <string>Rho</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.matthewyjiang.rho-ui</string>
+  <key>CFBundleExecutable</key>
+  <string>rho-ui</string>
+  <key>CFBundleIconFile</key>
+  <string>rho-ui</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
