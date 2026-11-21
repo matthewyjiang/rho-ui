@@ -71,7 +71,7 @@ mod workspaces;
 mod worktrees;
 
 #[cfg(not(target_family = "wasm"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{borrow::Cow, rc::Rc, sync::Arc};
 
 use gpui_kit::component::input::{Copy, Enter, Paste};
@@ -274,19 +274,25 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
             extra => return Err(format!("unexpected argument {extra}\n{USAGE}")),
         }
     }
-    let dir = match dir {
-        Some(dir) => dir,
-        None => std::env::current_dir()
-            .map_err(|error| format!("can't read the current directory: {error}"))?,
+    let workspace = if let Some(dir) = dir {
+        let workspace = rho_ui_core::platform::canonicalize(&dir)
+            .map_err(|error| format!("can't open {}: {error}", dir.display()))?;
+        if !workspace.is_dir() {
+            return Err(format!("{} is not a directory", workspace.display()));
+        }
+        Some(workspace)
+    } else {
+        let cwd = std::env::current_dir()
+            .and_then(|cwd| rho_ui_core::platform::canonicalize(&cwd))
+            .map_err(|error| format!("can't read the current directory: {error}"))?;
+        let exe = std::env::current_exe()
+            .and_then(|exe| rho_ui_core::platform::canonicalize(&exe))
+            .ok();
+        default_workspace(cwd, exe.as_deref().and_then(Path::parent))
     };
-    let workspace = rho_ui_core::platform::canonicalize(&dir)
-        .map_err(|error| format!("can't open {}: {error}", dir.display()))?;
-    if !workspace.is_dir() {
-        return Err(format!("{} is not a directory", workspace.display()));
-    }
     let daemon = DaemonTarget::rho(&rho).ok_or("can't find the rho home: set RHO_HOME or HOME")?;
     Ok(LaunchConfig {
-        workspace: Some(workspace),
+        workspace,
         local: Reach {
             daemon,
             rho: Some(RhoInstall::Here { rho }),
@@ -294,6 +300,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
         remote: Rc::new(RemoteMachine::ssh_reach),
         shell: TerminalShell::from_env(),
     })
+}
+
+/// Where new sessions start with no DIR given: `cwd`, unless it's a folder
+/// that only a launch from the desktop leaves, which no one means to work
+/// in: the filesystem's root, as Finder and the Dock give, or the
+/// program's own folder, as Explorer gives. Then `None`, the home folder.
+#[cfg(not(target_family = "wasm"))]
+fn default_workspace(cwd: PathBuf, exe_dir: Option<&Path>) -> Option<PathBuf> {
+    let from_desktop = cwd.parent().is_none() || exe_dir == Some(cwd.as_path());
+    (!from_desktop).then_some(cwd)
 }
 
 #[cfg(target_family = "wasm")]
@@ -626,6 +642,20 @@ mod tests {
             parse(&[workspace]).unwrap().local.daemon,
             DaemonTarget::rho("rho").unwrap()
         );
+    }
+
+    #[test]
+    fn a_desktop_launch_starts_sessions_at_home() {
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        let app = Path::new(if cfg!(windows) { r"C:\Rho" } else { "/opt/rho" });
+        let project = app.join("project");
+        assert_eq!(default_workspace(root.into(), Some(app)), None);
+        assert_eq!(default_workspace(app.to_owned(), Some(app)), None);
+        assert_eq!(
+            default_workspace(project.clone(), Some(app)),
+            Some(project.clone())
+        );
+        assert_eq!(default_workspace(project.clone(), None), Some(project));
     }
 
     #[test]
