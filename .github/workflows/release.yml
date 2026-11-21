@@ -57,7 +57,8 @@ jobs:
       - uses: ./.github/actions/setup
 
       # Apple's clang can't build for wasm32, as the web build's SQLite
-      # (sqlite-wasm-rs) must; the runner's Homebrew LLVM can.
+      # (sqlite-wasm-rs) must. xtask looks for Homebrew's `llvm`; the
+      # runner has `llvm@18`, so name its clang instead.
       - name: Give the web build a clang for wasm
         if: runner.os == 'macOS'
         run: |

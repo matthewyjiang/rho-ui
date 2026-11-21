@@ -53,7 +53,8 @@ runs:
         $loader.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append
 
     # Rust and Zig: libghostty-vt's build script builds Ghostty with Zig.
-    - uses: jdx/mise-action@v5
+    # Pinned, as it makes the toolchain that builds the release.
+    - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
 
     # Ghostty's source, and the Zig packages its build fetches, from the
     # cache: libghostty-vt's build script builds that and fetches nothing
@@ -102,9 +103,21 @@ runs:
         git clone --config core.longpaths=true --filter=blob:none --no-checkout "$repo" "$DIR"
         git -C "$DIR" checkout --quiet "$commit"
         rm -rf "$DIR/.git"
-        # Every package, lazy ones too, into the checkout's zig-pkg/: the
-        # native build needs lazy ones that a plain --fetch leaves out.
-        (cd "$DIR" && zig build --fetch=all)
+        # The packages libghostty-vt's builds need, into the checkout's
+        # zig-pkg/: `--help` configures a build, fetching the lazy packages
+        # it uses, and builds nothing. The options are the build script's,
+        # for this OS and the web build. A plain --fetch leaves out lazy ones
+        # the native build needs; --fetch=all takes all of Ghostty's, 542 MB,
+        # and can't unpack its themes on Windows. A package missed here is
+        # fetched by the build, so it costs time, not the build.
+        for target in native wasm32-freestanding; do
+          options=(-Demit-lib-vt=true -Doptimize=ReleaseFast -Dcpu=baseline -Demit-xcframework=false -Dapp-runtime=none)
+          if [ "$target" != native ]; then
+            options+=("-Dtarget=$target")
+          fi
+          (cd "$DIR" && zig build "${options[@]}" --cache-dir "$RUNNER_TEMP/ghostty-zig-cache" --help > /dev/null)
+        done
+        ls "$DIR/zig-pkg"
     # Saved here, not at the job's end, so it holds no build output.
     - name: Save Ghostty
       if: steps.restore-ghostty.outputs.cache-hit != 'true'
