@@ -55,7 +55,7 @@ install -Dm644 icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
 
 rho-ui links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desktop has. `rho-ui serve` needs them too, as the loader opens them before it starts, so on a server without a desktop install them first: `sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0` on Debian or Ubuntu, `sudo dnf install libxcb libxkbcommon libxkbcommon-x11` on Fedora.
 
-**macOS** (Apple silicon): unzip it and move `Rho.app` to Applications. The first time you open it, macOS says it can't verify the app; click Done, then open System Settings → Privacy & Security, click Open Anyway beside "Rho was blocked", and confirm. Or, in a terminal, before opening it:
+**macOS** (Apple silicon): unzip it and move `Rho.app` to Applications. The first time you open it, macOS says it can't verify the app; click Done, then open System Settings → Privacy & Security, click Open Anyway beside the note that Rho was blocked, and confirm. Or, in a terminal, before opening it:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Rho.app
