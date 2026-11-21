@@ -92,7 +92,7 @@ A tag `vX.Y.Z` runs `.github/workflows/release.yml`: `cargo xtask dist` on Ubunt
 
 The Linux build links `libxcb`, `libxkbcommon` and `libxkbcommon-x11` dynamically. Ubuntu ships no static `libxkbcommon`, so linking it in would mean building it from source in the job, for a library every Linux desktop has and a server gets with one package. Built on Ubuntu 24.04, it needs glibc 2.39.
 
-A release build caches nothing. A tag's run can restore only what its own tag or `main` saved, and `main`'s CI builds no release; nor is what a cache could carry across worth it: in a build of 18 to 21 minutes, cloning Ghostty took under 5 seconds and fetching its Zig packages under 100 (measured on the runners).
+rho-ui depends on libghostty-vt from git, as no release on crates.io builds Ghostty's vt-1.0.1 yet, and its build script would clone Ghostty and fetch the Zig packages Ghostty's build needs, from the network, in every build. So the shared setup keeps Ghostty's source, with every Zig package in its `zig-pkg/` (`zig build --fetch=all`; a plain `--fetch` leaves out lazy ones the native build needs), in a GitHub Actions cache keyed by libghostty-rs's rev in `Cargo.lock`, and points `GHOSTTY_SOURCE_DIR` at it; built from it, both of `dist`'s libghostty-vt builds, native and wasm, ran with no network at all. That is 119 MB compressed. A tag's run can restore only what its own tag or `main` saved, so it finds what `main`'s CI saved. Nothing else is cached for a release: `main` builds none, so a cargo cache would never be warm for one.
 
 ## State
 
