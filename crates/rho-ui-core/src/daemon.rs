@@ -39,7 +39,7 @@ use rho_protocol::{
     SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
     SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
     SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn, StatusParams,
-    TurnOutcome, UnsteerOutcome,
+    StopParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -107,6 +107,11 @@ impl DaemonTarget {
     }
 }
 
+/// What restarting a daemon would cost, and which side of an incompatible
+/// pair must change ([`DaemonError::Incompatible`]), as rho-protocol has
+/// them.
+pub use rho_protocol::{RestartCost, VersionFix, VersionMismatch};
+
 /// Why the daemon could not be reached, or refused a request.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DaemonError {
@@ -137,6 +142,12 @@ pub enum DaemonError {
     /// The connection is gone.
     #[error("the Rho daemon closed the connection")]
     Closed,
+    /// The daemon refused the handshake: it speaks another protocol
+    /// version. Which side must change, and with
+    /// [`VersionFix::RestartDaemon`] what restarting the daemon would cost;
+    /// its `Display` is rho's message for people.
+    #[error("{0}")]
+    Incompatible(VersionMismatch),
 }
 
 impl From<ClientError> for DaemonError {
@@ -153,6 +164,7 @@ impl From<ClientError> for DaemonError {
                 Some(ErrorCode::DaemonStopping) => Self::Stopping(error.message),
                 _ => Self::Refused(error.message),
             },
+            ClientError::VersionMismatch(mismatch) => Self::Incompatible(mismatch),
             // Each of these names the daemon and what to do, as rho's own
             // frontends show them.
             other => Self::Unreachable(other.to_string()),
@@ -211,7 +223,8 @@ impl std::fmt::Display for SessionId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonInfo {
     version: String,
-    notice: Option<String>,
+    pid: u32,
+    skew: Option<RestartCost>,
     home: Option<PathBuf>,
 }
 
@@ -221,11 +234,17 @@ impl DaemonInfo {
         &self.version
     }
 
+    /// The daemon's process ID, on its machine. A restart in place keeps
+    /// it.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Set when the daemon speaks this client's protocol version but is
-    /// another build, so a request may fail: what to tell the user, in the
-    /// daemon's words.
-    pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+    /// another build, so a request may fail: what restarting it, into the
+    /// rho installed there, would have cost as it answered.
+    pub fn skew(&self) -> Option<RestartCost> {
+        self.skew
     }
 
     /// The home directory of the user the daemon runs as, on its machine:
@@ -276,6 +295,17 @@ pub enum Unsteered {
     Withdrawn,
     /// Too late: the model has it, or will at its next request.
     Kept,
+}
+
+/// What `rho/daemon/status` says of the running daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonStatus {
+    /// How many things stopping or restarting it would cut short: turns
+    /// under way or waiting for a person, logins, and sessions with
+    /// background work.
+    pub in_progress: u64,
+    /// The upgrade it waits to run, if its program was replaced.
+    pub upgrade: Option<PendingUpgrade>,
 }
 
 /// A newer rho the daemon has found installed over its own program, and
@@ -556,7 +586,8 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
     };
     let info = DaemonInfo {
         version: hello.daemon.version,
-        notice: hello.skew.map(|skew| skew.to_string()),
+        pid: hello.daemon.pid,
+        skew: hello.skew.map(|skew| skew.restart),
         home: machine.home,
     };
     let daemon = Daemon {
@@ -688,21 +719,37 @@ impl Daemon {
         }
     }
 
-    /// The upgrade the daemon waits to run, if its program was replaced.
-    /// Nothing pushes it; ask again to refresh.
+    /// What the daemon is doing now: what stopping or restarting it would
+    /// cut short, and the upgrade it waits to run. Nothing pushes it; ask
+    /// again to refresh.
     ///
     /// # Errors
     ///
     /// Fails if the daemon rejects the request or the connection is gone.
-    pub async fn pending_upgrade(&self) -> Result<Option<PendingUpgrade>, DaemonError> {
+    pub async fn status(&self) -> Result<DaemonStatus, DaemonError> {
         let status = self
             .client
             .request::<methods::Status>(&StatusParams {})
             .await?;
-        Ok(status.upgrade.map(|upgrade| PendingUpgrade {
-            version: upgrade.version,
-            waiting_for: upgrade.waiting_for,
-        }))
+        Ok(DaemonStatus {
+            in_progress: status.in_progress,
+            upgrade: status.upgrade.map(|upgrade| PendingUpgrade {
+                version: upgrade.version,
+                waiting_for: upgrade.waiting_for,
+            }),
+        })
+    }
+
+    /// Stops the daemon: it closes every connection, this one too, cuts
+    /// its turns short and exits. The next client that starts it, as
+    /// [`Self::connect`] does, starts it afresh.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon rejects the request or the connection is gone.
+    pub async fn stop(&self) -> Result<(), DaemonError> {
+        self.client.request::<methods::Stop>(&StopParams {}).await?;
+        Ok(())
     }
 
     /// Restarts the daemon in place now, into the program installed: every

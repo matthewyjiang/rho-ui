@@ -1550,7 +1550,7 @@ impl SessionView {
             .title("Reconnecting"),
             Link::Lost => Alert::warning(
                 "link-alert",
-                "Retry from the sidebar to follow this session again.",
+                "Retry, or Start, from the sidebar to follow this session again.",
             )
             .title("Lost the connection to the Rho daemon"),
             Link::Refused(why) => Alert::error("link-alert", SharedString::from(why.clone()))

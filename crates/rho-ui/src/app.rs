@@ -38,8 +38,10 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs,
-    PendingUpgrade, Prompt, Session, SessionId,
+    PendingUpgrade, Prompt, Session, SessionId, VersionFix, VersionMismatch,
 };
+
+mod daemon_control;
 
 use crate::machines::RemoteMachine;
 use crate::{
@@ -48,7 +50,10 @@ use crate::{
     draft::{DraftEvent, DraftView},
     forge::Forges,
     kinetic::Kinetic,
-    machines::{Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach, SessionKey},
+    machines::{
+        DaemonAction, Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach,
+        SessionKey,
+    },
     projects::Projects,
     pull_requests::{Focus, PullRequests},
     rho_install::{render_setup, Installs, InstallsEvent, Offer},
@@ -140,6 +145,13 @@ struct Connection {
     /// restarting, the user asked it to, rho was updated under it, or it
     /// waits to upgrade.
     restarting: bool,
+    /// The user stopped the daemon: the connection's end is no failure,
+    /// and nothing connects again until the user asks.
+    stopped: bool,
+    /// rho-ui restarted a daemon that refused it for its older protocol;
+    /// a refusal on the connection after says the Rho installed there is
+    /// older too. Outlives [`RhoApp::connect`], which that restart calls.
+    restarted_older: bool,
     /// Connects to the daemon, then pumps its events. Dropping or replacing
     /// it stops both.
     task: Task<()>,
@@ -158,6 +170,8 @@ impl Connection {
             daemon: None,
             epoch: 0,
             restarting: false,
+            stopped: false,
+            restarted_older: false,
             task: Task::ready(()),
             jobs_task: Task::ready(()),
             jobs: Vec::new(),
@@ -233,10 +247,13 @@ pub(crate) struct RhoApp {
     /// one left last at the end. An empty draft goes once it is left.
     drafts: Vec<OpenDraft>,
     pane: Pane,
+    /// A Restart or Stop waits for the daemon's status before it asks;
+    /// another click meanwhile is ignored, so it never asks twice.
+    asking: bool,
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
-    _subscriptions: [Subscription; 6],
+    _subscriptions: [Subscription; 7],
 }
 
 impl RhoApp {
@@ -284,7 +301,6 @@ impl RhoApp {
                 SidebarEvent::Rename { id, title } => {
                     this.rename_session(id.clone(), title.clone(), window, cx);
                 }
-                SidebarEvent::Retry(machine) => this.connect(machine, window, cx),
                 SidebarEvent::OpenSettings => this.open_settings(window, cx),
                 SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
                 // The sidebar's width is laid out here.
@@ -300,11 +316,12 @@ impl RhoApp {
                     this.expect_restart(machine);
                     this.ask_upgrade(machine, cx);
                 }
-                InstallsEvent::Restart(machine) => {
-                    this.expect_restart(machine);
-                    this.restart_daemon(machine, window, cx);
-                }
             },
+        );
+        let machines_subscription = cx.subscribe_in(
+            &machines,
+            window,
+            |this, _, action: &DaemonAction, window, cx| this.daemon_action(action, window, cx),
         );
         let shell = launch.shell.clone();
         let panel = cx.new(|cx| RightPanel::new(workspaces.clone(), shell, prs.clone(), cx));
@@ -327,11 +344,13 @@ impl RhoApp {
             sessions: Vec::new(),
             drafts: Vec::new(),
             pane: Pane::Empty,
+            asking: false,
             kinetic: Rc::default(),
             focus_handle,
             _subscriptions: [
                 sidebar_subscription,
                 installs_subscription,
+                machines_subscription,
                 // With the system appearance, follow the desktop from light
                 // to dark and back.
                 cx.observe_window_appearance(window, |_, _, cx| {
@@ -477,6 +496,7 @@ impl RhoApp {
         };
         connection.epoch = epoch;
         connection.restarting = false;
+        connection.stopped = false;
         connection.jobs_task = Task::ready(());
         // So the first listing on the new connection reaches the sidebar.
         connection.jobs.clear();
@@ -527,13 +547,6 @@ impl RhoApp {
         cx: &mut Context<'_, Self>,
     ) {
         let info = daemon.info();
-        if let Some(notice) = info.notice() {
-            let title = match self.machines.read(cx).tag(machine) {
-                Some(label) => format!("Rho on {label} is another build"),
-                None => "Rho daemon is another build".to_owned(),
-            };
-            window.push_notification(Notification::warning(notice.to_owned()).title(title), cx);
-        }
         // Its CLIs may have changed while it was away; check them afresh
         // when next asked.
         self.forges
@@ -544,7 +557,9 @@ impl RhoApp {
             });
         }
         let status = MachineStatus::Ready {
-            version: format!("Rho {}", info.version()).into(),
+            version: info.version().to_owned().into(),
+            pid: info.pid(),
+            another_build: info.skew().is_some(),
         };
         self.set_status(machine, status, cx);
         self.rho_settings.update(cx, |settings, cx| {
@@ -590,9 +605,9 @@ impl RhoApp {
                     let due = asked_upgrade.is_none_or(|at| now - at >= UPGRADE_POLL);
                     if changed || due {
                         asked_upgrade = Some(now);
-                        if let Ok(upgrade) = daemon.pending_upgrade().await {
+                        if let Ok(status) = daemon.status().await {
                             let set = this.update(cx, |this, cx| {
-                                this.set_upgrade(&machine, upgrade, cx);
+                                this.set_upgrade(&machine, status.upgrade, cx);
                             });
                             if set.is_err() {
                                 return;
@@ -606,6 +621,7 @@ impl RhoApp {
         if let Some(connection) = self.connection_mut(machine) {
             connection.jobs_task = jobs_task;
             connection.daemon = Some(daemon);
+            connection.restarted_older = false;
         }
         self.refresh_sessions(machine, cx);
         self.reattach_all(machine, window, cx);
@@ -622,8 +638,9 @@ impl RhoApp {
         cx.notify();
     }
 
-    /// `machine`'s daemon couldn't be reached, because of `error`. Its
-    /// open sessions say so, and wait for the user's Retry.
+    /// `machine`'s daemon couldn't be reached, because of `error`, or the
+    /// user stopped it. Its open sessions say so, and wait for the user's
+    /// Retry or Start.
     fn failed(
         &mut self,
         machine: &MachineId,
@@ -631,9 +648,12 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let (mut stopped, mut restarted_older) = (false, false);
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
             connection.jobs.clear();
+            stopped = connection.stopped;
+            restarted_older = std::mem::take(&mut connection.restarted_older);
         }
         // Nothing says what runs there until it connects again.
         self.sidebar
@@ -651,7 +671,20 @@ impl RhoApp {
             // A machine without rho can't connect: say so, and offer it.
             installs.check(machine, None, cx);
         });
-        self.set_status(machine, MachineStatus::Failed(error.to_string().into()), cx);
+        let status = match error {
+            _ if stopped => MachineStatus::Stopped,
+            DaemonError::Incompatible(VersionMismatch {
+                fix: VersionFix::RestartDaemon,
+                ..
+            }) if restarted_older => MachineStatus::OlderRho,
+            DaemonError::Incompatible(VersionMismatch {
+                fix: VersionFix::RestartDaemon,
+                restart,
+                ..
+            }) => MachineStatus::OlderDaemon { cost: *restart },
+            other => MachineStatus::Failed(other.to_string().into()),
+        };
+        self.set_status(machine, status, cx);
         self.restart_drafts(machine, window, cx);
         cx.notify();
     }
@@ -716,8 +749,10 @@ impl RhoApp {
         };
         let machine = machine.clone();
         cx.spawn(async move |this, cx| {
-            if let Ok(upgrade) = daemon.pending_upgrade().await {
-                let _ = this.update(cx, |this, cx| this.set_upgrade(&machine, upgrade, cx));
+            if let Ok(status) = daemon.status().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_upgrade(&machine, status.upgrade, cx);
+                });
             }
         })
         .detach();
@@ -801,11 +836,7 @@ impl RhoApp {
             DaemonEvent::Detached { session, reason } => match reason {
                 Detached::Behind => self.reattach(&key(session), window, cx),
                 Detached::Deleted => self.session_deleted(&key(session), window, cx),
-                Detached::Restarting => {
-                    if let Some(connection) = self.connection_mut(machine) {
-                        connection.restarting = true;
-                    }
-                }
+                Detached::Restarting => self.expect_restart(machine),
                 Detached::Unloaded => {
                     if let Some(open) = self.opened(&key(session)) {
                         open.view.update(cx, |view, _| view.unload());
@@ -847,33 +878,14 @@ impl RhoApp {
 
     /// Notes that `machine`'s daemon may restart in place, so its
     /// connection's end is answered by connecting again; see
-    /// [`Self::disconnected`]. The next connection starts without it.
+    /// [`Self::disconnected`]. The next connection starts without it. A
+    /// daemon the user stopped stays stopped.
     fn expect_restart(&mut self, machine: &MachineId) {
         if let Some(connection) = self.connection_mut(machine) {
-            connection.restarting = true;
-        }
-    }
-
-    /// Restarts `machine`'s daemon now, into the newer rho it waits to
-    /// run. It detaches every session as restarting, so the connection
-    /// comes back on its own (see [`Self::disconnected`]).
-    fn restart_daemon(&self, machine: &MachineId, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(daemon) = self.daemon(machine).cloned() else {
-            return;
-        };
-        let label = self.machines.read(cx).label(machine);
-        cx.spawn_in(window, async move |_, cx| {
-            if let Err(error) = daemon.restart().await {
-                let _ = cx.update(|window, cx| {
-                    window.push_notification(
-                        Notification::error(error.to_string())
-                            .title(format!("Couldn't restart Rho on {label}")),
-                        cx,
-                    );
-                });
+            if !connection.stopped {
+                connection.restarting = true;
             }
-        })
-        .detach();
+        }
     }
 
     /// `machine`'s connection `epoch` ended. After the daemon said it was
@@ -1909,6 +1921,10 @@ impl RhoApp {
             Pane::Draft(view) => Some(view.clone()),
             Pane::Empty | Pane::Session(_) => None,
         }
+    }
+    /// How `machine`'s connection is doing, for UI tests.
+    pub(crate) fn machine_status(&self, machine: &MachineId, cx: &App) -> Option<MachineStatus> {
+        self.machines.read(cx).status(machine).cloned()
     }
     /// What the views offer for `machine`'s rho, for UI tests.
     pub(crate) fn rho_offer(&self, machine: &MachineId, cx: &App) -> Option<Offer> {

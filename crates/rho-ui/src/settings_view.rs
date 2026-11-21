@@ -346,6 +346,13 @@ fn unreachable_note(machines: &Machines, machine: &MachineId) -> Option<String> 
     match machines.status(machine) {
         None | Some(MachineStatus::Connecting) => Some(format!("Connecting to {label}…")),
         Some(MachineStatus::Failed(why)) => Some(format!("Can't reach {label}: {why}")),
+        Some(MachineStatus::OlderDaemon { .. }) => Some(format!(
+            "Rho on {label} is older than rho-ui: restart its daemon to connect"
+        )),
+        Some(MachineStatus::OlderRho) => Some(format!(
+            "Rho on {label} is older than rho-ui: update it there to connect"
+        )),
+        Some(MachineStatus::Stopped) => Some(format!("Rho on {label} is stopped")),
         Some(MachineStatus::Ready { .. }) => None,
     }
 }

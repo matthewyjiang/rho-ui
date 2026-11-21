@@ -12,8 +12,10 @@
 //! Show more under them adds 25 more at a time. Hovering a row shows its
 //! details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
-//! which machines aren't connected, and why any remote machine's
-//! repositories couldn't be read.
+//! which machines aren't connected, with what would fix it (Retry, a
+//! restart of a daemon too old for rho-ui or of another build, Start for
+//! one the user stopped), and why any remote machine's repositories
+//! couldn't be read.
 //!
 //! Drag the open sidebar's right edge to resize it, and double-click the
 //! edge for its default width. The sidebar collapses to a rail of buttons;
@@ -56,7 +58,7 @@ use rho_ui_core::{Job, SessionSummary};
 
 use crate::{
     badge::Badge,
-    machines::{MachineId, MachineStatus, Machines, Place, SessionKey},
+    machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
     pull_requests::{PrLinks, PrSummary, PullRequests, Rollup, Target, Watch},
     rho_install::{render_offer, Installs},
@@ -239,8 +241,6 @@ pub(crate) enum SidebarEvent {
         id: SessionKey,
         title: SharedString,
     },
-    /// Connect to a machine whose connection failed.
-    Retry(MachineId),
     OpenSettings,
     /// Collapse the sidebar to its rail, or open it again; see
     /// [`SidebarView::toggle_collapsed`].
@@ -1370,6 +1370,121 @@ impl SidebarView {
             .collect()
     }
 
+    /// What isn't right with how `machine`'s connection is doing, `status`,
+    /// with the buttons that would fix it; nothing for a daemon that works.
+    /// `label` names the machine, and `on` is " on {label}" where machines
+    /// need telling apart, else empty. `restart_runs` is the rho installed
+    /// there when it isn't the version the daemon runs, which only then a
+    /// restart would change.
+    fn render_status(
+        &self,
+        machines: &Machines,
+        machine: &MachineId,
+        (label, on): (&str, &str),
+        status: &MachineStatus,
+        restart_runs: Option<&str>,
+        muted: Hsla,
+    ) -> Option<AnyElement> {
+        let ask = |id: &str, label: &'static str, icon: Lucide, action: DaemonAction| {
+            let entity = self.machines.clone();
+            Button::new(SharedString::from(format!("{id}-{machine}")))
+                .outline()
+                .xsmall()
+                .icon(icon)
+                .label(label)
+                .on_click(move |_, _, cx| machines::ask(&entity, action.clone(), cx))
+        };
+        let retry = || {
+            let action = DaemonAction::Connect(machine.clone());
+            ask("retry", "Retry", Lucide::RotateCw, action)
+        };
+        let restart = || {
+            let action = DaemonAction::Restart(machine.clone());
+            ask("restart-daemon", "Restart…", Lucide::RotateCw, action)
+        };
+        let alert_with = |alert: Alert, buttons: Vec<Button>| {
+            v_flex()
+                .px_2()
+                .gap_1()
+                .child(alert.small())
+                .child(h_flex().justify_end().gap_1().children(buttons))
+                .into_any_element()
+        };
+        let shown = match status {
+            MachineStatus::Ready {
+                another_build: false,
+                ..
+            } => return None,
+            MachineStatus::Connecting => h_flex()
+                .px_3()
+                .gap_1()
+                .text_xs()
+                .text_color(muted)
+                .child(Icon::new(Lucide::CircleDashed).xsmall())
+                .child(format!("Connecting to {label}…"))
+                .into_any_element(),
+            MachineStatus::Ready {
+                version,
+                another_build: true,
+                ..
+            } => {
+                let why = skew_note(version, restart_runs);
+                let buttons = restart_runs.map(|_| restart()).into_iter().collect();
+                alert_with(
+                    Alert::warning(SharedString::from(format!("machine-skew-{machine}")), why)
+                        .title(format!("Rho{on} is another build")),
+                    buttons,
+                )
+            }
+            MachineStatus::OlderDaemon { .. } => alert_with(
+                Alert::error(
+                    SharedString::from(format!("machine-error-{machine}")),
+                    machines::OLDER_DAEMON,
+                )
+                .title(format!("Rho{on} is older than rho-ui")),
+                if machines.restarts_older(machine) {
+                    vec![retry(), restart()]
+                } else {
+                    vec![retry()]
+                },
+            ),
+            MachineStatus::OlderRho => alert_with(
+                Alert::error(
+                    SharedString::from(format!("machine-error-{machine}")),
+                    machines::OLDER_RHO,
+                )
+                .title(format!("Rho{on} is older than rho-ui")),
+                vec![retry()],
+            ),
+            MachineStatus::Failed(why) => alert_with(
+                Alert::error(
+                    SharedString::from(format!("machine-error-{machine}")),
+                    why.clone(),
+                )
+                .title(format!("Can't reach {label}")),
+                vec![retry()],
+            ),
+            MachineStatus::Stopped => h_flex()
+                .px_3()
+                .gap_2()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("Rho{on} is stopped")),
+                )
+                .child(ask(
+                    "start-daemon",
+                    "Start",
+                    Lucide::Play,
+                    DaemonAction::Connect(machine.clone()),
+                ))
+                .into_any_element(),
+        };
+        Some(shown)
+    }
+
     /// What isn't right with each machine, then why any remote machine's
     /// repositories couldn't be read, then what each rho needs, then
     /// Settings and the local rho's version.
@@ -1378,7 +1493,7 @@ impl SidebarView {
         let muted = theme.muted_foreground;
         let machines = self.machines.read(cx);
         let version = match machines.status(&MachineId::local()) {
-            Some(MachineStatus::Ready { version }) => Some(version.clone()),
+            Some(MachineStatus::Ready { version, .. }) => Some(format!("Rho {version}")),
             _ => None,
         };
         let installs = self.installs.read(cx);
@@ -1396,51 +1511,24 @@ impl SidebarView {
                     error.clone(),
                 ));
             }
-            match status {
-                MachineStatus::Ready { .. } => {}
-                // Without rho there is nothing to reach: its offer says so.
-                _ if installs
-                    .offer(machine, cx)
-                    .is_some_and(|offer| offer.replaces_connection_error()) => {}
-                MachineStatus::Connecting => troubles.push(
-                    h_flex()
-                        .px_3()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(Icon::new(Lucide::CircleDashed).xsmall())
-                        .child(format!("Connecting to {label}…"))
-                        .into_any_element(),
-                ),
-                MachineStatus::Failed(why) => {
-                    let retry = machine.clone();
-                    troubles.push(
-                        v_flex()
-                            .px_2()
-                            .gap_1()
-                            .child(
-                                Alert::error(
-                                    SharedString::from(format!("machine-error-{machine}")),
-                                    why.clone(),
-                                )
-                                .title(format!("Can't reach {label}"))
-                                .small(),
-                            )
-                            .child(
-                                h_flex().justify_end().child(
-                                    Button::new(SharedString::from(format!("retry-{machine}")))
-                                        .outline()
-                                        .xsmall()
-                                        .icon(IconName::RotateCw)
-                                        .label("Retry")
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(SidebarEvent::Retry(retry.clone()));
-                                        })),
-                                ),
-                            )
-                            .into_any_element(),
-                    );
-                }
+            let offers_install = installs
+                .offer(machine, cx)
+                .is_some_and(|offer| offer.replaces_connection_error());
+            // Without rho there is nothing to reach: its offer says so.
+            if !offers_install {
+                let named = (label.as_ref(), on.as_str());
+                let restart_runs = match status {
+                    MachineStatus::Ready { version, .. } => installs.restart_runs(machine, version),
+                    _ => None,
+                };
+                troubles.extend(self.render_status(
+                    machines,
+                    machine,
+                    named,
+                    status,
+                    restart_runs,
+                    muted,
+                ));
             }
         }
         let workspaces = self.workspaces.read(cx);
@@ -1469,6 +1557,21 @@ impl SidebarView {
                     version.map(|version| div().text_xs().text_color(muted).child(version)),
                 ),
             )
+    }
+}
+
+/// What the footer says of a daemon of another build than rho-ui's, which
+/// runs rho `version`: builds have no order, so either side may be the
+/// older one. `restart_runs` is the rho installed there, if a restart would
+/// run another version.
+fn skew_note(version: &str, restart_runs: Option<&str>) -> String {
+    match restart_runs {
+        Some(installed) => format!(
+            "Requests may fail. Its daemon runs Rho {version}, but Rho {installed} is installed \
+             there: restarting it runs that."
+        ),
+        None => "Requests may fail. Update whichever of Rho and rho-ui is older, then restart it."
+            .to_owned(),
     }
 }
 

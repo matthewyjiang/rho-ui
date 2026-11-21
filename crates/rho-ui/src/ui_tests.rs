@@ -32,8 +32,8 @@ use rho_ui_core::{
         REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
-    Delay, Entry, PromptKey, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
-    WorktreeVerdict,
+    Delay, Entry, PromptKey, RestartCost, RetryReason, RhoInstall, RunState, Session, SessionId,
+    ToolStatus, WorktreeVerdict,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -41,7 +41,7 @@ use gpui_kit::component::ActiveTheme as _;
 use crate::{
     app::{LaunchConfig, RhoApp},
     forge::ForgeCli,
-    machines::{MachineId, Place, Reach, RemoteMachine, SessionKey},
+    machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
     pull_requests::{BranchId, CheckStatus, Found, Lookup, PrLinks, RepoId, Target},
     rho_install::Offer,
@@ -149,13 +149,15 @@ static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| PathBuf::from("cmd.exe")
 
 /// Writes a `rho` at `path` that answers as rho 3.1.0, with 3.2.0 out:
 /// `update --check --json` says whether an update is available with the
-/// `sh` expression `available`, and `update` creates `updated` beside it.
+/// `sh` expression `available`, `update` creates `updated` beside it, and
+/// `daemon restart` creates `restarted`.
 fn write_fake_rho(path: &Path, available: &str) {
     let script = format!(
         r#"#!/bin/sh
 dir=$(dirname "$0")
 case $1 in
   --version) echo "rho 3.1.0" ;;
+  daemon) [ "$2" = restart ] && touch "$dir/restarted" ;;
   update)
     if [ "$2" = --check ]; then
       if {available}; then a=true; else a=false; fi
@@ -1859,6 +1861,16 @@ fn settings_open_apply_and_close() {
     });
 }
 
+/// Waits for the dialog whose button is labelled `ok`, then saves a
+/// screenshot named `name` once it has faded in.
+fn shot_dialog(ui: &mut Harness, ok: &str, name: &str) {
+    ui.wait_until(&format!("a dialog with {ok:?}"), |window, _, _| {
+        window.try_find_by_label(ok).is_some()
+    });
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.shot(name);
+}
+
 /// Opens Settings from the gear, past the dialog's entrance.
 fn open_settings(ui: &mut Harness) {
     ui.wait_until("the sidebar", |window, _, _| {
@@ -2582,6 +2594,7 @@ fn an_update_installs_then_restarts_the_daemon_on_request() {
     ui.shot("waiting");
 
     ui.click("restart-rho-local");
+    click_label(&mut ui, "Restart");
     ui.wait_for_daemon("the restart", |daemon| daemon.restarts() == 1);
     ui.cx.advance_clock(Duration::from_secs(2));
     ui.wait_until(
@@ -2685,6 +2698,158 @@ fn an_open_session_survives_lag_and_restarts() {
     assert_eq!(ui.fake().restarts(), 3);
     ui.wait_for_session("no turn", |session| !session.state().is_busy());
     ui.shot("gone");
+}
+
+/// A daemon that needs a restart offers one, which asks first: one too old
+/// for rho-ui's protocol restarts with `rho daemon restart`, and rho-ui
+/// connects once the Rho installed there is new enough, and until then says
+/// to update it rather than offer the restart again; one of another build
+/// restarts through the protocol, and comes back as rho-ui's own.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake rho written as a POSIX sh script")]
+fn a_daemon_that_needs_a_restart_restarts_once_confirmed() {
+    let dir = tempfile::tempdir().expect("a folder for the fake rho");
+    let rho = dir.path().join("rho");
+    write_fake_rho(&rho, "false");
+    let daemon = FakeDaemon::start(Script::default());
+    let cost = RestartCost {
+        in_progress: 2,
+        clients: 1,
+    };
+    // `rho daemon restart` starts the same old daemon at first.
+    daemon.speak_older_protocol(cost, &dir.path().join("never"));
+    let machines = Machines {
+        rho: Some(rho),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_with("older-daemon", daemon.target(), Some(daemon), machines);
+    let local = MachineId::local();
+    ui.wait_until("the restart offered", |window, cx, app| {
+        is_visible(window, "restart-daemon-local")
+            && app.machine_status(&local, cx)
+                == Some(MachineStatus::OlderDaemon { cost: Some(cost) })
+    });
+    ui.shot("older");
+    ui.click("restart-daemon-local");
+    shot_dialog(&mut ui, "Restart", "older-confirm");
+    click_label(&mut ui, "Restart");
+    // Past the dialog's exit, so the next one is the only one.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the installed Rho found older too", |window, cx, app| {
+        app.machine_status(&local, cx) == Some(MachineStatus::OlderRho)
+            && is_visible(window, "retry-local")
+            && !is_visible(window, "restart-daemon-local")
+    });
+    assert!(
+        dir.path().join("restarted").exists(),
+        "rho daemon restart ran"
+    );
+    ui.shot("older-rho");
+
+    // Rho is updated there; Retry finds the old daemon again, and a
+    // restart now runs the new Rho, another build still.
+    std::fs::remove_file(dir.path().join("restarted")).expect("the marker");
+    ui.fake()
+        .speak_older_protocol(cost, &dir.path().join("restarted"));
+    ui.fake().run_another_build(cost);
+    ui.click("retry-local");
+    ui.wait_until("the restart offered again", |window, _, _| {
+        is_visible(window, "restart-daemon-local")
+    });
+    ui.click("restart-daemon-local");
+    click_label(&mut ui, "Restart");
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("connected after the restart", |_, cx, app| {
+        matches!(
+            app.machine_status(&local, cx),
+            Some(MachineStatus::Ready {
+                another_build: true,
+                ..
+            })
+        )
+    });
+    assert_eq!(
+        ui.fake().refusals(),
+        3,
+        "the restarted daemon took the hello"
+    );
+
+    ui.wait_until("the other build's restart offered", |window, _, _| {
+        is_visible(window, "restart-daemon-local")
+    });
+    ui.shot("another-build");
+    ui.click("restart-daemon-local");
+    shot_dialog(&mut ui, "Restart", "another-build-confirm");
+    click_label(&mut ui, "Restart");
+    ui.wait_for_daemon("the restart in place", |daemon| daemon.restarts() == 1);
+    ui.wait_until("back as rho-ui's build", |window, cx, app| {
+        !is_visible(window, "restart-daemon-local")
+            && matches!(
+                app.machine_status(&local, cx),
+                Some(MachineStatus::Ready {
+                    another_build: false,
+                    ..
+                })
+            )
+    });
+    ui.shot("restarted");
+}
+
+/// Stop asks first, then stops the daemon, and rho-ui doesn't start it
+/// again by itself, though it expected the daemon to restart into an
+/// upgrade; Start does.
+#[test]
+fn a_stopped_daemon_stays_stopped_until_started() {
+    let mut ui = Harness::start("stop", Script::default());
+    let local = MachineId::local();
+    ui.wait_until("connected", |_, cx, app| {
+        matches!(
+            app.machine_status(&local, cx),
+            Some(MachineStatus::Ready { .. })
+        )
+    });
+    ui.fake().replace_program("3.2.0", 1);
+    ui.fake().set_in_progress(1);
+    ui.cx.advance_clock(Duration::from_secs(31));
+    ui.wait_until("the upgrade it waits on", |window, _, _| {
+        is_visible(window, "restart-rho-local")
+    });
+
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "About");
+    ui.wait_until("the daemon's controls", |window, _, _| {
+        is_visible(window, "about-stop-local")
+    });
+    ui.shot("about");
+    ui.click("about-stop-local");
+    shot_dialog(&mut ui, "Stop", "confirm");
+    click_label(&mut ui, "Stop");
+    ui.wait_until("the daemon stopped", |window, cx, app| {
+        is_visible(window, "about-start-local")
+            && app.machine_status(&local, cx) == Some(MachineStatus::Stopped)
+    });
+    assert_eq!(ui.fake().stops(), 1);
+    let hellos = ui.fake().hellos();
+    // Past every poll that could have connected again.
+    ui.cx.advance_clock(Duration::from_secs(61));
+    ui.frame();
+    assert_eq!(ui.fake().hellos(), hellos, "nothing connected by itself");
+    assert_eq!(ui.fake().restarts(), 0, "nor restarted it");
+
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the sidebar's Start", |window, _, _| {
+        is_visible(window, "start-daemon-local")
+    });
+    ui.shot("stopped");
+    ui.click("start-daemon-local");
+    ui.wait_until("connected again", |_, cx, app| {
+        matches!(
+            app.machine_status(&local, cx),
+            Some(MachineStatus::Ready { .. })
+        )
+    });
+    assert_eq!(ui.fake().hellos(), hellos + 1);
 }
 
 /// A turn rho's terminal UI started shows in the sidebar as running, though

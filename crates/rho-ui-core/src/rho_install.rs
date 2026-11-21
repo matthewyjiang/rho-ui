@@ -1,11 +1,13 @@
 //! A machine's `rho` program, apart from its daemon: whether rho is there,
-//! whether a newer release is out, and installing or updating it. On this
-//! machine rho-ui runs `rho` itself: `rho --version` and `rho update
-//! --check --json` to check, `rho update` to update. Installing runs rho's
-//! own installer, its `install.sh` with `sh` on Unix ([`INSTALL_SCRIPT`])
-//! and its `install.ps1` with `powershell` on Windows. On a remote machine,
-//! which is Unix, each job is one POSIX `sh` script over ssh:
-//! [`CHECK_SCRIPT`], [`INSTALL_SCRIPT`] and [`UPDATE_SCRIPT`].
+//! whether a newer release is out, installing or updating it, and
+//! restarting a daemon too old to talk to. On this machine rho-ui runs
+//! `rho` itself: `rho --version` and `rho update --check --json` to check,
+//! `rho update` to update, `rho daemon restart` to restart. Installing runs
+//! rho's own installer, its `install.sh` with `sh` on Unix
+//! ([`INSTALL_SCRIPT`]) and its `install.ps1` with `powershell` on Windows.
+//! On a remote machine, which is Unix, each job is one POSIX `sh` script
+//! over ssh: [`CHECK_SCRIPT`], [`INSTALL_SCRIPT`], [`UPDATE_SCRIPT`] and
+//! [`RESTART_SCRIPT`].
 
 #[cfg(not(target_family = "wasm"))]
 use std::{
@@ -137,6 +139,30 @@ impl RhoInstall {
                 on_own_thread(move || update_here(&find_rho(&rho))).await?
             }
             Place::There(link, rho) => link.run_long_script(UPDATE_SCRIPT, &[rho]).await.map(drop),
+        }
+    }
+
+    /// Restarts the machine's daemon with `rho daemon restart`, which
+    /// stops a daemon that refused rho-ui's handshake for its older
+    /// protocol and starts the rho installed. That is what rho says to do
+    /// then: `rho/daemon/restart` needs a handshake first. Here it runs
+    /// with this process's environment, as the daemon rho-ui connects to
+    /// is the one of its rho home.
+    ///
+    /// # Errors
+    ///
+    /// Fails, with what rho printed, if it fails or can't run.
+    pub async fn restart_daemon(&self) -> Result<(), DaemonError> {
+        match self.place().await? {
+            #[cfg(not(target_family = "wasm"))]
+            Place::Here(rho) => {
+                let rho = find_rho(rho);
+                on_own_thread(move || {
+                    run(platform::background_command(&rho).args(["daemon", "restart"]))
+                })
+                .await?
+            }
+            Place::There(link, rho) => link.run_script(RESTART_SCRIPT, &[rho]).await.map(drop),
         }
     }
 
@@ -362,6 +388,14 @@ const UPDATE_SCRIPT: &str = concat!(
     "exec 1>&2\nrho=$1\n",
     find_rho_sh!(),
     "exec \"$rho\" update </dev/null\n"
+);
+
+/// Runs `rho daemon restart` on a remote machine. Output goes to stderr,
+/// which a failure reports.
+const RESTART_SCRIPT: &str = concat!(
+    "exec 1>&2\nrho=$1\n",
+    find_rho_sh!(),
+    "exec \"$rho\" daemon restart </dev/null\n"
 );
 
 /// Printed when there is no rho, after whatever a login file printed.

@@ -31,9 +31,9 @@ pub use agent_settings::{AgentSettings, AgentSettingsChanged};
 pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
 pub use completion::{Completion, Edit};
 pub use daemon::{
-    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached,
-    PendingUpgrade, PromptKey, ReportedWorktree, SessionId, SessionSummary, SurfaceActionError,
-    Unsteered,
+    Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
+    Detached, PendingUpgrade, PromptKey, ReportedWorktree, RestartCost, SessionId, SessionSummary,
+    SurfaceActionError, Unsteered, VersionFix, VersionMismatch,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
