@@ -560,6 +560,11 @@ impl SessionView {
     }
 
     fn activity(&self) -> Activity {
+        // What the view knows of the session is stale until a connection
+        // follows it again.
+        if matches!(self.link, Link::Lost | Link::Refused(_)) {
+            return Activity::Idle;
+        }
         let running = || {
             self.session
                 .background()
@@ -626,14 +631,19 @@ impl SessionView {
                 }
                 self.attachments += 1;
             }
-            // The connection ended; the next one follows the session again.
-            Err(DaemonError::Closed) => {}
-            // Followed before: what it showed, and what was typed, stay.
-            Err(error) if self.attachments > 0 => {
+            // The connection ends next; the next one follows the session
+            // again.
+            Err(DaemonError::Closed | DaemonError::Stopping(_)) => {}
+            // Shown before: what it showed, and what was typed, stay.
+            Err(error) if matches!(self.loading, Loading::Ready) => {
                 self.link = Link::Refused(error.to_string());
                 self.give_back_waiting(window, cx);
+                self.report_live(cx);
             }
-            Err(error) => self.loading = Loading::Failed(error.to_string()),
+            Err(error) => {
+                self.loading = Loading::Failed(error.to_string());
+                self.give_back_waiting(window, cx);
+            }
         }
         self.after_change(window, cx);
         if answered {
@@ -660,6 +670,11 @@ impl SessionView {
         if !self.follows_again() {
             return None;
         }
+        // The turn under way, if any, is timed again from what the attach
+        // says: it may have ended meanwhile, or another begun.
+        self.busy_since = None;
+        self.turn_began = None;
+        self.transcript.forget_turn(cx);
         self.settings
             .update(cx, |settings, _| settings.set_daemon(daemon.clone()));
         self.added_dirs
@@ -680,6 +695,7 @@ impl SessionView {
         if lost {
             self.give_back_waiting(window, cx);
         }
+        self.report_live(cx);
         cx.notify();
     }
 
@@ -797,14 +813,19 @@ impl SessionView {
         let key = self.key();
         cx.global::<BackgroundLog>()
             .record(&key, &self.session, &mut self.recorded);
+        self.report_live(cx);
+        cx.notify();
+        self.send_held(window, cx);
+    }
+
+    /// Tells the app when the title or activity the sidebar shows changed.
+    fn report_live(&mut self, cx: &mut Context<'_, Self>) {
         let activity = self.activity();
         let title = self.title();
         if self.reported.0 != title || self.reported.1 != activity {
             self.reported = (title, activity);
             cx.emit(SessionEvent::LiveChanged);
         }
-        cx.notify();
-        self.send_held(window, cx);
     }
 
     /// Sends the composer's message: as a prompt, or while a turn runs, as

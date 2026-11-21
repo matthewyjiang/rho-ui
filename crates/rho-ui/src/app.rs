@@ -10,8 +10,10 @@
 //! goes: when the daemon stops sending its events, or the machine connects
 //! again, the app follows it again on the same view, from where its events
 //! left off ([`RhoApp::reattach`]). rho-ui connects again by itself only
-//! after the daemon said it is restarting; otherwise it waits for the user's
-//! Retry, as with no session followed it can't tell a restart from a stop.
+//! when it expects the daemon to restart: it said so, an upgrade waits, or
+//! rho-ui updated rho (see [`RhoApp::expect_restart`]). Otherwise it waits
+//! for the user's Retry, as with no session followed it can't tell a
+//! restart from a stop.
 //!
 //! The sidebar, the session view and the right panel are drawn as cached
 //! views: each redraws only when it changes, so a hover in one never
@@ -631,7 +633,11 @@ impl RhoApp {
     ) {
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
+            connection.jobs.clear();
         }
+        // Nothing says what runs there until it connects again.
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_jobs(machine, &[], cx));
         self.set_link(machine, &Link::Lost, window, cx);
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));

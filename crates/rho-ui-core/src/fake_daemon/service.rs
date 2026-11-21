@@ -52,10 +52,14 @@ impl Fake {
 
     /// Restarts in place, as rho does: the restarted daemon runs the new
     /// program, so no upgrade waits; every attached session is detached as
-    /// restarting, then every connection closes.
+    /// restarting, new sessions no prompt saved are gone, then every
+    /// connection closes.
     pub(super) fn restart_now(&self) {
         let mut state = self.lock();
         state.upgrade = None;
+        state
+            .sessions
+            .retain(|_, session| session.saved || session.subagent);
         for session in state.sessions.values_mut() {
             for publisher in session.publishers.drain(..) {
                 publisher.close(DetachReason::Restarting);

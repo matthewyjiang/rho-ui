@@ -2602,8 +2602,9 @@ fn an_update_installs_then_restarts_the_daemon_on_request() {
 /// events. Fallen behind, it carries on where it was scrolled to. Across a
 /// restart, its composer keeps what was typed and its transcript holds
 /// each entry once; and a prompt the restarting daemon couldn't take goes
-/// again once it is back, and runs once. A session gone after a restart
-/// keeps what it showed and what was typed, and says why.
+/// again once it is back, and runs once. A new session's first message
+/// cut off by a restart, which leaves no session to follow, goes back in
+/// the composer.
 #[test]
 fn an_open_session_survives_lag_and_restarts() {
     let script = Script {
@@ -2670,21 +2671,19 @@ fn an_open_session_survives_lag_and_restarts() {
     assert_eq!(sent, 1);
     ui.shot("sent-across");
 
-    let entries = ui.session().entries().len();
-    ui.type_in("still here");
-    ui.fake().restart_without("old");
-    ui.wait_until("the refusal", |window, _, _| {
-        is_visible(window, "link-notice")
+    // A new session's first message, which the restart cuts off before
+    // rho saved the session anywhere.
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.fake().restart_at_next_prompt();
+    ui.send("list files");
+    ui.wait_until("the message back, and why", |window, cx, app| {
+        app.active_session()
+            .is_some_and(|view| view.read(cx).composer_text(cx) == "list files")
+            && is_visible(window, "link-notice")
     });
-    ui.wait_for_daemon("the reconnect", |fake| fake.restarts() == 3);
-    ui.frame();
-    assert!(same_view(&mut ui), "the same view stays");
-    assert_eq!(ui.composer_text(), "still here");
-    assert_eq!(
-        ui.session().entries().len(),
-        entries,
-        "what it showed stays"
-    );
+    assert_eq!(ui.fake().restarts(), 3);
+    ui.wait_for_session("no turn", |session| !session.state().is_busy());
     ui.shot("gone");
 }
 
