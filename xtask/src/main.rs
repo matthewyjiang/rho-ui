@@ -105,11 +105,43 @@ fn cargo(args: &[&str]) -> Command {
 }
 
 /// `cargo SUBCOMMAND` for the web build's target, with what that needs to
-/// build on stable (see the module docs), then `args`.
-fn wasm_cargo(subcommand: &str, args: &[&str]) -> Command {
+/// build on stable (see the module docs) and a C compiler for it, then
+/// `args`.
+fn wasm_cargo(subcommand: &str, args: &[&str]) -> Result<Command> {
     let mut command = cargo(&[subcommand, "--target", WASM_TARGET]);
     command.args(args).env("RUSTC_BOOTSTRAP", "wasm_thread");
-    command
+    if cfg!(target_os = "macos") && std::env::var_os(WASM_CC).is_none() {
+        let llvm = homebrew_llvm()?;
+        command
+            .env(WASM_CC, llvm.join("bin/clang"))
+            .env(WASM_AR, llvm.join("bin/llvm-ar"));
+    }
+    Ok(command)
+}
+
+/// The variables the `cc` crate reads for the web build's C: its SQLite
+/// (`sqlite-wasm-rs`).
+const WASM_CC: &str = "CC_wasm32_unknown_unknown";
+const WASM_AR: &str = "AR_wasm32_unknown_unknown";
+
+/// Homebrew's LLVM, whose clang builds for wasm32, as Apple's can't.
+fn homebrew_llvm() -> Result<PathBuf> {
+    let missing = || {
+        format!(
+            "the web build's C needs a clang that builds for wasm32, which Apple's doesn't: \
+             `brew install llvm`, or set {WASM_CC} and {WASM_AR} to another LLVM's \
+             clang and llvm-ar"
+        )
+    };
+    let prefix = Command::new("brew")
+        .args(["--prefix", "llvm"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .with_context(missing)?;
+    let llvm = PathBuf::from(String::from_utf8_lossy(&prefix.stdout).trim());
+    ensure!(llvm.join("bin/clang").is_file(), "{}", missing());
+    Ok(llvm)
 }
 
 fn run(command: &mut Command) -> Result<()> {
@@ -122,7 +154,7 @@ fn run(command: &mut Command) -> Result<()> {
 
 /// Builds the web build into `target/web`.
 fn web(profile: Profile) -> Result<()> {
-    let mut build = wasm_cargo("build", &["-p", "rho-ui"]);
+    let mut build = wasm_cargo("build", &["-p", "rho-ui"])?;
     match profile {
         Profile::Release => {
             build.arg("--release");
@@ -200,12 +232,14 @@ fn fonts(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Builds a release `rho-ui`, with the web build in it where `rho-ui serve`
-/// runs, on Unix: the web build, gzipped into `target/web-gz`, which its
-/// `web` feature builds in. Elsewhere it would be dead weight.
+/// Builds a release `rho-ui` with the web build in it, gzipped into
+/// `target/web-gz`, which its `web` feature builds in. Without `rho-ui
+/// serve`, on Windows, the release alone.
 fn dist() -> Result<()> {
+    // As `mod serve` in crates/rho-ui/src/main.rs.
+    let serves = cfg!(unix);
     let mut build = cargo(&["build", "--release", "-p", "rho-ui"]);
-    if cfg!(unix) {
+    if serves {
         web(Profile::Release)?;
         let web = root().join("target/web");
         let gz = root().join("target/web-gz");
@@ -219,7 +253,7 @@ fn dist() -> Result<()> {
     let binary = target_dir()
         .join("release")
         .join(format!("rho-ui{}", std::env::consts::EXE_SUFFIX));
-    let serve = if cfg!(unix) {
+    let serve = if serves {
         "; run `rho-ui serve` for the browser"
     } else {
         ""
@@ -263,7 +297,7 @@ fn clippy_web() -> Result<()> {
             "-D",
             "warnings",
         ],
-    )
+    )?
     .env("CLIPPY_CONF_DIR", config))
 }
 
