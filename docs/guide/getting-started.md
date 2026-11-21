@@ -28,19 +28,16 @@ install -Dm644 rho-ui.desktop ~/.local/share/applications/rho-ui.desktop
 install -Dm644 icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
 ```
 
+It links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desktop has; a server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)).
+
 **macOS** (Apple silicon): unzip it and move `Rho.app` to Applications. The first time you open it, macOS says it can't verify the app. Click **Done**, then open **System Settings → Privacy & Security**, click **Open Anyway** beside the note that Rho was blocked, and confirm. Or, in a terminal, before opening it:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Rho.app
 ```
 
-**Windows** (x86_64): unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click **More info**, then **Run anyway**.
+**Windows** (x86_64): unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click **More info**, then **Run anyway**. It opens no console window, so it shows no command-line errors.
 
-::: details In detail
-- The Linux build links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desktop has. `rho-ui serve` needs them too, so a server without a desktop must install them: see [In a browser](./browser#what-differs-from-the-desktop).
-- The Mac app is signed ad hoc only, not by a developer Apple knows, which is why macOS asks.
-- On Windows, a release is a GUI program: it opens no console window, and so shows no command-line errors either.
-:::
 
 ### From source
 
