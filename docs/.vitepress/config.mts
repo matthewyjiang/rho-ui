@@ -24,7 +24,6 @@ const guide: DefaultTheme.SidebarItem[] = [
   {
     text: 'Reference',
     items: [
-      { text: 'Behavior in detail', link: '/features' },
       { text: 'Architecture', link: '/architecture' },
       { text: 'Testing', link: '/testing' },
     ],
@@ -58,7 +57,7 @@ export default withMermaid({
     nav: [
       { text: 'Getting started', link: '/guide/getting-started' },
       { text: 'Guide', link: '/guide/sessions' },
-      { text: 'Reference', link: '/features' },
+      { text: 'Reference', link: '/architecture' },
       { text: 'rho', link: 'https://matthewyjiang.github.io/rho/' },
     ],
     sidebar: guide,

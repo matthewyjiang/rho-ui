@@ -74,4 +74,4 @@ These follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set, on macOS too.
 
 ## More
 
-The [docs site](https://matthewyjiang.github.io/rho-ui/) has the user guide. [docs/](docs/) holds its source, with features in detail, architecture, and testing.
+The [docs site](https://matthewyjiang.github.io/rho-ui/) has the user guide. [docs/](docs/) holds its source, with the architecture and testing notes.
