@@ -575,10 +575,6 @@ fn a_prompt_past_the_message_limit_is_refused_and_the_connection_lives() {
 /// A rho that isn't there fails the connection with a reason that names
 /// it, so the user knows which path to fix.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "rho-ui can't start a daemon on Windows until rho-protocol's LocalDaemon is released there"
-)]
 fn a_missing_rho_fails_the_connection_with_a_reason() {
     // A home with no daemon, so the connection must start one.
     let target = DaemonTarget::Home {
