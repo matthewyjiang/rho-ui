@@ -13,12 +13,6 @@ On macOS, <kbd>Cmd</kbd> takes the place of <kbd>Ctrl</kbd> in these, and the me
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> | Show or hide the right panel |
 | <kbd>Ctrl</kbd>+<kbd>Q</kbd> | Quit |
 
-::: details In detail
-
-The app's shortcuts below are written with Ctrl; on macOS, Cmd takes its place, and tooltips show the shortcut this platform uses. The terminal's own keys say how they differ. On macOS the menu bar holds the Rho menu (Settings, Hide, Quit), File (New Session), Edit, View (the sidebar and right panel) and Window (Minimize, Zoom), each with its shortcut; an item is greyed out where it does nothing, such as Copy with no text box or terminal in use. Closing the window quits the app.
-
-:::
-
 ## Composer
 
 | Key | Action |

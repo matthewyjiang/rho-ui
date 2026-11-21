@@ -47,11 +47,7 @@ If rho isn't installed, rho-ui says so and offers **Install Rho**, which runs rh
 
 ## Your first session
 
-1. Press <kbd>Ctrl</kbd>+<kbd>N</kbd> (<kbd>Cmd</kbd>+<kbd>N</kbd> on macOS) for a new session.
-2. Pick a project under **Start a session in**, or **Add project…** to add a folder. rho-ui finds no projects on its own: you add the ones you want. You can also paste a git URL to clone it.
-3. Set the permission mode and model in the composer's footer if you like, type what you want done, and press <kbd>Enter</kbd>.
-
-From there, [Sessions](./sessions) covers the sidebar and projects, and [Working with a turn](./turns) covers what happens while the agent works.
+Press <kbd>Ctrl</kbd>+<kbd>N</kbd> and add a project: rho-ui doesn't find projects on its own. Then type what you want done. [Sessions](./sessions) covers projects, worktrees and attachments; [Working with a turn](./turns) covers steering and background work.
 
 ## Where rho-ui keeps things
 

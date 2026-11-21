@@ -2,7 +2,7 @@
 
 rho-ui is the desktop app for rho. See docs/architecture.md for the crate layout, docs/guide/ for behavior, and docs/testing.md for tests.
 
-`docs/` is also the docs site, built with VitePress and published to GitHub Pages from main (`npm run docs:dev` to preview). `docs/guide/` is the user guide and the one description of how rho-ui behaves: each section leads with what a user needs, and its `::: details In detail` block holds the exact behavior. When a change alters what a user sees or does, update both. Its screenshots come from the headless UI tests through `uv run docs/shots.py`.
+`docs/` is also the docs site, built with VitePress and published to GitHub Pages from main (`npm run docs:dev` to preview). `docs/guide/` is the user guide. It covers what a user can't learn by using the app: setup, requirements, concepts, limits, and behavior that would surprise them. Don't narrate the UI (what a button does, what a row shows); the app shows that itself. When a change alters any of those, update the guide. Its screenshots come from the headless UI tests through `uv run docs/shots.py`.
 
 ## Skills
 

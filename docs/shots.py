@@ -16,15 +16,9 @@ from pathlib import Path
 from PIL import Image
 
 SHOTS = [
-    "diff-changes",
     "machines-listed",
     "pull-request-pr",
-    "settings-open",
-    "surface-gallery-inputs-dark",
-    "terminal-tabs-split",
-    "turn-approval",
     "work-steps",
-    "worktree-chosen",
 ]
 
 root = Path(__file__).resolve().parent.parent
