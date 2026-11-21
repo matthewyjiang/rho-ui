@@ -318,9 +318,10 @@ mod tests {
                 _ => serde_json::json!({"type": "user_message",
                     "message": format!("m{n}"), "content": [{"type": "text", "text": text}]}),
             };
-            session.apply(SessionUpdate(
-                serde_json::from_value(event).expect("the script is a valid event"),
-            ));
+            session.apply(SessionUpdate {
+                seq: rho_protocol::Seq(0),
+                event: serde_json::from_value(event).expect("the script is a valid event"),
+            });
         }
         session.entries().to_vec()
     }

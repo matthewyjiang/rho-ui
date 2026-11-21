@@ -59,7 +59,15 @@
 //!   [`surface::gallery`] without waiting, and answers at once; "widen"
 //!   changes the form so ([`surface::widened`]).
 //!   [`FakeDaemon::fall_behind`] detaches a session's clients as fallen
-//!   behind; attaching again replays the calls with their surfaces.
+//!   behind.
+//! - An attach with a cursor of the daemon's stream gets the events after
+//!   it ([`Replay::Tail`]); any other attach gets the whole session
+//!   replayed ([`Replay::Reset`]), which replays the calls with their
+//!   surfaces. Each run of the daemon, from a restart on, has a stream of
+//!   its own, as rho's does.
+//! - A prompt sent again with the idempotency key of the session's latest
+//!   turn answers with that turn and starts none.
+//!   [`FakeDaemon::prompts`] counts the prompts that started a turn.
 //! - With [`Script::tui_job`], the session "tui-1" has a turn under way, as
 //!   one rho's terminal UI started: it is listed, its job runs, and a steer
 //!   is read at once, answered, and ends the turn. The steer "wait" is
@@ -89,8 +97,12 @@
 //!   set, if any. `rho/daemon/restart` restarts in place, as rho does: it
 //!   counts ([`FakeDaemon::restarts`]), drops the upgrade, as the restarted
 //!   daemon runs the new program, detaches every attached session as
-//!   restarting, and closes every connection; new ones are served as
-//!   before. [`FakeDaemon::attaches`] counts each session's attaches.
+//!   restarting, forgets new sessions no prompt saved, and closes every
+//!   connection; new ones are served as
+//!   before. [`FakeDaemon::restart`] restarts it so as rho does by itself
+//!   to upgrade, and [`FakeDaemon::restart_at_next_prompt`] as a prompt
+//!   arrives, which it answers `DaemonStopping`, having run nothing.
+//!   [`FakeDaemon::attaches`] counts each session's attaches.
 
 use std::{
     collections::BTreeMap,
@@ -105,14 +117,14 @@ use rho_protocol::{
         ToolHeader,
     },
     methods::{
-        BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, JobId, JobKind,
-        JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef, PendingUpgrade,
-        PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions, Replay, Seq,
-        SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams, SessionWorktree,
-        SteerId, StreamId, ToolCallId, ToolCallUpdate, TurnId,
+        BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, IdempotencyKey,
+        JobId, JobKind, JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef,
+        PendingUpgrade, PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions,
+        Replay, Seq, SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams,
+        SessionWorktree, SteerId, StreamId, ToolCallId, ToolCallUpdate, TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
-    CommandKind, ContentBlock, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
+    CommandKind, ContentBlock, Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
     DetachReason, ErrorCode, InputRequest, PermissionMode, PlanEntry, PlanStatus, Published,
     Publisher, Question, RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent,
     Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome, WorktreeReport, WorktreeVerdict,
@@ -398,9 +410,31 @@ impl FakeDaemon {
         });
     }
 
-    /// How many times a client asked the daemon to restart.
+    /// How many times the daemon restarted.
     pub fn restarts(&self) -> usize {
         *self.service.restarted.borrow()
+    }
+
+    /// Restarts the daemon in place, as rho does by itself once the
+    /// upgrade it waits for has nothing to cut short.
+    pub fn restart(&self) {
+        self.service.restart_now();
+    }
+
+    /// Has the daemon restart as the next prompt arrives, before the
+    /// prompt's turn starts, so it answers `DaemonStopping`.
+    pub fn restart_at_next_prompt(&self) {
+        self.service.lock().restart_at_prompt = true;
+    }
+
+    /// How many prompts started a turn in session `id`; one sent again
+    /// with its key counts once.
+    pub fn prompts(&self, id: &str) -> usize {
+        self.service
+            .lock()
+            .sessions
+            .get(id)
+            .map_or(0, |session| session.prompts)
     }
 
     /// How many times clients attached to session `id`.
@@ -841,6 +875,11 @@ struct FakeSession {
     publishers: Vec<Publisher>,
     /// How many times clients attached to it.
     attaches: usize,
+    /// How many prompts started a turn.
+    prompts: usize,
+    /// The idempotency key of the prompt that started the latest turn, and
+    /// that turn.
+    last_prompt: Option<(IdempotencyKey, TurnId)>,
     live_seq: u64,
     /// Background work, as the last background event listed it.
     background: Vec<BackgroundWork>,
@@ -866,6 +905,8 @@ impl FakeSession {
             history: Vec::new(),
             publishers: Vec::new(),
             attaches: 0,
+            prompts: 0,
+            last_prompt: None,
             live_seq: 0,
             background: Vec::new(),
             refused_busy: false,
@@ -887,13 +928,63 @@ impl FakeSession {
         session
     }
 
-    /// Follows the session from here: what it holds now, then what it
-    /// publishes until the client leaves. The replay leaves out background
+    /// Follows the session from here, in the daemon's `stream`: the events
+    /// after `after`, if it is a place in that stream, or else what the
+    /// session holds now; then what it publishes until the client leaves.
+    fn follow(
+        &mut self,
+        stream: StreamId,
+        after: Option<&Cursor>,
+    ) -> (SessionAttachResponse, Publisher, Subscription) {
+        let tail = after
+            .filter(|after| after.stream == stream && after.seq.0 <= self.live_seq)
+            .map(|after| after.seq.0);
+        let (replay, replayed) = match tail {
+            Some(after) => (Replay::Tail, self.tail(after)),
+            None => (Replay::Reset, self.transcript()),
+        };
+        let response = SessionAttachResponse {
+            stream,
+            workspace: self.cwd.clone(),
+            replay,
+            replay_events: u64::try_from(replayed.len()).unwrap_or(u64::MAX),
+            state: self.state,
+            turn: self.turn.as_ref().map(|turn| turn.id.clone()),
+            turn_elapsed_ms: self.turn.as_ref().map(Turn::elapsed_ms),
+            inputs: self
+                .turn
+                .iter()
+                .filter_map(|turn| turn.input.clone())
+                .collect(),
+            title: self.title.clone(),
+            options: self.settings.options(),
+            background: self.background.clone(),
+        };
+        let (publisher, subscription) = subscription(BACKLOG, replayed);
+        (response, publisher, subscription)
+    }
+
+    /// The events after seq `after`, as they were published: the `n`th
+    /// event published has seq `n`.
+    fn tail(&self, after: u64) -> Vec<(Seq, SessionEvent)> {
+        debug_assert_eq!(
+            u64::try_from(self.history.len()).ok(),
+            Some(self.live_seq),
+            "every event published is in the history, in order"
+        );
+        let skip = usize::try_from(after).expect("a seq the fake published fits in usize");
+        (after + 1..)
+            .map(Seq)
+            .zip(self.history[skip..].iter().cloned())
+            .collect()
+    }
+
+    /// The whole session, as a reset replays it. It leaves out background
     /// events, as rho's saved transcripts hold none (rho replays them only
     /// for a turn in progress, which the fake doesn't keep apart): the
     /// attach response lists the work as it is now, without work whose
     /// result the model has. Nor does it mark steers, as rho's doesn't.
-    fn follow(&mut self) -> (SessionAttachResponse, Publisher, Subscription) {
+    fn transcript(&self) -> Vec<(Seq, SessionEvent)> {
         let replay: Vec<SessionEvent> = self
             .history
             .iter()
@@ -908,30 +999,11 @@ impl FakeSession {
             .collect();
         // As the daemon numbers a reset's replay: 0 for all but the last.
         let last = replay.len().saturating_sub(1);
-        let replay: Vec<(Seq, SessionEvent)> = replay
+        replay
             .into_iter()
             .enumerate()
             .map(|(ix, event)| (Seq(if ix == last { self.live_seq } else { 0 }), event))
-            .collect();
-        let response = SessionAttachResponse {
-            stream: StreamId::new("stream"),
-            workspace: self.cwd.clone(),
-            replay: Replay::Reset,
-            replay_events: u64::try_from(replay.len()).unwrap_or(u64::MAX),
-            state: self.state,
-            turn: self.turn.as_ref().map(|turn| turn.id.clone()),
-            turn_elapsed_ms: self.turn.as_ref().map(Turn::elapsed_ms),
-            inputs: self
-                .turn
-                .iter()
-                .filter_map(|turn| turn.input.clone())
-                .collect(),
-            title: self.title.clone(),
-            options: self.settings.options(),
-            background: self.background.clone(),
-        };
-        let (publisher, subscription) = subscription(BACKLOG, replay);
-        (response, publisher, subscription)
+            .collect()
     }
 
     /// Records `event` and sends it to every attached client.
@@ -1061,6 +1133,8 @@ impl FakeSession {
     /// Starts `turn`, one of the daemon's own that tells the model `told`
     /// about background work that ended. It runs until a steer ends it.
     fn wake(&mut self, turn: Turn, told: &str) {
+        // A prompt's key names only the session's latest turn.
+        self.last_prompt = None;
         let id = turn.id.clone();
         self.turn = Some(turn);
         self.state(JobState::Running);
@@ -1444,6 +1518,9 @@ struct State {
     /// rho's own settings.
     config: FakeConfig,
     auth: FakeAuth,
+    /// Restart as the next prompt arrives; see
+    /// [`FakeDaemon::restart_at_next_prompt`].
+    restart_at_prompt: bool,
 }
 
 impl State {
@@ -1489,6 +1566,7 @@ impl State {
             extra_jobs: Vec::new(),
             config: FakeConfig::new(),
             auth: FakeAuth::new(&script),
+            restart_at_prompt: false,
         };
         if script.tui_job == TuiJob::Running {
             let mut session = FakeSession::new("/w/a", Some("from the tui"), 1_767_398_400);

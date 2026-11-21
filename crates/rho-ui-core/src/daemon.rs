@@ -5,8 +5,9 @@
 //! let target = DaemonTarget::rho("rho").expect("a rho home");
 //! let (daemon, mut events) = Daemon::connect(target).await?;
 //! let mut session = Session::from_setup(daemon.new_session(&cwd, Checkout::Local).await?);
-//! session.attached(daemon.attach(session.id()).await?);
-//! session.turn_began(&daemon.prompt(session.id(), &"hello".into()).await?);
+//! session.attached(daemon.attach(session.id(), None).await?);
+//! let key = PromptKey::generate();
+//! session.turn_began(&daemon.prompt(session.id(), &"hello".into(), &key).await?);
 //! while let Some(event) = events.recv().await { /* route by session id */ }
 //! ```
 //!
@@ -21,20 +22,24 @@
 use std::process::Command;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
     time::Duration,
 };
 
 use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
-    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, HelloResponse, IdleWake,
-    JobListParams, LoginId, LoginOutcome, LoginPrompt, Notifications, RestartParams,
-    SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams, SessionCancelParams,
-    SessionChange, SessionConfigureParams, SessionDeleteParams, SessionDetachParams,
-    SessionHoldParams, SessionListParams, SessionNewParams, SessionObserveParams,
-    SessionPromptParams, SessionRenameParams, SessionSteerParams, SessionSurfaceActionParams,
-    SessionUnsteerParams, SettingChange, SignIn, StatusParams, TurnOutcome, UnsteerOutcome,
+    ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, HelloResponse,
+    IdempotencyKey, IdleWake, JobListParams, LoginId, LoginOutcome, LoginPrompt, Notifications,
+    RestartParams, SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams,
+    SessionCancelParams, SessionChange, SessionConfigureParams, SessionDeleteParams,
+    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
+    SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
+    SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn, StatusParams,
+    TurnOutcome, UnsteerOutcome,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -49,7 +54,7 @@ use crate::{
     options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
     prompt::{mebibytes, Prompt},
     server::{self, ServerTarget},
-    session::{Attached, Checkout, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
+    session::{Attached, Checkout, Cursor, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
     surface::SurfaceAction,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -119,6 +124,11 @@ pub enum DaemonError {
     /// Holds the daemon's message.
     #[error("{0}")]
     Busy(String),
+    /// The daemon is stopping, or restarting in place, so it starts no
+    /// turn: a prompt it had yet to start ran nothing. The connection
+    /// closes next. Holds the daemon's message.
+    #[error("{0}")]
+    Stopping(String),
     /// A settings write found the settings changed since they were read,
     /// by another client or a hand edit of the file, and wrote nothing.
     /// Holds the daemon's message.
@@ -140,6 +150,7 @@ impl From<ClientError> for DaemonError {
             ClientError::Rpc { error, .. } => match error.error_code() {
                 Some(ErrorCode::SessionBusy | ErrorCode::NotSteerable) => Self::Busy(error.message),
                 Some(ErrorCode::ConfigConflict) => Self::Conflict(error.message),
+                Some(ErrorCode::DaemonStopping) => Self::Stopping(error.message),
                 _ => Self::Refused(error.message),
             },
             // Each of these names the daemon and what to do, as rho's own
@@ -282,8 +293,9 @@ pub struct PendingUpgrade {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detached {
     /// The session's events moved past what this client had read: it fell
-    /// too far behind, or the conversation moved to another branch. Attach
-    /// again to read it afresh.
+    /// too far behind, the daemon unloaded the session, or the
+    /// conversation moved to another branch. Attach again with the
+    /// session's cursor ([`crate::Session::reattach`]) to carry on.
     Behind,
     /// The session was deleted.
     Deleted,
@@ -292,7 +304,8 @@ pub enum Detached {
     /// again to read it afresh.
     Unloaded,
     /// The daemon is restarting in place, as it does to upgrade. The
-    /// connection closes next; connect again.
+    /// connection closes next; connect again, and attach with the
+    /// session's cursor.
     Restarting,
 }
 
@@ -355,7 +368,10 @@ impl DaemonEvents {
                 DaemonNotification::SessionEvent(event) => {
                     return Some(DaemonEvent::Update {
                         session: event.session.into(),
-                        update: SessionUpdate(event.event),
+                        update: SessionUpdate {
+                            seq: event.seq,
+                            event: event.event,
+                        },
                     });
                 }
                 DaemonNotification::SessionDetached(detached) => {
@@ -553,14 +569,11 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
     Ok((daemon, events))
 }
 
-/// Names this process's settings writes (see `ConfigSetParams::writer`):
-/// a revision stays good for a writer while only its own writes followed
-/// it, so two quick changes from this app never conflict with each other.
-/// Unique to this run of the app: its process ID, or in a browser, which
-/// has none, a random number, and when it first wrote.
-fn writer() -> &'static ConfigWriter {
-    static WRITER: OnceLock<ConfigWriter> = OnceLock::new();
-    WRITER.get_or_init(|| {
+/// A name unique to this run of the app: its process ID, or in a browser,
+/// which has none, a random number, and when it was first asked for.
+fn run_name() -> &'static str {
+    static RUN: OnceLock<String> = OnceLock::new();
+    RUN.get_or_init(|| {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -568,8 +581,33 @@ fn writer() -> &'static ConfigWriter {
         let run = std::process::id();
         #[cfg(target_family = "wasm")]
         let run = js_sys::Math::random().to_bits();
-        ConfigWriter::new(format!("rho-ui-{run}-{nanos}"))
+        format!("rho-ui-{run}-{nanos}")
     })
+}
+
+/// Names this process's settings writes (see `ConfigSetParams::writer`):
+/// a revision stays good for a writer while only its own writes followed
+/// it, so two quick changes from this app never conflict with each other.
+fn writer() -> &'static ConfigWriter {
+    static WRITER: OnceLock<ConfigWriter> = OnceLock::new();
+    WRITER.get_or_init(|| ConfigWriter::new(run_name()))
+}
+
+/// rho-ui's own name for one prompt, which makes sending it again safe:
+/// the daemon starts no second turn for a prompt whose key is that of the
+/// session's latest turn, and answers with that turn. Make one per prompt
+/// and send it with every try of that prompt ([`Daemon::prompt`]), as
+/// after a connection that closed before the daemon answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptKey(IdempotencyKey);
+
+impl PromptKey {
+    /// A key no other prompt of this run, or of any earlier one, has.
+    pub fn generate() -> Self {
+        static SENT: AtomicU64 = AtomicU64::new(0);
+        let n = SENT.fetch_add(1, Ordering::Relaxed);
+        Self(IdempotencyKey::new(format!("{}-{n}", run_name())))
+    }
 }
 
 /// What every session this client opens gets, as rho's terminal UI asks:
@@ -670,7 +708,9 @@ impl Daemon {
     /// Restarts the daemon in place now, into the program installed: every
     /// followed session gets [`Detached::Restarting`] and the connection
     /// closes, so connect again. Turns under way are cut short; a rho that
-    /// resumes them carries them on once it is back.
+    /// resumes them carries each on once a client attaches to its session
+    /// again, as `idle_wake: turn` (see [`session_setup`]) lets it start
+    /// turns of its own.
     ///
     /// # Errors
     ///
@@ -739,18 +779,24 @@ impl Daemon {
 
     /// Follows session `id`, reopening it in the daemon if it was unloaded.
     /// The daemon replays the conversation as [`DaemonEvent::Update`]s,
-    /// then sends what happens next. The replay may arrive before this
-    /// returns, so create the session's [`crate::Session`] first; it keeps
-    /// the events until [`crate::Session::attached`] gets this answer.
+    /// or with `after`, from [`crate::Session::reattach`], only the events
+    /// after it if it still has them, then sends what happens next. The
+    /// replay may arrive before this returns, so create the session's
+    /// [`crate::Session`] first; it keeps the events until
+    /// [`crate::Session::attached`] gets this answer.
     ///
     /// # Errors
     ///
     /// Fails if the session does not exist, another process such as a 2.x
     /// rho has it open, or the connection is gone.
-    pub async fn attach(&self, id: &SessionId) -> Result<Attached, DaemonError> {
+    pub async fn attach(
+        &self,
+        id: &SessionId,
+        after: Option<&Cursor>,
+    ) -> Result<Attached, DaemonError> {
         let params = SessionAttachParams {
             session: id.to_wire(),
-            after: None,
+            after: after.map(|cursor| cursor.0.clone()),
             environment: ClientEnvironment::clone(&self.environment),
             setup: session_setup(),
         };
@@ -761,36 +807,26 @@ impl Daemon {
         Ok(Attached(Box::new(response)))
     }
 
-    /// Attaches to session `id` and lets it go at once, dropping the events
-    /// that arrive meanwhile, which no [`crate::Session`] reads. After the
-    /// daemon restarted in place, a rho that resumes turns carries on the
-    /// one the restart cut short when a client attaches, as
-    /// `idle_wake: turn` (see [`session_setup`]) lets it start turns of
-    /// its own.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the session does not exist or the connection is gone.
-    pub async fn resume(&self, id: &SessionId) -> Result<(), DaemonError> {
-        self.attach(id).await?;
-        self.detach(id).await
-    }
-
     /// Follows session `id` without taking part in it, as for a subagent's
     /// session, which only the subagent writes and which can't be attached
     /// to. A loaded session is followed as [`Self::attach`] follows it; an
     /// unloaded one replays as saved, then [`Detached::Unloaded`] ends it,
     /// as it ends a subagent's run. Events arrive as for an attach, so
-    /// create the session's [`crate::Session`] first.
+    /// create the session's [`crate::Session`] first. `after` is as for
+    /// [`Self::attach`]; a session observed unloaded always replays whole.
     ///
     /// # Errors
     ///
     /// Fails if the session does not exist, a subagent's run has not opened
     /// it yet, or the connection is gone.
-    pub async fn observe(&self, id: &SessionId) -> Result<Attached, DaemonError> {
+    pub async fn observe(
+        &self,
+        id: &SessionId,
+        after: Option<&Cursor>,
+    ) -> Result<Attached, DaemonError> {
         let params = SessionObserveParams {
             session: id.to_wire(),
-            after: None,
+            after: after.map(|cursor| cursor.0.clone()),
         };
         let response = self
             .client
@@ -815,8 +851,11 @@ impl Daemon {
         Ok(())
     }
 
-    /// Sends a prompt. Returns once its turn began; pass the turn to
-    /// [`crate::Session::turn_began`]. The turn itself streams as events.
+    /// Sends a prompt, named `key`. Returns once its turn began; pass the
+    /// turn to [`crate::Session::turn_began`]. The turn itself streams as
+    /// events. Sending it again with the same key, on this connection or a
+    /// later one, answers with the same turn and starts no other, until
+    /// another turn starts on the session.
     ///
     /// # Errors
     ///
@@ -825,14 +864,22 @@ impl Daemon {
     /// Nothing was added to the session in that case. A prompt too large
     /// for one message to the daemon (see [`crate::MAX_PROMPT_ATTACHMENT_BYTES`])
     /// is [`DaemonError::Refused`], and the connection stays up.
-    pub async fn prompt(&self, id: &SessionId, prompt: &Prompt) -> Result<TurnId, DaemonError> {
+    /// [`DaemonError::Stopping`] and [`DaemonError::Closed`] may come
+    /// before or after the turn began: send it again, with `key`, once
+    /// connected again.
+    pub async fn prompt(
+        &self,
+        id: &SessionId,
+        prompt: &Prompt,
+        key: &PromptKey,
+    ) -> Result<TurnId, DaemonError> {
         let params = SessionPromptParams {
             session: id.to_wire(),
             content: prompt.to_wire(),
             timeout_ms: None,
             environment: ClientEnvironment::clone(&self.environment),
             grant: None,
-            idempotency_key: None,
+            idempotency_key: Some(key.0.clone()),
             author: rho_protocol::PromptAuthor::Person,
         };
         let response = self

@@ -12,7 +12,7 @@ use rho_protocol::{
         SessionConfigureParams, SessionConfigureResponse, SessionDeleteParams,
         SessionDeleteResponse, SessionId, SessionListParams, SessionListResponse,
         SessionObserveParams, SessionRenameParams, SessionRenameResponse, SessionSummary,
-        SessionUnsteerParams, SessionUnsteerResponse, SteerId,
+        SessionUnsteerParams, SessionUnsteerResponse, SteerId, StreamId,
     },
     ApprovalAsk, ApprovalSource, Ask, AuthChooseStoreParams, AuthChooseStoreResponse,
     AuthKeyParams, AuthKeyResponse, AuthListParams, AuthListResponse, AuthLoginCancelParams,
@@ -49,6 +49,117 @@ impl Fake {
             .lock()
             .expect("no test panics holding the fake daemon's state")
     }
+
+    /// Restarts in place, as rho does: the restarted daemon runs the new
+    /// program, so no upgrade waits; every attached session is detached as
+    /// restarting, new sessions no prompt saved are gone, then every
+    /// connection closes.
+    pub(super) fn restart_now(&self) {
+        let mut state = self.lock();
+        state.upgrade = None;
+        state
+            .sessions
+            .retain(|_, session| session.saved || session.subagent);
+        for session in state.sessions.values_mut() {
+            for publisher in session.publishers.drain(..) {
+                publisher.close(DetachReason::Restarting);
+            }
+        }
+        drop(state);
+        self.restarted.send_modify(|restarts| *restarts += 1);
+    }
+
+    /// The stream of this run of the daemon: a restart starts another.
+    fn stream(&self) -> StreamId {
+        StreamId::new(format!("stream-{}", *self.restarted.borrow()))
+    }
+}
+
+/// Starts the turn of the prompt `params`, as each prompt scripts it.
+fn start_prompt(
+    state: &mut State,
+    params: &SessionPromptParams,
+) -> Result<SessionPromptResponse, RpcError> {
+    let prompt = match params.content.first() {
+        Some(ContentBlock::Text { text }) => text.clone(),
+        _ => String::new(),
+    };
+    if prompt == "fail" {
+        return Err(RpcError::new(
+            ErrorCode::InvalidParams,
+            "the fake daemon refuses this prompt",
+        ));
+    }
+    if prompt == "deleting" {
+        return Err(RpcError::new(
+            ErrorCode::SessionBusy,
+            "the session is being deleted",
+        ));
+    }
+    let newest = state
+        .sessions
+        .values()
+        .map(|session| session.updated_at)
+        .max()
+        .unwrap_or_default();
+    let turn = state.next_turn();
+    let turn_id = turn.id.clone();
+    let session = state.session(&params.session)?;
+    if session.turn.is_some() {
+        return Err(busy());
+    }
+    session.saved = true;
+    session.updated_at = newest + 1;
+    if prompt == "busy" && !session.refused_busy {
+        session.refused_busy = true;
+        session.wake(turn, "Nothing new from the background.");
+        session.answer(&format!("m-{turn_id}-done"), "Back to you.");
+        return Err(busy());
+    }
+    if prompt == "subagent" {
+        return subagent_turn(state, params, turn);
+    }
+    if prompt == "background" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.start_background(format!("p-{turn_id}"));
+        session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "flaky" {
+        session.flaky(turn, echo(&turn_id, params));
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "figures" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.answer(&format!("m-{turn_id}"), FIGURES);
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "report" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.stream_answer(&format!("m-{turn_id}"), &report());
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if let Some(shown) = Shown::by(&prompt) {
+        session.show_surface(turn, echo(&turn_id, params), shown);
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "pictures" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.read_image(&format!("img-{turn_id}"));
+        session.answer(&format!("m-{turn_id}"), PICTURES);
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    let (ask, timeout) = other_ask(&prompt).unwrap_or_else(|| (ls_approval(&session.cwd), None));
+    session.ask(params, turn, ask, timeout);
+    Ok(SessionPromptResponse { turn: turn_id })
 }
 
 fn busy() -> RpcError {
@@ -345,14 +456,7 @@ impl Service for Fake {
     async fn stop(&self) {}
 
     async fn restart(&self) {
-        let mut state = self.lock();
-        state.upgrade = None;
-        for session in state.sessions.values_mut() {
-            for publisher in session.publishers.drain(..) {
-                publisher.close(DetachReason::Restarting);
-            }
-        }
-        self.restarted.send_modify(|restarts| *restarts += 1);
+        self.restart_now();
     }
 
     async fn new_session(&self, params: SessionNewParams) -> Result<SessionNewResponse, RpcError> {
@@ -396,91 +500,36 @@ impl Service for Fake {
         &self,
         params: SessionPromptParams,
     ) -> Result<SessionPromptResponse, RpcError> {
-        let prompt = match params.content.first() {
-            Some(ContentBlock::Text { text }) => text.clone(),
-            _ => String::new(),
-        };
-        if prompt == "fail" {
+        if std::mem::take(&mut self.lock().restart_at_prompt) {
+            self.restart_now();
             return Err(RpcError::new(
-                ErrorCode::InvalidParams,
-                "the fake daemon refuses this prompt",
+                ErrorCode::DaemonStopping,
+                "the daemon is restarting",
             ));
         }
-        if prompt == "deleting" {
-            return Err(RpcError::new(
-                ErrorCode::SessionBusy,
-                "the session is being deleted",
-            ));
-        }
-        if prompt == "slow" {
+        let slow =
+            matches!(params.content.first(), Some(ContentBlock::Text { text }) if text == "slow");
+        if slow {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        // One lock from the key's check to its record, so two tries of one
+        // prompt can't both start a turn.
         let mut state = self.lock();
-        let newest = state
-            .sessions
-            .values()
-            .map(|session| session.updated_at)
-            .max()
-            .unwrap_or_default();
-        let turn = state.next_turn();
-        let turn_id = turn.id.clone();
         let session = state.session(&params.session)?;
-        if session.turn.is_some() {
-            return Err(busy());
+        let again = session
+            .last_prompt
+            .as_ref()
+            .filter(|(key, _)| params.idempotency_key.as_ref() == Some(key));
+        if let Some((_, turn)) = again {
+            return Ok(SessionPromptResponse { turn: turn.clone() });
         }
-        session.saved = true;
-        session.updated_at = newest + 1;
-        if prompt == "busy" && !session.refused_busy {
-            session.refused_busy = true;
-            session.wake(turn, "Nothing new from the background.");
-            session.answer(&format!("m-{turn_id}-done"), "Back to you.");
-            return Err(busy());
-        }
-        if prompt == "subagent" {
-            return subagent_turn(&mut state, &params, turn);
-        }
-        if prompt == "background" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, &params));
-            session.start_background(format!("p-{turn_id}"));
-            session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "flaky" {
-            session.flaky(turn, echo(&turn_id, &params));
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "figures" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, &params));
-            session.answer(&format!("m-{turn_id}"), FIGURES);
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "report" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, &params));
-            session.stream_answer(&format!("m-{turn_id}"), &report());
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if let Some(shown) = Shown::by(&prompt) {
-            session.show_surface(turn, echo(&turn_id, &params), shown);
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "pictures" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, &params));
-            session.read_image(&format!("img-{turn_id}"));
-            session.answer(&format!("m-{turn_id}"), PICTURES);
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        let (ask, timeout) =
-            other_ask(&prompt).unwrap_or_else(|| (ls_approval(&session.cwd), None));
-        session.ask(&params, turn, ask, timeout);
-        Ok(SessionPromptResponse { turn: turn_id })
+        let started = start_prompt(&mut state, &params)?;
+        let session = state.session(&params.session)?;
+        session.prompts += 1;
+        session.last_prompt = params
+            .idempotency_key
+            .map(|key| (key, started.turn.clone()));
+        Ok(started)
     }
 
     async fn cancel_session(
@@ -717,7 +766,8 @@ impl Service for Fake {
             ));
         }
         session.attaches += 1;
-        let (response, publisher, subscription) = session.follow();
+        let (response, publisher, subscription) =
+            session.follow(self.stream(), params.after.as_ref());
         session.publishers.push(publisher);
         Ok((response, subscription))
     }
@@ -731,8 +781,11 @@ impl Service for Fake {
     ) -> Result<(SessionAttachResponse, Subscription), RpcError> {
         let mut state = self.lock();
         let session = state.session(&params.session)?;
-        let (response, publisher, subscription) = session.follow();
-        if session.subagent && session.turn.is_some() {
+        let loaded = session.subagent && session.turn.is_some();
+        // A session observed unloaded always replays whole.
+        let after = params.after.as_ref().filter(|_| loaded);
+        let (response, publisher, subscription) = session.follow(self.stream(), after);
+        if loaded {
             session.publishers.push(publisher);
         } else {
             publisher.close(DetachReason::NotLoaded);

@@ -3,9 +3,9 @@
 //! A view keeps one store beside its [`crate::Session`], and shows it each
 //! surface the session places ([`crate::Session::take_placed_surfaces`]).
 //! The daemon checked every message before sending it, so the store
-//! trusts them; it keeps why the processor refused any anyway. Nothing
-//! here outlasts the session's attachment: a client that fell behind
-//! attaches again with a new session and a new store, and the replay
+//! trusts them; it keeps why the processor refused any anyway. A session
+//! followed again from its cursor keeps its store; one the daemon replays
+//! whole ([`crate::Continuity::Replaced`]) gets a new store, and the replay
 //! shows every call again, in order.
 
 use std::{

@@ -21,6 +21,15 @@
 //! drag ended, which quotes it above the composer's text box; see
 //! [`ComposerState::add_quote`].
 //!
+//! The view lives as long as the session is open, across the connection
+//! that follows it: when the daemon stops sending the session's events, as
+//! when the view fell behind or the daemon restarted, the app follows it
+//! again on the same view ([`SessionView::reattach`]), so the composer,
+//! and unless the daemon replays the whole conversation, the scroll
+//! position and what is unfolded, stay. A prompt whose try reached a
+//! daemon that was stopping, or a connection that ended, goes again under
+//! its key once the session is followed again, so it runs once.
+//!
 //! The session's running background work is listed above the box, with a
 //! button to stop each piece; what ended is behind a button in the title
 //! bar. The view records the work as it starts and ends, and a session
@@ -53,9 +62,9 @@ use gpui_kit::{
     Window,
 };
 use rho_ui_core::{
-    surface::SurfaceAction, Answer, Attached, Attachment, BackgroundId, BackgroundStatus, Daemon,
-    DaemonError, Entry, InputId, JobActivity, Prompt, Run, RunState, Session, SessionId,
-    SessionUpdate, SteerId, SurfaceActionError, TurnId, Unsteered,
+    surface::SurfaceAction, Answer, Attached, Attachment, BackgroundId, BackgroundStatus,
+    Continuity, Cursor, Daemon, DaemonError, Entry, InputId, JobActivity, Prompt, PromptKey, Run,
+    RunState, Session, SessionId, SessionUpdate, SteerId, SurfaceActionError, TurnId, Unsteered,
 };
 
 use crate::{
@@ -105,6 +114,43 @@ pub(crate) enum SessionEvent {
     NewSession,
 }
 
+/// How the session's events reach the view, as its machine's connection
+/// is doing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Link {
+    /// A connection follows the session, or is attaching to it.
+    Following,
+    /// The connection ended as the daemon restarted in place, and the app
+    /// connects again by itself.
+    Reconnecting,
+    /// The connection ended, and rho-ui can't tell a restart from a stop:
+    /// the app connects again only when the user asks.
+    Lost,
+    /// The daemon refused to follow the session again, as when another
+    /// client deleted it meanwhile, in these words. What the view showed
+    /// stays; the next connection tries again.
+    Refused(String),
+}
+
+/// How the app follows a session again, from [`SessionView::reattach`].
+pub(crate) struct Follow {
+    /// Where its events left off.
+    pub(crate) cursor: Option<Cursor>,
+    /// A subagent's session is observed, not attached to.
+    pub(crate) observe: bool,
+}
+
+/// A prompt on its way to the daemon.
+enum Outgoing {
+    /// Sent; the daemon has yet to answer.
+    Sent,
+    /// Its try reached a daemon that was stopping, or a connection that
+    /// ended, so its turn may or may not have begun. It goes again under
+    /// the same key once an attach answers, which the daemon then takes
+    /// as the same prompt.
+    Waiting { prompt: Prompt, key: PromptKey },
+}
+
 /// Whether the session is usable yet.
 pub(crate) enum Loading {
     /// A new session, or a saved one whose replay has caught up.
@@ -112,7 +158,8 @@ pub(crate) enum Loading {
     /// The attach to a saved session has not answered yet, or its replay
     /// has not caught up: its rows wait for the whole replay. Only
     /// `after_change` ends it, which the event that catches up and the
-    /// attach's answer both reach.
+    /// attach's answer both reach. An attach that replays the whole
+    /// conversation to a session already shown starts it again.
     Attaching,
     /// The attach failed.
     Failed(String),
@@ -144,8 +191,13 @@ pub(crate) struct SessionView {
     added_dirs: Entity<AddedDirs>,
     /// The oldest open request, while there is one, and its events.
     card: Option<(Entity<InputCard>, Subscription)>,
-    /// A prompt is on its way to the daemon.
-    sending: bool,
+    /// A prompt on its way to the daemon.
+    outgoing: Option<Outgoing>,
+    /// How the session's events reach the view.
+    link: Link,
+    /// How many attaches have answered: a prompt's try that failed as the
+    /// connection ended goes again at once if one answered since it went.
+    attachments: u64,
     /// Steers, and messages refused as busy that wait on the job list,
     /// whose answers haven't come: what they carry may go back in the
     /// composer.
@@ -276,7 +328,9 @@ impl SessionView {
             sign_in: None,
             added_dirs,
             card: None,
-            sending: false,
+            outgoing: None,
+            link: Link::Following,
+            attachments: 0,
             in_flight: 0,
             stopping: Vec::new(),
             runs: Vec::new(),
@@ -418,15 +472,14 @@ impl SessionView {
         })
     }
 
-    /// The daemon stopped sending the session's events; see
-    /// [`Self::is_unloaded`].
+    /// The daemon stopped sending this observed session's events, so what
+    /// it shows may be out of date: observe it again to read it afresh.
     pub(crate) fn unload(&mut self) {
         self.unloaded = true;
     }
 
-    /// Whether the daemon stopped sending this observed session's events,
-    /// so what it shows may be out of date: observe it again to read it
-    /// afresh.
+    /// Whether [`Self::unload`] was called, for UI tests.
+    #[cfg(test)]
     pub(crate) fn is_unloaded(&self) -> bool {
         self.unloaded
     }
@@ -450,7 +503,7 @@ impl SessionView {
             && session.inputs().is_empty()
             && session.background().is_empty()
             && session.held().is_none()
-            && !self.sending
+            && self.outgoing.is_none()
             && self.in_flight == 0
             && self.error.is_none()
             && self.composer.read(cx).is_empty(cx)
@@ -503,10 +556,15 @@ impl SessionView {
     }
 
     fn is_busy(&self) -> bool {
-        self.sending || self.session.state().is_busy()
+        self.outgoing.is_some() || self.session.state().is_busy()
     }
 
     fn activity(&self) -> Activity {
+        // What the view knows of the session is stale until a connection
+        // follows it again.
+        if matches!(self.link, Link::Lost | Link::Refused(_)) {
+            return Activity::Idle;
+        }
         let running = || {
             self.session
                 .background()
@@ -559,6 +617,7 @@ impl SessionView {
         cx: &mut Context<'_, Self>,
     ) {
         let asked = !self.session.inputs().is_empty();
+        let answered = result.is_ok();
         match result {
             Ok(attached) => {
                 // A turn this client began meanwhile is already timed.
@@ -567,15 +626,105 @@ impl SessionView {
                     .filter(|_| self.busy_since.is_none())
                     .and_then(|elapsed| Instant::now().checked_sub(elapsed));
                 // Ready once the replay has caught up; see `after_change`.
-                self.session.attached(attached);
+                if self.session.attached(attached) == Continuity::Replaced {
+                    self.replaced();
+                }
+                self.attachments += 1;
             }
-            Err(error) => self.loading = Loading::Failed(error.to_string()),
+            // The connection ends next; the next one follows the session
+            // again.
+            Err(DaemonError::Closed | DaemonError::Stopping(_)) => {}
+            // Shown before: what it showed, and what was typed, stay.
+            Err(error) if matches!(self.loading, Loading::Ready) => {
+                self.link = Link::Refused(error.to_string());
+                self.give_back_waiting(window, cx);
+                self.report_live(cx);
+            }
+            Err(error) => {
+                self.loading = Loading::Failed(error.to_string());
+                self.give_back_waiting(window, cx);
+            }
         }
         self.after_change(window, cx);
+        if answered {
+            self.send_waiting(window, cx);
+        }
         // A question asked before the attach answered arrives with it.
         if !asked {
             self.focus_new_card(window, cx);
         }
+    }
+
+    /// Follows the session again on `daemon`, the daemon of its machine
+    /// now, as once the machine connected again or the daemon stopped
+    /// sending the session's events. Returns how, for the attach or
+    /// observe whose answer goes to [`Self::attached`]; `None` for a view
+    /// with nothing to follow (see [`Self::follows_again`]).
+    pub(crate) fn reattach(
+        &mut self,
+        daemon: Daemon,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<Follow> {
+        self.link = Link::Following;
+        cx.notify();
+        if !self.follows_again() {
+            return None;
+        }
+        // The turn under way, if any, is timed again from what the attach
+        // says: it may have ended meanwhile, or another begun.
+        self.busy_since = None;
+        self.turn_began = None;
+        self.transcript.forget_turn(cx);
+        self.settings
+            .update(cx, |settings, _| settings.set_daemon(daemon.clone()));
+        self.added_dirs
+            .update(cx, |dirs, _| dirs.set_daemon(daemon.clone()));
+        self.daemon = daemon;
+        Some(Follow {
+            cursor: self.session.reattach(),
+            observe: self.is_subagent(),
+        })
+    }
+
+    /// Records how the session's connection is doing, from the app. A
+    /// prompt waiting for a connection goes back in the composer once none
+    /// will come by itself.
+    pub(crate) fn set_link(&mut self, link: Link, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let lost = link == Link::Lost;
+        self.link = link;
+        if lost {
+            self.give_back_waiting(window, cx);
+        }
+        self.report_live(cx);
+        cx.notify();
+    }
+
+    /// Puts the prompt waiting for a connection back in the composer, as
+    /// none will send it: the connection is lost, the daemon refused to
+    /// follow the session again, or the user stopped it.
+    fn give_back_waiting(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        match self.outgoing.take() {
+            Some(Outgoing::Waiting { prompt, .. }) => {
+                self.give_back(prompt, window, cx);
+                self.after_change(window, cx);
+            }
+            other => self.outgoing = other,
+        }
+    }
+
+    /// Whether the app should follow the session again once its machine
+    /// connects: unless its first attach failed, or it is an observed
+    /// session whose events ended for good.
+    pub(crate) fn follows_again(&self) -> bool {
+        !self.unloaded && !self.failed_to_attach()
+    }
+
+    /// The daemon replays the whole conversation over what the view
+    /// showed: its rows, and its surfaces, are built again once it is all
+    /// there. The composer, and what only this client knows, stay.
+    fn replaced(&mut self) {
+        self.loading = Loading::Attaching;
+        self.surfaces = Surfaces::default();
     }
 
     /// Moves the keyboard into a card that just opened if the user is in
@@ -664,21 +813,31 @@ impl SessionView {
         let key = self.key();
         cx.global::<BackgroundLog>()
             .record(&key, &self.session, &mut self.recorded);
+        self.report_live(cx);
+        cx.notify();
+        self.send_held(window, cx);
+    }
+
+    /// Tells the app when the title or activity the sidebar shows changed.
+    fn report_live(&mut self, cx: &mut Context<'_, Self>) {
         let activity = self.activity();
         let title = self.title();
         if self.reported.0 != title || self.reported.1 != activity {
             self.reported = (title, activity);
             cx.emit(SessionEvent::LiveChanged);
         }
-        cx.notify();
-        self.send_held(window, cx);
     }
 
     /// Sends the composer's message: as a prompt, or while a turn runs, as
     /// a steer for it. A message with attachments can't steer, so it waits
     /// for the turn to end, and so does any message after one waiting.
     fn send(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.sending || !matches!(self.loading, Loading::Ready) {
+        // Until a connection follows the session, the message stays in the
+        // composer.
+        if self.outgoing.is_some()
+            || !matches!(self.loading, Loading::Ready)
+            || self.link != Link::Following
+        {
             return;
         }
         if self.composer.read(cx).prompt(cx).is_empty() {
@@ -706,7 +865,29 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.sending = true;
+        self.send_prompt(prompt, PromptKey::generate(), window, cx);
+    }
+
+    /// Sends the prompt that waits for an attach to answer, if one does.
+    fn send_waiting(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        match self.outgoing.take() {
+            Some(Outgoing::Waiting { prompt, key }) => self.send_prompt(prompt, key, window, cx),
+            other => self.outgoing = other,
+        }
+    }
+
+    /// Tries `prompt`, named `key` for every try of it. A try that reached
+    /// a daemon that was stopping, or a connection that ended, waits to go
+    /// again (see [`Outgoing::Waiting`]); one the daemon refused goes back
+    /// in the composer.
+    fn send_prompt(
+        &mut self,
+        prompt: Prompt,
+        key: PromptKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.outgoing = Some(Outgoing::Sent);
         self.error = None;
         // A new session's attach may still be on its way, as when the first
         // message goes at once; `after_change` then takes the state for
@@ -722,10 +903,11 @@ impl SessionView {
         let daemon = self.daemon.clone();
         let id = self.session.id().clone();
         let ended = self.session.ended_turn().cloned();
+        let attachments = self.attachments;
         cx.spawn_in(window, async move |this, cx| {
-            let result = daemon.prompt(&id, &prompt).await;
+            let result = daemon.prompt(&id, &prompt, &key).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.sending = false;
+                this.outgoing = None;
                 match result {
                     Ok(turn) => {
                         this.session.turn_began(&turn);
@@ -737,6 +919,20 @@ impl SessionView {
                     }
                     Err(DaemonError::Busy(error)) => {
                         this.refused_busy(prompt, ended, error, window, cx);
+                    }
+                    // No daemon that could run it had it, or one did and
+                    // the answer was lost: the key makes another try safe.
+                    Err(DaemonError::Stopping(_) | DaemonError::Closed) => {
+                        // Unless nothing will follow the session by itself.
+                        if matches!(this.link, Link::Lost | Link::Refused(_)) {
+                            this.give_back(prompt, window, cx);
+                        } else {
+                            this.outgoing = Some(Outgoing::Waiting { prompt, key });
+                            // An attach answered since it went.
+                            if this.attachments != attachments {
+                                this.send_waiting(window, cx);
+                            }
+                        }
                     }
                     Err(error) => {
                         // A turn another client began meanwhile is not
@@ -853,7 +1049,7 @@ impl SessionView {
 
     /// Sends the held message as a prompt once it is due.
     fn send_held(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.sending {
+        if self.outgoing.is_some() {
             return;
         }
         if let Some(prompt) = self.session.take_due() {
@@ -942,6 +1138,12 @@ impl SessionView {
     fn stop(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         // Only its parent stops a subagent's run.
         if !self.is_busy() || self.is_subagent() {
+            return;
+        }
+        // A prompt waiting for the daemon to come back hasn't run here: it
+        // goes back in the composer.
+        if matches!(self.outgoing, Some(Outgoing::Waiting { .. })) {
+            self.give_back_waiting(window, cx);
             return;
         }
         // The turn withdraws its open requests as it ends.
@@ -1336,6 +1538,27 @@ impl SessionView {
             .into_any_element()
     }
 
+    /// Says so while no connection follows the session: what it shows
+    /// stays, and comes up to date once one does.
+    fn render_link(&self) -> Option<impl IntoElement> {
+        let alert = match &self.link {
+            Link::Following => return None,
+            Link::Reconnecting => Alert::info(
+                "link-alert",
+                "This session carries on once the Rho daemon is back.",
+            )
+            .title("Reconnecting"),
+            Link::Lost => Alert::warning(
+                "link-alert",
+                "Retry from the sidebar to follow this session again.",
+            )
+            .title("Lost the connection to the Rho daemon"),
+            Link::Refused(why) => Alert::error("link-alert", SharedString::from(why.clone()))
+                .title("Couldn't follow this session again"),
+        };
+        Some(div().id("link-notice").test_support().child(alert.small()))
+    }
+
     /// Errors, approvals and the composer, under the transcript. A
     /// subagent's session shows only how its run failed and its own
     /// running work.
@@ -1354,6 +1577,7 @@ impl SessionView {
             .pb_3()
             // Each alert is wrapped so UI tests can find it: Kit's Alert
             // does not register its ID with them.
+            .children(self.render_link())
             .when_some(failure, |this, message| {
                 this.child(
                     div().id("turn-error").test_support().child(

@@ -14,7 +14,10 @@ use crate::{
 };
 
 fn update(value: serde_json::Value) -> SessionUpdate {
-    SessionUpdate(serde_json::from_value(value).expect("a valid session event"))
+    SessionUpdate {
+        seq: Seq(0),
+        event: serde_json::from_value(value).expect("a valid session event"),
+    }
 }
 
 fn options() -> SessionOptions {

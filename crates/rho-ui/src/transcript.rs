@@ -506,6 +506,15 @@ impl Transcript {
         self.remeasure(self.timeline.turn_rows(newest), cx);
     }
 
+    /// Forgets the running turn without timing it, as when the session is
+    /// followed again: the attach says whether a turn runs, and since
+    /// when.
+    pub(crate) fn forget_turn(&mut self, cx: &mut App) {
+        if let Some(running) = self.running.take() {
+            self.remeasure(self.timeline.turn_rows(running.turn), cx);
+        }
+    }
+
     /// The running turn finished, and folds.
     pub(crate) fn end_turn(&mut self, entries: &[Entry], cx: &mut App) {
         // The turn may have written files its messages showed before

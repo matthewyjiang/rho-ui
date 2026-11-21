@@ -9,6 +9,14 @@
 //! replay right after the attach response, and the two reach the UI on
 //! separate paths. [`Session::attached`] takes the response, then the events
 //! held so far, so the response always lands first.
+//!
+//! A session also keeps where its events left off.
+//! When the daemon stops sending them, as when the client fell behind or
+//! the daemon restarted, [`Session::reattach`] holds them again and gives
+//! that cursor for the next attach: a daemon that still has the events
+//! after it sends only those, and the session carries on as it was; one
+//! that doesn't replays the whole conversation, which replaces what the
+//! session showed.
 
 use std::{
     path::{Path, PathBuf},
@@ -18,8 +26,8 @@ use std::{
 use web_time::Instant;
 
 use rho_protocol::{
-    AnswerStop, CardTone, CompactionStatus, JobState, Resolution, SessionAttachResponse,
-    SessionEvent, SessionOptions, ToolCallUpdate, TurnOutcome,
+    AnswerStop, CardTone, CompactionStatus, JobState, Replay, Resolution, Seq,
+    SessionAttachResponse, SessionEvent, SessionOptions, StreamId, ToolCallUpdate, TurnOutcome,
 };
 
 use crate::{
@@ -33,8 +41,28 @@ use crate::{
 };
 
 /// An opaque event for one session. Only [`Session::apply`] reads it.
-#[derive(Debug)]
-pub struct SessionUpdate(pub(crate) SessionEvent);
+#[derive(Clone, Debug)]
+pub struct SessionUpdate {
+    /// Its place in the session's stream; see [`Session::reattach`].
+    pub(crate) seq: Seq,
+    pub(crate) event: SessionEvent,
+}
+
+/// Where a session's events left off, from [`Session::reattach`]: an
+/// attach that sends it back continues from there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor(pub(crate) rho_protocol::Cursor);
+
+/// What [`Session::attached`] did with what the session showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Continuity {
+    /// It stands: this was the session's first attach, or the daemon sends
+    /// only what came after the session's cursor.
+    Kept,
+    /// The daemon replays the whole conversation, which replaced it: its
+    /// entries start over, as [`Session::take_removed`] says.
+    Replaced,
+}
 
 /// What `rho/session/new` returned. Hand it to [`Session::from_setup`].
 #[derive(Clone, Debug, PartialEq)]
@@ -513,6 +541,11 @@ pub struct Session {
     /// files relative to it.
     workspace: Option<PathBuf>,
     sync: Sync,
+    /// The stream the latest attach answered with, once one did.
+    stream: Option<StreamId>,
+    /// The highest seq applied from that stream: where its events left
+    /// off.
+    seq: Seq,
     /// The surfaces placed since [`Self::take_placed_surfaces`], with
     /// their messages.
     placed_surfaces: Vec<PlacedSurface>,
@@ -537,7 +570,7 @@ struct LiveTurn {
 enum Sync {
     /// The attach has not answered. The events that arrive are kept until
     /// it does.
-    Attaching(Vec<SessionEvent>),
+    Attaching(Vec<SessionUpdate>),
     /// The attach answered, and this many events of its replay are still
     /// to come.
     Replaying(u64),
@@ -573,6 +606,8 @@ impl Session {
             ended_turn: None,
             workspace: None,
             sync: Sync::Attaching(Vec::new()),
+            stream: None,
+            seq: Seq(0),
             placed_surfaces: Vec::new(),
         }
     }
@@ -587,9 +622,34 @@ impl Session {
     }
 
     /// Records the attach response, then applies the events held for it.
-    /// The transcript may have grown; nothing in it changed before this.
-    pub fn attached(&mut self, attached: Attached) {
+    /// The transcript may have grown. Nothing in it changed before this,
+    /// unless the daemon replays the whole conversation to a session that
+    /// was attached before ([`Continuity::Replaced`]).
+    pub fn attached(&mut self, attached: Attached) -> Continuity {
         let response = *attached.0;
+        let followed = self.stream.is_some();
+        let continuity = match response.replay {
+            Replay::Tail => Continuity::Kept,
+            Replay::Reset => {
+                self.discard();
+                if followed {
+                    Continuity::Replaced
+                } else {
+                    Continuity::Kept
+                }
+            }
+        };
+        // A new stream is a new daemon, or the session reloaded: a turn
+        // that was under way lost the steers it had not read.
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|was| *was != response.stream)
+        {
+            let dropped = self.steers.drain(..).map(|steer| steer.text);
+            self.dropped_steers.extend(dropped);
+        }
+        self.stream = Some(response.stream);
         self.workspace = Some(response.workspace);
         if response.title.is_some() {
             self.title = response.title;
@@ -611,10 +671,55 @@ impl Session {
             self.settle_remembered();
         }
         if let Sync::Attaching(held) = held {
-            for event in held {
-                self.apply_event(event);
+            for update in held {
+                self.apply_event(update);
             }
         }
+        continuity
+    }
+
+    /// Holds the session's events again until the next
+    /// [`Self::attached`], once the daemon stopped sending them: it fell
+    /// behind, or the connection that followed it ended. Returns where
+    /// they left off, for that attach ([`crate::Daemon::attach`]); `None`
+    /// before any arrived, which replays the whole conversation.
+    pub fn reattach(&mut self) -> Option<Cursor> {
+        // Work seen running that the daemon no longer lists once the new
+        // attachment caught up ended while nothing followed it.
+        let running = self
+            .background
+            .iter()
+            .filter(|work| work.status() == BackgroundStatus::Running)
+            .cloned();
+        self.remembered_running.extend(running);
+        // What an attach that never answered held is replayed anew.
+        self.sync = Sync::Attaching(Vec::new());
+        self.cursor()
+    }
+
+    /// Where the session's events left off: the highest seq applied from
+    /// the stream of its latest attach, once above 0, which the protocol
+    /// says is always one to resume from.
+    fn cursor(&self) -> Option<Cursor> {
+        let stream = self.stream.clone()?;
+        (self.seq > Seq(0)).then_some(Cursor(rho_protocol::Cursor {
+            stream,
+            seq: self.seq,
+        }))
+    }
+
+    /// Forgets the conversation, for a replay of all of it; what only this
+    /// client knows, such as a held message or work seen ending, stays.
+    fn discard(&mut self) {
+        if !self.entries.is_empty() {
+            self.entries.clear();
+            self.removed = Some(0);
+        }
+        self.turn = LiveTurn::default();
+        self.plan.clear();
+        self.inputs.clear();
+        self.placed_surfaces.clear();
+        self.seq = Seq(0);
     }
 
     /// Background work an earlier run of the client saw, given before the
@@ -887,14 +992,15 @@ impl Session {
     pub fn apply(&mut self, update: SessionUpdate) -> Option<usize> {
         match &mut self.sync {
             Sync::Attaching(held) => {
-                held.push(update.0);
+                held.push(update);
                 None
             }
-            Sync::Replaying(_) | Sync::Live => self.apply_event(update.0),
+            Sync::Replaying(_) | Sync::Live => self.apply_event(update),
         }
     }
 
-    fn apply_event(&mut self, event: SessionEvent) -> Option<usize> {
+    fn apply_event(&mut self, SessionUpdate { seq, event }: SessionUpdate) -> Option<usize> {
+        self.seq = self.seq.max(seq);
         let mut caught_up = false;
         if let Sync::Replaying(left) = &mut self.sync {
             *left -= 1;
