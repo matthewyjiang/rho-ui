@@ -54,6 +54,19 @@ jobs:
       # GPUI's system packages, Rust and Zig (.github/actions/setup).
       - uses: ./.github/actions/setup
 
+      # Apple's clang can't build for wasm32, as the web build's SQLite
+      # (sqlite-wasm-rs) must; the runner's Homebrew LLVM can.
+      - name: Give the web build a clang for wasm
+        if: runner.os == 'macOS'
+        run: |
+          llvm=$(brew --prefix llvm@18)
+          if [ ! -x "$llvm/bin/clang" ]; then
+            echo "::error::no clang in $llvm: name the Homebrew LLVM the runner image has now"
+            exit 1
+          fi
+          echo "CC_wasm32_unknown_unknown=$llvm/bin/clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$llvm/bin/llvm-ar" >> "$GITHUB_ENV"
+
       # The release builds what Cargo.lock says, or fails.
       - run: cargo fetch --locked
       - run: cargo xtask dist
