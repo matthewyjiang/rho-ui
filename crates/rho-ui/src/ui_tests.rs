@@ -32,7 +32,7 @@ use rho_ui_core::{
         REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
-    Delay, Entry, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
+    Delay, Entry, PromptKey, RetryReason, RhoInstall, RunState, Session, SessionId, ToolStatus,
     WorktreeVerdict,
 };
 
@@ -608,7 +608,10 @@ impl Harness {
                     .await
                     .expect("a second client connects");
                 match how {
-                    Send::Prompt => daemon.prompt(&id, &text.into()).await.map(drop),
+                    Send::Prompt => daemon
+                        .prompt(&id, &text.into(), &PromptKey::generate())
+                        .await
+                        .map(drop),
                     Send::Steer => daemon.steer(&id, &text).await.map(drop),
                 }
                 .expect("the daemon takes the other client's message");
@@ -2529,9 +2532,8 @@ fn a_missing_rho_offers_its_install() {
 
 /// An update found by the check installs from the sidebar, and once the
 /// daemon finds the new program waiting on work, Restart now restarts it.
-/// rho-ui follows the session on screen again, and attaches once to the
-/// others it opened with work under way, so the daemon carries on their
-/// turns; other clients' sessions are left to them.
+/// rho-ui follows its open sessions again, the one on screen and the one
+/// with work under way, so the daemon carries on its turn.
 #[test]
 #[cfg_attr(windows, ignore = "runs a fake rho written as a POSIX sh script")]
 fn an_update_installs_then_restarts_the_daemon_on_request() {
@@ -2594,6 +2596,82 @@ fn an_update_installs_then_restarts_the_daemon_on_request() {
     });
     assert_eq!(ui.session().id().as_str(), "s1", "s1 is back on screen");
     ui.shot("restarted");
+}
+
+/// An open session keeps its view while the daemon stops sending its
+/// events. Fallen behind, it carries on where it was scrolled to. Across a
+/// restart, its composer keeps what was typed and its transcript holds
+/// each entry once; and a prompt the restarting daemon couldn't take goes
+/// again once it is back, and runs once.
+#[test]
+fn an_open_session_survives_lag_and_restarts() {
+    let script = Script {
+        replay_turns: 20,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("resume", script);
+    ui.open_old_session();
+    let app = ui.app.clone();
+    let view = ui
+        .cx
+        .update(|cx| app.read(cx).active_session().expect("a session is open"));
+    let same_view = |ui: &mut Harness| {
+        ui.cx
+            .update(|cx| app.read(cx).active_session() == Some(view.clone()))
+    };
+    let scroller = ui
+        .cx
+        .update(|cx| view.read(cx).transcript().scroller().clone());
+    ui.cx
+        .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(0, cx)));
+    ui.frame();
+    assert!(ui.label("worked-0").is_some(), "scrolled to the first turn");
+
+    ui.fake().fall_behind(&SessionId::from("old"));
+    ui.wait_for_daemon("old attached again", |fake| fake.attaches("old") == 2);
+    ui.wait_for_session("old caught up", |session| !session.is_replaying());
+    assert!(same_view(&mut ui), "the same view follows old");
+    assert!(
+        ui.label("worked-0").is_some(),
+        "still scrolled to the first turn"
+    );
+
+    let entries = ui.session().entries().len();
+    ui.type_in("half a thought");
+    ui.fake().restart();
+    ui.wait_until("the reconnect notice", |window, _, _| {
+        is_visible(window, "link-notice")
+    });
+    ui.shot("reconnecting");
+    ui.wait_for_daemon("old attached after the restart", |fake| {
+        fake.attaches("old") == 3
+    });
+    ui.wait_until("old caught up", |window, cx, app| {
+        app.active_session()
+            .is_some_and(|view| !view.read(cx).session().is_replaying())
+            && !is_visible(window, "link-notice")
+    });
+    assert!(same_view(&mut ui), "the same view follows old");
+    assert_eq!(ui.composer_text(), "half a thought");
+    assert_eq!(ui.session().entries().len(), entries, "each entry once");
+    ui.shot("restarted");
+
+    ui.fake().restart_at_next_prompt();
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_session("the prompt's turn after the restart", |session| {
+        session.inputs().len() == 1
+    });
+    assert_eq!(ui.fake().restarts(), 2);
+    assert_eq!(ui.fake().prompts("old"), 1, "the prompt ran once");
+    assert_eq!(ui.composer_text(), "", "the prompt left the composer");
+    let sent = ui
+        .session()
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::User(user) if user.text() == "half a thought"))
+        .count();
+    assert_eq!(sent, 1);
+    ui.shot("sent-across");
 }
 
 /// A turn rho's terminal UI started shows in the sidebar as running, though

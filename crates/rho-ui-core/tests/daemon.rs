@@ -12,11 +12,11 @@ use rho_ui_core::{
         FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
     },
     surface::{Node, SurfaceStore},
-    AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus, Checkout,
-    ChoiceKind, ConfigOption, ConfigValue, Daemon, DaemonError, DaemonEvent, DaemonEvents,
-    DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity, LoginOutcome, Prompt,
-    RunState, Session, SessionId, SurfaceActionError, ToolStatus, Unsteered, WorktreeVerdict,
-    MAX_PROMPT_ATTACHMENT_BYTES,
+    AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
+    BackgroundWork, Checkout, ChoiceKind, ConfigOption, ConfigValue, Continuity, Daemon,
+    DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Detached, Entry, Form, Image,
+    ImageFormat, JobActivity, LoginOutcome, Prompt, PromptKey, RunState, Session, SessionId,
+    SurfaceActionError, ToolStatus, Unsteered, WorktreeVerdict, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -160,7 +160,7 @@ async fn new_session(daemon: &Daemon) -> Session {
         .await
         .expect("the fake opens a session");
     let mut session = Session::from_setup(setup);
-    let attached = daemon.attach(session.id()).await;
+    let attached = daemon.attach(session.id(), None).await;
     session.attached(attached.expect("the fake attaches to a session it opened"));
     session
 }
@@ -262,7 +262,7 @@ fn a_prompt_runs_a_turn_through_an_approval() {
         assert_eq!(session.commands()[0].name(), "compact");
 
         daemon
-            .prompt(session.id(), &"list files".into())
+            .prompt(session.id(), &"list files".into(), &PromptKey::generate())
             .await
             .unwrap();
         until(&mut events, &mut session, |s| !s.inputs().is_empty()).await;
@@ -307,7 +307,11 @@ fn a_held_question_waits_for_its_answers() {
         let (daemon, mut events) = connect(&fake).await;
         let mut session = new_session(&daemon).await;
         daemon
-            .prompt(session.id(), &"questions timeout".into())
+            .prompt(
+                session.id(),
+                &"questions timeout".into(),
+                &PromptKey::generate(),
+            )
             .await
             .unwrap();
         until(&mut events, &mut session, |s| !s.inputs().is_empty()).await;
@@ -380,7 +384,10 @@ fn a_session_takes_another_sessions_settings() {
             .expect("the setup names its worktree");
         let other = Session::from_setup(setup);
         assert!(worktree.branch().starts_with("rho/a-"));
-        let attached = daemon.attach(other.id()).await.expect("the fake attaches");
+        let attached = daemon
+            .attach(other.id(), None)
+            .await
+            .expect("the fake attaches");
         assert_eq!(
             attached.workspace(),
             worktree.path(),
@@ -402,7 +409,7 @@ fn cancel_withdraws_the_approval_and_ends_the_turn() {
         let (daemon, mut events) = connect(&fake).await;
         let mut session = new_session(&daemon).await;
         daemon
-            .prompt(session.id(), &"list files".into())
+            .prompt(session.id(), &"list files".into(), &PromptKey::generate())
             .await
             .unwrap();
         until(&mut events, &mut session, |s| !s.inputs().is_empty()).await;
@@ -456,14 +463,17 @@ fn list_follows_the_cursor_and_attach_replays_the_conversation() {
         // A prompted new session is saved, so with three the list takes
         // more than one page.
         let mut new = new_session(&daemon).await;
-        daemon.prompt(new.id(), &"list files".into()).await.unwrap();
+        daemon
+            .prompt(new.id(), &"list files".into(), &PromptKey::generate())
+            .await
+            .unwrap();
         until(&mut events, &mut new, |s| !s.inputs().is_empty()).await;
         let sessions = daemon.list_sessions().await.unwrap();
         let ids: Vec<_> = sessions.iter().map(|s| s.id().as_str()).collect();
         assert_eq!(ids, ["new-1", "s1", "old"]);
 
         let mut old = Session::new(sessions[2].id().clone());
-        old.attached(daemon.attach(old.id()).await.unwrap());
+        old.attached(daemon.attach(old.id(), None).await.unwrap());
         until(&mut events, &mut old, |s| !s.is_replaying()).await;
         assert!(matches!(old.entries(), [Entry::Agent(m)] if m.text() == "replayed"));
     });
@@ -488,7 +498,7 @@ fn a_job_another_client_started_is_listed_attached_and_steered() {
         assert!(job.turn_elapsed() >= Some(ran), "{:?}", job.turn_elapsed());
 
         let mut session = Session::new(job.session().clone());
-        let attached = daemon.attach(session.id()).await.unwrap();
+        let attached = daemon.attach(session.id(), None).await.unwrap();
         assert!(attached.turn_elapsed() >= Some(ran));
         session.attached(attached);
         until(&mut events, &mut session, |s| !s.is_replaying()).await;
@@ -538,14 +548,18 @@ fn refused_prompts_say_why_and_busy_ones_are_told_apart() {
     block_on(async {
         let (daemon, _events) = connect(&fake).await;
         let session = new_session(&daemon).await;
-        let refused = daemon.prompt(session.id(), &"fail".into()).await;
+        let refused = daemon
+            .prompt(session.id(), &"fail".into(), &PromptKey::generate())
+            .await;
         assert_eq!(
             refused,
             Err(DaemonError::Refused(
                 "the fake daemon refuses this prompt".to_owned()
             ))
         );
-        let busy = daemon.prompt(session.id(), &"busy".into()).await;
+        let busy = daemon
+            .prompt(session.id(), &"busy".into(), &PromptKey::generate())
+            .await;
         assert!(matches!(busy, Err(DaemonError::Busy(_))), "{busy:?}");
     });
 }
@@ -563,10 +577,13 @@ fn a_prompt_past_the_message_limit_is_refused_and_the_connection_lives() {
             vec![0; MAX_PROMPT_ATTACHMENT_BYTES / 4 * 3 + 1],
         );
         let prompt = Prompt::new(String::new(), vec![Attachment::Image(huge)]);
-        let error = daemon.prompt(session.id(), &prompt).await.unwrap_err();
+        let error = daemon
+            .prompt(session.id(), &prompt, &PromptKey::generate())
+            .await
+            .unwrap_err();
         assert!(matches!(&error, DaemonError::Refused(_)), "{error:?}");
         daemon
-            .prompt(session.id(), &"list files".into())
+            .prompt(session.id(), &"list files".into(), &PromptKey::generate())
             .await
             .expect("the connection survives the refusal");
     });
@@ -621,7 +638,7 @@ fn background_work_is_listed_until_the_model_has_its_result() {
         let (daemon, mut events) = connect(&fake).await;
         let mut session = new_session(&daemon).await;
         daemon
-            .prompt(session.id(), &"background".into())
+            .prompt(session.id(), &"background".into(), &PromptKey::generate())
             .await
             .unwrap();
         until(&mut events, &mut session, |session| {
@@ -640,7 +657,7 @@ fn background_work_is_listed_until_the_model_has_its_result() {
 
         let (other, _other_events) = connect(&fake).await;
         let mut theirs = Session::new(session.id().clone());
-        theirs.attached(other.attach(session.id()).await.unwrap());
+        theirs.attached(other.attach(session.id(), None).await.unwrap());
         assert_eq!(theirs.background(), session.background());
 
         daemon
@@ -694,7 +711,10 @@ fn a_surface_is_placed_once_and_its_actions_reach_the_session() {
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
         let mut session = new_session(&daemon).await;
-        daemon.prompt(session.id(), &"ui".into()).await.unwrap();
+        daemon
+            .prompt(session.id(), &"ui".into(), &PromptKey::generate())
+            .await
+            .unwrap();
         until(&mut events, &mut session, |s| !surfaces(s).is_empty()).await;
         assert_eq!(surfaces(&session), [("tool-1", FORM_SURFACE)]);
         let mut shown = store(&mut session);
@@ -740,6 +760,92 @@ fn a_surface_is_placed_once_and_its_actions_reach_the_session() {
     });
 }
 
+/// Applies `session`'s events until the daemon stops sending them, and
+/// says why: what it published last may still be on its way.
+async fn until_detached(events: &mut DaemonEvents, session: &mut Session) -> Detached {
+    loop {
+        match next(events).await {
+            DaemonEvent::Detached {
+                session: id,
+                reason,
+            } if id == *session.id() => return reason,
+            DaemonEvent::Update { update, .. } => {
+                session.apply(update);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}
+
+/// A session the daemon detached as fallen behind attaches again with its
+/// cursor and carries on: the daemon sends only what it missed, which
+/// lands once, after what it showed. Work it saw running, and that ended
+/// meanwhile, is listed as it ended.
+#[test]
+fn a_session_that_fell_behind_carries_on_from_its_cursor() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut session = new_session(&daemon).await;
+        daemon
+            .prompt(session.id(), &"background".into(), &PromptKey::generate())
+            .await
+            .unwrap();
+        until(&mut events, &mut session, |s| {
+            s.state() == &RunState::Idle && !s.background().is_empty()
+        })
+        .await;
+        fake.fall_behind(session.id());
+        assert_eq!(
+            until_detached(&mut events, &mut session).await,
+            Detached::Behind
+        );
+        let shown = session.entries().to_vec();
+        // The daemon's own turn, while nothing follows the session.
+        fake.finish_background(session.id(), 0);
+
+        let cursor = session.reattach();
+        assert!(cursor.is_some(), "events arrived, so there is a place");
+        let attached = daemon.attach(session.id(), cursor.as_ref()).await.unwrap();
+        assert_eq!(session.attached(attached), Continuity::Kept);
+        until(&mut events, &mut session, |s| !s.is_replaying()).await;
+        assert_eq!(&session.entries()[..shown.len()], shown.as_slice());
+        assert_eq!(
+            session.entries().len(),
+            shown.len() + 2,
+            "the daemon's turn's thought and reply, once"
+        );
+        assert_eq!(last_reply(&session), "`sleep 30` exited with 0.");
+        assert_eq!(session.state(), &RunState::Running);
+        let ended: Vec<_> = session
+            .ended_background()
+            .iter()
+            .map(BackgroundWork::status)
+            .collect();
+        assert_eq!(ended, [BackgroundStatus::Completed]);
+    });
+}
+
+/// A prompt sent again with its key, as after a connection that closed
+/// before the daemon answered, answers with the turn it started and starts
+/// no other.
+#[test]
+fn a_prompt_sent_again_with_its_key_runs_once() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let session = new_session(&daemon).await;
+        let (prompt, key) = (Prompt::from("list files"), PromptKey::generate());
+        let turn = daemon.prompt(session.id(), &prompt, &key).await.unwrap();
+        // Its turn waits for an approval, so a prompt without the key
+        // would be refused as busy.
+        let (later, _later_events) = connect(&fake).await;
+        let again = later.prompt(session.id(), &prompt, &key).await;
+        assert_eq!(again, Ok(turn));
+        assert_eq!(fake.prompts(session.id().as_str()), 1);
+    });
+}
+
 /// A client the daemon detached as fallen behind attaches again with a
 /// new session, whose replay rebuilds the surface, once, where it was.
 #[test]
@@ -749,7 +855,7 @@ fn a_replay_rebuilds_a_surface_once() {
         let (daemon, mut events) = connect(&fake).await;
         let mut session = new_session(&daemon).await;
         daemon
-            .prompt(session.id(), &"gallery".into())
+            .prompt(session.id(), &"gallery".into(), &PromptKey::generate())
             .await
             .unwrap();
         until(&mut events, &mut session, |s| !surfaces(s).is_empty()).await;
@@ -762,28 +868,12 @@ fn a_replay_rebuilds_a_surface_once() {
         assert!(drawn.is_some(), "the gallery draws");
 
         fake.fall_behind(session.id());
-        // What the turn published last may still be on its way.
-        loop {
-            match next(&mut events).await {
-                DaemonEvent::Detached {
-                    session: id,
-                    reason,
-                } => {
-                    assert_eq!((&id, reason), (session.id(), Detached::Behind));
-                    break;
-                }
-                DaemonEvent::Update { update, .. } => {
-                    session.apply(update);
-                }
-                other @ (DaemonEvent::AgentSettingsChanged(_)
-                | DaemonEvent::LoginPrompt { .. }
-                | DaemonEvent::LoginFinished { .. }) => {
-                    panic!("unexpected event: {other:?}")
-                }
-            }
-        }
+        assert_eq!(
+            until_detached(&mut events, &mut session).await,
+            Detached::Behind
+        );
         let mut again = Session::new(session.id().clone());
-        again.attached(daemon.attach(again.id()).await.unwrap());
+        again.attached(daemon.attach(again.id(), None).await.unwrap());
         until(&mut events, &mut again, |s| !s.is_replaying()).await;
         let replayed = surfaces(&again)
             .into_iter()

@@ -32,7 +32,8 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonTarget, Detached,
-    PendingUpgrade, ReportedWorktree, SessionId, SessionSummary, SurfaceActionError, Unsteered,
+    PendingUpgrade, PromptKey, ReportedWorktree, SessionId, SessionSummary, SurfaceActionError,
+    Unsteered,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -63,9 +64,9 @@ pub use rho_protocol::{
 pub use rho_protocol::{SessionWorktree, WorktreeVerdict};
 pub use server::{ServerLink, ServerTarget};
 pub use session::{
-    Attached, Checkout, Delay, Entry, Message, Notice, NoticeLevel, PlanItem, PlanStatus,
-    RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall, ToolContent,
-    ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
+    Attached, Checkout, Continuity, Cursor, Delay, Entry, Message, Notice, NoticeLevel, PlanItem,
+    PlanStatus, RetryReason, RunState, Session, SessionSetup, SessionUpdate, SteerId, ToolCall,
+    ToolContent, ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use ssh::{SshLink, SshTarget, MAX_SHELLS};

@@ -104,6 +104,12 @@ impl SessionSettings {
         settings
     }
 
+    /// Sends changes to `daemon` from now on, as once the session's
+    /// machine connected again.
+    pub(crate) fn set_daemon(&mut self, daemon: Daemon) {
+        self.daemon = daemon;
+    }
+
     pub(crate) fn set_allowed(&mut self, allowed: Availability, cx: &mut Context<'_, Self>) {
         if self.allowed != allowed {
             self.allowed = allowed;

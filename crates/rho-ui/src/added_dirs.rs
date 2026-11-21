@@ -110,6 +110,12 @@ impl AddedDirs {
         }
     }
 
+    /// Sends adds to `daemon` from now on, as once the session's machine
+    /// connected again.
+    pub(crate) fn set_daemon(&mut self, daemon: Daemon) {
+        self.daemon = daemon;
+    }
+
     /// Shows `dirs`, the session's list as the daemon last sent it.
     pub(crate) fn sync(&mut self, dirs: &[PathBuf], cx: &mut Context<'_, Self>) {
         if self.dirs != dirs {

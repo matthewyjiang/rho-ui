@@ -6,6 +6,13 @@
 //! It also keeps the drafts of new sessions the user left with a message,
 //! which the sidebar lists until they are sent or discarded.
 //!
+//! An open session keeps its view while its machine's connection comes and
+//! goes: when the daemon stops sending its events, or the machine connects
+//! again, the app follows it again on the same view, from where its events
+//! left off ([`RhoApp::reattach`]). rho-ui connects again by itself only
+//! after the daemon said it is restarting; otherwise it waits for the user's
+//! Retry, as with no session followed it can't tell a restart from a stop.
+//!
 //! The sidebar, the session view and the right panel are drawn as cached
 //! views: each redraws only when it changes, so a hover in one never
 //! rebuilds the others.
@@ -28,8 +35,8 @@ use gpui_kit::{
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job, JobActivity,
-    Jobs, PendingUpgrade, Prompt, Session, SessionId,
+    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs,
+    PendingUpgrade, Prompt, Session, SessionId,
 };
 
 use crate::machines::RemoteMachine;
@@ -48,7 +55,7 @@ use crate::{
         PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, TerminalShortcut, MIN_PANE_REMS,
     },
     session_list::DraftRow,
-    session_view::{Loading, SessionEvent, SessionView},
+    session_view::{Link, Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
     sidebar::{ResizeSidebar, SidebarEvent, SidebarModels, SidebarState, SidebarView},
@@ -140,24 +147,6 @@ struct Connection {
     jobs: Vec<Job>,
     /// The latest `list_sessions`; a newer refresh replaces it.
     sessions_task: Task<()>,
-    /// What to follow again once the daemon is back from restarting.
-    resume: Option<Resume>,
-}
-
-/// The sessions a daemon restarting in place left: attaching to one again
-/// carries on the turn the restart cut short, in a rho that resumes them.
-struct Resume {
-    /// The session on screen.
-    shown: Option<Shown>,
-    /// The others that had work under way.
-    working: Vec<SessionId>,
-}
-
-/// The session on screen as a daemon restarted, to open again.
-struct Shown {
-    id: SessionKey,
-    cwd: PathBuf,
-    title: Option<SharedString>,
 }
 
 impl Connection {
@@ -171,7 +160,6 @@ impl Connection {
             jobs_task: Task::ready(()),
             jobs: Vec::new(),
             sessions_task: Task::ready(()),
-            resume: None,
         }
     }
 }
@@ -412,7 +400,10 @@ impl RhoApp {
             machines.set(wanted);
             cx.notify();
         });
+        // A machine at another address has another daemon, which doesn't
+        // follow the sessions opened on this one.
         for machine in stale {
+            self.forget_sessions(&machine, window, cx);
             self.connect(&machine, window, cx);
         }
         cx.notify();
@@ -457,11 +448,11 @@ impl RhoApp {
         });
     }
 
-    /// Connects to `machine`'s daemon, starting it if none runs. Views of
-    /// its sessions followed on an earlier connection are dropped; the
-    /// sessions themselves, and their turns, stay in the daemon.
+    /// Connects to `machine`'s daemon, starting it if none runs. Its open
+    /// sessions keep their views, which follow them again once it
+    /// connects ([`Self::connected`]).
     fn connect(&mut self, machine: &MachineId, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.forget_sessions(machine, window, cx);
+        self.set_link(machine, Link::Reconnecting, window, cx);
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
@@ -485,6 +476,8 @@ impl RhoApp {
         connection.epoch = epoch;
         connection.restarting = false;
         connection.jobs_task = Task::ready(());
+        // So the first listing on the new connection reaches the sidebar.
+        connection.jobs.clear();
         connection.daemon = None;
         let id = machine.clone();
         connection.task = cx.spawn_in(window, async move |this, cx| {
@@ -500,6 +493,7 @@ impl RhoApp {
                 }
                 Err(error) => {
                     let _ = this.update_in(cx, |this, window, cx| {
+                        this.set_link(&id, Link::Lost, window, cx);
                         this.failed(&id, &error, window, cx);
                     });
                     return;
@@ -613,7 +607,7 @@ impl RhoApp {
             connection.daemon = Some(daemon);
         }
         self.refresh_sessions(machine, cx);
-        self.follow_again(machine, window, cx);
+        self.reattach_all(machine, window, cx);
         // Drafts asked for a session while this machine connected.
         for draft in self.drafts_on(machine, cx) {
             let waits = {
@@ -637,8 +631,6 @@ impl RhoApp {
     ) {
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
-            // A later connection is no daemon coming back from a restart.
-            connection.resume = None;
         }
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
@@ -752,8 +744,9 @@ impl RhoApp {
         });
     }
 
-    /// Drops the views of `machine`'s open sessions, as the connection that
-    /// followed them is gone. Its drafts stay; see [`Self::restart_drafts`].
+    /// Drops the views of `machine`'s open sessions, as it is gone from the
+    /// settings or reached at another address. Its drafts stay; see
+    /// [`Self::restart_drafts`].
     fn forget_sessions(
         &mut self,
         machine: &MachineId,
@@ -799,7 +792,7 @@ impl RhoApp {
                 }
             }
             DaemonEvent::Detached { session, reason } => match reason {
-                Detached::Behind => self.reopen_session(&key(session), window, cx),
+                Detached::Behind => self.reattach(&key(session), window, cx),
                 Detached::Deleted => self.session_deleted(&key(session), window, cx),
                 Detached::Restarting => {
                     if let Some(connection) = self.connection_mut(machine) {
@@ -879,7 +872,8 @@ impl RhoApp {
     /// `machine`'s connection `epoch` ended. After the daemon said it was
     /// restarting, or while rho was updated under it, that is expected,
     /// and answered by connecting again: the daemon restarts in place on
-    /// the same socket, and the handshake waits until it answers.
+    /// the same socket, and the handshake waits until it answers. Either
+    /// way the open sessions keep their views.
     fn disconnected(
         &mut self,
         machine: &MachineId,
@@ -894,117 +888,83 @@ impl RhoApp {
             .connection(machine)
             .is_some_and(|connection| connection.restarting);
         if restarting {
-            let resume = self.resume(machine, cx);
-            if let Some(connection) = self.connection_mut(machine) {
-                connection.resume = Some(resume);
-            }
             self.connect(machine, window, cx);
         } else {
-            self.forget_sessions(machine, window, cx);
+            self.set_link(machine, Link::Lost, window, cx);
             self.failed(machine, &DaemonError::Closed, window, cx);
         }
     }
 
-    /// What `machine`'s daemon, about to restart, leaves to follow again:
-    /// the session on screen, and the others opened here whose work was
-    /// under way. Other clients' sessions are theirs to follow again.
-    fn resume(&self, machine: &MachineId, cx: &App) -> Resume {
-        let shown = match &self.pane {
-            Pane::Session(view) => {
-                let view = view.read(cx);
-                let live = view.live();
-                (live.id.machine == *machine && !view.is_subagent()).then_some(Shown {
-                    id: live.id,
-                    cwd: live.cwd,
-                    title: live.title,
-                })
-            }
-            Pane::Draft(_) | Pane::Empty => None,
-        };
-        let jobs = self
-            .connection(machine)
-            .map_or(&[][..], |connection| connection.jobs.as_slice());
-        let working = self
+    /// Tells each of `machine`'s open sessions how its connection is doing.
+    fn set_link(&self, machine: &MachineId, link: Link, window: &mut Window, cx: &mut App) {
+        for open in self
             .sessions
             .iter()
-            .filter(|open| open.id.machine == *machine && !open.view.read(cx).is_subagent())
-            .map(|open| open.id.id.clone())
-            // Work in the background goes on, or not, with nobody attached.
-            .filter(|id| {
-                jobs.iter()
-                    .any(|job| job.session() == id && job.activity() != JobActivity::Background)
-            })
-            .filter(|id| shown.as_ref().is_none_or(|shown| shown.id.id != *id))
-            .collect();
-        Resume { shown, working }
+            .filter(|open| open.id.machine == *machine)
+        {
+            open.view
+                .update(cx, |view, cx| view.set_link(link, window, cx));
+        }
     }
 
-    /// Follows again what `machine`'s daemon left as it restarted: shows
-    /// the session that was on screen, and attaches to the others with
-    /// work under way just long enough for the daemon to carry it on.
-    fn follow_again(
+    /// Follows each of `machine`'s open sessions again, now it connected:
+    /// attaching to a session carries on a turn the daemon's restart cut
+    /// short, in a rho that resumes them.
+    fn reattach_all(
         &mut self,
         machine: &MachineId,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(Resume { shown, working }) = self
-            .connection_mut(machine)
-            .and_then(|connection| connection.resume.take())
-        else {
-            return;
-        };
-        // `connect` emptied the pane of this machine's session; one the
-        // user opened since stays.
-        if let Some(Shown { id, cwd, title }) = shown {
-            if matches!(self.pane, Pane::Empty) {
-                self.open_session(id, cwd, title, window, cx);
+        let open: Vec<(SessionKey, bool)> = self
+            .sessions
+            .iter()
+            .filter(|open| open.id.machine == *machine)
+            .map(|open| (open.id.clone(), open.view.read(cx).follows_again()))
+            .collect();
+        for (id, follows) in open {
+            if follows {
+                self.reattach(&id, window, cx);
+            } else if let Some(open) = self.opened(&id) {
+                // Nothing to follow, but no longer waiting on the machine.
+                open.view
+                    .update(cx, |view, cx| view.set_link(Link::Following, window, cx));
             }
         }
-        let Some(daemon) = self.daemon(machine).cloned() else {
-            return;
-        };
-        cx.spawn(async move |_, _| {
-            for id in working {
-                // One gone or failing is no reason to skip the rest.
-                let _ = daemon.resume(&id).await;
-            }
-        })
-        .detach();
     }
 
-    /// Reads session `id` afresh after the daemon stopped sending its
-    /// events: a new view replaces the one that fell behind, and its
-    /// subagents' sessions go with it.
-    fn reopen_session(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Follows open session `id` again on the same view, on its machine's
+    /// daemon now, from where its events left off: the daemon stopped
+    /// sending them, or the machine connected again. A daemon that still
+    /// has the events after that sends only those, so the view keeps its
+    /// scroll position and what is unfolded. A subagent's session is
+    /// observed again.
+    fn reattach(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(view) = self.opened(id).map(|open| open.view.clone()) else {
             return;
         };
-        let shown = matches!(&self.pane, Pane::Session(shown)
-            if *shown == view || shown.read(cx).descends_from(&view, cx));
-        let (live, parent) = {
-            let view = view.read(cx);
-            (view.live(), view.parent())
+        let Some((daemon, epoch)) = self.ready(&id.machine) else {
+            return;
         };
-        // A subagent's session on screen gives way to the session above it
-        // until its new view shows, which keeps that one on screen, and open.
-        if let (true, Some(parent)) = (shown, &parent) {
-            self.set_pane(Pane::Session(parent.clone()), cx);
-        }
-        self.forget_session(id, window, cx);
-        match parent {
-            Some(parent) if shown => {
-                let title = live.title.unwrap_or_default();
-                self.open_subagent(&parent, live.id.id, title, window, cx);
-            }
-            // Opened again from its parent when wanted.
-            Some(_) => {}
-            None if shown => self.open_session(live.id, live.cwd, live.title, window, cx),
-            // Its row follows the daemon's jobs again until it is reopened.
-            None => self
-                .sidebar
-                .update(cx, |sidebar, cx| sidebar.close_live(id, cx)),
-        }
+        let (cursor, observes) = view.update(cx, |view, cx| {
+            (view.reattach(daemon.clone(), cx), view.is_subagent())
+        });
+        let id = id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let attached = if observes {
+                daemon.observe(&id.id, cursor.as_ref()).await
+            } else {
+                daemon.attach(&id.id, cursor.as_ref()).await
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                // An answer from a connection that ended since is stale:
+                // the next one follows the session again.
+                if this.is_current(&id.machine, epoch) {
+                    this.attached(&daemon, &id, attached, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Drops a session that is gone from its daemon, with its record of
@@ -1309,7 +1269,7 @@ impl RhoApp {
             let Ok(Some(id)) = opened else {
                 return;
             };
-            let attached = daemon.attach(&id.id).await;
+            let attached = daemon.attach(&id.id, None).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attached(&daemon, &id, attached, window, cx);
             });
@@ -1376,7 +1336,7 @@ impl RhoApp {
                 let attached = match options {
                     Ok(options) => {
                         session.set_config(options);
-                        daemon.attach(session.id()).await
+                        daemon.attach(session.id(), None).await
                     }
                     Err(error) => Err(error),
                 };
@@ -1467,8 +1427,8 @@ impl RhoApp {
                         Notification::error(error.to_string()).title("Couldn't delete the session"),
                         cx,
                     );
-                    // Its view no longer follows it: read it afresh.
-                    this.reopen_session(&id, window, cx);
+                    // Its view no longer follows it: follow it again.
+                    this.reattach(&id, window, cx);
                 }
             });
         })
@@ -1760,7 +1720,7 @@ impl RhoApp {
         self.show(Pane::Session(view), window, cx);
 
         cx.spawn_in(window, async move |this, cx| {
-            let attached = daemon.attach(&id.id).await;
+            let attached = daemon.attach(&id.id, None).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attached(&daemon, &id, attached, window, cx);
             });
@@ -1810,7 +1770,7 @@ impl RhoApp {
         self.show(Pane::Session(view), window, cx);
 
         cx.spawn_in(window, async move |this, cx| {
-            let observed = daemon.observe(&id.id).await;
+            let observed = daemon.observe(&id.id, None).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.attached(&daemon, &id, observed, window, cx);
             });

@@ -205,10 +205,11 @@ fn widen(ui: &mut Harness, session: &SessionId) {
 }
 
 /// Every component of the basic catalog draws, in tabs that switch. A
-/// session the daemon detached as fallen behind opens again, and draws
-/// the surface once, from the replay.
+/// session the daemon detached as fallen behind carries on from its
+/// cursor in the same view: the tab picked and the turn unfolded stay,
+/// and the surface is drawn once.
 #[test]
-fn the_gallery_draws_and_a_replay_draws_it_once() {
+fn the_gallery_draws_and_survives_falling_behind() {
     let mut ui = Harness::start("surface-gallery", Script::default());
     new_session_with(&mut ui, "gallery");
     let short = control("gallery", "short");
@@ -255,15 +256,32 @@ fn the_gallery_draws_and_a_replay_draws_it_once() {
     });
     shots(&mut ui, "media");
 
+    ui.toggle_turn("worked-0");
+    // The `ui` call, a step of its own.
+    ui.wait_until("the turn's working", |window, _, _| {
+        is_visible(window, "step-1")
+    });
+    let app = ui.app.clone();
+    let view = ui
+        .cx
+        .update(|cx| app.read(cx).active_session().expect("a session is open"));
     let session = ui.session().id().clone();
     ui.fake().fall_behind(&session);
     ui.wait_for_daemon("the session attached again", |fake| {
         fake.attaches(session.as_str()) == 2
     });
-    ui.wait_for_session("the replay", |session| !session.is_replaying());
+    ui.wait_for_session("the session caught up", |session| !session.is_replaying());
+    ui.frame();
+    let same = ui
+        .cx
+        .update(|cx| app.read(cx).active_session() == Some(view.clone()));
+    assert!(same, "the same view follows the session");
     let panel = element_id("gallery", Part::Panel);
-    ui.wait_until("the replayed gallery", |window, _, _| {
-        is_drawn(window, &short)
+    ui.act(|window, _| {
+        assert!(is_drawn(window, &picture), "the media tab stays picked");
+        assert!(!is_drawn(window, &short));
+        assert!(is_visible(window, "step-1"), "the turn stays unfolded");
+        assert_eq!(window.find_all(panel.clone()).len(), 1);
     });
-    ui.act(|window, _| assert_eq!(window.find_all(panel.clone()).len(), 1));
+    ui.shot("caught-up");
 }
