@@ -94,15 +94,24 @@
 //!   [`REFUSED_KEY`] is refused, and [`UNCHECKED_KEY`] saved unchecked. Credentials go to a file store the
 //!   config chose.
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
-//!   set, if any. `rho/daemon/restart` restarts in place, as rho does: it
-//!   counts ([`FakeDaemon::restarts`]), drops the upgrade, as the restarted
-//!   daemon runs the new program, detaches every attached session as
-//!   restarting, forgets new sessions no prompt saved, and closes every
-//!   connection; new ones are served as
-//!   before. [`FakeDaemon::restart`] restarts it so as rho does by itself
-//!   to upgrade, and [`FakeDaemon::restart_at_next_prompt`] as a prompt
-//!   arrives, which it answers `DaemonStopping`, having run nothing.
-//!   [`FakeDaemon::attaches`] counts each session's attaches.
+//!   set, if any, and what [`FakeDaemon::set_in_progress`] set.
+//!   `rho/daemon/restart` restarts in place, as rho does: it counts
+//!   ([`FakeDaemon::restarts`]), drops the upgrade, as the restarted daemon
+//!   runs the new program, detaches every attached session as restarting,
+//!   forgets new sessions no prompt saved, and closes every connection;
+//!   new ones are served as before. [`FakeDaemon::restart`] restarts it so
+//!   as rho does by itself to upgrade, and
+//!   [`FakeDaemon::restart_at_next_prompt`] as a prompt arrives, which it
+//!   answers `DaemonStopping`, having run nothing. `rho/daemon/stop`
+//!   detaches every session as stopping and closes every connection
+//!   ([`FakeDaemon::stops`]), and the next connection is served as a daemon
+//!   started afresh would be. [`FakeDaemon::attaches`] counts each
+//!   session's attaches.
+//! - [`FakeDaemon::run_another_build`] has the daemon answer every hello
+//!   as another build than the client's, until it restarts or stops.
+//!   [`FakeDaemon::speak_older_protocol`] has it refuse every hello as a
+//!   daemon of an older protocol, until a file appears, as a fake `rho
+//!   daemon restart` makes it: the real one replaces the daemon.
 
 use std::{
     collections::BTreeMap,
@@ -125,12 +134,16 @@ use rho_protocol::{
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
-    DetachReason, ErrorCode, InputRequest, PermissionMode, PlanEntry, PlanStatus, Published,
-    Publisher, Question, RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent,
-    Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome, WorktreeReport, WorktreeVerdict,
+    DetachReason, ErrorCode, InputRequest, PermissionMode, PlanEntry, PlanStatus, ProtocolVersion,
+    Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
+    SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
+    TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
-use tokio::runtime::Runtime;
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader},
+    runtime::Runtime,
+};
 
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
 
@@ -331,23 +344,33 @@ impl FakeDaemon {
         let service = Arc::new(Fake {
             state: Mutex::new(State::new(script)),
             restarted: tokio::sync::watch::Sender::new(0),
+            closed: tokio::sync::watch::Sender::new(()),
         });
         let serving = Arc::clone(&service);
         runtime.spawn(async move {
-            let info = DaemonInfo {
-                version: "9.9.9".to_owned(),
-                pid: std::process::id(),
-                build: BuildId::of_this_crate(),
-            };
             while let Ok(stream) = listener.accept().await {
-                let (service, info) = (Arc::clone(&serving), info.clone());
+                let service = Arc::clone(&serving);
                 tokio::spawn(async move {
-                    // Runs until the client leaves, or the daemon restarts.
-                    let mut restarted = service.restarted.subscribe();
-                    let restart = async move {
-                        let _ = restarted.changed().await;
+                    let greeting = service.lock().greet();
+                    let build = match greeting {
+                        Greeting::Refuse(cost) => {
+                            refuse_as_older(stream, cost, &service).await;
+                            return;
+                        }
+                        Greeting::Serve(build) => build,
                     };
-                    let _ = serve_connection(stream, &info, service, restart).await;
+                    let info = DaemonInfo {
+                        version: "9.9.9".to_owned(),
+                        pid: std::process::id(),
+                        build,
+                    };
+                    // Runs until the client leaves, or the daemon restarts
+                    // or stops.
+                    let mut closed = service.closed.subscribe();
+                    let close = async move {
+                        let _ = closed.changed().await;
+                    };
+                    let _ = serve_connection(stream, &info, service, close).await;
                 });
             }
         });
@@ -413,6 +436,47 @@ impl FakeDaemon {
     /// How many times the daemon restarted.
     pub fn restarts(&self) -> usize {
         *self.service.restarted.borrow()
+    }
+
+    /// How many times a client asked the daemon to stop.
+    pub fn stops(&self) -> usize {
+        self.service.lock().stops
+    }
+
+    /// How many things `rho/daemon/status` says stopping or restarting
+    /// the daemon would cut short.
+    pub fn set_in_progress(&self, in_progress: u64) {
+        self.service.lock().in_progress = in_progress;
+    }
+
+    /// Has the daemon answer each hello as another build than the
+    /// client's, saying a restart costs `cost`, until it restarts or
+    /// stops: then it runs the client's build. Connections open before
+    /// heard nothing of it.
+    pub fn run_another_build(&self, cost: RestartCost) {
+        self.service.lock().skew = Some(cost);
+    }
+
+    /// Has the daemon refuse each hello as a daemon of an older protocol
+    /// would, saying a restart costs `cost`, until the file `replaced`
+    /// exists: a fake `rho daemon restart` makes it, as the real one
+    /// replaces the daemon with the rho installed. Then it serves hellos
+    /// again.
+    pub fn speak_older_protocol(&self, cost: RestartCost, replaced: &Path) {
+        self.service.lock().older = Some(Older {
+            cost,
+            replaced: replaced.to_owned(),
+        });
+    }
+
+    /// How many hellos the daemon refused as older than the client.
+    pub fn refusals(&self) -> usize {
+        self.service.lock().refusals
+    }
+
+    /// How many hellos the daemon accepted: one per connection.
+    pub fn hellos(&self) -> usize {
+        self.service.lock().hellos
     }
 
     /// Restarts the daemon in place, as rho does by itself once the
@@ -1509,6 +1573,18 @@ struct State {
     holds: usize,
     /// The upgrade `rho/daemon/status` reports.
     upgrade: Option<PendingUpgrade>,
+    /// What `rho/daemon/status` says stopping or restarting would cut short.
+    in_progress: u64,
+    /// While the daemon answers hellos as another build, what it says a
+    /// restart costs.
+    skew: Option<RestartCost>,
+    /// While the daemon refuses hellos as older than its clients.
+    older: Option<Older>,
+    /// How many hellos it refused so.
+    refusals: usize,
+    /// How many hellos it accepted.
+    hellos: usize,
+    stops: usize,
     /// The environment the latest `rho/session/new` carried.
     new_session_environment: Option<ClientEnvironment>,
     turns: u64,
@@ -1523,7 +1599,76 @@ struct State {
     restart_at_prompt: bool,
 }
 
+/// A daemon of an older protocol than its clients', until it is replaced.
+#[derive(Debug)]
+struct Older {
+    /// What its refusals say a restart costs.
+    cost: RestartCost,
+    /// The file whose appearance replaces it.
+    replaced: PathBuf,
+}
+
+impl Older {
+    fn is_replaced(&self) -> bool {
+        self.replaced.exists()
+    }
+}
+
+/// A protocol older than any rho-ui speaks.
+const OLDER_PROTOCOL: ProtocolVersion = ProtocolVersion::new(0, 0);
+
+/// How the daemon answers a new connection's hello.
+enum Greeting {
+    /// As older than the client, saying a restart costs this.
+    Refuse(RestartCost),
+    /// Accepted, as a daemon of this build.
+    Serve(BuildId),
+}
+
+/// Reads the hello on `stream` and refuses it as a daemon of
+/// [`OLDER_PROTOCOL`] would, saying a restart costs `cost`, as rho-protocol's
+/// own server does a client newer than itself; its server speaks only
+/// [`PROTOCOL_VERSION`], so this writes the refusal itself. Counts it in
+/// `service`'s refusals.
+async fn refuse_as_older(stream: impl AsyncRead + AsyncWrite, cost: RestartCost, service: &Fake) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut hello = String::new();
+    if BufReader::new(reader).read_line(&mut hello).await.is_err() {
+        return;
+    }
+    service.lock().refusals += 1;
+    let id = serde_json::from_str::<Value>(&hello)
+        .ok()
+        .and_then(|hello| hello.get("id").cloned())
+        .unwrap_or(Value::Null);
+    let mismatch = VersionMismatch {
+        restart: Some(cost),
+        ..VersionMismatch::between(OLDER_PROTOCOL, PROTOCOL_VERSION)
+            .expect("rho-ui speaks a protocol newer than 0.0")
+    };
+    let data = serde_json::to_value(mismatch).expect("a mismatch is JSON");
+    let error = RpcError::new(ErrorCode::VersionMismatch, mismatch.to_string()).with_data(data);
+    let mut answer = json!({ "jsonrpc": "2.0", "id": id, "error": error }).to_string();
+    answer.push('\n');
+    let _ = writer.write_all(answer.as_bytes()).await;
+    let _ = writer.shutdown().await;
+}
+
 impl State {
+    /// How to answer a new connection's hello: refused while the daemon is
+    /// older than its clients and not yet replaced, else served as another
+    /// build or this one.
+    fn greet(&mut self) -> Greeting {
+        if self.older.as_ref().is_some_and(Older::is_replaced) {
+            self.older = None;
+        }
+        match (&self.older, self.skew) {
+            (Some(older), _) => Greeting::Refuse(older.cost),
+            (None, Some(_)) => Greeting::Serve(BuildId::new("another-build")),
+            (None, None) => Greeting::Serve(BuildId::of_this_crate()),
+        }
+    }
+
     fn new(script: Script) -> Self {
         let mut sessions = BTreeMap::new();
         sessions.insert(
@@ -1560,6 +1705,12 @@ impl State {
             session_worktrees: Vec::new(),
             holds: 0,
             upgrade: None,
+            in_progress: 0,
+            skew: None,
+            older: None,
+            refusals: 0,
+            hellos: 0,
+            stops: 0,
             new_session_environment: None,
             turns: 0,
             steers: 0,

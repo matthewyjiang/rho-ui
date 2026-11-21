@@ -15,8 +15,9 @@ use rho_ui_core::{
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
     BackgroundWork, Checkout, ChoiceKind, ConfigOption, ConfigValue, Continuity, Daemon,
     DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Detached, Entry, Form, Image,
-    ImageFormat, JobActivity, LoginOutcome, Prompt, PromptKey, RunState, Session, SessionId,
-    SurfaceActionError, ToolStatus, Unsteered, WorktreeVerdict, MAX_PROMPT_ATTACHMENT_BYTES,
+    ImageFormat, JobActivity, LoginOutcome, Prompt, PromptKey, RestartCost, RunState, Session,
+    SessionId, SurfaceActionError, ToolStatus, Unsteered, VersionFix, WorktreeVerdict,
+    MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -256,7 +257,7 @@ fn a_prompt_runs_a_turn_through_an_approval() {
     let fake = FakeDaemon::start(Script::default());
     block_on(async {
         let (daemon, mut events) = connect(&fake).await;
-        assert_eq!(daemon.info().notice(), None, "the fake is this build");
+        assert_eq!(daemon.info().skew(), None, "the fake is this build");
 
         let mut session = new_session(&daemon).await;
         assert_eq!(session.commands()[0].name(), "compact");
@@ -586,6 +587,41 @@ fn a_prompt_past_the_message_limit_is_refused_and_the_connection_lives() {
             .prompt(session.id(), &"list files".into(), &PromptKey::generate())
             .await
             .expect("the connection survives the refusal");
+    });
+}
+
+/// What a restart would cost reaches the app both ways rho says it: in the
+/// refusal of a daemon older than rho-ui, which a restart fixes, and in the
+/// answer of one of another build, which a restart replaces with the
+/// client's.
+#[test]
+fn a_daemon_that_needs_a_restart_says_what_it_costs() {
+    let fake = FakeDaemon::start(Script::default());
+    let cost = RestartCost {
+        in_progress: 2,
+        clients: 1,
+    };
+    let dir = tempfile::tempdir().expect("a folder for the marker");
+    let replaced = dir.path().join("replaced");
+    fake.speak_older_protocol(cost, &replaced);
+    let refused = block_on(Daemon::connect(fake.target()));
+    let Err(DaemonError::Incompatible(mismatch)) = &refused else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(
+        (mismatch.fix, mismatch.restart),
+        (VersionFix::RestartDaemon, Some(cost))
+    );
+
+    std::fs::write(&replaced, "").expect("the marker");
+    fake.run_another_build(cost);
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        assert_eq!(daemon.info().skew(), Some(cost));
+        assert_eq!(daemon.info().pid(), std::process::id(), "the fake's pid");
+        daemon.restart().await.expect("the restart");
+        let (daemon, _events) = connect(&fake).await;
+        assert_eq!(daemon.info().skew(), None, "the restart ran this build");
     });
 }
 

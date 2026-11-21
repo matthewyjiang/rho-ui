@@ -38,9 +38,11 @@ use super::{
 #[derive(Debug)]
 pub(super) struct Fake {
     pub(super) state: Mutex<State>,
-    /// Counts restarts; each connection ends when it changes, as a daemon
-    /// restarting in place closes them.
+    /// Counts restarts, which each start another stream.
     pub(super) restarted: tokio::sync::watch::Sender<usize>,
+    /// Changes at each restart and stop; every connection ends then, as
+    /// a daemon restarting or stopping closes them.
+    pub(super) closed: tokio::sync::watch::Sender<()>,
 }
 
 impl Fake {
@@ -57,6 +59,8 @@ impl Fake {
     pub(super) fn restart_now(&self) {
         let mut state = self.lock();
         state.upgrade = None;
+        // It runs the program installed, rho-ui's own build.
+        state.skew = None;
         state
             .sessions
             .retain(|_, session| session.saved || session.subagent);
@@ -67,6 +71,7 @@ impl Fake {
         }
         drop(state);
         self.restarted.send_modify(|restarts| *restarts += 1);
+        self.closed.send_replace(());
     }
 
     /// The stream of this run of the daemon: a restart starts another.
@@ -430,11 +435,15 @@ impl Service for Fake {
         }
     }
 
+    fn hello(&self, _: &ClientInfo) {
+        self.lock().hellos += 1;
+    }
+
     fn skewed(&self, _: &ClientInfo, _: &BuildId) -> RestartCost {
-        RestartCost {
+        self.lock().skew.unwrap_or(RestartCost {
             in_progress: 0,
             clients: 0,
-        }
+        })
     }
 
     async fn status(&self) -> DaemonStatus {
@@ -446,14 +455,28 @@ impl Service for Fake {
             started_at: 0,
             uptime_secs: 0,
             jobs: 0,
-            in_progress: 0,
+            in_progress: state.in_progress,
             socket: PathBuf::new(),
             credential_store: state.auth.store(),
             upgrade: state.upgrade.clone(),
         }
     }
 
-    async fn stop(&self) {}
+    /// The next client to start the daemon starts the program installed,
+    /// so it serves that one as rho-ui's own build.
+    async fn stop(&self) {
+        let mut state = self.lock();
+        state.stops += 1;
+        state.upgrade = None;
+        state.skew = None;
+        for session in state.sessions.values_mut() {
+            for publisher in session.publishers.drain(..) {
+                publisher.close(DetachReason::DaemonStopping);
+            }
+        }
+        drop(state);
+        self.closed.send_replace(());
+    }
 
     async fn restart(&self) {
         self.restart_now();

@@ -7,12 +7,12 @@
 
 use std::{fmt, path::PathBuf};
 
-use gpui_kit::SharedString;
+use gpui_kit::{App, Entity, EventEmitter, SharedString};
 #[cfg(target_family = "wasm")]
 use rho_ui_core::ServerTarget;
 #[cfg(not(target_family = "wasm"))]
 use rho_ui_core::SshTarget;
-use rho_ui_core::{DaemonTarget, RhoInstall, SessionId};
+use rho_ui_core::{DaemonTarget, RestartCost, RhoInstall, SessionId};
 
 use crate::forge::CliPaths;
 
@@ -176,13 +176,44 @@ impl RemoteMachine {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MachineStatus {
     Connecting,
-    /// Connected to a daemon of this rho version, such as `Rho 3.0.0`.
+    /// Connected to a daemon of this rho version, such as `3.0.0`, which
+    /// runs as process `pid` there.
     Ready {
         version: SharedString,
+        pid: u32,
+        /// Whether the daemon is another build than rho-ui's, so a request
+        /// may fail until it restarts.
+        another_build: bool,
     },
+    /// Its daemon refused rho-ui for speaking an older protocol; restarting
+    /// it into the rho installed there lets it connect, if that rho is new
+    /// enough. What that would cut short, when the daemon said.
+    OlderDaemon {
+        cost: Option<RestartCost>,
+    },
+    /// Its daemon still refused rho-ui after rho-ui restarted it: the Rho
+    /// installed there is older than rho-ui too, and must be updated.
+    OlderRho,
     /// Couldn't connect, or the connection closed; why, in rho's or ssh's
     /// words.
     Failed(SharedString),
+    /// The user stopped its daemon. rho-ui starts it again only when asked
+    /// ([`DaemonAction::Connect`]).
+    Stopped,
+}
+
+/// What the user asked of a machine's daemon, from whichever view;
+/// [`Machines`] emits it for [`crate::app::RhoApp`], which holds the
+/// connections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DaemonAction {
+    /// Connect again, starting the daemon if none runs: Retry, or Start
+    /// after a stop.
+    Connect(MachineId),
+    /// Restart the daemon, once the user confirms what that cuts short.
+    Restart(MachineId),
+    /// Stop the daemon, once the user confirms what that cuts short.
+    Stop(MachineId),
 }
 
 /// What rho-ui asks each daemon to list. Each can be refused on its own,
@@ -238,6 +269,23 @@ impl Entry {
 #[derive(Debug, Default)]
 pub(crate) struct Machines {
     list: Vec<Entry>,
+}
+
+impl EventEmitter<DaemonAction> for Machines {}
+
+/// What the views say of a daemon that refused rho-ui for its older
+/// protocol ([`MachineStatus::OlderDaemon`]).
+pub(crate) const OLDER_DAEMON: &str = "Its daemon speaks an older protocol. Restarting it runs \
+     the Rho installed there, which connects if it is new enough.";
+
+/// What the views say of a machine whose daemon still refused rho-ui after
+/// a restart ([`MachineStatus::OlderRho`]).
+pub(crate) const OLDER_RHO: &str =
+    "The Rho installed there speaks an older protocol than rho-ui. Update it there to connect.";
+
+/// Asks for `action`, which `machines` passes on; see [`DaemonAction`].
+pub(crate) fn ask(machines: &Entity<Machines>, action: DaemonAction, cx: &mut App) {
+    machines.update(cx, |_, cx| cx.emit(action));
 }
 
 impl Machines {
@@ -314,6 +362,15 @@ impl Machines {
         self.entry(id).map(|entry| &entry.status)
     }
 
+    /// Whether `id`'s daemon refused rho-ui for its older protocol and
+    /// rho-ui can restart it: only through the machine's `rho`, since the
+    /// daemon takes no request.
+    pub(crate) fn restarts_older(&self, id: &MachineId) -> bool {
+        self.entry(id).is_some_and(|entry| {
+            matches!(entry.status, MachineStatus::OlderDaemon { .. }) && entry.machine.rho.is_some()
+        })
+    }
+
     /// Records how `id`'s connection is doing. A new connection, or none,
     /// starts its listings over, so their refusals go. Returns whether
     /// anything changed.
@@ -348,7 +405,8 @@ impl Machines {
     }
 
     /// Each machine with something wrong: its ID, how its connection is
-    /// doing, and each listing its daemon refused, with why.
+    /// doing, and each listing its daemon refused, with why. A daemon of
+    /// another build is something wrong.
     pub(crate) fn troubles(
         &self,
     ) -> impl Iterator<Item = (&MachineId, &MachineStatus, Vec<(Listing, &SharedString)>)> {
@@ -360,7 +418,13 @@ impl Machines {
             .into_iter()
             .filter_map(|(listing, error)| Some((listing, error?)))
             .collect();
-            let ready = matches!(entry.status, MachineStatus::Ready { .. });
+            let ready = matches!(
+                entry.status,
+                MachineStatus::Ready {
+                    another_build: false,
+                    ..
+                }
+            );
             (!ready || !refused.is_empty()).then_some((&entry.machine.id, &entry.status, refused))
         })
     }
@@ -437,7 +501,9 @@ mod tests {
             clone_folder: SharedString::default(),
         }]);
         let ready = || MachineStatus::Ready {
-            version: "Rho 3".into(),
+            version: "3.0.0".into(),
+            pid: 7,
+            another_build: false,
         };
         assert!(machines.set_status(&id, ready()));
         let refused = |machines: &Machines| -> Vec<(Listing, String)> {

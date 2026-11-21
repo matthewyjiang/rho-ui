@@ -23,7 +23,7 @@ use gpui_kit::{
 use rho_ui_core::{platform, DaemonError, PendingUpgrade, RhoCheck, RhoInstall, Update};
 
 use crate::{
-    machines::{MachineId, MachineStatus, Machines},
+    machines::{self, DaemonAction, MachineId, MachineStatus, Machines},
     workspaces::tilde,
 };
 
@@ -103,8 +103,6 @@ pub(crate) enum InstallsEvent {
     /// rho was updated under the machine's daemon, which may now restart
     /// in place, or stop for the next client to start the new rho.
     Updated(MachineId),
-    /// The user asked the machine's daemon to restart now.
-    Restart(MachineId),
 }
 
 /// Every machine's rho, apart from its daemon.
@@ -142,6 +140,19 @@ impl Installs {
         )
     }
 
+    /// The rho installed on `machine`, once a check found it, if its
+    /// daemon runs another version, `running`: what a restart of the daemon
+    /// would run instead. A restart into the same version changes nothing.
+    pub(crate) fn restart_runs(&self, machine: &MachineId, running: &str) -> Option<&str> {
+        match self.states.get(machine) {
+            Some(State::Checked {
+                check: RhoCheck::Installed { current, .. },
+                ..
+            }) if current != running => Some(current),
+            _ => None,
+        }
+    }
+
     /// Checks `machine`'s rho unless a check or change is under way, or a
     /// check that found rho is fresh (see [`is_fresh`]). `running` is the
     /// version its daemon runs, once one answers.
@@ -165,15 +176,6 @@ impl Installs {
     /// would be cut short.
     pub(crate) fn update(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
         self.change(machine, Change::Update, cx);
-    }
-
-    /// Asks [`crate::app::RhoApp`] to restart `machine`'s daemon now.
-    #[expect(
-        clippy::unused_self,
-        reason = "a button takes it as it takes `install` and `update`"
-    )]
-    pub(crate) fn restart(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
-        cx.emit(InstallsEvent::Restart(machine.clone()));
     }
 
     /// Records the upgrade `machine`'s daemon waits to run, from its
@@ -441,16 +443,14 @@ pub(crate) fn render_offer(
                 1 => format!("Rho {version} starts{} once 1 task ends", on("on")),
                 n => format!("Rho {version} starts{} once {n} tasks end", on("on")),
             };
+            let machines = installs.read(cx).machines.clone();
+            let restart = DaemonAction::Restart(machine.clone());
             row(
                 line(text).into_any_element(),
                 (*waiting_for > 0).then(|| {
-                    button("restart", "Restart now")
+                    button("restart", "Restart now…")
                         .icon(IconName::RotateCw)
-                        .tooltip(
-                            "Running turns stop, and carry on after the restart in a Rho \
-                             that resumes them. Background processes stop.",
-                        )
-                        .on_click(act(Installs::restart))
+                        .on_click(move |_, _, cx| machines::ask(&machines, restart.clone(), cx))
                         .into_any_element()
                 }),
             )
@@ -652,7 +652,9 @@ mod tests {
             ),
         ];
         let ready = MachineStatus::Ready {
-            version: "Rho 3.1.0".into(),
+            version: "3.1.0".into(),
+            pid: 7,
+            another_build: false,
         };
         for (state, upgrade, want) in cases {
             assert_eq!(
