@@ -77,14 +77,22 @@ Whoever reaches `rho-ui serve` can run anything as its user, so it listens on 12
 
 The terminal's output comes at most `SHELL_WINDOW` (1 MiB) ahead of what the page took, as a browser can't hold back a WebSocket's reads: the page says what it took, and the server reads no more of the shell until it does.
 
-`cargo xtask web` (`xtask/src/main.rs`) builds the wasm and runs `wasm-bindgen` as a library, whose version `Cargo.lock` keeps equal to the app's `wasm-bindgen`, and downloads the page's fonts, Noto Sans and JetBrainsMono Nerd Font (the desktop's default code font, with the icons shell prompts draw), checked against their SHA-256, as a browser has no fonts GPUI can read. GPUI's web platform pulls in `wasm_thread`, which names a nightly feature even when unused, so the xtask lets that one crate build on stable with `RUSTC_BOOTSTRAP=wasm_thread`. The page fetches GPUI Kit's icons as it draws each, from `/assets/`, which the server serves from its own binary. `cargo xtask dist` gzips the web build into `target/web-gz` and builds a release `rho-ui` with the `web` feature, which embeds it; without that feature `rho-ui serve` serves `target/web` of its checkout, or `--web DIR`.
+`cargo xtask web` (`xtask/src/main.rs`) builds the wasm and runs `wasm-bindgen` as a library, whose version `Cargo.lock` keeps equal to the app's `wasm-bindgen`, and downloads the page's fonts, Noto Sans and JetBrainsMono Nerd Font (the desktop's default code font, with the icons shell prompts draw), checked against their SHA-256, as a browser has no fonts GPUI can read. GPUI's web platform pulls in `wasm_thread`, which names a nightly feature even when unused, so the xtask lets that one crate build on stable with `RUSTC_BOOTSTRAP=wasm_thread`. The page fetches GPUI Kit's icons as it draws each, from `/assets/`, which the server serves from its own binary. `cargo xtask dist` gzips the web build into `target/web-gz` and builds a release `rho-ui` with the `web` feature, which embeds it; without that feature `rho-ui serve` serves `target/web` of its checkout, or `--web DIR`. On Windows, which has no `rho-ui serve`, `dist` builds the release alone. The web build's SQLite is C, compiled for wasm32 by the system's clang, which on macOS must be LLVM's (`brew install llvm`, then `CC_wasm32_unknown_unknown` and `AR_wasm32_unknown_unknown` naming its `clang` and `llvm-ar`), as Apple's has no wasm32 target.
 
-A release of `rho-ui` links the desktop's libraries (`libxcb`, `libxkbcommon`) even to run `serve`, as the dynamic loader opens them before `main`, so a headless server needs them installed. A release job could link them statically to drop that. Code that runs in both builds takes `Instant` and `SystemTime` from `web-time`, as std's panic in a browser; `cargo xtask clippy-web` bans std's `now` there.
+A release of `rho-ui` links the desktop's libraries (`libxcb`, `libxkbcommon`, `libxkbcommon-x11`) even to run `serve`, as the dynamic loader opens them before `main`, so a headless server needs them installed; the README names the packages (see [Releases](#releases) for why they aren't linked statically). Code that runs in both builds takes `Instant` and `SystemTime` from `web-time`, as std's panic in a browser; `cargo xtask clippy-web` bans std's `now` there.
 
 What differs in a browser:
 
 - pele draws Mermaid diagrams as the page's own JavaScript (`pele/browser.rs`), which has no memory or time limit, unlike QuickJS's on the desktop.
 - There is no desktop file chooser: adding a project on the server's machine browses from `~/` in the search, as on a remote machine, and the composer has no attach button.
+
+## Releases
+
+A tag `vX.Y.Z` runs `.github/workflows/release.yml`: `cargo xtask dist` on Ubuntu 24.04, macOS 15 (Apple silicon) and Windows, each packaged as the README's install section describes, then one job publishes them, with their SHA-256 sums, as that tag's release. The tag must name `rho-ui`'s version in `crates/rho-ui/Cargo.toml`, which About shows. A tag with a pre-release part (`v0.1.0-test.1`) makes a draft, to try the workflow without publishing. The builds share CI's setup, `.github/actions/setup`. No build is signed yet: the Mac app is signed ad hoc, so it runs, and the README says how to open it the first time.
+
+The Linux build links `libxcb`, `libxkbcommon` and `libxkbcommon-x11` dynamically. Ubuntu ships no static `libxkbcommon`, so linking it in would mean building it from source in the job, for a library every Linux desktop has and a server gets with one package. Built on Ubuntu 24.04, it needs glibc 2.39.
+
+A release build caches nothing. A tag's run can restore only what its own tag or `main` saved, and `main`'s CI builds no release; nor is what a cache could carry across worth it: in a build of 18 to 21 minutes, cloning Ghostty took under 5 seconds and fetching its Zig packages under 100 (measured on the runners).
 
 ## State
 
