@@ -4,6 +4,8 @@
 
 The desktop app for [rho](https://github.com/matthewyjiang/rho).
 
+**Docs: [matthewyjiang.github.io/rho-ui](https://matthewyjiang.github.io/rho-ui/)**
+
 Sessions run in the rho daemon, so they keep running after you close the window, and sessions started in rho's terminal UI show up here too. Add remote machines in Settings to see their sessions beside this machine's, reached over ssh.
 
 ## Requirements
@@ -72,4 +74,4 @@ These follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set, on macOS too.
 
 ## More
 
-See [docs/](docs/) for features in detail, architecture, and testing.
+The [docs site](https://matthewyjiang.github.io/rho-ui/) has the user guide. [docs/](docs/) holds its source, with features in detail, architecture, and testing.

@@ -2,6 +2,8 @@
 
 rho-ui is the desktop app for rho. See docs/architecture.md for the crate layout, docs/features.md for behavior, and docs/testing.md for tests.
 
+`docs/` is also the docs site, built with VitePress and published to GitHub Pages from main (`npm run docs:dev` to preview). `docs/guide/` is the user guide: when a change alters what a user sees or does, update it alongside `docs/features.md`. Its screenshots come from the headless UI tests through `uv run docs/shots.py`.
+
 ## Skills
 
 Repo skills live in `.agents/skills`:
