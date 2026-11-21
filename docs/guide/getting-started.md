@@ -18,14 +18,12 @@ rho-ui is a window onto the [rho](https://matthewyjiang.github.io/rho/) daemon. 
 
 Each [release](https://github.com/matthewyjiang/rho-ui/releases) has a build for each OS. None is signed yet, so each OS asks once whether to trust it.
 
-**Linux** (x86_64, glibc 2.39 or later, as in Ubuntu 24.04 or Debian 13): unpack the tarball and install it for your user, with the desktop entry and icon that put it in your app menu:
+**Linux** (x86_64, glibc 2.39 or later, as in Ubuntu 24.04 or Debian 13): unpack the tarball and put `rho-ui` in `~/.local/bin`, then [add it to your app menu](#add-it-to-your-linux-app-menu) from the same folder:
 
 ```bash
 tar -xzf rho-ui-*-x86_64-linux.tar.gz
 cd rho-ui-*-x86_64-linux
 install -Dm755 rho-ui ~/.local/bin/rho-ui
-install -Dm644 rho-ui.desktop ~/.local/share/applications/rho-ui.desktop
-install -Dm644 icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
 ```
 
 It links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desktop has; a server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)).
@@ -36,8 +34,9 @@ It links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desk
 xattr -dr com.apple.quarantine /Applications/Rho.app
 ```
 
-**Windows** (x86_64): unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click **More info**, then **Run anyway**. It opens no console window, so it shows no command-line errors.
+Opened from the Finder, the app gets the system's `PATH`, not your shell's, so it finds `rho` only in `~/.local/bin`, where rho's installer puts it, or in `/usr/bin` and the other folders of that `PATH`. For a `rho` elsewhere, such as Homebrew's, start it once from a terminal with `/Applications/Rho.app/Contents/MacOS/rho-ui --rho "$(command -v rho)"`: the daemon it starts keeps running for the app.
 
+**Windows** (x86_64): unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click **More info**, then **Run anyway**. It opens no console window, so it shows no command-line errors.
 
 ### From source
 
@@ -50,14 +49,20 @@ mise install   # or install the Rust and Zig versions in mise.toml yourself
 cargo install --path crates/rho-ui
 ```
 
-To launch it from your Linux desktop's app menu, with its icon in the dock and window list:
+Its desktop entry and icon are in the checkout's `assets/`.
+
+### Add it to your Linux app menu
+
+To launch rho-ui from your desktop's app menu, with its icon in the dock and window list, install its desktop entry and icon, from the release's folder or the checkout's `assets/`. An app launched from the menu doesn't get your shell's `PATH`, so the entry names `rho-ui` by its full path, `BIN`:
 
 ```bash
-install -Dm644 assets/rho-ui.desktop ~/.local/share/applications/rho-ui.desktop
-install -Dm644 assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
+BIN=~/.local/bin/rho-ui   # from cargo install: BIN=~/.cargo/bin/rho-ui
+mkdir -p ~/.local/share/applications
+sed "s|^Exec=rho-ui|Exec=$BIN|" rho-ui.desktop > ~/.local/share/applications/rho-ui.desktop
+install -Dm644 icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
 ```
 
-An app launched from the menu doesn't get your shell's `PATH`. If `rho` isn't somewhere like `/usr/local/bin`, edit the entry's `Exec=` to `rho-ui --rho /path/to/rho`.
+If `rho` is neither on the menu's `PATH` nor in `~/.local/bin`, add `--rho /path/to/rho` to the entry's `Exec=` line.
 
 ## Run
 
@@ -65,7 +70,7 @@ An app launched from the menu doesn't get your shell's `PATH`. If `rho` isn't so
 rho-ui [DIR] [--rho PROGRAM]
 ```
 
-- `DIR` is where new sessions start until you pick a project. It defaults to the current directory.
+- `DIR` is where new sessions start until you pick a project. It defaults to the current directory, or your home folder when that is the filesystem's root or rho-ui's own folder, as when you open it from the Finder, the Dock or Explorer.
 - `PROGRAM` is the `rho` that starts the daemon if none is running. It defaults to `rho` on `PATH`, then `~/.local/bin/rho`, where rho's install script puts it.
 
 If rho isn't installed, rho-ui says so and offers **Install Rho**, which runs rho's own installer and then connects.

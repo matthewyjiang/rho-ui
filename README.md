@@ -39,48 +39,21 @@ Open the URL it prints, which holds its token. `rho-ui serve`, which listens on 
 
 ## Install
 
-### From a release
+Download the build for your OS from the [latest release](https://github.com/matthewyjiang/rho-ui/releases/latest): a tarball for Linux (x86_64), `Rho.app` for macOS (Apple silicon), a zip for Windows (x86_64). [Getting started](https://matthewyjiang.github.io/rho-ui/guide/getting-started#from-a-release) has the steps for each, with the libraries `rho-ui serve` needs on a Linux server.
 
-Each [release](https://github.com/matthewyjiang/rho-ui/releases) has a build for each OS: rho-ui alone, with the web build for `rho-ui serve` inside on Linux and macOS. None is signed yet, so each OS asks once whether to trust it.
-
-**Linux** (x86_64, glibc 2.39 or later, as in Ubuntu 24.04 or Debian 13): unpack the tarball and install it for your user, with the desktop entry and icon that put it in your app menu:
-
-```bash
-tar -xzf rho-ui-*-x86_64-linux.tar.gz
-cd rho-ui-*-x86_64-linux
-install -Dm755 rho-ui ~/.local/bin/rho-ui
-install -Dm644 rho-ui.desktop ~/.local/share/applications/rho-ui.desktop
-install -Dm644 icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
-```
-
-rho-ui links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desktop has. `rho-ui serve` needs them too, as the loader opens them before it starts, so on a server without a desktop install them first: `sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0` on Debian or Ubuntu, `sudo dnf install libxcb libxkbcommon libxkbcommon-x11` on Fedora.
-
-**macOS** (Apple silicon): unzip it and move `Rho.app` to Applications. The first time you open it, macOS says it can't verify the app; click Done, then open System Settings → Privacy & Security, click Open Anyway beside the note that Rho was blocked, and confirm. Or, in a terminal, before opening it:
+None is signed yet. macOS won't open `Rho.app` the first time: click Done, then Open Anyway in System Settings → Privacy & Security, or clear its quarantine before opening it:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Rho.app
 ```
 
-`rho-ui serve` is the same program: `/Applications/Rho.app/Contents/MacOS/rho-ui serve`.
+On Windows, if SmartScreen says it protected your PC, click More info, then Run anyway.
 
-**Windows** (x86_64): unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click More info, then Run anyway.
-
-### From source
-
-Building needs Rust and Zig at the versions `mise.toml` pins (Zig builds Ghostty's terminal library), and on Linux the system packages in GPUI Kit's [installation guide](https://gpui-kit.com/docs/installation/).
+To build it from source instead, with Rust and Zig at the versions `mise.toml` pins (and on Linux, the system packages in GPUI Kit's [installation guide](https://gpui-kit.com/docs/installation/)):
 
 ```bash
 cargo install --path crates/rho-ui
 ```
-
-On Linux, to launch it from your desktop's app menu, with its icon in the dock and window list:
-
-```bash
-install -Dm644 assets/rho-ui.desktop ~/.local/share/applications/rho-ui.desktop
-install -Dm644 assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
-```
-
-Wayland looks up the icon through this desktop entry, whose name matches the window's app ID, `rho-ui`. An app launched from the menu doesn't get your shell's `PATH`, so if `rho` isn't somewhere like `/usr/local/bin`, edit `Exec=` to `rho-ui --rho /path/to/rho`.
 
 ## Keys
 
