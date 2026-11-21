@@ -628,10 +628,6 @@ fn a_daemon_that_needs_a_restart_says_what_it_costs() {
 /// A rho that isn't there fails the connection with a reason that names
 /// it, so the user knows which path to fix.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "rho-ui can't start a daemon on Windows until rho-protocol's LocalDaemon is released there"
-)]
 fn a_missing_rho_fails_the_connection_with_a_reason() {
     // A home with no daemon, so the connection must start one.
     let target = DaemonTarget::Home {
