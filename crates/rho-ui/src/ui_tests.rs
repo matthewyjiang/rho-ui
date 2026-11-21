@@ -2602,7 +2602,8 @@ fn an_update_installs_then_restarts_the_daemon_on_request() {
 /// events. Fallen behind, it carries on where it was scrolled to. Across a
 /// restart, its composer keeps what was typed and its transcript holds
 /// each entry once; and a prompt the restarting daemon couldn't take goes
-/// again once it is back, and runs once.
+/// again once it is back, and runs once. A session gone after a restart
+/// keeps what it showed and what was typed, and says why.
 #[test]
 fn an_open_session_survives_lag_and_restarts() {
     let script = Script {
@@ -2639,10 +2640,6 @@ fn an_open_session_survives_lag_and_restarts() {
     let entries = ui.session().entries().len();
     ui.type_in("half a thought");
     ui.fake().restart();
-    ui.wait_until("the reconnect notice", |window, _, _| {
-        is_visible(window, "link-notice")
-    });
-    ui.shot("reconnecting");
     ui.wait_for_daemon("old attached after the restart", |fake| {
         fake.attaches("old") == 3
     });
@@ -2672,6 +2669,23 @@ fn an_open_session_survives_lag_and_restarts() {
         .count();
     assert_eq!(sent, 1);
     ui.shot("sent-across");
+
+    let entries = ui.session().entries().len();
+    ui.type_in("still here");
+    ui.fake().restart_without("old");
+    ui.wait_until("the refusal", |window, _, _| {
+        is_visible(window, "link-notice")
+    });
+    ui.wait_for_daemon("the reconnect", |fake| fake.restarts() == 3);
+    ui.frame();
+    assert!(same_view(&mut ui), "the same view stays");
+    assert_eq!(ui.composer_text(), "still here");
+    assert_eq!(
+        ui.session().entries().len(),
+        entries,
+        "what it showed stays"
+    );
+    ui.shot("gone");
 }
 
 /// A turn rho's terminal UI started shows in the sidebar as running, though

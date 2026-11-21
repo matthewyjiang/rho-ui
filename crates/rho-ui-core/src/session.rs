@@ -10,7 +10,7 @@
 //! separate paths. [`Session::attached`] takes the response, then the events
 //! held so far, so the response always lands first.
 //!
-//! A session also keeps where its events left off ([`Session::cursor`]).
+//! A session also keeps where its events left off.
 //! When the daemon stops sending them, as when the client fell behind or
 //! the daemon restarted, [`Session::reattach`] holds them again and gives
 //! that cursor for the next attach: a daemon that still has the events
@@ -43,7 +43,7 @@ use crate::{
 /// An opaque event for one session. Only [`Session::apply`] reads it.
 #[derive(Clone, Debug)]
 pub struct SessionUpdate {
-    /// Its place in the session's stream; see [`Session::cursor`].
+    /// Its place in the session's stream; see [`Session::reattach`].
     pub(crate) seq: Seq,
     pub(crate) event: SessionEvent,
 }
@@ -543,7 +543,8 @@ pub struct Session {
     sync: Sync,
     /// The stream the latest attach answered with, once one did.
     stream: Option<StreamId>,
-    /// The highest seq applied from that stream; see [`Self::cursor`].
+    /// The highest seq applied from that stream: where its events left
+    /// off.
     seq: Seq,
     /// The surfaces placed since [`Self::take_placed_surfaces`], with
     /// their messages.
@@ -699,7 +700,7 @@ impl Session {
     /// Where the session's events left off: the highest seq applied from
     /// the stream of its latest attach, once above 0, which the protocol
     /// says is always one to resume from.
-    pub fn cursor(&self) -> Option<Cursor> {
+    fn cursor(&self) -> Option<Cursor> {
         let stream = self.stream.clone()?;
         (self.seq > Seq(0)).then_some(Cursor(rho_protocol::Cursor {
             stream,

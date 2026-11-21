@@ -99,7 +99,8 @@
 //!   daemon runs the new program, detaches every attached session as
 //!   restarting, and closes every connection; new ones are served as
 //!   before. [`FakeDaemon::restart`] restarts it so as rho does by itself
-//!   to upgrade, and [`FakeDaemon::restart_at_next_prompt`] as a prompt
+//!   to upgrade, [`FakeDaemon::restart_without`] with a session gone, and
+//!   [`FakeDaemon::restart_at_next_prompt`] as a prompt
 //!   arrives, which it answers `DaemonStopping`, having run nothing.
 //!   [`FakeDaemon::attaches`] counts each session's attaches.
 
@@ -418,6 +419,14 @@ impl FakeDaemon {
     /// upgrade it waits for has nothing to cut short.
     pub fn restart(&self) {
         self.service.restart_now();
+    }
+
+    /// Restarts the daemon in place without session `id`, as if another
+    /// client deleted it while the daemon was down: attaching to it again
+    /// is refused.
+    pub fn restart_without(&self, id: &str) {
+        self.service.restart_now();
+        self.service.lock().sessions.remove(id);
     }
 
     /// Has the daemon restart as the next prompt arrives, before the
@@ -966,6 +975,11 @@ impl FakeSession {
     /// The events after seq `after`, as they were published: the `n`th
     /// event published has seq `n`.
     fn tail(&self, after: u64) -> Vec<(Seq, SessionEvent)> {
+        debug_assert_eq!(
+            u64::try_from(self.history.len()).ok(),
+            Some(self.live_seq),
+            "every event published is in the history, in order"
+        );
         let skip = usize::try_from(after).expect("a seq the fake published fits in usize");
         (after + 1..)
             .map(Seq)
@@ -1127,6 +1141,8 @@ impl FakeSession {
     /// Starts `turn`, one of the daemon's own that tells the model `told`
     /// about background work that ended. It runs until a steer ends it.
     fn wake(&mut self, turn: Turn, told: &str) {
+        // A prompt's key names only the session's latest turn.
+        self.last_prompt = None;
         let id = turn.id.clone();
         self.turn = Some(turn);
         self.state(JobState::Running);

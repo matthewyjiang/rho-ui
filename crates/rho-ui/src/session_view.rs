@@ -116,7 +116,7 @@ pub(crate) enum SessionEvent {
 
 /// How the session's events reach the view, as its machine's connection
 /// is doing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Link {
     /// A connection follows the session, or is attaching to it.
     Following,
@@ -126,6 +126,18 @@ pub(crate) enum Link {
     /// The connection ended, and rho-ui can't tell a restart from a stop:
     /// the app connects again only when the user asks.
     Lost,
+    /// The daemon refused to follow the session again, as when another
+    /// client deleted it meanwhile, in these words. What the view showed
+    /// stays; the next connection tries again.
+    Refused(String),
+}
+
+/// How the app follows a session again, from [`SessionView::reattach`].
+pub(crate) struct Follow {
+    /// Where its events left off.
+    pub(crate) cursor: Option<Cursor>,
+    /// A subagent's session is observed, not attached to.
+    pub(crate) observe: bool,
 }
 
 /// A prompt on its way to the daemon.
@@ -460,15 +472,14 @@ impl SessionView {
         })
     }
 
-    /// The daemon stopped sending the session's events; see
-    /// [`Self::is_unloaded`].
+    /// The daemon stopped sending this observed session's events, so what
+    /// it shows may be out of date: observe it again to read it afresh.
     pub(crate) fn unload(&mut self) {
         self.unloaded = true;
     }
 
-    /// Whether the daemon stopped sending this observed session's events,
-    /// so what it shows may be out of date: observe it again to read it
-    /// afresh.
+    /// Whether [`Self::unload`] was called, for UI tests.
+    #[cfg(test)]
     pub(crate) fn is_unloaded(&self) -> bool {
         self.unloaded
     }
@@ -611,15 +622,17 @@ impl SessionView {
                     .and_then(|elapsed| Instant::now().checked_sub(elapsed));
                 // Ready once the replay has caught up; see `after_change`.
                 if self.session.attached(attached) == Continuity::Replaced {
-                    // Its rows, and its surfaces, are built again once
-                    // the whole conversation is there.
-                    self.loading = Loading::Attaching;
-                    self.surfaces = Surfaces::default();
+                    self.replaced();
                 }
                 self.attachments += 1;
             }
             // The connection ended; the next one follows the session again.
             Err(DaemonError::Closed) => {}
+            // Followed before: what it showed, and what was typed, stay.
+            Err(error) if self.attachments > 0 => {
+                self.link = Link::Refused(error.to_string());
+                self.give_back_waiting(window, cx);
+            }
             Err(error) => self.loading = Loading::Failed(error.to_string()),
         }
         self.after_change(window, cx);
@@ -634,43 +647,68 @@ impl SessionView {
 
     /// Follows the session again on `daemon`, the daemon of its machine
     /// now, as once the machine connected again or the daemon stopped
-    /// sending the session's events. Returns where they left off, for the
-    /// attach (or for a subagent's session, the observe) whose answer goes
-    /// to [`Self::attached`].
+    /// sending the session's events. Returns how, for the attach or
+    /// observe whose answer goes to [`Self::attached`]; `None` for a view
+    /// with nothing to follow (see [`Self::follows_again`]).
     pub(crate) fn reattach(
         &mut self,
         daemon: Daemon,
         cx: &mut Context<'_, Self>,
-    ) -> Option<Cursor> {
+    ) -> Option<Follow> {
+        self.link = Link::Following;
+        cx.notify();
+        if !self.follows_again() {
+            return None;
+        }
         self.settings
             .update(cx, |settings, _| settings.set_daemon(daemon.clone()));
         self.added_dirs
             .update(cx, |dirs, _| dirs.set_daemon(daemon.clone()));
         self.daemon = daemon;
-        self.link = Link::Following;
-        cx.notify();
-        self.session.reattach()
+        Some(Follow {
+            cursor: self.session.reattach(),
+            observe: self.is_subagent(),
+        })
     }
 
     /// Records how the session's connection is doing, from the app. A
     /// prompt waiting for a connection goes back in the composer once none
     /// will come by itself.
     pub(crate) fn set_link(&mut self, link: Link, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let lost = link == Link::Lost;
         self.link = link;
-        if link == Link::Lost {
-            if let Some(Outgoing::Waiting { prompt, .. }) = self.outgoing.take() {
-                self.give_back(prompt, window, cx);
-                self.after_change(window, cx);
-            }
+        if lost {
+            self.give_back_waiting(window, cx);
         }
         cx.notify();
     }
 
+    /// Puts the prompt waiting for a connection back in the composer, as
+    /// none will send it: the connection is lost, the daemon refused to
+    /// follow the session again, or the user stopped it.
+    fn give_back_waiting(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        match self.outgoing.take() {
+            Some(Outgoing::Waiting { prompt, .. }) => {
+                self.give_back(prompt, window, cx);
+                self.after_change(window, cx);
+            }
+            other => self.outgoing = other,
+        }
+    }
+
     /// Whether the app should follow the session again once its machine
-    /// connects: unless its attach failed, or it is an observed session
-    /// whose events ended for good.
+    /// connects: unless its first attach failed, or it is an observed
+    /// session whose events ended for good.
     pub(crate) fn follows_again(&self) -> bool {
         !self.unloaded && !self.failed_to_attach()
+    }
+
+    /// The daemon replays the whole conversation over what the view
+    /// showed: its rows, and its surfaces, are built again once it is all
+    /// there. The composer, and what only this client knows, stay.
+    fn replaced(&mut self) {
+        self.loading = Loading::Attaching;
+        self.surfaces = Surfaces::default();
     }
 
     /// Moves the keyboard into a card that just opened if the user is in
@@ -864,7 +902,8 @@ impl SessionView {
                     // No daemon that could run it had it, or one did and
                     // the answer was lost: the key makes another try safe.
                     Err(DaemonError::Stopping(_) | DaemonError::Closed) => {
-                        if this.link == Link::Lost {
+                        // Unless nothing will follow the session by itself.
+                        if matches!(this.link, Link::Lost | Link::Refused(_)) {
                             this.give_back(prompt, window, cx);
                         } else {
                             this.outgoing = Some(Outgoing::Waiting { prompt, key });
@@ -1078,6 +1117,12 @@ impl SessionView {
     fn stop(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         // Only its parent stops a subagent's run.
         if !self.is_busy() || self.is_subagent() {
+            return;
+        }
+        // A prompt waiting for the daemon to come back hasn't run here: it
+        // goes back in the composer.
+        if matches!(self.outgoing, Some(Outgoing::Waiting { .. })) {
+            self.give_back_waiting(window, cx);
             return;
         }
         // The turn withdraws its open requests as it ends.
@@ -1475,7 +1520,7 @@ impl SessionView {
     /// Says so while no connection follows the session: what it shows
     /// stays, and comes up to date once one does.
     fn render_link(&self) -> Option<impl IntoElement> {
-        let alert = match self.link {
+        let alert = match &self.link {
             Link::Following => return None,
             Link::Reconnecting => Alert::info(
                 "link-alert",
@@ -1487,6 +1532,8 @@ impl SessionView {
                 "Retry from the sidebar to follow this session again.",
             )
             .title("Lost the connection to the Rho daemon"),
+            Link::Refused(why) => Alert::error("link-alert", SharedString::from(why.clone()))
+                .title("Couldn't follow this session again"),
         };
         Some(div().id("link-notice").test_support().child(alert.small()))
     }

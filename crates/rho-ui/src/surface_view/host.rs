@@ -13,8 +13,9 @@ use super::SurfacePanel;
 use crate::session_view::SessionView;
 
 /// The surfaces a session's `ui` calls showed. It goes with the session
-/// view, which a session that fell behind replaces, and the replay builds
-/// them again.
+/// view, which keeps it while the session is followed again, unless the
+/// daemon replays the whole conversation: the view then starts a new one,
+/// and the replay builds them again.
 #[derive(Default)]
 pub(crate) struct Surfaces {
     store: SurfaceStore,

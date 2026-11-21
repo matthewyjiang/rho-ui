@@ -452,7 +452,7 @@ impl RhoApp {
     /// sessions keep their views, which follow them again once it
     /// connects ([`Self::connected`]).
     fn connect(&mut self, machine: &MachineId, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.set_link(machine, Link::Reconnecting, window, cx);
+        self.set_link(machine, &Link::Reconnecting, window, cx);
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
@@ -493,7 +493,6 @@ impl RhoApp {
                 }
                 Err(error) => {
                     let _ = this.update_in(cx, |this, window, cx| {
-                        this.set_link(&id, Link::Lost, window, cx);
                         this.failed(&id, &error, window, cx);
                     });
                     return;
@@ -621,7 +620,8 @@ impl RhoApp {
         cx.notify();
     }
 
-    /// `machine`'s daemon couldn't be reached, because of `error`.
+    /// `machine`'s daemon couldn't be reached, because of `error`. Its
+    /// open sessions say so, and wait for the user's Retry.
     fn failed(
         &mut self,
         machine: &MachineId,
@@ -632,6 +632,7 @@ impl RhoApp {
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
         }
+        self.set_link(machine, &Link::Lost, window, cx);
         self.rho_settings
             .update(cx, |settings, cx| settings.forget(machine, cx));
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
@@ -890,20 +891,19 @@ impl RhoApp {
         if restarting {
             self.connect(machine, window, cx);
         } else {
-            self.set_link(machine, Link::Lost, window, cx);
             self.failed(machine, &DaemonError::Closed, window, cx);
         }
     }
 
     /// Tells each of `machine`'s open sessions how its connection is doing.
-    fn set_link(&self, machine: &MachineId, link: Link, window: &mut Window, cx: &mut App) {
+    fn set_link(&self, machine: &MachineId, link: &Link, window: &mut Window, cx: &mut App) {
         for open in self
             .sessions
             .iter()
             .filter(|open| open.id.machine == *machine)
         {
             open.view
-                .update(cx, |view, cx| view.set_link(link, window, cx));
+                .update(cx, |view, cx| view.set_link(link.clone(), window, cx));
         }
     }
 
@@ -916,20 +916,14 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let open: Vec<(SessionKey, bool)> = self
+        let open: Vec<SessionKey> = self
             .sessions
             .iter()
             .filter(|open| open.id.machine == *machine)
-            .map(|open| (open.id.clone(), open.view.read(cx).follows_again()))
+            .map(|open| open.id.clone())
             .collect();
-        for (id, follows) in open {
-            if follows {
-                self.reattach(&id, window, cx);
-            } else if let Some(open) = self.opened(&id) {
-                // Nothing to follow, but no longer waiting on the machine.
-                open.view
-                    .update(cx, |view, cx| view.set_link(Link::Following, window, cx));
-            }
+        for id in open {
+            self.reattach(&id, window, cx);
         }
     }
 
@@ -938,7 +932,7 @@ impl RhoApp {
     /// sending them, or the machine connected again. A daemon that still
     /// has the events after that sends only those, so the view keeps its
     /// scroll position and what is unfolded. A subagent's session is
-    /// observed again.
+    /// observed again; a view with nothing to follow is left as it is.
     fn reattach(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(view) = self.opened(id).map(|open| open.view.clone()) else {
             return;
@@ -946,22 +940,19 @@ impl RhoApp {
         let Some((daemon, epoch)) = self.ready(&id.machine) else {
             return;
         };
-        let (cursor, observes) = view.update(cx, |view, cx| {
-            (view.reattach(daemon.clone(), cx), view.is_subagent())
-        });
+        let Some(follow) = view.update(cx, |view, cx| view.reattach(daemon.clone(), cx)) else {
+            return;
+        };
         let id = id.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let attached = if observes {
-                daemon.observe(&id.id, cursor.as_ref()).await
+            let cursor = follow.cursor.as_ref();
+            let attached = if follow.observe {
+                daemon.observe(&id.id, cursor).await
             } else {
-                daemon.attach(&id.id, cursor.as_ref()).await
+                daemon.attach(&id.id, cursor).await
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                // An answer from a connection that ended since is stale:
-                // the next one follows the session again.
-                if this.is_current(&id.machine, epoch) {
-                    this.attached(&daemon, &id, attached, window, cx);
-                }
+                this.attached(&daemon, epoch, &id, attached, window, cx);
             });
         })
         .detach();
@@ -1271,23 +1262,30 @@ impl RhoApp {
             };
             let attached = daemon.attach(&id.id, None).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.attached(&daemon, &id, attached, window, cx);
+                this.attached(&daemon, epoch, &id, attached, window, cx);
             });
         })
         .detach();
     }
 
-    /// Hands the answer to an attach to whoever holds session `id` now: its
-    /// draft, or its view once the first message was sent. With neither
-    /// left, nothing follows the session, so the daemon is told.
+    /// Hands the answer to an attach made on connection `epoch` to whoever
+    /// holds session `id` now: its draft, or its view once the first
+    /// message was sent. With neither left, nothing follows the session,
+    /// so the daemon is told. An answer from a connection that ended since
+    /// is dropped: the views outlive it, and the next connection follows
+    /// them again.
     fn attached(
         &mut self,
         daemon: &Daemon,
+        epoch: u64,
         id: &SessionKey,
         attached: Result<Attached, DaemonError>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if !self.is_current(&id.machine, epoch) {
+            return;
+        }
         if let Some(draft) = self.draft_with(id, cx) {
             draft.update(cx, |draft, cx| draft.attached(attached, window, cx));
         } else if let Some(open) = self.opened(id) {
@@ -1538,10 +1536,7 @@ impl RhoApp {
                 let (subagent, follows) = {
                     let view = closed.view.read(cx);
                     // An unloaded or failed one has nothing to let go of.
-                    (
-                        view.is_subagent(),
-                        !view.is_unloaded() && !view.failed_to_attach(),
-                    )
+                    (view.is_subagent(), view.follows_again())
                 };
                 if !subagent {
                     self.sidebar
@@ -1692,7 +1687,7 @@ impl RhoApp {
             }
             None => {}
         }
-        let Some(daemon) = self.daemon(&id.machine).cloned() else {
+        let Some((daemon, epoch)) = self.ready(&id.machine) else {
             self.not_connected(&id.machine, "Couldn't open the session", window, cx);
             return;
         };
@@ -1722,7 +1717,7 @@ impl RhoApp {
         cx.spawn_in(window, async move |this, cx| {
             let attached = daemon.attach(&id.id, None).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.attached(&daemon, &id, attached, window, cx);
+                this.attached(&daemon, epoch, &id, attached, window, cx);
             });
         })
         .detach();
@@ -1744,7 +1739,7 @@ impl RhoApp {
         match self.opened(&id).map(|open| open.view.clone()) {
             // One that couldn't be observed, or whose events stopped as its
             // run ended, is read afresh.
-            Some(view) if view.read(cx).failed_to_attach() || view.read(cx).is_unloaded() => {
+            Some(view) if !view.read(cx).follows_again() => {
                 self.forget_session(&id, window, cx);
             }
             Some(view) => {
@@ -1753,7 +1748,7 @@ impl RhoApp {
             }
             None => {}
         }
-        let Some(daemon) = self.daemon(&id.machine).cloned() else {
+        let Some((daemon, epoch)) = self.ready(&id.machine) else {
             self.not_connected(
                 &id.machine,
                 "Couldn't open the subagent's session",
@@ -1772,7 +1767,7 @@ impl RhoApp {
         cx.spawn_in(window, async move |this, cx| {
             let observed = daemon.observe(&id.id, None).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.attached(&daemon, &id, observed, window, cx);
+                this.attached(&daemon, epoch, &id, observed, window, cx);
             });
         })
         .detach();

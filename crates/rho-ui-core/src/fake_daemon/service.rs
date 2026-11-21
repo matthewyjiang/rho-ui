@@ -69,98 +69,93 @@ impl Fake {
     fn stream(&self) -> StreamId {
         StreamId::new(format!("stream-{}", *self.restarted.borrow()))
     }
+}
 
-    /// Starts the turn of the prompt `params`, as each prompt scripts it.
-    async fn start_prompt(
-        &self,
-        params: &SessionPromptParams,
-    ) -> Result<SessionPromptResponse, RpcError> {
-        let prompt = match params.content.first() {
-            Some(ContentBlock::Text { text }) => text.clone(),
-            _ => String::new(),
-        };
-        if prompt == "fail" {
-            return Err(RpcError::new(
-                ErrorCode::InvalidParams,
-                "the fake daemon refuses this prompt",
-            ));
-        }
-        if prompt == "deleting" {
-            return Err(RpcError::new(
-                ErrorCode::SessionBusy,
-                "the session is being deleted",
-            ));
-        }
-        if prompt == "slow" {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        let mut state = self.lock();
-        let newest = state
-            .sessions
-            .values()
-            .map(|session| session.updated_at)
-            .max()
-            .unwrap_or_default();
-        let turn = state.next_turn();
-        let turn_id = turn.id.clone();
-        let session = state.session(&params.session)?;
-        if session.turn.is_some() {
-            return Err(busy());
-        }
-        session.saved = true;
-        session.updated_at = newest + 1;
-        if prompt == "busy" && !session.refused_busy {
-            session.refused_busy = true;
-            session.wake(turn, "Nothing new from the background.");
-            session.answer(&format!("m-{turn_id}-done"), "Back to you.");
-            return Err(busy());
-        }
-        if prompt == "subagent" {
-            return subagent_turn(&mut state, params, turn);
-        }
-        if prompt == "background" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, params));
-            session.start_background(format!("p-{turn_id}"));
-            session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "flaky" {
-            session.flaky(turn, echo(&turn_id, params));
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "figures" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, params));
-            session.answer(&format!("m-{turn_id}"), FIGURES);
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "report" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, params));
-            session.stream_answer(&format!("m-{turn_id}"), &report());
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if let Some(shown) = Shown::by(&prompt) {
-            session.show_surface(turn, echo(&turn_id, params), shown);
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        if prompt == "pictures" {
-            session.turn = Some(turn);
-            session.state(JobState::Running);
-            session.publish(echo(&turn_id, params));
-            session.read_image(&format!("img-{turn_id}"));
-            session.answer(&format!("m-{turn_id}"), PICTURES);
-            return Ok(SessionPromptResponse { turn: turn_id });
-        }
-        let (ask, timeout) =
-            other_ask(&prompt).unwrap_or_else(|| (ls_approval(&session.cwd), None));
-        session.ask(params, turn, ask, timeout);
-        Ok(SessionPromptResponse { turn: turn_id })
+/// Starts the turn of the prompt `params`, as each prompt scripts it.
+fn start_prompt(
+    state: &mut State,
+    params: &SessionPromptParams,
+) -> Result<SessionPromptResponse, RpcError> {
+    let prompt = match params.content.first() {
+        Some(ContentBlock::Text { text }) => text.clone(),
+        _ => String::new(),
+    };
+    if prompt == "fail" {
+        return Err(RpcError::new(
+            ErrorCode::InvalidParams,
+            "the fake daemon refuses this prompt",
+        ));
     }
+    if prompt == "deleting" {
+        return Err(RpcError::new(
+            ErrorCode::SessionBusy,
+            "the session is being deleted",
+        ));
+    }
+    let newest = state
+        .sessions
+        .values()
+        .map(|session| session.updated_at)
+        .max()
+        .unwrap_or_default();
+    let turn = state.next_turn();
+    let turn_id = turn.id.clone();
+    let session = state.session(&params.session)?;
+    if session.turn.is_some() {
+        return Err(busy());
+    }
+    session.saved = true;
+    session.updated_at = newest + 1;
+    if prompt == "busy" && !session.refused_busy {
+        session.refused_busy = true;
+        session.wake(turn, "Nothing new from the background.");
+        session.answer(&format!("m-{turn_id}-done"), "Back to you.");
+        return Err(busy());
+    }
+    if prompt == "subagent" {
+        return subagent_turn(state, params, turn);
+    }
+    if prompt == "background" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.start_background(format!("p-{turn_id}"));
+        session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "flaky" {
+        session.flaky(turn, echo(&turn_id, params));
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "figures" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.answer(&format!("m-{turn_id}"), FIGURES);
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "report" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.stream_answer(&format!("m-{turn_id}"), &report());
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if let Some(shown) = Shown::by(&prompt) {
+        session.show_surface(turn, echo(&turn_id, params), shown);
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "pictures" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.read_image(&format!("img-{turn_id}"));
+        session.answer(&format!("m-{turn_id}"), PICTURES);
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    let (ask, timeout) = other_ask(&prompt).unwrap_or_else(|| (ls_approval(&session.cwd), None));
+    session.ask(params, turn, ask, timeout);
+    Ok(SessionPromptResponse { turn: turn_id })
 }
 
 fn busy() -> RpcError {
@@ -508,19 +503,23 @@ impl Service for Fake {
                 "the daemon is restarting",
             ));
         }
-        {
-            let mut state = self.lock();
-            let session = state.session(&params.session)?;
-            let again = session
-                .last_prompt
-                .as_ref()
-                .filter(|(key, _)| params.idempotency_key.as_ref() == Some(key));
-            if let Some((_, turn)) = again {
-                return Ok(SessionPromptResponse { turn: turn.clone() });
-            }
+        let slow =
+            matches!(params.content.first(), Some(ContentBlock::Text { text }) if text == "slow");
+        if slow {
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        let started = self.start_prompt(&params).await?;
+        // One lock from the key's check to its record, so two tries of one
+        // prompt can't both start a turn.
         let mut state = self.lock();
+        let session = state.session(&params.session)?;
+        let again = session
+            .last_prompt
+            .as_ref()
+            .filter(|(key, _)| params.idempotency_key.as_ref() == Some(key));
+        if let Some((_, turn)) = again {
+            return Ok(SessionPromptResponse { turn: turn.clone() });
+        }
+        let started = start_prompt(&mut state, &params)?;
         let session = state.session(&params.session)?;
         session.prompts += 1;
         session.last_prompt = params
