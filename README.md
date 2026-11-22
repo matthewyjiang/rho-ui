@@ -13,7 +13,7 @@ Sessions run in the rho daemon, so they keep running after you close the window,
 - rho 3 or later, which rho-ui offers to install on a machine without it; on a remote machine, one whose `rho daemon status --json` names its socket, as rho 3.1's does
 - Linux, macOS or Windows
 - For a remote machine: its host key in your `known_hosts` (not only a certificate authority for it), and a key or certificate it accepts in your key agent, or in a key file without a passphrase (`ssh HOST` in a terminal should sign in without asking anything)
-- On Linux: Wayland or X11 with a working Vulkan driver, plus the system packages in GPUI Kit's [installation guide](https://gpui-kit.com/docs/installation/)
+- On Linux: Wayland or X11 with a working Vulkan driver
 
 ## Run
 
@@ -37,17 +37,23 @@ Open the URL it prints, which holds its token. `rho-ui serve`, which listens on 
 
 `cargo xtask dist` builds one `rho-ui` with the web build inside it, so `rho-ui serve` needs nothing beside it. [Architecture](docs/architecture.md#in-a-browser) says how it works.
 
-## Install on Linux
+## Install
 
-To launch rho-ui from your desktop's app menu, with its icon in the dock and window list:
+Download the build for your OS from the [latest release](https://github.com/matthewyjiang/rho-ui/releases/latest): a tarball for Linux (x86_64), `Rho.app` for macOS (Apple silicon), a zip for Windows (x86_64). [Getting started](https://matthewyjiang.github.io/rho-ui/guide/getting-started#from-a-release) has the steps for each, with the libraries `rho-ui serve` needs on a Linux server.
+
+None is signed yet. macOS won't open `Rho.app` the first time: click Done, then Open Anyway in System Settings → Privacy & Security, or clear its quarantine before opening it:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Rho.app
+```
+
+On Windows, if SmartScreen says it protected your PC, click More info, then Run anyway.
+
+To build it from source instead, with Rust and Zig at the versions `mise.toml` pins (and on Linux, the system packages in GPUI Kit's [installation guide](https://gpui-kit.com/docs/installation/)):
 
 ```bash
 cargo install --path crates/rho-ui
-install -Dm644 assets/rho-ui.desktop ~/.local/share/applications/rho-ui.desktop
-install -Dm644 assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
 ```
-
-Wayland looks up the icon through this desktop entry, whose name matches the window's app ID, `rho-ui`. An app launched from the menu doesn't get your shell's `PATH`, so if `rho` isn't somewhere like `/usr/local/bin`, edit `Exec=` to `rho-ui --rho /path/to/rho`.
 
 ## Keys
 

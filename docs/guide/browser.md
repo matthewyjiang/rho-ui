@@ -4,14 +4,22 @@ rho-ui also runs in a browser tab. `rho-ui serve` runs on the machine you want t
 
 ## Start it
 
-From a checkout, build the web app and start the server:
+A [release](./getting-started#from-a-release) for Linux or macOS has the web app inside it:
+
+```bash
+rho-ui serve [--port PORT] [--bind ADDRESS]
+```
+
+On macOS, that `rho-ui` is in the app: `/Applications/Rho.app/Contents/MacOS/rho-ui serve`.
+
+From a checkout, build the web app first:
 
 ```bash
 cargo xtask web
 cargo run -p rho-ui -- serve [--port PORT] [--bind ADDRESS]
 ```
 
-`cargo xtask dist` builds one `rho-ui` with the web app inside it, so `rho-ui serve` needs nothing beside it.
+`cargo xtask dist` builds one `rho-ui` with the web app inside it, as a release is, so `rho-ui serve` needs nothing beside it.
 
 The server listens on `127.0.0.1:8765` unless told otherwise. Open the URL it prints. The URL holds a token, and the server only talks to a page that has it.
 
@@ -30,4 +38,4 @@ Then open the printed URL on your machine.
 - `rho-ui serve` runs on Linux and macOS, not Windows.
 - There is no desktop folder chooser. Adding a project browses from `~/` in the search, as on a remote machine.
 - The composer has no attach button.
-- On a headless server, the release binary still needs the desktop's `libxcb` and `libxkbcommon` libraries installed to start.
+- On a Linux server without a desktop, `rho-ui` still needs the desktop's `libxcb`, `libxkbcommon` and `libxkbcommon-x11` libraries installed to start: `sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0` on Debian or Ubuntu, `sudo dnf install libxcb libxkbcommon libxkbcommon-x11` on Fedora.
