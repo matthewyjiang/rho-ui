@@ -34,7 +34,11 @@ It links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desk
 xattr -dr com.apple.quarantine /Applications/Rho.app
 ```
 
-Opened from the Finder, the app gets the system's `PATH`, not your shell's, so it finds `rho` only in `~/.local/bin`, where rho's installer puts it, or in `/usr/bin` and the other folders of that `PATH`. For a `rho` elsewhere, such as Homebrew's, start it once from a terminal with `/Applications/Rho.app/Contents/MacOS/rho-ui --rho "$(command -v rho)"`: the daemon it starts keeps running for the app.
+Opened from the Finder, the app gets the system's `PATH`, not your shell's, so it finds `rho` only in `~/.local/bin`, where rho's installer puts it, or in `/usr/bin` and the other folders of that `PATH`. For a `rho` elsewhere, such as Homebrew's, link it there:
+
+```bash
+mkdir -p ~/.local/bin && ln -s "$(command -v rho)" ~/.local/bin/rho
+```
 
 **Windows** (x86_64): unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click **More info**, then **Run anyway**. It opens no console window, so it shows no command-line errors.
 
@@ -49,8 +53,6 @@ mise install   # or install the Rust and Zig versions in mise.toml yourself
 cargo install --path crates/rho-ui
 ```
 
-Its desktop entry and icon are in the checkout's `assets/`.
-
 ### Add it to your Linux app menu
 
 To launch rho-ui from your desktop's app menu, with its icon in the dock and window list, install its desktop entry and icon, from the release's folder or the checkout's `assets/`. An app launched from the menu doesn't get your shell's `PATH`, so the entry names `rho-ui` by its full path, `BIN`:
@@ -62,7 +64,7 @@ sed "s|^Exec=rho-ui|Exec=$BIN|" rho-ui.desktop > ~/.local/share/applications/rho
 install -Dm644 icon.svg ~/.local/share/icons/hicolor/scalable/apps/rho-ui.svg
 ```
 
-If `rho` is neither on the menu's `PATH` nor in `~/.local/bin`, add `--rho /path/to/rho` to the entry's `Exec=` line.
+If `rho` is neither on the menu's `PATH` nor in `~/.local/bin`, link it into `~/.local/bin` as on macOS above.
 
 ## Run
 

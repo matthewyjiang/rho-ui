@@ -92,8 +92,9 @@ const UPGRADE_POLL: Duration = Duration::from_secs(30);
 
 /// What the command line asked for.
 pub(crate) struct LaunchConfig {
-    /// Where new sessions start on this machine; `None` in a browser,
-    /// where they start in its home. Resumed sessions keep their own
+    /// Where new sessions start on this machine; `None` for its home, as
+    /// in a browser, and on the desktop when the app was opened from it
+    /// (`default_workspace` in `main.rs`). Resumed sessions keep their own
     /// directory.
     pub(crate) workspace: Option<PathBuf>,
     /// How to reach this machine's daemon and rho.

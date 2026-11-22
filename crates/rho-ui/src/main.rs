@@ -1,7 +1,8 @@
 //! rho-ui: the desktop UI for the rho coding agent.
 //!
 //! `rho-ui [DIR] [--rho PROGRAM]` opens one window. DIR is the workspace for
-//! new sessions (default: the current directory); PROGRAM is the `rho` that
+//! new sessions (default: the current directory, or home when opened from
+//! the desktop: see [`default_workspace`]); PROGRAM is the `rho` that
 //! starts the daemon when none runs (default: `rho` on `PATH`).
 //!
 //! Built for wasm, it is rho-ui's web build instead, which `rho-ui serve`
