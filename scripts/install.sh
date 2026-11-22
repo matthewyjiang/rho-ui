@@ -107,8 +107,9 @@ else
   actual="$(shasum -a 256 "$tmp/$asset")"
 fi
 actual="${actual%% *}"
-[ -n "$expected" ] && [ "$actual" = "$expected" ] ||
+if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
   fail "$asset doesn't match its checksum in SHA256SUMS"
+fi
 
 mkdir -p "$INSTALL_DIR"
 dir="$tmp/rho-ui-$target"
