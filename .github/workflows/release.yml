@@ -30,7 +30,8 @@ jobs:
           - os: windows-2025
             platform: x86_64-windows
     runs-on: ${{ matrix.os }}
-    # Two tries of this took 18 to 25 minutes a job, the Mac slowest.
+    # Five runs of this took 14 to 25 minutes a job (runs 44955077449,
+    # 44957352847, 44962728276 twice, 44965686463).
     timeout-minutes: 50
     defaults:
       run:
@@ -129,7 +130,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-24.04
-    # It took 17 seconds, uploading 118 MB.
+    # It took 12 to 17 seconds, uploading 118 MB, in the same runs.
     timeout-minutes: 5
     permissions:
       contents: write
