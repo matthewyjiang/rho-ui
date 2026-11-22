@@ -16,31 +16,55 @@ rho-ui is a window onto the [rho](https://matthewyjiang.github.io/rho/) daemon. 
 
 ### From a release
 
-Each [release](https://github.com/matthewyjiang/rho-ui/releases) has a build for each OS. None is signed yet, so each OS asks once whether to trust it.
+Each [release](https://github.com/matthewyjiang/rho-ui/releases) has a build for Linux (x86_64, glibc 2.39 or later, as in Ubuntu 24.04 or Debian 13), macOS (Apple silicon) and Windows (x86_64). The install script downloads the latest one for your OS, checks it against the release's `SHA256SUMS`, and installs it. Run it again to update.
 
-**Linux** (x86_64, glibc 2.39 or later, as in Ubuntu 24.04 or Debian 13): unpack the tarball and put `rho-ui` in `~/.local/bin`, then [add it to your app menu](#add-it-to-your-linux-app-menu) from the same folder:
-
-```bash
-tar -xzf rho-ui-*-x86_64-linux.tar.gz
-cd rho-ui-*-x86_64-linux
-install -Dm755 rho-ui ~/.local/bin/rho-ui
-```
-
-It links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every Linux desktop has; a server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)).
-
-**macOS** (Apple silicon): unzip it and move `Rho.app` to Applications. The first time you open it, macOS says it can't verify the app. Click **Done**, then open **System Settings → Privacy & Security**, click **Open Anyway** beside the note that Rho was blocked, and confirm. Or, in a terminal, before opening it:
+On Linux or macOS:
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Rho.app
+curl -fsSL https://matthewyjiang.github.io/rho-ui/install.sh | sh
 ```
 
-Opened from the Finder, the app gets the system's `PATH`, not your shell's, so it finds `rho` only in `~/.local/bin`, where rho's installer puts it, or in `/usr/bin` and the other folders of that `PATH`. For a `rho` elsewhere, such as Homebrew's, link it there:
+On Windows, in PowerShell:
+
+```powershell
+irm https://matthewyjiang.github.io/rho-ui/install.ps1 | iex
+```
+
+Where it puts things:
+
+- **Linux:** `rho-ui` in `~/.local/bin`, and the app menu's entry and icon in `~/.local/share`.
+- **macOS:** `Rho.app` in `/Applications` (`~/Applications` if you can't write there), with `rho-ui` linked into `~/.local/bin`. A download made with `curl` isn't quarantined, so macOS doesn't ask whether to trust the app.
+- **Windows:** `rho-ui.exe` in `%LOCALAPPDATA%\Programs\rho-ui`, added to your user `PATH`, and **Rho** in the Start menu.
+
+`RHO_UI_VERSION=0.1.0` installs that release instead of the latest, and `RHO_UI_INSTALL_DIR` picks another folder for `rho-ui`. On macOS, `RHO_UI_APP_DIR` picks another one for `Rho.app`.
+
+On Linux, `rho-ui` links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every desktop has. A server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)). The script checks that `rho-ui` starts after installing it, and says why if it doesn't.
+
+Opened from the Finder, the macOS app gets the system's `PATH`, not your shell's. It finds `rho` only in `~/.local/bin`, where rho's installer puts it, or in `/usr/bin` and the other folders of that `PATH`. For a `rho` elsewhere, such as Homebrew's, link it there:
 
 ```bash
 mkdir -p ~/.local/bin && ln -s "$(command -v rho)" ~/.local/bin/rho
 ```
 
-**Windows** (x86_64): unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click **More info**, then **Run anyway**. It opens no console window, so it shows no command-line errors.
+#### By hand
+
+None of the builds is signed yet, so each OS asks once whether to trust one downloaded from a browser.
+
+**Linux:** unpack the tarball, put `rho-ui` in `~/.local/bin`, then [add it to your app menu](#add-it-to-your-linux-app-menu) from the same folder:
+
+```bash
+tar -xzf rho-ui-x86_64-linux.tar.gz
+cd rho-ui-x86_64-linux
+install -Dm755 rho-ui ~/.local/bin/rho-ui
+```
+
+**macOS:** unzip it and move `Rho.app` to Applications. The first time you open it, macOS says it can't verify the app. Click **Done**, then open **System Settings → Privacy & Security**, click **Open Anyway** beside the note that Rho was blocked, and confirm. Or, in a terminal, before opening it:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Rho.app
+```
+
+**Windows:** unzip it and run `rho-ui.exe`. If SmartScreen says it protected your PC, click **More info**, then **Run anyway**. It opens no console window, so it shows no command-line errors.
 
 ### From source
 
@@ -55,7 +79,7 @@ cargo install --path crates/rho-ui
 
 ### Add it to your Linux app menu
 
-To launch rho-ui from your desktop's app menu, with its icon in the dock and window list, install its desktop entry and icon, from the release's folder or the checkout's `assets/`. An app launched from the menu doesn't get your shell's `PATH`, so the entry names `rho-ui` by its full path, `BIN`:
+The install script does this for you. Otherwise, to launch rho-ui from your desktop's app menu, with its icon in the dock and window list, install its desktop entry and icon, from the release's folder or the checkout's `assets/`. An app launched from the menu doesn't get your shell's `PATH`, so the entry names `rho-ui` by its full path, `BIN`:
 
 ```bash
 BIN=~/.local/bin/rho-ui   # from cargo install: BIN=~/.cargo/bin/rho-ui

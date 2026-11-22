@@ -36,8 +36,10 @@ jobs:
     defaults:
       run:
         shell: bash
+    # No version in the name, so scripts/install.sh and install.ps1 find
+    # the latest release's at releases/latest/download/NAME.
     env:
-      NAME: rho-ui-${{ github.ref_name }}-${{ matrix.platform }}
+      NAME: rho-ui-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
 
@@ -150,3 +152,29 @@ jobs:
           case "$TAG" in *-*) draft=(--draft) ;; esac
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "rho-ui $TAG" --generate-notes "${draft[@]}" -- *
+
+  # Installs the published release with the install scripts, as a user
+  # would, so a build the scripts can't install fails here. A draft's files
+  # aren't public, so only a published release is checked.
+  install:
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      RHO_UI_VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      # What a Linux without a desktop needs, as docs/guide/browser.md says.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y libxcb1 libxkbcommon0 libxkbcommon-x11-0
+      # Piped in, as the docs' `curl ... | sh` and `irm ... | iex` do.
+      - if: runner.os != 'Windows'
+        run: sh < scripts/install.sh
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: Get-Content -Raw scripts/install.ps1 | Invoke-Expression

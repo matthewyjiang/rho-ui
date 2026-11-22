@@ -27,6 +27,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The install scripts run for real only once a release is published
+      # (release.yml), so check them on each change.
+      - name: Check install.sh
+        if: runner.os == 'Linux'
+        run: shellcheck scripts/install.sh
+      - name: Check install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd\scripts\install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          $errors
+          exit $errors.Count
+
       # GPUI's system packages, Rust and Zig, and lavapipe, which the UI
       # tests render on (.github/actions/setup).
       - uses: ./.github/actions/setup

@@ -39,15 +39,19 @@ Open the URL it prints, which holds its token. `rho-ui serve`, which listens on 
 
 ## Install
 
-Download the build for your OS from the [latest release](https://github.com/matthewyjiang/rho-ui/releases/latest): a tarball for Linux (x86_64), `Rho.app` for macOS (Apple silicon), a zip for Windows (x86_64). [Getting started](https://matthewyjiang.github.io/rho-ui/guide/getting-started#from-a-release) has the steps for each, with the libraries `rho-ui serve` needs on a Linux server.
-
-None is signed yet. macOS won't open `Rho.app` the first time: click Done, then Open Anyway in System Settings → Privacy & Security, or clear its quarantine before opening it:
+On Linux (x86_64) or macOS (Apple silicon):
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Rho.app
+curl -fsSL https://matthewyjiang.github.io/rho-ui/install.sh | sh
 ```
 
-On Windows, if SmartScreen says it protected your PC, click More info, then Run anyway.
+On Windows (x86_64), in PowerShell:
+
+```powershell
+irm https://matthewyjiang.github.io/rho-ui/install.ps1 | iex
+```
+
+It installs the [latest release](https://github.com/matthewyjiang/rho-ui/releases/latest) after checking its checksum, and updates rho-ui when run again. [Getting started](https://matthewyjiang.github.io/rho-ui/guide/getting-started#from-a-release) says where each OS's install goes, how to install a release by hand, and which libraries `rho-ui serve` needs on a Linux server. None of the builds is signed yet.
 
 To build it from source instead, with Rust and Zig at the versions `mise.toml` pins (and on Linux, the system packages in GPUI Kit's [installation guide](https://gpui-kit.com/docs/installation/)):
 
