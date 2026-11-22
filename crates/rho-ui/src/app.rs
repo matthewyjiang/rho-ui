@@ -37,8 +37,8 @@ use gpui_kit::{
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs,
-    PendingUpgrade, Prompt, Session, SessionId, VersionFix, VersionMismatch,
+    Attached, Checkout, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs, PendingUpgrade,
+    Prompt, Session, SessionId, SessionOptions, VersionFix, VersionMismatch,
 };
 
 mod daemon_control;
@@ -1076,8 +1076,8 @@ impl RhoApp {
                             cx,
                         );
                     }
-                    DraftEvent::StartInWorktree { config, prompt } => {
-                        this.start_in_worktree(draft, config.clone(), prompt.clone(), window, cx);
+                    DraftEvent::StartInWorktree { options, prompt } => {
+                        this.start_in_worktree(draft, options.clone(), prompt.clone(), window, cx);
                     }
                     DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
                 },
@@ -1323,14 +1323,14 @@ impl RhoApp {
 
     /// Starts `draft`'s first message, `prompt`, in a session in a new
     /// worktree of the draft's directory: opens it, which adds the
-    /// worktree, gives it `config`, the draft session's settings, follows
+    /// worktree, gives it `options`, the draft session's settings, follows
     /// it, then shows it and sends `prompt`. Until then the draft stays, with
     /// its own session, so a failure leaves it as it was, and only a
     /// session that starts makes a worktree.
     fn start_in_worktree(
         &mut self,
         draft: &Entity<DraftView>,
-        config: Vec<ConfigOption>,
+        options: Option<SessionOptions>,
         prompt: Prompt,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -1347,12 +1347,18 @@ impl RhoApp {
                 let mut session = Session::from_setup(setup);
                 // Nothing follows the session yet, so its events about these
                 // changes go nowhere; the answers carry the settings.
-                let options = daemon
-                    .match_config(session.id(), &config, session.config().to_vec())
-                    .await;
-                let attached = match options {
+                let matched = match (options, session.options().cloned()) {
+                    (Some(wanted), Some(current)) => daemon
+                        .match_options(session.id(), &wanted, current)
+                        .await
+                        .map(Some),
+                    _ => Ok(None),
+                };
+                let attached = match matched {
                     Ok(options) => {
-                        session.set_config(options);
+                        if let Some(options) = options {
+                            session.set_options(options);
+                        }
                         daemon.attach(session.id(), None).await
                     }
                     Err(error) => Err(error),

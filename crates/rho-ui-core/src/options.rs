@@ -1,160 +1,371 @@
-//! A session's settings as the UI shows them: generic options built from the
-//! daemon's `SessionOptions`, and the change a pick turns back into.
+//! A session's typed settings built from the daemon's `SessionOptions`, and
+//! the typed changes sent back with [`crate::Daemon::set_option`].
 
-use rho_protocol::{
-    ModelRef, PermissionMode, ReasoningLevel, SessionChange, SessionCommand, SessionOptions,
-};
+use std::fmt;
 
-const MODE_ID: &str = "mode";
-const MODEL_ID: &str = "model";
-const REASONING_ID: &str = "thought_level";
-/// The ID of the fast mode toggle, so a host can give it its own control.
-pub const FAST_MODE_ID: &str = "fast_mode";
+use rho_protocol::SessionCommand;
 
-/// Every permission mode this UI can show: its wire value and its label.
-const MODES: [(PermissionMode, &str, &str); 5] = [
-    (PermissionMode::Bypass, "bypass", "Bypass"),
-    (PermissionMode::Auto, "auto", "Auto"),
-    (PermissionMode::AllowEdits, "allow_edits", "Allow edits"),
-    (PermissionMode::Plan, "plan", "Plan"),
-    (PermissionMode::Supervised, "supervised", "Supervised"),
-];
-
-/// Every reasoning level this UI can show: its wire value and its label.
-const REASONING_LEVELS: [(ReasoningLevel, &str, &str); 7] = [
-    (ReasoningLevel::Off, "off", "Off"),
-    (ReasoningLevel::Minimal, "minimal", "Minimal"),
-    (ReasoningLevel::Low, "low", "Low"),
-    (ReasoningLevel::Medium, "medium", "Medium"),
-    (ReasoningLevel::High, "high", "High"),
-    (ReasoningLevel::Xhigh, "xhigh", "Extra high"),
-    (ReasoningLevel::Max, "max", "Max"),
-];
-
-/// A value to set with [`crate::Daemon::set_config`].
-#[derive(Clone, Debug, PartialEq)]
-pub enum ConfigValue {
-    /// A [`ConfigChoice::value`] for a [`ConfigKind::Select`] option.
-    Select(String),
-    /// The new state of a [`ConfigKind::Toggle`] option.
-    Toggle(bool),
+/// Which tool calls a session runs without asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PermissionMode {
+    /// Run every tool call without asking.
+    Bypass,
+    /// Decide automatically which tool calls need approval.
+    Auto,
+    /// Allow file edits without asking; ask for other tool calls.
+    AllowEdits,
+    /// Plan changes without modifying files or running side-effecting tools.
+    Plan,
+    /// Ask before tool calls that change state.
+    Supervised,
 }
 
-/// One choice in a [`ConfigKind::Select`].
+impl PermissionMode {
+    /// Label to show in controls.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bypass => "Bypass",
+            Self::Auto => "Auto",
+            Self::AllowEdits => "Allow edits",
+            Self::Plan => "Plan",
+            Self::Supervised => "Supervised",
+        }
+    }
+
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Bypass => "bypass",
+            Self::Auto => "auto",
+            Self::AllowEdits => "allow_edits",
+            Self::Plan => "plan",
+            Self::Supervised => "supervised",
+        }
+    }
+
+    pub(crate) fn from_wire(mode: rho_protocol::PermissionMode) -> Option<Self> {
+        match mode {
+            rho_protocol::PermissionMode::Bypass => Some(Self::Bypass),
+            rho_protocol::PermissionMode::Auto => Some(Self::Auto),
+            rho_protocol::PermissionMode::AllowEdits => Some(Self::AllowEdits),
+            rho_protocol::PermissionMode::Plan => Some(Self::Plan),
+            rho_protocol::PermissionMode::Supervised => Some(Self::Supervised),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn to_wire(self) -> rho_protocol::PermissionMode {
+        match self {
+            Self::Bypass => rho_protocol::PermissionMode::Bypass,
+            Self::Auto => rho_protocol::PermissionMode::Auto,
+            Self::AllowEdits => rho_protocol::PermissionMode::AllowEdits,
+            Self::Plan => rho_protocol::PermissionMode::Plan,
+            Self::Supervised => rho_protocol::PermissionMode::Supervised,
+        }
+    }
+}
+
+/// How much the model reasons on each turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReasoningLevel {
+    /// No extended reasoning.
+    Off,
+    /// Minimal reasoning budget.
+    Minimal,
+    /// Low reasoning budget.
+    Low,
+    /// Medium reasoning budget.
+    Medium,
+    /// High reasoning budget.
+    High,
+    /// Extra-high reasoning budget.
+    Xhigh,
+    /// Maximum reasoning budget.
+    Max,
+}
+
+impl ReasoningLevel {
+    /// Label to show in controls.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Minimal => "Minimal",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Xhigh => "Extra high",
+            Self::Max => "Max",
+        }
+    }
+
+    pub(crate) fn from_wire(level: rho_protocol::ReasoningLevel) -> Option<Self> {
+        match level {
+            rho_protocol::ReasoningLevel::Off => Some(Self::Off),
+            rho_protocol::ReasoningLevel::Minimal => Some(Self::Minimal),
+            rho_protocol::ReasoningLevel::Low => Some(Self::Low),
+            rho_protocol::ReasoningLevel::Medium => Some(Self::Medium),
+            rho_protocol::ReasoningLevel::High => Some(Self::High),
+            rho_protocol::ReasoningLevel::Xhigh => Some(Self::Xhigh),
+            rho_protocol::ReasoningLevel::Max => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn to_wire(self) -> rho_protocol::ReasoningLevel {
+        match self {
+            Self::Off => rho_protocol::ReasoningLevel::Off,
+            Self::Minimal => rho_protocol::ReasoningLevel::Minimal,
+            Self::Low => rho_protocol::ReasoningLevel::Low,
+            Self::Medium => rho_protocol::ReasoningLevel::Medium,
+            Self::High => rho_protocol::ReasoningLevel::High,
+            Self::Xhigh => rho_protocol::ReasoningLevel::Xhigh,
+            Self::Max => rho_protocol::ReasoningLevel::Max,
+        }
+    }
+}
+
+/// A setting with its current value and the choices the session allows.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigChoice {
-    value: String,
-    name: String,
+pub struct Choices<T> {
+    current: T,
+    available: Vec<T>,
 }
 
-impl ConfigChoice {
-    /// Pass to [`crate::Daemon::set_config`] as [`ConfigValue::Select`].
-    pub fn value(&self) -> &str {
-        &self.value
+impl<T: Copy> Choices<T> {
+    /// The value in use now.
+    pub fn current(&self) -> T {
+        self.current
     }
 
-    /// Label to show.
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Every choice the session allows, in the daemon's order.
+    pub fn available(&self) -> &[T] {
+        &self.available
     }
 }
 
-/// The shape of a [`ConfigOption`] and its current value.
+/// One model a session can run on, named by its provider and model ID.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ModelRef {
+    provider: String,
+    model: String,
+}
+
+impl ModelRef {
+    /// Names a model by its provider ID and the provider's model ID.
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    /// The provider ID, such as `anthropic`.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The model ID within its provider.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn from_wire(model: &rho_protocol::ModelRef) -> Self {
+        Self {
+            provider: model.provider.clone(),
+            model: model.model.clone(),
+        }
+    }
+
+    fn into_wire(self) -> rho_protocol::ModelRef {
+        rho_protocol::ModelRef {
+            provider: self.provider,
+            model: self.model,
+        }
+    }
+}
+
+impl fmt::Display for ModelRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.provider, self.model)
+    }
+}
+
+/// One model a session can switch to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConfigKind {
-    /// Pick one of several values.
-    Select {
-        /// The selected [`ConfigChoice::value`].
-        current: String,
-        /// Every choice, in the daemon's order.
-        choices: Vec<ConfigChoice>,
-    },
-    /// On or off.
-    Toggle(bool),
+pub struct ModelChoice {
+    model: ModelRef,
+    label: String,
 }
 
-/// What a [`ConfigOption`] sets, so a host can give it its place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConfigCategory {
-    /// The permission mode: which tool calls run without asking.
-    Mode,
-    /// Which model answers.
-    Model,
-    /// How much the model reasons per turn.
-    ThoughtLevel,
-    /// A model setting with no place of its own, such as fast mode.
-    Other,
+impl ModelChoice {
+    /// The model's provider and model ID, for [`OptionChange::Model`].
+    pub fn model(&self) -> &ModelRef {
+        &self.model
+    }
+
+    /// Short display label, unique within [`ModelOptions::available`].
+    pub fn label(&self) -> &str {
+        &self.label
+    }
 }
 
-/// A per-session setting rho exposes, such as mode or model.
+/// The session's model, its billing auth profile, and the models it can
+/// switch to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigOption {
-    id: &'static str,
-    name: &'static str,
-    category: ConfigCategory,
-    kind: ConfigKind,
-    /// For the model, the auth profile it runs on.
-    auth: Option<String>,
+pub struct ModelOptions {
+    current: ModelRef,
+    auth: String,
+    available: Vec<ModelChoice>,
 }
 
-impl ConfigOption {
-    /// Stable ID: `mode`, `model`, `thought_level`, or [`FAST_MODE_ID`].
-    pub fn id(&self) -> &str {
-        self.id
+impl ModelOptions {
+    /// The model answering turns now.
+    pub fn current(&self) -> &ModelRef {
+        &self.current
     }
 
-    /// Label to show, such as "Model".
-    pub fn name(&self) -> &str {
-        self.name
+    /// The entry in [`Self::available`] matching [`Self::current`].
+    pub fn current_choice(&self) -> Option<&ModelChoice> {
+        self.available
+            .iter()
+            .find(|choice| choice.model == self.current)
     }
 
-    /// What it sets.
-    pub fn category(&self) -> ConfigCategory {
-        self.category
+    /// The auth profile [`Self::current`] runs on, such as `openai-codex`,
+    /// which names how its use is billed.
+    pub fn auth(&self) -> &str {
+        &self.auth
     }
 
-    /// Its shape and current value.
-    pub fn kind(&self) -> &ConfigKind {
-        &self.kind
+    /// Every model the session can switch to, favorites first.
+    pub fn available(&self) -> &[ModelChoice] {
+        &self.available
+    }
+}
+
+/// A session's configurable settings: permission mode, model, reasoning, and
+/// fast mode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionOptions {
+    permission_mode: Option<Choices<PermissionMode>>,
+    model: ModelOptions,
+    reasoning: Option<Choices<ReasoningLevel>>,
+    fast_mode: Option<bool>,
+}
+
+impl SessionOptions {
+    /// The permission mode and the modes the session allows, or `None` when
+    /// the current mode is one a newer daemon added.
+    pub fn permission_mode(&self) -> Option<&Choices<PermissionMode>> {
+        self.permission_mode.as_ref()
     }
 
-    /// For the model, the auth profile the current model runs on, such as
-    /// `openai-codex`, which names how its use is billed; `None` for the
-    /// other options.
-    pub fn auth(&self) -> Option<&str> {
-        self.auth.as_deref()
+    /// The current model, its billing auth profile, and the models on offer.
+    pub fn model(&self) -> &ModelOptions {
+        &self.model
     }
 
-    /// The choice a [`ConfigKind::Select`] has selected.
-    pub fn current_choice(&self) -> Option<&ConfigChoice> {
-        match &self.kind {
-            ConfigKind::Select { current, choices } => {
-                choices.iter().find(|choice| choice.value == *current)
+    /// The reasoning level and the levels the current model allows, or `None`
+    /// when the model has no configurable reasoning (or uses a level a newer
+    /// daemon added).
+    pub fn reasoning(&self) -> Option<&Choices<ReasoningLevel>> {
+        self.reasoning.as_ref()
+    }
+
+    /// Fast mode's current state, or `None` when the current model has none.
+    pub fn fast_mode(&self) -> Option<bool> {
+        self.fast_mode
+    }
+
+    /// Shows `change` in place, before the daemon confirms it. A change for a
+    /// setting this session does not offer leaves it as it was.
+    pub fn apply_change(&mut self, change: &OptionChange) {
+        match change {
+            OptionChange::PermissionMode(mode) => {
+                if let Some(modes) = &mut self.permission_mode {
+                    modes.current = *mode;
+                }
             }
-            ConfigKind::Toggle(_) => None,
-        }
-    }
-
-    /// What it is set to, as [`crate::Daemon::set_config`] takes it.
-    pub fn value(&self) -> ConfigValue {
-        match &self.kind {
-            ConfigKind::Select { current, .. } => ConfigValue::Select(current.clone()),
-            ConfigKind::Toggle(on) => ConfigValue::Toggle(*on),
-        }
-    }
-
-    /// This option holding `value`, to show a change before the daemon
-    /// confirms it. A value of the other kind changes nothing.
-    #[must_use]
-    pub fn with_value(mut self, value: &ConfigValue) -> Self {
-        match (&mut self.kind, value) {
-            (ConfigKind::Select { current, .. }, ConfigValue::Select(value)) => {
-                current.clone_from(value);
+            OptionChange::Model(model) => {
+                self.model.current.clone_from(model);
             }
-            (ConfigKind::Toggle(on), ConfigValue::Toggle(value)) => *on = *value,
-            _ => {}
+            OptionChange::Reasoning(level) => {
+                if let Some(reasoning) = &mut self.reasoning {
+                    reasoning.current = *level;
+                }
+            }
+            OptionChange::FastMode(enabled) => {
+                if let Some(fast) = &mut self.fast_mode {
+                    *fast = *enabled;
+                }
+            }
         }
-        self
+    }
+
+    pub(crate) fn from_wire(options: &rho_protocol::SessionOptions) -> Self {
+        let permission_mode = choices(
+            options.permission_mode.current,
+            &options.permission_mode.available,
+            PermissionMode::from_wire,
+        );
+        let model = ModelOptions {
+            current: ModelRef::from_wire(&options.model.current),
+            auth: options.model.auth.clone(),
+            available: options
+                .model
+                .available
+                .iter()
+                .map(|choice| ModelChoice {
+                    model: ModelRef::from_wire(&choice.model),
+                    label: choice.label.clone(),
+                })
+                .collect(),
+        };
+        let reasoning = options.reasoning.as_ref().and_then(|reasoning| {
+            choices(
+                reasoning.current,
+                &reasoning.available,
+                ReasoningLevel::from_wire,
+            )
+        });
+        let fast_mode = options.fast_mode.as_ref().map(|fast| fast.enabled);
+        Self {
+            permission_mode,
+            model,
+            reasoning,
+            fast_mode,
+        }
+    }
+}
+
+/// One change to a session's settings, sent with [`crate::Daemon::set_option`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OptionChange {
+    /// Gate later turns' tool calls with this mode.
+    PermissionMode(PermissionMode),
+    /// Switch the session's model.
+    Model(ModelRef),
+    /// Spend this much reasoning on later turns.
+    Reasoning(ReasoningLevel),
+    /// Turn fast mode on or off.
+    FastMode(bool),
+}
+
+impl OptionChange {
+    pub(crate) fn into_wire(self) -> rho_protocol::SessionChange {
+        match self {
+            Self::PermissionMode(mode) => rho_protocol::SessionChange::PermissionMode {
+                mode: mode.to_wire(),
+            },
+            Self::Model(model) => rho_protocol::SessionChange::Model {
+                model: model.into_wire(),
+                auth: None,
+                setup: false,
+            },
+            Self::Reasoning(level) => rho_protocol::SessionChange::Reasoning {
+                level: level.to_wire(),
+            },
+            Self::FastMode(enabled) => rho_protocol::SessionChange::FastMode { enabled },
+        }
     }
 }
 
@@ -230,139 +441,22 @@ pub(crate) fn commands(list: Vec<SessionCommand>) -> Vec<CommandInfo> {
         .collect()
 }
 
-/// `provider/model`: how a model is named in a [`ConfigChoice::value`]. A
-/// provider id holds no `/`, so [`model_ref`] splits at the first one.
-fn model_value(model: &ModelRef) -> String {
-    format!("{}/{}", model.provider, model.model)
+/// Choices over values this UI knows. A value a newer daemon added is left
+/// out; the option itself is dropped when the current value is unknown.
+fn choices<W: Copy, T: Copy>(
+    current: W,
+    available: &[W],
+    from_wire: fn(W) -> Option<T>,
+) -> Option<Choices<T>> {
+    let current = from_wire(current)?;
+    let available = available.iter().copied().filter_map(from_wire).collect();
+    Some(Choices { current, available })
 }
 
-fn model_ref(value: &str) -> Option<ModelRef> {
-    let (provider, model) = value.split_once('/')?;
-    Some(ModelRef {
-        provider: provider.to_owned(),
-        model: model.to_owned(),
-    })
-}
-
-/// A select over the rows of `table` the daemon lists in `available`. A
-/// value this UI has no row for, such as one a newer daemon added, is left
-/// out; the option itself is dropped when the current value has none.
-fn select<T: Copy + PartialEq>(
-    id: &'static str,
-    name: &'static str,
-    category: ConfigCategory,
-    table: &[(T, &str, &str)],
-    current: T,
-    available: &[T],
-) -> Option<ConfigOption> {
-    let row = |value: T| table.iter().find(|(known, _, _)| *known == value);
-    let (_, current, _) = row(current)?;
-    let choices = available
-        .iter()
-        .filter_map(|value| row(*value))
-        .map(|(_, value, name)| ConfigChoice {
-            value: (*value).to_owned(),
-            name: (*name).to_owned(),
-        })
-        .collect();
-    Some(ConfigOption {
-        id,
-        name,
-        category,
-        kind: ConfigKind::Select {
-            current: (*current).to_owned(),
-            choices,
-        },
-        auth: None,
-    })
-}
-
-/// The settings in `options`, in the order the UI lays them out.
-pub(crate) fn config_options(options: &SessionOptions) -> Vec<ConfigOption> {
-    let mode = select(
-        MODE_ID,
-        "Mode",
-        ConfigCategory::Mode,
-        &MODES,
-        options.permission_mode.current,
-        &options.permission_mode.available,
-    );
-    let model = ConfigOption {
-        id: MODEL_ID,
-        name: "Model",
-        category: ConfigCategory::Model,
-        kind: ConfigKind::Select {
-            current: model_value(&options.model.current),
-            choices: options
-                .model
-                .available
-                .iter()
-                .map(|choice| ConfigChoice {
-                    value: model_value(&choice.model),
-                    name: choice.label.clone(),
-                })
-                .collect(),
-        },
-        auth: Some(options.model.auth.clone()),
-    };
-    let reasoning = options.reasoning.as_ref().and_then(|reasoning| {
-        select(
-            REASONING_ID,
-            "Reasoning",
-            ConfigCategory::ThoughtLevel,
-            &REASONING_LEVELS,
-            reasoning.current,
-            &reasoning.available,
-        )
-    });
-    let fast_mode = options.fast_mode.as_ref().map(|fast| ConfigOption {
-        id: FAST_MODE_ID,
-        name: "Fast mode",
-        category: ConfigCategory::Other,
-        kind: ConfigKind::Toggle(fast.enabled),
-        auth: None,
-    });
-    mode.into_iter()
-        .chain([model])
-        .chain(reasoning)
-        .chain(fast_mode)
-        .collect()
-}
-
-/// The change that sets option `config_id` to `value`, or `None` when no
-/// option of that ID takes such a value.
-pub(crate) fn change(config_id: &str, value: &ConfigValue) -> Option<SessionChange> {
-    fn known<T: Copy>(table: &[(T, &str, &str)], value: &str) -> Option<T> {
-        table
-            .iter()
-            .find(|(_, known, _)| *known == value)
-            .map(|(value, _, _)| *value)
-    }
-    match (config_id, value) {
-        (MODE_ID, ConfigValue::Select(value)) => {
-            let mode = known(&MODES, value)?;
-            Some(SessionChange::PermissionMode { mode })
-        }
-        (MODEL_ID, ConfigValue::Select(value)) => Some(SessionChange::Model {
-            model: model_ref(value)?,
-            auth: None,
-            setup: false,
-        }),
-        (REASONING_ID, ConfigValue::Select(value)) => {
-            let level = known(&REASONING_LEVELS, value)?;
-            Some(SessionChange::Reasoning { level })
-        }
-        (FAST_MODE_ID, ConfigValue::Toggle(enabled)) => {
-            Some(SessionChange::FastMode { enabled: *enabled })
-        }
-        _ => None,
-    }
-}
-
-/// The label for `mode`, for an approval that offers it.
-pub(crate) fn mode_label(mode: PermissionMode) -> Option<(&'static str, &'static str)> {
-    MODES
-        .iter()
-        .find(|(known, _, _)| *known == mode)
-        .map(|(_, value, name)| (*value, *name))
+/// The slug and label for `mode`, for a plan approval that offers it.
+pub(crate) fn mode_label(
+    mode: rho_protocol::PermissionMode,
+) -> Option<(&'static str, &'static str)> {
+    let mode = PermissionMode::from_wire(mode)?;
+    Some((mode.slug(), mode.label()))
 }

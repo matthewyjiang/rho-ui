@@ -29,7 +29,7 @@ use gpui_kit::{
     Subscription, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, ConfigOption, Daemon, DaemonError, Prompt, Session, SessionUpdate,
+    Attached, Checkout, Daemon, DaemonError, Prompt, Session, SessionOptions, SessionUpdate,
 };
 
 use crate::{
@@ -54,10 +54,10 @@ pub(crate) enum DraftEvent {
         prompt: Prompt,
     },
     /// Open a session in a new worktree of the draft's directory, give it
-    /// `config`, the draft session's settings, then show it and send
+    /// `options`, the draft session's settings, then show it and send
     /// `prompt` as its first. [`DraftView::launch_failed`] says it couldn't.
     StartInWorktree {
-        config: Vec<ConfigOption>,
+        options: Option<SessionOptions>,
         prompt: Prompt,
     },
     /// Open a session in the draft's directory: the first failed, or the
@@ -339,7 +339,7 @@ impl DraftView {
             SessionSettings::new(
                 daemon.clone(),
                 session.id().clone(),
-                session.config(),
+                session.options(),
                 window,
                 cx,
             )
@@ -391,7 +391,7 @@ impl DraftView {
             ) => {
                 session.attached(attached);
                 settings.update(cx, |settings, cx| {
-                    settings.sync(session.config(), window, cx);
+                    settings.sync(session.options(), window, cx);
                 });
                 self.composer.update(cx, |composer, cx| {
                     composer.set_commands(session.commands(), cx);
@@ -415,7 +415,7 @@ impl DraftView {
         {
             session.apply(update);
             settings.update(cx, |settings, cx| {
-                settings.sync(session.config(), window, cx);
+                settings.sync(session.options(), window, cx);
             });
             self.composer.update(cx, |composer, cx| {
                 composer.set_commands(session.commands(), cx);
@@ -434,7 +434,7 @@ impl DraftView {
             SettingsEvent::Changed(options) => {
                 self.error = None;
                 if let SessionState::Open { session, .. } = &mut self.state {
-                    session.set_config(options.clone());
+                    session.set_options(options.clone());
                 }
             }
             SettingsEvent::Failed(message) => self.error = Some(message.clone()),
@@ -462,10 +462,10 @@ impl DraftView {
             // worktree's session takes over.
             (state @ SessionState::Open { .. }, Checkout::NewWorktree) => {
                 if let SessionState::Open { session, .. } = &state {
-                    let config = session.config().to_vec();
+                    let options = session.options().cloned();
                     self.launching = true;
                     self.error = None;
-                    cx.emit(DraftEvent::StartInWorktree { config, prompt });
+                    cx.emit(DraftEvent::StartInWorktree { options, prompt });
                 }
                 self.state = state;
             }
@@ -534,7 +534,7 @@ impl Render for DraftView {
         );
         if let Some(settings) = settings {
             composer = composer
-                .leading(SessionSettings::render_modes(settings, cx))
+                .leading(SessionSettings::render_mode(settings, cx))
                 .trailing(SessionSettings::render_panel_button(settings, cx));
         }
         v_flex()

@@ -1,8 +1,7 @@
 //! The session settings in the composer footer, laid out by what rho lets a
-//! session change. The mode (which tool calls run without asking) sits on the
-//! left as a menu. On the right, one button names the model and its reasoning
-//! and opens a panel: the model list with search, beside the reasoning levels
-//! and any other setting rho offers, such as fast mode.
+//! session change. The permission mode sits on the left as a menu. On the
+//! right, one button names the model and its reasoning and opens a panel: the
+//! model list with search, beside the reasoning levels and fast mode.
 //!
 //! The daemon owns the values. [`SessionSettings`] sends a user change itself
 //! and tells its owner, a session or a new session's draft, what the daemon
@@ -24,13 +23,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    rems, Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _,
-    IntoElement, ParentElement as _, SharedString, Styled as _, Subscription, Task, WeakEntity,
-    Window,
+    rems, Anchor, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, IntoElement,
+    ParentElement as _, SharedString, Styled as _, Subscription, Task, WeakEntity, Window,
 };
 use rho_ui_core::{
-    ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue, Daemon, SessionId,
-    FAST_MODE_ID,
+    Choices, Daemon, ModelChoice, ModelRef, OptionChange, PermissionMode, ReasoningLevel,
+    SessionId, SessionOptions,
 };
 
 use crate::session_list::contains_ignore_case;
@@ -46,7 +44,7 @@ pub(crate) enum Availability {
 /// What the daemon answered to a change.
 pub(crate) enum SettingsEvent {
     /// The daemon took it; these are all the options now.
-    Changed(Vec<ConfigOption>),
+    Changed(SessionOptions),
     /// The daemon refused it, in these words; the controls show the old
     /// values again.
     Failed(String),
@@ -59,23 +57,22 @@ pub(crate) struct SessionSettings {
     /// Whether the owner lets the user change settings: not until a saved
     /// session's attach has answered.
     allowed: Availability,
-    /// `set_config` calls in flight. Controls wait for the answer.
+    /// `set_option` calls in flight. Controls wait for the answer.
     pending: usize,
     /// The options as the daemon last sent them.
-    synced: Vec<ConfigOption>,
+    synced: Option<SessionOptions>,
     /// What the controls show: `synced` plus a change on its way.
-    shown: Vec<ConfigOption>,
-    /// The list for the first model option, kept so its search and scroll
-    /// survive a value update.
+    shown: Option<SessionOptions>,
+    /// The model picker list, kept so its search and scroll survive a value
+    /// update.
     models: Option<ModelPicker>,
     /// Whether the settings panel is open.
     open: bool,
 }
 
 struct ModelPicker {
-    config_id: String,
     /// The choices `list` was built from, to tell when to rebuild it.
-    choices: Vec<ConfigChoice>,
+    choices: Vec<ModelChoice>,
     list: Entity<ListState<ModelList>>,
     _subscription: Subscription,
 }
@@ -86,7 +83,7 @@ impl SessionSettings {
     pub(crate) fn new(
         daemon: Daemon,
         session: SessionId,
-        options: &[ConfigOption],
+        options: Option<&SessionOptions>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -95,8 +92,8 @@ impl SessionSettings {
             session,
             allowed: Availability::Enabled,
             pending: 0,
-            synced: Vec::new(),
-            shown: Vec::new(),
+            synced: None,
+            shown: None,
             models: None,
             open: false,
         };
@@ -129,80 +126,67 @@ impl SessionSettings {
     /// requested. Does nothing if they already do.
     pub(crate) fn sync(
         &mut self,
-        options: &[ConfigOption],
+        options: Option<&SessionOptions>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.synced == options && self.shown == options {
+        if self.synced.as_ref() == options && self.shown.as_ref() == options {
             return;
         }
         cx.notify();
-        self.synced = options.to_vec();
-        self.shown = options.to_vec();
-        let model = options
-            .iter()
-            .find(|option| option.category() == ConfigCategory::Model);
-        let Some((option, current, choices)) = model.and_then(|option| match option.kind() {
-            ConfigKind::Select { current, choices } => Some((option, current, choices)),
-            ConfigKind::Toggle(_) => None,
-        }) else {
+        self.synced = options.cloned();
+        self.shown = options.cloned();
+        let Some(options) = options else {
             self.models = None;
             return;
         };
+        let model = options.model();
         match &self.models {
-            Some(picker) if picker.config_id == option.id() && picker.choices == *choices => {
-                set_current_model(&picker.list, current, window, cx);
+            Some(picker) if picker.choices == model.available() => {
+                set_current_model(&picker.list, model.current(), window, cx);
             }
             _ => {
-                self.models = Some(new_model_picker(option.id(), current, choices, window, cx));
+                self.models = Some(new_model_picker(
+                    model.current(),
+                    model.available(),
+                    window,
+                    cx,
+                ));
             }
         }
     }
 
     /// Sends a change. Until the daemon answers, the controls show it and
     /// take no other.
-    fn request(
-        &mut self,
-        id: String,
-        value: ConfigValue,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
+    fn request(&mut self, change: OptionChange, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.availability() == Availability::Disabled {
             return;
         }
-        if let Some(option) = self.shown.iter_mut().find(|option| option.id() == id) {
-            *option = option.clone().with_value(&value);
+        if let Some(shown) = &mut self.shown {
+            shown.apply_change(&change);
         }
-        if let (Some(picker), ConfigValue::Select(value)) = (&self.models, &value) {
-            if picker.config_id == id {
-                set_current_model(&picker.list, value, window, cx);
-            }
+        if let (Some(picker), OptionChange::Model(model)) = (&self.models, &change) {
+            set_current_model(&picker.list, model, window, cx);
         }
         self.pending += 1;
         cx.notify();
 
         let daemon = self.daemon.clone();
         let session = self.session.clone();
+        let name = setting_name(&change);
         cx.spawn_in(window, async move |this, cx| {
-            let result = daemon.set_config(&session, &id, value).await;
+            let result = daemon.set_option(&session, change).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.pending -= 1;
                 match result {
                     Ok(options) => {
-                        this.sync(&options, window, cx);
+                        this.sync(Some(&options), window, cx);
                         cx.emit(SettingsEvent::Changed(options));
                     }
                     Err(error) => {
-                        let name = this
-                            .synced
-                            .iter()
-                            .find(|option| option.id() == id)
-                            .map_or(id.as_str(), ConfigOption::name)
-                            .to_lowercase();
                         // Put back what the daemon still has.
-                        let synced = std::mem::take(&mut this.synced);
-                        this.sync(&synced, window, cx);
+                        let synced = this.synced.take();
+                        this.sync(synced.as_ref(), window, cx);
                         cx.emit(SettingsEvent::Failed(format!(
                             "Couldn't change {name}: {error}"
                         )));
@@ -227,33 +211,30 @@ impl SessionSettings {
         }
     }
 
-    /// One menu per mode option, for the left of the composer footer.
-    pub(crate) fn render_modes(this: &Entity<Self>, cx: &App) -> impl IntoElement {
+    /// The permission mode menu, for the left of the composer footer.
+    pub(crate) fn render_mode(this: &Entity<Self>, cx: &App) -> impl IntoElement {
         let settings = this.read(cx);
         let availability = settings.availability();
         let weak = this.downgrade();
         h_flex().gap_1().children(
             settings
                 .shown
-                .iter()
-                .filter(|option| option.category() == ConfigCategory::Mode)
-                .filter_map(|option| mode_menu(option, availability, &weak, cx)),
+                .as_ref()
+                .and_then(SessionOptions::permission_mode)
+                .map(|modes| mode_menu(modes, availability, &weak, cx)),
         )
     }
 
     /// The button that names the model and opens the settings panel, for the
-    /// right of the composer footer. Nothing when the agent offers nothing
-    /// but modes.
+    /// right of the composer footer. Nothing until the session's options
+    /// arrive.
     pub(crate) fn render_panel_button(this: &Entity<Self>, cx: &App) -> Option<impl IntoElement> {
         let settings = this.read(cx);
-        let panel = settings.panel_options();
-        if settings.models.is_none() && panel.is_empty() {
-            return None;
-        }
-        let weak = this.downgrade();
-        let list = settings.models.as_ref().map(|picker| picker.list.clone());
-        let focus = list.as_ref().map(|list| list.focus_handle(cx));
+        let options = settings.shown.clone()?;
+        let list = settings.models.as_ref()?.list.clone();
+        let focus = list.focus_handle(cx);
         let availability = settings.availability();
+        let weak = this.downgrade();
         let close = weak.clone();
         Some(
             Popover::new("settings-panel")
@@ -265,70 +246,56 @@ impl SessionSettings {
                         cx.notify();
                     });
                 })
-                .when_some(focus, |this, focus| this.track_focus(&focus))
+                .track_focus(&focus)
                 .trigger(
                     Button::new("config-panel")
                         .custom(footer_button(cx))
                         .small()
-                        .when(settings.is_fast(), |this| {
+                        .when(options.fast_mode() == Some(true), |this| {
                             this.icon(Lucide::Zap).tooltip("Fast mode")
                         })
-                        .label(settings.summary())
+                        .label(summary(&options))
                         .dropdown_caret(true)
                         .disabled(availability == Availability::Disabled),
                 )
-                .content(move |_, _, cx| {
-                    render_panel(list.as_ref(), &panel, availability, &weak, cx)
-                }),
+                .content(move |_, _, cx| render_panel(&list, &options, availability, &weak, cx)),
         )
     }
+}
 
-    /// The options the panel shows beside the model list.
-    fn panel_options(&self) -> Vec<ConfigOption> {
-        let model_id = self.models.as_ref().map(|picker| picker.config_id.as_str());
-        self.shown
-            .iter()
-            .filter(|option| {
-                option.category() != ConfigCategory::Mode && Some(option.id()) != model_id
-            })
-            .cloned()
-            .collect()
+/// "Claude Opus 5.5 · High": the model and its reasoning level. Fast mode is
+/// the button's icon instead.
+fn summary(options: &SessionOptions) -> SharedString {
+    let model = options.model().current_choice().map(ModelChoice::label);
+    let reasoning = options
+        .reasoning()
+        .map(|reasoning| reasoning.current().label());
+    let parts: Vec<&str> = model.into_iter().chain(reasoning).collect();
+    if parts.is_empty() {
+        "Settings".into()
+    } else {
+        parts.join(" · ").into()
     }
+}
 
-    /// Whether rho's fast mode is on.
-    fn is_fast(&self) -> bool {
-        self.shown.iter().any(|option| {
-            option.id() == FAST_MODE_ID && matches!(option.kind(), ConfigKind::Toggle(true))
-        })
+fn setting_name(change: &OptionChange) -> &'static str {
+    match change {
+        OptionChange::PermissionMode(_) => "mode",
+        OptionChange::Model(_) => "model",
+        OptionChange::Reasoning(_) => "reasoning",
+        OptionChange::FastMode(_) => "fast mode",
     }
+}
 
-    /// "Claude Opus 5.5 · High": the model, its reasoning, and any other
-    /// setting that is switched on. Fast mode is the button's icon instead.
-    fn summary(&self) -> SharedString {
-        let model = self
-            .shown
-            .iter()
-            .find(|option| option.category() == ConfigCategory::Model);
-        let thought = self
-            .shown
-            .iter()
-            .filter(|option| option.category() == ConfigCategory::ThoughtLevel);
-        let toggles = self.shown.iter().filter(|option| {
-            option.category() == ConfigCategory::Other
-                && option.id() != FAST_MODE_ID
-                && matches!(option.kind(), ConfigKind::Toggle(true))
-        });
-        let parts: Vec<&str> = model
-            .into_iter()
-            .chain(thought)
-            .filter_map(|option| option.current_choice().map(ConfigChoice::name))
-            .chain(toggles.map(ConfigOption::name))
-            .collect();
-        if parts.is_empty() {
-            "Settings".into()
-        } else {
-            parts.join(" · ").into()
-        }
+fn reasoning_id(level: ReasoningLevel) -> &'static str {
+    match level {
+        ReasoningLevel::Off => "off",
+        ReasoningLevel::Minimal => "minimal",
+        ReasoningLevel::Low => "low",
+        ReasoningLevel::Medium => "medium",
+        ReasoningLevel::High => "high",
+        ReasoningLevel::Xhigh => "xhigh",
+        ReasoningLevel::Max => "max",
     }
 }
 
@@ -344,215 +311,188 @@ fn footer_button(cx: &App) -> ButtonCustomVariant {
         .active(foreground.alpha(0.12))
 }
 
-/// A footer button naming the current mode, opening a menu of the others.
+/// A footer button naming the current permission mode, opening a menu of the
+/// others.
 fn mode_menu(
-    option: &ConfigOption,
-    availability: Availability,
-    settings: &WeakEntity<SessionSettings>,
-    cx: &App,
-) -> Option<AnyElement> {
-    let ConfigKind::Select { choices, .. } = option.kind() else {
-        return None;
-    };
-    let current = option.current_choice()?;
-    let config_id = option.id().to_owned();
-    let current_value = current.value().to_owned();
-    let choices = choices.clone();
-    let settings = settings.clone();
-    Some(
-        Button::new(SharedString::from(format!("config-{config_id}")))
-            .custom(footer_button(cx))
-            .small()
-            .icon(Lucide::Shield)
-            .label(current.name().to_owned())
-            .dropdown_caret(true)
-            .accessibility_label(option.name().to_owned())
-            .disabled(availability == Availability::Disabled)
-            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                choices.iter().fold(menu, |menu, choice| {
-                    let settings = settings.clone();
-                    let config_id = config_id.clone();
-                    let value = choice.value().to_owned();
-                    menu.item(
-                        PopupMenuItem::new(choice.name().to_owned())
-                            .checked(choice.value() == current_value)
-                            .on_click(move |_, window, cx| {
-                                let _ = settings.update(cx, |this, cx| {
-                                    this.request(
-                                        config_id.clone(),
-                                        ConfigValue::Select(value.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            }),
-                    )
-                })
-            })
-            .into_any_element(),
-    )
-}
-
-/// The panel's content: models on the left, every other setting on the right.
-fn render_panel(
-    models: Option<&Entity<ListState<ModelList>>>,
-    options: &[ConfigOption],
+    modes: &Choices<PermissionMode>,
     availability: Availability,
     settings: &WeakEntity<SessionSettings>,
     cx: &App,
 ) -> impl IntoElement {
-    h_flex()
-        .items_stretch()
-        .gap_3()
-        .when_some(models, |this, list| {
-            // Ten rows of about two rem each, under the search field.
-            this.child(
-                v_flex()
-                    .w(rems(18.))
-                    .h(rems(22.))
-                    .child(List::new(list).small().search_placeholder("Search models")),
-            )
-        })
-        .when(models.is_some() && !options.is_empty(), |this| {
-            this.child(Separator::vertical())
-        })
-        .when(!options.is_empty(), |this| {
-            this.child(
-                v_flex().w(rems(13.)).gap_2().children(
-                    options
-                        .iter()
-                        .map(|option| render_setting(option, availability, settings, cx)),
-                ),
-            )
-        })
-}
-
-/// One setting in the panel: a titled list of choices, or a switch.
-fn render_setting(
-    option: &ConfigOption,
-    availability: Availability,
-    settings: &WeakEntity<SessionSettings>,
-    cx: &App,
-) -> AnyElement {
-    let config_id = option.id().to_owned();
-    let disabled = availability == Availability::Disabled;
-    match option.kind() {
-        ConfigKind::Select { current, choices } => v_flex()
-            .child(
-                Label::new(option.name().to_owned())
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .px_3()
-                    .pb_1(),
-            )
-            .children(choices.iter().map(|choice| {
+    let current = modes.current();
+    let available = modes.available().to_vec();
+    let settings = settings.clone();
+    Button::new("config-mode")
+        .custom(footer_button(cx))
+        .small()
+        .icon(Lucide::Shield)
+        .label(current.label())
+        .dropdown_caret(true)
+        .accessibility_label("Mode")
+        .disabled(availability == Availability::Disabled)
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+            available.iter().copied().fold(menu, |menu, mode| {
                 let settings = settings.clone();
-                let config_id = config_id.clone();
-                let value = choice.value().to_owned();
-                ListItem::new(SharedString::from(format!(
-                    "config-{config_id}-{}",
-                    choice.value()
-                )))
-                .rounded(cx.theme().radius)
-                .check_icon(IconName::Check)
-                .confirmed(choice.value() == current)
-                .disabled(disabled)
-                .accessibility_label(choice.name().to_owned())
-                .child(choice.name().to_owned())
-                .on_click(move |_, window, cx| {
-                    let _ = settings.update(cx, |this, cx| {
-                        this.request(
-                            config_id.clone(),
-                            ConfigValue::Select(value.clone()),
-                            window,
-                            cx,
-                        );
-                    });
-                })
-            }))
-            .into_any_element(),
-        ConfigKind::Toggle(on) => {
-            let settings = settings.clone();
-            h_flex()
-                .px_3()
-                .py_1()
-                .justify_between()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .when(option.id() == FAST_MODE_ID, |this| {
-                            this.child(Icon::new(Lucide::Zap).small())
-                        })
-                        .child(option.name().to_owned()),
-                )
-                .child(
-                    Switch::new(SharedString::from(format!("config-{config_id}")))
-                        .small()
-                        .checked(*on)
-                        .accessibility_label(option.name().to_owned())
-                        .disabled(disabled)
-                        .on_change(move |on: &bool, window, cx| {
+                menu.item(
+                    PopupMenuItem::new(mode.label())
+                        .checked(mode == current)
+                        .on_click(move |_, window, cx| {
                             let _ = settings.update(cx, |this, cx| {
-                                this.request(
-                                    config_id.clone(),
-                                    ConfigValue::Toggle(*on),
-                                    window,
-                                    cx,
-                                );
+                                this.request(OptionChange::PermissionMode(mode), window, cx);
                             });
                         }),
                 )
-                .into_any_element()
-        }
-    }
+            })
+        })
+}
+
+/// The panel's content: models on the left, reasoning and fast mode on the
+/// right.
+fn render_panel(
+    models: &Entity<ListState<ModelList>>,
+    options: &SessionOptions,
+    availability: Availability,
+    settings: &WeakEntity<SessionSettings>,
+    cx: &App,
+) -> impl IntoElement {
+    let reasoning = options.reasoning();
+    let fast_mode = options.fast_mode();
+    let has_side = reasoning.is_some() || fast_mode.is_some();
+    let disabled = availability == Availability::Disabled;
+    h_flex()
+        .items_stretch()
+        .gap_3()
+        // Ten rows of about two rem each, under the search field.
+        .child(
+            v_flex().w(rems(18.)).h(rems(22.)).child(
+                List::new(models)
+                    .small()
+                    .search_placeholder("Search models"),
+            ),
+        )
+        .when(has_side, |this| this.child(Separator::vertical()))
+        .when(has_side, |this| {
+            this.child(
+                v_flex()
+                    .w(rems(13.))
+                    .gap_2()
+                    .when_some(reasoning, |this, reasoning| {
+                        this.child(render_reasoning(reasoning, availability, settings, cx))
+                    })
+                    .when_some(fast_mode, |this, on| {
+                        let settings = settings.clone();
+                        this.child(
+                            h_flex()
+                                .px_3()
+                                .py_1()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(Icon::new(Lucide::Zap).small())
+                                        .child("Fast mode"),
+                                )
+                                .child(
+                                    Switch::new("config-fast_mode")
+                                        .small()
+                                        .checked(on)
+                                        .accessibility_label("Fast mode")
+                                        .disabled(disabled)
+                                        .on_change(move |on: &bool, window, cx| {
+                                            let _ = settings.update(cx, |this, cx| {
+                                                this.request(
+                                                    OptionChange::FastMode(*on),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                ),
+                        )
+                    }),
+            )
+        })
+}
+
+/// The reasoning levels offered by the current model.
+fn render_reasoning(
+    reasoning: &Choices<ReasoningLevel>,
+    availability: Availability,
+    settings: &WeakEntity<SessionSettings>,
+    cx: &App,
+) -> impl IntoElement {
+    let current = reasoning.current();
+    let disabled = availability == Availability::Disabled;
+    v_flex()
+        .child(
+            Label::new("Reasoning")
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .px_3()
+                .pb_1(),
+        )
+        .children(reasoning.available().iter().copied().map(|level| {
+            let settings = settings.clone();
+            ListItem::new(SharedString::from(format!(
+                "config-reasoning-{}",
+                reasoning_id(level)
+            )))
+            .rounded(cx.theme().radius)
+            .check_icon(IconName::Check)
+            .confirmed(level == current)
+            .disabled(disabled)
+            .accessibility_label(level.label())
+            .child(level.label())
+            .on_click(move |_, window, cx| {
+                let _ = settings.update(cx, |this, cx| {
+                    this.request(OptionChange::Reasoning(level), window, cx);
+                });
+            })
+        }))
 }
 
 fn new_model_picker(
-    config_id: &str,
-    current: &str,
-    choices: &[ConfigChoice],
+    current: &ModelRef,
+    choices: &[ModelChoice],
     window: &mut Window,
     cx: &mut Context<'_, SessionSettings>,
 ) -> ModelPicker {
-    let delegate = ModelList::new(choices.to_vec(), current.to_owned());
+    let delegate = ModelList::new(choices.to_vec(), current.clone());
     let list = cx.new(|cx| ListState::new(delegate, window, cx).searchable(true));
     set_current_model(&list, current, window, cx);
-    let id = config_id.to_owned();
     let subscription = cx.subscribe_in(
         &list,
         window,
-        move |this: &mut SessionSettings, list, event: &ListEvent, window, cx| match event {
+        |this: &mut SessionSettings, list, event: &ListEvent, window, cx| match event {
             ListEvent::Confirm(ix) => {
-                let Some(value) = list.read(cx).delegate().value_at(*ix) else {
+                let Some(model) = list.read(cx).delegate().model_at(*ix).cloned() else {
                     return;
                 };
-                let value = ConfigValue::Select(value.to_owned());
                 this.close_panel(cx);
-                this.request(id.clone(), value, window, cx);
+                this.request(OptionChange::Model(model), window, cx);
             }
             ListEvent::Cancel => this.close_panel(cx),
             ListEvent::Select(_) => {}
         },
     );
     ModelPicker {
-        config_id: config_id.to_owned(),
         choices: choices.to_vec(),
         list,
         _subscription: subscription,
     }
 }
 
-/// Marks `value` as the model in use and moves the keyboard selection to it,
+/// Marks `model` as the model in use and moves the keyboard selection to it,
 /// so arrows start from there.
 fn set_current_model(
     list: &Entity<ListState<ModelList>>,
-    value: &str,
+    model: &ModelRef,
     window: &mut Window,
     cx: &mut App,
 ) {
     list.update(cx, |list, cx| {
-        value.clone_into(&mut list.delegate_mut().current);
-        let row = list.delegate().row_of(value);
+        list.delegate_mut().current.clone_from(model);
+        let row = list.delegate().row_of(model);
         list.set_selected_index(row, window, cx);
         cx.notify();
     });
@@ -560,15 +500,15 @@ fn set_current_model(
 
 /// The model choices for a searchable [`List`].
 struct ModelList {
-    choices: Vec<ConfigChoice>,
+    choices: Vec<ModelChoice>,
     /// Indices into `choices` that match the search, in order.
     matches: Vec<usize>,
-    /// The value of the model in use.
-    current: String,
+    /// The model in use.
+    current: ModelRef,
 }
 
 impl ModelList {
-    fn new(choices: Vec<ConfigChoice>, current: String) -> Self {
+    fn new(choices: Vec<ModelChoice>, current: ModelRef) -> Self {
         Self {
             matches: (0..choices.len()).collect(),
             choices,
@@ -576,19 +516,19 @@ impl ModelList {
         }
     }
 
-    fn choice_at(&self, ix: IndexPath) -> Option<&ConfigChoice> {
+    fn choice_at(&self, ix: IndexPath) -> Option<&ModelChoice> {
         self.choices.get(*self.matches.get(ix.row)?)
     }
 
-    fn value_at(&self, ix: IndexPath) -> Option<&str> {
-        self.choice_at(ix).map(ConfigChoice::value)
+    fn model_at(&self, ix: IndexPath) -> Option<&ModelRef> {
+        self.choice_at(ix).map(ModelChoice::model)
     }
 
-    /// Where `value` is among the matches.
-    fn row_of(&self, value: &str) -> Option<IndexPath> {
+    /// Where `model` is among the matches.
+    fn row_of(&self, model: &ModelRef) -> Option<IndexPath> {
         self.matches
             .iter()
-            .position(|&ix| self.choices[ix].value() == value)
+            .position(|&ix| self.choices[ix].model() == model)
             .map(|row| IndexPath::default().row(row))
     }
 }
@@ -596,7 +536,7 @@ impl ModelList {
 impl ListDelegate for ModelList {
     type Item = ListItem;
 
-    /// Matches the label or the value, which for rho is `provider/model`.
+    /// Matches the label or `provider/model`.
     fn perform_search(
         &mut self,
         query: &str,
@@ -608,8 +548,8 @@ impl ListDelegate for ModelList {
             .iter()
             .enumerate()
             .filter(|(_, choice)| {
-                contains_ignore_case(choice.name(), query)
-                    || contains_ignore_case(choice.value(), query)
+                contains_ignore_case(choice.label(), query)
+                    || contains_ignore_case(&choice.model().to_string(), query)
             })
             .map(|(ix, _)| ix)
             .collect();
@@ -628,12 +568,12 @@ impl ListDelegate for ModelList {
     ) -> Option<ListItem> {
         let choice = self.choice_at(ix)?;
         Some(
-            ListItem::new(SharedString::from(format!("model-{}", choice.value())))
+            ListItem::new(SharedString::from(format!("model-{}", choice.model())))
                 .rounded(cx.theme().radius)
                 .check_icon(IconName::Check)
-                .confirmed(choice.value() == self.current)
-                .accessibility_label(choice.name().to_owned())
-                .child(Label::new(choice.name().to_owned()).truncate()),
+                .confirmed(choice.model() == &self.current)
+                .accessibility_label(choice.label().to_owned())
+                .child(Label::new(choice.label().to_owned()).truncate()),
         )
     }
 

@@ -13,9 +13,9 @@ use rho_ui_core::{
     },
     surface::{Node, SurfaceStore},
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
-    BackgroundWork, Checkout, ChoiceKind, ConfigOption, ConfigValue, Continuity, Daemon,
-    DaemonError, DaemonEvent, DaemonEvents, DaemonTarget, Detached, Entry, Form, Image,
-    ImageFormat, JobActivity, LoginOutcome, Prompt, PromptKey, RestartCost, RunState, Session,
+    BackgroundWork, Checkout, ChoiceKind, Choices, Continuity, Daemon, DaemonError, DaemonEvent,
+    DaemonEvents, DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity,
+    LoginOutcome, OptionChange, PermissionMode, Prompt, PromptKey, RestartCost, RunState, Session,
     SessionId, SurfaceActionError, ToolStatus, Unsteered, VersionFix, WorktreeVerdict,
     MAX_PROMPT_ATTACHMENT_BYTES,
 };
@@ -365,14 +365,11 @@ fn a_session_takes_another_sessions_settings() {
     block_on(async {
         let (daemon, _events) = connect(&fake).await;
         let draft = new_session(&daemon).await;
-        let mode = |config: &[ConfigOption]| {
-            config
-                .iter()
-                .find(|option| option.id() == "mode")
-                .map(ConfigOption::value)
-        };
         let planned = daemon
-            .set_config(draft.id(), "mode", ConfigValue::Select("plan".into()))
+            .set_option(
+                draft.id(),
+                OptionChange::PermissionMode(PermissionMode::Plan),
+            )
             .await
             .expect("the fake takes plan mode");
         let setup = daemon
@@ -394,9 +391,13 @@ fn a_session_takes_another_sessions_settings() {
             worktree.path(),
             "it works in its worktree"
         );
-        assert_ne!(mode(other.config()), mode(&planned));
+        let initial = other.options().expect("a new session has options").clone();
+        assert_ne!(
+            initial.permission_mode().map(Choices::current),
+            planned.permission_mode().map(Choices::current)
+        );
         let matched = daemon
-            .match_config(other.id(), &planned, other.config().to_vec())
+            .match_options(other.id(), &planned, initial)
             .await
             .expect("the fake takes the settings");
         assert_eq!(matched, planned);

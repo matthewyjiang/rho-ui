@@ -31,9 +31,9 @@ use rho_ui_core::{
         report, subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
         REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
-    Attachment, BackgroundKind, BackgroundStatus, Checkout, ConfigKind, Daemon, DaemonTarget,
-    Delay, Entry, PromptKey, RestartCost, RetryReason, RhoInstall, RunState, Session, SessionId,
-    ToolStatus, WorktreeVerdict,
+    Attachment, BackgroundKind, BackgroundStatus, Checkout, Choices, Daemon, DaemonTarget, Delay,
+    Entry, ModelRef, PermissionMode, PromptKey, ReasoningLevel, RestartCost, RetryReason,
+    RhoInstall, RunState, Session, SessionId, SessionOptions, ToolStatus, WorktreeVerdict,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -1235,16 +1235,11 @@ fn a_code_block_copies_in_one_click() {
     );
 }
 
-/// The current value of setting `id` on the active session.
-fn setting(session: &Session, id: &str) -> Option<String> {
+fn permission_mode(session: &Session) -> Option<PermissionMode> {
     session
-        .config()
-        .iter()
-        .find(|option| option.id() == id)
-        .map(|option| match option.kind() {
-            ConfigKind::Select { current, .. } => current.clone(),
-            ConfigKind::Toggle(on) => on.to_string(),
-        })
+        .options()
+        .and_then(SessionOptions::permission_mode)
+        .map(Choices::current)
 }
 
 /// The composer's settings: the mode menu on the left, and a button naming
@@ -1265,7 +1260,7 @@ fn composer_settings_change_the_session() {
     // Arrows start at the model in use; Enter picks and closes the panel.
     ui.click("config-panel");
     ui.wait_until("the model list", |window, _, _| {
-        is_visible(window, "model-fake/large") && is_visible(window, "config-thought_level-high")
+        is_visible(window, "model-fake/large") && is_visible(window, "config-reasoning-high")
     });
     ui.shot("panel");
     ui.act(|window, cx| {
@@ -1273,7 +1268,9 @@ fn composer_settings_change_the_session() {
         window.press("enter", cx);
     });
     ui.wait_for_session("the new model", |session| {
-        setting(session, "model").as_deref() == Some("fake/large")
+        session
+            .options()
+            .is_some_and(|options| options.model().current() == &ModelRef::new("fake", "large"))
     });
     ui.wait_until("the panel to close", |window, _, _| {
         !is_visible(window, "model-fake/large")
@@ -1290,17 +1287,23 @@ fn composer_settings_change_the_session() {
     });
     ui.act(|window, cx| window.press("enter", cx));
     ui.wait_for_session("the searched model", |session| {
-        setting(session, "model").as_deref() == Some("fake/huge")
+        session
+            .options()
+            .is_some_and(|options| options.model().current() == &ModelRef::new("fake", "huge"))
     });
 
     // Reasoning and fast mode change in place; the panel stays open.
     ui.click("config-panel");
     ui.wait_until("the reasoning levels", |window, _, _| {
-        is_visible(window, "config-thought_level-high")
+        is_visible(window, "config-reasoning-high")
     });
-    ui.click("config-thought_level-high");
+    ui.click("config-reasoning-high");
     ui.wait_for_session("high reasoning", |session| {
-        setting(session, "thought_level").as_deref() == Some("high")
+        session
+            .options()
+            .and_then(SessionOptions::reasoning)
+            .map(Choices::current)
+            == Some(ReasoningLevel::High)
     });
     ui.wait_until("fast mode, enabled again", |window, _, _| {
         window
@@ -1309,18 +1312,18 @@ fn composer_settings_change_the_session() {
     });
     ui.click("config-fast_mode");
     ui.wait_for_session("fast mode", |session| {
-        setting(session, "fast_mode").as_deref() == Some("true")
+        session.options().and_then(SessionOptions::fast_mode) == Some(true)
     });
     ui.act(|window, cx| window.press("escape", cx));
     ui.wait_until("the panel to close", |window, _, _| {
-        !is_visible(window, "config-thought_level-high")
+        !is_visible(window, "config-reasoning-high")
     });
 
     // The mode menu opens above its button.
     ui.click("config-mode");
     click_label(&mut ui, "Plan");
     ui.wait_for_session("plan mode", |session| {
-        setting(session, "mode").as_deref() == Some("plan")
+        permission_mode(session) == Some(PermissionMode::Plan)
     });
     ui.shot("changed");
 }
@@ -5835,16 +5838,15 @@ fn a_new_session_can_work_in_a_new_worktree() {
     click_label(&mut ui, "Plan");
     ui.wait_until("Plan mode in the draft", |_, cx, app| {
         app.draft()
-            .and_then(|draft| draft.read(cx).session().and_then(|s| setting(s, "mode")))
-            .as_deref()
-            == Some("plan")
+            .and_then(|draft| draft.read(cx).session().and_then(permission_mode))
+            == Some(PermissionMode::Plan)
     });
     ui.send("list files");
     ui.wait_until("the session in its worktree, in Plan mode", |_, cx, app| {
         app.active_session().is_some_and(|view| {
             let view = view.read(cx);
             let cwd = view.live().cwd;
-            let plan = setting(view.session(), "mode").as_deref() == Some("plan");
+            let plan = permission_mode(view.session()) == Some(PermissionMode::Plan);
             cwd.parent() == Some(Path::new("/rho/worktrees"))
                 && cwd
                     .file_name()
