@@ -62,9 +62,9 @@ runs:
     # and fetches its packages, 70 to 100 s of the network a run. A tag's
     # run restores what main's CI saved, as caches go.
     #
-    # The key is libghostty-rs's rev in Cargo.lock, which pins the Ghostty
-    # commit, so a new rev fetches anew. With GHOSTTY_SOURCE_DIR set the
-    # build script doesn't check the commit itself.
+    # The key names libghostty-rs's rev in Cargo.lock, which pins the
+    # Ghostty commit, so a new rev fetches anew: with GHOSTTY_SOURCE_DIR
+    # set, the build script doesn't check the commit itself.
     - name: Find the Ghostty that libghostty-vt builds
       id: ghostty
       shell: bash
@@ -82,7 +82,8 @@ runs:
       uses: actions/cache/restore@v6
       with:
         path: ${{ steps.ghostty.outputs.dir }}
-        key: ghostty-${{ runner.os }}-${{ runner.arch }}-libghostty-rs-${{ steps.ghostty.outputs.rev }}-zig-${{ steps.ghostty.outputs.zig }}
+        # This file's hash too, so a change to how it fetches fetches anew.
+        key: ghostty-${{ runner.os }}-${{ runner.arch }}-libghostty-rs-${{ steps.ghostty.outputs.rev }}-zig-${{ steps.ghostty.outputs.zig }}-${{ hashFiles('.github/actions/setup/action.yml') }}
     - name: Fetch Ghostty
       if: steps.restore-ghostty.outputs.cache-hit != 'true'
       shell: bash
