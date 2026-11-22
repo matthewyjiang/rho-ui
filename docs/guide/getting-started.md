@@ -36,9 +36,19 @@ Where it puts things:
 - **macOS:** `Rho.app` in `/Applications` (`~/Applications` if you can't write there), with `rho-ui` linked into `~/.local/bin`. A download made with `curl` isn't quarantined, so macOS doesn't ask whether to trust the app.
 - **Windows:** `rho-ui.exe` in `%LOCALAPPDATA%\Programs\rho-ui`, added to your user `PATH`, and **Rho** in the Start menu.
 
-`RHO_UI_VERSION=0.1.0` installs that release instead of the latest, and `RHO_UI_INSTALL_DIR` picks another folder for `rho-ui`. On macOS, `RHO_UI_APP_DIR` picks another one for `Rho.app`.
+`RHO_UI_VERSION` installs another release than the latest, `RHO_UI_INSTALL_DIR` another folder for `rho-ui`, and on macOS, `RHO_UI_APP_DIR` another one for `Rho.app`. Set them for the shell that runs the script, not for `curl`:
 
-On Linux, `rho-ui` links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every desktop has. A server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)). The script checks that `rho-ui` starts after installing it, and says why if it doesn't.
+```bash
+curl -fsSL https://matthewyjiang.github.io/rho-ui/install.sh | RHO_UI_VERSION=0.1.0 sh
+```
+
+```powershell
+$env:RHO_UI_VERSION = "0.1.0"; irm https://matthewyjiang.github.io/rho-ui/install.ps1 | iex
+```
+
+The script checks that the new `rho-ui` starts before it replaces anything, so a build that can't run on your system leaves the one you had.
+
+On Linux, `rho-ui` links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every desktop has. A server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)).
 
 Opened from the Finder, the macOS app gets the system's `PATH`, not your shell's. It finds `rho` only in `~/.local/bin`, where rho's installer puts it, or in `/usr/bin` and the other folders of that `PATH`. For a `rho` elsewhere, such as Homebrew's, link it there:
 

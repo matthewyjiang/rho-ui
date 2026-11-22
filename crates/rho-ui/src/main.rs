@@ -338,6 +338,8 @@ fn main() -> std::process::ExitCode {
         Ok(launch) => launch,
         Err(message) => {
             eprintln!("{message}");
+            // scripts/install.sh and install.ps1 take 2 from `--help` to
+            // mean the binary loads.
             return std::process::ExitCode::from(2);
         }
     };

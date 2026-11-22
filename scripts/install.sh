@@ -25,7 +25,8 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
-# The release's name for this machine, as release.yml builds it.
+# Sets `target` and `asset`: this machine's names in the release, as
+# release.yml builds them.
 platform() {
   os="$(uname -s)"
   arch="$(uname -m)"
@@ -40,8 +41,8 @@ platform() {
     arch=aarch64
   fi
   case "$os-$arch" in
-    Linux-x86_64) echo x86_64-linux ;;
-    Darwin-aarch64) echo aarch64-macos ;;
+    Linux-x86_64) target=x86_64-linux asset=rho-ui-x86_64-linux.tar.gz ;;
+    Darwin-aarch64) target=aarch64-macos asset=rho-ui-aarch64-macos.zip ;;
     *) fail "no rho-ui build for $os on $arch; build it from source: $FROM_SOURCE" ;;
   esac
 }
@@ -65,21 +66,30 @@ listed_sha256() {
   done
 }
 
+# Checks that the rho-ui at $1 runs here before it replaces anything, so a
+# Linux older than the build's glibc keeps the rho-ui it had. `--help`
+# exits with 2 before any window opens (main.rs).
+check_runs() {
+  status=0
+  output="$("$1" --help 2>&1)" || status=$?
+  if [ "$status" -ne 2 ]; then
+    echo "$output" >&2
+    echo "error: this rho-ui build doesn't run here (above), so nothing was installed" >&2
+    return 1
+  fi
+}
+
 if command -v curl >/dev/null 2>&1; then
   download() { curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error "$1" --output "$2"; }
 elif command -v wget >/dev/null 2>&1; then
-  download() { wget --quiet --https-only "$1" -O "$2"; }
+  download() { wget -q "$1" -O "$2"; }
 else
   fail "required command not found: curl or wget"
 fi
 need_cmd uname
 need_cmd mktemp
 
-target="$(platform)"
-case "$target" in
-  *-linux) asset="rho-ui-$target.tar.gz" ;;
-  *-macos) asset="rho-ui-$target.zip" ;;
-esac
+platform
 url="$(release_url)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -102,14 +112,19 @@ actual="${actual%% *}"
 
 mkdir -p "$INSTALL_DIR"
 dir="$tmp/rho-ui-$target"
+bin="$INSTALL_DIR/rho-ui"
 case "$target" in
   *-linux)
     tar -xzf "$tmp/$asset" -C "$tmp"
-    bin="$INSTALL_DIR/rho-ui"
     # Into a temporary name first, then renamed over the old one, so a
-    # running rho-ui keeps its file.
+    # running rho-ui keeps its file. Checked there, not in $tmp, which may
+    # be mounted noexec.
     cp "$dir/rho-ui" "$bin.new"
     chmod 0755 "$bin.new"
+    check_runs "$bin.new" || {
+      rm -f "$bin.new"
+      exit 1
+    }
     mv -f "$bin.new" "$bin"
 
     # The app menu's entry. The menu doesn't get the shell's PATH, so it
@@ -130,22 +145,17 @@ case "$target" in
     # ditto keeps the bundle's signature intact. curl and wget mark no
     # download as quarantined, so Gatekeeper doesn't stop the first open.
     ditto -x -k "$tmp/$asset" "$tmp"
+    check_runs "$dir/Rho.app/Contents/MacOS/rho-ui" || exit 1
+    # Beside the old app first, so a failed move leaves the old one.
     mkdir -p "$apps"
+    rm -rf "$apps/.Rho.app.new"
+    mv "$dir/Rho.app" "$apps/.Rho.app.new"
     rm -rf "$apps/Rho.app"
-    mv "$dir/Rho.app" "$apps/Rho.app"
-    bin="$INSTALL_DIR/rho-ui"
+    mv "$apps/.Rho.app.new" "$apps/Rho.app"
     ln -sf "$apps/Rho.app/Contents/MacOS/rho-ui" "$bin"
     echo "Rho.app installed to $apps"
     ;;
 esac
-
-# `--help` exits before any window opens, so this checks that the binary
-# loads here: a Linux older than the build's glibc fails here, not at the
-# first launch from the menu.
-if ! check="$("$bin" --help 2>&1)" && ! printf '%s' "$check" | grep -q '^usage: rho-ui'; then
-  echo "$check" >&2
-  fail "rho-ui is installed at $bin but doesn't run here (above)"
-fi
 
 echo "rho-ui installed to $bin"
 case ":$PATH:" in

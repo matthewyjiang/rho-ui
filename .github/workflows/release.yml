@@ -95,7 +95,8 @@ jobs:
           cp target/release/rho-ui assets/rho-ui.desktop assets/icon.svg LICENSE "$NAME/"
           tar -czf "dist/$NAME.tar.gz" "$NAME"
 
-      # Rho.app, signed ad hoc only: README.md says how to open it.
+      # Rho.app, signed ad hoc only: docs/guide/getting-started.md says how
+      # to open one downloaded from a browser.
       - name: Package for macOS
         if: runner.os == 'macOS'
         run: |
@@ -154,8 +155,9 @@ jobs:
             --title "rho-ui $TAG" --generate-notes "${draft[@]}" -- *
 
   # Installs the published release with the install scripts, as a user
-  # would, so a build the scripts can't install fails here. A draft's files
-  # aren't public, so only a published release is checked.
+  # would, so a build the scripts can't install fails here: the tag's
+  # release first, then again as the latest, which updates it. A draft's
+  # files aren't public, so only a published release is checked.
   install:
     needs: release
     if: ${{ !contains(github.ref_name, '-') }}
@@ -165,16 +167,22 @@ jobs:
         os: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
-    env:
-      RHO_UI_VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v7
       # What a Linux without a desktop needs, as docs/guide/browser.md says.
       - if: runner.os == 'Linux'
-        run: sudo apt-get install -y libxcb1 libxkbcommon0 libxkbcommon-x11-0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1 libxkbcommon0 libxkbcommon-x11-0
       # Piped in, as the docs' `curl ... | sh` and `irm ... | iex` do.
       - if: runner.os != 'Windows'
-        run: sh < scripts/install.sh
+        run: |
+          RHO_UI_VERSION="$GITHUB_REF_NAME" sh < scripts/install.sh
+          sh < scripts/install.sh
       - if: runner.os == 'Windows'
         shell: powershell
-        run: Get-Content -Raw scripts/install.ps1 | Invoke-Expression
+        run: |
+          $env:RHO_UI_VERSION = $env:GITHUB_REF_NAME
+          Get-Content -Raw scripts/install.ps1 | Invoke-Expression
+          Remove-Item Env:RHO_UI_VERSION
+          Get-Content -Raw scripts/install.ps1 | Invoke-Expression
