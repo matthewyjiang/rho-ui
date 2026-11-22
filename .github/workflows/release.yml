@@ -72,7 +72,18 @@ jobs:
 
       # The release builds what Cargo.lock says, or fails.
       - run: cargo fetch --locked
-      - run: cargo xtask dist
+      # The build must take every Zig package from the Ghostty cache
+      # (.github/actions/ghostty); one it fetched names an option that
+      # action doesn't configure.
+      - name: Build
+        run: |
+          ls "$GHOSTTY_SOURCE_DIR/zig-pkg" > "$RUNNER_TEMP/zig-pkg-cached"
+          cargo xtask dist
+          ls "$GHOSTTY_SOURCE_DIR/zig-pkg" > "$RUNNER_TEMP/zig-pkg-built"
+          if ! diff "$RUNNER_TEMP/zig-pkg-cached" "$RUNNER_TEMP/zig-pkg-built"; then
+            echo "::error::the build fetched Zig packages the Ghostty cache lacks (above): fetch them in .github/actions/ghostty"
+            exit 1
+          fi
 
       - name: Package for Linux
         if: runner.os == 'Linux'

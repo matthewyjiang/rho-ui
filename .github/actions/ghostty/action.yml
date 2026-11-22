@@ -1,0 +1,85 @@
+name: Ghostty for libghostty-vt
+description: >-
+  Ghostty's source, at the commit the libghostty-vt in Cargo.lock builds,
+  with the Zig packages its build uses, from the cache, and
+  GHOSTTY_SOURCE_DIR naming it, so building rho-ui fetches no Ghostty.
+  Needs Zig on PATH.
+runs:
+  using: composite
+  steps:
+    # libghostty-vt's build script builds the Ghostty GHOSTTY_SOURCE_DIR
+    # names, fetching nothing; without, each build clones Ghostty and
+    # fetches its packages, 70 to 100 s of the network a run. A tag's run
+    # restores what main's CI saved, as caches go.
+    #
+    # The key names libghostty-rs's rev in Cargo.lock, which pins the
+    # Ghostty commit, so a new rev fetches anew: with GHOSTTY_SOURCE_DIR
+    # set, the build script doesn't check the commit itself.
+    - name: Find the Ghostty that libghostty-vt builds
+      id: ghostty
+      shell: bash
+      run: |
+        rev=$(sed -n 's|^source = "git+https://github.com/Uzaaft/libghostty-rs?rev=[0-9a-f]*#\([0-9a-f]*\)"$|\1|p' Cargo.lock | sort -u)
+        if [ "$(printf '%s\n' "$rev" | grep -c .)" != 1 ]; then
+          echo "::error::Cargo.lock has no one git rev of libghostty-rs (found: ${rev:-none}); if libghostty-vt comes from crates.io now, update .github/actions/ghostty"
+          exit 1
+        fi
+        echo "rev=$rev" >> "$GITHUB_OUTPUT"
+        echo "zig=$(zig version)" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TEMP/ghostty" >> "$GITHUB_OUTPUT"
+    - name: Restore Ghostty
+      id: restore-ghostty
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.ghostty.outputs.dir }}
+        # This file's hash too, so a change to how it fetches fetches anew.
+        key: ghostty-${{ runner.os }}-${{ runner.arch }}-libghostty-rs-${{ steps.ghostty.outputs.rev }}-zig-${{ steps.ghostty.outputs.zig }}-${{ hashFiles('.github/actions/ghostty/action.yml') }}
+    - name: Fetch Ghostty
+      if: steps.restore-ghostty.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        REV: ${{ steps.ghostty.outputs.rev }}
+        DIR: ${{ steps.ghostty.outputs.dir }}
+      run: |
+        build_rs=$(curl -fsSL "https://raw.githubusercontent.com/Uzaaft/libghostty-rs/$REV/crates/libghostty-vt-sys/build.rs")
+        repo=$(printf '%s\n' "$build_rs" | sed -n 's/^const GHOSTTY_REPO: &str = "\(.*\)";$/\1/p')
+        commit=$(printf '%s\n' "$build_rs" | sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";$/\1/p')
+        if [ -z "$repo" ] || [ -z "$commit" ]; then
+          echo "::error::libghostty-vt-sys's build.rs at $REV names no GHOSTTY_REPO and GHOSTTY_COMMIT for this step to read"
+          exit 1
+        fi
+        echo "Ghostty $commit from $repo"
+        rm -rf "$DIR"
+        # As the build script clones it: long paths for Windows.
+        git clone --config core.longpaths=true --filter=blob:none --no-checkout "$repo" "$DIR"
+        git -C "$DIR" checkout --quiet "$commit"
+        rm -rf "$DIR/.git"
+        # The packages libghostty-vt's builds need, into the checkout's
+        # zig-pkg/: `--help` configures a build, fetching the lazy packages
+        # it uses, and builds nothing. The options, and the clone's above,
+        # are the build script's (build_vendored and fetch_ghostty in
+        # crates/libghostty-vt-sys/build.rs): check them when the rev moves.
+        # This OS's build, then the web build's. A plain --fetch leaves out lazy ones
+        # the native build needs; --fetch=all takes all of Ghostty's, 542 MB,
+        # and can't unpack its themes on Windows. A package missed here is
+        # fetched by the build, so it costs time, not the build.
+        for target in native wasm32-freestanding; do
+          options=(-Demit-lib-vt=true -Doptimize=ReleaseFast -Dcpu=baseline -Demit-xcframework=false -Dapp-runtime=none)
+          if [ "$target" != native ]; then
+            options+=("-Dtarget=$target")
+          fi
+          (cd "$DIR" && zig build "${options[@]}" --cache-dir "$RUNNER_TEMP/ghostty-zig-cache" --help > /dev/null)
+        done
+        ls "$DIR/zig-pkg"
+    # Saved here, not at the job's end, so it holds no build output.
+    - name: Save Ghostty
+      if: steps.restore-ghostty.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.ghostty.outputs.dir }}
+        key: ${{ steps.restore-ghostty.outputs.cache-primary-key }}
+    - name: Build libghostty-vt from it
+      shell: bash
+      env:
+        DIR: ${{ steps.ghostty.outputs.dir }}
+      run: echo "GHOSTTY_SOURCE_DIR=$DIR" >> "$GITHUB_ENV"
