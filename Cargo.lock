@@ -7292,6 +7292,7 @@ name = "rho-ui"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "embed-resource",
  "futures",
  "getrandom 0.3.4",
  "gpui-kit",
@@ -7307,6 +7308,7 @@ dependencies = [
  "ratex-parser",
  "ratex-svg",
  "ratex-types",
+ "resvg 0.46.0",
  "rho-ui-core",
  "rquickjs",
  "rusqlite",

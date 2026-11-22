@@ -48,14 +48,39 @@
 
     # Adds $Dir to the user's PATH, for new terminals and this one. Returns
     # whether it wasn't there already.
+    #
+    # It edits the registry's value as written, a REG_EXPAND_SZ, so entries
+    # such as %USERPROFILE%\bin keep their variables:
+    # [Environment]::SetEnvironmentVariable would write them out expanded,
+    # as a plain string. So it tells running programs of the change itself,
+    # as rustup does, waiting up to rustup's 5 seconds on each.
     function Add-ToUserPath($Dir) {
-        $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        $Parts = if ($UserPath) { $UserPath -split ";" | Where-Object { $_ } } else { @() }
-        if ($Parts -contains $Dir) {
-            return $false
+        $Key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment")
+        try {
+            $UserPath = $Key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $Parts = $UserPath -split ";" | Where-Object { $_ } |
+                ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }
+            if ($Parts -contains $Dir) {
+                return $false
+            }
+            $NewPath = if ($UserPath) { "$($UserPath.TrimEnd(';'));$Dir" } else { $Dir }
+            $Key.SetValue("Path", $NewPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        } finally {
+            $Key.Close()
         }
-        $NewPath = if ($UserPath) { "$UserPath;$Dir" } else { $Dir }
-        [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
+
+        if (-not ("RhoUiInstall.Native" -as [type])) {
+            Add-Type -Namespace RhoUiInstall -Name Native -MemberDefinition @"
+[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result);
+"@
+        }
+        $HwndBroadcast = [IntPtr]0xffff
+        $WmSettingChange = 0x1a
+        $SmtoAbortIfHung = 2
+        $Result = [UIntPtr]::Zero
+        [RhoUiInstall.Native]::SendMessageTimeout($HwndBroadcast, $WmSettingChange, [UIntPtr]::Zero, "Environment", $SmtoAbortIfHung, 5000, [ref]$Result) | Out-Null
+
         $env:Path = "$env:Path;$Dir"
         return $true
     }
