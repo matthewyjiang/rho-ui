@@ -27,14 +27,15 @@ use web_time::Instant;
 
 use rho_protocol::{
     AnswerStop, CardTone, CompactionStatus, JobState, Replay, Resolution, Seq,
-    SessionAttachResponse, SessionEvent, SessionOptions, StreamId, ToolCallUpdate, TurnOutcome,
+    SessionAttachResponse, SessionEvent, SessionOptions as WireOptions, StreamId, ToolCallUpdate,
+    TurnOutcome,
 };
 
 use crate::{
     background::{BackgroundKind, BackgroundStatus, BackgroundWork},
     daemon::SessionId,
     input::{InputId, InputRequest},
-    options::{commands, config_options, CommandInfo, ConfigOption},
+    options::{commands, CommandInfo, SessionOptions},
     prompt::{Attachment, Image, Prompt},
     surface::{PlacedSurface, SurfaceRef},
     tool_card::ToolCard,
@@ -68,7 +69,7 @@ pub enum Continuity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSetup {
     pub(crate) id: SessionId,
-    pub(crate) options: SessionOptions,
+    pub(crate) options: WireOptions,
     pub(crate) worktree: Option<Worktree>,
 }
 
@@ -507,7 +508,7 @@ pub struct Session {
     turn: LiveTurn,
     state: RunState,
     usage: Option<Usage>,
-    config: Vec<ConfigOption>,
+    options: Option<SessionOptions>,
     commands: Vec<CommandInfo>,
     /// The directories the session's tools reach besides its workspace.
     added_dirs: Vec<PathBuf>,
@@ -591,7 +592,7 @@ impl Session {
             turn: LiveTurn::default(),
             state: RunState::Idle,
             usage: None,
-            config: Vec::new(),
+            options: None,
             commands: Vec::new(),
             added_dirs: Vec::new(),
             plan: Vec::new(),
@@ -617,7 +618,7 @@ impl Session {
     /// [`Self::new`], it holds its events until [`Self::attached`].
     pub fn from_setup(setup: SessionSetup) -> Self {
         let mut session = Self::new(setup.id);
-        session.set_options(setup.options);
+        session.apply_options(setup.options);
         session
     }
 
@@ -654,7 +655,7 @@ impl Session {
         if response.title.is_some() {
             self.title = response.title;
         }
-        self.set_options(response.options);
+        self.apply_options(response.options);
         self.settle(response.state);
         for request in response.inputs {
             self.open_input(InputRequest::from_wire(request));
@@ -742,9 +743,9 @@ impl Session {
         }
     }
 
-    /// Replaces the settings after [`crate::Daemon::set_config`].
-    pub fn set_config(&mut self, config: Vec<ConfigOption>) {
-        self.config = config;
+    /// Replaces the settings after [`crate::Daemon::set_option`].
+    pub fn set_options(&mut self, options: SessionOptions) {
+        self.options = Some(options);
     }
 
     /// Sets the title, such as one from [`crate::SessionSummary::title`].
@@ -801,16 +802,16 @@ impl Session {
         self.usage.as_ref()
     }
 
-    /// Settings the user can change, such as mode and model.
-    pub fn config(&self) -> &[ConfigOption] {
-        &self.config
+    /// Settings the user can change, such as mode and model, once known.
+    pub fn options(&self) -> Option<&SessionOptions> {
+        self.options.as_ref()
     }
 
     /// The auth profile the session's model runs on, once its settings
     /// are known. The session opens whether or not it has credentials; the
     /// daemon's [`crate::Daemon::auths`] says whether it is signed in.
     pub fn auth(&self) -> Option<&str> {
-        self.config.iter().find_map(ConfigOption::auth)
+        self.options.as_ref().map(|options| options.model().auth())
     }
 
     /// Slash commands and skills on offer.
@@ -1105,7 +1106,7 @@ impl Session {
                 None
             }
             SessionEvent::OptionsChanged { options } => {
-                self.set_options(*options);
+                self.apply_options(*options);
                 None
             }
             SessionEvent::TitleChanged { title } => {
@@ -1276,8 +1277,8 @@ impl Session {
         }
     }
 
-    fn set_options(&mut self, options: SessionOptions) {
-        self.config = config_options(&options);
+    fn apply_options(&mut self, options: WireOptions) {
+        self.options = Some(SessionOptions::from_wire(&options));
         self.commands = commands(options.commands);
         self.added_dirs = options.added_dirs;
     }

@@ -51,7 +51,7 @@ use crate::{
     input::{Answer, InputId},
     jobs::Jobs,
     link::Link,
-    options::{change, config_options, ConfigCategory, ConfigOption, ConfigValue},
+    options::{OptionChange, SessionOptions},
     prompt::{mebibytes, Prompt},
     server::{self, ServerTarget},
     session::{Attached, Checkout, Cursor, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
@@ -1116,64 +1116,68 @@ impl Daemon {
         }
     }
 
-    /// Changes a session setting. Returns every option, since one change can
-    /// move others (a new model has different reasoning levels). While a
-    /// turn runs, the daemon applies the change, and answers, once the turn
-    /// ends.
+    /// Applies `change` to session `id`'s settings, returning all of them as
+    /// they stand now. Changing one setting can move others (a new model has
+    /// different reasoning levels or fast mode). While a turn runs, the daemon
+    /// applies the change, and answers, once the turn ends.
     ///
     /// # Errors
     ///
-    /// Fails if the session has no such option, the daemon rejects the
-    /// value, or the connection is gone.
-    pub async fn set_config(
+    /// Fails if the daemon rejects the change or the connection is gone.
+    pub async fn set_option(
         &self,
         id: &SessionId,
-        config_id: &str,
-        value: ConfigValue,
-    ) -> Result<Vec<ConfigOption>, DaemonError> {
-        let change = change(config_id, &value)
-            .ok_or_else(|| DaemonError::Refused(format!("{config_id} doesn't take {value:?}")))?;
+        change: OptionChange,
+    ) -> Result<SessionOptions, DaemonError> {
         let params = SessionConfigureParams {
             session: id.to_wire(),
-            change,
+            change: change.into_wire(),
         };
         let response = self
             .client
             .request::<methods::SessionConfigure>(&params)
             .await?;
-        Ok(config_options(&response.options))
+        Ok(SessionOptions::from_wire(&response.options))
     }
 
     /// Sets session `id`'s settings, now `current`, to those of `wanted`,
     /// such as another session's: the model first, since a model offers
-    /// its own reasoning levels, then the rest. A setting the session lacks
-    /// is skipped. Returns every option as the last change left them.
+    /// its own reasoning levels and fast mode, then the rest. A setting the
+    /// session lacks is skipped. Returns the settings as the last change left
+    /// them.
     ///
     /// # Errors
     ///
     /// Fails if the daemon rejects a value or the connection is gone; the
     /// changes before it stay.
-    pub async fn match_config(
+    pub async fn match_options(
         &self,
         id: &SessionId,
-        wanted: &[ConfigOption],
-        mut current: Vec<ConfigOption>,
-    ) -> Result<Vec<ConfigOption>, DaemonError> {
-        let order = [
-            ConfigCategory::Model,
-            ConfigCategory::ThoughtLevel,
-            ConfigCategory::Other,
-            ConfigCategory::Mode,
-        ];
-        for category in order {
-            for want in wanted.iter().filter(|want| want.category() == category) {
-                let differs = current
-                    .iter()
-                    .find(|option| option.id() == want.id())
-                    .is_some_and(|option| option.value() != want.value());
-                if differs {
-                    current = self.set_config(id, want.id(), want.value()).await?;
-                }
+        wanted: &SessionOptions,
+        mut current: SessionOptions,
+    ) -> Result<SessionOptions, DaemonError> {
+        if current.model().current() != wanted.model().current() {
+            current = self
+                .set_option(id, OptionChange::Model(wanted.model().current().clone()))
+                .await?;
+        }
+        if let (Some(want), Some(now)) = (wanted.reasoning(), current.reasoning()) {
+            if now.current() != want.current() {
+                current = self
+                    .set_option(id, OptionChange::Reasoning(want.current()))
+                    .await?;
+            }
+        }
+        if let (Some(want), Some(now)) = (wanted.fast_mode(), current.fast_mode()) {
+            if now != want {
+                current = self.set_option(id, OptionChange::FastMode(want)).await?;
+            }
+        }
+        if let (Some(want), Some(now)) = (wanted.permission_mode(), current.permission_mode()) {
+            if now.current() != want.current() {
+                current = self
+                    .set_option(id, OptionChange::PermissionMode(want.current()))
+                    .await?;
             }
         }
         Ok(current)

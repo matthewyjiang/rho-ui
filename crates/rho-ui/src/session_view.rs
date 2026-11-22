@@ -276,7 +276,7 @@ impl SessionView {
             SessionSettings::new(
                 daemon.clone(),
                 session.id().clone(),
-                session.config(),
+                session.options(),
                 window,
                 cx,
             )
@@ -1359,7 +1359,7 @@ impl SessionView {
             Availability::Disabled
         };
         self.settings.update(cx, |settings, cx| {
-            settings.sync(self.session.config(), window, cx);
+            settings.sync(self.session.options(), window, cx);
             settings.set_allowed(allowed, cx);
         });
         self.composer.update(cx, |composer, cx| {
@@ -1380,7 +1380,7 @@ impl SessionView {
         match event {
             SettingsEvent::Changed(options) => {
                 self.error = None;
-                self.session.set_config(options.clone());
+                self.session.set_options(options.clone());
             }
             SettingsEvent::Failed(message) => self.error = Some(message.clone()),
         }
@@ -1643,7 +1643,7 @@ impl SessionView {
                         let _ = stop_view.update(cx, |this, cx| this.stop(window, cx));
                     },
                 )
-                .leading(SessionSettings::render_modes(&self.settings, cx))
+                .leading(SessionSettings::render_mode(&self.settings, cx))
                 .trailing(SessionSettings::render_panel_button(&self.settings, cx))
                 .usage(self.session.usage().cloned().map(UsageRing::new)),
             )

@@ -1,6 +1,7 @@
 use rho_protocol::{
-    FastModeOptions, ModelChoice, ModelOptions, ModelRef, PermissionMode, PermissionModeOptions,
-    Replay, StreamId,
+    FastModeOptions, ModelChoice as WireModelChoice, ModelOptions as WireModelOptions,
+    ModelRef as WireModelRef, PermissionMode as WirePermissionMode, PermissionModeOptions, Replay,
+    StreamId,
 };
 use serde_json::json;
 
@@ -8,7 +9,7 @@ use super::*;
 use crate::{
     background::BackgroundId,
     input::{Form, InputChoice},
-    options::{ConfigCategory, ConfigChoice, ConfigKind},
+    options::{ModelChoice, ModelRef, PermissionMode},
     tool_card::{SearchLine, ToolBody, ToolFact},
     Row, Timeline,
 };
@@ -20,16 +21,16 @@ fn update(value: serde_json::Value) -> SessionUpdate {
     }
 }
 
-fn options() -> SessionOptions {
-    let model = ModelRef {
+fn options() -> WireOptions {
+    let model = WireModelRef {
         provider: "a".to_owned(),
         model: "org/x".to_owned(),
     };
-    SessionOptions {
-        model: ModelOptions {
+    WireOptions {
+        model: WireModelOptions {
             current: model.clone(),
             auth: "key".to_owned(),
-            available: vec![ModelChoice {
+            available: vec![WireModelChoice {
                 model,
                 label: "X".to_owned(),
             }],
@@ -37,8 +38,8 @@ fn options() -> SessionOptions {
         reasoning: None,
         fast_mode: Some(FastModeOptions { enabled: true }),
         permission_mode: PermissionModeOptions {
-            current: PermissionMode::Plan,
-            available: vec![PermissionMode::Auto, PermissionMode::Plan],
+            current: WirePermissionMode::Plan,
+            available: vec![WirePermissionMode::Auto, WirePermissionMode::Plan],
         },
         commands: Vec::new(),
         added_dirs: Vec::new(),
@@ -446,29 +447,25 @@ fn options_become_the_settings_the_ui_lays_out() {
     session.apply(update(
         json!({"type": "options_changed", "options": options()}),
     ));
-    let config = session.config();
-    let shape: Vec<_> = config
-        .iter()
-        .map(|option| (option.id(), option.category()))
-        .collect();
+    let config = session.options().expect("options were applied");
+    let modes = config.permission_mode().expect("known permission mode");
+    assert_eq!(modes.current(), PermissionMode::Plan);
     assert_eq!(
-        shape,
-        [
-            ("mode", ConfigCategory::Mode),
-            ("model", ConfigCategory::Model),
-            ("fast_mode", ConfigCategory::Other),
-        ],
+        modes.available(),
+        [PermissionMode::Auto, PermissionMode::Plan]
+    );
+    assert_eq!(config.model().current(), &ModelRef::new("a", "org/x"));
+    assert_eq!(
+        config.model().current_choice().map(ModelChoice::label),
+        Some("X")
+    );
+    assert_eq!(session.auth(), Some("key"));
+    assert_eq!(
+        config.reasoning(),
+        None,
         "no reasoning option: the model's cannot be configured"
     );
-    assert_eq!(
-        config[0].current_choice().map(ConfigChoice::name),
-        Some("Plan")
-    );
-    assert_eq!(
-        config[1].current_choice().map(|c| (c.value(), c.name())),
-        Some(("a/org/x", "X"))
-    );
-    assert_eq!(config[2].kind(), &ConfigKind::Toggle(true));
+    assert_eq!(config.fast_mode(), Some(true));
 }
 
 fn approval(id: u64) -> serde_json::Value {

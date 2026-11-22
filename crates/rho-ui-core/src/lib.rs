@@ -42,8 +42,8 @@ pub use input::{
 pub use jobs::{Job, JobActivity, Jobs, Run, RunStatus, Runs};
 pub use link::Link;
 pub use options::{
-    CommandInfo, CommandKind, ConfigCategory, ConfigChoice, ConfigKind, ConfigOption, ConfigValue,
-    FAST_MODE_ID,
+    Choices, CommandInfo, CommandKind, ModelChoice, ModelOptions, ModelRef, OptionChange,
+    PermissionMode, ReasoningLevel, SessionOptions,
 };
 pub use prompt::{
     check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
