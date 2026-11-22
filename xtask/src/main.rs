@@ -110,11 +110,15 @@ fn cargo(args: &[&str]) -> Command {
 fn wasm_cargo(subcommand: &str, args: &[&str]) -> Result<Command> {
     let mut command = cargo(&[subcommand, "--target", WASM_TARGET]);
     command.args(args).env("RUSTC_BOOTSTRAP", "wasm_thread");
-    if cfg!(target_os = "macos") && std::env::var_os(WASM_CC).is_none() {
+    let unset: Vec<_> = [(WASM_CC, "clang"), (WASM_AR, "llvm-ar")]
+        .into_iter()
+        .filter(|(variable, _)| std::env::var_os(variable).is_none())
+        .collect();
+    if cfg!(target_os = "macos") && !unset.is_empty() {
         let llvm = homebrew_llvm()?;
-        command
-            .env(WASM_CC, llvm.join("bin/clang"))
-            .env(WASM_AR, llvm.join("bin/llvm-ar"));
+        for (variable, tool) in unset {
+            command.env(variable, llvm.join("bin").join(tool));
+        }
     }
     Ok(command)
 }
