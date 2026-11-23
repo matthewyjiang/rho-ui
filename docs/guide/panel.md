@@ -22,9 +22,10 @@ Both have limits: Files won't open a file over 2 MiB or a binary one, and lists 
 
 Shows the GitHub pull request for the session's branch, with its checks, reviews and threads, and lets you comment, merge, and mark it ready or draft.
 
-- **It needs `gh`.** It reads GitHub as this machine's account if that's signed in to the host, else as the session machine's. Comments and merges run on the session's machine. See [Source control](./settings#source-control).
-- **Profile pictures need `curl`** on the machine that reads GitHub, which fetches each from where GitHub serves it. Without it, or for a picture that needs a sign-in, initials show. Refresh asks again for the ones that didn't load.
+- **The session machine's rho reads it.** Each machine's rho daemon reads GitHub for its own sessions, with the `gh` on its own `PATH`, signed in on that machine. It needs a rho newer than 3.3; an older one says to update rho. Comments and merges run rho-ui's `gh` on the session's machine. See [Source control](./settings#source-control).
+- **Only github.com origins get a branch PR.** A session whose `origin` is on another host, GitHub Enterprise included, shows none for its branch; link one by its URL instead.
+- **Profile pictures need `curl`** on the session's machine, which fetches each from where GitHub serves it. Without it, or for a picture that needs a sign-in, initials show. Refresh asks again for the ones that didn't load.
 - **Merging is guarded.** A merge only merges the head commit you were shown, so a commit the session pushed since doesn't slip in. It doesn't delete the branch, which the session may still use.
-- **Reading is lazy.** It polls every 30 seconds, and only while its tab shows and the window has focus. When the account's API limit has 50 points or fewer left, it waits for the reset and says so.
-- **Link** follows other PRs too. Paste a URL, `owner/name#N`, or a number in the session's repository. Links are kept between runs.
-- **The sidebar marks each session's PR** beside its branch, with a red dot while its checks fail. It refreshes every 5 minutes.
+- **Reading is lazy.** rho reads the PR every 30 seconds, and only while its tab shows and the window has focus. When the account's API limit has 50 points or fewer left, rho waits for the reset and the panel says so.
+- **Link** follows other PRs too. Paste a URL, `owner/name#N`, or a number in the session's repository. Links are kept by the session's rho, so they follow the session to any rho-ui. The PRs the session's agent links or watches get tabs too, marked **watched** while the agent waits on them; unlinking one ends the agent's watch.
+- **The sidebar marks each session's PR** beside its branch, with a red dot while its checks fail. rho reads it every 5 minutes.
