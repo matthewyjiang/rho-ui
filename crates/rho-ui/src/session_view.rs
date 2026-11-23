@@ -23,10 +23,14 @@
 //!
 //! The view lives as long as the session is open, across the connection
 //! that follows it: when the daemon stops sending the session's events, as
-//! when the view fell behind or the daemon restarted, the app follows it
-//! again on the same view ([`SessionView::reattach`]), so the composer,
-//! and unless the daemon replays the whole conversation, the scroll
-//! position and what is unfolded, stay. A prompt whose try reached a
+//! when the view fell behind, the daemon restarted, or the app let the
+//! session go while it was off screen, the app follows it again on the
+//! same view ([`SessionView::reattach`]), so the composer, the scroll
+//! position and what is unfolded stay. A daemon that replays the whole
+//! conversation instead of what came since keeps the rows on screen until
+//! the replay is all there, then builds them again from the first entry
+//! that changed or holds a `ui` surface, whose panel the replay made again
+//! ([`Loading::Replaying`]): only a change above it moves the scroll. A prompt whose try reached a
 //! daemon that was stopping, or a connection that ended, goes again under
 //! its key once the session is followed again, so it runs once.
 //!
@@ -158,11 +162,29 @@ pub(crate) enum Loading {
     /// The attach to a saved session has not answered yet, or its replay
     /// has not caught up: its rows wait for the whole replay. Only
     /// `after_change` ends it, which the event that catches up and the
-    /// attach's answer both reach. An attach that replays the whole
-    /// conversation to a session already shown starts it again.
+    /// attach's answer both reach.
     Attaching,
+    /// The daemon replays the whole conversation to a session already
+    /// shown, as when it unloaded the session while the app let it go.
+    /// Until the replay catches up, the rows stay as they were, drawn from
+    /// the entries they were built from, which this holds; then
+    /// `after_change` builds them again from the first entry that changed.
+    Replaying(Vec<Entry>),
     /// The attach failed.
     Failed(String),
+}
+
+impl Loading {
+    /// The entries of `session` the rows were built from, once there are
+    /// rows: while the daemon replays the whole conversation over what was
+    /// shown, those it showed.
+    fn drawn<'a>(&'a self, session: &'a Session) -> Option<&'a [Entry]> {
+        match self {
+            Self::Ready => Some(session.entries()),
+            Self::Replaying(shown) => Some(shown),
+            Self::Attaching | Self::Failed(_) => None,
+        }
+    }
 }
 
 pub(crate) struct SessionView {
@@ -198,10 +220,6 @@ pub(crate) struct SessionView {
     /// How many attaches have answered: a prompt's try that failed as the
     /// connection ended goes again at once if one answered since it went.
     attachments: u64,
-    /// Steers, and messages refused as busy that wait on the job list,
-    /// whose answers haven't come: what they carry may go back in the
-    /// composer.
-    in_flight: usize,
     /// Background work the user asked to stop that still runs.
     stopping: Vec<BackgroundId>,
     /// The subagent and workflow runs the session started, as the daemon's
@@ -218,8 +236,10 @@ pub(crate) struct SessionView {
     turn_began: Option<Instant>,
     /// When the oldest open request arrived.
     waiting_since: Option<Instant>,
-    /// Title and activity as last reported in [`SessionEvent::LiveChanged`].
-    reported: (String, Activity),
+    /// Title and activity as last reported in [`SessionEvent::LiveChanged`];
+    /// `None` once the view follows the session again, so the app hears of
+    /// it when it has caught up, whatever changed.
+    reported: Option<(String, Activity)>,
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
     /// The surfaces the session's `ui` calls showed.
@@ -331,14 +351,13 @@ impl SessionView {
             outgoing: None,
             link: Link::Following,
             attachments: 0,
-            in_flight: 0,
             stopping: Vec::new(),
             runs: Vec::new(),
             recorded,
             busy_since: None,
             turn_began: None,
             waiting_since: None,
-            reported: (String::new(), Activity::Idle),
+            reported: None,
             error: None,
             surfaces: Surfaces::default(),
             plan: Disclosure::default(),
@@ -360,7 +379,7 @@ impl SessionView {
         };
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
-        view.reported = (view.title(), view.activity());
+        view.reported = Some((view.title(), view.activity()));
         view
     }
 
@@ -489,29 +508,6 @@ impl SessionView {
         matches!(self.loading, Loading::Failed(_))
     }
 
-    /// Whether the app may let the session go while it is off screen:
-    /// its attach has answered and caught up, no turn runs or waits on a
-    /// person, no message or change is on its way or held, no error waits
-    /// to be read, and nothing typed, a message or a key, would be lost. Opening it again
-    /// replays it. Background work that ended stays listed until the
-    /// daemon's own turn gives the model its result, so the session waits
-    /// for that turn too.
-    pub(crate) fn can_close(&self, cx: &App) -> bool {
-        let session = &self.session;
-        !session.is_replaying()
-            && !session.state().is_busy()
-            && session.inputs().is_empty()
-            && session.background().is_empty()
-            && session.held().is_none()
-            && self.outgoing.is_none()
-            && self.in_flight == 0
-            && self.error.is_none()
-            && self.composer.read(cx).is_empty(cx)
-            && self.sign_in.as_ref().is_none_or(|slot| slot.is_empty(cx))
-            && self.settings.read(cx).is_settled()
-            && self.added_dirs.read(cx).is_settled(cx)
-    }
-
     /// What the sidebar shows for this session.
     pub(crate) fn live(&self) -> LiveSession {
         LiveSession {
@@ -587,15 +583,16 @@ impl SessionView {
     ) {
         let asked = !self.session.inputs().is_empty();
         let changed = self.session.apply(update);
+        let building = matches!(self.loading, Loading::Ready);
         // A saved session's history goes into the session alone, with no
         // redraw per event; the event that catches up builds the
         // transcript once, in `after_change`.
-        if self.session.is_replaying() && matches!(self.loading, Loading::Attaching) {
+        if self.session.is_replaying() && !building {
             return;
         }
         // The session names the entry it changed; only its row is remeasured.
         // A new entry gets its row in `after_change`.
-        if let Some(ix) = changed {
+        if let Some(ix) = changed.filter(|_| building) {
             self.transcript.changed(self.session.entries(), ix, cx);
         }
         // A turn that ended before reading a steer dropped it.
@@ -626,8 +623,8 @@ impl SessionView {
                     .filter(|_| self.busy_since.is_none())
                     .and_then(|elapsed| Instant::now().checked_sub(elapsed));
                 // Ready once the replay has caught up; see `after_change`.
-                if self.session.attached(attached) == Continuity::Replaced {
-                    self.replaced();
+                if let Continuity::Replaced(shown) = self.session.attached(attached) {
+                    self.replaced(shown);
                 }
                 self.attachments += 1;
             }
@@ -635,7 +632,7 @@ impl SessionView {
             // again.
             Err(DaemonError::Closed | DaemonError::Stopping(_)) => {}
             // Shown before: what it showed, and what was typed, stay.
-            Err(error) if matches!(self.loading, Loading::Ready) => {
+            Err(error) if self.loading.drawn(&self.session).is_some() => {
                 self.link = Link::Refused(error.to_string());
                 self.give_back_waiting(window, cx);
                 self.report_live(cx);
@@ -670,6 +667,7 @@ impl SessionView {
         if !self.follows_again() {
             return None;
         }
+        self.reported = None;
         // The turn under way, if any, is timed again from what the attach
         // says: it may have ended meanwhile, or another begun.
         self.busy_since = None;
@@ -719,12 +717,64 @@ impl SessionView {
         !self.unloaded && !self.failed_to_attach()
     }
 
+    /// Whether the app may stop following the session while it is off
+    /// screen, so the daemon can unload it: it is saved, as the daemon
+    /// discards an unsaved one nothing follows, its attach has answered and
+    /// caught up, and nothing under way needs the daemon's events. No turn
+    /// runs or waits on a person, no background work runs or waits for the
+    /// daemon's own turn to give the model its result, and no message is
+    /// held or on its way. The view stays, with what was typed in it, and
+    /// showing it follows the session again. One with nothing to follow
+    /// (see [`Self::follows_again`]) has nothing to let go.
+    pub(crate) fn can_let_go(&self) -> bool {
+        let session = &self.session;
+        self.prompted
+            && self.follows_again()
+            && matches!(self.loading, Loading::Ready)
+            && !session.is_replaying()
+            && !session.state().is_busy()
+            && session.inputs().is_empty()
+            && session.background().is_empty()
+            && session.held().is_none()
+            && self.outgoing.is_none()
+    }
+
+    /// The replay caught up: a saved session's rows can be built. Rows kept
+    /// through a replay of the whole conversation are built again from the
+    /// first entry that changed, so where the transcript was scrolled to,
+    /// and what was unfolded, stay above it.
+    fn caught_up(&mut self, cx: &mut Context<'_, Self>) {
+        match std::mem::replace(&mut self.loading, Loading::Ready) {
+            Loading::Ready | Loading::Attaching => {}
+            Loading::Replaying(shown) => {
+                let from = first_change(&shown, self.session.entries());
+                // `from`, not the start that the replay itself reports.
+                self.session.take_removed();
+                self.transcript.truncate(from, cx);
+                // The replay placed its surfaces again, for a store of
+                // their own.
+                self.surfaces = Surfaces::default();
+            }
+            failed @ Loading::Failed(_) => self.loading = failed,
+        }
+    }
+
     /// The daemon replays the whole conversation over what the view
-    /// showed: its rows, and its surfaces, are built again once it is all
-    /// there. The composer, and what only this client knows, stay.
-    fn replaced(&mut self) {
-        self.loading = Loading::Attaching;
-        self.surfaces = Surfaces::default();
+    /// showed, `shown`: its rows stay until it is all there (see
+    /// [`Loading::Replaying`]). The composer, and what only this client
+    /// knows, stay.
+    fn replaced(&mut self, shown: Vec<Entry>) {
+        self.loading = match std::mem::replace(&mut self.loading, Loading::Attaching) {
+            Loading::Ready => Loading::Replaying(shown),
+            // Its rows still draw the entries they were built from, not the
+            // part of a replay `shown` holds.
+            replaying @ Loading::Replaying(_) => replaying,
+            // Nothing was drawn.
+            Loading::Attaching | Loading::Failed(_) => {
+                self.surfaces = Surfaces::default();
+                Loading::Attaching
+            }
+        };
     }
 
     /// Moves the keyboard into a card that just opened if the user is in
@@ -752,13 +802,13 @@ impl SessionView {
     /// `session`.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let replaying = self.session.is_replaying();
-        if !replaying && matches!(self.loading, Loading::Attaching) {
-            self.loading = Loading::Ready;
+        if !replaying {
+            self.caught_up(cx);
         }
         // A saved session's rows are built only once its replay is all
         // there, so a long session opens at its end rather than drawing as
         // it replays. A new one's replay is short, and builds as it comes.
-        if !matches!(self.loading, Loading::Attaching) {
+        if matches!(self.loading, Loading::Ready) {
             if let Some(from) = self.session.take_removed() {
                 self.transcript.truncate(from, cx);
             }
@@ -818,12 +868,12 @@ impl SessionView {
         self.send_held(window, cx);
     }
 
-    /// Tells the app when the title or activity the sidebar shows changed.
+    /// Tells the app when the title or activity the sidebar shows changed,
+    /// and once a view that follows the session again has caught up.
     fn report_live(&mut self, cx: &mut Context<'_, Self>) {
-        let activity = self.activity();
-        let title = self.title();
-        if self.reported.0 != title || self.reported.1 != activity {
-            self.reported = (title, activity);
+        let live = Some((self.title(), self.activity()));
+        if self.reported != live {
+            self.reported = live;
             cx.emit(SessionEvent::LiveChanged);
         }
     }
@@ -959,11 +1009,9 @@ impl SessionView {
         let daemon = self.daemon.clone();
         let id = self.session.id().clone();
         let ended = self.session.ended_turn().cloned();
-        self.in_flight += 1;
         cx.spawn_in(window, async move |this, cx| {
             let result = daemon.steer(&id, &text).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.in_flight -= 1;
                 match result {
                     Ok(steer) => {
                         this.session.steer_sent(steer, text);
@@ -1008,11 +1056,9 @@ impl SessionView {
             return;
         }
         let daemon = self.daemon.clone();
-        self.in_flight += 1;
         cx.spawn_in(window, async move |this, cx| {
             let jobs = daemon.jobs().await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.in_flight -= 1;
                 let id = this.session.id();
                 // Only a turn under way or waiting for a person refuses one.
                 let listed = jobs.is_ok_and(|jobs| {
@@ -1312,8 +1358,9 @@ impl SessionView {
 
     /// The panel of `surface` changed, and may have changed height.
     pub(crate) fn surface_resized(&self, surface: &str, cx: &mut Context<'_, Self>) {
-        self.transcript
-            .surface_changed(surface, self.session.entries(), cx);
+        if let Some(drawn) = self.loading.drawn(&self.session) {
+            self.transcript.surface_changed(surface, drawn, cx);
+        }
     }
 
     /// Sends `action` to the session. A session that no longer has the
@@ -1449,10 +1496,14 @@ impl SessionView {
 
     fn render_transcript(&self, cx: &mut Context<'_, Self>) -> AnyElement {
         // A replaying session may have entries already, but no rows yet.
-        if !matches!(self.loading, Loading::Ready) || self.session.entries().is_empty() {
+        if self
+            .loading
+            .drawn(&self.session)
+            .is_none_or(<[Entry]>::is_empty)
+        {
             let placeholder = Empty::new();
             return match &self.loading {
-                Loading::Attaching => placeholder.header(
+                Loading::Attaching | Loading::Replaying(_) => placeholder.header(
                     EmptyHeader::new()
                         .media(EmptyMedia::new().child(Spinner::new()))
                         .description(EmptyDescription::new().child("Loading session…")),
@@ -1476,7 +1527,11 @@ impl SessionView {
             let view = view.clone();
             Rc::new(move |action, _, cx| {
                 let _ = view.update(cx, |this, cx| {
-                    this.transcript.act(action, this.session.entries(), cx);
+                    this.transcript.act(
+                        action,
+                        this.loading.drawn(&this.session).unwrap_or_default(),
+                        cx,
+                    );
                     cx.notify();
                 });
             })
@@ -1487,8 +1542,12 @@ impl SessionView {
             Rc::new(move |place, _, cx| match view.upgrade() {
                 Some(view) => {
                     let this = view.read(cx);
-                    this.transcript
-                        .render_content(place, this.session.entries(), &act, cx)
+                    this.transcript.render_content(
+                        place,
+                        this.loading.drawn(&this.session).unwrap_or_default(),
+                        &act,
+                        cx,
+                    )
                 }
                 None => div().into_any_element(),
             })
@@ -1518,7 +1577,7 @@ impl SessionView {
                             let this = view.read(cx);
                             this.transcript.render_item(
                                 ix,
-                                this.session.entries(),
+                                this.loading.drawn(&this.session).unwrap_or_default(),
                                 &this.surfaces,
                                 &act,
                                 &content,
@@ -1861,6 +1920,17 @@ fn new_added_dirs(
     let (daemon, id, cwd) = (daemon.clone(), session.id().clone(), cwd.clone());
     let workspaces = workspace.table().clone();
     cx.new(|cx| AddedDirs::new(daemon, id, cwd, workspaces, access, window, cx))
+}
+
+/// The first entry of `now` whose row differs from the one built for
+/// `shown`'s: where the two part, or the first surface, whose panel a new
+/// store makes again.
+fn first_change(shown: &[Entry], now: &[Entry]) -> usize {
+    shown
+        .iter()
+        .zip(now)
+        .position(|(was, is)| was != is || matches!(is, Entry::Surface(_)))
+        .unwrap_or_else(|| shown.len().min(now.len()))
 }
 
 /// A held message on one line: its text, and what is attached to it, such

@@ -124,14 +124,6 @@ impl AddedDirs {
         }
     }
 
-    /// Whether the box holds nothing typed and no add is on its way, so
-    /// letting the session go loses nothing.
-    pub(crate) fn is_settled(&self, cx: &App) -> bool {
-        self.form
-            .as_ref()
-            .is_none_or(|form| !form.adding && form.input.read(cx).value().trim().is_empty())
-    }
-
     /// Sends the typed path to the daemon, or says why it isn't one.
     fn add(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(form) = &mut self.form else {

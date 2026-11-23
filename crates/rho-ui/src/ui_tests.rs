@@ -674,15 +674,6 @@ impl Harness {
         });
     }
 
-    /// Whether this machine's session `id` is open in the app.
-    fn is_open(&mut self, id: &str) -> bool {
-        let (app, key) = (
-            self.app.clone(),
-            SessionKey::new(MachineId::local(), SessionId::from(id)),
-        );
-        self.cx.update(|cx| app.read(cx).is_open(&key))
-    }
-
     /// What the active session's composer holds.
     fn composer_text(&mut self) -> String {
         let app = self.app.clone();
@@ -2668,6 +2659,10 @@ fn an_open_session_survives_lag_and_restarts() {
             && !is_visible(window, "link-notice")
     });
     assert!(same_view(&mut ui), "the same view follows old");
+    assert!(
+        ui.label("worked-0").is_some(),
+        "the whole replay kept the scroll position"
+    );
     assert_eq!(ui.composer_text(), "half a thought");
     assert_eq!(ui.session().entries().len(), entries, "each entry once");
     ui.shot("restarted");
@@ -2703,6 +2698,59 @@ fn an_open_session_survives_lag_and_restarts() {
     assert_eq!(ui.fake().restarts(), 3);
     ui.wait_for_session("no turn", |session| !session.state().is_busy());
     ui.shot("gone");
+}
+
+/// A session left with nothing under way is let go, so the daemon can
+/// unload it, but its view stays: shown again after the daemon unloaded it,
+/// it is there at once, as it was scrolled and with what was typed, while
+/// the app follows it again. A session left with background work running
+/// stays followed.
+#[test]
+fn a_left_session_is_let_go_and_shown_again_at_once() {
+    let script = Script {
+        replay_turns: 20,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("let-go", script);
+    ui.open_old_session();
+    let app = ui.app.clone();
+    let view = ui
+        .cx
+        .update(|cx| app.read(cx).active_session().expect("a session is open"));
+    let scroller = ui
+        .cx
+        .update(|cx| view.read(cx).transcript().scroller().clone());
+    ui.cx
+        .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(0, cx)));
+    ui.frame();
+    ui.type_in("half a thought");
+
+    ui.click("session-local-s1");
+    ui.wait_for_daemon("old let go", |fake| fake.followers("old") == 0);
+    ui.act(|window, _| {
+        assert!(is_visible(window, "session-local-old"), "old's row stays");
+    });
+    ui.send("background");
+    ui.wait_for_session("the turn ended, its process running", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+
+    ui.fake().unload(&SessionId::from("old"));
+    ui.click("session-local-old");
+    assert!(
+        ui.cx
+            .update(|cx| app.read(cx).active_session() == Some(view.clone())),
+        "the same view"
+    );
+    assert!(ui.label("worked-0").is_some(), "shown as it was, at once");
+    ui.wait_for_daemon("old followed again", |fake| {
+        fake.attaches("old") == 2 && fake.followers("old") == 1
+    });
+    ui.wait_for_session("old caught up", |session| !session.is_replaying());
+    assert!(ui.label("worked-0").is_some(), "still scrolled there");
+    assert_eq!(ui.composer_text(), "half a thought");
+    assert_eq!(ui.fake().followers("s1"), 1, "s1 waits on its process");
+    ui.shot("shown-again");
 }
 
 /// A daemon that needs a restart offers one, which asks first: one too old
@@ -3012,68 +3060,6 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
     ui.wait_until("the session open and the row seen", |window, _, app| {
         app.active_session().is_some() && !is_visible(window, "session-local-tui-1-done")
     });
-}
-
-/// A session left off screen stays followed while something in it would
-/// be lost: a message being written, or background work, which the row
-/// waits on rather than showing Done. Once idle it is let go: the daemon
-/// sees no follower, the row keeps its Done, and opening it again replays
-/// it. A session with nothing under way is let go as soon as it is left.
-#[test]
-fn a_left_session_is_let_go_once_idle() {
-    let mut ui = Harness::start("let-go", Script::default());
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-local-s1")
-    });
-    ui.click("session-local-s1");
-    ui.wait_for_daemon("s1 attached", |daemon| daemon.followers("s1") == 1);
-    ui.type_in("half a thought");
-    ui.click("session-local-old");
-    ui.wait_for_daemon("old attached", |daemon| daemon.followers("old") == 1);
-    assert!(ui.is_open("s1"), "s1 holds a message being written");
-
-    ui.click("session-local-s1");
-    assert_eq!(ui.composer_text(), "half a thought", "the same view");
-    ui.focus_composer();
-    ui.act(|window, cx| window.press("secondary-a", cx));
-    ui.send("background");
-    ui.wait_for_session("the turn ended, its process running", |session| {
-        session.state() == &RunState::Idle && !session.background().is_empty()
-    });
-    ui.click("new-session");
-    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
-    ui.wait_for_daemon("old let go", |daemon| daemon.followers("old") == 0);
-    assert!(ui.is_open("s1"), "s1 waits on its process");
-    ui.act(|window, _| {
-        assert!(is_visible(window, "session-local-old"), "old's row stays");
-        assert!(is_visible(window, "session-local-s1-background"));
-        assert!(!is_visible(window, "session-local-s1-done"), "not done yet");
-    });
-    ui.shot("waiting");
-
-    ui.fake().finish_background(&SessionId::from("s1"), 0);
-    ui.wait_until("the daemon's turn about the exit", |window, _, _| {
-        is_visible(window, "session-local-s1-busy")
-    });
-    ui.send_from_elsewhere("s1", "thanks", Send::Steer);
-    ui.wait_for_label("session-local-s1-done", "Done");
-    ui.wait_for_daemon("s1 let go", |daemon| daemon.followers("s1") == 0);
-    assert!(!ui.is_open("s1"));
-    ui.act(|window, _| {
-        assert!(
-            is_visible(window, "session-local-s1-done"),
-            "Done outlives the view"
-        );
-    });
-
-    ui.click("session-local-s1");
-    ui.wait_for_daemon("s1 attached again", |daemon| {
-        daemon.attaches("s1") == 2 && daemon.followers("s1") == 1
-    });
-    ui.wait_for_session("the conversation replayed", |session| {
-        session.entries().len() > 1
-    });
-    ui.shot("reopened");
 }
 
 /// A project with an origin remote gets a button beside its name in the

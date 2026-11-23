@@ -64,7 +64,8 @@
 //!   it ([`Replay::Tail`]); any other attach gets the whole session
 //!   replayed ([`Replay::Reset`]), which replays the calls with their
 //!   surfaces. Each run of the daemon, from a restart on, has a stream of
-//!   its own, as rho's does.
+//!   its own, as rho's does, and so does each load of a session after
+//!   [`FakeDaemon::unload`].
 //! - A prompt sent again with the idempotency key of the session's latest
 //!   turn answers with that turn and starts none.
 //!   [`FakeDaemon::prompts`] counts the prompts that started a turn.
@@ -726,6 +727,24 @@ impl FakeDaemon {
             .unwrap_or_default()
     }
 
+    /// Unloads `session`, as rho's daemon does a while after nothing follows
+    /// it: it loads again in a stream of its own, so attaching with a
+    /// cursor from before replays all of it.
+    ///
+    /// # Panics
+    ///
+    /// If a client still follows it, which keeps rho's loaded.
+    pub fn unload(&self, session: &UiSessionId) {
+        let mut state = self.service.lock();
+        let session = state
+            .sessions
+            .get_mut(session.as_str())
+            .expect("the session to unload exists");
+        let followers = session.publishers.iter().filter(|p| !p.is_gone()).count();
+        assert_eq!(followers, 0, "a followed session stays loaded");
+        session.unloads += 1;
+    }
+
     /// Detaches every client of `session` as fallen behind, as rho's
     /// daemon does to one that left too many events unread. Attaching
     /// again replays the session.
@@ -947,6 +966,9 @@ struct FakeSession {
     /// that turn.
     last_prompt: Option<(IdempotencyKey, TurnId)>,
     live_seq: u64,
+    /// How many times the daemon unloaded it ([`FakeDaemon::unload`]): each
+    /// load has a stream of its own.
+    unloads: u64,
     /// Background work, as the last background event listed it.
     background: Vec<BackgroundWork>,
     /// Whether a prompt "busy" was already refused.
@@ -974,6 +996,7 @@ impl FakeSession {
             prompts: 0,
             last_prompt: None,
             live_seq: 0,
+            unloads: 0,
             background: Vec::new(),
             refused_busy: false,
             subagent: false,

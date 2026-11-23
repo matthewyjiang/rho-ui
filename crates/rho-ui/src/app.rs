@@ -15,6 +15,10 @@
 //! for the user's Retry, as with no session followed it can't tell a
 //! restart from a stop.
 //!
+//! The view stays, too, while the session is off screen with nothing under
+//! way and the app stops following it, so the daemon can unload it; showing
+//! it follows it again ([`RhoApp::sync_following`]).
+//!
 //! The sidebar, the session view and the right panel are drawn as cached
 //! views: each redraws only when it changes, so a hover in one never
 //! rebuilds the others.
@@ -205,6 +209,10 @@ struct OpenDraft {
 struct OpenSession {
     id: SessionKey,
     view: Entity<SessionView>,
+    /// The detach of a session the app let go (see
+    /// [`RhoApp::sync_following`]). Following it again waits for it, so the
+    /// daemon can't take the attach first and then end it.
+    let_go: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -240,12 +248,13 @@ pub(crate) struct RhoApp {
     sidebar: Entity<SidebarView>,
     /// The panel at the right, laid out while [`PanelLayout`].
     panel: Entity<RightPanel>,
-    /// Sessions open in this run, with the subagents' opened under them.
-    /// One stays open, and followed in its daemon, while it is on screen
-    /// or has something under way; then [`Self::close_idle_sessions`] lets
-    /// it go. Its deletion, a reread, or the end of its connection also
-    /// drops it. Lookups by ID scan: the list holds only what the user
-    /// opened and what still runs.
+    /// Sessions opened in this run, with the subagents' opened under them.
+    /// Each keeps its view for the rest of the run, so switching back to
+    /// one shows it at once; only its deletion, a reread, or the end of its
+    /// connection drops it. Once one is off screen with nothing under way,
+    /// the app stops following it in its daemon (see
+    /// [`Self::sync_following`]). Lookups by ID scan: the list grows only
+    /// as the user opens sessions by hand.
     sessions: Vec<OpenSession>,
     /// The draft on screen, if any, and those left with a message, the
     /// one left last at the end. An empty draft goes once it is left.
@@ -818,22 +827,36 @@ impl RhoApp {
             DaemonEvent::Update { session, update } => {
                 let session = key(session);
                 if let Some(open) = self.opened(&session) {
-                    open.view
-                        .update(cx, |view, cx| view.apply(update, window, cx));
+                    // One let go hears what came since once followed again.
+                    if open.let_go.is_none() {
+                        open.view
+                            .update(cx, |view, cx| view.apply(update, window, cx));
+                    }
                 } else if let Some(draft) = self.draft_with(&session, cx) {
                     draft.update(cx, |draft, cx| draft.apply(update, window, cx));
                 }
             }
-            DaemonEvent::Detached { session, reason } => match reason {
-                Detached::Behind => self.reattach(&key(session), window, cx),
-                Detached::Deleted => self.session_deleted(&key(session), window, cx),
-                Detached::Restarting => self.expect_restart(machine),
-                Detached::Unloaded => {
-                    if let Some(open) = self.opened(&key(session)) {
-                        open.view.update(cx, |view, _| view.unload());
+            DaemonEvent::Detached { session, reason } => {
+                let session = key(session);
+                match reason {
+                    // Unless the app let it go meanwhile.
+                    Detached::Behind
+                        if self
+                            .opened(&session)
+                            .is_some_and(|open| open.let_go.is_none()) =>
+                    {
+                        self.reattach(&session, window, cx);
+                    }
+                    Detached::Behind => {}
+                    Detached::Deleted => self.session_deleted(&session, window, cx),
+                    Detached::Restarting => self.expect_restart(machine),
+                    Detached::Unloaded => {
+                        if let Some(open) = self.opened(&session) {
+                            open.view.update(cx, |view, _| view.unload());
+                        }
                     }
                 }
-            },
+            }
             DaemonEvent::AgentSettingsChanged(changed) => {
                 self.rho_settings
                     .update(cx, |settings, cx| settings.changed(machine, changed, cx));
@@ -951,35 +974,58 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // The connection that one let go was followed in is gone, and with
+        // it what its detach waited on.
+        for open in &mut self.sessions {
+            if open.id.machine == *machine && open.let_go.is_some() {
+                open.let_go = Some(Task::ready(()));
+            }
+        }
         let open: Vec<SessionKey> = self
             .sessions
             .iter()
-            .filter(|open| open.id.machine == *machine)
+            .filter(|open| open.id.machine == *machine && open.let_go.is_none())
             .map(|open| open.id.clone())
             .collect();
         for id in open {
             self.reattach(&id, window, cx);
         }
+        // One let go is followed again if it was shown while the machine
+        // was away.
+        self.sync_following(window, cx);
     }
 
     /// Follows open session `id` again on the same view, on its machine's
     /// daemon now, from where its events left off: the daemon stopped
-    /// sending them, or the machine connected again. A daemon that still
+    /// sending them, the machine connected again, or the app let it go
+    /// and shows it again. A daemon that still
     /// has the events after that sends only those, so the view keeps its
     /// scroll position and what is unfolded. A subagent's session is
     /// observed again; a view with nothing to follow is left as it is.
     fn reattach(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(view) = self.opened(id).map(|open| open.view.clone()) else {
-            return;
-        };
         let Some((daemon, epoch)) = self.ready(&id.machine) else {
             return;
         };
-        let Some(follow) = view.update(cx, |view, cx| view.reattach(daemon.clone(), cx)) else {
+        let Some(open) = self.sessions.iter_mut().find(|open| open.id == *id) else {
             return;
         };
+        let detach = open.let_go.take();
         let id = id.clone();
         cx.spawn_in(window, async move |this, cx| {
+            // Where its events left off is known once the detach ended
+            // their old subscription.
+            if let Some(detach) = detach {
+                detach.await;
+            }
+            let follow = this.update(cx, |this, cx| {
+                // Left again before this ran, it stays let go.
+                let open = this.opened(&id).filter(|open| open.let_go.is_none())?;
+                open.view
+                    .update(cx, |view, cx| view.reattach(daemon.clone(), cx))
+            });
+            let Ok(Some(follow)) = follow else {
+                return;
+            };
             let cursor = follow.cursor.as_ref();
             let attached = if follow.observe {
                 daemon.observe(&id.id, cursor).await
@@ -1326,8 +1372,6 @@ impl RhoApp {
         } else if let Some(open) = self.opened(id) {
             open.view
                 .update(cx, |view, cx| view.attached(attached, window, cx));
-            // One left while it attached can go now.
-            self.close_idle_sessions(cx);
         } else if attached.is_ok() {
             let (daemon, id) = (daemon.clone(), id.id.clone());
             cx.spawn(async move |_, _| {
@@ -1528,7 +1572,8 @@ impl RhoApp {
         let Some(closed) = self.opened(id).map(|open| open.view.clone()) else {
             return;
         };
-        self.take_sessions(&closed, cx);
+        self.sessions
+            .retain(|open| open.view != closed && !open.view.read(cx).descends_from(&closed, cx));
         let gone = match &self.pane {
             Pane::Session(view) => !self.sessions.iter().any(|open| open.view == *view),
             Pane::Empty | Pane::Draft(_) => false,
@@ -1539,64 +1584,53 @@ impl RhoApp {
         cx.notify();
     }
 
-    /// Takes `closed` out of the open sessions, with the subagents' opened
-    /// under it.
-    fn take_sessions(&mut self, closed: &Entity<SessionView>, cx: &App) -> Vec<OpenSession> {
-        self.sessions
-            .extract_if(.., |open| {
-                open.view == *closed || open.view.read(cx).descends_from(closed, cx)
-            })
-            .collect()
-    }
-
-    /// Lets go of each open session that is off screen and can close (see
-    /// [`SessionView::can_close`]): the daemon may unload it, its sidebar
-    /// row follows the daemon's jobs again, and opening it again replays
-    /// it, as opening any saved session does. Replaying the five largest
-    /// sessions of a rho home (6.6 to 18 MB saved) took 80 to 320 ms from a
-    /// local rho 3.1 daemon, so nothing is kept for a quick return.
-    fn close_idle_sessions(&mut self, cx: &mut Context<'_, Self>) {
+    /// Follows the session on screen again if the app let it go, and lets
+    /// go of each one off screen that can go (see
+    /// [`SessionView::can_let_go`]), so its daemon can unload it. One let go
+    /// keeps its view, and its sidebar row follows the daemon's jobs until
+    /// the view catches up again. Reopening a session from its daemon took
+    /// 115 to 310 ms for saved sessions of 12 to 68 MB on a local rho 3.3
+    /// daemon, while keeping four of those loaded held about 300 MB of the
+    /// daemon's memory, and a session it holds can't be opened in rho's
+    /// terminal UI.
+    fn sync_following(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let shown = match &self.pane {
-            Pane::Session(view) => Some(view.clone()),
+            Pane::Session(view) => Some(view),
             Pane::Empty | Pane::Draft(_) => None,
         };
-        // A subagent's session on screen keeps the sessions above it.
-        let on_screen = |view: &Entity<SessionView>| {
-            shown
-                .as_ref()
-                .is_some_and(|shown| shown == view || shown.read(cx).descends_from(view, cx))
-        };
-        let idle: Vec<Entity<SessionView>> = self
-            .sessions
-            .iter()
-            .filter(|open| !on_screen(&open.view) && open.view.read(cx).can_close(cx))
-            .map(|open| open.view.clone())
-            .collect();
-        for view in idle {
-            for closed in self.take_sessions(&view, cx) {
-                let (subagent, follows) = {
-                    let view = closed.view.read(cx);
-                    // An unloaded or failed one has nothing to let go of.
-                    (view.is_subagent(), view.follows_again())
-                };
-                if !subagent {
-                    self.sidebar
-                        .update(cx, |sidebar, cx| sidebar.close_live(&closed.id, cx));
+        let mut follow = None;
+        let mut let_go = Vec::new();
+        for (ix, open) in self.sessions.iter().enumerate() {
+            match (&open.let_go, shown == Some(&open.view)) {
+                (Some(_), true) => follow = Some(open.id.clone()),
+                (None, false) if open.view.read(cx).can_let_go() => {
+                    if let Some((daemon, _)) = self.ready(&open.id.machine) {
+                        let_go.push((ix, daemon));
+                    }
                 }
-                if let Some(daemon) = self.daemon(&closed.id.machine).filter(|_| follows) {
-                    let (daemon, id) = (daemon.clone(), closed.id.id);
-                    cx.spawn(async move |_, _| {
-                        let _ = daemon.detach(&id).await;
-                    })
-                    .detach();
-                }
+                _ => {}
             }
+        }
+        for (ix, daemon) in let_go {
+            let open = &self.sessions[ix];
+            let id = open.id.clone();
+            if !open.view.read(cx).is_subagent() {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.forget_live(&id, cx));
+            }
+            self.sessions[ix].let_go = Some(cx.spawn(async move |_, _| {
+                let _ = daemon.detach(&id.id).await;
+            }));
+        }
+        if let Some(id) = follow {
+            self.reattach(&id, window, cx);
         }
     }
 
     /// Shows `pane` in the main area and puts the keyboard in it.
     fn show(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.set_pane(pane, cx);
+        self.sync_following(window, cx);
         self.focus_pane(window, cx);
     }
 
@@ -1639,7 +1673,6 @@ impl RhoApp {
             .update(cx, |sidebar, cx| sidebar.set_active(active, cx));
         self.panel
             .update(cx, |panel, cx| panel.set_session(session, cx));
-        self.close_idle_sessions(cx);
         cx.notify();
     }
 
@@ -1833,8 +1866,9 @@ impl RhoApp {
                         this.sidebar
                             .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
                     }
-                    // Off screen, a turn that ended may leave it idle.
-                    this.close_idle_sessions(cx);
+                    // Off screen, a turn that ended, or the replay that
+                    // caught up, may leave it idle.
+                    this.sync_following(window, cx);
                 }
                 SessionEvent::Prompted => {
                     let id = view.read(cx).key();
@@ -1868,6 +1902,7 @@ impl RhoApp {
         self.sessions.push(OpenSession {
             id,
             view,
+            let_go: None,
             _subscription: subscription,
         });
     }
@@ -1932,11 +1967,6 @@ impl RhoApp {
             Pane::Session(view) => Some(view.clone()),
             Pane::Empty | Pane::Draft(_) => None,
         }
-    }
-    /// Whether `id`'s view is open, so the app follows the session, for UI
-    /// tests.
-    pub(crate) fn is_open(&self, id: &SessionKey) -> bool {
-        self.opened(id).is_some()
     }
     /// The new session's draft the main pane shows, for UI tests.
     pub(crate) fn draft(&self) -> Option<Entity<DraftView>> {

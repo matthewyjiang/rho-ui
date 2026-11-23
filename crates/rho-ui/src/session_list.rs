@@ -457,9 +457,10 @@ impl SessionList {
         true
     }
 
-    /// Forgets what an open session's view said about it, once the view is
-    /// gone: its row shows what the daemon's jobs say again.
-    pub(crate) fn close_live(&mut self, id: &SessionKey) {
+    /// Forgets what an open session's view said about it, once the app
+    /// stops following the session: its row shows what the daemon's jobs
+    /// say again, until the view follows it again and catches up.
+    pub(crate) fn forget_live(&mut self, id: &SessionKey) {
         let settled = self
             .live
             .iter()
@@ -1116,7 +1117,7 @@ mod tests {
         assert!(!done(&mut list), "working again");
 
         // A turn another client ran, seen through the daemon's jobs.
-        list.close_live(&id("a"));
+        list.forget_live(&id("a"));
         list.set_jobs(&here(), vec![job("a", JobActivity::Working, None)], now, 7);
         list.set_jobs(&here(), Vec::new(), now, 8);
         assert!(done(&mut list));
@@ -1140,8 +1141,8 @@ mod tests {
         list.set_live(live("a", None, Activity::Working(now)), 0, 12);
         list.set_jobs(&here(), vec![job("a", JobActivity::Working, None)], now, 12);
         list.set_live(live("a", None, Activity::Idle), 0, 13);
-        list.close_live(&id("a"));
-        assert!(done(&mut list), "Done outlives the view");
+        list.forget_live(&id("a"));
+        assert!(done(&mut list), "Done outlives following the session");
         assert_eq!(
             list.row(&id("a")).map(|row| row.activity),
             Some(Activity::Idle)
