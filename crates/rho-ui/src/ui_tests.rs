@@ -3074,6 +3074,34 @@ fn a_left_session_is_let_go_once_idle() {
     ui.shot("reopened");
 }
 
+/// A project with an origin remote gets a button beside its name in the
+/// title bar that opens the repository's page; `repo::web_url` owns which
+/// page. Headless GPUI records no opened URL, so this checks the button.
+#[test]
+fn a_projects_title_bar_links_its_repository() {
+    let checkout = tempfile::tempdir().unwrap();
+    let repo = rho_ui_core::platform::canonicalize(checkout.path()).unwrap();
+    let git = |args: &[&str]| crate::local::test::git(&repo, args);
+    git(&["init", "-q", "-b", "main"]);
+    git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "title-repo",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            workspace: Some(repo.clone()),
+            ..Machines::default()
+        },
+    );
+    ui.click("new-session");
+    ui.wait_until("the repository's link", |window, _, _| {
+        is_visible(window, "draft-view") && is_visible(window, "title-repo")
+    });
+    ui.act(|window, cx| window.hover("title-repo", cx));
+    ui.shot("hover");
+}
+
 /// The title bar lists the directories a session reaches besides its
 /// workspace, and adds one: a path the daemon refuses says why and stays
 /// in the box to fix, and one it takes is listed, as the session has it.

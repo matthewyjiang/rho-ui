@@ -2,14 +2,19 @@
 //! what the pane shows, each step nested under the one before it, as
 //! `rho-ui / Fix the parser / Read the parser` for a subagent's session
 //! under the session that started it. The project can start a new session
-//! in it, and every step but the last links back to it; controls for what the pane shows sit at the right, and at the right
-//! edge, while the right panel is hidden, the toggle that shows it.
+//! in it, a button beside it opens the repository's web page, and every
+//! step but the last links back to it; controls for what the pane shows sit
+//! at the right, and at the right edge, while the right panel is hidden, the
+//! toggle that shows it.
 //!
 //! Kit's `Breadcrumb` separates its items with chevrons and gives UI tests
 //! no way to find them; this bar uses slashes, and tests find each step.
 
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{h_flex, ActiveTheme as _, StyledExt as _};
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    h_flex, ActiveTheme as _, IconName, Sizable as _, StyledExt as _,
+};
 use gpui_kit::{
     div, rems, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
@@ -17,6 +22,7 @@ use gpui_kit::{
 
 use crate::{
     badge::Badge,
+    repo,
     right_panel::{self, PanelLayout},
     workspaces::Workspace,
 };
@@ -47,6 +53,8 @@ type Go = Box<dyn Fn(&mut Window, &mut App)>;
 pub(crate) struct TitleBar {
     initials: SharedString,
     project: SharedString,
+    /// The repository's web page, from its origin remote.
+    repo_page: Option<String>,
     /// What a click on the project does; without it, the project is text.
     on_project: Option<Go>,
     /// The steps between the project and the title, each with what a click
@@ -62,6 +70,7 @@ impl TitleBar {
         Self {
             initials: workspace.initials.clone(),
             project: workspace.short_name.clone(),
+            repo_page: workspace.origin().and_then(repo::web_url),
             on_project: None,
             parents: Vec::new(),
             title: title.into(),
@@ -141,6 +150,14 @@ impl RenderOnce for TitleBar {
                 .into_any_element(),
             None => project.into_any_element(),
         };
+        let repo_page = self.repo_page.map(|url| {
+            Button::new("title-repo")
+                .ghost()
+                .xsmall()
+                .icon(IconName::ExternalLink)
+                .tooltip(format!("Open {url}"))
+                .on_click(move |_, _, cx| cx.open_url(&url))
+        });
         h_flex()
             .id("title-bar")
             .flex_shrink_0()
@@ -154,7 +171,13 @@ impl RenderOnce for TitleBar {
                     .flex_1()
                     .min_w_0()
                     .gap_3()
-                    .child(project)
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_1()
+                            .child(project)
+                            .children(repo_page),
+                    )
                     .child(slash())
                     .children(parents)
                     .child(
