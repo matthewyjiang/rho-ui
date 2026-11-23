@@ -91,9 +91,10 @@ const NOTICE_LINES: usize = 6;
 const NOTICE_PARAGRAPH_GAP: f32 = 0.2;
 
 /// A Markdown heading's size relative to the body text, by level. Kit 0.9.1
-/// steps down from 1.8 and sets `####` at body size, which left the `##` and
-/// `###` replies use barely bigger than their text; these follow GitHub's
-/// 2 / 1.5 / 1.25, a step larger below `#`, and keep `####` above the body.
+/// steps down from 1.8 and sets `####` at body size, so the `##` and `###`
+/// headings replies use came out barely bigger than their text; these follow
+/// GitHub's 2 / 1.5 / 1.25, a step larger below `#`, and keep `####` above
+/// the body.
 fn heading_scale(level: u8) -> f32 {
     match level {
         1 => 2.,
@@ -117,6 +118,12 @@ fn message_style(body: Pixels) -> TextViewStyle {
         ..TextViewStyle::default()
     }
     .heading_font_size(|level, body| body * heading_scale(level))
+}
+
+/// The body size of text in a user's bubble or a notice card: both set it
+/// `text_sm`, 0.875 rem (Kit's `BubbleContent`, and [`notice_card`]).
+fn small_text(cx: &App) -> Pixels {
+    cx.theme().font_size * 0.875
 }
 
 /// How long a code block's copy button shows a check after it copies, as
@@ -861,11 +868,7 @@ impl Transcript {
         };
         let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
         let mut text = TextView::new(detail)
-            // The card sets its text `text_sm`, 0.875 rem.
-            .style(
-                message_style(cx.theme().font_size * 0.875)
-                    .paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)),
-            )
+            .style(message_style(small_text(cx)).paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)))
             .code_block_actions(code_actions)
             .selectable(true);
         if !open {
@@ -1078,7 +1081,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                         .test_support()
                         .child(
                             TextView::new(text)
-                                .style(message_style(cx.theme().font_size))
+                                .style(message_style(small_text(cx)))
                                 .code_block_actions(code_actions)
                                 .markdown_extensions(message_extensions(pictures, ix))
                                 .selectable(true),
