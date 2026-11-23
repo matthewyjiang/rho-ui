@@ -86,6 +86,12 @@ rho-ui-core = { path = "../rho-ui-core", features = ["test-support"] }
 # Files to attach in tests.
 tempfile = "3"
 
+# build.rs: rho-ui.exe's icon, drawn from assets/icon.svg. The versions
+# GPUI already builds.
+[build-dependencies]
+embed-resource = "3"
+resvg = { version = "0.46", default-features = false }
+
 # The UI tests' text system on macOS, the one GPUI's Mac platform makes,
 # built alone: the platform must be made on the main thread, and tests run
 # on others. Same version as GPUI Kit pins, so features unify.
