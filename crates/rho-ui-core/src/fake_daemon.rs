@@ -88,6 +88,10 @@
 //!   writes: "r0", "r1", ... A write against an older revision is refused
 //!   as a conflict, unless only its own writer wrote since.
 //!   [`FakeDaemon::edit_agent_setting`] changes one as a hand edit does.
+//! - `rho/model/list` lists the models a session offers, "fake/small",
+//!   "fake/large" and "fake/huge", and no Claude Code models.
+//!   [`FakeDaemon::set_models`] changes that list, and sends it to each
+//!   client that listed, as a sign-in does; sessions keep their models.
 //! - Sessions run on [`KEY_AUTH`], which takes an API key and is signed in
 //!   unless [`Script::signed_out`]; then a session opens only with
 //!   `sign_in: later`. [`LOGIN_AUTH`] takes a login, whose prompt follows
@@ -135,8 +139,8 @@ use rho_protocol::{
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
-    DetachReason, ErrorCode, InputRequest, PermissionMode, PlanEntry, PlanStatus, ProtocolVersion,
-    Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
+    DetachReason, ErrorCode, InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus,
+    ProtocolVersion, Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
     SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
     TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
 };
@@ -144,6 +148,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader},
     runtime::Runtime,
+    sync::watch,
 };
 
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
@@ -588,6 +593,16 @@ impl FakeDaemon {
         self.service.lock().config.edit(key, value);
     }
 
+    /// Lists `models`, each a `(model, label)` of provider `fake`, as the
+    /// models a model setting may take, as a sign-in to another provider
+    /// changes them: every client that read them hears of it.
+    pub fn set_models(&self, models: &[(&str, &str)]) {
+        self.service
+            .lock()
+            .models
+            .send_replace(Arc::new(model_list(models)));
+    }
+
     /// Ends `session`'s oldest running background process by itself, with
     /// exit code `code`, as `sleep` exiting does; the daemon then starts a
     /// turn of its own to tell the model.
@@ -825,6 +840,27 @@ fn model(name: &str) -> ModelRef {
     }
 }
 
+/// `models`, each a `(model, label)` of provider `fake`, as a session and
+/// a model setting list them.
+fn model_choices(models: &[(&str, &str)]) -> Vec<ModelChoice> {
+    models
+        .iter()
+        .map(|(name, label)| ModelChoice {
+            model: model(name),
+            label: (*label).to_owned(),
+        })
+        .collect()
+}
+
+/// `models` as `rho/model/list` answers: no Claude Code models, since the
+/// fake's model setting runs on rho alone.
+fn model_list(models: &[(&str, &str)]) -> ModelList {
+    ModelList {
+        models: model_choices(models),
+        claude_cli: Vec::new(),
+    }
+}
+
 /// A session's settings, as `rho/session/configure` changes them.
 #[derive(Clone, Debug)]
 struct Settings {
@@ -865,13 +901,7 @@ impl Settings {
             model: ModelOptions {
                 current: self.model.clone(),
                 auth: KEY_AUTH.to_owned(),
-                available: MODELS
-                    .iter()
-                    .map(|(name, label)| ModelChoice {
-                        model: model(name),
-                        label: (*label).to_owned(),
-                    })
-                    .collect(),
+                available: model_choices(&MODELS),
             },
             reasoning: Some(ReasoningOptions {
                 current: self.reasoning,
@@ -1618,6 +1648,9 @@ struct State {
     extra_jobs: Vec<JobSummary>,
     /// rho's own settings.
     config: FakeConfig,
+    /// The models a model setting may take, which every client that read
+    /// them follows.
+    models: watch::Sender<Arc<ModelList>>,
     auth: FakeAuth,
     /// Restart as the next prompt arrives; see
     /// [`FakeDaemon::restart_at_next_prompt`].
@@ -1741,6 +1774,7 @@ impl State {
             steers: 0,
             extra_jobs: Vec::new(),
             config: FakeConfig::new(),
+            models: watch::Sender::new(Arc::new(model_list(&MODELS))),
             auth: FakeAuth::new(&script),
             restart_at_prompt: false,
         };

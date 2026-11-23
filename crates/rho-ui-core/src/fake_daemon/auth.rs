@@ -121,7 +121,11 @@ impl FakeAuth {
             message: "HTTP 404".to_owned(),
         });
         self.signed_in.insert(auth);
-        Ok(AuthKeyResponse { unchecked })
+        Ok(AuthKeyResponse {
+            unchecked,
+            // The fake keeps no model lists to fetch.
+            refreshed: Vec::new(),
+        })
     }
 
     pub(super) fn logout(&mut self, params: &AuthLogoutParams) -> AuthLogoutResponse {

@@ -26,7 +26,7 @@ use gpui_kit::{
     WindowBounds, WindowOptions,
 };
 use rho_ui_core::{
-    agent_settings::SettingValue,
+    agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
         report, subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
         REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
@@ -6498,6 +6498,58 @@ fn rho_settings_write_and_follow_the_daemon() {
     fake.edit_agent_setting("general.auto_compact", SettingValue::Bool(true));
     ui.wait_until("the hand edit on the page", switch_is(true));
     ui.shot("edited");
+}
+
+/// A model setting picks from the models the daemon lists, and its picker
+/// follows the daemon's list when a sign-in or a refresh changes it.
+#[test]
+fn a_model_setting_picks_from_the_daemons_models() {
+    let mut ui = Harness::start("model-setting", Script::default());
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Rho");
+    let picker = "setting-general.title_model";
+    let shows = |label: &'static str| {
+        move |window: &Window, _: &App, _: &RhoApp| {
+            window
+                .try_find(picker)
+                .is_some_and(|picker| picker.visible() && picker.value() == Some(label))
+        }
+    };
+    let fake_model = |model: &str| {
+        Some(SettingValue::Model(ModelSelection::Rho {
+            provider: "fake".to_owned(),
+            model: model.to_owned(),
+        }))
+    };
+    ui.wait_until("the default model picked", shows("Small"));
+
+    // Opens the picker and clicks `model`'s row once it is listed.
+    let pick = |ui: &mut Harness, model: &str| {
+        ui.click(picker);
+        let row = format!("setting-model-fake/{model}");
+        ui.wait_until(&format!("{model} listed"), |window, _, _| {
+            is_visible(window, row.clone())
+        });
+        // Past the menu's entrance, for the screenshot.
+        ui.cx.advance_clock(Duration::from_secs(1));
+        ui.shot(&format!("listed-{model}"));
+        ui.act(|window, cx| window.click(row, cx));
+    };
+    pick(&mut ui, "large");
+    ui.wait_until("Large picked", shows("Large"));
+    ui.wait_for_daemon("the daemon's file holds it", |fake| {
+        fake.agent_setting("general.title_model") == fake_model("large")
+    });
+    ui.shot("picked");
+
+    // A sign-in elsewhere reaches another model.
+    ui.fake()
+        .set_models(&[("small", "Small"), ("large", "Large"), ("tiny", "Tiny")]);
+    pick(&mut ui, "tiny");
+    ui.wait_until("the new model picked", shows("Tiny"));
+    ui.wait_for_daemon("the daemon's file holds it", |fake| {
+        fake.agent_setting("general.title_model") == fake_model("tiny")
+    });
 }
 
 /// A new session whose model has no credentials opens anyway, signed

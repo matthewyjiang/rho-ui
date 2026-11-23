@@ -1,7 +1,8 @@
 //! rho's own settings on each machine, its `config.toml`, as that machine's
-//! daemon describes them: read once its connection is up, then kept current
-//! by the daemon's changes, so Settings shows them at once and follows a
-//! change made in rho's terminal UI or by hand. [`crate::settings_view`]
+//! daemon describes them, with the models a model setting may take: read
+//! once its connection is up, then kept current by the daemon's changes, so
+//! Settings shows them at once and follows a change made in rho's terminal
+//! UI or by hand, and a sign-in that reaches more models. [`crate::settings_view`]
 //! draws them; changes made there are written back through here, one write
 //! at a time per machine.
 

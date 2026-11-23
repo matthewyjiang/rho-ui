@@ -20,15 +20,15 @@ use rho_protocol::{
     AuthLogoutResponse, BackgroundStatus, BuildId, ClientInfo, ConfigGetParams, ConfigSchema,
     ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus, DetachReason,
     ErrorCode, InputAnswer, InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream,
-    Operation, PermissionMode, PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost,
-    RpcError, Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
-    SessionAttachResponse, SessionBackgroundStopParams, SessionBackgroundStopResponse,
-    SessionCancelParams, SessionCancelResponse, SessionChange, SessionEvent, SessionHoldParams,
-    SessionHoldResponse, SessionNewParams, SessionNewResponse, SessionPromptParams,
-    SessionPromptResponse, SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
-    SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription, ToolKind,
-    ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse,
-    WorktreeVerdict, PROTOCOL_VERSION,
+    ModelListParams, ModelWatch, Operation, PermissionMode, PlanApprovalAsk, ProtocolVersion,
+    QuestionAsk, RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
+    SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
+    SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
+    SessionEvent, SessionHoldParams, SessionHoldResponse, SessionNewParams, SessionNewResponse,
+    SessionPromptParams, SessionPromptResponse, SessionSteerParams, SessionSteerResponse,
+    SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
+    SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
+    WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -1036,5 +1036,9 @@ impl SettingsService for Fake {
 
     async fn set_config(&self, params: ConfigSetParams) -> Result<ConfigSetResponse, RpcError> {
         self.lock().config.set(params)
+    }
+
+    async fn list_models(&self, _: ModelListParams) -> Result<ModelWatch, RpcError> {
+        Ok(ModelWatch::new(self.lock().models.subscribe()))
     }
 }

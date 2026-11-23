@@ -3,7 +3,9 @@
 //! with no change here. Each item is the setting's label, its help and when
 //! a change applies, and a control for its kind: a switch, a dropdown of
 //! choices, a number or text box (applied on Enter or when it loses the
-//! keyboard), or, for a model, its name, which rho's terminal UI changes.
+//! keyboard), or, for a model, a searchable picker of the models the
+//! daemon lists ([`models`]). A daemon that can't list them shows the
+//! model's name alone.
 //! A setting the user's file sets can be reset to its default from the
 //! page's reset button.
 //!
@@ -15,6 +17,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     input::{Input, InputEvent, InputState, NumberInput},
+    select::Select,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage},
     switch::Switch,
     v_flex, ActiveTheme as _, Sizable as _,
@@ -25,8 +28,8 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     agent_settings::{
-        Applies, ConfigCategory, IntegerUnit, ModelSelection, SettingChange, SettingKey,
-        SettingKind, SettingSpec, SettingValue,
+        Applies, ConfigCategory, IntegerUnit, ListedModels, SettingChange, SettingKey, SettingKind,
+        SettingSpec, SettingValue,
     },
     AgentSettings,
 };
@@ -38,15 +41,19 @@ use crate::{
     machines::{MachineId, Machines},
     rho_settings::{Loaded, RhoSettings},
 };
+use models::{selection_name, ModelPicker};
 
-/// The rho pages' own state: which machine they show, and the text boxes
-/// of its text and number settings.
+mod models;
+
+/// The rho pages' own state: which machine they show, the text boxes of
+/// its text and number settings, and the pickers of its model settings.
 pub(super) struct RhoFields {
     settings: Entity<RhoSettings>,
     machine: PickedMachine,
     inputs: Vec<SettingInput>,
-    /// The machine whose settings `inputs` hold.
-    inputs_for: Option<MachineId>,
+    models: Vec<ModelPicker>,
+    /// The machine whose settings `inputs` and `models` hold.
+    controls_for: Option<MachineId>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -74,7 +81,7 @@ impl RhoFields {
         let subscriptions = [
             // A change from this page, another client, or a hand edit.
             cx.observe_in(&settings, window, |this, _, window, cx| {
-                this.sync_rho_inputs(window, cx);
+                this.sync_rho_controls(window, cx);
                 cx.notify();
             }),
             // A machine connecting, failing, or leaving the list.
@@ -84,7 +91,8 @@ impl RhoFields {
             settings,
             machine: PickedMachine::new(),
             inputs: Vec::new(),
-            inputs_for: None,
+            models: Vec::new(),
+            controls_for: None,
             _subscriptions: subscriptions,
         }
     }
@@ -137,7 +145,8 @@ impl SettingRef {
 enum Note {
     /// Why there are no settings to show yet.
     Status(String),
-    /// A problem in the file, which rho works around.
+    /// A problem rho works around: one in the file, or models it
+    /// couldn't list.
     Warning(String),
     /// A change of the user's that didn't land as made.
     Problem(SharedString),
@@ -157,16 +166,29 @@ impl SettingsView {
     }
 
     /// Gives each text and number setting of the shown machine a text box,
-    /// showing its value unless the user is typing in it, and drops the
-    /// boxes of settings that are gone. Called as the settings change, and
-    /// as the page draws a machine it hasn't yet.
-    pub(super) fn sync_rho_inputs(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// and each model setting a picker, showing its value, and drops the
+    /// controls of settings that are gone. Called as the settings change,
+    /// and as the page draws a machine it hasn't yet.
+    pub(super) fn sync_rho_controls(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let machine = self.rho_machine(cx);
-        if self.rho.inputs_for.as_ref() != Some(&machine) {
+        if self.rho.controls_for.as_ref() != Some(&machine) {
             self.rho.inputs.clear();
-            self.rho.inputs_for = Some(machine.clone());
+            self.rho.models.clear();
+            self.rho.controls_for = Some(machine.clone());
         }
-        let wanted = match self.rho.settings.read(cx).loaded(&machine) {
+        self.sync_text_boxes(&machine, window, cx);
+        self.sync_model_pickers(&machine, window, cx);
+    }
+
+    /// The text boxes of [`Self::sync_rho_controls`]: each shows its
+    /// setting's value unless the user is typing in it.
+    fn sync_text_boxes(
+        &mut self,
+        machine: &MachineId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let wanted = match self.rho.settings.read(cx).loaded(machine) {
             Some(Loaded::Ready(settings)) => text_settings(settings),
             _ => Vec::new(),
         };
@@ -237,12 +259,12 @@ impl SettingsView {
                     settings.set_problem(&machine, why.into(), cx);
                 }
             }),
-            Typed::Nothing => self.sync_rho_inputs(window, cx),
+            Typed::Nothing => self.sync_rho_controls(window, cx),
             Typed::Refused(why) => {
                 self.rho.settings.update(cx, |settings, cx| {
                     settings.set_problem(&machine, why.into(), cx);
                 });
-                self.sync_rho_inputs(window, cx);
+                self.sync_rho_controls(window, cx);
             }
         }
     }
@@ -256,9 +278,9 @@ impl SettingsView {
         cx: &mut Context<'_, Self>,
     ) -> SettingPage {
         let machine = self.rho_machine(cx);
-        // The boxes follow the machine picked since the last draw.
-        if self.rho.inputs_for.as_ref() != Some(&machine) {
-            self.sync_rho_inputs(window, cx);
+        // The controls follow the machine picked since the last draw.
+        if self.rho.controls_for.as_ref() != Some(&machine) {
+            self.sync_rho_controls(window, cx);
         }
         let view = cx.entity().downgrade();
         let machines = self.machine_list.read(cx);
@@ -310,6 +332,11 @@ impl SettingsView {
             .filter(|(_, shown)| !shown.is_empty())
             .collect();
         notes.extend(file_notes(settings, &categories));
+        if let ListedModels::Failed(why) = settings.models() {
+            notes.push(Note::Warning(format!(
+                "Couldn't list the models Rho runs, so model settings only show their value: {why}"
+            )));
+        }
         let groups = categories
             .into_iter()
             .map(|(category, shown)| self.category_group(category, shown, settings, &machine))
@@ -423,19 +450,33 @@ impl SettingsView {
                         .w(rems(CONTROL_REMS))
                 })
             }
-            // rho's terminal UI picks models from a session's list, which
-            // Settings doesn't have, so the model only shows here.
             SettingKind::Model { .. } => {
                 let id = SharedString::from(format!("setting-{}", spec.key));
-                SettingField::render(move |_, _, cx| {
-                    div()
-                        .id(id.clone())
-                        .test_support()
-                        .w(rems(CONTROL_REMS))
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(model_name(setting.value(cx).as_ref()))
-                })
+                match self.model_picker_for(&spec.key) {
+                    Some(state) => {
+                        let label = SharedString::from(spec.label.clone());
+                        SettingField::render(move |options, _, _| {
+                            Select::new(&state)
+                                .id(id.clone())
+                                .with_size(options.size())
+                                .accessibility_label(label.clone())
+                                .placeholder("Not set")
+                                .w(rems(CONTROL_REMS))
+                                .menu_width(rems(20.))
+                        })
+                    }
+                    // A daemon that can't list the models: the model only
+                    // shows here.
+                    None => SettingField::render(move |_, _, cx| {
+                        div()
+                            .id(id.clone())
+                            .test_support()
+                            .w(rems(CONTROL_REMS))
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(model_name(setting.value(cx).as_ref()))
+                    }),
+                }
             }
             _ => return None,
         }
@@ -443,8 +484,8 @@ impl SettingsView {
         Some(SettingItem::new(spec.label.clone(), field).description(description(spec, settings)))
     }
 
-    /// The text box of setting `key`, once [`Self::sync_rho_inputs`] made
-    /// it.
+    /// The text box of setting `key`, once [`Self::sync_rho_controls`]
+    /// made it.
     fn input_for(&self, key: &SettingKey) -> Option<Entity<InputState>> {
         self.rho
             .inputs
@@ -552,12 +593,14 @@ fn header_group(picker: Option<SettingItem>, notes: Vec<Note>) -> Option<Setting
     Some(group)
 }
 
-/// `spec`'s help, when a change applies, where to change a model, and the
-/// file's problem with its value, if any.
+/// `spec`'s help, when a change applies, where to change a model on a rho
+/// too old to list the models, and the file's problem with its value, if
+/// any.
 fn description(spec: &SettingSpec, settings: &AgentSettings) -> String {
     let mut text = spec.help.clone();
-    let model = matches!(spec.kind, SettingKind::Model { .. })
-        .then_some("Change it with /config in Rho's terminal UI.");
+    let model = (matches!(spec.kind, SettingKind::Model { .. })
+        && matches!(settings.models(), ListedModels::Unsupported))
+    .then_some("Change it with /config in Rho's terminal UI.");
     for sentence in [applies(spec.applies), model].into_iter().flatten() {
         if !text.is_empty() {
             text.push(' ');
@@ -601,12 +644,7 @@ fn unit_label(unit: IntegerUnit) -> Option<&'static str> {
 /// A model setting's value as rho names it.
 fn model_name(value: Option<&SettingValue>) -> SharedString {
     match value {
-        Some(SettingValue::Model(ModelSelection::Rho { provider, model })) => {
-            format!("{provider}/{model}").into()
-        }
-        Some(SettingValue::Model(ModelSelection::ClaudeCli { model })) => {
-            format!("claude-code/{}", model.as_deref().unwrap_or("default")).into()
-        }
+        Some(SettingValue::Model(model)) => selection_name(model).into(),
         Some(SettingValue::Text(text)) => text.clone().into(),
         _ => "Not set".into(),
     }
