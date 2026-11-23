@@ -34,7 +34,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, rems, transparent_white, AnyElement, App, AppContext as _, ClipboardItem, ElementId,
-    Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    Entity, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window,
 };
 use rho_ui_core::{
@@ -90,14 +90,40 @@ const NOTICE_LINES: usize = 6;
 /// detail sets as tight as the card it is in.
 const NOTICE_PARAGRAPH_GAP: f32 = 0.2;
 
-/// How messages and notices draw their Markdown.
-fn message_style() -> TextViewStyle {
+/// A Markdown heading's size relative to the body text, by level. Kit 0.9.1
+/// steps down from 1.8 and sets `####` at body size, so the `##` and `###`
+/// headings replies use came out barely bigger than their text; these follow
+/// GitHub's 2 / 1.5 / 1.25, a step larger below `#`, and keep `####` above
+/// the body.
+fn heading_scale(level: u8) -> f32 {
+    match level {
+        1 => 2.,
+        2 => 1.6,
+        3 => 1.3,
+        4 => 1.15,
+        5 => 1.,
+        _ => 0.9,
+    }
+}
+
+/// How messages and notices draw their Markdown, around body text of size
+/// `body`. Kit's heading sizes are pixels, so they come from `body` to follow
+/// the UI scale.
+fn message_style(body: Pixels) -> TextViewStyle {
     TextViewStyle {
+        heading_base_font_size: body,
         code_block: StyleRefinement::default()
             .pt(px(CODE_BLOCK_PAD_TOP))
             .pb(px(CODE_BLOCK_PAD_BOTTOM)),
         ..TextViewStyle::default()
     }
+    .heading_font_size(|level, body| body * heading_scale(level))
+}
+
+/// The body size of text in a user's bubble or a notice card: both set it
+/// `text_sm`, 0.875 rem (Kit's `BubbleContent`, and [`notice_card`]).
+fn small_text(cx: &App) -> Pixels {
+    cx.theme().font_size * 0.875
 }
 
 /// How long a code block's copy button shows a check after it copies, as
@@ -842,7 +868,7 @@ impl Transcript {
         };
         let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
         let mut text = TextView::new(detail)
-            .style(message_style().paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)))
+            .style(message_style(small_text(cx)).paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)))
             .code_block_actions(code_actions)
             .selectable(true);
         if !open {
@@ -1055,7 +1081,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                         .test_support()
                         .child(
                             TextView::new(text)
-                                .style(message_style())
+                                .style(message_style(small_text(cx)))
                                 .code_block_actions(code_actions)
                                 .markdown_extensions(message_extensions(pictures, ix))
                                 .selectable(true),
@@ -1073,7 +1099,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                 .into_any_element()
         }
         Entry::Agent(_) => {
-            let style = message_style();
+            let style = message_style(cx.theme().font_size);
             // The gap Kit would leave after the part's last block, were
             // the reply one text.
             let gap = style.paragraph_gap;
