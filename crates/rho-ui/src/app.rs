@@ -67,6 +67,7 @@ use crate::{
     settings::{Appearance, Settings},
     settings_view,
     sidebar::{ResizeSidebar, SidebarEvent, SidebarModels, SidebarState, SidebarView},
+    window_chrome,
     workspaces::{self, WorkspaceRef, Workspaces},
     worktrees::Worktrees,
     NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
@@ -257,7 +258,7 @@ pub(crate) struct RhoApp {
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
     focus_handle: FocusHandle,
-    _subscriptions: [Subscription; 7],
+    _subscriptions: [Subscription; 8],
 }
 
 impl RhoApp {
@@ -353,6 +354,11 @@ impl RhoApp {
                 // Machines added, removed or changed in the settings.
                 cx.observe_global_in::<Settings>(window, |this, window, cx| {
                     this.sync_machines(window, cx);
+                }),
+                // The UI scale sets the top row's height, which the traffic
+                // lights are centered in.
+                cx.observe_global_in::<Settings>(window, |_, window, cx| {
+                    window_chrome::place_traffic_lights(window, cx);
                 }),
                 // Pull requests wait while the window is unfocused.
                 cx.observe_window_activation(window, |this, window, cx| {
@@ -1875,7 +1881,12 @@ impl RhoApp {
     /// The main pane when no session is open.
     /// The main pane: the session or draft on screen, else the empty one,
     /// or while this machine has no rho, the offer to install it.
-    fn render_main(&self, style: StyleRefinement, cx: &mut Context<'_, Self>) -> AnyElement {
+    fn render_main(
+        &self,
+        style: StyleRefinement,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> AnyElement {
         let setup = self
             .installs
             .read(cx)
@@ -1886,12 +1897,26 @@ impl RhoApp {
             Pane::Draft(view) => view.read(cx).request().0.machine.is_local(),
             Pane::Session(_) => false,
         };
+        // Panes without a title bar move the window from their top.
+        let strip = window_chrome::top_strip(window, cx);
+        let untitled = |pane: AnyElement| {
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(pane)
+                .children(strip)
+                .into_any_element()
+        };
         match (&self.pane, setup) {
             // This machine has no rho, so nothing here can work yet.
-            (_, Some(offer)) if on_this_machine => render_setup(&self.installs, &offer, cx),
+            (_, Some(offer)) if on_this_machine => {
+                untitled(render_setup(&self.installs, &offer, cx))
+            }
             (Pane::Session(view), _) => view.clone().cached(style).into_any_element(),
             (Pane::Draft(view), _) => view.clone().cached(style).into_any_element(),
-            (Pane::Empty, _) => Self::render_no_session(cx).into_any_element(),
+            (Pane::Empty, _) => untitled(Self::render_no_session(cx).into_any_element()),
         }
     }
 
@@ -2019,10 +2044,10 @@ impl Render for RhoApp {
             .child(Kinetic::hook(&self.kinetic));
 
         let pane_style = || StyleRefinement::default().flex_1().min_w_0().h_full();
-        let sidebar_width = self.sidebar.read(cx).width();
+        let sidebar_width = self.sidebar.read(cx).width(cx);
         let rem = f32::from(window.rem_size());
         let row = f32::from(window.viewport_size().width) / rem;
-        let main = self.render_main(pane_style(), cx);
+        let main = self.render_main(pane_style(), window, cx);
         root.child(
             h_flex()
                 .size_full()
@@ -2035,7 +2060,7 @@ impl Render for RhoApp {
                         let bounds = event.bounds;
                         let width = f32::from(bounds.right() - event.event.position.x) / rem;
                         let row = f32::from(bounds.size.width) / rem;
-                        let sidebar = this.sidebar.read(cx).width().0;
+                        let sidebar = this.sidebar.read(cx).width(cx).0;
                         PanelLayout::resize(width, row, sidebar, cx);
                     },
                 ))
@@ -2049,7 +2074,7 @@ impl Render for RhoApp {
                         let bounds = event.bounds;
                         let width = f32::from(event.event.position.x - bounds.left()) / rem;
                         let row = f32::from(bounds.size.width) / rem;
-                        let sidebar = this.sidebar.read(cx).width().0;
+                        let sidebar = this.sidebar.read(cx).width(cx).0;
                         let panel = if PanelLayout::get(cx) {
                             PanelLayout::width(row, sidebar, cx).0
                         } else {
@@ -2084,6 +2109,8 @@ impl Render for RhoApp {
                     )
                 }),
         )
+        .children(window_chrome::drag_areas(cx))
+        .children(window_chrome::caption_buttons(window, cx))
         .into_any_element()
     }
 }

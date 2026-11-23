@@ -44,6 +44,7 @@ use gpui_kit::component::{
     v_flex, ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Selectable as _,
     Sizable as _, StyledExt as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, rems, AnyElement, App, AppContext as _, Axis, BorrowAppContext as _, Context, Entity,
     Global, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, ScrollHandle,
@@ -64,6 +65,7 @@ use crate::{
     session_view::{SessionEvent, SessionView},
     store::{Key, StateDb},
     title_bar::TOP_ROW_REMS,
+    window_chrome::{self, DragArea, MovesWindow as _},
     workspaces::Workspaces,
 };
 
@@ -200,12 +202,12 @@ impl PanelLayout {
 
     /// The panel's width in a row `row` wide that also holds a sidebar
     /// `sidebar` wide, both in rems: as the user left it, but leaving the
-    /// main pane [`MIN_PANE_REMS`], and never under [`MIN_WIDTH_REMS`].
+    /// main pane [`MIN_PANE_REMS`], and never under [`least`].
     pub(crate) fn width(row: f32, sidebar: f32, cx: &App) -> Rems {
         let width = cx
             .try_global::<Self>()
             .map_or(DEFAULT_WIDTH_REMS, |this| this.width);
-        rems(fit(width, row - sidebar - MIN_PANE_REMS))
+        rems(fit(width, row - sidebar - MIN_PANE_REMS, cx))
     }
 
     /// Shows the panel, or hides it, and saves which.
@@ -221,7 +223,7 @@ impl PanelLayout {
     /// a sidebar `sidebar` wide, as a drag of its edge goes. Saved by
     /// [`Self::save_width`] when the drag ends.
     pub(crate) fn resize(width: f32, row: f32, sidebar: f32, cx: &mut App) {
-        let width = fit(width, row - sidebar - MIN_PANE_REMS);
+        let width = fit(width, row - sidebar - MIN_PANE_REMS, cx);
         cx.update_global(|this: &mut Self, _| this.width = width);
     }
 
@@ -238,10 +240,16 @@ impl PanelLayout {
     }
 }
 
-/// `width`, held to the `room` there is, but at least [`MIN_WIDTH_REMS`]:
-/// a window too narrow for both squeezes the pane, not the panel.
-fn fit(width: f32, room: f32) -> f32 {
-    width.min(room).max(MIN_WIDTH_REMS)
+/// `width`, held to the `room` there is, but at least [`least`]: a window
+/// too narrow for both squeezes the pane, not the panel.
+fn fit(width: f32, room: f32, cx: &App) -> f32 {
+    width.min(room).max(least(cx))
+}
+
+/// The narrowest the panel goes, in rems: [`MIN_WIDTH_REMS`], and on
+/// Windows the room the window buttons take of its header besides.
+fn least(cx: &App) -> f32 {
+    MIN_WIDTH_REMS + window_chrome::caption_room_rems(cx)
 }
 
 /// What a drag of the panel's edge carries. The drag draws nothing: the
@@ -940,7 +948,9 @@ impl RightPanel {
 
     /// The tabs, +, and the toggle at the right edge, in a row as tall as
     /// the title bar beside it. Tabs that don't fit scroll, + staying put.
-    fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+    /// The room between + and the toggle moves the window, where the app
+    /// draws the title bar.
+    fn render_header(&self, window: &Window, cx: &Context<'_, Self>) -> impl IntoElement {
         let menu_view = cx.entity().downgrade();
         let set = self.set();
         let tabs = set.into_iter().flat_map(|set| {
@@ -954,13 +964,14 @@ impl RightPanel {
             .h(rems(TOP_ROW_REMS))
             .gap_1()
             // The title bar's inset, so the toggle doesn't move.
-            .px_4()
+            .pl_4()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
+                    .h_full()
                     .gap_1()
                     .child(
                         h_flex()
@@ -981,9 +992,19 @@ impl RightPanel {
                             .dropdown_menu(move |menu, _, _| {
                                 Self::surface_menu(menu, &menu_view, &openable)
                             })
-                    })),
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .moves_window(DragArea::PanelHeader, window, cx),
+                    ),
             )
             .child(toggle_button(cx))
+            .map(|row| match window_chrome::caption_room(window, cx) {
+                Some(room) => row.child(room),
+                None => row.pr_4(),
+            })
     }
 
     /// The surfaces `set` can open, centered.
@@ -1051,7 +1072,7 @@ fn message(text: impl Into<SharedString>, media: Option<AnyElement>) -> AnyEleme
 }
 
 impl Render for RightPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let body = match self.set() {
             None => message("Open a session to use its surfaces.", None),
             Some(set) => match set.active.and_then(|key| set.tab(key)) {
@@ -1066,7 +1087,7 @@ impl Render for RightPanel {
             .size_full()
             .border_l_1()
             .border_color(cx.theme().border)
-            .child(self.render_header(cx))
+            .child(self.render_header(window, cx))
             .child(div().flex_1().min_h_0().child(body))
             // [`crate::app::RhoApp`] follows the drag, as it lays out the
             // row the panel sits in.

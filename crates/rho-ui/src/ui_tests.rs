@@ -50,8 +50,10 @@ use crate::{
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
     store::{Key, StateDb},
+    title_bar::TOP_ROW_REMS,
     turn_times::TurnTimes,
     unseen::Unseen,
+    window_chrome::Chrome,
 };
 
 mod live;
@@ -288,6 +290,9 @@ impl Harness {
         // tasks, which the deterministic scheduler only accepts this way.
         cx.allow_parking();
         cx.update(|cx| crate::init(cx, &state));
+        // Every platform lays the app out alike: the tests of the app's own
+        // title bar set theirs.
+        cx.update(|cx| cx.set_global(Chrome::System));
         cx.update(|cx| settings.apply(cx));
         // A remote machine reaches its fake daemon, never ssh: a host
         // without one gets a socket that isn't there.
@@ -3661,6 +3666,63 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
     ui.click("toggle-right-panel");
     ui.act(|window, _| assert!(!is_visible(window, "right-panel")));
     assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("hidden"));
+}
+
+/// With Windows' window buttons drawn over the top row's right end, the
+/// control at that end still takes clicks: the title bar's panel toggle,
+/// then the panel's own.
+#[test]
+fn windows_buttons_leave_the_top_rows_controls_clickable() {
+    let mut ui = Harness::start("windows-chrome", Script::default());
+    ui.cx.update(|cx| {
+        let chrome = Chrome::windows(cx);
+        cx.set_global(chrome);
+    });
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("session-local-s1");
+    ui.wait_until("the session and the window buttons", |window, _, _| {
+        is_visible(window, "session-title") && is_visible(window, "window-close")
+    });
+    ui.shot("session");
+
+    ui.click("toggle-right-panel");
+    ui.act(|window, _| assert!(is_visible(window, "right-panel"), "shown"));
+    ui.shot("panel");
+    ui.click("toggle-right-panel");
+    ui.act(|window, _| assert!(!is_visible(window, "right-panel"), "hidden"));
+    assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("hidden"));
+}
+
+/// On macOS the traffic lights take the sidebar's top row, and draw over
+/// the app where a click can't reach it: the rail's toggle goes under that
+/// row, and still opens the sidebar.
+#[test]
+fn macs_traffic_lights_leave_the_rails_toggle_clickable() {
+    let mut ui = Harness::start("mac-chrome", Script::default());
+    ui.cx.update(|cx| cx.set_global(Chrome::Mac));
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("toggle-sidebar");
+    ui.wait_until("the rail", |window, _, _| {
+        is_visible(window, "sidebar-rail")
+    });
+    ui.act(|window, _| {
+        let toggle = bounds(window, "toggle-sidebar").expect("the rail's toggle is drawn");
+        let lights = window.rem_size() * TOP_ROW_REMS;
+        assert!(
+            toggle.top() >= lights,
+            "{toggle:?} is under the lights' row"
+        );
+    });
+    ui.shot("rail");
+
+    ui.click("toggle-sidebar");
+    ui.act(|window, _| assert!(!is_visible(window, "sidebar-rail"), "open again"));
+    assert_eq!(ui.state.get(Key::SidebarLayout).as_deref(), Some("open"));
+    ui.shot("open");
 }
 
 /// The + in the right panel's header opens a menu of the surfaces without
