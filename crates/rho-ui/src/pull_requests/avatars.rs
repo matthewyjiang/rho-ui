@@ -28,7 +28,7 @@ enum Picture {
 
 /// Everything said on `detail`: its comments and reviews, then its
 /// threads' comments.
-fn every_post(detail: &PullRequestDetail) -> impl Iterator<Item = &PullRequestPost> {
+pub(crate) fn every_post(detail: &PullRequestDetail) -> impl Iterator<Item = &PullRequestPost> {
     let threads = detail.threads.iter().flat_map(|thread| &thread.comments);
     detail.posts.iter().chain(threads)
 }

@@ -43,7 +43,7 @@ use gpui_kit::component::ActiveTheme as _;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
-    forge::{avatar::test::serve_pictures, ForgeCli},
+    forge::{avatar::test::serve_pictures, Check, ForgeCli},
     machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
     pull_requests::{Serving, Shown, Which},
@@ -3774,24 +3774,44 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
 }
 
-/// A gh signed in to github.com as octocat, for the tests that act on a
-/// PR: it writes the arguments of each `gh pr ...` it runs. It reads
-/// nothing: the daemon reads PRs.
+/// A gh for the tests that act on a PR: it writes the arguments of each
+/// `gh pr ...` it runs, and notes each `gh auth status`. It reads nothing:
+/// the daemon reads PRs.
 struct StubGh {
     bin: tempfile::TempDir,
 }
 
 impl StubGh {
+    /// One signed in to github.com as octocat.
     fn new() -> Self {
+        Self::with_hosts(
+            r#"{"github.com":[{"state":"success","active":true,"host":"github.com","login":"octocat"}]}"#,
+        )
+    }
+
+    /// One signed in nowhere, so it can't comment.
+    fn signed_out() -> Self {
+        Self::with_hosts("{}")
+    }
+
+    /// One whose `gh auth status --json hosts` gives `hosts`.
+    fn with_hosts(hosts: &str) -> Self {
         let bin = tempfile::tempdir().unwrap();
         let script = format!(
             "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
-             auth) echo '{{\"hosts\":{{\"github.com\":[{{\"state\":\"success\",\"active\":true,\"host\":\"github.com\",\"login\":\"octocat\"}}]}}}}' ;;\n  \
-             pr) printf '%s\\n' \"$@\" > '{}' ;;\nesac\n",
-            bin.path().join("acted").display(),
+             auth) echo checked >> '{checks}'; echo '{{\"hosts\":{hosts}}}' ;;\n  \
+             pr) printf '%s\\n' \"$@\" > '{acted}' ;;\nesac\n",
+            checks = bin.path().join("checks").display(),
+            acted = bin.path().join("acted").display(),
         );
         write_program(&bin.path().join("gh"), &script);
         StubGh { bin }
+    }
+
+    /// How many times its accounts were checked.
+    fn checks(&self) -> usize {
+        std::fs::read_to_string(self.bin.path().join("checks"))
+            .map_or(0, |checks| checks.lines().count())
     }
 
     /// Settings that act through this gh on this machine.
@@ -3908,8 +3928,7 @@ fn open_pr_surface(name: &'static str, settings: Settings) -> (Harness, SessionK
 /// branch, with its people's pictures. While it shows, it asks the daemon
 /// again every 30 seconds, so the daemon keeps reading it, and nothing
 /// while the panel is hidden; a change the daemon reports redraws it at
-/// once, and a turn's end asks for a fresh read. A trouble the daemon
-/// reports shows over the PR it read last.
+/// once. A trouble the daemon reports shows over the PR it read last.
 #[test]
 fn the_pull_request_surface_shows_the_branchs_pr() {
     let (mut ui, key) = open_pr_surface("pull-request", Settings::default());
@@ -3989,13 +4008,6 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
             .is_some_and(|title| title.label() == Some("Add widgets, renamed"))
     });
 
-    // A turn that ends asks for a fresh read.
-    let fresh = fresh_shows(ui.fake(), &key);
-    ui.send("background");
-    ui.wait_for_daemon("a fresh show after the turn", |fake| {
-        fresh_shows(fake, &key) > fresh
-    });
-
     // The daemon paused its reads: it says so over the PR it read last.
     ui.fake().edit_pull_requests(&key.id, |set| {
         let branch = set.branch.as_mut().expect("the branch");
@@ -4064,8 +4076,9 @@ fn a_sidebar_row_marks_its_pr() {
 
 /// Links go to the daemon, and tabs follow its links: each PR linked by
 /// hand or by the agent opens a tab of its own, except the branch's own
-/// PR, which has one; what names no PR shows the daemon's refusal; closing
-/// a linked PR's tab, or Unlink, unlinks it.
+/// PR, which has one, also while the daemon looks the branch up; what
+/// names no PR shows the daemon's refusal; closing a linked PR's tab, or
+/// Unlink, unlinks it.
 #[test]
 fn pull_requests_link_by_hand() {
     let (mut ui, key) = open_pr_surface("pull-request-link", Settings::default());
@@ -4093,6 +4106,25 @@ fn pull_requests_link_by_hand() {
     });
     assert_eq!(linked(&ui), [12]);
     ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
+    // A daemon that restarted looks the branch up again: until it has
+    // found the branch's PR, that PR, watched, gets no tab of its own
+    // either, to close again once it has.
+    let branch = ui.fake().pull_requests(&key.id).branch;
+    ui.fake().edit_pull_requests(&key.id, |set| {
+        set.branch.as_mut().expect("the branch").lookup = BranchLookup::Looking;
+        set.linked[0].watched = true;
+    });
+    ui.wait_until("the branch looked up again", |_, cx, app| {
+        let set = app.pull_requests().read(cx).of(&key);
+        set.and_then(|set| set.branch.as_ref())
+            .is_some_and(|branch| branch.lookup == BranchLookup::Looking)
+    });
+    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
+    ui.fake()
+        .edit_pull_requests(&key.id, move |set| set.branch = branch);
+    ui.wait_until("the branch's PR found again", |window, _, _| {
+        is_visible(window, "pull-request-title")
+    });
 
     link(&mut ui, "#13");
     ui.wait_until("the linked PR in a tab of its own", |window, _, _| {
@@ -4148,6 +4180,48 @@ fn pull_requests_link_by_hand() {
                 .is_some_and(|title| title.label() == Some("Add widgets"))
     });
     assert_eq!(linked(&ui), [12]);
+}
+
+/// An unlink the daemon refuses shows why on the PR's own tab, and the
+/// tab stays: closing a linked tab never fails silently.
+#[test]
+fn a_refused_unlink_shows_on_its_tab() {
+    let (mut ui, key) = open_pr_surface("pull-request-unlink-refused", Settings::default());
+    let linked = |ui: &Harness| linked_numbers(ui.fake(), &key);
+    // A link on a host the daemon refuses can't be unlinked: closing its
+    // tab shows why there, and the tab stays.
+    let id = PullRequestId::new("ghe.acme.com", "acme", "widgets", 15);
+    let url = "https://ghe.acme.com/acme/widgets/pull/15";
+    let mut elsewhere =
+        LinkedPullRequest::new(id.clone(), url, PullRequestLinkOrigin::User, 1_767_312_200);
+    elsewhere.summary = Some(PullRequestSummary::new(
+        id,
+        "Widgets elsewhere",
+        url,
+        PullRequestState::Open,
+        PullRequestRollup::Passing,
+        "fed",
+        "2026-11-17T00:00:00Z",
+    ));
+    ui.fake()
+        .edit_pull_requests(&key.id, |set| set.linked.push(elsewhere));
+    ui.wait_until("its tab", |window, _, _| {
+        is_visible(window, "panel-tab-pull-request-2")
+    });
+    ui.click("panel-tab-pull-request-2");
+    ui.wait_until("its PR", |window, _, _| {
+        window
+            .try_find("pull-request-title")
+            .is_some_and(|title| title.label() == Some("Widgets elsewhere"))
+    });
+    ui.act(|window, _| assert!(!is_visible(window, "pull-request-trouble")));
+    ui.act(|window, cx| window.hover("panel-tab-pull-request-2", cx));
+    ui.click("close-panel-tab-pull-request-2");
+    ui.wait_until("the refusal on its tab", |window, _, _| {
+        is_visible(window, "pull-request-trouble")
+    });
+    ui.act(|window, _| assert!(is_visible(window, "panel-tab-pull-request-2")));
+    assert_eq!(linked(&ui), [15]);
 }
 
 /// Two sessions on one branch each have a Pull request tab of the same PR;
@@ -4277,6 +4351,38 @@ fn a_pull_request_merges_once_confirmed() {
     ui.wait_for_daemon("a fresh show after the merge", |fake| {
         fresh_shows(fake, &key) > fresh
     });
+}
+
+/// A turn's end has the daemon read the PR on screen afresh, but leaves
+/// alone the check of a gh that can't comment, which would run `gh auth
+/// status` on its machine after every turn; Refresh checks it again, as
+/// the user may have just signed in.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_turn_end_reads_the_pr_afresh_and_refresh_checks_gh() {
+    let gh = StubGh::signed_out();
+    let (mut ui, key) = open_pr_surface("pull-request-gh-check", gh.settings());
+    let checked = |cx: &App, app: &RhoApp| {
+        let forges = app.forges().read(cx);
+        matches!(
+            forges.check(&key.machine, ForgeCli::Gh),
+            Some(Check::Done(_))
+        )
+    };
+    ui.wait_until("gh checked", |_, cx, app| checked(cx, app));
+    let checks = gh.checks();
+
+    let fresh = fresh_shows(ui.fake(), &key);
+    ui.send("background");
+    ui.wait_for_daemon("a fresh show after the turn", |fake| {
+        fresh_shows(fake, &key) > fresh
+    });
+
+    ui.click("pull-request-refresh");
+    ui.wait_until("gh checked again", |_, cx, app| {
+        gh.checks() > checks && checked(cx, app)
+    });
+    assert_eq!(gh.checks(), checks + 1, "only Refresh checked gh again");
 }
 
 /// A daemon from before pull requests is asked once a connection: its

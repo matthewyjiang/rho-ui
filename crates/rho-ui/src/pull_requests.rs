@@ -23,17 +23,19 @@ use rho_ui_core::{
     SessionPullRequests,
 };
 
+pub(crate) use self::avatars::every_post;
 use self::avatars::Avatars;
-pub(crate) use crate::forge::PrAction;
+pub(crate) use self::reading::{Reading, Seen};
 
 use crate::{
     folders::Reader,
-    forge::{self, AuthState, Check, CliProbe, ForgeCli, Forges},
+    forge::{self, AuthState, Check, CliProbe, ForgeCli, Forges, PrAction},
     machines::{MachineId, SessionKey},
     workspaces::Workspaces,
 };
 
 mod avatars;
+mod reading;
 
 /// How often the PR on screen is shown again: the protocol asks for `show`
 /// within 30 s to keep the daemon reading it, and the daemon's lease lasts
@@ -168,6 +170,13 @@ impl<K: PartialEq> Cadence<K> {
         again
     }
 
+    /// Drops the request under way, or the timer waiting for the next:
+    /// whether another was asked for after it.
+    fn cancel(&mut self) -> bool {
+        self.task = Task::ready(());
+        self.finish()
+    }
+
     /// How long until a request for `key` is due, `period` after the last
     /// one for it; `None` when it is due now.
     fn due_in(&self, key: &K, period: Duration, now: Instant) -> Option<Duration> {
@@ -198,8 +207,39 @@ fn after(
     })
 }
 
+/// Whether a request loop's next request is due now, or waits: for a
+/// timer, or for the request under way, whose end arms the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Due {
+    Now,
+    Armed,
+}
+
+/// Arms `cadence`'s next request for `key`, `period` after its last one:
+/// nothing while one runs, as its end arms the next; else a timer that
+/// runs `request` once it is due, or [`Due::Now`], for the caller to send
+/// it.
+fn arm<K: PartialEq>(
+    cadence: &mut Cadence<K>,
+    key: &K,
+    period: Duration,
+    request: impl FnOnce(&mut PullRequests, &mut Context<'_, PullRequests>) + 'static,
+    cx: &mut Context<'_, PullRequests>,
+) -> Due {
+    if cadence.is_running() {
+        return Due::Armed;
+    }
+    match cadence.due_in(key, period, cx.background_executor().now()) {
+        Some(wait) => {
+            cadence.task = after(wait, request, cx);
+            Due::Armed
+        }
+        None => Due::Now,
+    }
+}
+
 /// How sentences name `machine`.
-fn on(machine: &MachineId) -> String {
+pub(crate) fn on(machine: &MachineId) -> String {
     if machine.is_local() {
         "this machine".to_owned()
     } else {
@@ -207,35 +247,16 @@ fn on(machine: &MachineId) -> String {
     }
 }
 
-/// What the panel says of a machine whose daemon serves no pull requests.
+/// What is said of a machine whose daemon serves no pull requests.
 fn unserved(machine: &MachineId) -> SharedString {
     let on = on(machine);
     format!("Update rho on {on} to see its pull requests here.").into()
 }
 
+/// What is said of a machine that isn't connected.
 fn not_connected(machine: &MachineId) -> SharedString {
     let on = on(machine);
-    format!("rho on {on} isn't connected.").into()
-}
-
-/// How `show` and `unlink` name the linked PR `id`: the link's own `url`
-/// from `set`, never `owner/name#N`, which the daemon reads as github.com.
-/// One `set` doesn't hold goes by its address on its own host.
-fn link_text(set: Option<&SessionPullRequests>, id: &PullRequestId) -> String {
-    set.and_then(|set| set.linked.iter().find(|linked| linked.id == *id))
-        .map_or_else(
-            || {
-                let PullRequestId {
-                    host,
-                    owner,
-                    name,
-                    number,
-                    ..
-                } = id;
-                format!("https://{host}/{owner}/{name}/pull/{number}")
-            },
-            |linked| linked.url.clone(),
-        )
+    format!("Not connected to {on}.").into()
 }
 
 /// Whether the daemon is still looking up something of `set`, with no
@@ -326,22 +347,15 @@ struct MachinePrs {
     /// Each pull request's detail, from the last `show` that carried one:
     /// per machine, as two machines may read one PR as two accounts.
     details: HashMap<PullRequestId, PullRequestDetail>,
-    /// Why the last request to this daemon got no answer, until one does.
+    /// Why the daemon itself last failed to answer, until it answers: what
+    /// befell the machine, not what it refused of one request, which goes
+    /// back to whoever asked.
     failed: Option<SharedString>,
     /// Reissues `list` for this machine's listed sessions.
     list: Cadence<()>,
 }
 
 impl MachinePrs {
-    /// An answer came: the daemon serves pull requests, and whatever kept
-    /// the last one from answering is over. Whether that changed anything.
-    fn answered(&mut self) -> bool {
-        let changed = self.serving != Serving::Served || self.failed.is_some();
-        self.serving = Serving::Served;
-        self.failed = None;
-        changed
-    }
-
     /// Replaces `session`'s set with `set`: whether it changed.
     fn store(&mut self, session: &SessionId, set: SessionPullRequests) -> bool {
         if self.sessions.get(session) == Some(&set) {
@@ -351,19 +365,48 @@ impl MachinePrs {
         true
     }
 
-    /// A request to `machine` got no answer, for `error`: notes why, and
-    /// says it as people read it.
+    /// Takes `answer` to a request to `machine`'s daemon. An answer means
+    /// the daemon serves pull requests and whatever failed before is over;
+    /// a refusal comes back as people read it, noted first as
+    /// [`Self::refused`] says.
+    fn take<T>(
+        &mut self,
+        machine: &MachineId,
+        answer: Result<T, PullRequestError>,
+    ) -> Result<T, SharedString> {
+        match answer {
+            Ok(value) => {
+                self.serving = Serving::Served;
+                self.failed = None;
+                Ok(value)
+            }
+            Err(error) => Err(self.refused(machine, error)),
+        }
+    }
+
+    /// What `error` says of `machine`, as people read it: a daemon from
+    /// before pull requests is [`Serving::Unserved`] from now on, and a
+    /// failure of the daemon itself is [`Self::failed`]; what it refused
+    /// of the request alone (`Invalid`) is only the caller's.
     fn refused(&mut self, machine: &MachineId, error: PullRequestError) -> SharedString {
-        let why: SharedString = match error {
+        match error {
             PullRequestError::Unserved => {
                 self.serving = Serving::Unserved;
-                return unserved(machine);
+                unserved(machine)
             }
             PullRequestError::Invalid(message) => message.into(),
-            PullRequestError::Daemon(error) => error.to_string().into(),
-        };
-        self.failed = Some(why.clone());
-        why
+            PullRequestError::Daemon(error) => {
+                let why = SharedString::from(error.to_string());
+                self.failed = Some(why.clone());
+                why
+            }
+        }
+    }
+
+    /// Whether the daemon serves pull requests, and why it last failed: to
+    /// tell whether an answer changed them.
+    fn health(&self) -> (Serving, Option<SharedString>) {
+        (self.serving, self.failed.clone())
     }
 }
 
@@ -392,6 +435,9 @@ pub(crate) struct PullRequests {
     show: Cadence<Shown>,
     /// What the next `show` asks.
     next: PullRequestRead,
+    /// Why the daemon refused the last `show`, and what it showed, until a
+    /// `show` is answered.
+    show_refused: Option<(Shown, SharedString)>,
     focus: Focus,
     avatars: Avatars,
     _forges_changed: gpui_kit::Subscription,
@@ -415,6 +461,7 @@ impl PullRequests {
             shown_by: None,
             show: Cadence::new(),
             next: PullRequestRead::Cached,
+            show_refused: None,
             focus: Focus::Focused,
             avatars: Avatars::default(),
             _forges_changed: forges_changed,
@@ -455,11 +502,23 @@ impl PullRequests {
     }
 
     /// `machine`'s connection is gone, or the machine is: what it said
-    /// goes with it.
+    /// goes with it. A `show` still waiting on that connection goes too,
+    /// as it would hold up the show of every machine's PRs.
     pub(crate) fn forget(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
-        if self.machines.remove(machine).is_some() {
-            cx.notify();
+        if self.machines.remove(machine).is_none() {
+            return;
         }
+        let waiting = self.show.is_running()
+            && self
+                .show
+                .last
+                .as_ref()
+                .is_some_and(|(shown, _)| shown.session.machine == *machine);
+        // One asked for after it, of another machine's PR, goes now.
+        if waiting && self.show.cancel() {
+            self.show_now(cx);
+        }
+        cx.notify();
     }
 
     /// `session`'s daemon says its set is now `set`. When that moved the PR
@@ -473,6 +532,8 @@ impl PullRequests {
         let Some(entry) = self.machines.get_mut(&session.machine) else {
             return;
         };
+        // An event answers no request, so it leaves `failed` alone: only
+        // an answer says the daemon is over what kept it from answering.
         if entry.serving == Serving::Asking {
             entry.serving = Serving::Served;
         }
@@ -480,18 +541,7 @@ impl PullRequests {
             return;
         }
         cx.notify();
-        let moved = self
-            .shown
-            .as_ref()
-            .filter(|shown| shown.session == *session)
-            .and_then(|shown| self.summary(shown))
-            .is_some_and(|summary| {
-                self.detail(&session.machine, &summary.id)
-                    .is_none_or(|detail| detail.summary != *summary)
-            });
-        if moved {
-            self.show_now(cx);
-        }
+        self.show_if_moved(session, cx);
     }
 
     /// The window gained the focus or lost it: requests wait while it is
@@ -566,11 +616,17 @@ impl PullRequests {
         cx.notify();
     }
 
-    /// A `show` with `read: fresh`: a turn ended, Refresh, or an action was
-    /// done. Pictures that didn't load are asked for again, and so is the
-    /// check of a `gh` that can't comment.
-    pub(crate) fn refresh(&mut self, cx: &mut Context<'_, Self>) {
+    /// Shows what is on screen now with `read: fresh`, as a turn ended,
+    /// which may have changed the PR.
+    pub(crate) fn show_fresh(&mut self, cx: &mut Context<'_, Self>) {
         self.next = PullRequestRead::Fresh;
+        self.show_now(cx);
+    }
+
+    /// Refresh, or an action done: [`Self::show_fresh`], and pictures that
+    /// didn't load are asked for again, and so is the check of a `gh` that
+    /// can't comment.
+    pub(crate) fn refresh(&mut self, cx: &mut Context<'_, Self>) {
         self.avatars.forget_failed();
         if let Some(shown) = &self.shown {
             let machine = shown.session.machine.clone();
@@ -585,13 +641,22 @@ impl PullRequests {
                     .update(cx, |forges, cx| forges.recheck(&machine, cx));
             }
         }
-        self.show_now(cx);
+        self.show_fresh(cx);
     }
 
     /// Whether `machine`'s daemon serves pull requests; `None` while the
     /// machine isn't connected.
     pub(crate) fn serving(&self, machine: &MachineId) -> Option<Serving> {
         self.machines.get(machine).map(|entry| entry.serving)
+    }
+
+    /// Whether `machine`'s daemon can be asked about pull requests: it is
+    /// connected, and not from before them.
+    pub(crate) fn asks(&self, machine: &MachineId) -> bool {
+        matches!(
+            self.serving(machine),
+            Some(Serving::Asking | Serving::Served)
+        )
     }
 
     /// `session`'s set, once its daemon answered with one.
@@ -602,20 +667,12 @@ impl PullRequests {
             .get(&session.id)
     }
 
-    /// The summary of what `shown` names, once the daemon found or read it.
+    /// The summary of what `shown` names, once the daemon found or read
+    /// it: what [`Self::reading`] shows as [`Seen::Pr`].
     pub(crate) fn summary(&self, shown: &Shown) -> Option<&PullRequestSummary> {
-        let set = self.of(&shown.session)?;
-        match &shown.which {
-            Which::Branch => match &set.branch.as_ref()?.lookup {
-                BranchLookup::Found { pull_request } => Some(pull_request.as_ref()),
-                _ => None,
-            },
-            Which::Linked(id) => set
-                .linked
-                .iter()
-                .find(|linked| linked.id == *id)?
-                .summary
-                .as_ref(),
+        match self.reading(shown).seen {
+            Seen::Pr(summary) => Some(summary),
+            Seen::Disconnected(_) | Seen::Unserved(_) | Seen::Looking | Seen::Nothing(_) => None,
         }
     }
 
@@ -629,32 +686,30 @@ impl PullRequests {
         self.machines.get(machine)?.details.get(id)
     }
 
-    /// Why the last request to `machine`'s daemon got no answer.
-    pub(crate) fn failed(&self, machine: &MachineId) -> Option<&SharedString> {
-        self.machines.get(machine)?.failed.as_ref()
-    }
-
     /// The PR a sidebar row marks: its branch's, else the first linked one
     /// read.
     pub(crate) fn mark(&self, session: &SessionKey) -> Option<&PullRequestSummary> {
         let set = self.of(session)?;
-        if let Some(BranchLookup::Found { pull_request }) =
-            set.branch.as_ref().map(|branch| &branch.lookup)
-        {
-            return Some(pull_request.as_ref());
-        }
-        set.linked.iter().find_map(|linked| linked.summary.as_ref())
+        set.branch_pull_request()
+            .or_else(|| set.linked.iter().find_map(|linked| linked.summary.as_ref()))
     }
 
     /// The linked PRs that get tabs of their own, in the order linked: all
     /// but the branch's own, which the agent's watch links too and which
-    /// has the branch's tab. `None` while the session has no set.
+    /// has the branch's tab. `None`, so tabs stay as they are, until the
+    /// daemon has looked the branch up: before that, a watched branch's
+    /// PR would open a tab of its own, then close it.
     pub(crate) fn linked_tabs(&self, session: &SessionKey) -> Option<Vec<PullRequestId>> {
         let set = self.of(session)?;
-        let branch = match set.branch.as_ref().map(|branch| &branch.lookup) {
-            Some(BranchLookup::Found { pull_request }) => Some(&pull_request.id),
-            _ => None,
-        };
+        // While the branch's lookup is under way its PR may be among the
+        // links, and would flash up as a tab of its own. A lookup that
+        // can't finish (gh missing or signed out) has a trouble: tabs
+        // follow the links then.
+        let branch = set.branch.as_ref()?;
+        if matches!(branch.lookup, BranchLookup::Looking) && branch.trouble.is_none() {
+            return None;
+        }
+        let branch = set.branch_pull_request().map(|pr| &pr.id);
         let tabs = set
             .linked
             .iter()
@@ -686,17 +741,10 @@ impl PullRequests {
                 let Some(entry) = this.current(&session.machine, connection) else {
                     return Err(not_connected(&session.machine));
                 };
-                let linked = match answer {
-                    Ok(response) => {
-                        entry.answered();
-                        entry.store(&session.id, response.pull_requests);
-                        Ok(response.pull_request)
-                    }
-                    // The user's text named no PR the daemon reads: the
-                    // form says why.
-                    Err(PullRequestError::Invalid(message)) => Err(message.into()),
-                    Err(error) => Err(entry.refused(&session.machine, error)),
-                };
+                let linked = entry.take(&session.machine, answer).map(|response| {
+                    entry.store(&session.id, response.pull_requests);
+                    response.pull_request
+                });
                 cx.notify();
                 linked
             })
@@ -705,7 +753,7 @@ impl PullRequests {
     }
 
     /// Unlinks PR `id` from `session`, ending the agent's watch on it if
-    /// it watched it. A refusal is also the machine's [`Self::failed`].
+    /// it watched it. Answers with why not, as the daemon says it.
     pub(crate) fn unlink(
         &mut self,
         session: &SessionKey,
@@ -716,7 +764,17 @@ impl PullRequests {
             Ok(entry) => entry,
             Err(why) => return Task::ready(Err(why)),
         };
-        let text = link_text(entry.sessions.get(&session.id), id);
+        // The link's own `url`, never `owner/name#N`, which the daemon
+        // reads as github.com.
+        let Some(text) = entry
+            .sessions
+            .get(&session.id)
+            .and_then(|set| set.link(id))
+            .map(|link| link.url.clone())
+        else {
+            // Unlinked already.
+            return Task::ready(Ok(()));
+        };
         let (daemon, connection, session) =
             (entry.daemon.clone(), entry.connection, session.clone());
         cx.spawn(async move |this, cx| {
@@ -725,14 +783,9 @@ impl PullRequests {
                 let Some(entry) = this.current(&session.machine, connection) else {
                     return Err(not_connected(&session.machine));
                 };
-                let unlinked = match answer {
-                    Ok(set) => {
-                        entry.answered();
-                        entry.store(&session.id, set);
-                        Ok(())
-                    }
-                    Err(error) => Err(entry.refused(&session.machine, error)),
-                };
+                let unlinked = entry.take(&session.machine, answer).map(|set| {
+                    entry.store(&session.id, set);
+                });
                 cx.notify();
                 unlinked
             })
@@ -767,8 +820,8 @@ impl PullRequests {
         }
     }
 
-    /// Does `action` to PR `id` as [`Self::poster`], then shows the PR
-    /// fresh to show what it did.
+    /// Does `action` to PR `id` as [`Self::poster`], then
+    /// [refreshes](Self::refresh) to show what it did.
     pub(crate) fn act(
         &mut self,
         id: PullRequestId,
@@ -813,11 +866,30 @@ impl PullRequests {
         Ok(entry)
     }
 
-    /// `machine`'s state, while it is still on `connection`.
+    /// `machine`'s state, while it is still on `connection`: an answer sent
+    /// on an earlier one is dropped.
     fn current(&mut self, machine: &MachineId, connection: u64) -> Option<&mut MachinePrs> {
         self.machines
             .get_mut(machine)
             .filter(|entry| entry.connection == connection)
+    }
+
+    /// Shows what is on screen again now if it is of `session`, whose set
+    /// just changed, and its summary moved past the detail last read of it,
+    /// or no detail was read yet.
+    fn show_if_moved(&mut self, session: &SessionKey, cx: &mut Context<'_, Self>) {
+        let moved = self
+            .shown
+            .as_ref()
+            .filter(|shown| shown.session == *session)
+            .and_then(|shown| self.summary(shown))
+            .is_some_and(|summary| {
+                self.detail(&session.machine, &summary.id)
+                    .is_none_or(|detail| detail.summary != *summary)
+            });
+        if moved {
+            self.show_now(cx);
+        }
     }
 
     /// Shows now if what is on screen wasn't shown in the last
@@ -826,14 +898,11 @@ impl PullRequests {
         let Some(shown) = &self.shown else {
             return;
         };
-        if self.show.is_running() {
-            // It schedules the next when it ends.
+        if self.serving(&shown.session.machine) == Some(Serving::Unserved) {
             return;
         }
-        let now = cx.background_executor().now();
-        match self.show.due_in(shown, SHOW_EVERY, now) {
-            Some(wait) => self.show.task = after(wait, Self::show_now, cx),
-            None => self.show_now(cx),
+        if arm(&mut self.show, shown, SHOW_EVERY, Self::show_now, cx) == Due::Now {
+            self.show_now(cx);
         }
     }
 
@@ -851,8 +920,19 @@ impl PullRequests {
         };
         let target = match &shown.which {
             Which::Branch => PullRequestTarget::Branch,
-            Which::Linked(id) => PullRequestTarget::Linked {
-                pull_request: link_text(entry.sessions.get(&shown.session.id), id),
+            Which::Linked(id) => match entry.sessions.get(&shown.session.id) {
+                // Not answered since it connected: the branch's show answers
+                // with the set, and the set shows the link
+                // ([`Self::show_if_moved`]).
+                None => PullRequestTarget::Branch,
+                Some(set) => match set.link(id) {
+                    // Named by the link's own `url`, as `unlink` names it.
+                    Some(link) => PullRequestTarget::Linked {
+                        pull_request: link.url.clone(),
+                    },
+                    // Unlinked, as its tab closes.
+                    None => return,
+                },
             },
         };
         let (daemon, connection) = (entry.daemon.clone(), entry.connection);
@@ -868,25 +948,15 @@ impl PullRequests {
                 if this.show.finish() {
                     this.show_now(cx);
                 } else {
-                    this.show_later(cx);
+                    this.show_when_due(cx);
                 }
             });
         });
     }
 
-    /// Shows what is on screen again after [`SHOW_EVERY`], unless nothing
-    /// is, or its daemon serves no pull requests.
-    fn show_later(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(shown) = &self.shown else {
-            return;
-        };
-        if self.serving(&shown.session.machine) == Some(Serving::Unserved) {
-            return;
-        }
-        self.show.task = after(SHOW_EVERY, Self::show_now, cx);
-    }
-
-    /// Takes the answer to a `show` of `shown` sent on `connection`.
+    /// Takes the answer to a `show` of `shown` sent on `connection`. A
+    /// refusal stays with what it showed, and what was shown before stays,
+    /// with why it may be out of date.
     fn showed(
         &mut self,
         shown: &Shown,
@@ -895,37 +965,42 @@ impl PullRequests {
         cx: &mut Context<'_, Self>,
     ) {
         let machine = &shown.session.machine;
-        let Some(entry) = self
-            .machines
-            .get_mut(machine)
-            .filter(|entry| entry.connection == connection)
-        else {
+        let Some(entry) = self.current(machine, connection) else {
             return;
         };
-        let changed = match answer {
+        let before = entry.health();
+        let mut stored = false;
+        let mut read = None;
+        let refused = match entry.take(machine, answer) {
             Ok(response) => {
-                let mut changed = entry.answered();
-                changed |= entry.store(&shown.session.id, response.pull_requests);
+                stored = entry.store(&shown.session.id, response.pull_requests);
                 if let Some(detail) = response.detail {
                     let id = detail.summary.id.clone();
                     if entry.details.get(&id) != Some(&*detail) {
-                        self.avatars.queue(&detail, machine);
-                        entry.details.insert(id, *detail);
-                        changed = true;
+                        entry.details.insert(id.clone(), *detail);
+                        read = Some(id);
                     }
                 }
-                changed
+                None
             }
-            Err(error) => {
-                // What was shown before stays, with why it may be out of
-                // date.
-                entry.refused(machine, error);
-                true
-            }
+            Err(why) => Some((shown.clone(), why)),
         };
+        let mut changed = stored || entry.health() != before;
+        if self.show_refused != refused {
+            self.show_refused = refused;
+            changed = true;
+        }
+        let detail = read.and_then(|id| self.machines.get(machine)?.details.get(&id));
+        if let Some(detail) = detail {
+            self.avatars.queue(detail, machine);
+            changed = true;
+        }
         if changed {
             cx.notify();
             self.fetch_next_avatar(cx);
+        }
+        if stored {
+            self.show_if_moved(&shown.session, cx);
         }
     }
 
@@ -948,24 +1023,26 @@ impl PullRequests {
         }
     }
 
-    /// Lists `machine`'s listed sessions now if they are due, as the
-    /// window gains the focus; else once they are.
+    /// Lists `machine`'s listed sessions now if they are due, else once
+    /// they are; not for a daemon from before pull requests.
     fn list_when_due(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
         let period = self.list_period(machine);
         let Some(entry) = self.machines.get_mut(machine) else {
             return;
         };
-        if entry.list.is_running() {
-            // It schedules the next when it ends.
+        if entry.serving == Serving::Unserved {
             return;
         }
-        let now = cx.background_executor().now();
-        match entry.list.due_in(&(), period, now) {
-            Some(wait) => {
-                let machine = machine.clone();
-                entry.list.task = after(wait, move |this, cx| this.list_now(&machine, cx), cx);
-            }
-            None => self.list_now(machine, cx),
+        let then = machine.clone();
+        let list = arm(
+            &mut entry.list,
+            &(),
+            period,
+            move |this, cx| this.list_now(&then, cx),
+            cx,
+        );
+        if list == Due::Now {
+            self.list_now(machine, cx);
         }
     }
 
@@ -1012,35 +1089,33 @@ impl PullRequests {
         let Some(entry) = self.current(machine, connection) else {
             return;
         };
+        let before = entry.health();
+        // What the daemon refused of the list alone has no one to tell: the
+        // next list asks again.
+        let sets = entry.take(machine, answer).unwrap_or_default();
+        let mut stored = false;
+        for (session, set) in sets {
+            stored |= entry.store(&session, set);
+        }
+        let changed = stored || entry.health() != before;
+        let again = entry.list.finish();
         // Every notify redraws the sidebar and syncs the panel's tabs: only
         // when something changed.
-        let changed = match answer {
-            Ok(sets) => {
-                let mut changed = entry.answered();
-                for (session, set) in sets {
-                    changed |= entry.store(&session, set);
-                }
-                changed
-            }
-            Err(error) => {
-                entry.refused(machine, error);
-                true
-            }
-        };
-        let again = entry.list.finish();
-        let unserved = entry.serving == Serving::Unserved;
         if changed {
             cx.notify();
         }
+        let shown = self
+            .shown
+            .as_ref()
+            .map(|shown| shown.session.clone())
+            .filter(|session| session.machine == *machine);
+        if let Some(session) = shown.filter(|_| stored) {
+            self.show_if_moved(&session, cx);
+        }
         if again {
             self.list_now(machine, cx);
-        } else if !unserved {
-            let period = self.list_period(machine);
-            let then = machine.clone();
-            let task = after(period, move |this, cx| this.list_now(&then, cx), cx);
-            if let Some(entry) = self.machines.get_mut(machine) {
-                entry.list.task = task;
-            }
+        } else {
+            self.list_when_due(machine, cx);
         }
     }
 

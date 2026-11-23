@@ -1993,6 +1993,10 @@ impl RhoApp {
     pub(crate) fn pull_requests(&self) -> &Entity<PullRequests> {
         &self.prs
     }
+    /// The forge CLIs found on each machine, for UI tests.
+    pub(crate) fn forges(&self) -> &Entity<Forges> {
+        &self.forges
+    }
     /// The session the main pane shows, for UI tests.
     pub(crate) fn active_session(&self) -> Option<Entity<SessionView>> {
         match &self.pane {

@@ -17,7 +17,7 @@
 
 pub(crate) mod avatar;
 mod gh;
-mod gh_pulls;
+mod gh_actions;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -38,7 +38,7 @@ use crate::{
     workspaces::Workspaces,
 };
 
-pub(crate) use gh_pulls::PrAction;
+pub(crate) use gh_actions::PrAction;
 
 /// How long a CLI may take to answer before rho-ui calls it stuck: a
 /// tripwire, as long as a script over ssh gets. Checking gh took 0.35 s
@@ -107,9 +107,9 @@ pub(crate) async fn act(
         format!("{}/{}", pr.owner, pr.name).into(),
         pr.number.to_string().into(),
     ];
-    args.extend(gh_pulls::action_args(action)?);
-    let output = run(ForgeCli::Gh, reader, &gh_pulls::ACTION, args, executor).await?;
-    gh_pulls::parse_action(&output)
+    args.extend(gh_actions::action_args(action)?);
+    let output = run(ForgeCli::Gh, reader, &gh_actions::ACTION, args, executor).await?;
+    gh_actions::parse_action(&output)
 }
 
 /// A forge's command-line tool that rho-ui knows how to drive.

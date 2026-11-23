@@ -5,7 +5,8 @@
 //! checks ([`checks`]), its description, and its threads on the code and
 //! conversation, with a box to comment in ([`conversation`]). It asks the
 //! daemon to keep reading the PR only while it shows; the session's turn
-//! ending reads it again, and so does Refresh.
+//! ending reads it again, and so does Refresh. What it shows is
+//! [`PullRequests::reading`]'s to say; the surface draws it.
 
 mod actions;
 mod checks;
@@ -34,12 +35,10 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, Stateful, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window,
 };
-use rho_ui_core::{
-    BranchLookup, BranchPullRequest, LinkedPullRequest, PullRequestDetail, PullRequestId,
-    PullRequestPost, PullRequestSummary, PullRequestTrouble,
-};
+use rho_ui_core::{PullRequestDetail, PullRequestId, PullRequestSummary};
 
 pub(crate) use self::header::state_look;
+pub(super) use self::header::unlink_tooltip;
 pub(super) use self::link::ShowLinked;
 use self::{
     actions::Acting,
@@ -47,11 +46,11 @@ use self::{
     conversation::{open_threads, Posting},
     diagrams::DiagramState,
     header::{identity, toolbar, web_url},
-    link::{link_button, LinkForm},
+    link::{link_button, LinkForm, Unlinking},
 };
 use crate::{
-    machines::{MachineId, SessionKey},
-    pull_requests::{PullRequests, Serving, Shown, Which},
+    machines::SessionKey,
+    pull_requests::{every_post, PullRequests, Seen, Shown, Which},
     time,
 };
 
@@ -85,9 +84,7 @@ pub(super) struct PullRequestSurface {
     posting: Posting,
     /// The form to link a PR by hand, while it is open.
     link_form: Option<LinkForm>,
-    /// Why the daemon refused to unlink the PR shown, until it is asked
-    /// again.
-    unlink_refused: Option<SharedString>,
+    unlinking: Unlinking,
     acting: Acting,
     _subscriptions: [Subscription; 1],
 }
@@ -101,6 +98,7 @@ impl PullRequestSurface {
     ) -> Self {
         let subscriptions = [cx.observe(&prs, |this, _, cx| {
             this.sync_texts(cx);
+            this.forget_stale_refusal(cx);
             cx.notify();
         })];
         // Closing the tab stops the daemon reading it for this surface.
@@ -120,7 +118,7 @@ impl PullRequestSurface {
             comment_box: None,
             posting: Posting::Idle,
             link_form: None,
-            unlink_refused: None,
+            unlinking: Unlinking::Idle,
             acting: Acting::Idle,
             _subscriptions: subscriptions,
         };
@@ -131,7 +129,7 @@ impl PullRequestSurface {
     /// Reads the PR again as the session's turn ended, if it shows.
     pub(super) fn turn_ended(&mut self, cx: &mut Context<'_, Self>) {
         if self.visibility == Visibility::Shown {
-            self.prs.update(cx, PullRequests::refresh);
+            self.prs.update(cx, PullRequests::show_fresh);
         }
     }
 
@@ -345,144 +343,6 @@ impl PullRequestSurface {
 /// The key of a PR's description in [`PullRequestSurface::texts`].
 const DESCRIPTION: &str = "description";
 
-/// Every post of `detail`: those in its conversation, then those in its
-/// threads.
-fn every_post(detail: &PullRequestDetail) -> impl Iterator<Item = &PullRequestPost> {
-    let threads = detail.threads.iter().flat_map(|thread| &thread.comments);
-    detail.posts.iter().chain(threads)
-}
-
-/// What the daemon last said of the PR a surface shows.
-enum Seen<'a> {
-    /// The session's machine isn't connected.
-    Disconnected,
-    /// Its daemon is from before pull requests.
-    Unserved,
-    /// Not answered yet, or still looking.
-    Looking,
-    /// There is no PR to show, and why, as a person reads it.
-    Nothing(String),
-    Pr(&'a PullRequestSummary),
-}
-
-/// What a surface shows, with why it may be out of date, and the link
-/// to the session of the PR it shows, if it is linked.
-struct Reading<'a> {
-    seen: Seen<'a>,
-    trouble: Option<&'a PullRequestTrouble>,
-    link: Option<&'a LinkedPullRequest>,
-}
-
-impl<'a> Reading<'a> {
-    fn only(seen: Seen<'a>) -> Self {
-        Self {
-            seen,
-            trouble: None,
-            link: None,
-        }
-    }
-}
-
-/// What `prs` holds of `which` of `session`'s PRs.
-fn read<'a>(prs: &'a PullRequests, session: &SessionKey, which: &Which) -> Reading<'a> {
-    match prs.serving(&session.machine) {
-        None => return Reading::only(Seen::Disconnected),
-        Some(Serving::Unserved) => return Reading::only(Seen::Unserved),
-        Some(Serving::Asking | Serving::Served) => {}
-    }
-    let Some(set) = prs.of(session) else {
-        return Reading::only(Seen::Looking);
-    };
-    let linked = |id: &PullRequestId| set.linked.iter().find(|link| link.id == *id);
-    match which {
-        Which::Branch => {
-            let Some(branch) = &set.branch else {
-                return Reading::only(Seen::Looking);
-            };
-            let seen = branch_seen(branch);
-            let link = match &seen {
-                Seen::Pr(summary) => linked(&summary.id),
-                _ => None,
-            };
-            Reading {
-                seen,
-                trouble: branch.trouble.as_ref(),
-                link,
-            }
-        }
-        Which::Linked(id) => {
-            let Some(link) = linked(id) else {
-                // Not in the set yet, or just unlinked: its tab closes.
-                return Reading::only(Seen::Looking);
-            };
-            let seen = match (&link.summary, &link.trouble) {
-                (Some(summary), _) => Seen::Pr(summary),
-                // The message says it all.
-                (None, Some(PullRequestTrouble::NotFound { .. })) => {
-                    return Reading {
-                        seen: Seen::Nothing(format!(
-                            "There's no pull request #{} in {}/{}.",
-                            id.number, id.owner, id.name
-                        )),
-                        trouble: None,
-                        link: Some(link),
-                    };
-                }
-                (None, _) => Seen::Looking,
-            };
-            Reading {
-                seen,
-                trouble: link.trouble.as_ref(),
-                link: Some(link),
-            }
-        }
-    }
-}
-
-/// What the lookup of a session's branch's PR found.
-fn branch_seen(branch: &BranchPullRequest) -> Seen<'_> {
-    let name = branch.branch.as_deref();
-    let text = match &branch.lookup {
-        BranchLookup::Looking => return Seen::Looking,
-        BranchLookup::Found { pull_request } => return Seen::Pr(pull_request),
-        BranchLookup::NotGit => "This session's folder isn't in a git repository.".to_owned(),
-        BranchLookup::Detached { commit } => {
-            format!("This session's checkout is on no branch, at {commit}.")
-        }
-        BranchLookup::NoForge => "This repository has no origin remote on github.com.".to_owned(),
-        BranchLookup::DefaultBranch => match name {
-            Some(name) => format!("This session works on {name}, the default branch."),
-            None => "This session works on the default branch.".to_owned(),
-        },
-        BranchLookup::None => match name {
-            Some(name) => format!("No pull request for {name}."),
-            None => "No pull request for this branch.".to_owned(),
-        },
-        BranchLookup::OnlyForks { count } => {
-            let from = name.map_or_else(
-                || "this branch".to_owned(),
-                |name| format!("a branch named {name}"),
-            );
-            format!(
-                "The {count} newest pull requests from {from} all come from forks. If this \
-                 repository has its own, it is older."
-            )
-        }
-        // A lookup a newer rho sends.
-        _ => "This rho-ui doesn't know what rho found. Update rho-ui.".to_owned(),
-    };
-    Seen::Nothing(text)
-}
-
-/// `machine` as a sentence names it.
-fn on(machine: &MachineId) -> String {
-    if machine.is_local() {
-        "this machine".to_owned()
-    } else {
-        machine.to_string()
-    }
-}
-
 /// A row in a list that a click acts on: its fill on hover reaches past
 /// the list's edges, so what it starts with lines up with the heading.
 fn row(id: impl Into<SharedString>, cx: &App) -> ObservedElement<Stateful<Div>> {
@@ -533,47 +393,6 @@ fn section(
         .child(body)
 }
 
-/// Why what shows may be out of date, as a person reads it.
-fn trouble_text(trouble: &PullRequestTrouble, machine: &MachineId) -> SharedString {
-    let on = on(machine);
-    match trouble {
-        PullRequestTrouble::NotInstalled => {
-            format!("gh isn't installed on {on}. See Settings → Source control.").into()
-        }
-        PullRequestTrouble::SignedOut { host } => {
-            format!("gh on {on} isn't signed in to {host}. See Settings → Source control.").into()
-        }
-        PullRequestTrouble::Paused {
-            remaining,
-            floor,
-            resets_at,
-            ..
-        } => {
-            // An upper bound, which stays true as the minutes pass unredrawn.
-            // GitHub's limit resets hourly; hours are for a forge that doesn't.
-            let minutes = (resets_at - time::now_unix())
-                .max(0)
-                .unsigned_abs()
-                .div_ceil(60);
-            let wait = if minutes <= 60 {
-                format!("{minutes} min")
-            } else {
-                format!("{} h", minutes.div_ceil(60))
-            };
-            format!(
-                "Paused: this GitHub account has {remaining} API points left, and rho leaves the \
-                 last {floor} for other uses. Its limit resets within {wait}."
-            )
-            .into()
-        }
-        PullRequestTrouble::NotFound { message } | PullRequestTrouble::Failed { message } => {
-            message.clone().into()
-        }
-        // A trouble a newer rho sends.
-        _ => "rho reported a problem this rho-ui doesn't know. Update rho-ui.".into(),
-    }
-}
-
 /// A message in place of the PR, with `action` under it.
 fn message(
     text: impl Into<SharedString>,
@@ -600,44 +419,28 @@ impl Render for PullRequestSurface {
         self.ensure_comment_box(window, cx);
         let cx = &*cx;
         let prs = self.prs.read(cx);
-        let machine = &self.session.machine;
-        let serving = prs.serving(machine);
-        let reading = read(prs, &self.session, &self.which);
-        // Why what shows may be stale: what was just refused first, then
-        // what the daemon says of the PR, then why it didn't answer.
+        let reading = prs.reading(&self.shown());
+        // Why what shows may be stale: what this surface was just refused
+        // first, then what the reading says.
         let trouble = match &reading.seen {
-            Seen::Disconnected | Seen::Unserved => None,
-            Seen::Looking | Seen::Nothing(_) | Seen::Pr(_) => {
-                self.unlink_refused.clone().or_else(|| {
-                    reading
-                        .trouble
-                        .map(|trouble| trouble_text(trouble, machine))
-                        .or_else(|| prs.failed(machine).cloned())
-                })
-            }
+            Seen::Disconnected(_) | Seen::Unserved(_) => None,
+            Seen::Looking | Seen::Nothing(_) | Seen::Pr(_) => self
+                .unlinking
+                .refusal()
+                .cloned()
+                .or_else(|| reading.trouble.clone()),
         };
         let content = match &reading.seen {
-            Seen::Disconnected => Some(message(
-                format!("Not connected to {}.", on(machine)),
-                None,
-                None,
-            )),
-            Seen::Unserved => {
-                let text: SharedString = format!(
-                    "Update rho on {} to see its pull requests here.",
-                    on(machine)
-                )
-                .into();
-                Some(
-                    div()
-                        .id("pull-request-unserved")
-                        .test_support()
-                        .aria_label(text.clone())
-                        .h_full()
-                        .child(message(text, None, None))
-                        .into_any_element(),
-                )
-            }
+            Seen::Disconnected(text) => Some(message(text.clone(), None, None)),
+            Seen::Unserved(text) => Some(
+                div()
+                    .id("pull-request-unserved")
+                    .test_support()
+                    .aria_label(text.clone())
+                    .h_full()
+                    .child(message(text.clone(), None, None))
+                    .into_any_element(),
+            ),
             // The trouble says why there is nothing yet.
             Seen::Looking if trouble.is_some() => None,
             Seen::Looking => Some(message(
@@ -647,18 +450,14 @@ impl Render for PullRequestSurface {
             )),
             Seen::Nothing(why) => Some(message(why.clone(), None, Some(link_button(cx)))),
             Seen::Pr(summary) => {
-                Some(self.render_pr(summary, prs.detail(machine, &summary.id), cx))
+                Some(self.render_pr(summary, prs.detail(&self.session.machine, &summary.id), cx))
             }
-        };
-        let pr = match reading.seen {
-            Seen::Pr(summary) => Some(summary),
-            _ => None,
         };
         v_flex()
             .id("pull-request")
             .test_support()
             .size_full()
-            .child(toolbar(pr, reading.link, &self.which, serving, cx))
+            .child(toolbar(&reading, &self.which, cx))
             .children(self.link_form(cx))
             .child(
                 v_flex()

@@ -24,7 +24,7 @@ use rho_ui_core::{
 };
 
 use super::{header::web_url, quiet, row, PullRequestSurface};
-use crate::{forge::PrAction, time};
+use crate::{forge::PrAction, pull_requests, time};
 
 /// Where the comment being written stands.
 pub(super) enum Posting {
@@ -117,11 +117,7 @@ impl PullRequestSurface {
             (Posting::Failed(why), _) => (why.clone(), theme.red),
             (_, Err(why)) => (why.clone(), theme.muted_foreground),
             (_, Ok(poster)) => {
-                let from = if poster.machine.is_local() {
-                    "this machine".to_owned()
-                } else {
-                    poster.machine.to_string()
-                };
+                let from = pull_requests::on(&poster.machine);
                 let note = format!("As @{} from {from}", poster.login);
                 (note.into(), theme.muted_foreground)
             }

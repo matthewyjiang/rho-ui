@@ -4,6 +4,9 @@
 //!
 //! Every session's origin is `acme/widgets` on github.com, and until a test
 //! scripts it, its workspace is in no git repository and links nothing.
+//! The fake reads github.com alone: it links and unlinks only pull
+//! requests there, as rho refuses another host than github.com or the
+//! origin's, though it shows a link on another host a test scripts.
 //! [`FakeDaemon::open_pull_request`] gives a session the pull request
 //! `acme/widgets#12`, and [`FakeDaemon::edit_pull_requests`] changes a
 //! session's set as a read would. Each change tells the session's
@@ -42,7 +45,8 @@ pub enum PullRequestMethods {
 pub const PULL_REQUEST_BODY: &str =
     "Adds **widgets**.\n\n```mermaid\nflowchart LR\n  A --> B\n```\n";
 
-/// The forge every session's origin is on, and the only one the fake reads.
+/// The forge every session's origin is on, and the only one the fake links
+/// on.
 const HOST: &str = "github.com";
 
 /// Every session's origin: where `#12` points.
@@ -123,28 +127,50 @@ impl FakePullRequests {
 }
 
 /// The pull request `text` names, as rho reads what a person typed: a
-/// github.com pull URL, `owner/name#12`, or `#12` in the origin's
-/// repository.
+/// pull URL on any host, `owner/name#12` on github.com, or `#12` in the
+/// origin's repository.
 fn parse(text: &str) -> Option<PullRequestId> {
     let text = text.trim();
-    let (repo, number) = if let Some(path) = text.strip_prefix("https://github.com/") {
+    let (host, repo, number) = if let Some(path) = text.strip_prefix("https://") {
         let mut parts = path.split('/');
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(owner), Some(name), Some("pull"), Some(number)) if parts.next().is_none() => {
-                ((owner, name), number)
+        match (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) {
+            (Some(host), Some(owner), Some(name), Some("pull"), Some(number))
+                if parts.next().is_none() && !host.is_empty() =>
+            {
+                (host, (owner, name), number)
             }
             _ => return None,
         }
     } else if let Some(number) = text.strip_prefix('#') {
-        (ORIGIN, number)
+        (HOST, ORIGIN, number)
     } else {
         let (repo, number) = text.split_once('#')?;
-        (repo.split_once('/')?, number)
+        (HOST, repo.split_once('/')?, number)
     };
     let (owner, name) = repo;
     let number = number.parse::<u32>().ok().filter(|number| *number > 0)?;
     let named = !owner.is_empty() && !name.is_empty() && !name.contains('/');
-    named.then(|| PullRequestId::new(HOST, owner, name, number))
+    named.then(|| PullRequestId::new(host, owner, name, number))
+}
+
+/// The pull request `text` names, if it is on the one host the fake links
+/// on, as rho reads what `link` and `unlink` are given; else their
+/// refusal.
+fn linkable(text: &str) -> Result<PullRequestId, RpcError> {
+    let id = parse(text).ok_or_else(|| not_a_pull_request(text))?;
+    if id.host != HOST {
+        return Err(RpcError::new(
+            ErrorCode::InvalidParams,
+            format!("rho reads pull requests on {HOST} only, not on {}", id.host),
+        ));
+    }
+    Ok(id)
 }
 
 /// The refusal of text that names no pull request.
@@ -153,14 +179,6 @@ fn not_a_pull_request(text: &str) -> RpcError {
         ErrorCode::InvalidParams,
         format!("{text} is not a pull request: give its URL, owner/name#12, or #12"),
     )
-}
-
-/// The summary of the branch's pull request, once found.
-fn branch_summary(set: &SessionPullRequests) -> Option<&PullRequestSummary> {
-    match &set.branch.as_ref()?.lookup {
-        BranchLookup::Found { pull_request } => Some(pull_request.as_ref()),
-        _ => None,
-    }
 }
 
 impl State {
@@ -188,7 +206,7 @@ impl State {
         let mut set = self.pull_requests.set(session);
         edit(&mut set);
         let linked = set.linked.iter().filter_map(|link| link.summary.as_ref());
-        for summary in branch_summary(&set).into_iter().chain(linked) {
+        for summary in set.branch_pull_request().into_iter().chain(linked) {
             if let Some(detail) = self.pull_requests.details.get_mut(&summary.id) {
                 detail.summary = summary.clone();
             }
@@ -230,10 +248,12 @@ impl State {
         self.session(&params.session)?;
         let set = self.pull_requests.set(session);
         let id = match &params.target {
-            PullRequestTarget::Branch => branch_summary(&set).map(|summary| summary.id.clone()),
+            PullRequestTarget::Branch => {
+                set.branch_pull_request().map(|summary| summary.id.clone())
+            }
             PullRequestTarget::Linked { pull_request } => {
                 let id = parse(pull_request).ok_or_else(|| not_a_pull_request(pull_request))?;
-                if !set.linked.iter().any(|link| link.id == id) {
+                if set.link(&id).is_none() {
                     return Err(RpcError::new(
                         ErrorCode::InvalidParams,
                         format!("{id} is not linked to the session"),
@@ -261,11 +281,10 @@ impl State {
     ) -> Result<SessionPullRequestLinkResponse, RpcError> {
         self.pull_requests.served(SESSION_PULL_REQUEST_LINK)?;
         self.session(&params.session)?;
-        let id =
-            parse(&params.pull_request).ok_or_else(|| not_a_pull_request(&params.pull_request))?;
+        let id = linkable(&params.pull_request)?;
         let session = params.session.as_str();
         let mut set = self.pull_requests.set(session);
-        if !set.linked.iter().any(|link| link.id == id) {
+        if set.link(&id).is_none() {
             set.linked.push(self.pull_requests.link(id.clone()));
         }
         self.replace_pull_requests(session, set.clone());
@@ -280,8 +299,7 @@ impl State {
     ) -> Result<SessionPullRequestUnlinkResponse, RpcError> {
         self.pull_requests.served(SESSION_PULL_REQUEST_UNLINK)?;
         self.session(&params.session)?;
-        let id =
-            parse(&params.pull_request).ok_or_else(|| not_a_pull_request(&params.pull_request))?;
+        let id = linkable(&params.pull_request)?;
         let session = params.session.as_str();
         let mut set = self.pull_requests.set(session);
         set.linked.retain(|link| link.id != id);

@@ -20,21 +20,32 @@ use rho_ui_core::{
 };
 
 use super::PullRequestSurface;
-use crate::pull_requests::{PullRequests, Serving, Which};
+use crate::pull_requests::{PullRequests, Reading, Seen, Which};
 
-/// The strip above the PR: its repository and number, and the buttons to
-/// open it on the forge, to link another, to unlink one linked, and to
-/// read it again. `pr` is what the daemon found, `link` the session's link
-/// to it, if it has one; while `serving` says the daemon can't be asked,
-/// it offers nothing that asks it.
+/// What Unlink says it does to the session's `link`, here and on its tab:
+/// it ends the agent's watch too, while the agent watches it.
+pub(in crate::right_panel) fn unlink_tooltip(link: Option<&LinkedPullRequest>) -> &'static str {
+    if link.is_some_and(|link| link.watched) {
+        "Unlink and end the agent's watch"
+    } else {
+        "Unlink"
+    }
+}
+
+/// The strip above the PR the surface shows, by its `reading`: the PR's
+/// repository and number, and the buttons to open it on the forge, to link
+/// another, to unlink one linked, and to read it again. While the daemon
+/// can't be asked, it offers nothing that asks it.
 pub(super) fn toolbar(
-    pr: Option<&PullRequestSummary>,
-    link: Option<&LinkedPullRequest>,
+    reading: &Reading<'_>,
     which: &Which,
-    serving: Option<Serving>,
     cx: &Context<'_, PullRequestSurface>,
 ) -> impl IntoElement {
     let theme = cx.theme();
+    let pr = match reading.seen {
+        Seen::Pr(pr) => Some(pr),
+        Seen::Disconnected(_) | Seen::Unserved(_) | Seen::Looking | Seen::Nothing(_) => None,
+    };
     let url = pr.and_then(|pr| web_url(&pr.url));
     let linked = match which {
         Which::Branch => None,
@@ -42,13 +53,8 @@ pub(super) fn toolbar(
     };
     // A linked PR is named before it is found; a branch's once it is.
     let id: Option<&PullRequestId> = pr.map(|pr| &pr.id).or(linked);
-    let watched = link.is_some_and(|link| link.watched);
-    let asks = matches!(serving, Some(Serving::Asking | Serving::Served));
-    let unlink_tip = if watched {
-        "Unlink, closing its tab and ending the agent's watch"
-    } else {
-        "Unlink, closing its tab"
-    };
+    let watched = reading.link.is_some_and(|link| link.watched);
+    let asks = reading.seen.asks();
     h_flex()
         .flex_shrink_0()
         .h_8()
@@ -105,7 +111,7 @@ pub(super) fn toolbar(
                     .ghost()
                     .xsmall()
                     .icon(Lucide::Unlink)
-                    .tooltip(unlink_tip)
+                    .tooltip(unlink_tooltip(reading.link))
                     .on_click(cx.listener(|this, _, _, cx| this.unlink(cx))),
             )
         })
