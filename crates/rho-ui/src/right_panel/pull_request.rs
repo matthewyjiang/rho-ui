@@ -255,9 +255,7 @@ impl PullRequestSurface {
                 let summary = prs.pr(&target)?;
                 let detail = prs.detail(&summary.id)?;
                 let posts = detail
-                    .posts
-                    .iter()
-                    .chain(detail.threads.iter().flat_map(|thread| &thread.comments))
+                    .every_post()
                     .map(|post| (post.url.clone(), post.body.clone()));
                 Some(
                     std::iter::once((DESCRIPTION.into(), detail.body.clone()))

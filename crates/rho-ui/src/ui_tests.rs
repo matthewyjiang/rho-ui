@@ -3776,8 +3776,10 @@ const PR_BODY: &str = "Adds **widgets**.\n\n```mermaid\nflowchart LR\n  A --> B\
 
 /// What [`StubGh`]'s API answers: PR 12 on `feature`, with a diagram in its
 /// description, a failed check and a passed one, a comment and an
-/// approval, an open thread and a resolved one.
-fn stub_answer() -> String {
+/// approval, an open thread and a resolved one. Their authors' pictures
+/// are at `pictures`, an address such as
+/// [`serve_pictures`](crate::forge::avatar::test::serve_pictures) returns.
+fn stub_answer(pictures: &str) -> String {
     let summary = |checks: serde_json::Value| {
         serde_json::json!({
             "number": 12, "title": "Add widgets", "url": "https://github.com/acme/widgets/pull/12",
@@ -3794,9 +3796,10 @@ fn stub_answer() -> String {
         })
     };
     // A comment and an approval; an open thread and a resolved one.
+    let author = |login: &str| serde_json::json!({ "login": login, "avatarUrl": format!("{pictures}/{login}.png") });
     let post = |login: &str, at: &str, body: &str, url: &str| {
         serde_json::json!({
-            "author": { "login": login }, "body": body, "createdAt": at, "url": url
+            "author": author(login), "body": body, "createdAt": at, "url": url
         })
     };
     let thread = |id: &str, resolved: bool, path: &str, line: u32, body: &str| {
@@ -3830,7 +3833,7 @@ fn stub_answer() -> String {
             "https://github.com/acme/widgets/pull/12#c1",
         )] },
         "reviews": { "totalCount": 1, "nodes": [{
-            "author": { "login": "monalisa" }, "body": "Ship it.", "state": "APPROVED",
+            "author": author("monalisa"), "body": "Ship it.", "state": "APPROVED",
             "submittedAt": "2026-11-14T23:30:00Z",
             "url": "https://github.com/acme/widgets/pull/12#r1",
         }] },
@@ -3859,7 +3862,8 @@ fn stub_answer() -> String {
 
 /// A checkout of `acme/widgets` on GitHub, on branch `feature`, and a gh
 /// signed in to github.com whose API answers with PR 12 on `feature`, a
-/// failed check and a passed one, and counts its queries.
+/// failed check and a passed one, and counts its queries. The pictures of
+/// the PR's people are served on this machine, which `curl` fetches.
 struct StubGh {
     _checkout: tempfile::TempDir,
     repo: PathBuf,
@@ -3878,7 +3882,7 @@ impl StubGh {
 
         let bin = tempfile::tempdir().unwrap();
         let queries = bin.path().join("queries");
-        let answer = stub_answer();
+        let answer = stub_answer(&crate::forge::avatar::test::serve_pictures());
         std::fs::write(bin.path().join("answer.json"), answer).unwrap();
         let gh = bin.path().join("gh");
         let script = format!(
@@ -3977,19 +3981,30 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
         repo: RepoId::from_url("git@github.com:acme/widgets.git").unwrap(),
         branch: "feature".into(),
     };
-    let statuses = ui.cx.update(|cx| {
+    let (id, statuses) = ui.cx.update(|cx| {
         let prs = ui.app.read(cx).pull_requests().read(cx);
         let Lookup::Found(Found::Pr(summary)) = prs.lookup(&Target::Branch(branch.clone())) else {
             panic!("PR 12");
         };
         let detail = prs.detail(&summary.id).expect("its detail");
-        detail
+        let statuses = detail
             .checks
             .iter()
             .map(|check| check.status)
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (summary.id.clone(), statuses)
     });
     assert_eq!(statuses, [CheckStatus::Failed, CheckStatus::Passed]);
+    // Those who posted show their pictures, fetched from where GitHub
+    // serves each.
+    ui.wait_until("the authors' pictures", |_, cx, app| {
+        let prs = app.pull_requests().read(cx);
+        let detail = prs.detail(&id).expect("its detail");
+        detail.every_post().all(|post| {
+            let url = post.avatar_url.as_ref().expect("the author's picture");
+            prs.avatar(url).is_some()
+        })
+    });
     assert_eq!(
         ui.label("pull-request-title").as_deref(),
         Some("Add widgets")
