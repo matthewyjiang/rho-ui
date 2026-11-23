@@ -339,7 +339,7 @@ fn token_source(source: &str) -> Option<TokenSource> {
 /// Whether `gh` failed an account because GitHub refused its token, as
 /// opposed to not reaching GitHub at all. The refusal arrives as the raw
 /// 401 response, which says nothing a person needs.
-pub(super) fn refused(error: &str) -> bool {
+fn refused(error: &str) -> bool {
     error.contains("401") || error.contains("Bad credentials")
 }
 

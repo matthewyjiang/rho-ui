@@ -1,11 +1,11 @@
-//! The Pull request surface: one of a session's PRs, as [`PullRequests`]
-//! reads it: the one whose head is its branch, or one linked by hand
-//! ([`link`]), each in a tab of its own ([`Shows`]). It shows what the PR is
-//! ([`header`]), its checks ([`checks`]), its description, and its threads
-//! on the code and conversation, with a box to comment in
-//! ([`conversation`]). It watches the PR only while it shows, so a hidden
-//! panel or another tab costs no queries; the session's turn ending reads
-//! it again, and so does Refresh.
+//! The Pull request surface: one of a session's PRs, as its machine's rho
+//! daemon reads it ([`PullRequests`]): the one whose head is its branch, or
+//! one linked to the session, by hand ([`link`]) or by its agent, each in a
+//! tab of its own ([`Which`]). It shows what the PR is ([`header`]), its
+//! checks ([`checks`]), its description, and its threads on the code and
+//! conversation, with a box to comment in ([`conversation`]). It asks the
+//! daemon to keep reading the PR only while it shows; the session's turn
+//! ending reads it again, and so does Refresh.
 
 mod actions;
 mod checks;
@@ -34,6 +34,10 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, Stateful, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window,
 };
+use rho_ui_core::{
+    BranchLookup, BranchPullRequest, LinkedPullRequest, PullRequestDetail, PullRequestId,
+    PullRequestPost, PullRequestSummary, PullRequestTrouble,
+};
 
 pub(crate) use self::header::state_look;
 pub(super) use self::link::ShowLinked;
@@ -46,13 +50,9 @@ use self::{
     link::{link_button, LinkForm},
 };
 use crate::{
-    machines::{Place, SessionKey},
-    pull_requests::{
-        Found, Lookup, NoTarget, PrDetail, PrId, PrSummary, PullRequests, Refresh, RepoId, Target,
-        Trouble, Watch, BUDGET_FLOOR,
-    },
+    machines::{MachineId, SessionKey},
+    pull_requests::{PullRequests, Serving, Shown, Which},
     time,
-    workspaces::{WorkspaceRef, Workspaces},
 };
 
 /// Whether the surface is on screen.
@@ -62,24 +62,13 @@ pub(super) enum Visibility {
     Hidden,
 }
 
-/// Which of its session's PRs a surface shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Shows {
-    /// The one whose head is the session's branch, or why there is none.
-    Branch,
-    /// One linked by hand, in [`crate::pull_requests::PrLinks`].
-    Linked(PrId),
-}
-
 /// The Pull request surface of [`super::RightPanel`]: one PR of the
 /// session its tab belongs to.
 pub(super) struct PullRequestSurface {
     prs: Entity<PullRequests>,
     /// Its session.
     session: SessionKey,
-    /// The session's folder, whose branch and origin it reads.
-    workspace: WorkspaceRef,
-    shows: Shows,
+    which: Which,
     /// Whether it is on screen: the tab shown in a panel that shows.
     visibility: Visibility,
     /// The Markdown of the PR on screen, parsed once per text it has: its
@@ -89,46 +78,41 @@ pub(super) struct PullRequestSurface {
     diagrams: DiagramState,
     /// The comment threads on the code the user opened or closed, by id:
     /// those resolved start closed, the rest open.
-    flipped: HashSet<SharedString>,
+    flipped: HashSet<String>,
     /// The box to write a comment in, and its events. It is made on the
     /// first render, which has the window it needs.
     comment_box: Option<(Entity<TextareaState>, Subscription)>,
     posting: Posting,
     /// The form to link a PR by hand, while it is open.
     link_form: Option<LinkForm>,
+    /// Why the daemon refused to unlink the PR shown, until it is asked
+    /// again.
+    unlink_refused: Option<SharedString>,
     acting: Acting,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 1],
 }
 
 impl PullRequestSurface {
     pub(super) fn new(
         prs: Entity<PullRequests>,
-        workspaces: &Entity<Workspaces>,
         session: SessionKey,
-        place: &Place,
-        shows: Shows,
+        which: Which,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let subscriptions = [
-            cx.observe(&prs, |this, _, cx| {
-                this.sync_texts(cx);
-                cx.notify();
-            }),
-            // A branch switch shows in the workspace once it is read again.
-            cx.observe(workspaces, |this, _, cx| this.watch(cx)),
-        ];
-        // Closing the tab stops the polling for it.
+        let subscriptions = [cx.observe(&prs, |this, _, cx| {
+            this.sync_texts(cx);
+            cx.notify();
+        })];
+        // Closing the tab stops the daemon reading it for this surface.
         let surface = cx.entity_id();
         cx.on_release(move |this, cx| {
             this.prs.update(cx, |prs, cx| prs.hide(surface, cx));
         })
         .detach();
-        let workspace = WorkspaceRef::new(workspaces, place, cx);
         let mut this = Self {
             prs,
             session,
-            workspace,
-            shows,
+            which,
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
             diagrams: DiagramState::new(),
@@ -136,6 +120,7 @@ impl PullRequestSurface {
             comment_box: None,
             posting: Posting::Idle,
             link_form: None,
+            unlink_refused: None,
             acting: Acting::Idle,
             _subscriptions: subscriptions,
         };
@@ -146,12 +131,11 @@ impl PullRequestSurface {
     /// Reads the PR again as the session's turn ended, if it shows.
     pub(super) fn turn_ended(&mut self, cx: &mut Context<'_, Self>) {
         if self.visibility == Visibility::Shown {
-            self.prs
-                .update(cx, |prs, cx| prs.refresh(Refresh::Changed, cx));
+            self.prs.update(cx, PullRequests::refresh);
         }
     }
 
-    /// Shows the surface or hides it: only one on screen polls.
+    /// Shows the surface or hides it: only the one on screen is read.
     pub(super) fn set_visibility(&mut self, visibility: Visibility, cx: &mut Context<'_, Self>) {
         if self.visibility != visibility {
             self.visibility = visibility;
@@ -159,22 +143,23 @@ impl PullRequestSurface {
         }
     }
 
-    /// The PR linked by hand that it shows, if it shows one.
-    pub(super) fn linked(&self) -> Option<&PrId> {
-        match &self.shows {
-            Shows::Branch => None,
-            Shows::Linked(id) => Some(id),
+    /// The linked PR that it shows, if it shows one.
+    pub(super) fn linked(&self) -> Option<&PullRequestId> {
+        match &self.which {
+            Which::Branch => None,
+            Which::Linked(id) => Some(id),
         }
     }
 
     /// What its tab says: the PR's number, once its branch's is found.
     pub(super) fn label(&self, cx: &App) -> SharedString {
-        let number = match &self.shows {
-            Shows::Linked(id) => Some(id.number),
-            Shows::Branch => self.target(cx).ok().and_then(|target| {
-                let pr = self.prs.read(cx).pr(&target)?;
-                Some(pr.id.number)
-            }),
+        let number = match &self.which {
+            Which::Linked(id) => Some(id.number),
+            Which::Branch => self
+                .prs
+                .read(cx)
+                .summary(&self.shown())
+                .map(|summary| summary.id.number),
         };
         number.map_or_else(
             || "Pull request".into(),
@@ -182,42 +167,23 @@ impl PullRequestSurface {
         )
     }
 
-    /// What the surface follows: the PR it links, else its session's
-    /// branch's, in a repository on a forge; or why there is none.
-    fn target(&self, cx: &App) -> Result<Target, SharedString> {
-        if let Shows::Linked(id) = &self.shows {
-            return Ok(Target::Pr(id.clone()));
+    /// What the surface shows, as [`PullRequests`] names it.
+    fn shown(&self) -> Shown {
+        Shown {
+            session: self.session.clone(),
+            which: self.which.clone(),
         }
-        let workspace = self.workspace.read(cx);
-        Target::branch(workspace).map_err(|why| match why {
-            NoTarget::NotGit => "This session's folder isn't in a git repository.".into(),
-            NoTarget::Detached(hash) => {
-                format!("This session's checkout is on no branch, at {hash}.").into()
-            }
-            NoTarget::NoForge => "This repository has no origin remote on a forge.".into(),
-        })
     }
 
-    /// The repository of the session's origin remote, if it is on a forge.
-    fn origin(&self, cx: &App) -> Option<RepoId> {
-        let workspace = self.workspace.read(cx);
-        RepoId::from_url(workspace.origin()?)
-    }
-
-    /// Tells [`PullRequests`] what to watch for this surface.
+    /// Tells [`PullRequests`] whether this surface is on screen, so the
+    /// daemon reads what it shows.
     fn watch(&mut self, cx: &mut Context<'_, Self>) {
-        let watch = self
-            .target(cx)
-            .ok()
-            .filter(|_| self.visibility == Visibility::Shown)
-            .map(|target| Watch {
-                machine: self.session.machine.clone(),
-                target,
-            });
         let surface = cx.entity_id();
-        self.prs.update(cx, |prs, cx| match watch {
-            Some(watch) => prs.show(surface, watch, cx),
-            None => prs.hide(surface, cx),
+        let shown = self.shown();
+        let visibility = self.visibility;
+        self.prs.update(cx, |prs, cx| match visibility {
+            Visibility::Shown => prs.show(surface, shown, cx),
+            Visibility::Hidden => prs.hide(surface, cx),
         });
         self.sync_texts(cx);
         cx.notify();
@@ -237,9 +203,16 @@ impl PullRequestSurface {
     }
 
     /// The PR on screen, if one is.
-    fn shown_pr(&self, cx: &App) -> Option<PrId> {
-        let target = self.target(cx).ok()?;
-        Some(self.prs.read(cx).pr(&target)?.id.clone())
+    fn shown_pr(&self, cx: &App) -> Option<PullRequestId> {
+        let prs = self.prs.read(cx);
+        Some(prs.summary(&self.shown())?.id.clone())
+    }
+
+    /// The whole PR on screen, once the daemon read it.
+    fn shown_detail<'a>(&self, cx: &'a App) -> Option<&'a PullRequestDetail> {
+        let prs = self.prs.read(cx);
+        let summary = prs.summary(&self.shown())?;
+        prs.detail(&self.session.machine, &summary.id)
     }
 
     /// Parses the Markdown of the PR on screen that changed, and drops
@@ -248,21 +221,22 @@ impl PullRequestSurface {
     /// would hold up the diagrams of the PR on screen.
     fn sync_texts(&mut self, cx: &mut Context<'_, Self>) {
         let wanted: Vec<(SharedString, SharedString)> = self
-            .target(cx)
-            .ok()
-            .and_then(|target| {
-                let prs = self.prs.read(cx);
-                let summary = prs.pr(&target)?;
-                let detail = prs.detail(&summary.id)?;
-                let posts = detail
-                    .every_post()
-                    .map(|post| (post.url.clone(), post.body.clone()));
-                Some(
-                    std::iter::once((DESCRIPTION.into(), detail.body.clone()))
-                        .chain(posts)
-                        .filter(|(_, text)| !text.trim().is_empty())
-                        .collect(),
-                )
+            .shown_detail(cx)
+            .map(|detail| {
+                let posts = every_post(detail).map(|post| {
+                    (
+                        SharedString::from(post.url.clone()),
+                        SharedString::from(post.body.clone()),
+                    )
+                });
+                let description = (
+                    SharedString::from(DESCRIPTION),
+                    SharedString::from(detail.body.clone()),
+                );
+                std::iter::once(description)
+                    .chain(posts)
+                    .filter(|(_, text)| !text.trim().is_empty())
+                    .collect()
             })
             .unwrap_or_default();
         let mut parsed = std::mem::take(&mut self.texts);
@@ -319,8 +293,8 @@ impl PullRequestSurface {
     /// description, each under a rule.
     fn render_pr(
         &self,
-        summary: &PrSummary,
-        detail: Option<&PrDetail>,
+        summary: &PullRequestSummary,
+        detail: Option<&PullRequestDetail>,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let content = v_flex().gap_6().child(identity(summary, detail, cx));
@@ -370,6 +344,144 @@ impl PullRequestSurface {
 
 /// The key of a PR's description in [`PullRequestSurface::texts`].
 const DESCRIPTION: &str = "description";
+
+/// Every post of `detail`: those in its conversation, then those in its
+/// threads.
+fn every_post(detail: &PullRequestDetail) -> impl Iterator<Item = &PullRequestPost> {
+    let threads = detail.threads.iter().flat_map(|thread| &thread.comments);
+    detail.posts.iter().chain(threads)
+}
+
+/// What the daemon last said of the PR a surface shows.
+enum Seen<'a> {
+    /// The session's machine isn't connected.
+    Disconnected,
+    /// Its daemon is from before pull requests.
+    Unserved,
+    /// Not answered yet, or still looking.
+    Looking,
+    /// There is no PR to show, and why, as a person reads it.
+    Nothing(String),
+    Pr(&'a PullRequestSummary),
+}
+
+/// What a surface shows, with why it may be out of date, and the link
+/// to the session of the PR it shows, if it is linked.
+struct Reading<'a> {
+    seen: Seen<'a>,
+    trouble: Option<&'a PullRequestTrouble>,
+    link: Option<&'a LinkedPullRequest>,
+}
+
+impl<'a> Reading<'a> {
+    fn only(seen: Seen<'a>) -> Self {
+        Self {
+            seen,
+            trouble: None,
+            link: None,
+        }
+    }
+}
+
+/// What `prs` holds of `which` of `session`'s PRs.
+fn read<'a>(prs: &'a PullRequests, session: &SessionKey, which: &Which) -> Reading<'a> {
+    match prs.serving(&session.machine) {
+        None => return Reading::only(Seen::Disconnected),
+        Some(Serving::Unserved) => return Reading::only(Seen::Unserved),
+        Some(Serving::Asking | Serving::Served) => {}
+    }
+    let Some(set) = prs.of(session) else {
+        return Reading::only(Seen::Looking);
+    };
+    let linked = |id: &PullRequestId| set.linked.iter().find(|link| link.id == *id);
+    match which {
+        Which::Branch => {
+            let Some(branch) = &set.branch else {
+                return Reading::only(Seen::Looking);
+            };
+            let seen = branch_seen(branch);
+            let link = match &seen {
+                Seen::Pr(summary) => linked(&summary.id),
+                _ => None,
+            };
+            Reading {
+                seen,
+                trouble: branch.trouble.as_ref(),
+                link,
+            }
+        }
+        Which::Linked(id) => {
+            let Some(link) = linked(id) else {
+                // Not in the set yet, or just unlinked: its tab closes.
+                return Reading::only(Seen::Looking);
+            };
+            let seen = match (&link.summary, &link.trouble) {
+                (Some(summary), _) => Seen::Pr(summary),
+                // The message says it all.
+                (None, Some(PullRequestTrouble::NotFound { .. })) => {
+                    return Reading {
+                        seen: Seen::Nothing(format!(
+                            "There's no pull request #{} in {}/{}.",
+                            id.number, id.owner, id.name
+                        )),
+                        trouble: None,
+                        link: Some(link),
+                    };
+                }
+                (None, _) => Seen::Looking,
+            };
+            Reading {
+                seen,
+                trouble: link.trouble.as_ref(),
+                link: Some(link),
+            }
+        }
+    }
+}
+
+/// What the lookup of a session's branch's PR found.
+fn branch_seen(branch: &BranchPullRequest) -> Seen<'_> {
+    let name = branch.branch.as_deref();
+    let text = match &branch.lookup {
+        BranchLookup::Looking => return Seen::Looking,
+        BranchLookup::Found { pull_request } => return Seen::Pr(pull_request),
+        BranchLookup::NotGit => "This session's folder isn't in a git repository.".to_owned(),
+        BranchLookup::Detached { commit } => {
+            format!("This session's checkout is on no branch, at {commit}.")
+        }
+        BranchLookup::NoForge => "This repository has no origin remote on github.com.".to_owned(),
+        BranchLookup::DefaultBranch => match name {
+            Some(name) => format!("This session works on {name}, the default branch."),
+            None => "This session works on the default branch.".to_owned(),
+        },
+        BranchLookup::None => match name {
+            Some(name) => format!("No pull request for {name}."),
+            None => "No pull request for this branch.".to_owned(),
+        },
+        BranchLookup::OnlyForks { count } => {
+            let from = name.map_or_else(
+                || "this branch".to_owned(),
+                |name| format!("a branch named {name}"),
+            );
+            format!(
+                "The {count} newest pull requests from {from} all come from forks. If this \
+                 repository has its own, it is older."
+            )
+        }
+        // A lookup a newer rho sends.
+        _ => "This rho-ui doesn't know what rho found. Update rho-ui.".to_owned(),
+    };
+    Seen::Nothing(text)
+}
+
+/// `machine` as a sentence names it.
+fn on(machine: &MachineId) -> String {
+    if machine.is_local() {
+        "this machine".to_owned()
+    } else {
+        machine.to_string()
+    }
+}
 
 /// A row in a list that a click acts on: its fill on hover reaches past
 /// the list's edges, so what it starts with lines up with the heading.
@@ -422,13 +534,24 @@ fn section(
 }
 
 /// Why what shows may be out of date, as a person reads it.
-fn trouble_text(trouble: &Trouble<'_>) -> SharedString {
+fn trouble_text(trouble: &PullRequestTrouble, machine: &MachineId) -> SharedString {
+    let on = on(machine);
     match trouble {
-        Trouble::NoReader(why) | Trouble::Failed(why) => (*why).clone(),
-        Trouble::Paused(budget) => {
+        PullRequestTrouble::NotInstalled => {
+            format!("gh isn't installed on {on}. See Settings → Source control.").into()
+        }
+        PullRequestTrouble::SignedOut { host } => {
+            format!("gh on {on} isn't signed in to {host}. See Settings → Source control.").into()
+        }
+        PullRequestTrouble::Paused {
+            remaining,
+            floor,
+            resets_at,
+            ..
+        } => {
             // An upper bound, which stays true as the minutes pass unredrawn.
             // GitHub's limit resets hourly; hours are for a forge that doesn't.
-            let minutes = (budget.resets_at - time::now_unix())
+            let minutes = (resets_at - time::now_unix())
                 .max(0)
                 .unsigned_abs()
                 .div_ceil(60);
@@ -438,12 +561,16 @@ fn trouble_text(trouble: &Trouble<'_>) -> SharedString {
                 format!("{} h", minutes.div_ceil(60))
             };
             format!(
-                "Paused: this GitHub account has {} API points left, and rho-ui leaves the last \
-                 {BUDGET_FLOOR} for other uses. Its limit resets within {wait}.",
-                budget.remaining
+                "Paused: this GitHub account has {remaining} API points left, and rho leaves the \
+                 last {floor} for other uses. Its limit resets within {wait}."
             )
             .into()
         }
+        PullRequestTrouble::NotFound { message } | PullRequestTrouble::Failed { message } => {
+            message.clone().into()
+        }
+        // A trouble a newer rho sends.
+        _ => "rho reported a problem this rho-ui doesn't know. Update rho-ui.".into(),
     }
 }
 
@@ -472,48 +599,66 @@ impl Render for PullRequestSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.ensure_comment_box(window, cx);
         let cx = &*cx;
-        let target = self.target(cx);
         let prs = self.prs.read(cx);
-        let (pr, trouble, content) = match &target {
-            Err(why) => (
-                None,
-                None,
-                Some(message(why.clone(), None, Some(link_button(cx)))),
-            ),
-            Ok(target) => {
-                let trouble = prs.trouble(target).map(|trouble| trouble_text(&trouble));
-                let lookup = prs.lookup(target);
-                let pr = prs.pr(target);
-                let content = match lookup {
-                    // The trouble says why there is nothing yet.
-                    Lookup::Looking if trouble.is_some() => None,
-                    Lookup::Looking => Some(message(
-                        "Looking for a pull request…",
-                        Some(Spinner::new().into_any_element()),
-                        None,
-                    )),
-                    Lookup::Found(Found::Pr(summary)) => {
-                        Some(self.render_pr(summary, prs.detail(&summary.id), cx))
-                    }
-                    lookup => Some(message(
-                        nothing_found(target, &lookup),
-                        None,
-                        Some(link_button(cx)),
-                    )),
-                };
-                (pr, trouble, content)
+        let machine = &self.session.machine;
+        let serving = prs.serving(machine);
+        let reading = read(prs, &self.session, &self.which);
+        // Why what shows may be stale: what was just refused first, then
+        // what the daemon says of the PR, then why it didn't answer.
+        let trouble = match &reading.seen {
+            Seen::Disconnected | Seen::Unserved => None,
+            Seen::Looking | Seen::Nothing(_) | Seen::Pr(_) => {
+                self.unlink_refused.clone().or_else(|| {
+                    reading
+                        .trouble
+                        .map(|trouble| trouble_text(trouble, machine))
+                        .or_else(|| prs.failed(machine).cloned())
+                })
             }
+        };
+        let content = match &reading.seen {
+            Seen::Disconnected => Some(message(
+                format!("Not connected to {}.", on(machine)),
+                None,
+                None,
+            )),
+            Seen::Unserved => {
+                let text: SharedString = format!(
+                    "Update rho on {} to see its pull requests here.",
+                    on(machine)
+                )
+                .into();
+                Some(
+                    div()
+                        .id("pull-request-unserved")
+                        .test_support()
+                        .aria_label(text.clone())
+                        .h_full()
+                        .child(message(text, None, None))
+                        .into_any_element(),
+                )
+            }
+            // The trouble says why there is nothing yet.
+            Seen::Looking if trouble.is_some() => None,
+            Seen::Looking => Some(message(
+                "Looking for a pull request…",
+                Some(Spinner::new().into_any_element()),
+                None,
+            )),
+            Seen::Nothing(why) => Some(message(why.clone(), None, Some(link_button(cx)))),
+            Seen::Pr(summary) => {
+                Some(self.render_pr(summary, prs.detail(machine, &summary.id), cx))
+            }
+        };
+        let pr = match reading.seen {
+            Seen::Pr(summary) => Some(summary),
+            _ => None,
         };
         v_flex()
             .id("pull-request")
             .test_support()
             .size_full()
-            .child(toolbar(
-                target.as_ref().ok().map(Target::repo),
-                pr,
-                &self.shows,
-                cx,
-            ))
+            .child(toolbar(pr, reading.link, &self.which, serving, cx))
             .children(self.link_form(cx))
             .child(
                 v_flex()
@@ -536,27 +681,5 @@ impl Render for PullRequestSurface {
                     .children(content),
             )
             .into_any_element()
-    }
-}
-
-/// What the surface says when `target` has no PR to show, as `lookup` found.
-fn nothing_found(target: &Target, lookup: &Lookup<'_>) -> String {
-    match (target, lookup) {
-        (Target::Pr(id), _) => format!(
-            "There's no pull request #{} in {}/{}.",
-            id.number, id.repo.owner, id.repo.name
-        ),
-        (Target::Branch(branch), Lookup::DefaultBranch) => {
-            format!(
-                "This session works on {}, the default branch.",
-                branch.branch
-            )
-        }
-        (Target::Branch(branch), Lookup::Found(Found::OnlyForks(read))) => format!(
-            "The {read} newest pull requests from a branch named {} all come from forks. \
-             If this repository has its own, it is older.",
-            branch.branch
-        ),
-        (Target::Branch(branch), _) => format!("No pull request for {}.", branch.branch),
     }
 }

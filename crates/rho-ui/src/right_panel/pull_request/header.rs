@@ -14,21 +14,41 @@ use gpui_kit::{
     div, Context, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _,
 };
+use rho_ui_core::{
+    LinkedPullRequest, PullRequestDetail, PullRequestId, PullRequestReview, PullRequestState,
+    PullRequestSummary,
+};
 
-use super::{PullRequestSurface, Shows};
-use crate::pull_requests::{PrDetail, PrState, PrSummary, Refresh, RepoId, Review};
+use super::PullRequestSurface;
+use crate::pull_requests::{PullRequests, Serving, Which};
 
 /// The strip above the PR: its repository and number, and the buttons to
-/// open it on the forge, to link another by hand, to unlink one linked so,
-/// and to read it again.
+/// open it on the forge, to link another, to unlink one linked, and to
+/// read it again. `pr` is what the daemon found, `link` the session's link
+/// to it, if it has one; while `serving` says the daemon can't be asked,
+/// it offers nothing that asks it.
 pub(super) fn toolbar(
-    repo: Option<&RepoId>,
-    pr: Option<&PrSummary>,
-    shows: &Shows,
+    pr: Option<&PullRequestSummary>,
+    link: Option<&LinkedPullRequest>,
+    which: &Which,
+    serving: Option<Serving>,
     cx: &Context<'_, PullRequestSurface>,
 ) -> impl IntoElement {
     let theme = cx.theme();
     let url = pr.and_then(|pr| web_url(&pr.url));
+    let linked = match which {
+        Which::Branch => None,
+        Which::Linked(id) => Some(id),
+    };
+    // A linked PR is named before it is found; a branch's once it is.
+    let id: Option<&PullRequestId> = pr.map(|pr| &pr.id).or(linked);
+    let watched = link.is_some_and(|link| link.watched);
+    let asks = matches!(serving, Some(Serving::Asking | Serving::Served));
+    let unlink_tip = if watched {
+        "Unlink, closing its tab and ending the agent's watch"
+    } else {
+        "Unlink, closing its tab"
+    };
     h_flex()
         .flex_shrink_0()
         .h_8()
@@ -38,22 +58,25 @@ pub(super) fn toolbar(
         .border_color(theme.border)
         .text_xs()
         .text_color(theme.muted_foreground)
-        .children(repo.map(|repo| {
-            div()
-                .min_w_0()
-                .truncate()
-                .child(format!("{}/{}", repo.owner, repo.name))
-        }))
-        .when_some(pr, |this, pr| {
+        .when_some(id, |this, id| {
             this.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(format!("{}/{}", id.owner, id.name)),
+            )
+            .child(
                 div()
                     .flex_shrink_0()
                     .text_color(theme.foreground)
-                    .child(format!("#{}", pr.id.number)),
+                    .child(format!("#{}", id.number)),
             )
         })
-        .when(matches!(shows, Shows::Linked(_)), |this| {
+        .when(linked.is_some(), |this| {
             this.child(div().flex_shrink_0().child("· linked"))
+        })
+        .when(watched, |this| {
+            this.child(div().flex_shrink_0().child("· watched"))
         })
         .child(div().flex_1())
         .when_some(url, |this, url| {
@@ -66,43 +89,47 @@ pub(super) fn toolbar(
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             )
         })
-        .child(
-            Button::new("pull-request-link")
-                .ghost()
-                .xsmall()
-                .icon(Lucide::Link)
-                .tooltip("Link another pull request")
-                .on_click(cx.listener(|this, _, window, cx| this.start_linking(window, cx))),
-        )
-        .when(matches!(shows, Shows::Linked(_)), |this| {
+        .when(asks, |this| {
+            this.child(
+                Button::new("pull-request-link")
+                    .ghost()
+                    .xsmall()
+                    .icon(Lucide::Link)
+                    .tooltip("Link another pull request")
+                    .on_click(cx.listener(|this, _, window, cx| this.start_linking(window, cx))),
+            )
+        })
+        .when(asks && linked.is_some(), |this| {
             this.child(
                 Button::new("pull-request-unlink")
                     .ghost()
                     .xsmall()
                     .icon(Lucide::Unlink)
-                    .tooltip("Unlink, closing its tab")
+                    .tooltip(unlink_tip)
                     .on_click(cx.listener(|this, _, _, cx| this.unlink(cx))),
             )
         })
-        .when(repo.is_some(), |this| this.child(refresh_button(cx)))
+        .when(asks, |this| this.child(refresh_button(cx)))
 }
 
 /// How a PR's state reads, here and on its sidebar row: its word, icon
 /// and color.
-pub(crate) fn state_look(state: PrState) -> (&'static str, Lucide, ColorName) {
+pub(crate) fn state_look(state: PullRequestState) -> (&'static str, Lucide, ColorName) {
     match state {
-        PrState::Open => ("Open", Lucide::GitPullRequest, ColorName::Green),
-        PrState::Draft => ("Draft", Lucide::GitPullRequestDraft, ColorName::Gray),
-        PrState::Merged => ("Merged", Lucide::GitMerge, ColorName::Purple),
-        PrState::Closed => ("Closed", Lucide::GitPullRequestClosed, ColorName::Red),
+        PullRequestState::Open => ("Open", Lucide::GitPullRequest, ColorName::Green),
+        PullRequestState::Draft => ("Draft", Lucide::GitPullRequestDraft, ColorName::Gray),
+        PullRequestState::Merged => ("Merged", Lucide::GitMerge, ColorName::Purple),
+        PullRequestState::Closed => ("Closed", Lucide::GitPullRequestClosed, ColorName::Red),
+        // A state a newer rho sends.
+        _ => ("Unknown", Lucide::CircleQuestionMark, ColorName::Gray),
     }
 }
 
 /// The title, then its state, author and branches, then its size and
 /// review.
 pub(super) fn identity(
-    summary: &PrSummary,
-    detail: Option<&PrDetail>,
+    summary: &PullRequestSummary,
+    detail: Option<&PullRequestDetail>,
     cx: &Context<'_, PullRequestSurface>,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -161,15 +188,20 @@ pub(super) fn identity(
 
 /// "+10 −2 · 3 files · Approved".
 pub(super) fn size_and_review(
-    detail: &PrDetail,
+    detail: &PullRequestDetail,
     cx: &Context<'_, PullRequestSurface>,
 ) -> impl IntoElement {
     let theme = cx.theme();
     let review = match detail.review {
-        Review::None => None,
-        Review::Required => Some(("Review required", Lucide::CircleDashed, theme.yellow)),
-        Review::ChangesRequested => Some(("Changes requested", Lucide::CircleX, theme.red)),
-        Review::Approved => Some(("Approved", Lucide::CircleCheck, theme.green)),
+        PullRequestReview::Required => {
+            Some(("Review required", Lucide::CircleDashed, theme.yellow))
+        }
+        PullRequestReview::ChangesRequested => {
+            Some(("Changes requested", Lucide::CircleX, theme.red))
+        }
+        PullRequestReview::Approved => Some(("Approved", Lucide::CircleCheck, theme.green)),
+        // None asked or given, or a review a newer rho sends.
+        _ => None,
     };
     let files = match detail.changed_files {
         1 => "1 file".to_owned(),
@@ -204,8 +236,7 @@ pub(super) fn size_and_review(
         })
 }
 
-/// Reads the PR again, its detail too, and checks again a CLI that
-/// couldn't read it.
+/// Has the daemon read the PR again, its detail too.
 pub(super) fn refresh_button(cx: &Context<'_, PullRequestSurface>) -> Button {
     Button::new("pull-request-refresh")
         .ghost()
@@ -213,8 +244,7 @@ pub(super) fn refresh_button(cx: &Context<'_, PullRequestSurface>) -> Button {
         .icon(IconName::RotateCw)
         .tooltip("Refresh")
         .on_click(cx.listener(|this, _, _, cx| {
-            this.prs
-                .update(cx, |prs, cx| prs.refresh(Refresh::Everything, cx));
+            this.prs.update(cx, PullRequests::refresh);
         }))
 }
 

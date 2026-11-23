@@ -416,6 +416,7 @@ impl RhoApp {
                 .update(cx, |auths, cx| auths.forget(&gone.machine, cx));
             self.worktrees
                 .update(cx, |worktrees, cx| worktrees.forget(&gone.machine, cx));
+            self.prs.update(cx, |prs, cx| prs.forget(&gone.machine, cx));
             self.forges
                 .update(cx, |forges, cx| forges.forget(&gone.machine, cx));
             self.forget_sessions(&gone.machine, window, cx);
@@ -485,6 +486,7 @@ impl RhoApp {
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.forget(machine, cx));
+        self.prs.update(cx, |prs, cx| prs.forget(machine, cx));
         self.installs
             .update(cx, |installs, cx| installs.set_upgrade(machine, None, cx));
         self.next_epoch += 1;
@@ -576,6 +578,8 @@ impl RhoApp {
         self.worktrees.update(cx, |worktrees, cx| {
             worktrees.connected(machine, daemon.clone(), cx);
         });
+        self.prs
+            .update(cx, |prs, cx| prs.connected(machine, daemon.clone(), cx));
         self.installs.update(cx, |installs, cx| {
             installs.check(machine, Some(info.version()), cx);
         });
@@ -670,6 +674,7 @@ impl RhoApp {
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.forget(machine, cx));
+        self.prs.update(cx, |prs, cx| prs.forget(machine, cx));
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
         self.installs.update(cx, |installs, cx| {
@@ -832,6 +837,12 @@ impl RhoApp {
         match event {
             DaemonEvent::Update { session, update } => {
                 let session = key(session);
+                // Its pull requests go to their one owner; the update still
+                // goes on, so the session's cursor advances.
+                if let Some(set) = update.pull_requests() {
+                    self.prs
+                        .update(cx, |prs, cx| prs.replaced(&session, set.clone(), cx));
+                }
                 if let Some(open) = self.opened(&session) {
                     // One let go hears what came since once followed again.
                     if open.let_go.is_none() {
@@ -1981,10 +1992,6 @@ impl RhoApp {
     /// The pull requests the right panel reads, for UI tests.
     pub(crate) fn pull_requests(&self) -> &Entity<PullRequests> {
         &self.prs
-    }
-    /// The forge CLIs found on each machine, for UI tests.
-    pub(crate) fn forges(&self) -> &Entity<Forges> {
-        &self.forges
     }
     /// The session the main pane shows, for UI tests.
     pub(crate) fn active_session(&self) -> Option<Entity<SessionView>> {

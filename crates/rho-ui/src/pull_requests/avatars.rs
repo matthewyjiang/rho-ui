@@ -12,8 +12,8 @@ use std::{
 };
 
 use gpui_kit::{Image, SharedString};
+use rho_ui_core::{PullRequestDetail, PullRequestPost};
 
-use super::model::PrDetail;
 use crate::machines::MachineId;
 
 /// Where one picture is.
@@ -24,6 +24,13 @@ enum Picture {
     /// It didn't load: its person's initials show until Refresh asks
     /// again.
     Failed,
+}
+
+/// Everything said on `detail`: its comments and reviews, then its
+/// threads' comments.
+fn every_post(detail: &PullRequestDetail) -> impl Iterator<Item = &PullRequestPost> {
+    let threads = detail.threads.iter().flat_map(|thread| &thread.comments);
+    detail.posts.iter().chain(threads)
 }
 
 /// A picture's address less its query, which names it.
@@ -39,7 +46,7 @@ pub(super) struct Avatars {
     /// that fetches it. One runs
     /// at a time: on a remote machine each is an ssh session on the shared
     /// connection, which sshd's default `MaxSessions` holds to 10, and the
-    /// poll, the Files surface and git need some too.
+    /// daemon connection, the Files surface and git need some too.
     queue: VecDeque<(MachineId, SharedString)>,
     fetching: bool,
 }
@@ -55,14 +62,12 @@ impl Avatars {
 
     /// Queues the pictures of those who posted on `detail`, less those
     /// asked for before, to fetch on `machine`, which read it.
-    pub(super) fn queue(&mut self, detail: &PrDetail, machine: &MachineId) {
-        for url in detail
-            .every_post()
-            .filter_map(|post| post.avatar_url.as_ref())
-        {
+    pub(super) fn queue(&mut self, detail: &PullRequestDetail, machine: &MachineId) {
+        for url in every_post(detail).filter_map(|post| post.avatar_url.as_ref()) {
             if let Entry::Vacant(entry) = self.pictures.entry(name(url).to_owned()) {
                 entry.insert(Picture::Fetching);
-                self.queue.push_back((machine.clone(), url.clone()));
+                self.queue
+                    .push_back((machine.clone(), SharedString::from(url.clone())));
             }
         }
     }

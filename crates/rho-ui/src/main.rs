@@ -397,7 +397,6 @@ fn init(cx: &mut App, db: &StateDb) {
     cx.set_global(BackgroundLog::new(db));
     cx.set_global(PanelLayout::load(db));
     cx.set_global(LastCheckout::load(db));
-    cx.set_global(pull_requests::PrLinks::load(db));
     cx.on_action(|_: &Quit, cx| cx.quit());
     // `secondary` is Cmd on macOS and Ctrl elsewhere.
     cx.bind_keys([

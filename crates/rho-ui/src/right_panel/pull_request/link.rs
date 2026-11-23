@@ -1,8 +1,9 @@
 //! Linking PRs to a session by hand, for those the branch doesn't find: a
-//! fork's, one from another branch, or one in another repository. Each link
-//! is kept in [`PrLinks`], so it outlasts restarts, until it is unlinked,
-//! and shows in a tab of its own, which [`super::super::RightPanel`] opens
-//! and closes as [`PrLinks`] changes.
+//! fork's, one from another branch, or one in another repository. The
+//! session's daemon keeps each link, the agent's too, until it is
+//! unlinked, and each shows in a tab of its own, which
+//! [`super::super::RightPanel`] opens and closes as the daemon's links
+//! change.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -10,28 +11,30 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
-    v_flex, ActiveTheme as _, IconName, Sizable as _,
+    v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, AnyElement, AppContext as _, BorrowAppContext as _, Context, Entity, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Subscription, Window,
+    div, AnyElement, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _,
+    IntoElement, ParentElement as _, SharedString, Styled as _, Subscription, Task, Window,
 };
+use rho_ui_core::PullRequestId;
 
 use super::PullRequestSurface;
-use crate::pull_requests::{PrId, PrLinks};
 
 /// Asks [`super::super::RightPanel`] to show the tab of this PR, which the
 /// user just linked, or named when it was linked already.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::right_panel) struct ShowLinked(pub(in crate::right_panel) PrId);
+pub(in crate::right_panel) struct ShowLinked(pub(in crate::right_panel) PullRequestId);
 
 /// The form to link a PR, while it is open.
 pub(super) struct LinkForm {
     input: Entity<InputState>,
-    /// Why what was given doesn't name a PR.
+    /// Why the daemon refused what was given.
     error: Option<SharedString>,
+    /// The link asked of the daemon, until it answers; dropping it stops
+    /// waiting.
+    linking: Option<Task<()>>,
     _events: Subscription,
 }
 
@@ -66,6 +69,7 @@ impl PullRequestSurface {
             self.link_form = Some(LinkForm {
                 input,
                 error: None,
+                linking: None,
                 _events: events,
             });
         }
@@ -75,36 +79,63 @@ impl PullRequestSurface {
         cx.notify();
     }
 
-    /// Links the PR the form names to the session, beside those linked
-    /// already, or says why it can't.
+    /// Asks the session's daemon to link the PR the form names, as typed:
+    /// the daemon reads it. Once linked, the form closes and its tab shows;
+    /// a refusal shows under the form.
     fn link(&mut self, cx: &mut Context<'_, Self>) {
         let Some(form) = &self.link_form else {
             return;
         };
-        let (text, key) = (form.input.read(cx).value(), self.session.clone());
-        match PrId::parse(&text, self.origin(cx).as_ref()) {
-            Ok(id) => {
-                cx.update_global::<PrLinks, _>(|links, _| links.add(&key, id.clone()));
-                self.link_form = None;
-                cx.emit(ShowLinked(id));
-                cx.notify();
-            }
-            Err(why) => {
-                if let Some(form) = &mut self.link_form {
-                    form.error = Some(why.into());
+        let text = form.input.read(cx).value().trim().to_owned();
+        if text.is_empty() || form.linking.is_some() {
+            return;
+        }
+        let session = self.session.clone();
+        let linked = self.prs.update(cx, |prs, cx| prs.link(&session, text, cx));
+        let task = cx.spawn(async move |this, cx| {
+            let result = linked.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(id) => {
+                        this.link_form = None;
+                        cx.emit(ShowLinked(id));
+                    }
+                    Err(why) => {
+                        if let Some(form) = &mut this.link_form {
+                            form.linking = None;
+                            form.error = Some(why);
+                        }
+                    }
                 }
                 cx.notify();
-            }
+            });
+        });
+        if let Some(form) = &mut self.link_form {
+            form.error = None;
+            form.linking = Some(task);
         }
+        cx.notify();
     }
 
-    /// Unlinks the PR it shows, which closes its tab.
+    /// Asks the session's daemon to unlink the PR it shows, which closes
+    /// its tab once it answers; a refusal shows as trouble.
     pub(super) fn unlink(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(id) = self.linked() else {
+        let Some(id) = self.linked().cloned() else {
             return;
         };
-        let (key, id) = (self.session.clone(), id.clone());
-        cx.update_global::<PrLinks, _>(|links, _| links.remove(&key, &id));
+        let session = self.session.clone();
+        let unlinked = self.prs.update(cx, |prs, cx| prs.unlink(&session, &id, cx));
+        self.unlink_refused = None;
+        cx.spawn(async move |this, cx| {
+            if let Err(why) = unlinked.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.unlink_refused = Some(why);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     /// The form, under the toolbar, while it is open.
@@ -126,6 +157,8 @@ impl PullRequestSurface {
                     .primary()
                     .small()
                     .label("Link")
+                    .loading(form.linking.is_some())
+                    .disabled(form.linking.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.link(cx))),
             )
             .child(

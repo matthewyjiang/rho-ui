@@ -1,7 +1,10 @@
-//! Pull requests: which one a session's branch has, and what it says, read
-//! through a forge CLI (so far GitHub's `gh`) on some machine. What is
-//! watched is read in one batched query per poll ([`FetchPlan`]), with a
-//! PR's full detail only when it changed; see [`PullRequests`].
+//! Pull requests: each session's, as its machine's rho daemon reads them
+//! with its own `gh`. rho-ui only asks: `list` for the sidebar's rows,
+//! `show` for the PR on screen, `link` and `unlink` for the user's links;
+//! and each change to a followed session's set arrives as an event
+//! ([`PullRequests::replaced`]). What rho-ui does *to* a PR (comment,
+//! merge, ready, draft) still runs `gh` on the session's machine
+//! ([`PullRequests::act`]); see [`PullRequests`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -12,170 +15,83 @@ use std::{
 
 use web_time::Instant;
 
-use gpui_kit::{BackgroundExecutor, Context, Entity, EntityId, Image, SharedString, Task};
+use gpui_kit::{App, Context, Entity, EntityId, Image, SharedString, Task};
 
-use rho_ui_core::SessionId;
+use rho_ui_core::{
+    BranchLookup, Daemon, PullRequestDetail, PullRequestError, PullRequestId, PullRequestRead,
+    PullRequestSummary, PullRequestTarget, SessionId, SessionPullRequestShowResponse,
+    SessionPullRequests,
+};
 
 use self::avatars::Avatars;
-pub(crate) use self::model::*;
+pub(crate) use crate::forge::PrAction;
 
 use crate::{
     folders::Reader,
     forge::{self, AuthState, Check, CliProbe, ForgeCli, Forges},
     machines::{MachineId, SessionKey},
-    repo::Head,
-    store::StateDb,
-    time,
-    workspaces::{Workspace, Workspaces},
+    workspaces::Workspaces,
 };
 
 mod avatars;
-pub(crate) mod model;
 
-/// How often the PR on screen is read again: often enough to follow a CI
-/// run (the last one here took 21 min 40 s, so about 44 polls), at one
-/// GraphQL point a poll, 120 an hour of GitHub's 5,000.
-const POLL: Duration = Duration::from_secs(30);
+/// How often the PR on screen is shown again: the protocol asks for `show`
+/// within 30 s to keep the daemon reading it, and the daemon's lease lasts
+/// two of these, 60 s, so a request that takes a second still renews it in
+/// time (rho's `crates/rho/src/app/pull_requests/interest.rs`).
+const SHOW_EVERY: Duration = Duration::from_secs(30);
 
-/// How often the sidebar's PRs are read again while the window has the
-/// focus: one query per host and reader, at one point each, so 12 points
-/// an hour. A row only needs a PR's state and its checks' rollup, which
-/// the surface follows every [`POLL`] for the session on screen.
-const INDEX_POLL: Duration = Duration::from_secs(300);
+/// How often a machine's listed sessions are listed again while the window
+/// has the focus. A `list` reads no GitHub: it answers from the daemon's
+/// last read and runs `git` twice a session, 3 to 4 ms each, so about
+/// 0.2 s of `git` a minute for 30 rows. Nothing pushes a change to a
+/// session rho-ui lists but doesn't follow, so this is how far a row
+/// trails the daemon's read; it renews the daemon's 5-minute lease five
+/// times over.
+const LIST_EVERY: Duration = Duration::from_secs(60);
 
-/// How much of a host's GraphQL budget to leave for everything else that
-/// spends it, such as the agent's own `gh` calls: at or below this,
-/// polling waits for the budget to reset, and says so. A poll costs one
-/// point (measured), so this holds back 25 minutes of polling.
-pub(crate) const BUDGET_FLOOR: u32 = 50;
+/// How often a machine is listed again instead of [`LIST_EVERY`] while
+/// its last answer holds a listed session still looking, with no trouble:
+/// a daemon's first read of 100 summaries took 3.0 s, and the marks of a
+/// just-started app shouldn't wait a minute. It ends by itself: a read
+/// that fails sets a trouble.
+const LOOKING_EVERY: Duration = Duration::from_secs(5);
 
-/// The PRs linked by hand to each session, in the order linked, each shown
-/// in a Pull request tab of its own beside the branch's; kept in the state
-/// database's `pr_links` table. A global.
-#[derive(Debug)]
-pub(crate) struct PrLinks {
-    links: HashMap<SessionKey, Vec<PrId>>,
-    db: StateDb,
+/// The one host whose branches a daemon looks up.
+const GITHUB: &str = "github.com";
+
+/// What an answer says when `PullRequests` went away first.
+const GONE: &str = "rho-ui is closing.";
+
+/// Which of a session's pull requests the Pull request surface shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Which {
+    /// The one of the branch its workspace has checked out.
+    Branch,
+    /// One linked to it, by the user or the agent.
+    Linked(PullRequestId),
 }
 
-impl gpui_kit::Global for PrLinks {}
-
-impl PrLinks {
-    /// Loads every saved link.
-    pub(crate) fn load(db: &StateDb) -> Self {
-        let rows = db.query(
-            "SELECT machine, session_id, host, owner, name, number FROM pr_links ORDER BY rowid",
-            [],
-            |row| {
-                let machine = MachineId::from(row.get::<_, String>(0)?.as_str());
-                let session = SessionId::from(row.get::<_, String>(1)?.as_str());
-                let repo = RepoId {
-                    host: row.get(2)?,
-                    owner: row.get(3)?,
-                    name: row.get(4)?,
-                };
-                let id = PrId {
-                    repo,
-                    number: row.get(5)?,
-                };
-                Ok((SessionKey::new(machine, session), id))
-            },
-        );
-        let mut links: HashMap<SessionKey, Vec<PrId>> = HashMap::new();
-        for (session, id) in rows {
-            links.entry(session).or_default().push(id);
-        }
-        Self {
-            links,
-            db: db.clone(),
-        }
-    }
-
-    /// The PRs linked to `session`, in the order linked.
-    pub(crate) fn get(&self, session: &SessionKey) -> &[PrId] {
-        self.links.get(session).map_or(&[], Vec::as_slice)
-    }
-
-    /// Links `id` to `session`, after those linked before; a PR linked
-    /// already stays where it is.
-    pub(crate) fn add(&mut self, session: &SessionKey, id: PrId) {
-        let linked = self.links.entry(session.clone()).or_default();
-        if linked.contains(&id) {
-            return;
-        }
-        self.db.execute(
-            "INSERT OR IGNORE INTO pr_links (machine, session_id, host, owner, name, number) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            Self::row(session, &id),
-        );
-        linked.push(id);
-    }
-
-    /// Unlinks `id` from `session`.
-    pub(crate) fn remove(&mut self, session: &SessionKey, id: &PrId) {
-        self.db.execute(
-            "DELETE FROM pr_links WHERE machine = ?1 AND session_id = ?2 \
-             AND host = ?3 AND owner = ?4 AND name = ?5 AND number = ?6",
-            Self::row(session, id),
-        );
-        if let Some(linked) = self.links.get_mut(session) {
-            linked.retain(|linked| linked != id);
-            if linked.is_empty() {
-                self.links.remove(session);
-            }
-        }
-    }
-
-    /// The `pr_links` row of `id` linked to `session`, in its columns'
-    /// order.
-    fn row<'a>(
-        session: &'a SessionKey,
-        id: &'a PrId,
-    ) -> (&'a str, &'a str, &'a str, &'a str, &'a str, u32) {
-        let repo = &id.repo;
-        (
-            session.machine.as_str(),
-            session.id.as_str(),
-            &repo.host,
-            &repo.owner,
-            &repo.name,
-            id.number,
-        )
-    }
+/// What the Pull request surface on screen shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Shown {
+    pub(crate) session: SessionKey,
+    pub(crate) which: Which,
 }
 
-/// What the Pull request surface can say of a branch.
-#[derive(Debug)]
-pub(crate) enum Lookup<'a> {
-    /// Not asked yet, or being asked.
-    Looking,
-    /// The branch is the repository's default, which PRs merge into.
-    DefaultBranch,
-    Found(&'a Found),
-}
-
-/// Why what [`Lookup`] says may be out of date, or missing.
-#[derive(Debug)]
-pub(crate) enum Trouble<'a> {
-    /// No machine can ask the forge, and why.
-    NoReader(&'a SharedString),
-    /// Polling waits for the host's API budget to reset.
-    Paused(&'a Budget),
-    /// The last poll failed, and why.
-    Failed(&'a SharedString),
-}
-
-/// What [`PullRequests::refresh`] reads.
+/// Whether a machine's daemon serves pull requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Refresh {
-    /// What is watched, and a PR's detail if it changed.
-    Changed,
-    /// The PR's detail too, changed or not, as the user asked, from a
-    /// fresh check of the CLIs that couldn't read it.
-    Everything,
+pub(crate) enum Serving {
+    /// Not answered since it connected.
+    Asking,
+    Served,
+    /// It is from before pull requests (`MethodNotFound`): nothing more is
+    /// asked of it until it connects again.
+    Unserved,
 }
 
-/// Whether the window has the focus: polls wait while it doesn't.
+/// Whether the window has the focus: requests wait while it doesn't, so
+/// the daemon's leases lapse and it stops reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Focus {
     Focused,
@@ -193,26 +109,18 @@ impl Focus {
     }
 }
 
-/// Whether an answer moved a repository to the session's own machine,
-/// which should be asked next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ingested {
-    Done,
-    AskTheSession,
-}
-
-/// Whether a polling loop's read runs.
+/// Whether a request loop's request runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Run {
     Idle,
     Running,
-    /// Running, and something asked for another read after it.
+    /// Running, and something asked for another request after it.
     RunningThenAgain,
 }
 
-/// One polling loop's timing: whether a read runs, what the last one was
-/// for and when it started, and the task that runs it or waits for the
-/// next.
+/// One request loop's timing: whether a request runs, what the last one
+/// was for and when it started, and the task that runs it or waits for
+/// the next.
 struct Cadence<K> {
     run: Run,
     /// On the executor's clock.
@@ -233,13 +141,13 @@ impl<K: PartialEq> Cadence<K> {
         self.run != Run::Idle
     }
 
-    /// Whether the last read, or the one under way, was for `key`.
+    /// Whether the last request, or the one under way, was for `key`.
     fn was_for(&self, key: &K) -> bool {
         self.last.as_ref().is_some_and(|(last, _)| last == key)
     }
 
-    /// Asks for another read once the one under way ends; whether one is
-    /// under way.
+    /// Asks for another request once the one under way ends; whether one
+    /// is under way.
     fn again(&mut self) -> bool {
         if self.run == Run::Running {
             self.run = Run::RunningThenAgain;
@@ -247,20 +155,20 @@ impl<K: PartialEq> Cadence<K> {
         self.is_running()
     }
 
-    /// Notes a read for `key` starting `now`.
+    /// Notes a request for `key` starting `now`.
     fn start(&mut self, key: K, now: Instant) {
         self.run = Run::Running;
         self.last = Some((key, now));
     }
 
-    /// Ends the read under way: whether another was asked for.
+    /// Ends the request under way: whether another was asked for.
     fn finish(&mut self) -> bool {
         let again = self.run == Run::RunningThenAgain;
         self.run = Run::Idle;
         again
     }
 
-    /// How long until a read for `key` is due, `period` after the last
+    /// How long until a request for `key` is due, `period` after the last
     /// one for it; `None` when it is due now.
     fn due_in(&self, key: &K, period: Duration, now: Instant) -> Option<Duration> {
         let (_, at) = self.last.as_ref().filter(|_| self.was_for(key))?;
@@ -281,7 +189,7 @@ fn report_avatar(url: &str, why: &str) {
 /// Runs `then` after `wait`, unless the task is dropped first.
 fn after(
     wait: Duration,
-    then: fn(&mut PullRequests, &mut Context<'_, PullRequests>),
+    then: impl FnOnce(&mut PullRequests, &mut Context<'_, PullRequests>) + 'static,
     cx: &mut Context<'_, PullRequests>,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
@@ -290,94 +198,57 @@ fn after(
     })
 }
 
-/// Why the PR on screen can't be polled yet.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Blocked {
-    /// Waiting for a check of a machine's CLI, which picks the reader.
-    WaitingForCheck,
-    /// No machine can ask the forge, and why; a check that ends may
-    /// change that.
-    NoReader(SharedString),
-}
-
-/// Why a session has no [`Target`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NoTarget {
-    /// Its folder isn't in a git repository.
-    NotGit,
-    /// Its checkout is on no branch, but this commit.
-    Detached(String),
-    /// Its repository has no origin remote on a forge.
-    NoForge,
-}
-
-impl Target {
-    /// The PR of the branch `workspace` is on.
-    ///
-    /// # Errors
-    ///
-    /// When it is on none, or its repository is on no forge: why.
-    pub(crate) fn branch(workspace: &Workspace) -> Result<Self, NoTarget> {
-        let branch = match workspace.head() {
-            None => return Err(NoTarget::NotGit),
-            Some(Head::Detached(hash)) => return Err(NoTarget::Detached(hash.clone())),
-            Some(Head::Branch(branch)) => branch.clone(),
-        };
-        let repo = workspace
-            .origin()
-            .and_then(RepoId::from_url)
-            .ok_or(NoTarget::NoForge)?;
-        Ok(Target::Branch(BranchId { repo, branch }))
-    }
-
-    /// What a session's sidebar row marks: its [branch's](Self::branch)
-    /// PR, else the first PR linked to it in `links`.
-    ///
-    /// # Errors
-    ///
-    /// When it has neither: why it has no branch's.
-    pub(crate) fn of(
-        session: &SessionKey,
-        workspace: &Workspace,
-        links: &PrLinks,
-    ) -> Result<Self, NoTarget> {
-        Self::branch(workspace).or_else(|why| {
-            let first = links.get(session).first().ok_or(why)?;
-            Ok(Target::Pr(first.clone()))
-        })
+/// How sentences name `machine`.
+fn on(machine: &MachineId) -> String {
+    if machine.is_local() {
+        "this machine".to_owned()
+    } else {
+        machine.to_string()
     }
 }
 
-/// What the Pull request surface follows, and the machine of the session
-/// it shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Watch {
-    pub(crate) machine: MachineId,
-    pub(crate) target: Target,
+/// What the panel says of a machine whose daemon serves no pull requests.
+fn unserved(machine: &MachineId) -> SharedString {
+    let on = on(machine);
+    format!("Update rho on {on} to see its pull requests here.").into()
 }
 
-/// One query: what it asks of a host, the machine whose CLI runs it, and
-/// the machine of the sessions it is for.
-struct Read {
-    /// A repository this machine's account can't see moves to the
-    /// sessions' machine.
-    session_machine: MachineId,
-    host: String,
-    machine: MachineId,
-    program: PathBuf,
-    plan: FetchPlan,
+fn not_connected(machine: &MachineId) -> SharedString {
+    let on = on(machine);
+    format!("rho on {on} isn't connected.").into()
 }
 
-impl Read {
-    /// Asks it, run on its machine by `runner`.
-    async fn run(
-        &self,
-        runner: Reader,
-        executor: &BackgroundExecutor,
-    ) -> Result<Batch, forge::QueryError> {
-        let program = self.program.clone();
-        forge::query_prs(runner, program, &self.host, &self.plan, executor).await
-    }
+/// How `show` and `unlink` name the linked PR `id`: the link's own `url`
+/// from `set`, never `owner/name#N`, which the daemon reads as github.com.
+/// One `set` doesn't hold goes by its address on its own host.
+fn link_text(set: Option<&SessionPullRequests>, id: &PullRequestId) -> String {
+    set.and_then(|set| set.linked.iter().find(|linked| linked.id == *id))
+        .map_or_else(
+            || {
+                let PullRequestId {
+                    host,
+                    owner,
+                    name,
+                    number,
+                    ..
+                } = id;
+                format!("https://{host}/{owner}/{name}/pull/{number}")
+            },
+            |linked| linked.url.clone(),
+        )
+}
+
+/// Whether the daemon is still looking up something of `set`, with no
+/// trouble to say why it can't: it will have an answer in seconds.
+fn still_looking(set: &SessionPullRequests) -> bool {
+    let branch = set.branch.as_ref().is_some_and(|branch| {
+        matches!(branch.lookup, BranchLookup::Looking) && branch.trouble.is_none()
+    });
+    let linked = set
+        .linked
+        .iter()
+        .any(|linked| linked.summary.is_none() && linked.trouble.is_none());
+    branch || linked
 }
 
 /// The machine, CLI and account that comment on a PR.
@@ -388,47 +259,141 @@ pub(crate) struct Poster {
     pub(crate) login: SharedString,
 }
 
-/// Which machine runs the CLI for a watch.
+/// What a machine's `gh` can do on a host, as its check says.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ReaderChoice {
+enum Gh {
     Use {
-        machine: MachineId,
         program: PathBuf,
+        login: SharedString,
     },
-    /// A check of a machine's CLI is under way, or not started.
-    Wait,
-    None(SharedString),
+    /// Its check is under way, or not started.
+    Checking,
+    /// It can't, and why.
+    Unusable(SharedString),
 }
 
-/// The PRs of what is watched, read through the forge CLIs [`Forges`]
-/// found. One poll at a time: a request while one runs is folded into one
-/// more after it.
+impl Gh {
+    /// What `machine`'s `gh` can do on `host`, by its `check`.
+    fn of(machine: &MachineId, host: &str, check: Option<&Check>) -> Self {
+        let on = on(machine);
+        match check {
+            None | Some(Check::Checking) => Gh::Checking,
+            Some(Check::Failed(failed)) => {
+                Gh::Unusable(format!("Couldn't check gh on {on}: {failed}").into())
+            }
+            Some(Check::Done(CliProbe::Missing)) => Gh::Unusable(
+                format!("gh isn't installed on {on}. See Settings → Source control.").into(),
+            ),
+            Some(Check::Done(CliProbe::Broken { why, .. })) => {
+                Gh::Unusable(format!("gh doesn't run on {on}: {why}").into())
+            }
+            Some(Check::Done(CliProbe::Found(status))) => {
+                // One that couldn't reach the forge when checked may be
+                // signed in: acting says if it isn't.
+                let account = status.accounts.iter().find(|account| {
+                    account.active
+                        && account.host == host
+                        && !matches!(account.auth, AuthState::Refused(_))
+                });
+                let Some(account) = account else {
+                    return Gh::Unusable(
+                        format!(
+                            "gh on {on} isn't signed in to {host}. See Settings → Source control."
+                        )
+                        .into(),
+                    );
+                };
+                Gh::Use {
+                    program: status.path.clone(),
+                    login: account.login.clone(),
+                }
+            }
+        }
+    }
+}
+
+/// What one connected machine's daemon said of its sessions' pull
+/// requests.
+struct MachinePrs {
+    /// Which of the machine's connections this is; an answer sent on an
+    /// earlier one is dropped.
+    connection: u64,
+    daemon: Daemon,
+    serving: Serving,
+    /// Each session's set, replaced whole by every answer and event, never
+    /// merged.
+    sessions: HashMap<SessionId, SessionPullRequests>,
+    /// Each pull request's detail, from the last `show` that carried one:
+    /// per machine, as two machines may read one PR as two accounts.
+    details: HashMap<PullRequestId, PullRequestDetail>,
+    /// Why the last request to this daemon got no answer, until one does.
+    failed: Option<SharedString>,
+    /// Reissues `list` for this machine's listed sessions.
+    list: Cadence<()>,
+}
+
+impl MachinePrs {
+    /// An answer came: the daemon serves pull requests, and whatever kept
+    /// the last one from answering is over. Whether that changed anything.
+    fn answered(&mut self) -> bool {
+        let changed = self.serving != Serving::Served || self.failed.is_some();
+        self.serving = Serving::Served;
+        self.failed = None;
+        changed
+    }
+
+    /// Replaces `session`'s set with `set`: whether it changed.
+    fn store(&mut self, session: &SessionId, set: SessionPullRequests) -> bool {
+        if self.sessions.get(session) == Some(&set) {
+            return false;
+        }
+        self.sessions.insert(session.clone(), set);
+        true
+    }
+
+    /// A request to `machine` got no answer, for `error`: notes why, and
+    /// says it as people read it.
+    fn refused(&mut self, machine: &MachineId, error: PullRequestError) -> SharedString {
+        let why: SharedString = match error {
+            PullRequestError::Unserved => {
+                self.serving = Serving::Unserved;
+                return unserved(machine);
+            }
+            PullRequestError::Invalid(message) => message.into(),
+            PullRequestError::Daemon(error) => error.to_string().into(),
+        };
+        self.failed = Some(why.clone());
+        why
+    }
+}
+
+/// Each session's pull requests, as each machine's daemon serves them.
+/// Two request loops keep the daemons reading what is on screen: `list`
+/// per machine for the sidebar's rows, every [`LIST_EVERY`], and `show`
+/// for the Pull request surface, every [`SHOW_EVERY`]. Each runs one
+/// request at a time: a request asked for while one is in flight is folded
+/// into one more after it. Neither runs while the window is unfocused, for
+/// a machine that isn't connected, or for one whose daemon is
+/// [`Serving::Unserved`].
 pub(crate) struct PullRequests {
+    /// The `gh` that acts: [`Self::poster`].
     forges: Entity<Forges>,
+    /// How to run `gh` and `curl` on a machine.
     workspaces: Entity<Workspaces>,
-    on_screen: Option<Watch>,
-    /// The surface that asked for `on_screen`: two sessions may watch the
-    /// same target, and only the one that asked last can stop it.
+    machines: HashMap<MachineId, MachinePrs>,
+    connections: u64,
+    /// The sidebar's sessions.
+    listed: Vec<SessionKey>,
+    shown: Option<Shown>,
+    /// The surface that asked for `shown`: two may show the same, and only
+    /// the one that asked last can stop it.
     shown_by: Option<EntityId>,
-    found: HashMap<Target, Found>,
-    details: HashMap<PrId, PrDetail>,
-    avatars: Avatars,
-    default_branches: HashMap<RepoId, Option<String>>,
-    /// Why the last poll of a target failed, until one answers.
-    failed: HashMap<Target, SharedString>,
-    /// Repositories this machine's account can't see, read from the
-    /// session's machine instead until Refresh.
-    hidden: HashSet<RepoId>,
-    budgets: HashMap<String, Budget>,
+    /// Reissues `show` for what is on screen.
+    show: Cadence<Shown>,
+    /// What the next `show` asks.
+    next: PullRequestRead,
     focus: Focus,
-    /// What the next poll reads of the PR on screen.
-    next: Refresh,
-    /// The PR on screen's polling, keyed by its target.
-    poll: Cadence<Target>,
-    blocked: Option<Blocked>,
-    /// The sidebar's sessions, read every [`INDEX_POLL`].
-    listed: Vec<Watch>,
-    index: Cadence<()>,
+    avatars: Avatars,
     _forges_changed: gpui_kit::Subscription,
 }
 
@@ -438,361 +403,645 @@ impl PullRequests {
         workspaces: Entity<Workspaces>,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        // A machine's CLI check ending may give a waiting poll its reader.
-        let forges_changed = cx.observe(&forges, |this, _, cx| {
-            if this.blocked.is_some() {
-                this.poll_now(cx);
-            }
-            if this.unread_listed() {
-                this.poll_index(cx);
-            }
-        });
+        // A machine's CLI check ending changes who comments.
+        let forges_changed = cx.observe(&forges, |_, _, cx| cx.notify());
         Self {
             forges,
             workspaces,
-            on_screen: None,
-            shown_by: None,
-            found: HashMap::new(),
-            details: HashMap::new(),
-            avatars: Avatars::default(),
-            default_branches: HashMap::new(),
-            failed: HashMap::new(),
-            hidden: HashSet::new(),
-            budgets: HashMap::new(),
-            focus: Focus::Focused,
-            next: Refresh::Changed,
-            poll: Cadence::new(),
-            blocked: None,
+            machines: HashMap::new(),
+            connections: 0,
             listed: Vec::new(),
-            index: Cadence::new(),
+            shown: None,
+            shown_by: None,
+            show: Cadence::new(),
+            next: PullRequestRead::Cached,
+            focus: Focus::Focused,
+            avatars: Avatars::default(),
             _forges_changed: forges_changed,
         }
     }
 
-    /// What is known of `target`'s PR.
-    pub(crate) fn lookup(&self, target: &Target) -> Lookup<'_> {
-        if let Target::Branch(branch) = target {
-            if self.is_default(branch) {
-                return Lookup::DefaultBranch;
-            }
-        }
-        self.found
-            .get(target)
-            .map_or(Lookup::Looking, Lookup::Found)
-    }
-
-    /// The PR found for `target`, if one was.
-    pub(crate) fn pr(&self, target: &Target) -> Option<&PrSummary> {
-        match self.lookup(target) {
-            Lookup::Found(Found::Pr(summary)) => Some(summary),
-            _ => None,
-        }
-    }
-
-    /// The detail of PR `id`, once read; it may be older than its summary.
-    pub(crate) fn detail(&self, id: &PrId) -> Option<&PrDetail> {
-        self.details.get(id)
-    }
-
-    /// The picture of a post's author, served at `url`
-    /// ([`Post::avatar_url`]), once fetched.
-    pub(crate) fn avatar(&self, url: &str) -> Option<Arc<Image>> {
-        self.avatars.get(url)
-    }
-
-    /// Why what is known of `target` may be out of date, if it may.
-    pub(crate) fn trouble(&self, target: &Target) -> Option<Trouble<'_>> {
-        let on_screen = self
-            .on_screen
+    /// `machine` connected to `daemon`, replacing what an earlier
+    /// connection said: its listed sessions are listed, and what is on
+    /// screen of it shown, at once.
+    pub(crate) fn connected(
+        &mut self,
+        machine: &MachineId,
+        daemon: Daemon,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.connections += 1;
+        self.machines.insert(
+            machine.clone(),
+            MachinePrs {
+                connection: self.connections,
+                daemon,
+                serving: Serving::Asking,
+                sessions: HashMap::new(),
+                details: HashMap::new(),
+                failed: None,
+                list: Cadence::new(),
+            },
+        );
+        cx.notify();
+        self.list_now(machine, cx);
+        if self
+            .shown
             .as_ref()
-            .is_some_and(|watch| watch.target == *target);
-        if let (Some(Blocked::NoReader(why)), true) = (&self.blocked, on_screen) {
-            return Some(Trouble::NoReader(why));
+            .is_some_and(|shown| shown.session.machine == *machine)
+        {
+            self.show_now(cx);
         }
-        if let Some(budget) = self.paused(&target.repo().host) {
-            return Some(Trouble::Paused(budget));
+    }
+
+    /// `machine`'s connection is gone, or the machine is: what it said
+    /// goes with it.
+    pub(crate) fn forget(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        if self.machines.remove(machine).is_some() {
+            cx.notify();
         }
-        self.failed.get(target).map(Trouble::Failed)
     }
 
-    fn is_default(&self, branch: &BranchId) -> bool {
-        self.default_branches
-            .get(&branch.repo)
-            .and_then(Option::as_deref)
-            == Some(branch.branch.as_str())
-    }
-
-    /// The host's budget, while polling waits for it to reset.
-    fn paused(&self, host: &str) -> Option<&Budget> {
-        self.budgets.get(host).filter(|budget| {
-            budget.remaining <= BUDGET_FLOOR && budget.resets_at > time::now_unix()
-        })
-    }
-
-    /// Watches `watch` for `surface`, the Pull request surface on screen,
-    /// in place of what another watched. A target not read in the last
-    /// [`POLL`] is read at once.
-    pub(crate) fn show(&mut self, surface: EntityId, watch: Watch, cx: &mut Context<'_, Self>) {
-        self.shown_by = Some(surface);
-        if self.on_screen.as_ref() == Some(&watch) {
+    /// `session`'s daemon says its set is now `set`. When that moved the PR
+    /// on screen past the detail last read of it, it is shown again now.
+    pub(crate) fn replaced(
+        &mut self,
+        session: &SessionKey,
+        set: SessionPullRequests,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(entry) = self.machines.get_mut(&session.machine) else {
+            return;
+        };
+        if entry.serving == Serving::Asking {
+            entry.serving = Serving::Served;
+        }
+        if !entry.store(&session.id, set) {
             return;
         }
-        self.blocked = None;
-        if self.poll.is_running() && !self.poll.was_for(&watch.target) {
-            // One for this follows the one under way for another.
-            self.poll.again();
-        }
-        self.on_screen = Some(watch);
-        self.poll_when_due(cx);
         cx.notify();
+        let moved = self
+            .shown
+            .as_ref()
+            .filter(|shown| shown.session == *session)
+            .and_then(|shown| self.summary(shown))
+            .is_some_and(|summary| {
+                self.detail(&session.machine, &summary.id)
+                    .is_none_or(|detail| detail.summary != *summary)
+            });
+        if moved {
+            self.show_now(cx);
+        }
     }
 
-    /// Stops watching for `surface`, as it left the screen. Another surface
-    /// may show already, as tabs switch: what it watches stays.
-    pub(crate) fn hide(&mut self, surface: EntityId, cx: &mut Context<'_, Self>) {
-        if self.shown_by != Some(surface) {
-            return;
-        }
-        self.shown_by = None;
-        self.on_screen = None;
-        self.blocked = None;
-        if !self.poll.is_running() {
-            // Nothing to poll for: a timer waiting for the next poll goes.
-            self.poll.task = Task::ready(());
-        }
-        cx.notify();
-    }
-
-    /// Reads what is watched now, as when the session's turn ended or on
-    /// Refresh.
-    pub(crate) fn refresh(&mut self, refresh: Refresh, cx: &mut Context<'_, Self>) {
-        if refresh == Refresh::Everything {
-            self.next = Refresh::Everything;
-            self.avatars.forget_failed();
-            if let Some(watch) = self.on_screen.clone() {
-                // This machine's account may see it now.
-                self.hidden.remove(watch.target.repo());
-                if let Some(Blocked::NoReader(_)) = self.blocked {
-                    // A CLI installed or signed in since its check.
-                    self.blocked = None;
-                    for machine in [MachineId::local(), watch.machine] {
-                        self.forges
-                            .update(cx, |forges, cx| forges.recheck(&machine, cx));
-                    }
-                }
-            }
-        }
-        self.poll_now(cx);
-    }
-
-    /// The window gained the focus or lost it: polls wait while it is
-    /// unfocused, and one runs when it comes back, if one is due.
+    /// The window gained the focus or lost it: requests wait while it is
+    /// unfocused, and whatever is due goes when it comes back.
     pub(crate) fn set_focus(&mut self, focus: Focus, cx: &mut Context<'_, Self>) {
         if self.focus == focus {
             return;
         }
         self.focus = focus;
         if focus == Focus::Focused {
-            self.poll_when_due(cx);
-            self.poll_index_when_due(cx);
+            self.show_when_due(cx);
+            let machines: Vec<MachineId> = self.machines.keys().cloned().collect();
+            for machine in machines {
+                self.list_when_due(&machine, cx);
+            }
         }
     }
 
-    /// Polls now if the target on screen wasn't read in the last [`POLL`],
-    /// else once it is due.
-    fn poll_when_due(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(watch) = &self.on_screen else {
+    /// Lists `listed` for the sidebar: its sessions, each on its machine. A
+    /// machine that gained one is listed at once.
+    pub(crate) fn set_listed(&mut self, listed: Vec<SessionKey>, cx: &mut Context<'_, Self>) {
+        if self.listed == listed {
+            return;
+        }
+        let gained: HashSet<MachineId> = {
+            let before: HashSet<&SessionKey> = self.listed.iter().collect();
+            listed
+                .iter()
+                .filter(|session| !before.contains(session))
+                .map(|session| session.machine.clone())
+                .collect()
+        };
+        self.listed = listed;
+        for machine in gained {
+            self.list_now(&machine, cx);
+        }
+    }
+
+    /// Shows `shown` for `surface`, the Pull request surface on screen, in
+    /// place of what another showed. What wasn't shown in the last
+    /// [`SHOW_EVERY`] is shown at once.
+    pub(crate) fn show(&mut self, surface: EntityId, shown: Shown, cx: &mut Context<'_, Self>) {
+        self.shown_by = Some(surface);
+        if self.shown.as_ref() == Some(&shown) {
+            return;
+        }
+        if self.show.is_running() && !self.show.was_for(&shown) {
+            // One for this follows the one under way for another.
+            self.show.again();
+        }
+        let machine = shown.session.machine.clone();
+        self.shown = Some(shown);
+        // Who comments on it.
+        self.forges
+            .update(cx, |forges, cx| forges.ensure_checked(&machine, cx));
+        self.show_when_due(cx);
+        cx.notify();
+    }
+
+    /// Stops showing for `surface`, as it left the screen. Another surface
+    /// may show already, as tabs switch: what it shows stays.
+    pub(crate) fn hide(&mut self, surface: EntityId, cx: &mut Context<'_, Self>) {
+        if self.shown_by != Some(surface) {
+            return;
+        }
+        self.shown_by = None;
+        self.shown = None;
+        if !self.show.is_running() {
+            // Nothing to show: a timer waiting for the next show goes.
+            self.show.task = Task::ready(());
+        }
+        cx.notify();
+    }
+
+    /// A `show` with `read: fresh`: a turn ended, Refresh, or an action was
+    /// done. Pictures that didn't load are asked for again, and so is the
+    /// check of a `gh` that can't comment.
+    pub(crate) fn refresh(&mut self, cx: &mut Context<'_, Self>) {
+        self.next = PullRequestRead::Fresh;
+        self.avatars.forget_failed();
+        if let Some(shown) = &self.shown {
+            let machine = shown.session.machine.clone();
+            let check = self.forges.read(cx).check(&machine, ForgeCli::Gh);
+            let unusable = matches!(
+                Gh::of(&machine, self.host_of(shown), check),
+                Gh::Unusable(_)
+            );
+            if unusable {
+                // A CLI installed or signed in since its check.
+                self.forges
+                    .update(cx, |forges, cx| forges.recheck(&machine, cx));
+            }
+        }
+        self.show_now(cx);
+    }
+
+    /// Whether `machine`'s daemon serves pull requests; `None` while the
+    /// machine isn't connected.
+    pub(crate) fn serving(&self, machine: &MachineId) -> Option<Serving> {
+        self.machines.get(machine).map(|entry| entry.serving)
+    }
+
+    /// `session`'s set, once its daemon answered with one.
+    pub(crate) fn of(&self, session: &SessionKey) -> Option<&SessionPullRequests> {
+        self.machines
+            .get(&session.machine)?
+            .sessions
+            .get(&session.id)
+    }
+
+    /// The summary of what `shown` names, once the daemon found or read it.
+    pub(crate) fn summary(&self, shown: &Shown) -> Option<&PullRequestSummary> {
+        let set = self.of(&shown.session)?;
+        match &shown.which {
+            Which::Branch => match &set.branch.as_ref()?.lookup {
+                BranchLookup::Found { pull_request } => Some(pull_request.as_ref()),
+                _ => None,
+            },
+            Which::Linked(id) => set
+                .linked
+                .iter()
+                .find(|linked| linked.id == *id)?
+                .summary
+                .as_ref(),
+        }
+    }
+
+    /// The detail of PR `id` as `machine`'s daemon last showed it; it may
+    /// be older than its summary.
+    pub(crate) fn detail(
+        &self,
+        machine: &MachineId,
+        id: &PullRequestId,
+    ) -> Option<&PullRequestDetail> {
+        self.machines.get(machine)?.details.get(id)
+    }
+
+    /// Why the last request to `machine`'s daemon got no answer.
+    pub(crate) fn failed(&self, machine: &MachineId) -> Option<&SharedString> {
+        self.machines.get(machine)?.failed.as_ref()
+    }
+
+    /// The PR a sidebar row marks: its branch's, else the first linked one
+    /// read.
+    pub(crate) fn mark(&self, session: &SessionKey) -> Option<&PullRequestSummary> {
+        let set = self.of(session)?;
+        if let Some(BranchLookup::Found { pull_request }) =
+            set.branch.as_ref().map(|branch| &branch.lookup)
+        {
+            return Some(pull_request.as_ref());
+        }
+        set.linked.iter().find_map(|linked| linked.summary.as_ref())
+    }
+
+    /// The linked PRs that get tabs of their own, in the order linked: all
+    /// but the branch's own, which the agent's watch links too and which
+    /// has the branch's tab. `None` while the session has no set.
+    pub(crate) fn linked_tabs(&self, session: &SessionKey) -> Option<Vec<PullRequestId>> {
+        let set = self.of(session)?;
+        let branch = match set.branch.as_ref().map(|branch| &branch.lookup) {
+            Some(BranchLookup::Found { pull_request }) => Some(&pull_request.id),
+            _ => None,
+        };
+        let tabs = set
+            .linked
+            .iter()
+            .map(|linked| &linked.id)
+            .filter(|id| Some(*id) != branch)
+            .cloned()
+            .collect();
+        Some(tabs)
+    }
+
+    /// Links the PR `text` names to `session`, as the user typed it; the
+    /// daemon reads it. Answers with the PR it named, or why not, as the
+    /// daemon says it.
+    pub(crate) fn link(
+        &mut self,
+        session: &SessionKey,
+        text: String,
+        cx: &mut Context<'_, Self>,
+    ) -> Task<Result<PullRequestId, SharedString>> {
+        let entry = match self.served(&session.machine) {
+            Ok(entry) => entry,
+            Err(why) => return Task::ready(Err(why)),
+        };
+        let (daemon, connection, session) =
+            (entry.daemon.clone(), entry.connection, session.clone());
+        cx.spawn(async move |this, cx| {
+            let answer = daemon.link_pull_request(&session.id, &text).await;
+            this.update(cx, |this, cx| {
+                let Some(entry) = this.current(&session.machine, connection) else {
+                    return Err(not_connected(&session.machine));
+                };
+                let linked = match answer {
+                    Ok(response) => {
+                        entry.answered();
+                        entry.store(&session.id, response.pull_requests);
+                        Ok(response.pull_request)
+                    }
+                    // The user's text named no PR the daemon reads: the
+                    // form says why.
+                    Err(PullRequestError::Invalid(message)) => Err(message.into()),
+                    Err(error) => Err(entry.refused(&session.machine, error)),
+                };
+                cx.notify();
+                linked
+            })
+            .unwrap_or_else(|_| Err(GONE.into()))
+        })
+    }
+
+    /// Unlinks PR `id` from `session`, ending the agent's watch on it if
+    /// it watched it. A refusal is also the machine's [`Self::failed`].
+    pub(crate) fn unlink(
+        &mut self,
+        session: &SessionKey,
+        id: &PullRequestId,
+        cx: &mut Context<'_, Self>,
+    ) -> Task<Result<(), SharedString>> {
+        let entry = match self.served(&session.machine) {
+            Ok(entry) => entry,
+            Err(why) => return Task::ready(Err(why)),
+        };
+        let text = link_text(entry.sessions.get(&session.id), id);
+        let (daemon, connection, session) =
+            (entry.daemon.clone(), entry.connection, session.clone());
+        cx.spawn(async move |this, cx| {
+            let answer = daemon.unlink_pull_request(&session.id, &text).await;
+            this.update(cx, |this, cx| {
+                let Some(entry) = this.current(&session.machine, connection) else {
+                    return Err(not_connected(&session.machine));
+                };
+                let unlinked = match answer {
+                    Ok(set) => {
+                        entry.answered();
+                        entry.store(&session.id, set);
+                        Ok(())
+                    }
+                    Err(error) => Err(entry.refused(&session.machine, error)),
+                };
+                cx.notify();
+                unlinked
+            })
+            .unwrap_or_else(|_| Err(GONE.into()))
+        })
+    }
+
+    /// The picture of a post's author, served at `url`
+    /// ([`rho_ui_core::PullRequestPost::avatar_url`]), once fetched.
+    pub(crate) fn avatar(&self, url: &str) -> Option<Arc<Image>> {
+        self.avatars.get(url)
+    }
+
+    /// Who comments on the PR on screen: the session machine's `gh`, with
+    /// its account there for the PR's host, as the session's own work goes;
+    /// or why no one can.
+    pub(crate) fn poster(&self, cx: &App) -> Result<Poster, SharedString> {
+        let shown = self
+            .shown
+            .as_ref()
+            .ok_or_else(|| SharedString::from("No pull request is on screen."))?;
+        let machine = &shown.session.machine;
+        let check = self.forges.read(cx).check(machine, ForgeCli::Gh);
+        match Gh::of(machine, self.host_of(shown), check) {
+            Gh::Use { program, login } => Ok(Poster {
+                machine: machine.clone(),
+                program,
+                login,
+            }),
+            Gh::Checking => Err("Checking gh…".into()),
+            Gh::Unusable(why) => Err(why),
+        }
+    }
+
+    /// Does `action` to PR `id` as [`Self::poster`], then shows the PR
+    /// fresh to show what it did.
+    pub(crate) fn act(
+        &mut self,
+        id: PullRequestId,
+        action: PrAction,
+        cx: &mut Context<'_, Self>,
+    ) -> Task<Result<(), SharedString>> {
+        let poster = match self.poster(cx) {
+            Ok(poster) => poster,
+            Err(why) => return Task::ready(Err(why)),
+        };
+        let reader = self.workspaces.read(cx).reader(&poster.machine);
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = forge::act(reader, poster.program, &id, &action, &executor).await;
+            if result.is_ok() {
+                let _ = this.update(cx, PullRequests::refresh);
+            }
+            result.map_err(SharedString::from)
+        })
+    }
+
+    /// The host of the PR `shown` names: its summary's, a link's own, or
+    /// github.com, the one host whose branches a daemon looks up.
+    fn host_of<'a>(&'a self, shown: &'a Shown) -> &'a str {
+        match (self.summary(shown), &shown.which) {
+            (Some(summary), _) => &summary.id.host,
+            (None, Which::Linked(id)) => &id.host,
+            (None, Which::Branch) => GITHUB,
+        }
+    }
+
+    /// `machine`'s state, if it is connected and its daemon may serve pull
+    /// requests; else what to say instead.
+    fn served(&self, machine: &MachineId) -> Result<&MachinePrs, SharedString> {
+        let entry = self
+            .machines
+            .get(machine)
+            .ok_or_else(|| not_connected(machine))?;
+        if entry.serving == Serving::Unserved {
+            return Err(unserved(machine));
+        }
+        Ok(entry)
+    }
+
+    /// `machine`'s state, while it is still on `connection`.
+    fn current(&mut self, machine: &MachineId, connection: u64) -> Option<&mut MachinePrs> {
+        self.machines
+            .get_mut(machine)
+            .filter(|entry| entry.connection == connection)
+    }
+
+    /// Shows now if what is on screen wasn't shown in the last
+    /// [`SHOW_EVERY`], else once it is due.
+    fn show_when_due(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(shown) = &self.shown else {
             return;
         };
-        if self.poll.is_running() {
+        if self.show.is_running() {
             // It schedules the next when it ends.
             return;
         }
         let now = cx.background_executor().now();
-        match self.poll.due_in(&watch.target, POLL, now) {
-            Some(wait) => self.poll.task = after(wait, Self::poll_now, cx),
-            None => self.poll_now(cx),
+        match self.show.due_in(shown, SHOW_EVERY, now) {
+            Some(wait) => self.show.task = after(wait, Self::show_now, cx),
+            None => self.show_now(cx),
         }
     }
 
-    /// Polls now, or once the poll under way ends.
-    fn poll_now(&mut self, cx: &mut Context<'_, Self>) {
-        if self.poll.again() {
+    /// Shows what is on screen now, or once the show under way ends.
+    fn show_now(&mut self, cx: &mut Context<'_, Self>) {
+        if self.show.again() || self.focus == Focus::Unfocused {
             return;
         }
-        let Some(watch) = self.on_screen.clone() else {
+        let Some(shown) = self.shown.clone() else {
             return;
         };
-        if self.focus == Focus::Unfocused {
-            return;
-        }
-        let choice = self.reader_for(&watch, cx);
-        let blocked = match &choice {
-            // The check's end polls again.
-            ReaderChoice::Wait => Some(Blocked::WaitingForCheck),
-            ReaderChoice::None(why) => Some(Blocked::NoReader(why.clone())),
-            ReaderChoice::Use { .. } => None,
-        };
-        if blocked != self.blocked {
-            self.blocked = blocked;
-            cx.notify();
-        }
-        let ReaderChoice::Use { machine, program } = choice else {
+        let Ok(entry) = self.served(&shown.session.machine) else {
+            // Its connection, if it comes, shows it.
             return;
         };
-        let host = watch.target.repo().host.clone();
-        if let Some(budget) = self.paused(&host) {
-            let wait = budget.resets_at - time::now_unix();
-            let wait = Duration::from_secs(wait.unsigned_abs());
-            self.poll.task = after(wait, Self::poll_now, cx);
-            return;
-        }
-        let plan = self.plan(&watch);
-        if plan.is_empty() {
-            self.poll.task = after(POLL, Self::poll_now, cx);
-            return;
-        }
-        let runner = self.workspaces.read(cx).reader(&machine);
-        let read = Read {
-            session_machine: watch.machine.clone(),
-            host,
-            machine,
-            program,
-            plan,
+        let target = match &shown.which {
+            Which::Branch => PullRequestTarget::Branch,
+            Which::Linked(id) => PullRequestTarget::Linked {
+                pull_request: link_text(entry.sessions.get(&shown.session.id), id),
+            },
         };
-        let executor = cx.background_executor().clone();
-        self.next = Refresh::Changed;
-        self.poll.start(watch.target.clone(), executor.now());
-        self.poll.task = cx.spawn(async move |this, cx| {
-            let answer = read.run(runner, &executor).await;
+        let (daemon, connection) = (entry.daemon.clone(), entry.connection);
+        let read = std::mem::take(&mut self.next);
+        self.show
+            .start(shown.clone(), cx.background_executor().now());
+        self.show.task = cx.spawn(async move |this, cx| {
+            let answer = daemon
+                .show_pull_request(&shown.session.id, target, read)
+                .await;
             let _ = this.update(cx, |this, cx| {
-                let ingested = this.ingest(&read, answer, cx);
-                if ingested == Ingested::AskTheSession || this.detail_owed(&watch, &read.plan) {
-                    this.poll.again();
-                }
-                if this.poll.finish() {
-                    this.poll_now(cx);
+                this.showed(&shown, connection, answer, cx);
+                if this.show.finish() {
+                    this.show_now(cx);
                 } else {
-                    this.poll.task = after(POLL, Self::poll_now, cx);
+                    this.show_later(cx);
                 }
             });
         });
     }
 
-    /// What the next poll asks: the branch on screen, unless it is its
-    /// repository's default, or the PR linked; and the PR's detail when it
-    /// changed since the last read, while its checks run, or on Refresh.
-    fn plan(&self, watch: &Watch) -> FetchPlan {
-        let mut plan = match &watch.target {
-            Target::Branch(branch) if self.is_default(branch) => return FetchPlan::default(),
-            Target::Branch(branch) => FetchPlan {
-                branches: vec![branch.clone()],
-                ..FetchPlan::default()
-            },
-            Target::Pr(id) => FetchPlan {
-                links: vec![id.clone()],
-                ..FetchPlan::default()
-            },
+    /// Shows what is on screen again after [`SHOW_EVERY`], unless nothing
+    /// is, or its daemon serves no pull requests.
+    fn show_later(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(shown) = &self.shown else {
+            return;
         };
-        if let Some(Found::Pr(summary)) = self.found.get(&watch.target) {
-            let read = self.details.get(&summary.id);
-            let stale = self.detail_stale(summary);
-            // The rollup reads failed once one check failed, while others
-            // may still run.
-            let running = summary.change.rollup == Rollup::Pending
-                || read.is_some_and(|detail| {
-                    detail.checks.iter().any(|check| {
-                        matches!(check.status, CheckStatus::Running | CheckStatus::Pending)
-                    })
-                });
-            if stale || running || self.next == Refresh::Everything {
-                plan.details.push(summary.id.clone());
-            }
+        if self.serving(&shown.session.machine) == Some(Serving::Unserved) {
+            return;
         }
-        plan
+        self.show.task = after(SHOW_EVERY, Self::show_now, cx);
     }
 
-    /// Whether PR `summary` has no detail read, or changed since it was.
-    fn detail_stale(&self, summary: &PrSummary) -> bool {
-        self.details
-            .get(&summary.id)
-            .is_none_or(|detail| detail.summary.change != summary.change)
-    }
-
-    /// Whether the PR on screen is [stale](Self::detail_stale) and `plan`
-    /// didn't ask for it: so it is read at once, not in a loop when the
-    /// answer just failed to read it.
-    fn detail_owed(&self, watch: &Watch, plan: &FetchPlan) -> bool {
-        let Some(Found::Pr(summary)) = self.found.get(&watch.target) else {
-            return false;
-        };
-        self.detail_stale(summary) && !plan.details.contains(&summary.id)
-    }
-
-    /// Takes the answer to `read`, which may move a repository to its
-    /// sessions' machine.
-    fn ingest(
+    /// Takes the answer to a `show` of `shown` sent on `connection`.
+    fn showed(
         &mut self,
-        read: &Read,
-        answer: Result<Batch, forge::QueryError>,
+        shown: &Shown,
+        connection: u64,
+        answer: Result<SessionPullRequestShowResponse, PullRequestError>,
         cx: &mut Context<'_, Self>,
-    ) -> Ingested {
-        let plan = &read.plan;
-        let mut ingested = Ingested::Done;
-        let batch = match answer {
-            Ok(batch) => batch,
+    ) {
+        let machine = &shown.session.machine;
+        let Some(entry) = self
+            .machines
+            .get_mut(machine)
+            .filter(|entry| entry.connection == connection)
+        else {
+            return;
+        };
+        let changed = match answer {
+            Ok(response) => {
+                let mut changed = entry.answered();
+                changed |= entry.store(&shown.session.id, response.pull_requests);
+                if let Some(detail) = response.detail {
+                    let id = detail.summary.id.clone();
+                    if entry.details.get(&id) != Some(&*detail) {
+                        self.avatars.queue(&detail, machine);
+                        entry.details.insert(id, *detail);
+                        changed = true;
+                    }
+                }
+                changed
+            }
             Err(error) => {
-                if matches!(error, forge::QueryError::SignedOut(_)) {
-                    let machine = read.machine.clone();
-                    self.forges
-                        .update(cx, |forges, cx| forges.recheck(&machine, cx));
-                }
-                // What was read before stays on screen, with why it may be
-                // out of date.
-                let why = SharedString::from(error.to_string());
-                for target in plan.targets() {
-                    self.failed.insert(target, why.clone());
-                }
-                cx.notify();
-                return ingested;
+                // What was shown before stays, with why it may be out of
+                // date.
+                entry.refused(machine, error);
+                true
             }
         };
-        if let Some(budget) = batch.budget {
-            self.budgets.insert(read.host.clone(), budget);
+        if changed {
+            cx.notify();
+            self.fetch_next_avatar(cx);
         }
-        self.default_branches.extend(batch.default_branches);
-        for (repo, why) in batch.missing {
-            let read_here = read.machine.is_local() && !read.session_machine.is_local();
-            if read_here && self.hidden.insert(repo.clone()) {
-                // The session's own machine may see it: ask it next.
-                ingested = Ingested::AskTheSession;
-                continue;
-            }
-            for target in plan.targets().filter(|target| *target.repo() == repo) {
-                self.failed.insert(target, why.clone().into());
-            }
+    }
+
+    /// How often `machine` is listed: [`LOOKING_EVERY`] while its last
+    /// answer holds a listed session still looking, else [`LIST_EVERY`].
+    fn list_period(&self, machine: &MachineId) -> Duration {
+        let Some(entry) = self.machines.get(machine) else {
+            return LIST_EVERY;
+        };
+        let looking = self
+            .listed
+            .iter()
+            .filter(|session| session.machine == *machine)
+            .filter_map(|session| entry.sessions.get(&session.id))
+            .any(still_looking);
+        if looking {
+            LOOKING_EVERY
+        } else {
+            LIST_EVERY
         }
-        for (id, detail) in batch.details {
-            match detail {
-                Some(detail) => {
-                    self.avatars.queue(&detail, &read.machine);
-                    self.fetch_next_avatar(cx);
-                    self.details.insert(id, detail)
+    }
+
+    /// Lists `machine`'s listed sessions now if they are due, as the
+    /// window gains the focus; else once they are.
+    fn list_when_due(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        let period = self.list_period(machine);
+        let Some(entry) = self.machines.get_mut(machine) else {
+            return;
+        };
+        if entry.list.is_running() {
+            // It schedules the next when it ends.
+            return;
+        }
+        let now = cx.background_executor().now();
+        match entry.list.due_in(&(), period, now) {
+            Some(wait) => {
+                let machine = machine.clone();
+                entry.list.task = after(wait, move |this, cx| this.list_now(&machine, cx), cx);
+            }
+            None => self.list_now(machine, cx),
+        }
+    }
+
+    /// Lists `machine`'s listed sessions now, or once the list under way
+    /// ends.
+    fn list_now(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        let sessions: Vec<SessionId> = self
+            .listed
+            .iter()
+            .filter(|session| session.machine == *machine)
+            .map(|session| session.id.clone())
+            .collect();
+        let focused = self.focus == Focus::Focused;
+        let Some(entry) = self.machines.get_mut(machine) else {
+            return;
+        };
+        if entry.list.again()
+            || !focused
+            || entry.serving == Serving::Unserved
+            || sessions.is_empty()
+        {
+            return;
+        }
+        let (daemon, connection) = (entry.daemon.clone(), entry.connection);
+        entry.list.start((), cx.background_executor().now());
+        let machine = machine.clone();
+        entry.list.task = cx.spawn(async move |this, cx| {
+            let answer = daemon.list_pull_requests(&sessions).await;
+            let _ = this.update(cx, |this, cx| {
+                this.list_answered(&machine, connection, answer, cx);
+            });
+        });
+    }
+
+    /// Takes the answer to a `list` sent to `machine` on `connection`, and
+    /// schedules the next.
+    fn list_answered(
+        &mut self,
+        machine: &MachineId,
+        connection: u64,
+        answer: Result<Vec<(SessionId, SessionPullRequests)>, PullRequestError>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(entry) = self.current(machine, connection) else {
+            return;
+        };
+        // Every notify redraws the sidebar and syncs the panel's tabs: only
+        // when something changed.
+        let changed = match answer {
+            Ok(sets) => {
+                let mut changed = entry.answered();
+                for (session, set) in sets {
+                    changed |= entry.store(&session, set);
                 }
-                None => self.details.remove(&id),
-            };
+                changed
+            }
+            Err(error) => {
+                entry.refused(machine, error);
+                true
+            }
+        };
+        let again = entry.list.finish();
+        let unserved = entry.serving == Serving::Unserved;
+        if changed {
+            cx.notify();
         }
-        let branches = batch.branches.into_iter();
-        let links = batch.links.into_iter();
-        let found = branches
-            .map(|(branch, found)| (Target::Branch(branch), found))
-            .chain(links.map(|(id, found)| (Target::Pr(id), found)));
-        for (target, found) in found {
-            self.failed.remove(&target);
-            self.found.insert(target, found);
+        if again {
+            self.list_now(machine, cx);
+        } else if !unserved {
+            let period = self.list_period(machine);
+            let then = machine.clone();
+            let task = after(period, move |this, cx| this.list_now(&then, cx), cx);
+            if let Some(entry) = self.machines.get_mut(machine) {
+                entry.list.task = task;
+            }
         }
-        cx.notify();
-        ingested
     }
 
     /// Fetches the next picture waiting, unless a fetch runs; its end
@@ -819,343 +1068,5 @@ impl PullRequests {
             });
         })
         .detach();
-    }
-
-    /// Watches `listed` for the sidebar: its sessions, each on its machine.
-    /// One not read yet is read at once.
-    pub(crate) fn set_listed(&mut self, listed: Vec<Watch>, cx: &mut Context<'_, Self>) {
-        if self.listed == listed {
-            return;
-        }
-        self.listed = listed;
-        if self.unread_listed() {
-            self.poll_index(cx);
-        }
-    }
-
-    /// Whether a listed session's PR was never asked for: neither found,
-    /// nor failed (that waits for the next poll), nor a default branch's.
-    fn unread_listed(&self) -> bool {
-        self.listed.iter().any(|watch| {
-            matches!(self.lookup(&watch.target), Lookup::Looking)
-                && !self.failed.contains_key(&watch.target)
-        })
-    }
-
-    /// Reads the listed sessions' PRs now, one query per host and reader,
-    /// each in turn; or once the reads under way end.
-    fn poll_index(&mut self, cx: &mut Context<'_, Self>) {
-        if self.index.again() || self.focus == Focus::Unfocused {
-            return;
-        }
-        let reads = self.index_reads(cx);
-        if reads.is_empty() {
-            self.index.task = after(INDEX_POLL, Self::poll_index, cx);
-            return;
-        }
-        let workspaces = self.workspaces.read(cx);
-        let reads: Vec<(Read, Reader)> = reads
-            .into_iter()
-            .map(|read| {
-                let runner = workspaces.reader(&read.machine);
-                (read, runner)
-            })
-            .collect();
-        let executor = cx.background_executor().clone();
-        self.index.start((), executor.now());
-        self.index.task = cx.spawn(async move |this, cx| {
-            let mut again = false;
-            for (read, runner) in reads {
-                let answer = read.run(runner, &executor).await;
-                let ingested = this.update(cx, |this, cx| this.ingest(&read, answer, cx));
-                again |= matches!(ingested, Ok(Ingested::AskTheSession));
-            }
-            let _ = this.update(cx, |this, cx| {
-                if this.index.finish() || again {
-                    this.poll_index(cx);
-                } else {
-                    this.index.task = after(INDEX_POLL, Self::poll_index, cx);
-                }
-            });
-        });
-    }
-
-    /// Reads the listed sessions when [`INDEX_POLL`] has passed since the
-    /// last read, as the window gains the focus.
-    fn poll_index_when_due(&mut self, cx: &mut Context<'_, Self>) {
-        if self.index.is_running() {
-            // It schedules the next when it ends.
-            return;
-        }
-        let now = cx.background_executor().now();
-        match self.index.due_in(&(), INDEX_POLL, now) {
-            Some(wait) => self.index.task = after(wait, Self::poll_index, cx),
-            None => self.poll_index(cx),
-        }
-    }
-
-    /// The listed sessions' lookups, one read per session machine, reader
-    /// and host: but not the session on screen, which its own poll reads,
-    /// nor a default branch, nor a host whose budget is spent, nor one
-    /// whose reader isn't known yet (its check's end asks again).
-    fn index_reads(&mut self, cx: &mut Context<'_, Self>) -> Vec<Read> {
-        let mut reads: Vec<Read> = Vec::new();
-        for watch in self.listed.clone() {
-            let skip = match &watch.target {
-                Target::Branch(branch) => self.is_default(branch),
-                Target::Pr(_) => false,
-            };
-            if skip || self.on_screen.as_ref() == Some(&watch) {
-                continue;
-            }
-            let ReaderChoice::Use { machine, program } = self.reader_for(&watch, cx) else {
-                continue;
-            };
-            let host = &watch.target.repo().host;
-            if self.paused(host).is_some() {
-                continue;
-            }
-            let ix = reads.iter().position(|read| {
-                read.session_machine == watch.machine
-                    && read.machine == machine
-                    && read.host == *host
-            });
-            let ix = ix.unwrap_or_else(|| {
-                reads.push(Read {
-                    session_machine: watch.machine.clone(),
-                    host: host.clone(),
-                    machine,
-                    program,
-                    plan: FetchPlan::default(),
-                });
-                reads.len() - 1
-            });
-            let plan = &mut reads[ix].plan;
-            match watch.target {
-                Target::Branch(branch) => plan.branches.push(branch),
-                Target::Pr(id) => plan.links.push(id),
-            }
-        }
-        reads
-    }
-
-    /// Who comments on the PR on screen: the session machine's CLI, with
-    /// its account there, as the session's own work goes; or why no one
-    /// can.
-    pub(crate) fn poster(&self, cx: &gpui_kit::App) -> Result<Poster, SharedString> {
-        let watch = self
-            .on_screen
-            .as_ref()
-            .ok_or_else(|| SharedString::from("No pull request is on screen."))?;
-        let host = watch.target.repo().host.as_str();
-        let forges = self.forges.read(cx);
-        let check = |machine: &MachineId| forges.check(machine, ForgeCli::Gh);
-        match choose(&[&watch.machine], host, check) {
-            ReaderChoice::Use { machine, program } => {
-                let login = match check(&machine) {
-                    Some(Check::Done(CliProbe::Found(status))) => status
-                        .accounts
-                        .iter()
-                        .find(|account| account.active && account.host == host)
-                        .map(|account| account.login.clone()),
-                    _ => None,
-                };
-                Ok(Poster {
-                    machine,
-                    program,
-                    login: login.unwrap_or_default(),
-                })
-            }
-            ReaderChoice::Wait => Err("Checking gh…".into()),
-            ReaderChoice::None(why) => Err(why),
-        }
-    }
-
-    /// Does `action` to PR `id` as [`Self::poster`], then reads the PR
-    /// again to show what it did.
-    pub(crate) fn act(
-        &mut self,
-        id: PrId,
-        action: PrAction,
-        cx: &mut Context<'_, Self>,
-    ) -> Task<Result<(), SharedString>> {
-        let poster = match self.poster(cx) {
-            Ok(poster) => poster,
-            Err(why) => return Task::ready(Err(why)),
-        };
-        let reader = self.workspaces.read(cx).reader(&poster.machine);
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
-            let result = forge::act(reader, poster.program, &id, &action, &executor).await;
-            if result.is_ok() {
-                let _ = this.update(cx, |this, cx| this.refresh(Refresh::Everything, cx));
-            }
-            result.map_err(SharedString::from)
-        })
-    }
-
-    /// [`Self::choose_reader`], once the checks it needs are asked for.
-    fn reader_for(&mut self, watch: &Watch, cx: &mut Context<'_, Self>) -> ReaderChoice {
-        for machine in [MachineId::local(), watch.machine.clone()] {
-            self.forges
-                .update(cx, |forges, cx| forges.ensure_checked(&machine, cx));
-        }
-        self.choose_reader(watch, cx)
-    }
-
-    /// Which machine asks the forge for `watch`: this one when its CLI is
-    /// signed in to the host, which needs no ssh; else the session's own.
-    fn choose_reader(&self, watch: &Watch, cx: &gpui_kit::App) -> ReaderChoice {
-        let forges = self.forges.read(cx);
-        let repo = watch.target.repo();
-        let local = MachineId::local();
-        let mut candidates = vec![];
-        if !self.hidden.contains(repo) || watch.machine.is_local() {
-            candidates.push(&local);
-        }
-        if !watch.machine.is_local() {
-            candidates.push(&watch.machine);
-        }
-        choose(&candidates, &repo.host, |machine| {
-            forges.check(machine, ForgeCli::Gh)
-        })
-    }
-}
-
-/// The first of `machines` whose CLI is signed in to `host` (or may be),
-/// waiting while
-/// one before it is still being checked; with none, why not, as the last
-/// machine's check says.
-fn choose<'a>(
-    machines: &[&MachineId],
-    host: &str,
-    check: impl Fn(&MachineId) -> Option<&'a Check>,
-) -> ReaderChoice {
-    let mut why = SharedString::from("No machine can ask GitHub.");
-    for &machine in machines {
-        let on = if machine.is_local() {
-            "this machine".to_owned()
-        } else {
-            machine.to_string()
-        };
-        match check(machine) {
-            None | Some(Check::Checking) => return ReaderChoice::Wait,
-            Some(Check::Failed(failed)) => {
-                why = format!("Couldn't check gh on {on}: {failed}").into();
-            }
-            Some(Check::Done(CliProbe::Missing)) => {
-                why = format!("gh isn't installed on {on}. See Settings → Source control.").into();
-            }
-            Some(Check::Done(CliProbe::Broken { why: broken, .. })) => {
-                why = format!("gh doesn't run on {on}: {broken}").into();
-            }
-            Some(Check::Done(CliProbe::Found(status))) => {
-                // One that couldn't reach the forge when checked may be
-                // signed in: its query says if it isn't.
-                let signed_in = status.accounts.iter().any(|account| {
-                    account.active
-                        && account.host == host
-                        && !matches!(account.auth, AuthState::Refused(_))
-                });
-                if signed_in {
-                    return ReaderChoice::Use {
-                        machine: machine.clone(),
-                        program: status.path.clone(),
-                    };
-                }
-                why =
-                    format!("gh on {on} isn't signed in to {host}. See Settings → Source control.")
-                        .into();
-            }
-        }
-    }
-    ReaderChoice::None(why)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::forge::{Account, CliStatus, FoundBy};
-
-    /// The reader is this machine when its gh is signed in to the host,
-    /// else the session's machine; it waits on a check under way, and says
-    /// why when no machine can read.
-    #[test]
-    fn the_reader_prefers_this_machine() {
-        let signed_in = |host: &str| {
-            Check::Done(CliProbe::Found(CliStatus {
-                path: PathBuf::from("/bin/gh"),
-                found_by: FoundBy::Path,
-                version: "2.99.0".into(),
-                accounts: vec![Account {
-                    host: host.to_owned().into(),
-                    login: "octocat".into(),
-                    active: true,
-                    auth: AuthState::SignedIn,
-                    git_protocol: None,
-                    token_source: None,
-                    scopes: None,
-                }],
-            }))
-        };
-        let local = MachineId::local();
-        let remote = MachineId::remote("box");
-        let use_ = |machine: &MachineId| ReaderChoice::Use {
-            machine: machine.clone(),
-            program: PathBuf::from("/bin/gh"),
-        };
-        let both = [&local, &remote];
-        let reader = |checks: [Option<Check>; 2]| {
-            choose(&both, "github.com", |machine| {
-                if machine.is_local() {
-                    checks[0].as_ref()
-                } else {
-                    checks[1].as_ref()
-                }
-            })
-        };
-        assert_eq!(reader([Some(signed_in("github.com")), None]), use_(&local));
-        let with_auth = |host: &str, auth: AuthState| match signed_in(host) {
-            Check::Done(CliProbe::Found(mut status)) => {
-                status.accounts[0].auth = auth;
-                Check::Done(CliProbe::Found(status))
-            }
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            reader([
-                Some(with_auth(
-                    "github.com",
-                    AuthState::Unreachable("offline".into())
-                )),
-                Some(signed_in("github.com"))
-            ]),
-            use_(&local),
-            "offline when checked, which says nothing of its token"
-        );
-        assert_eq!(
-            reader([
-                Some(with_auth("github.com", AuthState::Refused("401".into()))),
-                Some(signed_in("github.com"))
-            ]),
-            use_(&remote),
-            "its token refused"
-        );
-        assert_eq!(
-            reader([Some(signed_in("ghe.corp")), Some(signed_in("github.com"))]),
-            use_(&remote),
-            "this machine signed in to another host"
-        );
-        assert_eq!(
-            reader([Some(Check::Checking), Some(signed_in("github.com"))]),
-            ReaderChoice::Wait
-        );
-        assert!(matches!(
-            reader([
-                Some(Check::Done(CliProbe::Missing)),
-                Some(Check::Done(CliProbe::Missing))
-            ]),
-            ReaderChoice::None(_)
-        ));
     }
 }

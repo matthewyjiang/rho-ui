@@ -1,7 +1,6 @@
 //! The PR's checks on the Pull request surface: a row each, those that
-//! need a look first, and how many stand each way.
-
-use std::collections::BTreeMap;
+//! need a look first, as the daemon sends them, and how many stand each
+//! way.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -12,12 +11,16 @@ use gpui_kit::{
     ParentElement as _, StatefulInteractiveElement as _, Styled as _,
 };
 
+use rho_ui_core::{PullRequestCheck, PullRequestCheckStatus, PullRequestDetail};
+
 use super::{header::web_url, row, PullRequestSurface};
-use crate::pull_requests::{CheckRun, CheckStatus, PrDetail};
 
 /// A row per check, those that need a look first; each opens its log.
 /// Says how many more there are past those read.
-pub(super) fn checks(detail: &PrDetail, cx: &Context<'_, PullRequestSurface>) -> AnyElement {
+pub(super) fn checks(
+    detail: &PullRequestDetail,
+    cx: &Context<'_, PullRequestSurface>,
+) -> AnyElement {
     let theme = cx.theme();
     if detail.checks.is_empty() {
         return div()
@@ -52,24 +55,26 @@ pub(super) fn checks(detail: &PrDetail, cx: &Context<'_, PullRequestSurface>) ->
 }
 
 /// The icon and color of a check's status.
-pub(super) fn status_look(status: CheckStatus, cx: &App) -> (Lucide, Hsla) {
+pub(super) fn status_look(status: PullRequestCheckStatus, cx: &App) -> (Lucide, Hsla) {
     let theme = cx.theme();
     match status {
-        CheckStatus::Failed => (Lucide::CircleX, theme.red),
-        CheckStatus::Running => (Lucide::LoaderCircle, theme.yellow),
-        CheckStatus::Pending => (Lucide::CircleDashed, theme.muted_foreground),
-        CheckStatus::Cancelled => (Lucide::CircleSlash, theme.muted_foreground),
-        CheckStatus::Passed => (Lucide::CircleCheck, theme.green),
-        CheckStatus::Neutral | CheckStatus::Skipped => {
+        PullRequestCheckStatus::Failed => (Lucide::CircleX, theme.red),
+        PullRequestCheckStatus::Running => (Lucide::LoaderCircle, theme.yellow),
+        PullRequestCheckStatus::Pending => (Lucide::CircleDashed, theme.muted_foreground),
+        PullRequestCheckStatus::Cancelled => (Lucide::CircleSlash, theme.muted_foreground),
+        PullRequestCheckStatus::Passed => (Lucide::CircleCheck, theme.green),
+        PullRequestCheckStatus::Neutral | PullRequestCheckStatus::Skipped => {
             (Lucide::CircleMinus, theme.muted_foreground)
         }
+        // A status a newer rho sends.
+        _ => (Lucide::CircleQuestionMark, theme.muted_foreground),
     }
 }
 
 /// One check: its status, name and workflow. A click opens its log.
 pub(super) fn check_row(
     ix: usize,
-    check: &CheckRun,
+    check: &PullRequestCheck,
     cx: &Context<'_, PullRequestSurface>,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -103,21 +108,26 @@ pub(super) fn check_row(
         })
 }
 
-/// How many checks stand each way, most urgent first, each in its
-/// status's color: "1 failed  3 passed".
-pub(super) fn check_counts(checks: &[CheckRun], cx: &App) -> AnyElement {
-    let mut counts: BTreeMap<CheckStatus, usize> = BTreeMap::new();
+/// How many checks stand each way, in the order the daemon sends them,
+/// most urgent first, each in its status's color: "1 failed  3 passed".
+pub(super) fn check_counts(checks: &[PullRequestCheck], cx: &App) -> AnyElement {
+    // The checks come grouped by status, so a count is a run of one.
+    let mut counts: Vec<(PullRequestCheckStatus, usize)> = Vec::new();
     for check in checks {
-        *counts.entry(check.status).or_default() += 1;
+        match counts.last_mut() {
+            Some((status, count)) if *status == check.status => *count += 1,
+            _ => counts.push((check.status, 1)),
+        }
     }
-    let word = |status: CheckStatus| match status {
-        CheckStatus::Failed => "failed",
-        CheckStatus::Running => "running",
-        CheckStatus::Pending => "waiting",
-        CheckStatus::Cancelled => "cancelled",
-        CheckStatus::Passed => "passed",
-        CheckStatus::Neutral => "neutral",
-        CheckStatus::Skipped => "skipped",
+    let word = |status: PullRequestCheckStatus| match status {
+        PullRequestCheckStatus::Failed => "failed",
+        PullRequestCheckStatus::Running => "running",
+        PullRequestCheckStatus::Pending => "waiting",
+        PullRequestCheckStatus::Cancelled => "cancelled",
+        PullRequestCheckStatus::Passed => "passed",
+        PullRequestCheckStatus::Neutral => "neutral",
+        PullRequestCheckStatus::Skipped => "skipped",
+        _ => "unknown",
     };
     h_flex()
         .gap_2()
