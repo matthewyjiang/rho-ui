@@ -218,9 +218,7 @@ pub fn relaunch(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use super::{newer, Installation, Layout};
+    use super::newer;
 
     /// Versions compare as versions, not strings, and a build newer than
     /// the latest release, as a build from main is, is offered nothing.
@@ -251,6 +249,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_update_installs_over_the_scripts_layout_only() {
+        use super::{Installation, Layout};
+        use std::path::Path;
+
         let cases = [
             (
                 "/home/u/.local/bin/rho-ui",
