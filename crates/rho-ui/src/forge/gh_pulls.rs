@@ -622,10 +622,10 @@ struct GhThread {
 
 impl GhComment {
     fn into_post(self) -> Post {
-        let (author, avatar) = author(self.author);
+        let (author, avatar_url) = author(self.author);
         Post {
             author,
-            avatar,
+            avatar_url,
             at: time::parse_utc(&self.created_at).unwrap_or_default(),
             body: self.body.into(),
             verdict: None,
@@ -647,10 +647,10 @@ impl GhReview {
             _ => return None,
         };
         let at = time::parse_utc(self.submitted_at.as_deref()?).unwrap_or_default();
-        let (author, avatar) = author(self.author);
+        let (author, avatar_url) = author(self.author);
         Some(Post {
             author,
-            avatar,
+            avatar_url,
             at,
             body: self.body.into(),
             verdict: Some(verdict),

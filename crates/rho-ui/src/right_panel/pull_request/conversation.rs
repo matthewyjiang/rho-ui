@@ -214,8 +214,8 @@ impl PullRequestSurface {
         // The author's picture once it is fetched, their initials until
         // then.
         let mut avatar = Avatar::new().name(post.author.clone()).small();
-        let picture = post.avatar.as_ref();
-        if let Some(picture) = picture.and_then(|url| self.prs.read(cx).avatar(url)) {
+        let picture = post.avatar_url.as_ref();
+        if let Some(picture) = picture.and_then(|at| self.prs.read(cx).avatar(at)) {
             avatar = avatar.src(picture);
         }
         v_flex()

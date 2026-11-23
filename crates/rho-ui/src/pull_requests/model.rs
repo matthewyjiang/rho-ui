@@ -225,6 +225,15 @@ pub(crate) struct PrDetail {
     pub(crate) merge_methods: Vec<MergeMethod>,
 }
 
+impl PrDetail {
+    /// Everything said on it: its comments and reviews, then its threads'
+    /// comments.
+    pub(crate) fn every_post(&self) -> impl Iterator<Item = &Post> {
+        let threads = self.threads.iter().flat_map(|thread| &thread.comments);
+        self.posts.iter().chain(threads)
+    }
+}
+
 /// How a PR merges into its base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MergeMethod {
@@ -287,7 +296,7 @@ pub(crate) struct Post {
     /// Where the forge serves the author's picture, which
     /// [`PullRequests::avatar`](super::PullRequests::avatar) fetches;
     /// `None` for a deleted account's.
-    pub(crate) avatar: Option<SharedString>,
+    pub(crate) avatar_url: Option<SharedString>,
     /// Unix seconds.
     pub(crate) at: i64,
     /// Markdown; a review may have none.

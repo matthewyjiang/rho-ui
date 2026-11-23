@@ -270,10 +270,12 @@ impl<K: PartialEq> Cadence<K> {
     }
 }
 
-/// Says on stderr that the picture at `url` didn't load, and `why`.
+/// Says on stderr that the picture at `url` didn't load, and `why`: by
+/// its name, as its query may hold a token.
 #[expect(clippy::print_stderr, reason = "the desktop app has no log")]
 fn report_avatar(url: &str, why: &str) {
-    eprintln!("rho-ui: the profile picture at {url} didn't load, so initials show: {why}");
+    let picture = avatars::name(url);
+    eprintln!("rho-ui: the profile picture at {picture} didn't load, so initials show: {why}");
 }
 
 /// Runs `then` after `wait`, unless the task is dropped first.
@@ -493,7 +495,7 @@ impl PullRequests {
     }
 
     /// The picture of a post's author, served at `url`
-    /// ([`Post::avatar`]), once fetched.
+    /// ([`Post::avatar_url`]), once fetched.
     pub(crate) fn avatar(&self, url: &str) -> Option<Arc<Image>> {
         self.avatars.get(url)
     }
@@ -773,7 +775,8 @@ impl PullRequests {
         for (id, detail) in batch.details {
             match detail {
                 Some(detail) => {
-                    self.fetch_avatars(&detail, read.machine.clone(), cx);
+                    self.avatars.queue(&detail, &read.machine);
+                    self.fetch_next_avatar(cx);
                     self.details.insert(id, detail)
                 }
                 None => self.details.remove(&id),
@@ -792,34 +795,28 @@ impl PullRequests {
         ingested
     }
 
-    /// Fetches the pictures of those who posted on `detail` that weren't
-    /// asked for before, on `machine`, which read it. One after another: a
-    /// machine's sshd opens only so many sessions at once (10, unless
-    /// set). One that doesn't load leaves its author's initials, and says
-    /// why on stderr.
-    fn fetch_avatars(&mut self, detail: &PrDetail, machine: MachineId, cx: &mut Context<'_, Self>) {
-        let urls = self.avatars.claim(detail);
-        if urls.is_empty() {
-            return;
-        }
+    /// Fetches the next picture waiting, unless a fetch runs; its end
+    /// starts the one after. One that doesn't load leaves its author's
+    /// initials, and says why on stderr.
+    fn fetch_next_avatar(&mut self, cx: &mut Context<'_, Self>) {
+        let (runner, url) = loop {
+            let Some((machine, url)) = self.avatars.start_next() else {
+                return;
+            };
+            match self.workspaces.read(cx).reader(&machine) {
+                Reader::Unread => self.avatars.abandon(&url, &machine),
+                runner @ (Reader::Here | Reader::There(_)) => break (runner, url),
+            }
+        };
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
-            for url in urls {
-                let Ok(runner) =
-                    this.read_with(cx, |this, cx| this.workspaces.read(cx).reader(&machine))
-                else {
-                    return;
-                };
-                let picture = forge::avatar::fetch(runner, &url, &executor).await;
-                let picture = picture.inspect_err(|why| report_avatar(&url, why)).ok();
-                let kept = this.update(cx, |this, cx| {
-                    this.avatars.set(url, picture);
-                    cx.notify();
-                });
-                if kept.is_err() {
-                    return;
-                }
-            }
+            let picture = forge::avatar::fetch(runner, &url, &executor).await;
+            let picture = picture.inspect_err(|why| report_avatar(&url, why)).ok();
+            let _ = this.update(cx, |this, cx| {
+                this.avatars.finish(&url, picture);
+                cx.notify();
+                this.fetch_next_avatar(cx);
+            });
         })
         .detach();
     }
