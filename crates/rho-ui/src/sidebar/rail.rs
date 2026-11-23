@@ -10,14 +10,17 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex, v_flex, ActiveTheme as _, Icon, IconName, Sizable as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, Context, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Styled as _,
+    div, rems, Context, InteractiveElement as _, IntoElement, ParentElement as _, Rems,
+    Styled as _, Window,
 };
 
 use super::{new_session_button, settings_button, SidebarEvent, SidebarView};
 use crate::{
     session_list::Busy,
     store::{Key, StateDb},
+    window_chrome,
 };
 
 /// How much of the sidebar shows.
@@ -131,23 +134,31 @@ impl SidebarView {
     /// collapses, and a second click on the toggle undoes the first. Under
     /// New session, an icon stands for the sessions that wait for a person
     /// and another for those working, so collapsing hides nobody's turn.
-    pub(super) fn render_rail(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+    /// On macOS the traffic lights take the top row, and the toggle goes
+    /// first under them.
+    pub(super) fn render_rail(&self, window: &Window, cx: &Context<'_, Self>) -> impl IntoElement {
+        let lights = window_chrome::traffic_light_room(window, cx);
+        let under_lights = lights.is_some();
+        let top = h_flex().flex_shrink_0().h(super::top_row());
+        let top = match lights {
+            // The room starts at the window's edge, not at the inset.
+            Some(room) => top.mx_neg_3().child(room),
+            None => top.child(toggle_button(Layout::Rail, cx)),
+        };
         v_flex()
             .id("sidebar-rail")
             .test_support()
             .size_full()
             .px_3()
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .h(super::top_row())
-                    .child(toggle_button(Layout::Rail, cx)),
-            )
+            .child(top)
             .child(
                 v_flex()
                     .flex_1()
                     .min_h_0()
                     .gap_1()
+                    .when(under_lights, |column| {
+                        column.child(toggle_button(Layout::Rail, cx))
+                    })
                     .child(new_session_button(cx))
                     // Status, not actions: a group of its own.
                     .child(

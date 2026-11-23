@@ -74,6 +74,7 @@ use crate::{
     time,
     title_bar::TOP_ROW_REMS,
     unseen::Unseen,
+    window_chrome::{self, DragArea, MovesWindow as _},
     workspaces::{Workspace, Workspaces},
 };
 
@@ -578,9 +579,15 @@ impl SidebarView {
             .is_some_and(|active| self.list.mark_seen(active))
     }
 
-    /// How wide the app lays the sidebar out.
-    pub(crate) fn width(&self) -> Rems {
-        self.layout.width()
+    /// How wide the app lays the sidebar out: on macOS, never too narrow
+    /// for the traffic lights over it.
+    pub(crate) fn width(&self, cx: &App) -> Rems {
+        rems(
+            self.layout
+                .width()
+                .0
+                .max(window_chrome::sidebar_least_rems(cx)),
+        )
     }
 
     /// Makes the open sidebar `width` rems wide, held to the `room` the
@@ -1285,16 +1292,27 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// The toggle, "Rho", and New session at the far end.
-    fn render_header(cx: &Context<'_, Self>) -> impl IntoElement {
-        h_flex()
-            .flex_shrink_0()
-            .h(top_row())
-            .px_3()
-            .gap_1()
-            .child(toggle_button(Layout::Open, cx))
-            .child(div().flex_1().font_semibold().child("Rho"))
-            .child(new_session_button(cx))
+    /// The toggle, "Rho", and New session at the far end; on macOS, the
+    /// traffic lights first. "Rho" moves the window, as a title does.
+    fn render_header(window: &Window, cx: &Context<'_, Self>) -> impl IntoElement {
+        let row = h_flex().flex_shrink_0().h(top_row()).pr_3().gap_1();
+        match window_chrome::traffic_light_room(window, cx) {
+            Some(room) => row.child(room),
+            None => row.pl_3(),
+        }
+        .child(toggle_button(Layout::Open, cx))
+        .child(
+            div()
+                .id("sidebar-title")
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .font_semibold()
+                .moves_window(DragArea::SidebarTitle, window, cx)
+                .child("Rho"),
+        )
+        .child(new_session_button(cx))
     }
 
     fn render_list(&self, window: &Window, cx: &mut Context<'_, Self>) -> AnyElement {
@@ -1621,10 +1639,10 @@ impl Render for SidebarView {
             .border_r_1()
             .border_color(theme.sidebar_border);
         if self.layout.current() == Layout::Rail {
-            return frame.child(self.render_rail(cx));
+            return frame.child(self.render_rail(window, cx));
         }
         frame
-            .child(Self::render_header(cx))
+            .child(Self::render_header(window, cx))
             .child(
                 // The header's padding, so the filter lines up under New session.
                 h_flex()

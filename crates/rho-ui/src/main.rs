@@ -69,6 +69,7 @@ mod unseen;
 mod usage;
 #[cfg(target_family = "wasm")]
 mod web;
+mod window_chrome;
 mod work;
 mod workspaces;
 mod worktrees;
@@ -83,7 +84,7 @@ use gpui_kit::AppContext as _;
 use gpui_kit::QuitMode;
 use gpui_kit::{
     px, size, Action, App, AssetSource, Axis, DevicePixels, KeyBinding, KeyBindingContextPredicate,
-    NoAction, SharedString, SvgSize, TitlebarOptions, WindowBounds, WindowOptions,
+    NoAction, SharedString, SvgSize, WindowBounds, WindowOptions,
 };
 #[cfg(not(target_family = "wasm"))]
 use rho_ui_core::{DaemonTarget, RhoInstall};
@@ -390,6 +391,7 @@ fn open_app(launch: LaunchConfig, db: &StateDb, settings: Settings, cx: &mut App
 fn init(cx: &mut App, db: &StateDb) {
     gpui_kit::init(cx);
     themes::install(cx);
+    window_chrome::install(cx);
     Settings::default().apply(cx);
     cx.set_global(TurnTimes::load(db));
     cx.set_global(BackgroundLog::new(db));
@@ -519,15 +521,14 @@ fn shortcut(keys: &str, action: impl Action, context: Option<&str>, cx: &App) ->
 }
 
 /// The main window: centered, large enough for the sidebar and a readable
-/// transcript side by side.
+/// transcript side by side, with the app's own title bar where it draws
+/// one (`window_chrome`).
 fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.), px(800.)), cx)),
         window_min_size: Some(size(px(720.), px(480.))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("Rho".into()),
-            ..Default::default()
-        }),
+        titlebar: Some(window_chrome::titlebar_options(cx)),
+        app_owns_titlebar_drag: window_chrome::app_owns_titlebar_drag(cx),
         app_id: Some("rho-ui".to_owned()),
         icon: app_icon(cx),
         ..Default::default()

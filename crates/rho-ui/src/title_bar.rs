@@ -15,6 +15,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex, ActiveTheme as _, IconName, Sizable as _, StyledExt as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, rems, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
     RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
@@ -24,6 +25,7 @@ use crate::{
     badge::Badge,
     repo,
     right_panel::{self, PanelLayout},
+    window_chrome::{self, DragArea, MovesWindow as _},
     workspaces::Workspace,
 };
 
@@ -104,7 +106,7 @@ impl TitleBar {
 }
 
 impl RenderOnce for TitleBar {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, foreground) = (theme.muted_foreground, theme.foreground);
         let slash = || {
@@ -163,13 +165,14 @@ impl RenderOnce for TitleBar {
             .flex_shrink_0()
             .h(rems(TOP_ROW_REMS))
             .gap_2()
-            .px_4()
+            .pl_4()
             .border_b_1()
             .border_color(theme.border)
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
+                    .h_full()
                     .gap_3()
                     .child(
                         h_flex()
@@ -180,19 +183,34 @@ impl RenderOnce for TitleBar {
                     )
                     .child(slash())
                     .children(parents)
+                    // Takes the bar's room up to the controls, so all of
+                    // it moves the window where the app draws the title
+                    // bar.
                     .child(
                         div()
                             .id("session-title")
                             .test_support()
                             .aria_label(self.title.clone())
+                            .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .h_full()
+                            .flex()
+                            .items_center()
                             .font_medium()
-                            .child(self.title),
+                            .moves_window(DragArea::SessionTitle, window, cx)
+                            .child(div().min_w_0().truncate().child(self.title)),
                     ),
             )
             .children(self.trailing)
-            .children((!PanelLayout::get(cx)).then(|| right_panel::toggle_button(cx)))
+            // At the window's right edge while the panel is hidden, where
+            // the window buttons' room takes the place of the inset.
+            .when(!PanelLayout::get(cx), |bar| {
+                bar.child(right_panel::toggle_button(cx))
+            })
+            .map(|bar| match window_chrome::caption_room(window, cx) {
+                Some(room) if !PanelLayout::get(cx) => bar.child(room),
+                _ => bar.pr_4(),
+            })
     }
 }
 
