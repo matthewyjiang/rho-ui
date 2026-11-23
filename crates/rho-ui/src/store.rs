@@ -22,7 +22,7 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
 
 /// Bump on any change to [`SCHEMA`]. A database of another version starts
 /// over empty: rho-ui has no release, so there is nothing to migrate.
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Every table. Each belongs to the module that reads and writes it.
 /// Tables keyed by text are `WITHOUT ROWID`, so the key is stored once
@@ -42,6 +42,13 @@ const SCHEMA: &str = "
         PRIMARY KEY (machine, session_id),
         CHECK ((settled_at IS NOT NULL) + (snoozed_until IS NOT NULL)
             + (pinned_at IS NOT NULL) <= 1)
+    ) STRICT, WITHOUT ROWID;
+    -- Sessions whose turn finished since they were last on screen, by
+    -- machine and session; see crate::unseen.
+    CREATE TABLE unseen (
+        machine TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        PRIMARY KEY (machine, session_id)
     ) STRICT, WITHOUT ROWID;
     -- The user's projects, in the order added (rowid); see crate::projects.
     -- The path's bytes, as a path needn't be UTF-8.
