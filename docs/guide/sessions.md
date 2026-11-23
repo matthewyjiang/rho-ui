@@ -12,6 +12,8 @@ rho-ui doesn't find projects on its own: add the folders you work in. Type a pat
 
 A project is a repository rather than one checkout of it. Adding a linked worktree or a subfolder adds the repository it belongs to. With several machines, checkouts of the same repository count as one project, matched by repository name, so a project missing from one machine offers to clone it there.
 
+For a repository with an origin remote on a web host, the button beside the project's name in the title bar opens the repository's page in your browser. rho-ui leaves out any credentials in the remote's URL, and drops an ssh port.
+
 ## Worktrees
 
 In a git project you can start a session in a **New worktree** instead of the project's checkout, so parallel sessions in one repository never write the same files.

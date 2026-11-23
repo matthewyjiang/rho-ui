@@ -272,6 +272,48 @@ pub(crate) fn url_name(url: &str) -> Option<String> {
     })
 }
 
+/// The web page of the repository at remote `url`, as the title bar links
+/// it: `git@host:owner/name.git`, `ssh://git@host:22/owner/name` and
+/// `https://user:token@host/owner/name.git` all give
+/// `https://host/owner/name`. Any credentials in the URL are dropped, as is
+/// an ssh port, which the web server doesn't share. `None` for a remote
+/// with no host, such as a local path or a `file://` URL.
+pub(crate) fn web_url(url: &str) -> Option<String> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // scp-like `[user@]host:path`, as git reads it: a `/` before the
+        // `:` makes it a path, as does one letter, a Windows drive.
+        let (authority, path) = url.split_once(':')?;
+        return if authority.contains(['/', '\\']) || authority.len() == 1 {
+            None
+        } else {
+            web_page("https", without_user(authority), path)
+        };
+    };
+    let (authority, path) = rest.split_once('/')?;
+    let host = without_user(authority);
+    match scheme {
+        "http" | "https" => web_page(scheme, host, path),
+        "ssh" | "git" | "git+ssh" | "ssh+git" => {
+            web_page("https", host.split(':').next().unwrap_or(host), path)
+        }
+        _ => None,
+    }
+}
+
+/// `authority` without its `user[:password]@`.
+fn without_user(authority: &str) -> &str {
+    authority.rsplit('@').next().unwrap_or(authority)
+}
+
+/// `scheme://host/path`, without a trailing `/` or `.git` on the path.
+fn web_page(scheme: &str, host: &str, path: &str) -> Option<String> {
+    let path = path
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    (!host.is_empty() && !path.is_empty()).then(|| format!("{scheme}://{host}/{path}"))
+}
+
 /// For tests: a checkout `project` with a linked worktree `wt` beside it,
 /// under `dir`, made of bare `.git` files. Returns both folders; the
 /// worktree has a `src` subfolder and the checkout a `docs` one.
@@ -314,6 +356,33 @@ mod tests {
         assert_eq!(repo("matthewyjiang/rho").initials(), "RO");
         assert_eq!(repo("dux-shell").initials(), "DS");
         assert_eq!(repo("x").initials(), "X");
+    }
+
+    #[test]
+    fn remote_urls_give_a_web_page_without_credentials() {
+        let page = Some("https://github.com/me/thing");
+        for url in [
+            "git@github.com:me/thing.git",
+            "github.com:me/thing",
+            "ssh://git@github.com:22/me/thing.git",
+            "git://github.com/me/thing",
+            "https://me:ghp_secret@github.com/me/thing.git/",
+        ] {
+            assert_eq!(web_url(url).as_deref(), page, "{url}");
+        }
+        assert_eq!(
+            web_url("http://git.lab:8080/group/sub/thing").as_deref(),
+            Some("http://git.lab:8080/group/sub/thing")
+        );
+        for local in [
+            "/srv/git/thing.git",
+            "../thing",
+            "file:///srv/git/thing.git",
+            r"C:\code\thing",
+            "https://github.com",
+        ] {
+            assert_eq!(web_url(local), None, "{local}");
+        }
     }
 
     #[test]

@@ -491,7 +491,7 @@ mod tests {
                 ),
             ]
         );
-        assert!(runs.of(&SessionId::from("s-a")).is_empty());
+        assert_eq!(runs.of(&SessionId::from("s-a")), Vec::<Run>::new());
     }
 
     /// The daemon reports a running turn's elapsed time anew at each
