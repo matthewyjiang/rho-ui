@@ -51,6 +51,7 @@ use crate::{
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
     store::{Key, StateDb},
     turn_times::TurnTimes,
+    unseen::Unseen,
 };
 
 mod live;
@@ -314,6 +315,7 @@ impl Harness {
         };
         let sidebar = SidebarState {
             shelves,
+            unseen: Unseen::load(&state),
             layout: SidebarLayout::load(&state),
             filter: SavedFilter::load(&state),
         };

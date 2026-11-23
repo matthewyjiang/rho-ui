@@ -6,6 +6,10 @@ Sessions belong to the rho daemon, not to rho-ui. The sidebar lists every saved 
 
 Pinning, snoozing and settling are rho-ui's own; rho has no such state, so rho's terminal UI doesn't see them. Sessions that started outside rho-ui begin settled, so the sidebar doesn't fill with your old terminal history. A session with work under way always shows as active, and a settled one comes back when it has new activity.
 
+The active list reads as an inbox. Under the pinned sessions, which stay on top whatever they are doing, come the sessions that need you, then the Done ones, then the idle ones, and last those working or waiting on their own background work. A session moves as its state changes: it sinks when you send it a prompt and rises when its turn ends.
+
+A session stays Done until you open it, even across restarts of rho-ui. A turn that finishes while rho-ui is closed doesn't mark its session Done, since rho-ui didn't see it end.
+
 ## Projects
 
 rho-ui doesn't find projects on its own: add the folders you work in. Type a path in the project search to browse, or paste a git URL to clone it into the machine's clone folder (`$RHO_HOME/projects` unless you set one in **Settings → Machines**).

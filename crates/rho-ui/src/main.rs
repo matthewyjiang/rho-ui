@@ -65,6 +65,7 @@ mod transcript;
 mod turn_times;
 #[cfg(test)]
 mod ui_tests;
+mod unseen;
 mod usage;
 #[cfg(target_family = "wasm")]
 mod web;

@@ -1,5 +1,6 @@
 //! The session list, drawn: one scrolling list of every machine's active
-//! sessions, newest first, then the Snoozed and Settled shelves, held at the
+//! sessions, pinned first and the rest ranked as an inbox (see
+//! [`crate::session_list`]), then the Snoozed and Settled shelves, held at the
 //! bottom until opened shelves fill the list. Drafts of new sessions the
 //! user left with a message lead it, saying Draft; hovering one offers
 //! Discard. An active row shows the
@@ -72,6 +73,7 @@ use crate::{
     store::StateDb,
     time,
     title_bar::TOP_ROW_REMS,
+    unseen::Unseen,
     workspaces::{Workspace, Workspaces},
 };
 
@@ -277,10 +279,11 @@ struct Renaming {
 }
 
 /// What the sidebar remembers between runs, each part loaded from the
-/// state database: settled and snoozed sessions, whether it is collapsed,
-/// and its filter.
+/// state database: settled and snoozed sessions, the ones Done and not yet
+/// seen, whether it is collapsed, and its filter.
 pub(crate) struct SidebarState {
     pub(crate) shelves: Shelves,
+    pub(crate) unseen: Unseen,
     pub(crate) layout: SidebarLayout,
     pub(crate) filter: SavedFilter,
 }
@@ -289,6 +292,7 @@ impl SidebarState {
     pub(crate) fn load(db: &StateDb, now: i64) -> Self {
         Self {
             shelves: Shelves::load(db, now),
+            unseen: Unseen::load(db),
             layout: SidebarLayout::load(db),
             filter: SavedFilter::load(db),
         }
@@ -388,7 +392,7 @@ impl SidebarView {
                 break;
             }
         });
-        let mut list = SessionList::default();
+        let mut list = SessionList::new(state.unseen);
         list.set_filter(state.filter.filter().clone());
         Self {
             list,
@@ -553,8 +557,11 @@ impl SidebarView {
     pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.active != id {
             self.active = id;
-            self.mark_active_seen();
-            cx.notify();
+            if self.mark_active_seen() {
+                self.rebuild(cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 
@@ -564,10 +571,11 @@ impl SidebarView {
     }
 
     /// The session on screen has no Done to show: its turn ended in view.
-    fn mark_active_seen(&mut self) {
-        if let Some(active) = &self.active {
-            self.list.mark_seen(active);
-        }
+    /// Returns whether it had one, so the list needs a rebuild.
+    fn mark_active_seen(&mut self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| self.list.mark_seen(active))
     }
 
     /// How wide the app lays the sidebar out.
