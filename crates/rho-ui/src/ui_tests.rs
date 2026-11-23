@@ -6482,21 +6482,24 @@ fn a_signed_out_session_signs_in_from_its_card() {
     });
 }
 
-/// Settings → Providers signs in with an account's login, showing the
-/// login's page until the provider approves it, and signs out of a
-/// profile, which then takes a key again.
+/// Settings → Providers lists only the profiles signed in. Add provider
+/// offers the rest: an account's login starts as it is picked, showing
+/// its page until the provider approves it; a profile signed out leaves
+/// the list, and one picked but not signed in can be removed again.
 #[test]
-fn providers_sign_in_with_a_login_and_out() {
+fn providers_add_a_login_and_sign_out() {
     let mut ui = Harness::start("providers", Script::default());
     open_settings(&mut ui);
     open_settings_page(&mut ui, "Providers");
-    let login = "providers-fake-login-login";
-    ui.wait_until("the login's Sign in", |window, _, _| {
-        is_visible(window, login)
+    ui.wait_until("only the signed-in profile listed", |window, _, _| {
+        is_visible(window, "providers-fake-api-key-logout")
+            && is_visible(window, "providers-add")
+            && !is_visible(window, "providers-fake-login")
     });
     ui.shot("listed");
 
-    ui.click(login);
+    ui.click("providers-add");
+    click_label(&mut ui, "Fake Pro (login)");
     ui.wait_until("the login's page", |window, _, _| {
         is_visible(window, "providers-fake-login-prompt")
     });
@@ -6509,11 +6512,25 @@ fn providers_sign_in_with_a_login_and_out() {
     assert!(ui.fake().signed_in(LOGIN_AUTH));
 
     ui.click("providers-fake-api-key-logout");
-    ui.wait_until("the key's box back", |window, _, _| {
-        is_visible(window, "providers-fake-api-key-save")
+    ui.wait_until("the profile off the list", |window, _, _| {
+        !is_visible(window, "providers-fake-api-key")
     });
     assert!(!ui.fake().signed_in(KEY_AUTH));
-    ui.shot("signed-out");
+
+    ui.click("providers-add");
+    ui.wait_until("the menu", |window, _, _| {
+        window.try_find_by_label("Fake (API key)").is_some()
+    });
+    ui.shot("menu");
+    click_label(&mut ui, "Fake (API key)");
+    ui.wait_until("the key's box", |window, _, _| {
+        is_visible(window, "providers-fake-api-key-save")
+    });
+    ui.shot("adding");
+    ui.click("providers-fake-api-key-remove");
+    ui.wait_until("the profile off the list again", |window, _, _| {
+        !is_visible(window, "providers-fake-api-key") && is_visible(window, "providers-add")
+    });
 }
 
 /// Settings → Worktrees lists the daemon's session worktrees with what a
