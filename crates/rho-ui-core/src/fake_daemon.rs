@@ -549,15 +549,17 @@ impl FakeDaemon {
             None => format!("job-gone-{}", state.session_worktrees.len()),
         });
         state.session_worktrees.push(WorktreeReport {
-            job,
+            job: Some(job),
             worktree: SessionWorktree {
                 branch: branch.to_owned(),
                 // Spelled out, not joined, so it reads the same on Windows.
                 path: PathBuf::from(format!("/rho/worktrees/{}", branch.replace('/', "-"))),
                 origin: PathBuf::from("/w/a"),
             },
+            detached: false,
             verdict,
             stale: false,
+            bytes: None,
         });
     }
 

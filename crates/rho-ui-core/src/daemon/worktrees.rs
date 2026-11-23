@@ -33,7 +33,11 @@ impl Daemon {
     /// Fails if the daemon rejects the request, as a rho too old to prune
     /// worktrees, or the connection is gone.
     pub async fn check_worktrees(&self) -> Result<Vec<ReportedWorktree>, DaemonError> {
-        self.prune(WorktreePruneParams { dry_run: true }).await
+        self.prune(WorktreePruneParams {
+            dry_run: true,
+            measure: false,
+        })
+        .await
     }
 
     /// Removes each session worktree that is clean, merged and unused,
@@ -46,16 +50,21 @@ impl Daemon {
     /// worktrees, or the connection is gone. Git failing on one worktree
     /// is no error: its report says so.
     pub async fn prune_worktrees(&self) -> Result<Vec<ReportedWorktree>, DaemonError> {
-        self.prune(WorktreePruneParams { dry_run: false }).await
+        self.prune(WorktreePruneParams {
+            dry_run: false,
+            measure: false,
+        })
+        .await
     }
 
     async fn prune(
         &self,
         params: WorktreePruneParams,
     ) -> Result<Vec<ReportedWorktree>, DaemonError> {
-        // A report names its worktree's job, not the session (rho-protocol
-        // 1.2's `WorktreeReport` has no `session`): the job list says which
-        // session each job is. Without it, worktrees go unnamed.
+        // A report names its worktree's job, if a session owns it, not the
+        // session (rho-protocol 1.3's `WorktreeReport` has no `session`):
+        // the job list says which session each job is. Without it,
+        // worktrees go unnamed.
         let (response, jobs) = futures::future::join(
             self.client.request::<methods::WorktreePrune>(&params),
             self.client.request::<methods::JobList>(&JobListParams {}),
@@ -74,7 +83,7 @@ impl Daemon {
             .worktrees
             .into_iter()
             .map(|report| ReportedWorktree {
-                session: sessions.get(&report.job).cloned(),
+                session: report.job.and_then(|job| sessions.get(&job).cloned()),
                 worktree: report.worktree,
                 verdict: report.verdict,
                 stale: report.stale,

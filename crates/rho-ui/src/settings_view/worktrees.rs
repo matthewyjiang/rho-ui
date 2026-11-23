@@ -313,7 +313,7 @@ fn by_project(worktrees: Vec<&ReportedWorktree>) -> Vec<(&Path, Vec<&ReportedWor
 /// lists those that need them at its top.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Concern {
-    /// Git failed on it.
+    /// Rho could not check or remove it.
     Failed,
     /// It holds work no commit has.
     Dirty,
@@ -348,13 +348,13 @@ impl Concern {
     }
 }
 
-/// What `verdict` asks of the user, how the page says it, and git's error
+/// What `verdict` asks of the user, how the page says it, and the error
 /// if it failed.
 fn describe(verdict: &WorktreeVerdict) -> (Concern, String, Option<String>) {
     match verdict {
         WorktreeVerdict::Failed { error } => (
             Concern::Failed,
-            "Git failed".to_owned(),
+            "Check failed".to_owned(),
             Some(error.clone()),
         ),
         WorktreeVerdict::Dirty => (Concern::Dirty, "Uncommitted changes".to_owned(), None),
@@ -362,6 +362,9 @@ fn describe(verdict: &WorktreeVerdict) -> (Concern, String, Option<String>) {
             (Concern::Unmerged, format!("Not merged into {base}"), None)
         }
         WorktreeVerdict::InUse => (Concern::InUse, "In use".to_owned(), None),
+        WorktreeVerdict::Occupied => (Concern::InUse, "In use by a process".to_owned(), None),
+        WorktreeVerdict::Recent => (Concern::InUse, "Used in the last day".to_owned(), None),
+        WorktreeVerdict::Locked => (Concern::Other, "Locked".to_owned(), None),
         WorktreeVerdict::Merged { base } => {
             (Concern::Removable, format!("Merged into {base}"), None)
         }
