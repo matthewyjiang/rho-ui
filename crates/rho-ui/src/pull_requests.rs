@@ -6,15 +6,17 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
 use web_time::Instant;
 
-use gpui_kit::{BackgroundExecutor, Context, Entity, EntityId, SharedString, Task};
+use gpui_kit::{BackgroundExecutor, Context, Entity, EntityId, Image, SharedString, Task};
 
 use rho_ui_core::SessionId;
 
+use self::avatars::Avatars;
 pub(crate) use self::model::*;
 
 use crate::{
@@ -27,6 +29,7 @@ use crate::{
     workspaces::{Workspace, Workspaces},
 };
 
+mod avatars;
 pub(crate) mod model;
 
 /// How often the PR on screen is read again: often enough to follow a CI
@@ -267,6 +270,12 @@ impl<K: PartialEq> Cadence<K> {
     }
 }
 
+/// Says on stderr that the picture at `url` didn't load, and `why`.
+#[expect(clippy::print_stderr, reason = "the desktop app has no log")]
+fn report_avatar(url: &str, why: &str) {
+    eprintln!("rho-ui: the profile picture at {url} didn't load, so initials show: {why}");
+}
+
 /// Runs `then` after `wait`, unless the task is dropped first.
 fn after(
     wait: Duration,
@@ -401,6 +410,7 @@ pub(crate) struct PullRequests {
     shown_by: Option<EntityId>,
     found: HashMap<Target, Found>,
     details: HashMap<PrId, PrDetail>,
+    avatars: Avatars,
     default_branches: HashMap<RepoId, Option<String>>,
     /// Why the last poll of a target failed, until one answers.
     failed: HashMap<Target, SharedString>,
@@ -442,6 +452,7 @@ impl PullRequests {
             shown_by: None,
             found: HashMap::new(),
             details: HashMap::new(),
+            avatars: Avatars::default(),
             default_branches: HashMap::new(),
             failed: HashMap::new(),
             hidden: HashSet::new(),
@@ -479,6 +490,12 @@ impl PullRequests {
     /// The detail of PR `id`, once read; it may be older than its summary.
     pub(crate) fn detail(&self, id: &PrId) -> Option<&PrDetail> {
         self.details.get(id)
+    }
+
+    /// The picture of a post's author, served at `url`
+    /// ([`Post::avatar`]), once fetched.
+    pub(crate) fn avatar(&self, url: &str) -> Option<Arc<Image>> {
+        self.avatars.get(url)
     }
 
     /// Why what is known of `target` may be out of date, if it may.
@@ -549,6 +566,7 @@ impl PullRequests {
     pub(crate) fn refresh(&mut self, refresh: Refresh, cx: &mut Context<'_, Self>) {
         if refresh == Refresh::Everything {
             self.next = Refresh::Everything;
+            self.avatars.forget_failed();
             if let Some(watch) = self.on_screen.clone() {
                 // This machine's account may see it now.
                 self.hidden.remove(watch.target.repo());
@@ -754,7 +772,10 @@ impl PullRequests {
         }
         for (id, detail) in batch.details {
             match detail {
-                Some(detail) => self.details.insert(id, detail),
+                Some(detail) => {
+                    self.fetch_avatars(&detail, read.machine.clone(), cx);
+                    self.details.insert(id, detail)
+                }
                 None => self.details.remove(&id),
             };
         }
@@ -769,6 +790,38 @@ impl PullRequests {
         }
         cx.notify();
         ingested
+    }
+
+    /// Fetches the pictures of those who posted on `detail` that weren't
+    /// asked for before, on `machine`, which read it. One after another: a
+    /// machine's sshd opens only so many sessions at once (10, unless
+    /// set). One that doesn't load leaves its author's initials, and says
+    /// why on stderr.
+    fn fetch_avatars(&mut self, detail: &PrDetail, machine: MachineId, cx: &mut Context<'_, Self>) {
+        let urls = self.avatars.claim(detail);
+        if urls.is_empty() {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            for url in urls {
+                let Ok(runner) =
+                    this.read_with(cx, |this, cx| this.workspaces.read(cx).reader(&machine))
+                else {
+                    return;
+                };
+                let picture = forge::avatar::fetch(runner, &url, &executor).await;
+                let picture = picture.inspect_err(|why| report_avatar(&url, why)).ok();
+                let kept = this.update(cx, |this, cx| {
+                    this.avatars.set(url, picture);
+                    cx.notify();
+                });
+                if kept.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Watches `listed` for the sidebar: its sessions, each on its machine.

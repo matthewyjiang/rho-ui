@@ -211,6 +211,13 @@ impl PullRequestSurface {
         let url = web_url(&post.url);
         let muted = theme.muted_foreground;
         let foreground = theme.foreground;
+        // The author's picture once it is fetched, their initials until
+        // then.
+        let mut avatar = Avatar::new().name(post.author.clone()).small();
+        let picture = post.avatar.as_ref();
+        if let Some(picture) = picture.and_then(|url| self.prs.read(cx).avatar(url)) {
+            avatar = avatar.src(picture);
+        }
         v_flex()
             .id(id)
             .test_support()
@@ -219,7 +226,7 @@ impl PullRequestSurface {
                 h_flex()
                     .gap_2()
                     .text_xs()
-                    .child(Avatar::new().name(post.author.clone()).small())
+                    .child(avatar)
                     .child(
                         div()
                             .min_w_0()

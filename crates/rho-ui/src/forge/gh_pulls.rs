@@ -168,7 +168,10 @@ const SUMMARY: &str = "fragment Summary on PullRequest {
 /// rust-lang/rust#137944 (210 comments, 129 reviews, 84 threads), which
 /// read in 1.5 s, as it did with 50 of each. The surface says how many more
 /// there are. A new comment updates the PR's `updatedAt` (cli/cli#10513:
-/// comment 20:42:15, update 20:42:16), so a poll sees it.
+/// comment 20:42:15, update 20:42:16), so a poll sees it. Where each
+/// author's picture is costs nothing more either (still 1 point on
+/// cli/cli#14578), at 72 px a side: the 24 px it is drawn at,
+/// sharp up to a display scale of 3.
 const DETAIL: &str = "fragment Detail on PullRequest {
   ...Summary
   body author { login } headRefName baseRefName additions deletions changedFiles reviewDecision
@@ -183,15 +186,16 @@ const DETAIL: &str = "fragment Detail on PullRequest {
     }
   } } } } }
   comments(last: 30) { totalCount nodes { ...Post } }
-  reviews(last: 30) { totalCount nodes { author { login } body state submittedAt url } }
+  reviews(last: 30) { totalCount nodes { author { ...Author } body state submittedAt url } }
   reviewThreads(last: 30) { totalCount nodes {
     id isResolved isOutdated path line comments(first: 10) { totalCount nodes { ...Post } }
   } }
 }
 fragment Post on Comment {
-  author { login } body createdAt
+  author { ...Author } body createdAt
   ... on IssueComment { url } ... on PullRequestReviewComment { url }
 }
+fragment Author on Actor { login avatarUrl(size: 72) }
 ";
 
 /// The repositories `plan` names, each once, in the order it first names
@@ -554,6 +558,23 @@ struct Login {
     login: String,
 }
 
+/// Who wrote a post.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhAuthor {
+    login: String,
+    avatar_url: String,
+}
+
+/// A post's author and where their picture is: a deleted account's reads
+/// as GitHub shows it, `ghost`, and has none.
+fn author(author: Option<GhAuthor>) -> (SharedString, Option<SharedString>) {
+    match author {
+        Some(author) => (author.login.into(), Some(author.avatar_url.into())),
+        None => ("ghost".into(), None),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Connection<T> {
@@ -572,7 +593,7 @@ impl<T> Connection<T> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GhComment {
-    author: Option<Login>,
+    author: Option<GhAuthor>,
     body: String,
     created_at: String,
     url: String,
@@ -581,7 +602,7 @@ struct GhComment {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GhReview {
-    author: Option<Login>,
+    author: Option<GhAuthor>,
     body: String,
     state: String,
     submitted_at: Option<String>,
@@ -599,15 +620,12 @@ struct GhThread {
     comments: Connection<GhComment>,
 }
 
-/// Whose it is: a deleted account's reads as GitHub shows it, `ghost`.
-fn login(author: Option<Login>) -> SharedString {
-    author.map_or_else(|| "ghost".into(), |author| author.login.into())
-}
-
 impl GhComment {
     fn into_post(self) -> Post {
+        let (author, avatar) = author(self.author);
         Post {
-            author: login(self.author),
+            author,
+            avatar,
             at: time::parse_utc(&self.created_at).unwrap_or_default(),
             body: self.body.into(),
             verdict: None,
@@ -628,9 +646,12 @@ impl GhReview {
             "COMMENTED" if !self.body.trim().is_empty() => Verdict::Commented,
             _ => return None,
         };
+        let at = time::parse_utc(self.submitted_at.as_deref()?).unwrap_or_default();
+        let (author, avatar) = author(self.author);
         Some(Post {
-            author: login(self.author),
-            at: time::parse_utc(self.submitted_at.as_deref()?).unwrap_or_default(),
+            author,
+            avatar,
+            at,
             body: self.body.into(),
             verdict: Some(verdict),
             url: self.url.into(),

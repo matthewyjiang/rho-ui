@@ -284,6 +284,10 @@ pub(crate) enum PrAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Post {
     pub(crate) author: SharedString,
+    /// Where the forge serves the author's picture, which
+    /// [`PullRequests::avatar`](super::PullRequests::avatar) fetches;
+    /// `None` for a deleted account's.
+    pub(crate) avatar: Option<SharedString>,
     /// Unix seconds.
     pub(crate) at: i64,
     /// Markdown; a review may have none.

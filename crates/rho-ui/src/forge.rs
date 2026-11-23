@@ -7,7 +7,11 @@
 //!
 //! To add a CLI: add a [`ForgeCli`] variant, with its check script and
 //! parser in a module of its own, as [`gh`] has.
+//!
+//! People's pictures come from where the forge serves them, without its
+//! CLI; see [`avatar`].
 
+pub(crate) mod avatar;
 mod gh;
 mod gh_pulls;
 

@@ -198,7 +198,8 @@
      "nodes": [
       {
        "author": {
-        "login": "BagToad"
+        "login": "BagToad",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/47394200?s=72&u=38155c9aa3b997813620b354b92bae0516cb8b86&v=4"
        },
        "body": "> [!NOTE]\n> Copilot generated this recording and comment.\n\n### Exercising `gh extension browse` at e15e40d\n\nThis recording exercises this PR's build ([`e15e40d`",
        "createdAt": "2026-10-02T19:08:19Z",
@@ -206,7 +207,8 @@
       },
       {
        "author": {
-        "login": "BagToad"
+        "login": "BagToad",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/47394200?s=72&u=38155c9aa3b997813620b354b92bae0516cb8b86&v=4"
        },
        "body": "> [!NOTE]\n> Copilot generated this screenshot and comment.\n\n\ud83d\udc1b potential bug, minor, non-blocking, \ud83e\udd16 copilot found: README lines that can't wrap push the footer ",
        "createdAt": "2026-10-06T19:12:00Z",
@@ -214,7 +216,8 @@
       },
       {
        "author": {
-        "login": "williammartin"
+        "login": "williammartin",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
        },
        "body": "> [!NOTE]\r\n> Copilot generated this screenshot and comment.\r\n\r\nFixed in c12892961. Lipgloss v2 includes the border in the styled width and height, so the frame ",
        "createdAt": "2026-10-07T04:42:46Z",
@@ -222,7 +225,8 @@
       },
       {
        "author": {
-        "login": "BagToad"
+        "login": "BagToad",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/47394200?s=72&u=38155c9aa3b997813620b354b92bae0516cb8b86&v=4"
        },
        "body": "> [!NOTE]\n> Copilot generated this screenshot and comment.\n\nTwo more findings. Neither should block merging.\n\n\ud83d\udc1b potential bug, minor, non-blocking, \ud83e\udd16 copilot fo",
        "createdAt": "2026-10-07T19:31:48Z",
@@ -230,7 +234,8 @@
       },
       {
        "author": {
-        "login": "williammartin"
+        "login": "williammartin",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
        },
        "body": "Fixed the multi-line error display in 7dca83938 and polished wrapped command indentation in 7cb1cfff7. Status text now wraps at terminal width, the catalog/READ",
        "createdAt": "2026-10-08T04:40:32Z",
@@ -243,7 +248,8 @@
      "nodes": [
       {
        "author": {
-        "login": "copilot-pull-request-reviewer"
+        "login": "copilot-pull-request-reviewer",
+        "avatarUrl": "https://avatars.githubusercontent.com/in/946600?s=72&v=4"
        },
        "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udfe1 Changes recommended\n\nFiltering regressions, hidden action failures, and short-terminal overflow rema",
        "state": "COMMENTED",
@@ -252,7 +258,8 @@
       },
       {
        "author": {
-        "login": "copilot-pull-request-reviewer"
+        "login": "copilot-pull-request-reviewer",
+        "avatarUrl": "https://avatars.githubusercontent.com/in/946600?s=72&v=4"
        },
        "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udfe1 Changes recommended\n\nPrintable-key handling and quitting during extension mutations can cause broken",
        "state": "COMMENTED",
@@ -261,7 +268,8 @@
       },
       {
        "author": {
-        "login": "williammartin"
+        "login": "williammartin",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
        },
        "body": "",
        "state": "COMMENTED",
@@ -270,7 +278,8 @@
       },
       {
        "author": {
-        "login": "williammartin"
+        "login": "williammartin",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
        },
        "body": "",
        "state": "COMMENTED",
@@ -279,7 +288,8 @@
       },
       {
        "author": {
-        "login": "williammartin"
+        "login": "williammartin",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
        },
        "body": "",
        "state": "COMMENTED",
@@ -288,7 +298,8 @@
       },
       {
        "author": {
-        "login": "williammartin"
+        "login": "williammartin",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
        },
        "body": "",
        "state": "COMMENTED",
@@ -297,7 +308,8 @@
       },
       {
        "author": {
-        "login": "williammartin"
+        "login": "williammartin",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
        },
        "body": "",
        "state": "COMMENTED",
@@ -306,7 +318,8 @@
       },
       {
        "author": {
-        "login": "BagToad"
+        "login": "BagToad",
+        "avatarUrl": "https://avatars.githubusercontent.com/u/47394200?s=72&u=38155c9aa3b997813620b354b92bae0516cb8b86&v=4"
        },
        "body": "",
        "state": "APPROVED",
@@ -329,7 +342,8 @@
         "nodes": [
          {
           "author": {
-           "login": "copilot-pull-request-reviewer"
+           "login": "copilot-pull-request-reviewer",
+           "avatarUrl": "https://avatars.githubusercontent.com/in/946600?s=72&v=4"
           },
           "body": "\ud83d\uded1 Requirement: Do not clear unseen action failures when leaving an overlay\n\nIf an install or removal finishes while the help or full-screen README page is open,",
           "createdAt": "2026-10-02T16:20:57Z",
@@ -337,7 +351,8 @@
          },
          {
           "author": {
-           "login": "williammartin"
+           "login": "williammartin",
+           "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
           },
           "body": "Fixed in f3adaae4d. Completed action status is now cleared only by interactions that begin on the catalog page, so leaving help or the full-screen README preser",
           "createdAt": "2026-10-06T16:06:23Z",
@@ -357,7 +372,8 @@
         "nodes": [
          {
           "author": {
-           "login": "copilot-pull-request-reviewer"
+           "login": "copilot-pull-request-reviewer",
+           "avatarUrl": "https://avatars.githubusercontent.com/in/946600?s=72&v=4"
           },
           "body": "\ud83d\uded1 Requirement: Preserve filtering by extension status\n\nThe previous filter searched the displayed title, so users could filter the catalog by `official` or `ins",
           "createdAt": "2026-10-02T16:20:58Z",
@@ -365,7 +381,8 @@
          },
          {
           "author": {
-           "login": "williammartin"
+           "login": "williammartin",
+           "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
           },
           "body": "Fixed in f3adaae4d. The filter haystack now includes the displayed `official` and `installed` labels, with table-driven coverage for both.",
           "createdAt": "2026-10-06T16:06:23Z",
@@ -385,7 +402,8 @@
         "nodes": [
          {
           "author": {
-           "login": "copilot-pull-request-reviewer"
+           "login": "copilot-pull-request-reviewer",
+           "avatarUrl": "https://avatars.githubusercontent.com/in/946600?s=72&v=4"
           },
           "body": "\ud83d\uded1 Requirement: Handle terminals shorter than six rows\n\nFor `height <= 5`, this still renders one extension as two rows, while the header, filter, separator, and",
           "createdAt": "2026-10-02T16:20:58Z",
@@ -393,7 +411,8 @@
          },
          {
           "author": {
-           "login": "williammartin"
+           "login": "williammartin",
+           "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
           },
           "body": "Fixed in f3adaae4d. Terminals shorter than six rows now render a width-constrained one-line fallback, with coverage for a five-row terminal.",
           "createdAt": "2026-10-06T16:06:23Z",
@@ -413,7 +432,8 @@
         "nodes": [
          {
           "author": {
-           "login": "copilot-pull-request-reviewer"
+           "login": "copilot-pull-request-reviewer",
+           "avatarUrl": "https://avatars.githubusercontent.com/in/946600?s=72&v=4"
           },
           "body": "\ud83d\uded1 Requirement: Prevent `q` from exiting while an install or removal is running.\n\nBubble Tea runs commands in detached goroutines and explicitly does not wait fo",
           "createdAt": "2026-10-06T15:22:30Z",
@@ -421,7 +441,8 @@
          },
          {
           "author": {
-           "login": "williammartin"
+           "login": "williammartin",
+           "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
           },
           "body": "Fixed in f3adaae4d. Normal `q` is ignored while an extension action is running; Ctrl+C remains available as the explicit forced exit. Added regression coverage ",
           "createdAt": "2026-10-06T16:06:23Z",
@@ -441,7 +462,8 @@
         "nodes": [
          {
           "author": {
-           "login": "copilot-pull-request-reviewer"
+           "login": "copilot-pull-request-reviewer",
+           "avatarUrl": "https://avatars.githubusercontent.com/in/946600?s=72&v=4"
           },
           "body": "\ud83d\uded1 Requirement: Cover returning from the full-screen README.\n\nThe new tests verify rerendering at full-screen width, but none exercise this exit branch or the pr",
           "createdAt": "2026-10-06T15:22:31Z",
@@ -449,7 +471,8 @@
          },
          {
           "author": {
-           "login": "williammartin"
+           "login": "williammartin",
+           "avatarUrl": "https://avatars.githubusercontent.com/u/1611510?s=72&u=1208184deacce6d59b31fb28f8464688c577ffdf&v=4"
           },
           "body": "Covered in f3adaae4d. The existing exit path already resized and rerendered the README; the new test opens the full-screen README at width 118, exits with `q`, ",
           "createdAt": "2026-10-06T16:06:23Z",
