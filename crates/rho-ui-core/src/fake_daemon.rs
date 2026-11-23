@@ -33,7 +33,8 @@
 //!   ends it, and drops the work it delivered from the list as it ends.
 //! - The prompt "subagent" starts a subagent, [`SUBAGENT_TASK`], and
 //!   answers at once, leaving it running in a session of its own,
-//!   "sub-N", which can be observed but not attached to.
+//!   "sub-N", on [`SUBAGENT_MODEL`], which can be observed but not
+//!   attached to.
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
 //!   whole result as a card, [`subagent_result`], and the parent's daemon
 //!   turn tells the model, as for a process.
@@ -181,6 +182,10 @@ pub const TUI_SESSION: &str = "tui-1";
 /// The task of the subagent the prompt "subagent" starts: its title in
 /// the parent's background work, and its session's first message.
 pub const SUBAGENT_TASK: &str = "Read the parser";
+
+/// What the subagent [`SUBAGENT_TASK`] runs on, as its session's model and
+/// reasoning say: not its parent's.
+pub const SUBAGENT_MODEL: &str = "Huge · High";
 
 /// The name of the workflow [`FakeDaemon::start_workflow`] starts.
 pub const WORKFLOW_NAME: &str = "review";
@@ -1022,11 +1027,13 @@ impl FakeSession {
     }
 
     /// The session of a subagent in `cwd` whose run, `turn`, is under way
-    /// on [`SUBAGENT_TASK`].
+    /// on [`SUBAGENT_TASK`], with [`SUBAGENT_MODEL`].
     fn subagent(cwd: &Path, turn: Turn) -> Self {
         let mut session = Self::new(&cwd.to_string_lossy(), None, 0);
         session.saved = false;
         session.subagent = true;
+        session.settings.model = model("huge");
+        session.settings.reasoning = ReasoningLevel::High;
         session.turn = Some(turn);
         session.state(JobState::Running);
         session.publish(user_message("sub-u1", SUBAGENT_TASK));

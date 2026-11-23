@@ -29,8 +29,8 @@ use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{
         report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script, TuiJob,
-        KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION,
-        UNCHECKED_KEY, WORKFLOW_ERROR,
+        KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_MODEL, SUBAGENT_TASK,
+        TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices, Daemon,
     DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
@@ -5054,6 +5054,11 @@ fn a_subagents_session_opens_nested_under_its_parent() {
                 .any(|entry| matches!(entry, Entry::Agent(m) if m.text() == "Reading the parser."))
     });
     assert_eq!(ui.label("session-title").as_deref(), Some(SUBAGENT_TASK));
+    assert_eq!(
+        ui.label("subagent-model").as_deref(),
+        Some(SUBAGENT_MODEL),
+        "what the subagent runs on, not its parent"
+    );
     ui.act(|window, _| {
         assert!(
             is_visible(window, "title-parent-0"),
@@ -5112,6 +5117,7 @@ fn a_subagents_session_opens_nested_under_its_parent() {
     });
     ui.click("background-ended-0");
     ui.wait_for_session("the subagent's session as saved", subagent_saved);
+    assert_eq!(ui.label("subagent-model").as_deref(), Some(SUBAGENT_MODEL));
     ui.shot("reopened");
     restart_and_open_the_ended_run(ui, &parent);
 }

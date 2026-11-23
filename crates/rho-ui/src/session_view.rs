@@ -7,7 +7,8 @@
 //! A subagent's session opens from its row in the background work, nested
 //! under the session that started it. Only the subagent writes to it, so
 //! its view only watches: no composer, no approvals (the subagent's
-//! questions go to its parent), and no stopping its work.
+//! questions go to its parent), and no stopping its work. Where the
+//! composer would be, it names the model the subagent runs on.
 //!
 //! While a turn runs, whoever started it, the composer steers it: Enter adds
 //! the text to the turn's next model request, and it waits above the box
@@ -82,7 +83,7 @@ use crate::{
     pictures::{PictureRead, Pictures},
     plan::PlanList,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
-    session_settings::{Availability, SessionSettings, SettingsEvent},
+    session_settings::{model_summary, Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
@@ -1649,6 +1650,7 @@ impl SessionView {
         if self.is_subagent() {
             return footer
                 .children(self.render_background(cx))
+                .child(self.render_subagent_status(cx))
                 .into_any_element();
         }
         let busy = self.is_busy();
@@ -1707,6 +1709,36 @@ impl SessionView {
                 .usage(self.session.usage().cloned().map(UsageRing::new)),
             )
             .into_any_element()
+    }
+
+    /// Where a subagent's session would have its composer: what it runs on
+    /// and how full its context is. Read-only, as only the subagent writes.
+    fn render_subagent_status(&self, cx: &App) -> impl IntoElement {
+        // "Subagent" only until the observe answers with its options.
+        let model = self
+            .session
+            .options()
+            .and_then(model_summary)
+            .unwrap_or_else(|| "Subagent".into());
+        h_flex()
+            .id("subagent-status")
+            .test_support()
+            .gap_2()
+            .px_3()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(Lucide::Bot).xsmall())
+            .child(
+                div()
+                    .id("subagent-model")
+                    .test_support()
+                    .aria_label(model.clone())
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(model),
+            )
+            .children(self.session.usage().cloned().map(UsageRing::new))
     }
 
     /// The steers the turn has taken that the model has not read yet,
