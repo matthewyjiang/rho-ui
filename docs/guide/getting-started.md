@@ -50,7 +50,9 @@ The script checks that the new `rho-ui` starts before it replaces anything, so a
 
 #### Updates
 
-A release build checks GitHub for a newer release when it starts, then hourly, and offers **Update** in the sidebar and in Settings → About. Updating runs that release's install script over the rho-ui that's running, wherever it is, with `curl`. The running rho-ui keeps going until you choose **Restart**, and the sessions you had open come back. A build from source or `cargo install` never updates itself.
+A release build checks GitHub for a newer release when it starts, then hourly, and offers **Update** in the sidebar and in Settings → About. Updating runs that release's install script over the rho-ui that's running, in the folder it's in, so it needs `curl` on Linux and macOS. The running rho-ui keeps going until you choose **Restart**. Your sessions keep running in the daemon across the restart, but text you haven't sent is lost.
+
+Only a rho-ui laid out as the install script lays it out updates itself: `rho-ui` (`rho-ui.exe`) on Linux and Windows, `Rho.app` on macOS. A renamed copy, a build from source, and `cargo install` never do. On macOS the script also links `rho-ui` into `~/.local/bin`, or into `RHO_UI_INSTALL_DIR` if that's set where rho-ui runs.
 
 On Linux, `rho-ui` links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every desktop has. A server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)).
 

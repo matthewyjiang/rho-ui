@@ -4,7 +4,6 @@
 //! Installing runs the release's own install script
 //! ([`rho_ui_core::release`]).
 
-use std::path::PathBuf;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
@@ -12,10 +11,14 @@ use gpui_kit::component::{
     alert::Alert, button::Button, h_flex, spinner::Spinner, v_flex, ActiveTheme as _, IconName,
     Sizable as _,
 };
+#[cfg(not(target_family = "wasm"))]
+use gpui_kit::Task;
 use gpui_kit::{
     div, AnyElement, App, Context, Entity, IntoElement, ParentElement as _, SharedString,
-    Styled as _, Task,
+    Styled as _,
 };
+#[cfg(not(target_family = "wasm"))]
+use rho_ui_core::release::{self, Installation};
 
 use crate::rho_install::last_lines;
 
@@ -54,39 +57,33 @@ pub(crate) enum AppOffer {
 /// rho-ui's own updates.
 pub(crate) struct AppUpdate {
     offer: Option<AppOffer>,
-    /// This rho-ui's program as it was at start, which an update replaces
-    /// and a restart runs; `None` in a build that doesn't update itself.
-    /// Kept from the start because on Linux, once an update renames the new
-    /// program over it, the running one's path names a deleted file.
-    exe: Option<PathBuf>,
-    /// The checks, or the install under way; replacing it drops the other.
-    #[cfg_attr(
-        target_family = "wasm",
-        expect(dead_code, reason = "a page in a browser never updates itself")
-    )]
-    task: Option<Task<()>>,
+    /// `None` in a build that doesn't update itself, or one the install
+    /// scripts didn't put in place.
+    #[cfg(not(target_family = "wasm"))]
+    updater: Option<Updater>,
+}
+
+/// The installation an update replaces, and the work on it.
+#[cfg(not(target_family = "wasm"))]
+struct Updater {
+    /// Found at start: on Linux, once an update renames the new program
+    /// over the old, the running one's path names a deleted file.
+    installation: Installation,
+    /// Every [`CHECK_EVERY`], for as long as rho-ui runs.
+    _checks: Task<()>,
+    /// The install under way, if one is.
+    install: Option<Task<()>>,
 }
 
 impl AppUpdate {
     /// Starts checking for a newer release in a release build.
     pub(crate) fn new(cx: &mut Context<'_, Self>) -> Self {
-        #[cfg(not(target_family = "wasm"))]
-        if UPDATES {
-            return Self {
-                offer: None,
-                // A symlink, as macOS's `rho-ui` on PATH is, to the program.
-                exe: std::env::current_exe()
-                    .and_then(|exe| rho_ui_core::platform::canonicalize(&exe))
-                    .ok(),
-                task: Some(Self::check(cx)),
-            };
-        }
         #[cfg(target_family = "wasm")]
         let _ = cx;
         Self {
             offer: None,
-            exe: None,
-            task: None,
+            #[cfg(not(target_family = "wasm"))]
+            updater: Self::updater(cx),
         }
     }
 
@@ -95,30 +92,63 @@ impl AppUpdate {
         self.offer.as_ref()
     }
 
-    /// Checks now and every [`CHECK_EVERY`] after. A failed check, as when
-    /// GitHub is out of reach, leaves the offer as it was.
+    /// Starts the checks, if this build updates itself and the install
+    /// scripts put it in place. Says why not on stderr, where a launch from
+    /// a terminal shows it.
     #[cfg(not(target_family = "wasm"))]
+    #[expect(clippy::print_stderr, reason = "the desktop app has no log")]
+    fn updater(cx: &mut Context<'_, Self>) -> Option<Updater> {
+        if !UPDATES {
+            return None;
+        }
+        // Without symlinks, as macOS's `rho-ui` on PATH is one.
+        let exe = std::env::current_exe().and_then(|exe| rho_ui_core::platform::canonicalize(&exe));
+        let Some(installation) = exe.as_deref().ok().and_then(Installation::of) else {
+            eprintln!(
+                "rho-ui: not updating itself: {exe:?} isn't laid out as the install scripts lay it out"
+            );
+            return None;
+        };
+        Some(Updater {
+            installation,
+            _checks: Self::check(cx),
+            install: None,
+        })
+    }
+
+    /// Checks now and every [`CHECK_EVERY`] after. A newer release replaces
+    /// an offer to install an older one, or one that failed to; a failed
+    /// check, as when GitHub is out of reach, leaves the offer as it was,
+    /// and says why on stderr.
+    #[cfg(not(target_family = "wasm"))]
+    #[expect(clippy::print_stderr, reason = "the desktop app has no log")]
     fn check(cx: &mut Context<'_, Self>) -> Task<()> {
         cx.spawn(async move |this, cx| loop {
-            if let Ok(newer) = rho_ui_core::release::newer_release(env!("CARGO_PKG_VERSION")).await
-            {
-                let updated = this.update(cx, |this, cx| {
-                    if matches!(this.offer, None | Some(AppOffer::Available { .. })) {
-                        this.offer = newer.map(|latest| AppOffer::Available {
-                            latest: latest.into(),
-                        });
-                        cx.notify();
+            match release::newer_release(env!("CARGO_PKG_VERSION")).await {
+                Ok(newer) => {
+                    let updated = this.update(cx, |this, cx| {
+                        if matches!(
+                            this.offer,
+                            None | Some(AppOffer::Available { .. } | AppOffer::Failed { .. })
+                        ) {
+                            this.offer = newer.map(|latest| AppOffer::Available {
+                                latest: latest.into(),
+                            });
+                            cx.notify();
+                        }
+                    });
+                    if updated.is_err() {
+                        break;
                     }
-                });
-                if updated.is_err() {
-                    break;
                 }
+                Err(error) => eprintln!("rho-ui: {error}"),
             }
             cx.background_executor().timer(CHECK_EVERY).await;
         })
     }
 
     /// Installs the release on offer over this rho-ui.
+    #[cfg(not(target_family = "wasm"))]
     fn install(&mut self, cx: &mut Context<'_, Self>) {
         let latest = match &self.offer {
             Some(AppOffer::Available { latest } | AppOffer::Failed { latest, .. }) => {
@@ -126,42 +156,70 @@ impl AppUpdate {
             }
             _ => return,
         };
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let Some(exe) = self.exe.clone() else {
-                return;
-            };
-            self.offer = Some(AppOffer::Installing {
-                latest: latest.clone(),
-            });
-            cx.notify();
-            self.task = Some(cx.spawn(async move |this, cx| {
-                let installed = rho_ui_core::release::install_release(&latest, &exe).await;
-                let _ = this.update(cx, |this, cx| {
-                    this.offer = Some(match installed {
-                        Ok(()) => AppOffer::Installed { latest },
-                        Err(error) => AppOffer::Failed {
-                            latest,
-                            why: error.to_string().into(),
-                        },
-                    });
-                    cx.notify();
+        let Some(updater) = self.updater.as_mut() else {
+            return;
+        };
+        let installation = updater.installation.clone();
+        self.offer = Some(AppOffer::Installing {
+            latest: latest.clone(),
+        });
+        cx.notify();
+        updater.install = Some(cx.spawn(async move |this, cx| {
+            let installed = release::install_release(&latest, &installation).await;
+            let _ = this.update(cx, |this, cx| {
+                this.offer = Some(match installed {
+                    Ok(()) => AppOffer::Installed { latest },
+                    Err(error) => AppOffer::Failed {
+                        latest,
+                        why: error.to_string().into(),
+                    },
                 });
-            }));
-        }
-        #[cfg(target_family = "wasm")]
-        let _ = (latest, cx);
+                cx.notify();
+            });
+        }));
     }
-}
 
-/// Quits and starts the program installed, `exe`, with the arguments this
-/// one started with (`main`). On macOS GPUI opens the app bundle, whose
-/// path the update kept.
-fn restart(exe: Option<PathBuf>, cx: &mut App) {
-    if let Some(exe) = exe.filter(|_| !cfg!(target_os = "macos")) {
-        cx.set_restart_path(exe);
+    /// Quits, and starts the program installed with the arguments this one
+    /// started with. On Unix it starts in this one's folder and environment,
+    /// so relative arguments and `RHO_HOME` mean what they did; GPUI's own
+    /// restart would reopen a macOS app as the Finder does, without them.
+    /// On Windows, GPUI's restart does, with the arguments from `main`.
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(
+        unix,
+        expect(clippy::print_stderr, reason = "the desktop app has no log")
+    )]
+    fn restart(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(updater) = &self.updater else {
+            return;
+        };
+        #[cfg(unix)]
+        match release::relaunch(&updater.installation, std::env::args_os().skip(1)) {
+            Ok(()) => cx.quit(),
+            Err(error) => eprintln!("rho-ui: couldn't restart into the update: {error}"),
+        }
+        #[cfg(windows)]
+        {
+            cx.set_restart_path(updater.installation.exe().to_path_buf());
+            cx.restart();
+        }
     }
-    cx.restart();
+
+    /// A page in a browser never updates itself.
+    #[cfg(target_family = "wasm")]
+    #[expect(
+        clippy::unused_self,
+        reason = "the views call the desktop's, which uses it"
+    )]
+    fn install(&mut self, _: &mut Context<'_, Self>) {}
+
+    /// A page in a browser never updates itself.
+    #[cfg(target_family = "wasm")]
+    #[expect(
+        clippy::unused_self,
+        reason = "the views call the desktop's, which uses it"
+    )]
+    fn restart(&mut self, _: &mut Context<'_, Self>) {}
 }
 
 /// What `offer` says, and the button that acts on it: the sidebar's footer
@@ -214,7 +272,7 @@ pub(crate) fn render_offer(update: &Entity<AppUpdate>, offer: &AppOffer, cx: &Ap
             row(
                 format!("rho-ui v{latest} is installed"),
                 button("restart-rho-ui", "Restart", IconName::RotateCw)
-                    .on_click(move |_, _, cx| restart(update.read(cx).exe.clone(), cx)),
+                    .on_click(move |_, _, cx| update.update(cx, AppUpdate::restart)),
             )
         }
     }

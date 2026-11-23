@@ -117,7 +117,7 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wP
         $Exe = Join-Path $InstallDir "rho-ui.exe"
         # Windows won't overwrite a running program, but will rename it: the
         # old one moves aside, so rho-ui can update itself while it runs.
-        # The last update's is gone once that rho-ui quit.
+        # The next install deletes it, once nothing runs it.
         $OldExe = "$Exe.old"
         Remove-Item -Force $OldExe -ErrorAction SilentlyContinue
         try {
