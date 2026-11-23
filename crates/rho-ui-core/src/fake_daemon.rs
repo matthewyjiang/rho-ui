@@ -113,6 +113,18 @@
 //!   [`FakeDaemon::speak_older_protocol`] has it refuse every hello as a
 //!   daemon of an older protocol, until a file appears, as a fake `rho
 //!   daemon restart` makes it: the real one replaces the daemon.
+//! - Every session's origin is `acme/widgets` on github.com, and its
+//!   pull requests are those of a workspace in no git repository that
+//!   links nothing, until [`FakeDaemon::open_pull_request`] gives its
+//!   branch `feature` the pull request `acme/widgets#12` or
+//!   [`FakeDaemon::edit_pull_requests`] changes them; each change reaches
+//!   its followers as a `pull_requests` event. A link takes a github.com
+//!   pull URL, `owner/name#12` or `#12`, and refuses other text as
+//!   `InvalidParams`. [`FakeDaemon::pull_request_lists`] and
+//!   [`FakeDaemon::pull_request_shows`] say what clients asked. With
+//!   [`Script::pull_requests`] [`PullRequestMethods::Unserved`], the
+//!   daemon is from before pull requests: every pull request method
+//!   answers `MethodNotFound`.
 
 use std::{
     collections::BTreeMap,
@@ -151,6 +163,7 @@ use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId
 mod auth;
 mod config;
 mod listener;
+mod pull_requests;
 mod service;
 pub mod surface;
 
@@ -158,6 +171,8 @@ use auth::FakeAuth;
 pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
 use config::FakeConfig;
 use listener::Listener;
+use pull_requests::FakePullRequests;
+pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
 use service::Fake;
 
 /// The session [`Script::tui_job`] runs.
@@ -294,6 +309,8 @@ pub struct Script {
     /// Whether [`KEY_AUTH`], which every session runs on, starts signed
     /// out, so a session opens only with `sign_in: later`.
     pub signed_out: bool,
+    /// Whether the daemon serves pull requests, or is from before them.
+    pub pull_requests: PullRequestMethods,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -1072,12 +1089,18 @@ impl FakeSession {
     /// events, as rho's saved transcripts hold none (rho replays them only
     /// for a turn in progress, which the fake doesn't keep apart): the
     /// attach response lists the work as it is now, without work whose
-    /// result the model has. Nor does it mark steers, as rho's doesn't.
+    /// result the model has. Nor do they hold pull requests, which a
+    /// client asks for. Nor does it mark steers, as rho's doesn't.
     fn transcript(&self) -> Vec<(Seq, SessionEvent)> {
         let replay: Vec<SessionEvent> = self
             .history
             .iter()
-            .filter(|event| !matches!(event, SessionEvent::Background { .. }))
+            .filter(|event| {
+                !matches!(
+                    event,
+                    SessionEvent::Background { .. } | SessionEvent::PullRequests { .. }
+                )
+            })
             .cloned()
             .map(|mut event| {
                 if let SessionEvent::UserMessage { steer, .. } = &mut event {
@@ -1619,6 +1642,7 @@ struct State {
     /// rho's own settings.
     config: FakeConfig,
     auth: FakeAuth,
+    pull_requests: FakePullRequests,
     /// Restart as the next prompt arrives; see
     /// [`FakeDaemon::restart_at_next_prompt`].
     restart_at_prompt: bool,
@@ -1742,6 +1766,7 @@ impl State {
             extra_jobs: Vec::new(),
             config: FakeConfig::new(),
             auth: FakeAuth::new(&script),
+            pull_requests: FakePullRequests::new(script.pull_requests),
             restart_at_prompt: false,
         };
         if script.tui_job == TuiJob::Running {
