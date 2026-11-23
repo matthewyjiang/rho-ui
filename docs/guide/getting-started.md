@@ -48,6 +48,12 @@ $env:RHO_UI_VERSION = "0.1.0"; irm https://matthewyjiang.github.io/rho-ui/instal
 
 The script checks that the new `rho-ui` starts before it replaces anything, so a build that can't run on your system leaves the one you had.
 
+#### Updates
+
+A release build checks GitHub for a newer release when it starts, then hourly, and offers **Update** in the sidebar and in Settings → About. Updating runs that release's install script over the rho-ui that's running, in the folder it's in, so it needs `curl` on Linux and macOS. The running rho-ui keeps going until you choose **Restart**. Your sessions keep running in the daemon across the restart, but text you haven't sent is lost.
+
+Only a rho-ui laid out as the install script lays it out updates itself: `rho-ui` (`rho-ui.exe`) on Linux and Windows, `Rho.app` on macOS. A renamed copy, a build from source, and `cargo install` never do. On macOS the script also links `rho-ui` into `~/.local/bin`, or into `RHO_UI_INSTALL_DIR` if that's set where rho-ui runs.
+
 On Linux, `rho-ui` links `libxcb`, `libxkbcommon` and `libxkbcommon-x11`, which every desktop has. A server without a desktop needs them installed for `rho-ui serve` (see [In a browser](./browser#what-differs-from-the-desktop)).
 
 Opened from the Finder, the macOS app gets the system's `PATH`, not your shell's. It finds `rho` only in `~/.local/bin`, where rho's installer puts it, or in `/usr/bin` and the other folders of that `PATH`. For a `rho` elsewhere, such as Homebrew's, link it there:

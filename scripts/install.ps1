@@ -115,9 +115,20 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wP
 
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         $Exe = Join-Path $InstallDir "rho-ui.exe"
+        # Windows won't overwrite a running program, but will rename it: the
+        # old one moves aside, so rho-ui can update itself while it runs.
+        # The next install deletes it, once nothing runs it.
+        $OldExe = "$Exe.old"
+        Remove-Item -Force $OldExe -ErrorAction SilentlyContinue
         try {
+            if (Test-Path $Exe) {
+                Move-Item -Path $Exe -Destination $OldExe -Force
+            }
             Copy-Item -Path $NewExe -Destination $Exe -Force
         } catch {
+            if (-not (Test-Path $Exe) -and (Test-Path $OldExe)) {
+                Move-Item -Path $OldExe -Destination $Exe -ErrorAction SilentlyContinue
+            }
             throw "can't replace $Exe; quit rho-ui and run this again. $($_.Exception.Message)"
         }
 

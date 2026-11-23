@@ -17,6 +17,7 @@ mod added_dirs;
 mod app;
 #[cfg(target_os = "macos")]
 mod app_menu;
+mod app_update;
 mod attachments;
 mod auths;
 mod background;
@@ -347,13 +348,17 @@ fn main() -> std::process::ExitCode {
     // Quit with the window, on macOS too, where GPUI's default keeps the
     // app running with none: rho-ui has one window and no menu bar or Dock
     // menu to open another.
-    gpui_kit::application()
+    let app = gpui_kit::application()
         .with_assets(Assets::new(""))
-        .with_quit_mode(QuitMode::LastWindowClosed)
-        .run(move |cx| {
-            open_app(launch, &StateDb::open(), Settings::load(), cx);
-            cx.activate(true);
-        });
+        .with_quit_mode(QuitMode::LastWindowClosed);
+    // GPUI's restart, which restarts into an update on Windows
+    // (`app_update.rs`), starts the program with this one's arguments.
+    #[cfg(windows)]
+    let app = app.with_restart_arguments(std::env::args_os().skip(1).collect());
+    app.run(move |cx| {
+        open_app(launch, &StateDb::open(), Settings::load(), cx);
+        cx.activate(true);
+    });
     std::process::ExitCode::SUCCESS
 }
 

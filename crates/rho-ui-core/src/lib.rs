@@ -16,6 +16,8 @@ mod link;
 mod options;
 pub mod platform;
 mod prompt;
+#[cfg(not(target_family = "wasm"))]
+pub mod release;
 mod remote_shell;
 mod rho_install;
 pub mod server;

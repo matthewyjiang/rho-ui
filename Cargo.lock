@@ -7341,6 +7341,7 @@ dependencies = [
  "rho-ui-core",
  "ring",
  "russh",
+ "semver",
  "serde",
  "serde_json",
  "similar",

@@ -558,7 +558,7 @@ pub(crate) fn render_setup(installs: &Entity<Installs>, offer: &Offer, cx: &App)
 
 /// The last lines of a long error, as an install script's output is: the
 /// part that says what went wrong.
-fn last_lines(why: &str) -> SharedString {
+pub(crate) fn last_lines(why: &str) -> SharedString {
     /// About as many as a small alert shows before it grows tall.
     const SHOWN: usize = 6;
     let lines: Vec<&str> = why.trim().lines().collect();
