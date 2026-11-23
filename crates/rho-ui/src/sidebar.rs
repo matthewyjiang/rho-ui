@@ -57,6 +57,7 @@ use gpui_kit::{
 use rho_ui_core::{Job, SessionSummary};
 
 use crate::{
+    app_update::{self, AppUpdate},
     badge::Badge,
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
@@ -300,6 +301,8 @@ pub(crate) struct SidebarView {
     machines: Entity<Machines>,
     /// Each machine's rho, which the footer offers to install or update.
     installs: Entity<Installs>,
+    /// A newer rho-ui, which the footer offers to install.
+    app_update: Entity<AppUpdate>,
     projects: Entity<Projects>,
     /// Each active row's PR, which its branch line marks.
     prs: Entity<PullRequests>,
@@ -318,7 +321,7 @@ pub(crate) struct SidebarView {
     /// The list's height in the last frame, which the gap above the
     /// shelves fills up to.
     viewport: Pixels,
-    _subscriptions: [Subscription; 7],
+    _subscriptions: [Subscription; 8],
     _tick: Task<()>,
 }
 
@@ -329,6 +332,8 @@ pub(crate) struct SidebarModels {
     pub(crate) machines: Entity<Machines>,
     /// What each machine's rho needs, which the footer offers.
     pub(crate) installs: Entity<Installs>,
+    /// A newer rho-ui, which the footer offers.
+    pub(crate) app_update: Entity<AppUpdate>,
     /// What the filter offers.
     pub(crate) projects: Entity<Projects>,
     /// Each active row's PR.
@@ -349,6 +354,7 @@ impl SidebarView {
             workspaces,
             machines,
             installs,
+            app_update,
             projects,
             prs,
         } = models;
@@ -371,6 +377,7 @@ impl SidebarView {
                 this.rebuild(cx);
             }),
             cx.observe(&installs, |_, _, cx| cx.notify()),
+            cx.observe(&app_update, |_, _, cx| cx.notify()),
             cx.observe(&prs, |_, _, cx| cx.notify()),
             // A PR linked or unlinked: the row follows another.
             cx.observe_global::<PrLinks>(Self::rebuild),
@@ -388,6 +395,7 @@ impl SidebarView {
             workspaces,
             machines,
             installs,
+            app_update,
             projects,
             prs,
             shelves: state.shelves,
@@ -1347,15 +1355,19 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// What each machine's rho needs: installing, updating, or a restart
-    /// into the newer one its daemon waits to run. Without a session on
-    /// screen, the main pane offers this machine's install itself.
+    /// A newer rho-ui, then what each machine's rho needs: installing,
+    /// updating, or a restart into the newer one its daemon waits to run.
+    /// Without a session on screen, the main pane offers this machine's
+    /// install itself.
     fn render_offers(&self, cx: &App) -> Vec<AnyElement> {
         let machines = self.machines.read(cx);
         let installs = self.installs.read(cx);
-        machines
-            .iter()
-            .filter_map(|machine| {
+        let app = self.app_update.read(cx).offer().map(|offer| {
+            let offer = app_update::render_offer(&self.app_update, offer, cx);
+            div().px_3().child(offer).into_any_element()
+        });
+        app.into_iter()
+            .chain(machines.iter().filter_map(|machine| {
                 let offer = installs.offer(&machine.id, cx)?;
                 if machine.id.is_local()
                     && self.active.is_none()
@@ -1366,7 +1378,7 @@ impl SidebarView {
                 let tag = machines.tag(&machine.id);
                 let offer = render_offer(&self.installs, &machine.id, tag.as_deref(), &offer, cx);
                 Some(div().px_3().child(offer).into_any_element())
-            })
+            }))
             .collect()
     }
 

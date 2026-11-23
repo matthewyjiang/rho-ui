@@ -45,6 +45,7 @@ mod daemon_control;
 
 use crate::machines::RemoteMachine;
 use crate::{
+    app_update::AppUpdate,
     auths::Auths,
     background_log::BackgroundLog,
     draft::{DraftEvent, DraftView},
@@ -223,6 +224,8 @@ pub(crate) struct RhoApp {
     worktrees: Entity<Worktrees>,
     /// Each machine's rho, apart from its daemon: installing and updating.
     installs: Entity<Installs>,
+    /// rho-ui's own updates.
+    app_update: Entity<AppUpdate>,
     /// The forge CLIs on each machine, for Settings and pull requests.
     forges: Entity<Forges>,
     /// The pull requests the right panel shows.
@@ -276,6 +279,7 @@ impl RhoApp {
         // Empty until `sync_machines` connects to each.
         let machines = cx.new(|_| Machines::default());
         let installs = cx.new(|_| Installs::new(machines.clone()));
+        let app_update = cx.new(AppUpdate::new);
         let forges = cx.new(|_| Forges::new(workspaces.clone()));
         let prs = cx.new(|cx| PullRequests::new(forges.clone(), workspaces.clone(), cx));
         let sidebar = cx.new(|cx| {
@@ -283,31 +287,16 @@ impl RhoApp {
                 workspaces: workspaces.clone(),
                 machines: machines.clone(),
                 installs: installs.clone(),
+                app_update: app_update.clone(),
                 projects: projects.clone(),
                 prs: prs.clone(),
             };
             SidebarView::new(models, sidebar, window, cx)
         });
-        let sidebar_subscription = cx.subscribe_in(
-            &sidebar,
-            window,
-            |this, _, event: &SidebarEvent, window, cx| match event {
-                SidebarEvent::Open { id, cwd, title } => {
-                    this.open_session(id.clone(), cwd.clone(), title.clone(), window, cx);
-                }
-                SidebarEvent::NewSession => this.new_session(window, cx),
-                SidebarEvent::OpenDraft(id) => this.open_draft(*id, window, cx),
-                SidebarEvent::DiscardDraft(id) => this.discard_draft(*id, window, cx),
-                SidebarEvent::Delete { id } => this.delete_session(id.clone(), window, cx),
-                SidebarEvent::Rename { id, title } => {
-                    this.rename_session(id.clone(), title.clone(), window, cx);
-                }
-                SidebarEvent::OpenSettings => this.open_settings(window, cx),
-                SidebarEvent::ToggleCollapsed => this.toggle_sidebar(window, cx),
-                // The sidebar's width is laid out here.
-                SidebarEvent::Resized => cx.notify(),
-            },
-        );
+        let sidebar_subscription =
+            cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+                this.sidebar_event(event, window, cx);
+            });
         let installs_subscription = cx.subscribe_in(
             &installs,
             window,
@@ -334,6 +323,7 @@ impl RhoApp {
             auths: cx.new(|_| Auths::default()),
             worktrees: cx.new(|_| Worktrees::default()),
             installs,
+            app_update,
             forges,
             prs,
             next_epoch: 0,
@@ -861,6 +851,31 @@ impl RhoApp {
         }
     }
 
+    /// Does what the sidebar asks.
+    fn sidebar_event(
+        &mut self,
+        event: &SidebarEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match event {
+            SidebarEvent::Open { id, cwd, title } => {
+                self.open_session(id.clone(), cwd.clone(), title.clone(), window, cx);
+            }
+            SidebarEvent::NewSession => self.new_session(window, cx),
+            SidebarEvent::OpenDraft(id) => self.open_draft(*id, window, cx),
+            SidebarEvent::DiscardDraft(id) => self.discard_draft(*id, window, cx),
+            SidebarEvent::Delete { id } => self.delete_session(id.clone(), window, cx),
+            SidebarEvent::Rename { id, title } => {
+                self.rename_session(id.clone(), title.clone(), window, cx);
+            }
+            SidebarEvent::OpenSettings => self.open_settings(window, cx),
+            SidebarEvent::ToggleCollapsed => self.toggle_sidebar(window, cx),
+            // The sidebar's width is laid out here.
+            SidebarEvent::Resized => cx.notify(),
+        }
+    }
+
     /// Opens Settings over the window, with rho's own settings on each
     /// machine.
     fn open_settings(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -873,6 +888,7 @@ impl RhoApp {
             workspaces: self.workspaces.clone(),
             forges: self.forges.clone(),
             installs: self.installs.clone(),
+            app_update: self.app_update.clone(),
         };
         settings_view::open(app, window, cx);
     }

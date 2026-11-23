@@ -78,7 +78,10 @@ jobs:
       # The build must take every Zig package from the Ghostty cache
       # (.github/actions/ghostty); one it fetched names an option that
       # action doesn't configure.
+      # RHO_UI_RELEASE makes a build that updates itself (app_update.rs).
       - name: Build
+        env:
+          RHO_UI_RELEASE: "1"
         run: |
           ls "$GHOSTTY_SOURCE_DIR/zig-pkg" > "$RUNNER_TEMP/zig-pkg-cached"
           cargo xtask dist

@@ -1,7 +1,8 @@
-//! The About page: rho-ui's version, source and license, then Rho on each
-//! machine: its daemon's version and process ID, with Restart and Stop, or
-//! why there is none to show yet, with what would fix it, and under it what
-//! its rho needs: installing, updating, or a restart into the newer one.
+//! The About page: rho-ui's version, with a newer one to update to, its
+//! source and license, then Rho on each machine: its daemon's version and
+//! process ID, with Restart and Stop, or why there is none to show yet,
+//! with what would fix it, and under it what its rho needs: installing,
+//! updating, or a restart into the newer one.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
@@ -14,6 +15,7 @@ use gpui_kit::{div, App, Entity, ParentElement as _, SharedString, Styled as _};
 
 use super::{page_header, value, Tone};
 use crate::{
+    app_update::{render_offer as render_app_offer, AppUpdate},
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines},
     rho_install::{render_offer, Installs},
 };
@@ -30,16 +32,22 @@ struct DaemonButton {
     action: DaemonAction,
 }
 
-/// The About page, with a row for each of `machines`, and what `installs`
-/// offers for its rho under it.
+/// The About page: rho-ui, with what `app_update` offers under its
+/// version, then a row for each of `machines`, with what `installs` offers
+/// for its rho under it.
 pub(super) fn about_page(
     machines: &Entity<Machines>,
     installs: &Entity<Installs>,
+    app_update: &Entity<AppUpdate>,
     cx: &App,
 ) -> SettingPage {
     let machines_read = machines.read(cx);
-    let app = SettingGroup::new().items([
-        SettingItem::new("Version", value(env!("CARGO_PKG_VERSION"), Tone::Plain)),
+    let update = app_update.read(cx).offer().cloned().map(|offer| {
+        let app_update = app_update.clone();
+        SettingItem::render(move |_, _, cx| render_app_offer(&app_update, &offer, cx))
+    });
+    let version = SettingItem::new("Version", value(env!("CARGO_PKG_VERSION"), Tone::Plain));
+    let app = SettingGroup::new().items(std::iter::once(version).chain(update).chain([
         SettingItem::new(
             "Source",
             SettingField::render(|options, _, _| {
@@ -51,7 +59,7 @@ pub(super) fn about_page(
             }),
         ),
         SettingItem::new("License", value(env!("CARGO_PKG_LICENSE"), Tone::Plain)),
-    ]);
+    ]));
     let rho = SettingGroup::new()
         .title("Rho")
         .items(machines_read.iter().flat_map(|machine| {

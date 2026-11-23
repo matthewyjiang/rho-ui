@@ -32,6 +32,7 @@ use gpui_kit::{
 };
 
 use crate::{
+    app_update::AppUpdate,
     auths::Auths,
     forge::Forges,
     machines::{MachineId, MachineStatus, Machines},
@@ -117,6 +118,8 @@ pub(crate) struct AppState {
     pub(crate) forges: Entity<Forges>,
     /// Each machine's rho, for About: installing and updating.
     pub(crate) installs: Entity<Installs>,
+    /// rho-ui's own updates, for About.
+    pub(crate) app_update: Entity<AppUpdate>,
 }
 
 /// One choice in a font Select.
@@ -196,7 +199,9 @@ struct SettingsView {
     worktrees: WorktreesFields,
     /// Each machine's rho, for About.
     installs: Entity<Installs>,
-    _subscriptions: [Subscription; 3],
+    /// rho-ui's own updates, for About.
+    app_update: Entity<AppUpdate>,
+    _subscriptions: [Subscription; 4],
 }
 
 impl SettingsView {
@@ -210,8 +215,10 @@ impl SettingsView {
             workspaces,
             forges,
             installs,
+            app_update,
         } = app;
         let installs_subscription = cx.observe(&installs, |_, _, cx| cx.notify());
+        let app_update_subscription = cx.observe(&app_update, |_, _, cx| cx.notify());
         let fonts: Vec<Choice> = cx
             .text_system()
             .all_font_names()
@@ -233,7 +240,13 @@ impl SettingsView {
             rho: RhoFields::new(&machines, rho_settings, window, cx),
             machine_list: machines,
             installs,
-            _subscriptions: [ui_subscription, code_subscription, installs_subscription],
+            app_update,
+            _subscriptions: [
+                ui_subscription,
+                code_subscription,
+                installs_subscription,
+                app_update_subscription,
+            ],
         };
         view.sync_machine_fields(window, cx);
         view.sync_rho_inputs(window, cx);
@@ -541,7 +554,7 @@ impl Render for SettingsView {
         let providers = self.providers_page(window, cx);
         let worktrees = self.worktrees_page(cx);
         let rho = self.rho_page(window, cx);
-        let about = about::about_page(&self.machine_list, &self.installs, cx);
+        let about = about::about_page(&self.machine_list, &self.installs, &self.app_update, cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
         // corners, since the dialog has no padding to keep it inside.

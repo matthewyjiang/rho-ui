@@ -204,7 +204,7 @@ enum Place<'a> {
 /// # Errors
 ///
 /// [`DaemonError::Closed`] if the job panicked.
-async fn on_own_thread<T: Send + 'static>(
+pub(crate) async fn on_own_thread<T: Send + 'static>(
     job: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, DaemonError> {
     let (reply, ran) = oneshot::channel();
@@ -221,7 +221,7 @@ async fn on_own_thread<T: Send + 'static>(
 /// # Errors
 ///
 /// Says why if it can't start.
-fn output(command: &mut Command) -> Result<Output, DaemonError> {
+pub(crate) fn output(command: &mut Command) -> Result<Output, DaemonError> {
     command.output().map_err(|error| {
         let program = command.get_program().to_string_lossy();
         DaemonError::Unreachable(format!("couldn't run {program}: {error}"))
@@ -231,7 +231,7 @@ fn output(command: &mut Command) -> Result<Output, DaemonError> {
 #[cfg(not(target_family = "wasm"))]
 /// Whether a program that ended as `output` says succeeded, else an error
 /// with what it printed in `said`, or how it ended if that is empty.
-fn succeeded(output: &Output, said: &[u8]) -> Result<(), DaemonError> {
+pub(crate) fn succeeded(output: &Output, said: &[u8]) -> Result<(), DaemonError> {
     if output.status.success() {
         return Ok(());
     }

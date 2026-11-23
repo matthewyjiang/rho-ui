@@ -53,6 +53,9 @@ tokio = { version = "1.36", features = ["io-util", "macros", "sync"] }
 # Off the browser: the ssh client, this machine's daemon and programs, and
 # the runtime they run on.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Whether a rho-ui release is newer than this one (`release.rs`). Already
+# in the lock.
+semver = "1"
 # This machine's hostname, for the `%l`, `%L` and `%C` tokens of an ssh
 # config's `IdentityFile` (`ssh/config.rs`). Already in the lock, under GPUI.
 gethostname = "1"
