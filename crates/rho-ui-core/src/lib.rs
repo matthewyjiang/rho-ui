@@ -34,8 +34,8 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
-    Detached, PendingUpgrade, PromptKey, ReportedWorktree, RestartCost, SessionId, SessionSummary,
-    SurfaceActionError, Unsteered, VersionFix, VersionMismatch,
+    Detached, PendingUpgrade, PromptKey, PullRequestError, ReportedWorktree, RestartCost,
+    SessionId, SessionSummary, SurfaceActionError, Unsteered, VersionFix, VersionMismatch,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -60,6 +60,17 @@ pub use rho_install::{RhoCheck, RhoInstall, Update};
 pub use rho_protocol::{
     AuthKind, AuthStatus, AuthSummary, CredentialStoreKind, CredentialStoreStatus, LoginId,
     LoginOutcome, LoginPrompt, StoreSelectedBy, UncheckedKey, UncheckedReason,
+};
+/// A session's pull requests, as [`Daemon::list_pull_requests`] and its
+/// siblings answer and [`SessionUpdate::pull_requests`] carries them, as
+/// rho-protocol has them.
+pub use rho_protocol::{
+    BranchLookup, BranchPullRequest, LinkedPullRequest, PullRequestCheck, PullRequestCheckStatus,
+    PullRequestDetail, PullRequestId, PullRequestLinkOrigin, PullRequestMergeMethod,
+    PullRequestMergeable, PullRequestPost, PullRequestRead, PullRequestReview, PullRequestRollup,
+    PullRequestState, PullRequestSummary, PullRequestTarget, PullRequestThread,
+    PullRequestThreadState, PullRequestTrouble, PullRequestVerdict, SessionPullRequestLinkResponse,
+    SessionPullRequestShowResponse, SessionPullRequests,
 };
 /// What [`Daemon::check_worktrees`] and [`Daemon::prune_worktrees`] report
 /// of each session worktree, as rho-protocol has it.

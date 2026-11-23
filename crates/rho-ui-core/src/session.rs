@@ -27,8 +27,8 @@ use web_time::Instant;
 
 use rho_protocol::{
     AnswerStop, CardTone, CompactionStatus, JobState, Replay, Resolution, Seq,
-    SessionAttachResponse, SessionEvent, SessionOptions as WireOptions, StreamId, ToolCallUpdate,
-    TurnOutcome,
+    SessionAttachResponse, SessionEvent, SessionOptions as WireOptions, SessionPullRequests,
+    StreamId, ToolCallUpdate, TurnOutcome,
 };
 
 use crate::{
@@ -47,6 +47,18 @@ pub struct SessionUpdate {
     /// Its place in the session's stream; see [`Session::reattach`].
     pub(crate) seq: Seq,
     pub(crate) event: SessionEvent,
+}
+
+impl SessionUpdate {
+    /// The session's pull requests, when this update says they changed:
+    /// all of them, to replace what the client holds, never to merge.
+    /// [`Session::apply`] ignores them; a session holds no pull requests.
+    pub fn pull_requests(&self) -> Option<&SessionPullRequests> {
+        match &self.event {
+            SessionEvent::PullRequests { pull_requests } => Some(pull_requests.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 /// Where a session's events left off, from [`Session::reattach`]: an
