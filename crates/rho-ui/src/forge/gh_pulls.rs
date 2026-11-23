@@ -982,7 +982,7 @@ mod tests {
         let batch = parse(&plan, &printed(answer, "")).unwrap();
         assert!(matches!(batch.links.as_slice(), [(_, Found::None)]));
         assert!(matches!(batch.branches.as_slice(), [(_, Found::None)]));
-        assert!(batch.missing.is_empty());
+        assert_eq!(batch.missing, Vec::<(RepoId, String)>::new());
     }
 
     /// A real conversation, cli/cli#14578, bodies cut short: its comments

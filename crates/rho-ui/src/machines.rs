@@ -513,7 +513,7 @@ mod tests {
                 .map(|(listing, error)| (listing, error.to_string()))
                 .collect()
         };
-        assert!(refused(&machines).is_empty());
+        assert_eq!(refused(&machines), Vec::<(Listing, String)>::new());
 
         assert!(machines.set_error(&id, Listing::Sessions, Some("no list".into())));
         assert!(machines.set_error(&id, Listing::Jobs, Some("no jobs".into())));
