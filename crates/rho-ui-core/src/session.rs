@@ -55,14 +55,16 @@ pub struct SessionUpdate {
 pub struct Cursor(pub(crate) rho_protocol::Cursor);
 
 /// What [`Session::attached`] did with what the session showed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Continuity {
     /// It stands: this was the session's first attach, or the daemon sends
     /// only what came after the session's cursor.
     Kept,
     /// The daemon replays the whole conversation, which replaced it: its
-    /// entries start over, as [`Session::take_removed`] says.
-    Replaced,
+    /// entries start over, as [`Session::take_removed`] says. Holds the
+    /// entries it had, which a view can keep drawing until the replay is
+    /// all there, then rebuild from the first that changed instead.
+    Replaced(Vec<Entry>),
 }
 
 /// What `rho/session/new` returned. Hand it to [`Session::from_setup`].
@@ -632,9 +634,9 @@ impl Session {
         let continuity = match response.replay {
             Replay::Tail => Continuity::Kept,
             Replay::Reset => {
-                self.discard();
+                let shown = self.discard();
                 if followed {
-                    Continuity::Replaced
+                    Continuity::Replaced(shown)
                 } else {
                     Continuity::Kept
                 }
@@ -709,11 +711,12 @@ impl Session {
         }))
     }
 
-    /// Forgets the conversation, for a replay of all of it; what only this
-    /// client knows, such as a held message or work seen ending, stays.
-    fn discard(&mut self) {
-        if !self.entries.is_empty() {
-            self.entries.clear();
+    /// Forgets the conversation, for a replay of all of it, and returns
+    /// its entries; what only this client knows, such as a held message or
+    /// work seen ending, stays.
+    fn discard(&mut self) -> Vec<Entry> {
+        let shown = std::mem::take(&mut self.entries);
+        if !shown.is_empty() {
             self.removed = Some(0);
         }
         self.turn = LiveTurn::default();
@@ -721,6 +724,7 @@ impl Session {
         self.inputs.clear();
         self.placed_surfaces.clear();
         self.seq = Seq(0);
+        shown
     }
 
     /// Background work an earlier run of the client saw, given before the

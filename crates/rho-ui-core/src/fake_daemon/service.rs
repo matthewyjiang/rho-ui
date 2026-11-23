@@ -74,9 +74,10 @@ impl Fake {
         self.closed.send_replace(());
     }
 
-    /// The stream of this run of the daemon: a restart starts another.
-    fn stream(&self) -> StreamId {
-        StreamId::new(format!("stream-{}", *self.restarted.borrow()))
+    /// The stream of a session in this run of the daemon, once it was
+    /// unloaded `unloads` times: a restart, or a reload, starts another.
+    fn stream(&self, unloads: u64) -> StreamId {
+        StreamId::new(format!("stream-{}-{unloads}", *self.restarted.borrow()))
     }
 }
 
@@ -790,7 +791,7 @@ impl Service for Fake {
         }
         session.attaches += 1;
         let (response, publisher, subscription) =
-            session.follow(self.stream(), params.after.as_ref());
+            session.follow(self.stream(session.unloads), params.after.as_ref());
         session.publishers.push(publisher);
         Ok((response, subscription))
     }
@@ -807,7 +808,8 @@ impl Service for Fake {
         let loaded = session.subagent && session.turn.is_some();
         // A session observed unloaded always replays whole.
         let after = params.after.as_ref().filter(|_| loaded);
-        let (response, publisher, subscription) = session.follow(self.stream(), after);
+        let (response, publisher, subscription) =
+            session.follow(self.stream(session.unloads), after);
         if loaded {
             session.publishers.push(publisher);
         } else {

@@ -519,9 +519,11 @@ impl SidebarView {
         }
     }
 
-    /// Forgets an open session's own state, once its view is gone.
-    pub(crate) fn close_live(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
-        self.list.close_live(id);
+    /// Forgets what an open session's view says of it, once the app stops
+    /// following the session: its row follows the daemon's jobs again, until
+    /// the view follows it again and catches up.
+    pub(crate) fn forget_live(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
+        self.list.forget_live(id);
         self.rebuild(cx);
     }
 

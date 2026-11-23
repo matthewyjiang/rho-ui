@@ -198,12 +198,6 @@ impl SessionSettings {
         .detach();
     }
 
-    /// Whether no change is on its way to the daemon, which answers one
-    /// made during a turn once the turn ends.
-    pub(crate) fn is_settled(&self) -> bool {
-        self.pending == 0
-    }
-
     fn close_panel(&mut self, cx: &mut Context<'_, Self>) {
         if self.open {
             self.open = false;
