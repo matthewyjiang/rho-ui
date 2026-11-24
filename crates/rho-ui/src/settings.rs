@@ -1,5 +1,6 @@
 //! rho-ui's own settings: light or dark, UI scale, fonts, whether scrolling
-//! glides, the machines it connects to, and the forge CLIs' programs on each. They live in
+//! glides, whether the sidebar warns of a daemon of another build, the
+//! machines it connects to, and the forge CLIs' programs on each. They live in
 //! `settings` in rho-ui's config folder ([`AppDir::Config`]: by default
 //! `~/.config/rho-ui`), one `key = value` per line. In a browser they are
 //! that file on the server's machine, as `rho-ui serve` shares it. The
@@ -184,6 +185,9 @@ pub(crate) struct Settings {
     pub(crate) smooth_scroll: SmoothScroll,
     pub(crate) ui_font: SharedString,
     pub(crate) code_font: SharedString,
+    /// Whether the sidebar warns of a daemon of another build than
+    /// rho-ui's; see [`crate::machines::MachineStatus::Ready`].
+    pub(crate) warn_other_builds: bool,
     /// What the sidebar calls this machine.
     pub(crate) local_label: SharedString,
     /// Where this machine clones projects; see
@@ -226,6 +230,7 @@ impl Default for Settings {
             smooth_scroll: SmoothScroll::default(),
             ui_font: DEFAULT_UI_FONT.into(),
             code_font: DEFAULT_CODE_FONT.into(),
+            warn_other_builds: true,
             local_label: LOCAL.into(),
             local_clone_folder: String::new(),
             local_cli: CliPaths::default(),
@@ -349,12 +354,13 @@ impl Settings {
     /// `.<program>`.
     fn to_text(&self) -> String {
         let mut text = format!(
-            "appearance = {}\nui_scale = {}\nsmooth_scroll = {}\nui_font = {}\ncode_font = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
+            "appearance = {}\nui_scale = {}\nsmooth_scroll = {}\nui_font = {}\ncode_font = {}\nwarn_other_builds = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
             self.appearance.name(),
             self.ui_scale.percent(),
             self.smooth_scroll.name(),
             self.ui_font,
             self.code_font,
+            self.warn_other_builds,
             self.local_label,
             self.local_clone_folder,
         );
@@ -413,6 +419,14 @@ impl Settings {
     }
 }
 
+/// Applies and saves a change to the current settings.
+pub(crate) fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
+    let mut settings = cx.global::<Settings>().clone();
+    change(&mut settings);
+    settings.save();
+    settings.apply(cx);
+}
+
 /// Reads the settings file at `path`, telling a missing file from one
 /// that exists but can't be read, which nothing may write over.
 #[cfg(not(target_family = "wasm"))]
@@ -453,6 +467,11 @@ fn parse(text: &str) -> Settings {
             }
             "ui_font" if !value.is_empty() => settings.ui_font = value.to_owned().into(),
             "code_font" if !value.is_empty() => settings.code_font = value.to_owned().into(),
+            "warn_other_builds" => {
+                if let Ok(warn) = value.parse() {
+                    settings.warn_other_builds = warn;
+                }
+            }
             "local.label" if !value.is_empty() => settings.local_label = value.to_owned().into(),
             "local.clone_folder" => value.clone_into(&mut settings.local_clone_folder),
             key => {
@@ -515,6 +534,7 @@ mod tests {
     fn machines_survive_a_save_in_the_order_added() {
         let mut settings = Settings {
             smooth_scroll: SmoothScroll::On,
+            warn_other_builds: false,
             local_label: "laptop".into(),
             local_clone_folder: "~/code".to_owned(),
             ..Settings::default()
@@ -533,6 +553,7 @@ mod tests {
         let read = parse(&settings.to_text());
         assert_eq!(read.machines, settings.machines);
         assert_eq!(read.smooth_scroll, SmoothScroll::On);
+        assert!(!read.warn_other_builds);
         assert_eq!(read.local_label, "laptop");
         assert_eq!(read.local_clone_folder, "~/code");
         assert_eq!(read.local_cli, settings.local_cli);

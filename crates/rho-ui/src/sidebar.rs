@@ -69,6 +69,7 @@ use crate::{
         Activity, DraftRow, Item, JobSession, LiveSession, Row, SavedSession, SessionList,
         SHELF_PAGE,
     },
+    settings::{self, Settings},
     shelf::{Shelf, Shelves},
     store::StateDb,
     time,
@@ -1431,11 +1432,14 @@ impl SidebarView {
             let action = DaemonAction::Restart(machine.clone());
             ask("restart-daemon", "Restart…", Lucide::RotateCw, action)
         };
-        let alert_with = |alert: Alert, buttons: Vec<Button>| {
+        // The alert registered as `{kind}-{machine}`, which Kit's Alert
+        // isn't, with `buttons` under it.
+        let alert_with = |kind: &str, alert: Alert, buttons: Vec<Button>| {
+            let id = SharedString::from(format!("{kind}-{machine}"));
             v_flex()
                 .px_2()
                 .gap_1()
-                .child(alert.small())
+                .child(div().id(id).test_support().child(alert.small()))
                 .child(h_flex().justify_end().gap_1().children(buttons))
                 .into_any_element()
         };
@@ -1457,15 +1461,12 @@ impl SidebarView {
                 another_build: true,
                 ..
             } => {
-                let why = skew_note(version, restart_runs);
                 let buttons = restart_runs.map(|_| restart()).into_iter().collect();
-                alert_with(
-                    Alert::warning(SharedString::from(format!("machine-skew-{machine}")), why)
-                        .title(format!("Rho{on} is another build")),
-                    buttons,
-                )
+                let why = skew_note(version, restart_runs);
+                alert_with("skew", skew_alert(machine, on, why), buttons)
             }
             MachineStatus::OlderDaemon { .. } => alert_with(
+                "older-daemon",
                 Alert::error(
                     SharedString::from(format!("machine-error-{machine}")),
                     machines::OLDER_DAEMON,
@@ -1478,6 +1479,7 @@ impl SidebarView {
                 },
             ),
             MachineStatus::OlderRho => alert_with(
+                "older-rho",
                 Alert::error(
                     SharedString::from(format!("machine-error-{machine}")),
                     machines::OLDER_RHO,
@@ -1486,6 +1488,7 @@ impl SidebarView {
                 vec![retry()],
             ),
             MachineStatus::Failed(why) => alert_with(
+                "unreachable",
                 Alert::error(
                     SharedString::from(format!("machine-error-{machine}")),
                     why.clone(),
@@ -1526,6 +1529,7 @@ impl SidebarView {
             _ => None,
         };
         let installs = self.installs.read(cx);
+        let warn_other_builds = cx.global::<Settings>().warn_other_builds;
         let offers = self.render_offers(cx);
         let mut troubles: Vec<AnyElement> = Vec::new();
         for (machine, status, refused) in machines.troubles() {
@@ -1544,7 +1548,15 @@ impl SidebarView {
                 .offer(machine, cx)
                 .is_some_and(|offer| offer.replaces_connection_error());
             // Without rho there is nothing to reach: its offer says so.
-            if !offers_install {
+            let unwarned = !warn_other_builds
+                && matches!(
+                    status,
+                    MachineStatus::Ready {
+                        another_build: true,
+                        ..
+                    }
+                );
+            if !offers_install && !unwarned {
                 let named = (label.as_ref(), on.as_str());
                 let restart_runs = match status {
                     MachineStatus::Ready { version, .. } => installs.restart_runs(machine, version),
@@ -1587,6 +1599,17 @@ impl SidebarView {
                 ),
             )
     }
+}
+
+/// The warning that `machine`'s daemon is another build, saying `why`; `on`
+/// is as in [`SidebarView::render_status`]. Its X turns the warning off for
+/// every machine, until Settings → About turns it back on.
+fn skew_alert(machine: &MachineId, on: &str, why: String) -> Alert {
+    Alert::warning(SharedString::from(format!("machine-skew-{machine}")), why)
+        .title(format!("Rho{on} is another build"))
+        .on_close(|_, _, cx| {
+            settings::update(cx, |settings| settings.warn_other_builds = false);
+        })
 }
 
 /// What the footer says of a daemon of another build than rho-ui's, which

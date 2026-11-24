@@ -38,7 +38,9 @@ use crate::{
     machines::{MachineId, MachineStatus, Machines},
     rho_install::Installs,
     rho_settings::RhoSettings,
-    settings::{Appearance, Settings, SmoothScroll, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT},
+    settings::{
+        update, Appearance, Settings, SmoothScroll, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT,
+    },
     sidebar::SidebarView,
     workspaces::Workspaces,
     worktrees::Worktrees,
@@ -428,14 +430,6 @@ fn value(text: impl Into<SharedString>, tone: Tone) -> SettingField<SharedString
             .text_color(tone.color(cx))
             .child(text.clone())
     })
-}
-
-/// Applies and saves a change to the current settings.
-fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) {
-    let mut settings = cx.global::<Settings>().clone();
-    change(&mut settings);
-    settings.save();
-    settings.apply(cx);
 }
 
 fn set_font(role: FontRole, family: SharedString, cx: &mut App) {

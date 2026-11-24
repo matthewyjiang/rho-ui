@@ -2784,7 +2784,8 @@ fn a_left_session_is_let_go_and_shown_again_at_once() {
 /// for rho-ui's protocol restarts with `rho daemon restart`, and rho-ui
 /// connects once the Rho installed there is new enough, and until then says
 /// to update it rather than offer the restart again; one of another build
-/// restarts through the protocol, and comes back as rho-ui's own.
+/// warns until hidden, restarts through the protocol, and comes back as
+/// rho-ui's own.
 #[test]
 #[cfg_attr(windows, ignore = "runs a fake rho written as a POSIX sh script")]
 fn a_daemon_that_needs_a_restart_restarts_once_confirmed() {
@@ -2858,6 +2859,25 @@ fn a_daemon_that_needs_a_restart_restarts_once_confirmed() {
         is_visible(window, "restart-daemon-local")
     });
     ui.shot("another-build");
+    // The warning's X drops it, with its restart, until the setting is
+    // back. Kit's Alert doesn't register its X: a 20 px box in the top
+    // right corner, inside the small alert's 12 px by 8 px padding.
+    ui.act(|window, cx| {
+        let alert = window.find("skew-local");
+        let offset = gpui_kit::point(alert.bounds().size.width - px(22.), px(18.));
+        window.click_with_options("skew-local", ClickOptions::new().with_offset(offset), cx);
+    });
+    ui.wait_until("the warning hidden", |window, cx, _| {
+        !is_visible(window, "skew-local") && !cx.global::<Settings>().warn_other_builds
+    });
+    ui.cx.update(|cx| {
+        let mut settings = cx.global::<Settings>().clone();
+        settings.warn_other_builds = true;
+        settings.apply(cx);
+    });
+    ui.wait_until("the warning back", |window, _, _| {
+        is_visible(window, "skew-local") && is_visible(window, "restart-daemon-local")
+    });
     ui.click("restart-daemon-local");
     shot_dialog(&mut ui, "Restart", "another-build-confirm");
     click_label(&mut ui, "Restart");

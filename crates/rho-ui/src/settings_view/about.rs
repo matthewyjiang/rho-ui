@@ -2,7 +2,8 @@
 //! source and license, then Rho on each machine: its daemon's version and
 //! process ID, with Restart and Stop, or why there is none to show yet,
 //! with what would fix it, and under it what its rho needs: installing,
-//! updating, or a restart into the newer one.
+//! updating, or a restart into the newer one; then whether the sidebar
+//! warns of a daemon of another build.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
@@ -18,6 +19,7 @@ use crate::{
     app_update::{render_offer as render_app_offer, AppUpdate},
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines},
     rho_install::{render_offer, Installs},
+    settings::{self, Settings},
 };
 
 /// rho-ui's source, from its `Cargo.toml`.
@@ -131,12 +133,30 @@ pub(super) fn about_page(
                 })
             });
             std::iter::once(item).chain(offer)
-        }));
+        }))
+        .item(warn_item());
     SettingPage::new("About")
         .icon(IconName::Info)
         .header_style(&page_header())
         .group(app)
         .group(rho)
+}
+
+/// The switch for whether the sidebar warns of a daemon of another build.
+fn warn_item() -> SettingItem {
+    SettingItem::new(
+        "Warn about other builds",
+        SettingField::switch(
+            |cx: &App| cx.global::<Settings>().warn_other_builds,
+            |warn: bool, cx: &mut App| {
+                settings::update(cx, |settings| settings.warn_other_builds = warn);
+            },
+        ),
+    )
+    .description(
+        "Warn in the sidebar when a daemon is another build than rho-ui's, so some \
+         requests may fail.",
+    )
 }
 
 /// `text` about `machine`'s daemon, with a button for each of `buttons`,

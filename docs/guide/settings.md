@@ -42,6 +42,7 @@ A model setting lists the models that machine's rho can run with its sign-ins, a
 - **Stop** sticks: rho-ui won't start that daemon again by itself until you press **Start** or rho-ui restarts.
 - **A daemon too old for rho-ui** refuses to connect. The sidebar offers to restart it into the newer rho installed there, or says to update rho. On a remote machine where the daemon is busy and older than the rho installed there, rho-ui can only show rho's message with **Retry**.
 - **A daemon newer than rho-ui** says to update rho-ui.
+- **A daemon of another build**, such as one built from source, speaks the same protocol, but some requests may fail. The sidebar warns until you close the warning or turn off **Warn about other builds** in About.
 
 ## Updating rho
 
