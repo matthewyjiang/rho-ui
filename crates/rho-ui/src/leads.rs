@@ -1,11 +1,12 @@
-//! A lead's folders on its machine. A lead is a session opened as rho's
-//! [`LEAD_AGENT`](rho_ui_core::LEAD_AGENT), which works in a folder of its
-//! own, `<rho home>/leads/<name>`, named from its first message
-//! ([`slug`]). Its draft works in the leads root, `<rho home>/leads`, which
-//! holds the lead agent's settings until the first message goes. rho's
-//! protocol makes no folder, so rho-ui makes them: [`make_here`] on this
-//! machine, and [`SCRIPT`] on a remote one, over its link, by the same
-//! rules.
+//! Leads, and their folders on their machine. A lead ([`Kind::Lead`]) is a
+//! session opened as rho's [`LEAD_AGENT`], which works in a folder of its
+//! own, `<rho home>/leads/<name>`, named from its first message ([`slug`]).
+//! Its draft works in the leads root, `<rho home>/leads`, which holds the
+//! lead agent's settings until the first message goes. rho's protocol
+//! makes no folder, so rho-ui makes them: [`make_here`] on this machine,
+//! and [`SCRIPT`] on a remote one, over its link, by the same rules. A
+//! folder whose lead didn't start goes again while it is empty
+//! ([`Leads::unmake`]).
 
 use std::{
     ffi::OsString,
@@ -14,9 +15,29 @@ use std::{
 };
 
 use gpui_kit::BackgroundExecutor;
-use rho_ui_core::{platform, Daemon, SessionSetup};
+use rho_ui_core::{platform, LEAD_AGENT};
 
-use crate::folders::{Deadline, Reader};
+use crate::folders::{self, Deadline, Reader};
+
+/// Whether a session is a lead: one opened as rho's [`LEAD_AGENT`], which
+/// runs a goal through sessions it starts. A lead works in a folder of its
+/// own, in no project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Session,
+    Lead,
+}
+
+impl Kind {
+    /// The kind of a session that runs as `agent`, by id.
+    pub(crate) fn of(agent: &str) -> Self {
+        if agent == LEAD_AGENT {
+            Kind::Lead
+        } else {
+            Kind::Session
+        }
+    }
+}
 
 /// The longest a lead's folder name runs, in characters, before [`slug`]
 /// cuts it at a word: about six words, which a terminal's listing and the
@@ -28,7 +49,7 @@ const SLUG_CHARS: usize = 40;
 /// digit.
 const NO_SLUG: &str = "lead";
 
-/// Which folder [`Leads::open`] makes before it opens the lead.
+/// Which folder [`Leads::make`] makes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Folder {
     /// The leads root, made if missing, where a lead's draft works.
@@ -48,10 +69,13 @@ impl Folder {
 /// The POSIX `sh` script that makes a folder of [`Folder`] on a remote
 /// machine, given a lead's folder name as its argument, or an empty one for
 /// the root, in the rho home found as rho-ui's ssh setup finds it. A taken
-/// name gets `-2`, `-3`, ... after it. It prints a NUL, then the folder's
-/// resolved path and a NUL, so whatever a login file prints comes before
-/// them.
-pub(crate) const SCRIPT: &str = r#"name=$1
+/// name gets `-2`, `-3`, ... after it: each is tried by making it, so a
+/// name another client takes meanwhile is passed over, and a folder that
+/// can't be made for another reason fails with `mkdir`'s message. It
+/// prints a NUL, then the folder's resolved path and a NUL, so whatever a
+/// login file prints comes before them.
+const SCRIPT: &str = r#"unset CDPATH
+name=$1
 cd || exit
 root=${RHO_HOME:-$HOME/.rho}/leads
 mkdir -p -- "$root" && root=$(cd -P -- "$root" && pwd -P) || exit
@@ -59,14 +83,18 @@ dest=$root
 if [ -n "$name" ]; then
   dest=$root/$name
   n=1
-  while [ -e "$dest" ] || [ -L "$dest" ]; do
+  until mkdir -- "$dest" 2>/dev/null; do
+    [ -e "$dest" ] || [ -L "$dest" ] || { mkdir -- "$dest" && break; exit; }
     n=$((n + 1))
     dest=$root/$name-$n
   done
-  mkdir -- "$dest" || exit
 fi
 printf '\0%s\0' "$dest"
 "#;
+
+/// The POSIX `sh` script that removes the folder given as its argument on
+/// a remote machine if it is empty, as [`unmake_here`] does here.
+const UNMAKE_SCRIPT: &str = "rmdir -- \"$1\"\n";
 
 /// A lead's folder name from its first message, `text`: its runs of ASCII
 /// letters and digits, lowercased, joined by `-`, as many whole as fit in
@@ -99,7 +127,7 @@ fn slug(text: &str) -> String {
     }
 }
 
-/// A machine's leads root, and how rho-ui makes folders in it.
+/// A machine's leads root, and how rho-ui makes and removes folders in it.
 pub(crate) struct Leads {
     reader: Reader,
     /// This machine's rho home, for a machine `reader` reads here.
@@ -124,45 +152,49 @@ impl Leads {
     }
 
     /// Makes `folder`, with [`make_here`] on this machine and [`SCRIPT`] on
-    /// a remote one, then opens a lead in it on `daemon`.
+    /// a remote one, and returns its resolved path.
     ///
     /// # Errors
     ///
-    /// Says why, in the file system's, ssh's or the daemon's words, if the
-    /// machine isn't connected, the folder can't be made, or the daemon
-    /// won't open the lead, as a rho without the lead agent won't.
-    pub(crate) async fn open(
-        self,
-        daemon: &Daemon,
-        folder: Folder,
-    ) -> Result<SessionSetup, String> {
-        let name = match &folder {
+    /// Says why, in the file system's or ssh's words, if the machine isn't
+    /// connected or the folder can't be made.
+    pub(crate) async fn make(&self, folder: &Folder) -> Result<PathBuf, String> {
+        let name = match folder {
             Folder::Root => String::new(),
             Folder::Lead(name) => name.clone(),
         };
-        let rho_home = self.rho_home;
+        let (rho_home, folder) = (self.rho_home.clone(), folder.clone());
         let here = move || -> Result<PathBuf, String> {
             let rho_home = rho_home.ok_or("There's no home directory to keep leads in.")?;
             make_here(&rho_home.join("leads"), &folder)
         };
         let parse = |output: Vec<u8>| {
-            // The last field is the path, after whatever a login file
-            // printed.
-            let mut fields = output.split(|&byte| byte == 0).filter(|f| !f.is_empty());
-            fields
-                .next_back()
-                .map(platform::path_from_bytes)
-                .ok_or_else(|| "the leads script printed no path".to_owned())
+            folders::last_path(&output).ok_or_else(|| "the leads script printed no path".to_owned())
         };
         let args = vec![OsString::from(name)];
-        let cwd = self
-            .reader
+        self.reader
+            .clone()
             .query(&self.executor, here, SCRIPT, args, Deadline::Script, parse)
-            .await?;
-        daemon
-            .new_lead(&cwd)
             .await
-            .map_err(|error| error.to_string())
+    }
+
+    /// Removes `dir`, a lead's folder [`Self::make`] made, if it is still
+    /// empty, as when its lead didn't start, so a retry takes its name
+    /// again: with [`unmake_here`] on this machine and [`UNMAKE_SCRIPT`] on
+    /// a remote one. Best effort: a folder that holds anything stays, and a
+    /// failure goes unsaid.
+    pub(crate) async fn unmake(&self, dir: &Path) {
+        let args = vec![dir.as_os_str().to_owned()];
+        let dir = dir.to_path_buf();
+        let here = move || {
+            unmake_here(&dir);
+            Ok(())
+        };
+        let (script, deadline) = (UNMAKE_SCRIPT, Deadline::Script);
+        let reader = self.reader.clone();
+        let _ = reader
+            .query(&self.executor, here, script, args, deadline, |_| Ok(()))
+            .await;
     }
 }
 
@@ -194,6 +226,14 @@ fn make_here(root: &Path, folder: &Folder) -> Result<PathBuf, String> {
             Err(error) => return Err(format!("Couldn't make {}: {error}", dest.display())),
         }
     }
+}
+
+/// Removes `dir` on this machine if it is empty, as [`UNMAKE_SCRIPT`]
+/// does; one that holds anything stays. Does file I/O; call it off the UI
+/// thread.
+fn unmake_here(dir: &Path) {
+    // Fails, and leaves it, when it isn't empty.
+    let _ = std::fs::remove_dir(dir);
 }
 
 #[cfg(test)]
@@ -264,8 +304,41 @@ mod tests {
             if !output.status.success() {
                 return Err(String::from_utf8_lossy(&output.stderr).into_owned());
             }
-            let path = output.stdout.split(|&b| b == 0).rfind(|f| !f.is_empty());
-            Ok(platform::path_from_bytes(path.unwrap()))
+            Ok(folders::last_path(&output.stdout).unwrap())
         });
+    }
+
+    /// A lead's folder that didn't start goes while it is empty, here and
+    /// by [`UNMAKE_SCRIPT`]; one that holds a file stays.
+    #[test]
+    fn unmaking_a_folder_removes_it_only_while_empty() {
+        let script = |dir: &Path| {
+            // Fails on a folder that holds a file, which `Leads::unmake`
+            // ignores too.
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(UNMAKE_SCRIPT)
+                .arg("sh")
+                .arg(dir)
+                .status();
+        };
+        let mut unmakers: Vec<&dyn Fn(&Path)> = Vec::new();
+        unmakers.push(&unmake_here);
+        if cfg!(unix) {
+            unmakers.push(&script);
+        }
+        // Whether the folder holds a file, and so stays.
+        for holds_file in [false, true] {
+            for unmake in &unmakers {
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path().join("fix-the-parser");
+                std::fs::create_dir(&dir).unwrap();
+                if holds_file {
+                    std::fs::write(dir.join("brief.md"), "the goal").unwrap();
+                }
+                unmake(dir.as_path());
+                assert_eq!(dir.is_dir(), holds_file, "holds a file: {holds_file}");
+            }
+        }
     }
 }

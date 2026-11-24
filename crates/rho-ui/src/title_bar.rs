@@ -53,8 +53,9 @@ type Go = Box<dyn Fn(&mut Window, &mut App)>;
 /// steps above the title with [`TitleBar::parent`], outermost first.
 #[derive(IntoElement)]
 pub(crate) struct TitleBar {
-    initials: SharedString,
-    project: SharedString,
+    /// The project's initials and name; `None` while the pane has no
+    /// folder yet, as a lead's draft until its session opens.
+    project: Option<(SharedString, SharedString)>,
     /// The repository's web page, from its origin remote.
     repo_page: Option<String>,
     /// What a click on the project does; without it, the project is text.
@@ -67,12 +68,15 @@ pub(crate) struct TitleBar {
 }
 
 impl TitleBar {
-    /// A bar reading `project / title`.
-    pub(crate) fn new(workspace: &Workspace, title: impl Into<SharedString>) -> Self {
+    /// A bar reading `project / title`, or `title` alone with no
+    /// `workspace`.
+    pub(crate) fn new(workspace: Option<&Workspace>, title: impl Into<SharedString>) -> Self {
         Self {
-            initials: workspace.initials.clone(),
-            project: workspace.short_name.clone(),
-            repo_page: workspace.origin().and_then(repo::web_url),
+            project: workspace
+                .map(|workspace| (workspace.initials.clone(), workspace.short_name.clone())),
+            repo_page: workspace
+                .and_then(Workspace::origin)
+                .and_then(repo::web_url),
             on_project: None,
             parents: Vec::new(),
             title: title.into(),
@@ -135,23 +139,27 @@ impl RenderOnce for TitleBar {
             });
         // The same text with or without a click, so the bar reads alike in
         // every pane; a link, as the steps after it are.
-        let project = h_flex()
-            .flex_shrink_0()
-            .gap_2()
-            .text_color(muted)
-            .child(Badge::new(self.initials, rems(BADGE_REMS)))
-            .child(self.project.clone());
-        let project = match self.on_project {
-            Some(go) => project
-                .id("title-project")
-                .test_support()
-                .aria_label(format!("New session in {}", self.project))
-                .cursor_pointer()
-                .hover(move |style| style.text_color(foreground))
-                .on_click(move |_, window, cx| go(window, cx))
-                .into_any_element(),
-            None => project.into_any_element(),
-        };
+        let on_project = self.on_project;
+        let project = self.project.map(|(initials, name)| {
+            let project = h_flex()
+                .flex_shrink_0()
+                .gap_2()
+                .text_color(muted)
+                .child(Badge::new(initials, rems(BADGE_REMS)))
+                .child(name.clone());
+            match on_project {
+                Some(go) => project
+                    .id("title-project")
+                    .test_support()
+                    .aria_label(format!("New session in {name}"))
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(foreground))
+                    .on_click(move |_, window, cx| go(window, cx))
+                    .into_any_element(),
+                None => project.into_any_element(),
+            }
+        });
+        let has_project = project.is_some();
         let repo_page = self.repo_page.map(|url| {
             Button::new("title-repo")
                 .ghost()
@@ -174,14 +182,16 @@ impl RenderOnce for TitleBar {
                     .min_w_0()
                     .h_full()
                     .gap_3()
-                    .child(
-                        h_flex()
-                            .flex_shrink_0()
-                            .gap_1()
-                            .child(project)
-                            .children(repo_page),
-                    )
-                    .child(slash())
+                    .when(has_project, |bar| {
+                        bar.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_1()
+                                .children(project)
+                                .children(repo_page),
+                        )
+                        .child(slash())
+                    })
                     .children(parents)
                     // Takes the bar's room up to the controls, so all of
                     // it moves the window where the app draws the title

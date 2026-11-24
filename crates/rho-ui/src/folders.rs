@@ -236,6 +236,7 @@ pub(crate) struct Lookup {
 /// [`crate::local`]); on a remote machine, which is Unix, with a POSIX `sh`
 /// script over its ssh link, whose output it parses. Both give the feature
 /// the same value.
+#[derive(Clone)]
 pub(crate) enum Reader {
     /// From this machine's files.
     Here,

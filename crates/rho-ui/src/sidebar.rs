@@ -1,14 +1,14 @@
 //! The session list, drawn: one scrolling list of every machine's active
-//! sessions, pinned first and the rest ranked as an inbox (see
-//! [`crate::session_list`]), then the Snoozed and Settled shelves, held at the
-//! bottom until opened shelves fill the list. Drafts of new sessions the
-//! user left with a message lead it, saying Draft; hovering one offers
-//! Discard. The active leads follow under a header of their own. An active
-//! row shows the
-//! workspace, the session's status or age, its title, its branch, and with
-//! more than one machine, the machine's label; hovering it swaps the status
-//! for Snooze and Settle, or Unpin. Pinned sessions lead the list, and a
-//! turn that finished off screen shows Done until its session is opened.
+//! sessions, the leads first under a header of their own, pinned sessions
+//! first in each part and the rest ranked as an inbox (see
+//! [`crate::session_list`]), then the Snoozed and Settled shelves, held at
+//! the bottom until opened shelves fill the list. Drafts of new sessions
+//! the user left with a message come before them all, saying Draft;
+//! hovering one offers Discard. An active row shows the workspace, the
+//! session's status or age, its title, its branch, and with more than one
+//! machine, the machine's label; hovering it swaps the status for Snooze
+//! and Settle, or Unpin. A turn that finished off screen shows Done until
+//! its session is opened.
 //! Right-click a row for its menu, which also renames it in place. A shelf
 //! opens from its header into one-line rows, its newest 25 at first, and
 //! Show more under them adds 25 more at a time. A session another session
@@ -64,14 +64,15 @@ use rho_ui_core::{Job, SessionSummary};
 use crate::{
     app_update::{self, AppUpdate},
     badge::Badge,
+    leads::Kind,
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
     pr_mark::{mark_label, pr_mark},
     projects::Projects,
     pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
     session_list::{
-        Activity, DraftRow, Family, Fold, FoldLine, Item, JobSession, Kind, LiveSession, Pressing,
-        Row, SavedSession, SessionList, SHELF_PAGE,
+        Activity, DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
+        SavedSession, SessionList, SHELF_PAGE,
     },
     settings::{self, Settings},
     shelf::{Shelf, Shelves},
@@ -114,8 +115,8 @@ const MACHINE_LABEL_REMS: f32 = 5.;
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
 
-/// A gap's height where the sidebar doesn't stretch it, as under the
-/// leads: half a header, a break that reads as one without a line.
+/// The break's height under the leads: half a header, which reads as a
+/// break without a line.
 const BREAK_REMS: f32 = HEADER_REMS / 2.;
 
 /// The line under a session that started others: one line of text, padded
@@ -139,15 +140,16 @@ pub(crate) use filter::SavedFilter;
 pub(crate) use rail::SidebarLayout;
 use rail::{toggle_button, Layout};
 
-/// Each item's height. The gap above the shelves takes its from the list's
-/// height instead; see [`SidebarView::render_list`].
+/// Each item's height. The gap's comes from the list's height instead; see
+/// [`SidebarView::render_list`].
 fn item_rems(item: Item) -> f32 {
     match item {
         Item::Draft(_) | Item::Session(_) => ROW_REMS,
         Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
         Item::Header(_) | Item::Leads => HEADER_REMS,
         Item::Fold(_) => FOLD_REMS,
-        Item::Gap => BREAK_REMS,
+        Item::Gap => 0.,
+        Item::Break => BREAK_REMS,
     }
 }
 
@@ -255,6 +257,7 @@ pub(crate) enum SidebarEvent {
         id: SessionKey,
         cwd: PathBuf,
         title: Option<SharedString>,
+        kind: Kind,
     },
     NewSession,
     /// Show a draft for a new lead.
@@ -467,7 +470,7 @@ impl SidebarView {
                     parent: session
                         .parent()
                         .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
-                    kind: Kind::of(session.agent()),
+                    kind: session.agent().map_or(Kind::Session, Kind::of),
                 })
                 .collect();
             workspaces.set_history(
@@ -702,6 +705,7 @@ impl SidebarView {
                 id: row.id.clone(),
                 cwd: row.cwd.clone(),
                 title: row.title.clone(),
+                kind: row.kind,
             });
         }
     }
@@ -939,7 +943,7 @@ impl SidebarView {
             .map(|&item| match item {
                 Item::Draft(ix) => {
                     let draft = self.list.draft_at(ix);
-                    let workspace = workspaces.get(draft.workspace);
+                    let workspace = draft.workspace.map(|ix| workspaces.get(ix));
                     let label = machines.tag(&draft.cwd.machine);
                     self.render_draft(draft, workspace, label, cx)
                 }
@@ -957,7 +961,7 @@ impl SidebarView {
                 Item::Leads => Self::render_leads_header(),
                 Item::Fold(line) => self.render_fold(line, cx),
                 Item::More(which) => self.render_show_more(which, cx),
-                Item::Gap => div().into_any_element(),
+                Item::Gap | Item::Break => div().into_any_element(),
             })
             .collect()
     }
@@ -983,7 +987,7 @@ impl SidebarView {
             .test_support()
             .gap(rems(GAP_REMS))
             .py(rems(PAD_REMS))
-            .child(workspace_line(workspace, theme).child(right))
+            .child(workspace_line(Some(workspace), theme).child(right))
             .child(self.rename_box(row, cx).unwrap_or_else(|| {
                 div()
                     .h(rems(TITLE_REMS))
@@ -994,7 +998,7 @@ impl SidebarView {
                     .into_any_element()
             }))
             .child(branch_line(
-                workspace,
+                workspace.branch.clone(),
                 self.prs.read(cx).mark(&row.id).map(|mark| {
                     pr_mark(&mark, theme)
                         // Apart from the branch before it.
@@ -1017,7 +1021,7 @@ impl SidebarView {
     fn render_draft(
         &self,
         draft: &DraftRow,
-        workspace: &Workspace,
+        workspace: Option<&Workspace>,
         machine: Option<SharedString>,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
@@ -1061,7 +1065,7 @@ impl SidebarView {
                     .child(title),
             )
             .child(branch_line(
-                workspace,
+                workspace.and_then(|workspace| workspace.branch.clone()),
                 None,
                 machine.map(|label| (format!("{}-machine", draft.element_id).into(), label)),
                 theme,
@@ -1467,15 +1471,9 @@ impl SidebarView {
             .iter()
             .map(|&item| size(px(0.), rem * item_rems(item)))
             .collect();
-        // The gap above the shelves takes whatever height the rows leave,
-        // pushing the shelves to the bottom; once they overflow it is gone.
-        let above_shelves = self
-            .list
-            .items()
-            .windows(2)
-            .position(|pair| matches!(pair, [Item::Gap, Item::Header(_)]));
-        if let Some(gap) = above_shelves {
-            sizes[gap].height = Pixels::ZERO;
+        // The gap takes whatever height the rows leave, pushing the shelves
+        // to the bottom; once they overflow it is gone.
+        if let Some(gap) = self.list.items().iter().position(|&item| item == Item::Gap) {
             let rows: Pixels = sizes.iter().map(|size| size.height).sum();
             sizes[gap].height = (self.viewport - rows).max(Pixels::ZERO);
         }
@@ -1873,19 +1871,19 @@ struct Clock {
 }
 
 /// Badge and workspace name; the caller adds the status or actions.
-fn workspace_line(workspace: &Workspace, theme: &Theme) -> gpui_kit::Div {
+fn workspace_line(workspace: Option<&Workspace>, theme: &Theme) -> gpui_kit::Div {
     h_flex()
         .h(rems(LINE_REMS))
         .gap_2()
         .text_xs()
-        .child(badge(workspace.initials.clone()))
+        .children(workspace.map(|workspace| badge(workspace.initials.clone())))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_color(theme.muted_foreground)
-                .child(workspace.name.clone()),
+                .children(workspace.map(|workspace| workspace.name.clone())),
         )
 }
 
@@ -1987,7 +1985,7 @@ impl Card {
 /// `pr` mark, and at the right the machine's label, when there is more than
 /// one machine, as its element ID and the label.
 fn branch_line(
-    workspace: &Workspace,
+    branch: Option<SharedString>,
     pr: Option<AnyElement>,
     machine: Option<(SharedString, SharedString)>,
     theme: &Theme,
@@ -1998,7 +1996,7 @@ fn branch_line(
         .min_w_0()
         .text_xs()
         .text_color(theme.muted_foreground)
-        .when_some(workspace.branch.clone(), |this, branch| {
+        .when_some(branch, |this, branch| {
             this.child(Icon::new(Lucide::GitBranch).xsmall())
                 .child(div().truncate().child(branch))
         })
@@ -2343,7 +2341,7 @@ mod tests {
                 title: None,
                 placeholder: "",
                 activity: Activity::Working(Instant::now()),
-                kind: Kind::Session,
+                kind: Some(Kind::Session),
             };
             list.set_live(live, 0, 1);
         }

@@ -290,10 +290,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        leads::Kind,
         machines::{MachineId, Place},
         session_list::{
             tests::{here, id, job, rebuild, saved, shown},
-            Filter, JobSession, Kind, SavedSession,
+            Filter, JobSession, SavedSession,
         },
         shelf::Shelves,
     };
@@ -428,7 +429,8 @@ mod tests {
 
     /// Active leads list first, under their header, each over the sessions
     /// it started, then the other active sessions, which alone the active
-    /// shelf counts; a settled lead lists on its shelf.
+    /// shelf counts; a settled lead lists on its shelf. A lead is in no
+    /// project, so a project filter that hides the others leaves it.
     #[test]
     fn active_leads_list_apart_over_their_families() {
         let lead = |text: &str, title: &str, updated: i64| SavedSession {
@@ -452,13 +454,20 @@ mod tests {
             "[Leads]",
             "Lead",
             "› 1 started",
-            "~",
+            "-",
             "Other",
             "~",
             "[Settled 1]",
         ];
         assert_eq!(shown(&list), listed);
         assert_eq!(list.count(Shelf::Active), 1);
+
+        // Kept to a project none of them is in.
+        let mut filter = Filter::default();
+        filter.toggle_project(&Place::new(here(), "/srv"));
+        list.set_filter(filter);
+        rebuild(&mut list, &shelves, 10);
+        assert_eq!(shown(&list), ["[Leads]", "Lead", "~", "[Settled 1]"]);
     }
 
     /// A search or a filter that shows only sessions a session started

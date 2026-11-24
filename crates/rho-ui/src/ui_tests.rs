@@ -45,6 +45,7 @@ use gpui_kit::component::ActiveTheme as _;
 use crate::{
     app::{LaunchConfig, RhoApp},
     forge::{avatar::test::serve_pictures, Check, ForgeCli},
+    leads::Kind,
     machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
     pull_requests::{Serving, Shown, Which},
@@ -1650,7 +1651,7 @@ fn sessions_a_session_started_fold_under_it() {
     ui.act(|window, cx| {
         app.update(cx, |app, cx| {
             let w2 = SessionKey::local("w2");
-            app.open_session(w2, PathBuf::from("/w/a"), None, window, cx);
+            app.open_session(w2, PathBuf::from("/w/a"), None, Kind::Session, window, cx);
         });
     });
     ui.wait_until(
@@ -1663,30 +1664,18 @@ fn sessions_a_session_started_fold_under_it() {
 }
 
 /// A lead starts as rho's lead agent in a folder of its own, named from its
-/// first message, made in the rho home's leads. It lists under the Leads
-/// header, above the other active sessions, whatever project the filter
-/// keeps to.
+/// first message, made in the rho home's leads, and lists under the Leads
+/// header. A new session from it starts in a project, not in its folder.
 #[test]
 fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
     let rho_home = tempfile::tempdir().expect("a rho home");
-    let state = StateDb::in_memory();
-    // The filter keeps to /w/a, which holds s1 and not old, nor the lead.
-    state.execute(
-        "INSERT INTO filter_projects (machine, path) VALUES (?1, ?2)",
-        (MachineId::local().as_str().to_owned(), b"/w/a".to_vec()),
-    );
     let daemon = FakeDaemon::start(Script::default());
-    let target = daemon.target();
     let machines = Machines {
-        shelves: kept(["s1", "old"]),
-        projects: Projects::of(["/w/a"]),
         rho_home: Some(rho_home.path().to_path_buf()),
         ..Machines::default()
     };
-    let mut ui = Harness::open_on("leads", target, Some(daemon), machines, state);
-    ui.wait_until("the filtered sidebar", |window, _, _| {
-        is_visible(window, "session-local-s1") && !is_visible(window, "session-local-old")
-    });
+    let mut ui = Harness::open_with("leads", daemon.target(), Some(daemon), machines);
+    ui.wait_until("the sidebar", |window, _, _| is_visible(window, "new-lead"));
 
     ui.click("new-lead");
     ui.wait_until("the lead's draft", |_, cx, app| {
@@ -1702,14 +1691,24 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
         (Some(LEAD_AGENT.to_owned()), Some(folder.clone()))
     );
     assert!(folder.is_dir(), "the lead's folder is made");
-
-    // Under the header, above s1, though the filter keeps to /w/a.
     ui.wait_until("the lead under the header", |window, _, _| {
-        let tops = ["leads-header", "session-local-new-2", "session-local-s1"]
-            .map(|id| bounds(window, id).map(|bounds| bounds.top()));
-        tops.iter().all(Option::is_some) && tops.is_sorted()
+        is_visible(window, "leads-header") && is_visible(window, "session-local-new-2")
     });
     ui.shot("listed");
+
+    ui.click("new-session");
+    ui.wait_until("a session's draft", |_, _, app| app.draft().is_some());
+    let app = ui.app.clone();
+    ui.act(|_, cx| {
+        let draft = app.read(cx).draft().expect("the draft");
+        let draft = draft.read(cx);
+        assert_eq!(draft.kind(), Kind::Session);
+        assert!(
+            !draft.cwd().path.starts_with(&leads),
+            "a session's draft works outside the leads: {:?}",
+            draft.cwd().path
+        );
+    });
 }
 
 /// Sessions quiet for long start settled. A draft makes no session until

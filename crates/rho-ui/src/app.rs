@@ -41,12 +41,12 @@ use gpui_kit::{
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Checkout, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs, PendingUpgrade,
-    Prompt, Session, SessionId, SessionOptions, VersionFix, VersionMismatch,
+    Attached, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs, PendingUpgrade, Prompt,
+    Session, SessionId, SessionOptions, VersionFix, VersionMismatch, LEAD_AGENT,
 };
 
 mod daemon_control;
-mod leads;
+mod opening;
 mod side_chat;
 
 use crate::machines::RemoteMachine;
@@ -55,10 +55,10 @@ use crate::{
     auths::Auths,
     background_log::BackgroundLog,
     cloning,
-    draft::{DraftEvent, DraftView, Target},
+    draft::{DraftEvent, DraftView},
     forge::Forges,
     kinetic::Kinetic,
-    leads::Folder,
+    leads::Kind,
     machines::{
         DaemonAction, Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach,
         SessionKey,
@@ -70,7 +70,7 @@ use crate::{
     right_panel::{
         PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, TerminalShortcut, MIN_PANE_REMS,
     },
-    session_list::{DraftRow, Kind},
+    session_list::DraftRow,
     session_view::{Link, Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
@@ -950,8 +950,13 @@ impl RhoApp {
         cx: &mut Context<'_, Self>,
     ) {
         match event {
-            SidebarEvent::Open { id, cwd, title } => {
-                self.open_session(id.clone(), cwd.clone(), title.clone(), window, cx);
+            SidebarEvent::Open {
+                id,
+                cwd,
+                title,
+                kind,
+            } => {
+                self.open_session(id.clone(), cwd.clone(), title.clone(), *kind, window, cx);
             }
             SidebarEvent::NewSession => self.new_session(window, cx),
             SidebarEvent::NewLead => self.new_lead(window, cx),
@@ -1155,8 +1160,11 @@ impl RhoApp {
     fn new_session_cwd(&self, cx: &App) -> Place {
         let on_screen = match &self.pane {
             Pane::Session(view) => {
-                let live = view.read(cx).live();
-                (live.kind == Kind::Session).then(|| Place::new(live.id.machine, live.cwd))
+                let view = view.read(cx);
+                (view.kind(cx) == Kind::Session).then(|| {
+                    let live = view.live();
+                    Place::new(live.id.machine, live.cwd)
+                })
             }
             Pane::Draft(view) => {
                 let draft = view.read(cx);
@@ -1186,6 +1194,11 @@ impl RhoApp {
         self.new_draft(Kind::Session, window, cx);
     }
 
+    /// Shows a draft for a new lead and opens its session right away.
+    fn new_lead(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.new_draft(Kind::Lead, window, cx);
+    }
+
     /// Shows a draft of `kind` and opens its session right away: a lead's
     /// on the machine a new session would start on.
     fn new_draft(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1207,17 +1220,12 @@ impl RhoApp {
                 return;
             }
         }
-        let cwd = match kind {
-            Kind::Session => self.new_session_cwd(cx),
-            Kind::Lead => self.leads_root(&self.new_session_cwd(cx).machine, cx),
-        };
+        let cwd = self.new_session_cwd(cx);
         let (workspaces, projects, machines) = (&self.workspaces, &self.projects, &self.machines);
         let auths = self.auths.clone();
         let view = cx.new(|cx| match kind {
             Kind::Session => DraftView::new(cwd, workspaces, projects, machines, auths, window, cx),
-            Kind::Lead => {
-                DraftView::new_lead(cwd, workspaces, projects, machines, auths, window, cx)
-            }
+            Kind::Lead => DraftView::new_lead(cwd.machine, workspaces, machines, auths, window, cx),
         });
         let subscriptions = [
             cx.subscribe_in(
@@ -1235,13 +1243,8 @@ impl RhoApp {
                             cx,
                         );
                     }
-                    DraftEvent::StartIn {
-                        target,
-                        options,
-                        prompt,
-                    } => {
-                        let (options, prompt) = (options.clone(), prompt.clone());
-                        this.start_in(draft, *target, options, prompt, window, cx);
+                    DraftEvent::StartIn { options, prompt } => {
+                        this.start_in(draft, options.clone(), prompt.clone(), window, cx);
                     }
                     DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
                 },
@@ -1310,6 +1313,7 @@ impl RhoApp {
                 let draft = open.view.read(cx);
                 DraftRow::new(
                     open.view.entity_id(),
+                    draft.kind(),
                     draft.cwd().clone(),
                     draft.title(cx),
                     draft.workspace_index(),
@@ -1405,7 +1409,7 @@ impl RhoApp {
     ) {
         let (cwd, request) = draft.read(cx).request();
         let machine = cwd.machine.clone();
-        let leads = (draft.read(cx).kind() == Kind::Lead).then(|| self.leads(&machine, cx));
+        let opening = self.opening(draft.read(cx), /*first*/ None, cx);
         let Some((daemon, epoch)) = self.ready(&machine) else {
             let machines = self.machines.read(cx);
             if machines.status(&machine) == Some(&MachineStatus::Connecting) {
@@ -1419,13 +1423,7 @@ impl RhoApp {
         };
         let draft = draft.downgrade();
         cx.spawn_in(window, async move |this, cx| {
-            let setup = match leads {
-                Some(leads) => leads.open(&daemon, Folder::Root).await,
-                None => daemon
-                    .new_session(&cwd.path, Checkout::Local)
-                    .await
-                    .map_err(|error| error.to_string()),
-            };
+            let setup = opening.open(&daemon, &cwd.path).await;
             let opened = this.update_in(cx, |this, window, cx| {
                 // A draft dropped meanwhile, or moved to another project,
                 // leaves the session unfollowed, and the daemon discards one
@@ -1434,11 +1432,11 @@ impl RhoApp {
                     this.is_current(&machine, epoch) && draft.read(cx).awaits(request)
                 })?;
                 match setup {
-                    Ok(setup) => {
+                    Ok((setup, dir)) => {
                         let session = Session::from_setup(setup);
                         let id = SessionKey::new(machine.clone(), session.id().clone());
                         let daemon = daemon.clone();
-                        draft.update(cx, |draft, cx| draft.open(daemon, session, window, cx));
+                        draft.update(cx, |draft, cx| draft.open(daemon, session, dir, window, cx));
                         Some(id)
                     }
                     Err(error) => {
@@ -1490,17 +1488,17 @@ impl RhoApp {
         }
     }
 
-    /// Starts `draft`'s first message, `prompt`, in a session of its own
-    /// where `target` says: in a new worktree of the draft's directory, or
-    /// as a lead in a folder made for it, named from `prompt`. Opens it,
-    /// gives it `options`, the draft session's settings, follows it, then
-    /// shows it and sends `prompt`. Until then the draft stays, with its own
-    /// session, so a failure leaves it as it was, and only a session that
-    /// starts makes a worktree.
+    /// Starts `draft`'s first message, `prompt`, in a session of its own,
+    /// as [`Self::opening`] says: for a session's draft, in a new worktree
+    /// of its directory; for a lead's, as a lead in a folder made for it,
+    /// named from `prompt`. Opens it, gives it `options`, the draft
+    /// session's settings, follows it, then shows it and sends `prompt`.
+    /// Until then the draft stays, with its own session, so a failure
+    /// leaves it as it was: only a session that starts keeps its worktree,
+    /// and a lead's folder goes again while it is empty.
     fn start_in(
         &mut self,
         draft: &Entity<DraftView>,
-        target: Target,
         options: Option<SessionOptions>,
         prompt: Prompt,
         window: &mut Window,
@@ -1508,21 +1506,14 @@ impl RhoApp {
     ) {
         let cwd = draft.read(cx).cwd().clone();
         let machine = cwd.machine.clone();
-        let lead_folder = (target == Target::Lead)
-            .then(|| (self.leads(&machine, cx), Folder::named_from(prompt.text())));
+        let opening = self.opening(draft.read(cx), Some(&prompt), cx);
         let Some((daemon, epoch)) = self.ready(&machine) else {
             return;
         };
         let draft = draft.downgrade();
         cx.spawn_in(window, async move |this, cx| {
             let opened = async {
-                let setup = match lead_folder {
-                    Some((leads, folder)) => leads.open(&daemon, folder).await?,
-                    None => daemon
-                        .new_session(&cwd.path, Checkout::NewWorktree)
-                        .await
-                        .map_err(|error| error.to_string())?,
-                };
+                let (setup, dir) = opening.open(&daemon, &cwd.path).await?;
                 let mut session = Session::from_setup(setup);
                 // Nothing follows the session yet, so its events about these
                 // changes go nowhere; the answers carry the settings.
@@ -1542,20 +1533,21 @@ impl RhoApp {
                     }
                     Err(error) => Err(error),
                 };
-                Ok::<_, String>((session, attached))
+                Ok::<_, String>((session, dir, attached))
             }
             .await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let abandoned = this.update_in(cx, |this, window, cx| {
                 let draft = draft
                     .upgrade()
                     .filter(|draft| this.is_current(&machine, epoch) && draft.read(cx).launching());
                 match (opened, draft) {
-                    (Ok((mut session, Ok(attached))), Some(draft)) => {
+                    (Ok((mut session, _, Ok(attached))), Some(draft)) => {
                         let cwd = Place::new(machine.clone(), attached.workspace());
                         session.attached(attached);
                         this.start_session(&draft, session, &cwd, prompt, window, cx);
+                        None
                     }
-                    (Ok((session, attached)), draft) => {
+                    (Ok((session, dir, attached)), draft) => {
                         // Not wanted, or not set up: unfollowed and unsaved,
                         // the daemon discards it, and its clean worktree.
                         let id = session.id().clone();
@@ -1568,13 +1560,19 @@ impl RhoApp {
                             draft
                                 .update(cx, |draft, cx| draft.launch_failed(error.to_string(), cx));
                         }
+                        Some(dir)
                     }
                     (Err(error), Some(draft)) => {
                         draft.update(cx, |draft, cx| draft.launch_failed(error, cx));
+                        None
                     }
-                    (Err(_), None) => {}
+                    (Err(_), None) => None,
                 }
             });
+            // A lead's folder its lead won't use goes while it is empty.
+            if let Ok(Some(dir)) = abandoned {
+                opening.unmake(&dir).await;
+            }
         })
         .detach();
     }
@@ -1882,12 +1880,14 @@ impl RhoApp {
     }
 
     /// Opens a saved session, or switches to it if it is already open.
-    /// `title` is the listed title, shown until the daemon answers.
+    /// `title` is the listed title, shown until the daemon answers, and
+    /// `kind` the listed kind, so a lead shows as one from the start.
     pub(crate) fn open_session(
         &mut self,
         id: SessionKey,
         cwd: PathBuf,
         title: Option<SharedString>,
+        kind: Kind,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1910,6 +1910,9 @@ impl RhoApp {
         // replays as events that may arrive before the attach's answer.
         let mut session = Session::new(id.id.clone());
         session.set_title(title.map(String::from));
+        if kind == Kind::Lead {
+            session.set_agent(Some(LEAD_AGENT.to_owned()));
+        }
         let cwd = Place::new(id.machine.clone(), cwd);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
