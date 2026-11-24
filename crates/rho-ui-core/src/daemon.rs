@@ -265,19 +265,17 @@ pub struct SessionSummary {
     cwd: PathBuf,
     title: Option<String>,
     updated_at: u64,
-    agent: Option<String>,
     parent: Option<SessionId>,
 }
 
 impl SessionSummary {
-    /// A row of `rho/session/list`, which names no agent or parent.
+    /// A row of `rho/session/list`, which names no parent.
     fn from_wire(session: rho_protocol::SessionSummary) -> Self {
         Self {
             id: session.session.into(),
             cwd: session.cwd,
             title: session.title.or(session.first_user_message),
             updated_at: session.updated_at,
-            agent: None,
             parent: None,
         }
     }
@@ -285,7 +283,6 @@ impl SessionSummary {
     /// A row of `rho/session/list_detailed`.
     fn from_detailed(session: rho_protocol::DetailedSessionSummary) -> Self {
         Self {
-            agent: session.agent,
             parent: session.parent.map(SessionId::from),
             ..Self::from_wire(session.summary)
         }
@@ -310,12 +307,6 @@ impl SessionSummary {
     /// When the session was last saved, in Unix seconds.
     pub fn updated_at(&self) -> u64 {
         self.updated_at
-    }
-
-    /// The agent the session runs as, by id (`default` for the default
-    /// agent); `None` from a rho that doesn't say.
-    pub fn agent(&self) -> Option<&str> {
-        self.agent.as_deref()
     }
 
     /// The session that started this one through session control, as rho's
@@ -736,10 +727,10 @@ impl Daemon {
         self.link.as_ref()
     }
 
-    /// Saved sessions in every workspace, newest first, each with the agent
-    /// it runs as and the session that started it. A rho from before
+    /// Saved sessions in every workspace, newest first, each with the
+    /// session that started it. A rho from before
     /// `rho/session/list_detailed` (`MethodNotFound`), as on a machine not
-    /// updated yet, lists them with neither.
+    /// updated yet, lists them without.
     ///
     /// # Errors
     ///

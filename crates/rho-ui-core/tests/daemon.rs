@@ -544,7 +544,6 @@ fn the_session_list_names_the_session_that_started_each() {
                 ("old", None)
             ]
         );
-        assert_eq!(sessions[0].agent(), Some("default"));
 
         // The job list names it too, for a session that saved nothing yet.
         let jobs = daemon.jobs().await.unwrap().active;
@@ -565,12 +564,9 @@ fn the_session_list_names_the_session_that_started_each() {
         let sessions = daemon.list_sessions().await.unwrap();
         let parents: Vec<_> = sessions
             .iter()
-            .map(|s| (s.id().as_str(), s.parent(), s.agent()))
+            .map(|s| (s.id().as_str(), s.parent()))
             .collect();
-        assert_eq!(
-            parents,
-            [("w1", None, None), ("s1", None, None), ("old", None, None)]
-        );
+        assert_eq!(parents, [("w1", None), ("s1", None), ("old", None)]);
     });
 }
 
