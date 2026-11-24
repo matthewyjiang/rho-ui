@@ -291,6 +291,10 @@ impl Harness {
                 .local_cli
                 .set(ForgeCli::Gh, "/nonexistent/gh".to_owned());
         }
+        // Never the user's clone folder, whose projects would join the list.
+        if settings.local_clone_folder.is_empty() {
+            "/nonexistent/clones".clone_into(&mut settings.local_clone_folder);
+        }
         let mut cx = HeadlessAppContext::with_platform(
             text_system(),
             Arc::new(crate::Assets::new("")),
@@ -6178,9 +6182,60 @@ fn a_typed_git_url_clones_into_the_clone_folder() {
     ui.wait_until("the draft in the clone", draft_in(&clone));
     assert!(clone.join(".git").is_dir(), "git cloned it");
     ui.cx.update(|cx| {
-        let projects = ui.app.read(cx).projects(cx).to_vec();
+        let projects = ui.app.read(cx).projects(cx);
         assert_eq!(projects, [Place::local("/w/a"), Place::local(&clone)]);
     });
+}
+
+/// The folders in this machine's clone folder are projects without being
+/// added: the list shows them beside the added ones, with no Remove, as
+/// they stay while their folder does, and New session finds a folder made
+/// since. Choosing one starts the draft there.
+#[test]
+fn the_clone_folders_folders_are_projects() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let folder = rho_ui_core::platform::canonicalize(dir.path()).expect("it resolves");
+    std::fs::create_dir(folder.join("found")).expect("a project folder");
+    let row = |name: &str| -> &'static str {
+        format!("project-local:{}", folder.join(name).display()).leak()
+    };
+    let mut settings = Settings::default();
+    settings.local_clone_folder = folder.display().to_string();
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "found",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            projects: Projects::of(["/w/a"]),
+            settings,
+            ..Machines::default()
+        },
+    );
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    ui.click("new-session");
+    ui.wait_until("the added and the found project", |window, _, _| {
+        is_visible(window, "project-local:/w/a") && is_visible(window, row("found"))
+    });
+    ui.act(|window, cx| window.hover("project-local:/w/a", cx));
+    ui.wait_until("Remove on the added one", |window, _, _| {
+        is_visible(window, "project-remove")
+    });
+    ui.act(|window, cx| window.hover(row("found"), cx));
+    ui.wait_until("no Remove on the found one", |window, _, _| {
+        !is_visible(window, "project-remove")
+    });
+    ui.shot("found");
+
+    std::fs::create_dir(folder.join("later")).expect("another project folder");
+    ui.click("new-session");
+    ui.wait_until("the folder made since", |window, _, _| {
+        is_visible(window, row("later"))
+    });
+    ui.click(row("later"));
+    ui.wait_until("the draft in it", draft_in(&folder.join("later")));
 }
 
 /// In a git project, the project list offers a new worktree, made only

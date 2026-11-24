@@ -379,8 +379,8 @@ impl SidebarView {
             // Labels changed, or a machine came or went.
             cx.observe(&machines, |_, _, cx| cx.notify()),
             cx.observe(&projects, |this, projects, cx| {
-                let roots = projects.read(cx).roots().to_vec();
-                this.prune_filter(|filter| filter.keep_projects(&roots));
+                let projects = projects.read(cx);
+                this.prune_filter(|filter| filter.keep_projects(|root| projects.may_list(root)));
                 this.rebuild(cx);
             }),
             cx.observe(&installs, |_, _, cx| cx.notify()),

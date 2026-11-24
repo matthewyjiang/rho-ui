@@ -140,7 +140,6 @@ pub(super) fn button(sidebar: &SidebarView, cx: &mut Context<'_, SidebarView>) -
         .projects
         .read(cx)
         .roots()
-        .iter()
         .map(|project| {
             let name = workspaces.find(&[project]).map_or_else(
                 || project.path.display().to_string(),

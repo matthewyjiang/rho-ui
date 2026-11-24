@@ -53,6 +53,7 @@ use crate::{
     app_update::AppUpdate,
     auths::Auths,
     background_log::BackgroundLog,
+    cloning,
     draft::{DraftEvent, DraftView},
     forge::Forges,
     kinetic::Kinetic,
@@ -421,6 +422,11 @@ impl RhoApp {
             self.prs.update(cx, |prs, cx| prs.forget(&gone.machine, cx));
             self.forges
                 .update(cx, |forges, cx| forges.forget(&gone.machine, cx));
+            self.projects.update(cx, |projects, cx| {
+                if projects.set_found(&gone.machine, Vec::new()) {
+                    cx.notify();
+                }
+            });
             self.forget_sessions(&gone.machine, window, cx);
             self.drop_drafts(&gone.machine, window, cx);
             self.sidebar
@@ -467,6 +473,28 @@ impl RhoApp {
     fn ready(&self, machine: &MachineId) -> Option<(Daemon, u64)> {
         let connection = self.connection(machine)?;
         Some((connection.daemon.clone()?, connection.epoch))
+    }
+
+    /// Reads `machine`'s clone folder for the projects in it (see
+    /// [`Projects`]). A machine that isn't connected, or a folder that
+    /// can't be read, keeps what was last found there, until the next
+    /// draft or connection reads it again.
+    fn find_projects(&self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        let reader = self.workspaces.read(cx).reader(machine);
+        let folder = self.machines.read(cx).clone_folder(machine).to_string();
+        let executor = cx.background_executor().clone();
+        let (projects, machine) = (self.projects.clone(), machine.clone());
+        cx.spawn(async move |_, cx| {
+            let Ok(found) = cloning::find_projects(reader, folder, executor).await else {
+                return;
+            };
+            projects.update(cx, |projects, cx| {
+                if projects.set_found(&machine, found) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Records how `machine`'s connection is doing, for the views.
@@ -566,6 +594,7 @@ impl RhoApp {
                 workspaces.connected(machine, &daemon, cx);
             });
         }
+        self.find_projects(machine, cx);
         let status = MachineStatus::Ready {
             version: info.version().to_owned().into(),
             pid: info.pid(),
@@ -1140,6 +1169,11 @@ impl RhoApp {
     /// Shows a draft for a new session and opens the session right away; see
     /// [`DraftView`].
     pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // A clone or a folder made since the last New session is a project
+        // now.
+        for connection in &self.connections {
+            self.find_projects(&connection.machine, cx);
+        }
         // An empty draft on screen is reused, so its settings survive; one
         // with a message is left for the sidebar, in place of the new one.
         if let Pane::Draft(view) = &self.pane {
@@ -2075,8 +2109,8 @@ impl RhoApp {
         self.installs.read(cx).offer(machine, cx)
     }
     /// The user's projects, for UI tests.
-    pub(crate) fn projects<'a>(&self, cx: &'a App) -> &'a [Place] {
-        self.projects.read(cx).roots()
+    pub(crate) fn projects(&self, cx: &App) -> Vec<Place> {
+        self.projects.read(cx).roots().cloned().collect()
     }
     /// `machine`'s home directory, as its daemon said, for UI tests.
     pub(crate) fn workspaces_home(&self, machine: &MachineId, cx: &App) -> Option<PathBuf> {

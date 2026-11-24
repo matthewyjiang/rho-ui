@@ -770,11 +770,11 @@ impl Filter {
         *self != before
     }
 
-    /// Keeps to the chosen projects still in `roots`, the ones the menu
-    /// offers. Returns whether the filter changed.
-    pub(crate) fn keep_projects(&mut self, roots: &[Place]) -> bool {
+    /// Keeps to the chosen projects that `listed` says the menu offers, or
+    /// may yet. Returns whether the filter changed.
+    pub(crate) fn keep_projects(&mut self, listed: impl Fn(&Place) -> bool) -> bool {
         let before = self.projects.len();
-        self.projects.retain(|project| roots.contains(project));
+        self.projects.retain(listed);
         self.projects.len() != before
     }
 
@@ -1316,8 +1316,12 @@ mod tests {
 
         // What the menu no longer offers stops filtering, so nothing stays
         // hidden with no item left to undo it.
-        assert!(!filter.keep_projects(&[Place::new(there.clone(), "/srv")]));
-        assert!(filter.keep_projects(&[]), "the chosen project was removed");
+        let srv = Place::new(there.clone(), "/srv");
+        assert!(!filter.keep_projects(|root| *root == srv));
+        assert!(
+            filter.keep_projects(|_| false),
+            "the chosen project was removed"
+        );
         assert!(filter.is_empty());
         filter.toggle_machine(&there);
         filter.toggle_project(&Place::new(there.clone(), "/srv"));

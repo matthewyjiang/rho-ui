@@ -16,7 +16,9 @@ A session stays Done until you open it, even across restarts of rho-ui. A turn t
 
 ## Projects
 
-rho-ui doesn't find projects on its own: add the folders you work in. Type a path in the project search to browse, or paste a git URL to clone it into the machine's clone folder (`$RHO_HOME/projects` unless you set one in **Settings → Machines**).
+Every folder in a machine's clone folder (`$RHO_HOME/projects` unless you set one in **Settings → Machines**) is a project, found again each time you start a new session. Since the folder puts it on the list, removing it from the list does nothing: move or delete the folder instead. Hidden folders are skipped.
+
+Add the folders you work in elsewhere yourself. Type a path in the project search to browse, or paste a git URL to clone it into the machine's clone folder.
 
 A project is a repository rather than one checkout of it. Adding a linked worktree or a subfolder adds the repository it belongs to. With several machines, checkouts of the same repository count as one project, matched by repository name, so a project missing from one machine offers to clone it there.
 

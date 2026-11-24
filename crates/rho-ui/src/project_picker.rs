@@ -35,7 +35,7 @@ use gpui_kit::component::{
     kbd::Kbd,
     label::Label,
     list::{List, ListDelegate, ListEvent, ListItem, ListState},
-    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     notification::Notification,
     separator::Separator,
     spinner::Spinner,
@@ -631,13 +631,19 @@ fn remove(projects: &Entity<Projects>, root: &Place, cx: &mut App) {
     });
 }
 
-/// The item of a project row's right-click menu that takes `root` off the
-/// user's projects.
-fn remove_item(projects: &Entity<Projects>, root: &Place) -> PopupMenuItem {
+/// The right-click menu of a project row: Remove, which takes `root` off
+/// the user's projects, unless it is in its machine's clone folder, which
+/// keeps it on the list.
+fn with_remove(menu: PopupMenu, projects: &Entity<Projects>, root: &Place, cx: &App) -> PopupMenu {
+    if projects.read(cx).is_found(root) {
+        return menu;
+    }
     let (projects, root) = (projects.clone(), root.clone());
-    PopupMenuItem::new("Remove from list")
-        .icon(Icon::new(IconName::Close))
-        .on_click(move |_, _, cx| remove(&projects, &root, cx))
+    menu.item(
+        PopupMenuItem::new("Remove from list")
+            .icon(Icon::new(IconName::Close))
+            .on_click(move |_, _, cx| remove(&projects, &root, cx)),
+    )
 }
 
 impl Render for ProjectPicker {
@@ -795,7 +801,7 @@ impl ProjectList {
     /// Follows the project list: gives each project a workspace, so its
     /// repository is read, then lists them again.
     fn sync(&mut self, cx: &mut App) {
-        let roots = self.projects.read(cx).roots().to_vec();
+        let roots: Vec<Place> = self.projects.read(cx).roots().cloned().collect();
         self.known = self.workspaces.update(cx, |workspaces, cx| {
             roots
                 .iter()
@@ -940,7 +946,8 @@ impl ProjectList {
         let workspace = self.workspaces.read(cx).get(ix);
         let checked = self.checked == Some(ix);
         let root = workspace.place().clone();
-        let trailing = if self.hovered == Some(ix) {
+        let removable = !self.projects.read(cx).is_found(&root);
+        let trailing = if removable && self.hovered == Some(ix) {
             let (projects, root) = (self.projects.clone(), root.clone());
             div()
                 // The button acts on the row; it must not also pick it.
@@ -1004,7 +1011,7 @@ impl ProjectList {
                         .child(trailing)
                         .child(check),
                 )
-                .context_menu(move |menu, _, _| menu.item(remove_item(&projects, &root))),
+                .context_menu(move |menu, _, cx| with_remove(menu, &projects, &root, cx)),
             )
     }
 
@@ -1053,7 +1060,7 @@ impl ProjectList {
                 .child(trailing)
                 // Its machine may be gone from the settings, so it can be
                 // removed from here.
-                .context_menu(move |menu, _, _| menu.item(remove_item(&projects, &root))),
+                .context_menu(move |menu, _, cx| with_remove(menu, &projects, &root, cx)),
             )
     }
 }

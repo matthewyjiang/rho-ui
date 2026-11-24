@@ -1,14 +1,18 @@
 //! The projects a new session can start in, each a folder on one machine.
 //! The user adds them, by typing a path or with the folder chooser, and
-//! removes them; rho-ui never adds one on its own. A project is a folder,
+//! removes them. rho-ui also finds the folders in each machine's clone
+//! folder (see [`crate::cloning::find_projects`]): those are projects for
+//! as long as they are there, so removing one doesn't take it off the
+//! list. A project is a folder,
 //! and for a git repository on this machine it is the main checkout: adding
 //! a linked worktree or a subfolder adds the repository it belongs to (see
 //! [`crate::repo::Repo::root`]).
 //!
-//! The list lives in the state database's `projects` table (see
-//! [`StateDb`]), in the order the projects were added.
+//! The added projects live in the state database's `projects` table (see
+//! [`StateDb`]), in the order added. Found ones aren't saved: the clone
+//! folder is read again as each machine connects and each draft opens.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rho_ui_core::platform;
 
@@ -20,7 +24,13 @@ use crate::{
 /// The user's projects.
 #[derive(Debug)]
 pub(crate) struct Projects {
+    /// Those the user added, in the order added.
     roots: Vec<Place>,
+    /// Those found in each machine's clone folder, as last read, sorted
+    /// by machine and path.
+    found: Vec<Place>,
+    /// The machines whose clone folder has been read.
+    read: Vec<MachineId>,
     db: StateDb,
 }
 
@@ -47,6 +57,8 @@ impl Projects {
         );
         Self {
             roots,
+            found: Vec::new(),
+            read: Vec::new(),
             db: db.clone(),
         }
     }
@@ -61,9 +73,46 @@ impl Projects {
         projects
     }
 
-    /// Every project, in the order added.
-    pub(crate) fn roots(&self) -> &[Place] {
-        &self.roots
+    /// Every project: those added, in the order added, then those found
+    /// and not added.
+    pub(crate) fn roots(&self) -> impl Iterator<Item = &Place> {
+        let found = self.found.iter().filter(|root| !self.roots.contains(root));
+        self.roots.iter().chain(found)
+    }
+
+    /// Whether `root` is in its machine's clone folder, so it stays on the
+    /// list until its folder goes.
+    pub(crate) fn is_found(&self, root: &Place) -> bool {
+        self.found.contains(root)
+    }
+
+    /// Whether `root` may be on the list: it is, or its machine's clone
+    /// folder, where it may be, hasn't been read yet.
+    pub(crate) fn may_list(&self, root: &Place) -> bool {
+        !self.read.contains(&root.machine) || self.roots().any(|known| known == root)
+    }
+
+    /// Takes `found` as the projects in `machine`'s clone folder, in place
+    /// of those last found there. Returns whether the list changed.
+    pub(crate) fn set_found(&mut self, machine: &MachineId, found: Vec<PathBuf>) -> bool {
+        if !self.read.contains(machine) {
+            self.read.push(machine.clone());
+        }
+        let mut all: Vec<Place> = self
+            .found
+            .iter()
+            .filter(|root| root.machine != *machine)
+            .cloned()
+            .chain(
+                found
+                    .into_iter()
+                    .map(|path| Place::new(machine.clone(), path)),
+            )
+            .collect();
+        all.sort();
+        let changed = all != self.found;
+        self.found = all;
+        changed
     }
 
     /// Adds `root`, a project's folder, unless it is in the list already.
@@ -118,7 +167,7 @@ mod tests {
         projects.add(Place::local(platform::path_from_bytes(b"/w/\xff")));
         // The same folder on another machine is another project.
         projects.add(Place::new(MachineId::remote("workstation"), "/w/c"));
-        assert_eq!(Projects::load(&db).roots(), projects.roots());
+        assert_eq!(roots(&Projects::load(&db)), roots(&projects));
     }
 
     #[test]
@@ -128,6 +177,45 @@ mod tests {
         assert!(projects.add(Place::local("/w/b")));
         assert!(!projects.remove(&Place::local("/w/c")));
         assert!(projects.remove(&Place::local("/w/a")));
-        assert_eq!(projects.roots(), [Place::local("/w/b")]);
+        assert_eq!(roots(&projects), [Place::local("/w/b")]);
+    }
+
+    /// A project found in a clone folder lists once, after those added,
+    /// stays when removed while its folder is there, goes when a later
+    /// read of its machine misses it, and isn't saved.
+    #[test]
+    fn found_projects_follow_their_folder() {
+        let db = StateDb::in_memory();
+        let mut projects = Projects::load(&db);
+        let there = MachineId::remote("workstation");
+        projects.add(Place::local("/p/b"));
+        // Until its machine's clone folder is read, any project may be.
+        assert!(projects.may_list(&Place::local("/p/a")));
+        assert!(projects.set_found(&MachineId::local(), vec!["/p/a".into(), "/p/b".into()]));
+        assert!(projects.set_found(&there, vec!["/p/c".into()]));
+        let listed = [
+            Place::local("/p/b"),
+            Place::local("/p/a"),
+            Place::new(there.clone(), "/p/c"),
+        ];
+        assert_eq!(roots(&projects), listed);
+        projects.remove(&Place::local("/p/b"));
+        projects.remove(&Place::local("/p/a"));
+        assert_eq!(
+            roots(&projects),
+            [listed[1].clone(), listed[0].clone(), listed[2].clone()]
+        );
+        assert!(
+            !projects.set_found(&there, vec!["/p/c".into()]),
+            "the same read"
+        );
+        assert!(projects.set_found(&MachineId::local(), Vec::new()));
+        assert_eq!(roots(&projects), [Place::new(there, "/p/c")]);
+        assert!(!projects.may_list(&Place::local("/p/a")), "it was read");
+        assert_eq!(roots(&Projects::load(&db)), []);
+    }
+
+    fn roots(projects: &Projects) -> Vec<Place> {
+        projects.roots().cloned().collect()
     }
 }
