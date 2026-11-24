@@ -9,7 +9,11 @@
 //! `window-change` resizes it, as sshd does; a client that closes the
 //! channel first hangs up on it. [`FakeSshd::terminal_ended`] says how
 //! each such session ended, and [`FakeSshd::refuse_terminals`] makes it
-//! refuse pseudo-terminals, as `PermitTTY no` does. It forwards each
+//! refuse pseudo-terminals, as `PermitTTY no` does. It refuses a
+//! connection's session channels past [`MAX_SESSIONS`] open at once, as
+//! sshd's `MaxSessions` does. [`FakeSshd::hold_sessions`] leaves the
+//! session channels asked for unconfirmed, as a slow link does for a
+//! moment, and it counts those it took and those over. It forwards each
 //! `direct-streamlocal` channel to the local socket it names, such as a
 //! [`FakeDaemon`](crate::fake_daemon::FakeDaemon)'s.
 //!
@@ -39,7 +43,7 @@ use russh::{
 use tokio::{
     net::TcpListener,
     runtime::Runtime,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex, Semaphore},
 };
 
 use crate::{
@@ -80,6 +84,19 @@ pub enum TerminalEnd {
     HungUp,
 }
 
+/// The session channels open at once on one connection, past which it
+/// refuses another: the default of sshd's `MaxSessions`.
+pub const MAX_SESSIONS: usize = 10;
+
+/// The session channels clients have asked for that it didn't refuse,
+/// and those of them that are over: the client closed them, or their
+/// command ended.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sessions {
+    asked: usize,
+    ended: usize,
+}
+
 /// A running fake ssh server. Dropping it stops it.
 #[derive(Debug)]
 pub struct FakeSshd {
@@ -94,6 +111,10 @@ pub struct FakeSshd {
     refuse_terminals: Arc<AtomicBool>,
     /// How each session under a pseudo-terminal ended, in order.
     terminal_ends: Mutex<mpsc::UnboundedReceiver<TerminalEnd>>,
+    /// Whether session channels asked for wait unconfirmed.
+    hold_sessions: watch::Sender<bool>,
+    /// The session channels it took, and those of them over.
+    sessions: watch::Sender<Sessions>,
     /// Numbers each target's host, so each gets a connection of its own.
     targets: AtomicUsize,
     _runtime: Runtime,
@@ -166,6 +187,8 @@ impl FakeSshd {
         let sign_ins: Arc<AtomicUsize> = Arc::default();
         let refuse_terminals: Arc<AtomicBool> = Arc::default();
         let (terminal_ended, ends) = mpsc::unbounded_channel();
+        let hold_sessions = watch::Sender::new(false);
+        let sessions = watch::Sender::new(Sessions::default());
         let sshd = Sshd {
             home: home.to_path_buf(),
             accepted: accepted.public_key().clone(),
@@ -173,10 +196,17 @@ impl FakeSshd {
             sign_ins: Arc::clone(&sign_ins),
             refuse_terminals: Arc::clone(&refuse_terminals),
             terminal_ended,
+            hold_sessions: hold_sessions.clone(),
+            sessions: sessions.clone(),
+            open_sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
         };
         runtime.spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (config, sshd) = (Arc::clone(&config), sshd.clone());
+                let config = Arc::clone(&config);
+                let sshd = Sshd {
+                    open_sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
+                    ..sshd.clone()
+                };
                 tokio::spawn(async move {
                     if let Ok(session) = server::run_stream(config, stream, sshd).await {
                         let _ = session.await;
@@ -191,6 +221,8 @@ impl FakeSshd {
             sign_ins,
             refuse_terminals,
             terminal_ends: Mutex::new(ends),
+            hold_sessions,
+            sessions,
             targets: AtomicUsize::new(0),
             _runtime: runtime,
         }
@@ -260,6 +292,37 @@ impl FakeSshd {
     pub async fn terminal_ended(&self) -> Option<TerminalEnd> {
         self.terminal_ends.lock().await.recv().await
     }
+
+    /// Leaves each session channel asked for from now on unconfirmed, as
+    /// a slow link does for a moment, until [`Self::confirm_sessions`].
+    pub fn hold_sessions(&self) {
+        self.hold_sessions.send_replace(true);
+    }
+
+    /// Confirms the session channels [`Self::hold_sessions`] held, and
+    /// each asked for from now on.
+    pub fn confirm_sessions(&self) {
+        self.hold_sessions.send_replace(false);
+    }
+
+    /// Waits until clients have asked for `count` session channels it
+    /// didn't refuse.
+    pub async fn sessions_asked(&self, count: usize) {
+        self.sessions_are(|sessions| sessions.asked >= count).await;
+    }
+
+    /// Waits until every session channel it took is over: none stays
+    /// open, holding one of the sessions sshd allows a connection.
+    pub async fn sessions_ended(&self) {
+        self.sessions_are(|sessions| sessions.ended == sessions.asked)
+            .await;
+    }
+
+    async fn sessions_are(&self, want: impl Fn(&Sessions) -> bool) {
+        let mut sessions = self.sessions.subscribe();
+        // The sender lives as long as `self`.
+        let _ = sessions.wait_for(want).await;
+    }
 }
 
 fn file_name(key: ClientKey) -> &'static str {
@@ -291,6 +354,11 @@ struct Sshd {
     sign_ins: Arc<AtomicUsize>,
     refuse_terminals: Arc<AtomicBool>,
     terminal_ended: mpsc::UnboundedSender<TerminalEnd>,
+    hold_sessions: watch::Sender<bool>,
+    sessions: watch::Sender<Sessions>,
+    /// A permit for each session channel open on this connection, held
+    /// ones too, of [`MAX_SESSIONS`].
+    open_sessions: Arc<Semaphore>,
 }
 
 impl server::Handler for Sshd {
@@ -327,8 +395,25 @@ impl server::Handler for Sshd {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        reply.accept().await;
-        tokio::spawn(run_session(channel, self.clone()));
+        let Ok(open) = Arc::clone(&self.open_sessions).try_acquire_owned() else {
+            // As sshd words its refusal.
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        self.sessions.send_modify(|sessions| sessions.asked += 1);
+        let sshd = self.clone();
+        // In a task, so a held channel doesn't hold up the connection's
+        // other messages, such as the close of one before it.
+        tokio::spawn(async move {
+            let mut held = sshd.hold_sessions.subscribe();
+            // The sender lives as long as `sshd`.
+            let _ = held.wait_for(|held| !held).await;
+            reply.accept().await;
+            let sessions = sshd.sessions.clone();
+            run_session(channel, sshd).await;
+            sessions.send_modify(|sessions| sessions.ended += 1);
+            drop(open);
+        });
         Ok(())
     }
 

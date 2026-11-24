@@ -49,7 +49,8 @@ mod imp {
     /// Runs `future` on the I/O runtime and waits for it. Dropping the
     /// future this returns stops the task, and drops what the task holds,
     /// such as a half-open connection or a script's ssh channel, so a
-    /// caller that stops waiting leaves nothing running.
+    /// caller that stops waiting leaves nothing running, but an ssh
+    /// channel still being opened, which closes itself once it has.
     ///
     /// # Errors
     ///

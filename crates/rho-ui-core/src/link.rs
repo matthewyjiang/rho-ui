@@ -93,6 +93,9 @@ impl Link {
                 ScriptError::TimedOut(deadline) => {
                     format!("a script on {name} ran past {} s", deadline.as_secs())
                 }
+                ScriptError::NoSlot { waited, at_once } => {
+                    format!("a script didn't run: {}", no_slot(name, waited, at_once))
+                }
                 ScriptError::Cut => format!("the connection to {name} closed while a script ran"),
                 ScriptError::Refused => {
                     format!("a script on {name} failed: sshd refused to run sh")
@@ -139,6 +142,13 @@ impl Link {
 pub(crate) enum ScriptError {
     /// It ran past its deadline, this one.
     TimedOut(Duration),
+    /// It never started: its deadline, `waited`, passed while the machine
+    /// was running `at_once` others, the most its link runs at once.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "only an ssh link's scripts wait for a slot")
+    )]
+    NoSlot { waited: Duration, at_once: usize },
     /// The link closed with no word of how the script ended, as when the
     /// connection died.
     Cut,
@@ -150,6 +160,15 @@ pub(crate) enum ScriptError {
     /// The machine couldn't be asked: the connection is gone, or the host
     /// refused a session.
     Session(DaemonError),
+}
+
+/// Words a [`ScriptError::NoSlot`] on the machine `name`.
+pub(crate) fn no_slot(name: &str, waited: Duration, at_once: usize) -> String {
+    format!(
+        "{name} was still running {at_once} other scripts after {} s, the most rho-ui runs \
+         there at once",
+        waited.as_secs()
+    )
 }
 
 /// What a script printed, and how it ended.

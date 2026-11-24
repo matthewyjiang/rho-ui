@@ -8,10 +8,12 @@
 //! the login environment ([`crate::setup`]), then opens a `direct-streamlocal`
 //! channel to the daemon's socket, as `ssh -W` does, and speaks rho's
 //! protocol over it. Every script after that runs in a session channel
-//! of its own on the same connection ([`script`]). The terminals' login
-//! shells, under a pseudo-terminal there ([`shell`]), run on a second
-//! connection, made when the first terminal opens, so they never take the sessions
-//! scripts need; [`MAX_SHELLS`] at most. A new connection costs a key
+//! of its own on the same connection ([`script`]), 5 at once, half the
+//! sessions sshd allows a connection by default; the rest wait their
+//! turn. The terminals' login shells, under a pseudo-terminal there
+//! ([`shell`]), run on a second connection, made when the first terminal
+//! opens, so they never take the sessions scripts need; [`MAX_SHELLS`]
+//! at most. A new connection costs a key
 //! signature, which an agent such as 1Password's asks the user to
 //! approve, so the user approves once per host, and once more for its
 //! terminals, while the app uses the host and the link stays up; a
@@ -225,9 +227,12 @@ impl SshLink {
     /// script.
     pub async fn relay_script(&self, input: Vec<u8>) -> Option<(Vec<u8>, wire::ScriptEnd)> {
         let lease = Arc::clone(&self.lease);
-        let ran = on_io(async move { script::sh(lease.connection(), &input).await })
-            .await
-            .and_then(|ran| ran);
+        let ran = on_io(async move {
+            let connection = lease.connection();
+            script::sh(connection, connection.script_slot().await, &input).await
+        })
+        .await
+        .and_then(|ran| ran);
         crate::server::script_end(ran, self.host())
     }
 

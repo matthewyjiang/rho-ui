@@ -21,8 +21,8 @@
 //! once, without sending the input still queued, and sshd hangs up on
 //! the shell. Clones of [`ShellInput`] don't keep it. One machine runs at
 //! most [`MAX_SHELLS`](crate::MAX_SHELLS) shells at once, the sessions
-//! sshd allows on their connection by default; a shell's slot frees when
-//! its task ends.
+//! sshd allows on their connection by default; a shell's slot frees once
+//! its channel is told to close.
 //!
 //! russh's session loop hands each channel what arrives for it through a
 //! queue of `channel_buffer_size` messages (100, `client::Config`'s
@@ -184,22 +184,20 @@ impl Asked {
 /// it `start`; then forwards what it prints to `output`, and `requests` to
 /// it, at once, so a write waiting on the host's window never stops the
 /// reading. Runs on the I/O runtime; returns when the shell ends, and
-/// closes the channel. Dropped, it closes the channel too, and frees the
-/// slot.
+/// closes the channel, which frees the slot. Dropped, it does both too.
 ///
 /// # Errors
 ///
 /// As [`ShellEnded::wait`].
 async fn run(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     start: Start<'_>,
     output: &mpsc::Sender<Vec<u8>>,
     requests: &mut mpsc::UnboundedReceiver<Request>,
 ) -> Result<(), ShellError> {
-    // Held while this runs.
-    let _slot = connection.shell_slot().map_err(ShellError::NotStarted)?;
+    let slot = connection.shell_slot().map_err(ShellError::NotStarted)?;
     let (mut read, write) = connection
-        .session()
+        .session(slot)
         .await
         .map_err(|error| ShellError::NotStarted(error.to_string()))?;
     let channel = write.channel();

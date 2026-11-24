@@ -64,6 +64,19 @@ const SSHD_SESSIONS: usize = 10;
 /// lower refuses past it, and that error names it.
 pub const MAX_SHELLS: usize = SSHD_SESSIONS;
 
+/// The most scripts running at once on one connection; one past it waits
+/// for another to end. Half of sshd's sessions, because sshd goes on
+/// counting a session for a moment after its channel closes: it frees
+/// the session on the next turn of its loop, after every packet it has
+/// read, and the open of the script that took the slot may be among
+/// them. So each script at once may count twice, and twice this must
+/// fit. Handing scripts over to OpenSSH 8.9's sshd on one machine, 10 at
+/// once had it refuse 104 of 1,200, 6 at once 2 of 10,200, and 5 at once
+/// none of 10,200. A script given up on while it runs leaves its slot at
+/// once, though sshd holds its session until the script's process ends,
+/// so sshd may still refuse one, with an error that names `MaxSessions`.
+pub(super) const SCRIPTS_AT_ONCE: usize = SSHD_SESSIONS / 2;
+
 /// What a connection to a host carries. Scripts burst to a handful of
 /// sessions at once as a session's turn ends, and a terminal pane keeps a
 /// shell for each session it has shown, so the two sharing sshd's 10
@@ -86,6 +99,9 @@ pub(super) struct Connection {
     handle: Handle<Verifier>,
     /// A permit for each terminal's shell open on it, of [`MAX_SHELLS`].
     shells: Arc<Semaphore>,
+    /// A permit for each script's session open on it, of
+    /// [`SCRIPTS_AT_ONCE`].
+    scripts: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -252,6 +268,7 @@ impl Connection {
             resolved: resolved.clone(),
             handle,
             shells: Arc::new(Semaphore::new(MAX_SHELLS)),
+            scripts: Arc::new(Semaphore::new(SCRIPTS_AT_ONCE)),
         })
     }
 
@@ -271,23 +288,39 @@ impl Connection {
     }
 
     /// Opens a session channel, for one command: its reading half, and its
-    /// writing half, which closes the channel when dropped.
+    /// writing half, which closes the channel when dropped. The channel
+    /// holds `slot`, from [`Self::script_slot`] or [`Self::shell_slot`],
+    /// until it has been told to close.
+    ///
+    /// The open runs in a task of its own, to its end whether or not the
+    /// caller still waits. russh can't take back a channel it has asked
+    /// for, and closes none it is never told to, so one whose caller went
+    /// before sshd confirmed it would stay open, holding one of sshd's
+    /// [`SSHD_SESSIONS`] until the connection ends; ten of those and sshd
+    /// refuses every script. The task closes a channel nobody took.
     ///
     /// # Errors
     ///
     /// Fails if the connection is gone, or the host refuses a session, as
     /// at sshd's `MaxSessions`.
-    pub(super) async fn session(&self) -> Result<(ChannelReadHalf, CloseOnDrop), DaemonError> {
+    pub(super) async fn session(
+        self: &Arc<Self>,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<(ChannelReadHalf, CloseOnDrop), DaemonError> {
         let host = &self.host;
         if self.is_closed() {
             return Err(DaemonError::Unreachable(format!(
                 "no ssh connection to {host}"
             )));
         }
-        let channel = self
-            .handle
-            .channel_open_session()
+        let connection = Arc::clone(self);
+        let opening = io().spawn(async move {
+            let (read, write) = connection.handle.channel_open_session().await?.split();
+            Ok::<_, russh::Error>((read, CloseOnDrop(Some((write, slot)))))
+        });
+        opening
             .await
+            .map_err(|_| DaemonError::Closed)?
             .map_err(|error| match error {
                 russh::Error::ChannelOpenFailure(reason) => DaemonError::Unreachable(format!(
                     "{host} refused an ssh session ({reason:?}): sshd allows \
@@ -297,16 +330,25 @@ impl Connection {
                 other => DaemonError::Unreachable(format!(
                     "couldn't open an ssh session on {host}: {other}"
                 )),
-            })?;
-        let (read, write) = channel.split();
-        Ok((read, CloseOnDrop(Some(write))))
+            })
     }
 
-    /// A slot for one more terminal's shell, of [`MAX_SHELLS`]; the shell
-    /// holds it while it runs, and dropping it frees it. sshd frees the
-    /// shell's session a moment later, once the shell has gone, so a
-    /// terminal opened at once in its place may meet sshd's own refusal,
-    /// whose error names `MaxSessions` too.
+    /// A slot for one more script, of [`SCRIPTS_AT_ONCE`], once one is
+    /// free: a burst of scripts runs that many at a time, in the order
+    /// they asked, rather than have sshd refuse those past its
+    /// `MaxSessions`. Dropping the future gives up its place.
+    pub(super) async fn script_slot(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.scripts)
+            .acquire_owned()
+            .await
+            .expect("nothing closes the scripts' semaphore")
+    }
+
+    /// A slot for one more terminal's shell, of [`MAX_SHELLS`]; the
+    /// shell's channel holds it ([`Self::session`]) until it is told to
+    /// close. sshd frees the shell's session a moment later, once the
+    /// shell has gone, so a terminal opened at once in its place may meet
+    /// sshd's own refusal, whose error names `MaxSessions` too.
     ///
     /// # Errors
     ///
@@ -328,15 +370,32 @@ impl Connection {
     /// A stream to the Unix socket `socket` on the host, such as the Rho
     /// daemon's, over a `direct-streamlocal` channel, as `ssh -W` opens.
     ///
+    /// The open runs to its end whether or not the caller still waits, as
+    /// [`Self::session`]'s does: the stream closes its channel when
+    /// dropped, so a connect given up on leaves no channel to the daemon
+    /// open.
+    ///
     /// # Errors
     ///
     /// Fails if sshd won't forward to the socket, or nothing listens there.
-    pub(super) async fn daemon(&self, socket: &str) -> Result<ChannelStream<Msg>, DaemonError> {
+    pub(super) async fn daemon(
+        self: &Arc<Self>,
+        socket: &str,
+    ) -> Result<ChannelStream<Msg>, DaemonError> {
         let host = &self.host;
-        let channel = self
-            .handle
-            .channel_open_direct_streamlocal(socket)
+        let opening = io().spawn({
+            let (connection, socket) = (Arc::clone(self), socket.to_owned());
+            async move {
+                let channel = connection
+                    .handle
+                    .channel_open_direct_streamlocal(socket)
+                    .await?;
+                Ok::<_, russh::Error>(channel.into_stream())
+            }
+        });
+        opening
             .await
+            .map_err(|_| DaemonError::Closed)?
             .map_err(|error| {
                 DaemonError::Unreachable(match error {
                     russh::Error::ChannelOpenFailure(
@@ -353,28 +412,30 @@ impl Connection {
                         format!("couldn't reach the Rho daemon on {host} at {socket}: {other}")
                     }
                 })
-            })?;
-        Ok(channel.into_stream())
+            })
     }
 }
 
 /// A channel's writing half that closes the channel when dropped, as when
 /// a script's future is given up, a shell ends or is hung up on, or sshd
-/// refused either. Closing one already closed does nothing.
-pub(super) struct CloseOnDrop(Option<ChannelWriteHalf<Msg>>);
+/// refused either. Closing one already closed does nothing. With it, the
+/// channel's slot on its connection, freed once the close is sent.
+pub(super) struct CloseOnDrop(Option<(ChannelWriteHalf<Msg>, OwnedSemaphorePermit)>);
 
 impl CloseOnDrop {
     pub(super) fn channel(&self) -> &ChannelWriteHalf<Msg> {
-        self.0.as_ref().expect("only dropping takes the channel")
+        let (channel, _) = self.0.as_ref().expect("only dropping takes the channel");
+        channel
     }
 }
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
-        if let Some(channel) = self.0.take() {
+        if let Some((channel, slot)) = self.0.take() {
             // On the I/O runtime, as the future may drop on any thread.
             io().spawn(async move {
                 let _ = channel.close().await;
+                drop(slot);
             });
         }
     }

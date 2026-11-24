@@ -248,6 +248,77 @@ fn a_machine_runs_at_most_max_shells_and_a_dropped_control_hangs_up() {
     );
 }
 
+/// A script given up on before sshd confirms its session channel, as each
+/// key typed in the project search gives up the last one's folder lookup,
+/// still closes the channel once it opens. Left open, each would hold one
+/// of the 10 sessions sshd allows the connection until it ends, and the
+/// eleventh script would be refused.
+#[cfg(unix)]
+#[test]
+fn a_script_dropped_while_its_session_opens_closes_it() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let sshd = FakeSshd::start(home.path());
+    block_on(async {
+        let ssh = sshd.target().link().await.expect("the fake sshd answers");
+        let ssh = rho_ui_core::Link::Ssh(ssh);
+        sshd.hold_sessions();
+        {
+            let mut script = std::pin::pin!(ssh.run_script("true", &[""; 0]));
+            assert!(
+                futures::poll!(&mut script).is_pending(),
+                "the script waits for its session"
+            );
+            within(
+                "the script's session being asked for",
+                sshd.sessions_asked(1),
+            )
+            .await;
+        }
+        sshd.confirm_sessions();
+        within(
+            "the dropped script's session closing",
+            sshd.sessions_ended(),
+        )
+        .await;
+    });
+}
+
+/// Twice as many scripts at once as sshd allows a connection sessions all
+/// run: the connection runs a few at a time and the rest wait their
+/// turn, where sshd would refuse those past its `MaxSessions`.
+#[cfg(unix)]
+#[test]
+fn scripts_past_sshds_sessions_wait_their_turn() {
+    use rho_ui_core::{fake_sshd::MAX_SESSIONS, Link};
+
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let sshd = FakeSshd::start(home.path());
+    block_on(async {
+        let socket = sshd.target().link().await.expect("the fake sshd answers");
+        let ssh = Link::Ssh(socket.clone());
+        // Held, every session asked for counts as open until confirmed.
+        sshd.hold_sessions();
+        let scripts = futures::future::join_all(
+            (0..2 * MAX_SESSIONS).map(|_| ssh.run_script("true", &[""; 0])),
+        );
+        let confirm = async {
+            sshd.sessions_asked(1).await;
+            // A round trip behind the sessions the scripts asked for, so
+            // sshd has counted each, and refused those past its limit,
+            // before it confirms any.
+            assert!(
+                socket.open_socket("/no/such/socket").await.is_err(),
+                "nothing listens there"
+            );
+            sshd.confirm_sessions();
+        };
+        let (ran, ()) = within("the scripts", futures::future::join(scripts, confirm)).await;
+        for ran in ran {
+            ran.expect("a script that waited its turn runs");
+        }
+    });
+}
+
 /// Waits for `shell` to answer what is typed.
 #[cfg(unix)]
 async fn started(shell: &mut rho_ui_core::RemoteShell) {
