@@ -1,26 +1,67 @@
 //! Sessions a session started through session control, as rho's `sessions`
 //! tool does, fold under it: one level deep, under the top-most session up
 //! the parents that the list holds. [`Families`] works out which row each
-//! folds under, [`SessionList::shelve`] puts each family on its starter's
-//! shelf, and [`SessionList::push_family`] lays one out under its starter.
+//! folds under and what each family comes to ([`FamilyMarks`]), which
+//! shelves, ranks and dates it, and [`SessionList::push_family`] lays one
+//! out under its starter.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    machines::SessionKey,
-    shelf::{Shelf, Shelves},
-};
+use crate::{machines::SessionKey, shelf::Shelf};
 
-use super::{Busy, Item, Row, SessionList};
+use super::{Activity, Attention, Item, Passes, Row, SessionList};
 
 /// Where a row sits in the list, as of the last rebuild.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Family {
-    /// On its own: nothing the list holds started it.
-    Top,
-    /// Folded under this session, the top-most up its parents that the
-    /// list holds.
-    Started(SessionKey),
+    /// On its own, over the sessions it started if any, with what the
+    /// family comes to.
+    Top(FamilyMarks),
+    /// Folded under the top-most session up its parents that the list
+    /// holds.
+    Started,
+}
+
+/// What a top row's family, the row and the sessions under it, comes to:
+/// worked out once a rebuild, it places, dates and ranks the family, and
+/// says what its fold line shows and what moves its row offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FamilyMarks {
+    /// The newest last activity in it, in Unix seconds.
+    pub(super) updated: i64,
+    /// The most pressing in it, which ranks it on the active shelf.
+    pub(super) attention: Attention,
+    /// Any session of it is busy, which keeps it active.
+    pub(crate) busy: bool,
+    /// How many of the sessions under the row wait for the user, are Done,
+    /// and work.
+    waiting: usize,
+    done: usize,
+    working: usize,
+}
+
+impl FamilyMarks {
+    /// The one thing the fold line says of the sessions under the row.
+    fn pressing(self) -> Option<Pressing> {
+        if self.waiting > 0 {
+            Some(Pressing::Waiting(self.waiting))
+        } else if self.done > 0 {
+            Some(Pressing::Done(self.done))
+        } else if self.working > 0 {
+            Some(Pressing::Working(self.working))
+        } else {
+            None
+        }
+    }
+}
+
+/// The most pressing thing of the sessions under a fold: how many wait for
+/// the user, else how many are Done, else how many work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pressing {
+    Waiting(usize),
+    Done(usize),
+    Working(usize),
 }
 
 /// Whether a starter's fold shows the sessions it started.
@@ -28,17 +69,32 @@ pub(crate) enum Family {
 pub(crate) enum Fold {
     Open,
     Closed,
+    /// Open because the search or the filter shows some of them and not
+    /// the starter, which shows only for them: the user can't close it.
+    Showing,
 }
 
 /// The line under a starter's row: how many of the sessions it started
-/// the list shows, how many of those are busy, and whether they show.
+/// show under it, the most pressing thing of its family, and whether they
+/// show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FoldLine {
     /// The starter's index into the rows.
     pub(crate) starter: usize,
     pub(crate) sessions: usize,
-    pub(crate) busy: Busy,
+    pub(crate) pressing: Option<Pressing>,
     pub(crate) fold: Fold,
+}
+
+impl Row {
+    /// Whether it is busy, or for a starter, whether any of its family is,
+    /// as of the last rebuild. Its row offers no move then, nor Delete.
+    pub(crate) fn busy(&self) -> bool {
+        match self.family {
+            Family::Top(marks) => marks.busy,
+            Family::Started => !self.activity.is_idle(),
+        }
+    }
 }
 
 /// Which rows fold under which, as of one rebuild.
@@ -66,10 +122,55 @@ impl Families {
         Self { starters, members }
     }
 
+    /// The row that row `ix` folds under, if any.
+    pub(super) fn starter(&self, ix: usize) -> Option<usize> {
+        self.starters[ix]
+    }
+
     /// The rows that fold under row `ix`, newest first: none unless it
     /// started some.
     pub(super) fn members(&self, ix: usize) -> &[usize] {
         self.members.get(&ix).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// The marks of top row `top`'s family, from what its rows do, are
+    /// Done and watch as they stand.
+    pub(super) fn marks(&self, rows: &[Row], top: usize) -> FamilyMarks {
+        let starter = &rows[top];
+        let mut marks = FamilyMarks {
+            updated: starter.updated,
+            attention: starter.attention(),
+            busy: !starter.activity.is_idle(),
+            ..FamilyMarks::default()
+        };
+        for row in self.members(top).iter().map(|&ix| &rows[ix]) {
+            let attention = row.attention();
+            marks.updated = marks.updated.max(row.updated);
+            marks.attention = marks.attention.min(attention);
+            marks.busy |= !row.activity.is_idle();
+            match attention {
+                Attention::Asks => marks.waiting += 1,
+                Attention::Done => marks.done += 1,
+                Attention::Runs if matches!(row.activity, Activity::Working(_)) => {
+                    marks.working += 1;
+                }
+                Attention::Rests | Attention::Runs => {}
+            }
+        }
+        marks
+    }
+
+    /// The rows under top row `top` that show, by `passes`: those the
+    /// filter shows that match the search, or whose starter does.
+    pub(super) fn drawn<'a>(
+        &'a self,
+        top: usize,
+        passes: &'a [Passes],
+    ) -> impl Iterator<Item = usize> + 'a {
+        self.members(top)
+            .iter()
+            .copied()
+            .filter(move |&ix| passes[ix].filter && (passes[ix].search || passes[top].search))
     }
 }
 
@@ -82,111 +183,63 @@ impl SessionList {
         }
     }
 
-    /// Opens the fold session `id` is under, as it comes on screen: at the
-    /// next rebuild that lists it. The user can close it again.
-    pub(crate) fn reveal(&mut self, id: &SessionKey) {
-        self.reveal = Some(id.clone());
+    /// Opens the fold session `id`, on screen now, is under, at the first
+    /// rebuild that lists it under its starter, which may come a poll
+    /// later. The user can close it again. Another session, or `None`,
+    /// drops the request.
+    pub(crate) fn reveal(&mut self, id: Option<&SessionKey>) {
+        self.reveal = id.cloned();
     }
 
-    /// Opens the fold the session to reveal is under, once it is listed.
-    pub(super) fn open_revealed(&mut self, families: &Families) {
-        let Some(id) = &self.reveal else {
-            return;
-        };
-        let Some(ix) = self.rows.iter().position(|row| row.id == *id) else {
-            return;
-        };
-        if let Some(starter) = families.starters[ix] {
-            self.open_folds.insert(self.rows[starter].id.clone());
-        }
-        self.reveal = None;
-    }
-
-    /// Puts every row on its shelf, as of `now`, and sets what it shows.
-    /// A family is on its starter's shelf, which takes the marks: active
-    /// while any of it is busy, and dated by its newest session. `watching`
-    /// holds the sessions whose agent watches a pull request.
-    pub(super) fn shelve(
-        &mut self,
-        families: &Families,
-        shelves: &Shelves,
-        now: i64,
-        watching: &HashSet<SessionKey>,
-    ) {
-        for ix in 0..self.rows.len() {
-            if families.starters[ix].is_some() {
-                continue;
-            }
-            let (rows, members) = (&self.rows, families.members(ix));
-            let busy = |m: &usize| !rows[*m].activity.is_idle();
-            let updated = members
-                .iter()
-                .fold(rows[ix].updated, |newest, &m| newest.max(rows[m].updated));
-            self.rows[ix].shelf = if busy(&ix) || members.iter().any(busy) {
-                Shelf::Active
-            } else {
-                shelves.shelf(&rows[ix].id, updated, now)
-            };
-        }
-        for ix in 0..self.rows.len() {
-            let (placed, family, pinned) = if let Some(starter) = families.starters[ix] {
-                let starter = &self.rows[starter];
-                (starter.shelf, Family::Started(starter.id.clone()), None)
-            } else {
-                let row = &self.rows[ix];
-                (row.shelf, Family::Top, shelves.pinned(&row.id))
-            };
-            let row = &mut self.rows[ix];
-            row.shelf = placed;
-            row.family = family;
-            row.pinned = pinned;
-            row.done = self.unseen.contains(&row.id);
-            row.watching = row.shelf == Shelf::Active && watching.contains(&row.id);
+    /// Readies the folds for a rebuild: forgets those of sessions that
+    /// start none the list holds now, and opens the one the session to
+    /// reveal is under, once it is under one.
+    pub(super) fn keep_folds(&mut self, families: &Families) {
+        let rows = &self.rows;
+        let position = |id: &SessionKey| rows.iter().position(|row| row.id == *id);
+        self.open_folds
+            .retain(|id| position(id).is_some_and(|ix| !families.members(ix).is_empty()));
+        let revealed = self.reveal.as_ref().and_then(position);
+        if let Some(starter) = revealed.and_then(|ix| families.starter(ix)) {
+            self.open_folds.insert(rows[starter].id.clone());
+            self.reveal = None;
         }
     }
 
-    /// Pushes the fold line under top row `starter`, if it started any
-    /// sessions (`family`), then, while it's open, those that show, laid
-    /// out by the starter's shelf: all of them when the starter matches
-    /// the search (`matched`, by row); else only those that match, with
-    /// the fold open.
+    /// Pushes the fold line under top row `top`, whose family comes to
+    /// `marks`, when any of the sessions under it show (see
+    /// [`Families::drawn`]), then, while it's open, those, laid out on its
+    /// shelf.
     pub(super) fn push_family(
         &self,
         items: &mut Vec<Item>,
-        starter: usize,
-        family: &[usize],
-        matched: &[bool],
+        families: &Families,
+        top: usize,
+        marks: FamilyMarks,
+        passes: &[Passes],
     ) {
-        if family.is_empty() {
+        let mut drawn: Vec<usize> = families.drawn(top, passes).collect();
+        if drawn.is_empty() {
             return;
         }
-        let placed = self.rows[starter].shelf;
-        let mut shown: Vec<usize> = family
-            .iter()
-            .copied()
-            .filter(|&ix| matched[starter] || matched[ix])
-            .collect();
-        if placed == Shelf::Active {
+        let starter = &self.rows[top];
+        if starter.shelf == Shelf::Active {
             // Stable, so sessions that tie keep their order, newest first.
-            shown.sort_by_key(|&ix| self.rows[ix].attention());
+            drawn.sort_by_key(|&ix| self.rows[ix].attention());
         }
-        let fold = if !matched[starter] || self.open_folds.contains(&self.rows[starter].id) {
-            Fold::Open
-        } else {
-            Fold::Closed
+        let fold = match (passes[top].both(), self.open_folds.contains(&starter.id)) {
+            (false, _) => Fold::Showing,
+            (true, true) => Fold::Open,
+            (true, false) => Fold::Closed,
         };
-        let mut busy = Busy::default();
-        for &ix in &shown {
-            busy.add(self.rows[ix].activity);
-        }
         items.push(Item::Fold(FoldLine {
-            starter,
-            sessions: shown.len(),
-            busy,
+            starter: top,
+            sessions: drawn.len(),
+            pressing: marks.pressing(),
             fold,
         }));
-        if fold == Fold::Open {
-            items.extend(shown.into_iter().map(|ix| Item::row(placed, ix)));
+        if fold != Fold::Closed {
+            items.extend(drawn.into_iter().map(|ix| Item::row(starter.shelf, ix)));
         }
     }
 }
@@ -222,8 +275,29 @@ fn starters(rows: &[(&SessionKey, Option<&SessionKey>)]) -> Vec<Option<usize>> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, path::Path};
+
+    use web_time::Instant;
+
+    use rho_ui_core::JobActivity;
+
     use super::*;
-    use crate::machines::MachineId;
+    use crate::{
+        machines::{MachineId, Place},
+        session_list::{
+            tests::{here, id, job, rebuild, saved, shown},
+            Filter, JobSession, SavedSession,
+        },
+        shelf::Shelves,
+    };
+
+    /// A saved session that session `parent` started.
+    fn started(text: &str, title: &str, updated: i64, parent: &str) -> SavedSession {
+        SavedSession {
+            parent: Some(id(parent)),
+            ..saved(text, Some(title), updated)
+        }
+    }
 
     #[test]
     fn a_row_folds_under_the_top_most_starter_the_list_holds() {
@@ -258,5 +332,144 @@ mod tests {
             .chain([None])
             .collect();
         assert_eq!(starters(&rows), expected);
+    }
+
+    /// Sessions a session started fold under it, on its shelf: a settled
+    /// family stays settled together, dated by its newest session, until
+    /// one of it is busy, a session with no saved row yet included, which
+    /// makes it active. It ranks by its most pressing session, and its fold
+    /// line says who asks, else who is Done, else who works. The session on
+    /// screen opens the fold it is under once the list knows its starter.
+    #[test]
+    fn a_family_lives_on_its_starters_shelf_and_a_busy_member_keeps_it_active() {
+        let mut shelves = Shelves::default();
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                saved("other", Some("Other"), 6),
+                started("w2", "Test", 5, "lead"),
+                started("w1", "Write", 4, "lead"),
+                saved("solo", Some("Solo"), 4),
+                saved("lead", Some("Lead"), 3),
+            ],
+        );
+        shelves.settle(&id("lead"), 10);
+        shelves.settle(&id("solo"), 10);
+        rebuild(&mut list, &shelves, 10);
+        assert_eq!(shown(&list), ["Other", "~", "[Settled 2]"]);
+        list.toggle(Shelf::Settled);
+        list.toggle_fold(&id("lead"));
+        rebuild(&mut list, &shelves, 10);
+        // Newer than Solo by its newest session, though Lead itself isn't.
+        let settled = ["Lead", "⌄ 2 started", "  Test", "  Write", "Solo"];
+        assert_eq!(shown(&list)[3..], settled);
+
+        let asks = JobSession {
+            parent: Some(id("lead")),
+            ..job("w3", JobActivity::Waiting, None)
+        };
+        let writes = job("w1", JobActivity::Working, None);
+        list.set_jobs(&here(), vec![asks, writes], Instant::now(), 11);
+        rebuild(&mut list, &shelves, 11);
+        let asking = [
+            "Lead",
+            "⌄ 3 started, 1 waiting",
+            "  job w3",
+            "  Test",
+            "  Write",
+        ];
+        assert_eq!(shown(&list)[..5], asking);
+        assert_eq!(shown(&list)[5..], ["Other", "~", "[Settled 1]", "Solo"]);
+
+        // Write's turn ends off screen while Test works: Done beats work,
+        // and ranks the family over Other at rest.
+        let testing = || job("w2", JobActivity::Working, None);
+        list.set_jobs(&here(), vec![testing()], Instant::now(), 12);
+        list.toggle_fold(&id("lead"));
+        rebuild(&mut list, &shelves, 12);
+        assert_eq!(shown(&list)[..3], ["Lead", "› 2 started, 1 done", "Other"]);
+
+        // On screen before the list says who started it, it shows on its
+        // own until a poll says, which opens the fold.
+        list.reveal(Some(&id("w4")));
+        let unknown = job("w4", JobActivity::Working, None);
+        list.set_jobs(&here(), vec![testing(), unknown], Instant::now(), 13);
+        rebuild(&mut list, &shelves, 13);
+        assert_eq!(
+            shown(&list)[..4],
+            ["Lead", "› 2 started, 1 done", "Other", "job w4"]
+        );
+        let known = JobSession {
+            parent: Some(id("lead")),
+            ..job("w4", JobActivity::Working, None)
+        };
+        list.set_jobs(&here(), vec![testing(), known], Instant::now(), 14);
+        rebuild(&mut list, &shelves, 14);
+        let revealed = [
+            "Lead",
+            "⌄ 3 started, 1 done",
+            "  Write",
+            "  job w4",
+            "  Test",
+        ];
+        assert_eq!(shown(&list)[..5], revealed);
+    }
+
+    /// A search or a filter that shows only sessions a session started
+    /// shows their starter with the fold held open and only those sessions;
+    /// one that shows the starter shows the rest of its family the filter
+    /// shows, folded as the user left it.
+    #[test]
+    fn a_search_that_matches_a_member_shows_its_starter_with_the_fold_open() {
+        let shelves = Shelves::default();
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                SavedSession {
+                    workspace: 1,
+                    ..started("w2", "Test the parser", 5, "lead")
+                },
+                started("w1", "Write the parser", 4, "lead"),
+                saved("lead", Some("Plan the release"), 3),
+                saved("other", Some("Other work"), 2),
+            ],
+        );
+        let relist = |list: &mut SessionList| {
+            let roots = |ix: usize| match ix {
+                0 => ("atlas", Path::new("/w")),
+                _ => ("srv", Path::new("/srv")),
+            };
+            list.rebuild(&shelves, 10, &HashSet::new(), roots);
+        };
+        list.set_query("write");
+        relist(&mut list);
+        let write = ["Plan the release", "• 1 started", "  Write the parser"];
+        assert_eq!(shown(&list), write);
+        assert_eq!(list.count(Shelf::Active), 1);
+
+        list.set_query("plan");
+        relist(&mut list);
+        assert_eq!(shown(&list), ["Plan the release", "› 2 started"]);
+
+        // Kept to the starter's project: only Write folds under it.
+        list.set_query("");
+        let mut filter = Filter::default();
+        filter.toggle_project(&Place::new(here(), "/w"));
+        list.set_filter(filter.clone());
+        relist(&mut list);
+        assert_eq!(
+            shown(&list),
+            ["Plan the release", "› 1 started", "Other work"]
+        );
+
+        // Kept to another project, the starter shows only for Test.
+        filter.toggle_project(&Place::new(here(), "/w"));
+        filter.toggle_project(&Place::new(here(), "/srv"));
+        list.set_filter(filter);
+        relist(&mut list);
+        let srv = ["Plan the release", "• 1 started", "  Test the parser"];
+        assert_eq!(shown(&list), srv);
     }
 }

@@ -12,7 +12,8 @@
 //! opens from its header into one-line rows, its newest 25 at first, and
 //! Show more under them adds 25 more at a time. A session another session
 //! started is drawn indented under it, behind a line that counts them and
-//! opens on a click, or by itself when one of them comes on screen.
+//! opens on a click, or by itself when one of them comes on screen, or
+//! while the search or the filter shows some of them and not their starter.
 //! Hovering a row shows its details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
 //! which machines aren't connected, with what would fix it (Retry, a
@@ -68,7 +69,7 @@ use crate::{
     pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
     session_list::{
-        Activity, Busy, DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Row,
+        Activity, DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
         SavedSession, SessionList, SHELF_PAGE,
     },
     settings::{self, Settings},
@@ -198,20 +199,17 @@ impl ShelfAction {
     ];
 
     /// What a row offers, inline and in its menu. A busy session offers
-    /// nothing: it shows as active until its turn ends. Nor does a pinned
-    /// one, which stays active until unpinned, or one a session started,
-    /// which moves with that one.
+    /// nothing: it shows as active until its turn ends, as does a session
+    /// whose family is busy. Nor does a pinned one, which stays active
+    /// until unpinned, or one a session started, which moves with that one.
     fn for_row(row: &Row) -> &'static [ShelfAction] {
-        if row.pinned.is_some() || matches!(row.family, Family::Started(_)) {
+        if row.pinned.is_some() || row.family == Family::Started || row.busy() {
             return &[];
         }
-        Self::offered(row.shelf, row.activity)
+        Self::offered(row.shelf)
     }
 
-    fn offered(shelf: Shelf, activity: Activity) -> &'static [ShelfAction] {
-        if !activity.is_idle() {
-            return &[];
-        }
+    fn offered(shelf: Shelf) -> &'static [ShelfAction] {
         match shelf {
             Shelf::Active => &Self::ON_ACTIVE,
             Shelf::Snoozed => &[ShelfAction::Restore, ShelfAction::Settle],
@@ -494,6 +492,7 @@ impl SidebarView {
             .as_ref()
             .is_some_and(|active| active.machine == *machine)
         {
+            self.list.reveal(None);
             self.active = None;
         }
         self.rebuild(cx);
@@ -566,6 +565,7 @@ impl SidebarView {
             .as_ref()
             .is_some_and(|active| active.machine == *machine)
         {
+            self.list.reveal(None);
             self.active = None;
         }
         self.rebuild(cx);
@@ -574,9 +574,7 @@ impl SidebarView {
     /// Puts session `id` on screen, opening the fold it is under.
     pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.active != id {
-            if let Some(id) = &id {
-                self.list.reveal(id);
-            }
+            self.list.reveal(id.as_ref());
             self.active = id;
             self.mark_active_seen();
             // Its PR is listed, whichever shelf it is on.
@@ -644,20 +642,22 @@ impl SidebarView {
                 let workspace = workspaces.get(ix);
                 (workspace.name.as_ref(), workspace.root_path())
             });
-        // The active rows shown have their PRs listed by their daemons,
-        // and so has the session on screen, for its title bar.
-        let mut listed: Vec<SessionKey> = self
+        // Every session on the active shelf the filter shows has its PRs
+        // listed by its daemon, under a closed fold too, as what it watches
+        // ranks its family; so has every row drawn there, a starter shown
+        // for its sessions included, and the session on screen, for its
+        // title bar.
+        let drawn = self.list.items().iter().filter_map(|item| match *item {
+            Item::Session(ix) => Some(self.list.row_at(ix).id.clone()),
+            _ => None,
+        });
+        let active = self
             .list
-            .items()
-            .iter()
-            .filter_map(|item| match *item {
-                Item::Session(ix) => Some(self.list.row_at(ix).id.clone()),
-                _ => None,
-            })
-            .collect();
-        if let Some(active) = &self.active {
-            if !listed.contains(active) {
-                listed.push(active.clone());
+            .on_active_shelf(|ix| workspaces.get(ix).root_path());
+        let mut listed: Vec<SessionKey> = Vec::new();
+        for id in active.into_iter().chain(drawn).chain(self.active.clone()) {
+            if !listed.contains(&id) {
+                listed.push(id);
             }
         }
         self.prs.update(cx, |prs, cx| prs.set_listed(listed, cx));
@@ -1132,7 +1132,7 @@ impl SidebarView {
         div()
             .h(height)
             .px_2()
-            .when(matches!(row.family, Family::Started(_)), |this| {
+            .when(row.family == Family::Started, |this| {
                 this.pl(rems(NEST_REMS))
             })
             .py(rems(GUTTER_REMS))
@@ -1246,7 +1246,9 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// "Snoozed 1 ⌄": the shelf's name and count; a click opens or folds it.
+    /// "Snoozed 1 ⌄": the shelf's name and how many families it holds, a
+    /// session and those it started counting once; a click opens or folds
+    /// it.
     /// Kit's `Accordion` owns its items, which here are separate rows of
     /// the virtual list, so the header is laid out by hand.
     fn render_shelf_header(&self, which: Shelf, cx: &Context<'_, Self>) -> AnyElement {
@@ -1293,36 +1295,33 @@ impl SidebarView {
     }
 
     /// "⌄ 3 sessions · 1 needs you": the line under a session that started
-    /// others, indented as they are, with how many of them wait for the
-    /// user or else work; a click opens or closes the fold. Kit's
+    /// others, indented as they are, with the most pressing thing of its
+    /// family: how many of them wait for the user, else are Done, else
+    /// work. A click opens or closes the fold, unless the search or the
+    /// filter holds it open, which leaves out the chevron. Kit's
     /// `Collapsible` owns its content, which here is separate rows of the
     /// virtual list, so the line is laid out by hand, as a shelf header is.
     fn render_fold(&self, line: FoldLine, cx: &Context<'_, Self>) -> AnyElement {
         let theme = cx.theme();
         let starter = self.list.row_at(line.starter);
         let chevron = match line.fold {
-            Fold::Open => IconName::ChevronDown,
-            Fold::Closed => IconName::ChevronRight,
+            Fold::Open => Some(IconName::ChevronDown),
+            Fold::Closed => Some(IconName::ChevronRight),
+            Fold::Showing => None,
         };
         let count = match line.sessions {
             1 => "1 session".to_owned(),
             sessions => format!("{sessions} sessions"),
         };
         // As their rows say it, in their colors.
-        let busy = match line.busy {
-            Busy {
-                waiting: 0,
-                working: 0,
-            } => None,
-            Busy {
-                waiting: 0,
-                working,
-            } => Some((theme.blue, format!("{working} working"))),
-            Busy { waiting: 1, .. } => Some((theme.warning, "1 needs you".to_owned())),
-            Busy { waiting, .. } => Some((theme.warning, format!("{waiting} need you"))),
-        };
-        let label = match &busy {
-            Some((_, busy)) => format!("{count} · {busy}"),
+        let pressing = line.pressing.map(|pressing| match pressing {
+            Pressing::Waiting(1) => (theme.warning, "1 needs you".to_owned()),
+            Pressing::Waiting(waiting) => (theme.warning, format!("{waiting} need you")),
+            Pressing::Done(done) => (theme.success, format!("{done} done")),
+            Pressing::Working(working) => (theme.blue, format!("{working} working")),
+        });
+        let label = match &pressing {
+            Some((_, pressing)) => format!("{count} · {pressing}"),
             None => count.clone(),
         };
         let hover = theme.sidebar_accent.opacity(0.5);
@@ -1341,16 +1340,19 @@ impl SidebarView {
                     .px_2()
                     .gap_1()
                     .rounded(theme.radius)
-                    .cursor_pointer()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .hover(move |style| style.bg(hover))
-                    .child(Icon::new(chevron).xsmall())
-                    .child(count)
-                    .when_some(busy, |this, (color, busy)| {
-                        this.child("·").child(div().text_color(color).child(busy))
+                    .when_some(chevron, |this, chevron| {
+                        this.cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .child(Icon::new(chevron).xsmall())
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_fold(&key, cx)))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_fold(&key, cx))),
+                    .child(count)
+                    .when_some(pressing, |this, (color, pressing)| {
+                        this.child("·")
+                            .child(div().text_color(color).child(pressing))
+                    }),
             )
             .into_any_element()
     }
@@ -2068,7 +2070,8 @@ enum Pin {
 
 /// The right-click menu: Rename, Pin unless the session moves with the one
 /// that started it, the moves the hover buttons offer,
-/// Copy, and Delete, which a busy session can't do.
+/// Copy, and Delete, which a busy session can't do, nor one whose family is
+/// busy.
 fn row_menu(
     menu: PopupMenu,
     view: &WeakEntity<SidebarView>,
@@ -2195,7 +2198,8 @@ fn copy_menu(
     )
 }
 
-/// Delete…, which asks first, and is greyed out while the session is busy.
+/// Delete…, which asks first, and is greyed out while the session is busy,
+/// or for a starter, while any of its family is.
 fn delete_item(view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenuItem {
     let (view, id, title) = (view.clone(), row.id.clone(), row.title.clone());
     PopupMenuItem::new("Delete…")
@@ -2230,7 +2234,8 @@ struct MenuRow {
     /// What the menu offers: a session a session started has no pin of its
     /// own, as it moves with that one.
     pin: Option<Pin>,
-    /// Busy sessions can't be deleted.
+    /// Busy sessions can't be deleted, nor a starter while any of its
+    /// family is busy: as with moves, it waits for them.
     busy: bool,
 }
 
@@ -2241,32 +2246,60 @@ impl MenuRow {
             title: row.title(),
             cwd: row.cwd.clone(),
             offered: ShelfAction::for_row(row),
-            pin: match (&row.family, row.pinned) {
-                (Family::Started(_), _) => None,
-                (Family::Top, Some(_)) => Some(Pin::Unpin),
-                (Family::Top, None) => Some(Pin::Pin),
+            pin: match (row.family, row.pinned) {
+                (Family::Started, _) => None,
+                (Family::Top(_), Some(_)) => Some(Pin::Unpin),
+                (Family::Top(_), None) => Some(Pin::Pin),
             },
-            busy: !row.activity.is_idle(),
+            busy: row.busy(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, path::Path};
+
     use super::*;
 
+    /// A busy session offers no moves, nor a starter at rest while a
+    /// session it started works, as its family stays active until then;
+    /// shelves offer a way back.
     #[test]
     fn busy_sessions_offer_no_moves_and_shelves_offer_a_way_back() {
-        assert_eq!(
-            ShelfAction::offered(Shelf::Active, Activity::Working(Instant::now())),
-            []
-        );
-        assert_eq!(
-            ShelfAction::offered(Shelf::Settled, Activity::Idle),
-            [ShelfAction::Restore]
-        );
-        assert!(
-            ShelfAction::offered(Shelf::Snoozed, Activity::Idle).contains(&ShelfAction::Restore)
-        );
+        let session = |id: &str, parent: Option<&str>| SavedSession {
+            id: SessionKey::local(id),
+            cwd: PathBuf::from("/w"),
+            title: None,
+            updated: 1,
+            workspace: 0,
+            parent: parent.map(SessionKey::local),
+        };
+        let mut list = SessionList::default();
+        let sessions = vec![
+            session("busy", None),
+            session("w1", Some("lead")),
+            session("lead", None),
+        ];
+        list.set_saved(&MachineId::local(), sessions);
+        for id in ["busy", "w1"] {
+            let live = LiveSession {
+                id: SessionKey::local(id),
+                cwd: PathBuf::from("/w"),
+                title: None,
+                placeholder: "",
+                activity: Activity::Working(Instant::now()),
+            };
+            list.set_live(live, 0, 1);
+        }
+        list.rebuild(&Shelves::default(), 1, &HashSet::new(), |_| {
+            ("w", Path::new("/w"))
+        });
+        for id in ["busy", "lead"] {
+            let row = list.row(&SessionKey::local(id)).expect("listed");
+            assert_eq!(ShelfAction::for_row(row), [], "{id}");
+        }
+        assert_eq!(ShelfAction::offered(Shelf::Settled), [ShelfAction::Restore]);
+        assert!(ShelfAction::offered(Shelf::Snoozed).contains(&ShelfAction::Restore));
     }
 }
