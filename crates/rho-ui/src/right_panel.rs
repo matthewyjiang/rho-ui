@@ -7,9 +7,11 @@
 //! Each surface opens as a tab in the panel's header; hovering a tab swaps
 //! its icon for × to close it, and dragging one onto another moves it
 //! there. Terminal opens as many tabs as asked, each named for the program
-//! it runs; Pull request opens one for the branch's PR and one for each
-//! other PR linked to the session, by hand or by its agent, each named for
-//! its number; the others open one. With none open, the panel lists the
+//! it runs. Side chat opens one for each fork of the session the app makes
+//! and follows (see [`crate::session_view`]); closing its tab deletes the
+//! fork. Pull request opens one for the branch's PR and one for each other
+//! PR linked to the session, by hand or by its agent, each named for its
+//! number; the others open one. With none open, the panel lists the
 //! surfaces to open; + in the header opens a menu of the rest. Each
 //! session has its own tabs ([`TabSet`]): switching sessions switches
 //! tabs, and a session's first time on screen it has none.
@@ -96,13 +98,16 @@ pub(crate) enum Surface {
     PullRequest,
     /// A shell in the session's folder.
     Terminal,
+    /// A side conversation: a fork of the session.
+    SideChat,
 }
 
 impl Surface {
     /// Every surface, in the order the panel lists them.
-    const ALL: [Surface; 5] = [
+    const ALL: [Surface; 6] = [
         Surface::Files,
         Surface::Terminal,
+        Surface::SideChat,
         Surface::Diff,
         Surface::PullRequest,
         Surface::Background,
@@ -116,6 +121,7 @@ impl Surface {
             Surface::Files => "files",
             Surface::PullRequest => "pull-request",
             Surface::Terminal => "terminal",
+            Surface::SideChat => "side-chat",
         }
     }
 
@@ -126,6 +132,7 @@ impl Surface {
             Surface::Files => "Files",
             Surface::PullRequest => "Pull request",
             Surface::Terminal => "Terminal",
+            Surface::SideChat => "Side chat",
         }
     }
 
@@ -136,6 +143,7 @@ impl Surface {
             Surface::Files => Lucide::FolderTree,
             Surface::PullRequest => Lucide::GitPullRequest,
             Surface::Terminal => Lucide::SquareTerminal,
+            Surface::SideChat => Lucide::MessagesSquare,
         }
     }
 
@@ -397,6 +405,7 @@ impl RightPanel {
         tabs.any(|tab| match tab {
             Tab::PullRequest { view, .. } => view.read(cx).has_keyboard(window, cx),
             Tab::Terminal { view, .. } => view.read(cx).has_keyboard_anywhere(window, cx),
+            Tab::SideChat { view, .. } => view.read(cx).has_keyboard(window, cx),
             Tab::Background | Tab::Diff(_) | Tab::Files(_) => false,
         })
     }
@@ -494,7 +503,10 @@ impl RightPanel {
                 Tab::PullRequest { view, .. } if why == Reload::TurnEnded => {
                     view.update(cx, PullRequestSurface::turn_ended);
                 }
-                Tab::Background | Tab::PullRequest { .. } | Tab::Terminal { .. } => {}
+                Tab::Background
+                | Tab::PullRequest { .. }
+                | Tab::Terminal { .. }
+                | Tab::SideChat { .. } => {}
             }
         }
     }
@@ -502,7 +514,9 @@ impl RightPanel {
     /// Shows `surface` for the session on screen: a new tab of a surface
     /// that opens many, else its tab, opened if it has none. Pull request
     /// opens the tabs of the PRs linked to it too. Returns the tab shown,
-    /// or `None` with no session on screen.
+    /// or `None` with no session on screen. Side chat asks the session for
+    /// a fork instead, whose tab opens once the fork does
+    /// ([`Self::open_side_chat`]).
     fn open(
         &mut self,
         surface: Surface,
@@ -511,6 +525,11 @@ impl RightPanel {
     ) -> Option<TabKey> {
         let session = self.on_screen()?.clone();
         let set = self.sets.get_mut(&session)?;
+        if surface == Surface::SideChat {
+            let view = set.view.upgrade()?;
+            view.update(cx, SessionView::start_side_chat);
+            return None;
+        }
         let open = set
             .tabs
             .iter()
@@ -583,7 +602,54 @@ impl RightPanel {
                     _subscriptions: subscriptions,
                 }
             }
+            Surface::SideChat => unreachable!("open() asks the session for a fork"),
         }
+    }
+
+    /// Opens a tab for `view`, a side chat of `session`, the app made, and
+    /// shows it with the keyboard in its composer if `session` is on
+    /// screen.
+    pub(crate) fn open_side_chat(
+        &mut self,
+        session: &SessionKey,
+        view: Entity<SessionView>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(set) = self.sets.get_mut(session) else {
+            return;
+        };
+        let key = set.next_key(Surface::SideChat);
+        let composer = view.read(cx).focus_target(cx);
+        set.push(Tab::SideChat {
+            number: key.number,
+            view,
+        });
+        if self.on_screen() == Some(session) {
+            self.show(key, cx);
+            window.focus(&composer, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Closes the side-chat tabs of `dropped`, views the app let go of.
+    pub(crate) fn close_side_chats(
+        &mut self,
+        dropped: &[Entity<SessionView>],
+        cx: &mut Context<'_, Self>,
+    ) {
+        for set in self.sets.values_mut() {
+            let keys: Vec<TabKey> = set
+                .tabs
+                .iter()
+                .filter(|tab| matches!(tab, Tab::SideChat { view, .. } if dropped.contains(view)))
+                .map(Tab::key)
+                .collect();
+            set.remove(|key| keys.contains(&key));
+        }
+        self.forget_closed_hover();
+        cx.notify();
     }
 
     /// A Pull request tab of `session`, numbered `number`: of PR `linked`,
@@ -705,10 +771,14 @@ impl RightPanel {
     /// those unlinks it through its surface (ending the agent's watch, if
     /// it watches it), and the observer of `prs` closes it once the
     /// daemon's set no longer links it. A refusal shows on that surface.
+    /// A side chat's view is discarded, which deletes the fork.
     fn close(&mut self, session: &SessionKey, key: TabKey, cx: &mut Context<'_, Self>) {
         let Some(set) = self.sets.get_mut(session) else {
             return;
         };
+        if let Some(Tab::SideChat { view, .. }) = set.tab(key) {
+            view.clone().update(cx, SessionView::discard);
+        }
         if let Some(Tab::PullRequest {
             linked: Some(_),
             view,
@@ -841,6 +911,15 @@ impl RightPanel {
         }
     }
 
+    /// The side chat on screen, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn side_chat(&self) -> Option<Entity<SessionView>> {
+        match self.active_tab()? {
+            Tab::SideChat { view, .. } => Some(view.clone()),
+            _ => None,
+        }
+    }
+
     /// The terminal tab on screen's panes, for UI tests.
     #[cfg(test)]
     pub(crate) fn terminal_panes(&self, cx: &App) -> usize {
@@ -852,9 +931,9 @@ impl RightPanel {
 
     /// Whether + has anything to offer: a surface shows, so the list
     /// doesn't, and there is a surface to open.
-    fn offers_more(&self) -> bool {
+    fn offers_more(&self, cx: &App) -> bool {
         self.set()
-            .is_some_and(|set| set.active.is_some() && set.openable().next().is_some())
+            .is_some_and(|set| set.active.is_some() && !set.openable(cx).is_empty())
     }
 
     /// Moves the on-screen session's tab `key` to `index`, where a drag
@@ -1014,7 +1093,7 @@ impl RightPanel {
             let tabs = set.tabs.iter().enumerate();
             tabs.map(move |(index, tab)| self.render_tab(set, index, tab, cx))
         });
-        let openable: Vec<Surface> = set.into_iter().flat_map(TabSet::openable).collect();
+        let openable = set.map(|set| set.openable(cx)).unwrap_or_default();
         let scroll = set.map_or_else(ScrollHandle::new, |set| set.scroll.clone());
         h_flex()
             .flex_shrink_0()
@@ -1039,7 +1118,7 @@ impl RightPanel {
                             .gap_1()
                             .children(tabs),
                     )
-                    .children(self.offers_more().then(|| {
+                    .children(self.offers_more(cx).then(|| {
                         Button::new("panel-surfaces")
                             .ghost()
                             .small()
@@ -1080,7 +1159,7 @@ impl RightPanel {
                         .child(div().flex_1().child(label)),
                 )
         };
-        let open = set.openable().map(|surface| {
+        let open = set.openable(cx).into_iter().map(|surface| {
             row(
                 format!("open-surface-{}", surface.id()).into(),
                 surface.icon(),
@@ -1112,6 +1191,7 @@ impl RightPanel {
             Tab::Files(files) => files.clone().into_any_element(),
             Tab::PullRequest { view, .. } => view.clone().into_any_element(),
             Tab::Terminal { view, .. } => view.clone().into_any_element(),
+            Tab::SideChat { view, .. } => view.clone().into_any_element(),
         }
     }
 }

@@ -30,7 +30,7 @@ In a git project you can start a session in a **New worktree** instead of the pr
 
 ## Commands, skills and agents
 
-Type `/` at the start of a message or `$` anywhere to complete the session's commands and skills: rho's own commands, prompt templates, MCP prompts, workflows and agents. Commands that rho's terminal UI runs itself, such as `/model`, aren't offered: use the composer's footer instead.
+Type `/` at the start of a message or `$` anywhere to complete the session's commands and skills: rho's own commands, prompt templates, MCP prompts, workflows and agents. Commands that rho's terminal UI runs itself, such as `/model`, aren't offered: use the composer's footer instead. `/side` and `/btw` still work: they start a [side chat](./panel#side-chat).
 
 To run a new session as one of the workspace's agents, start its first message with `/agent:<name>` and the task.
 

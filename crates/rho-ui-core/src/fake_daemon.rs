@@ -3,6 +3,10 @@
 //! rho-ui-core's daemon tests and rho-ui's headless UI tests both run it.
 //!
 //! - `rho/session/new` returns "new-1", "new-2", ...
+//! - `rho/session/fork` returns "fork-1", "fork-2", ...: a saved session
+//!   in supervised mode that replays its parent's conversation. The list
+//!   leaves forks out, and deleting a session deletes its forks. Forking a fork, a subagent's session or one that
+//!   saved nothing is refused as rho refuses it.
 //! - `rho/session/list` returns pages of two: new sessions that have had a
 //!   prompt, newest first, then "s1" (titled "first") and "old" (untitled).
 //!   `rho/session/delete` drops one, and `rho/session/rename` titles one.
@@ -533,6 +537,11 @@ impl FakeDaemon {
             .map_or(0, |session| session.prompts)
     }
 
+    /// Whether the daemon has session `id`, saved or loaded.
+    pub fn has_session(&self, id: &str) -> bool {
+        self.service.lock().sessions.contains_key(id)
+    }
+
     /// How many times clients attached to session `id`.
     pub fn attaches(&self, id: &str) -> usize {
         self.service
@@ -1034,6 +1043,8 @@ struct FakeSession {
     /// A subagent's session, which only its run writes: observed, never
     /// attached to.
     subagent: bool,
+    /// For a fork, the session it forked.
+    fork_of: Option<String>,
     /// The actions clients sent on its surfaces.
     surface_actions: Vec<SessionSurfaceActionParams>,
 }
@@ -1059,8 +1070,26 @@ impl FakeSession {
             background: Vec::new(),
             refused_busy: false,
             subagent: false,
+            fork_of: None,
             surface_actions: Vec::new(),
         }
+    }
+
+    /// A fork of `self`: its conversation, in supervised mode, as
+    /// `rho/session/fork` opens one. The tests fork only between turns.
+    fn fork(&self, parent: &str) -> Self {
+        let mut fork = Self::new(
+            &self.cwd.to_string_lossy(),
+            self.title.as_deref(),
+            self.updated_at,
+        );
+        fork.history.clone_from(&self.history);
+        fork.agent.clone_from(&self.agent);
+        fork.settings.model = self.settings.model.clone();
+        fork.settings.reasoning = self.settings.reasoning;
+        fork.settings.mode = PermissionMode::Supervised;
+        fork.fork_of = Some(parent.to_owned());
+        fork
     }
 
     /// The session of a subagent in `cwd` whose run, `turn`, is under way
@@ -1664,6 +1693,7 @@ struct State {
     sessions: BTreeMap<String, FakeSession>,
     /// How many of each the daemon has made, for their IDs.
     new_sessions: u64,
+    forks: u64,
     /// How many sessions asked for a new worktree.
     worktrees: usize,
     /// Session worktrees on disk, for `rho/worktree/prune`.
@@ -1804,6 +1834,7 @@ impl State {
         let mut state = Self {
             sessions,
             new_sessions: 0,
+            forks: 0,
             worktrees: 0,
             session_worktrees: Vec::new(),
             holds: 0,

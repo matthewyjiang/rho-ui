@@ -1,6 +1,6 @@
 # The right panel
 
-The panel beside the transcript (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>) holds a terminal, the session's files, its diff, its pull request, and its background work. Each session has its own tabs, and they stay alive while you look at another session, terminal shells included, until rho-ui quits. Everything in the panel runs on the session's machine.
+The panel beside the transcript (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>) holds a terminal, side chats, the session's files, its diff, its pull request, and its background work. Each session has its own tabs, and they stay alive while you look at another session, terminal shells included, until rho-ui quits. Everything in the panel runs on the session's machine.
 
 ![A pull request in the panel, beside its session](/shots/pull-request-pr.webp)
 
@@ -11,6 +11,15 @@ The panel beside the transcript (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>) ho
 - **Mouse**: a program that takes the mouse, such as vim or htop, gets your clicks. Hold <kbd>Shift</kbd> to select or paste anyway.
 - **Remote limits**: a remote machine runs at most 10 terminal shells at once, the sessions sshd allows on one connection by default (`MaxSessions`).
 - **Remote shells**: they get `TERM=xterm-256color`, plus this machine's `LANG` and `LC_*` where the host's `AcceptEnv` allows. The command that starts the shell is POSIX, so a login shell of fish goes wrong with a folder whose name holds a backslash.
+
+## Side chat
+
+A side chat asks something aside without changing the session. Start one with `/side` or `/btw` and a question in the session's composer, or open **Side chat** in the panel for an empty one. You can have several.
+
+- **It's a fork.** It starts from the session's conversation as rho last saved it, so a turn still under way isn't in it, and works in the same folder as the same agent on the same model. Nothing in it goes back to the session.
+- **It asks before it acts.** It opens in Supervised mode, or Plan if the session is in Plan, and rho tells its model it's a side chat that should leave the workspace alone. Change its mode in its footer if you want it to edit.
+- **Closing its tab deletes it**, stopping its turn and background work first. The panel's Files and Diff tabs reload when the session's turn ends, not a side chat's. Side chats don't come back after rho-ui quits: rho keeps them, unlisted, until you delete their session, which deletes them too.
+- **A session forks once its first message is sent.** A side chat can't start another, and neither can a subagent's session. It needs rho 3.5 or newer; an older rho refuses.
 
 ## Files and Diff
 

@@ -3658,6 +3658,100 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
     assert_eq!(ui.state.get(Key::RightPanel).as_deref(), Some("hidden"));
 }
 
+/// `/side` forks the session into a side chat in the right panel: the
+/// fork asks its own approval and answers there, and the session itself
+/// takes no prompt. Closing the tab deletes the fork, after stopping its
+/// turn if one waits; the panel's list starts another.
+#[test]
+fn a_side_chat_forks_the_session_into_the_right_panel() {
+    let mut ui = Harness::start("side-chat", Script::default());
+    new_session_with(&mut ui, "list files");
+    ui.wait_until("the approval card", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.click("approval-allow-once");
+    ui.wait_for_session("the turn to finish", |session| {
+        session.state() == &RunState::Idle && session.entries().len() == 3
+    });
+
+    ui.send("/side why ls");
+    ui.wait_until("the side chat's approval", |window, cx, app| {
+        let asked = app
+            .side_chat(cx)
+            .is_some_and(|view| view.read(cx).session().state() == &RunState::NeedsAction);
+        asked && is_visible(window, "panel-tab-side-chat")
+    });
+    assert_eq!(ui.composer_text(), "", "the question left the composer");
+    // The question went once the forked conversation was all there, so
+    // its turn is the one running, not the turn it forked.
+    ui.act(|window, _| {
+        let forked = window
+            .within("right-panel")
+            .find("worked-0")
+            .label()
+            .map(str::to_owned);
+        assert!(
+            forked
+                .as_deref()
+                .is_some_and(|label| label.starts_with("Worked for ")),
+            "the forked turn's header: {forked:?}"
+        );
+    });
+    ui.shot("approval");
+    ui.act(|window, cx| {
+        window
+            .within("right-panel")
+            .click("approval-allow-once", cx);
+    });
+    let app = ui.app.clone();
+    ui.wait_until("the side chat's answer", |_, cx, _| {
+        app.read(cx).side_chat(cx).is_some_and(|view| {
+            let session = view.read(cx).session();
+            session.state() == &RunState::Idle
+                && matches!(session.entries().last(), Some(Entry::Agent(m)) if m.text() == "you chose allow_once")
+        })
+    });
+    let side = ui.cx.update(|cx| {
+        let view = app.read(cx).side_chat(cx).expect("a side chat shows");
+        view.read(cx).session().clone()
+    });
+    // It forked the conversation, then asked its own question.
+    assert!(matches!(&side.entries()[0], Entry::User(m) if m.text() == "list files"));
+    assert!(matches!(&side.entries()[3], Entry::User(m) if m.text() == "why ls"));
+    assert_eq!(ui.session().entries().len(), 3, "the session is untouched");
+    assert_eq!(
+        (ui.fake().prompts("new-1"), ui.fake().prompts("fork-1")),
+        (1, 1)
+    );
+    ui.shot("answered");
+
+    ui.act(|window, cx| window.hover("panel-tab-side-chat", cx));
+    ui.click("close-panel-tab-side-chat");
+    ui.wait_for_daemon("the fork deleted", |fake| !fake.has_session("fork-1"));
+    ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
+
+    // One closed while its turn waits on an approval goes too.
+    ui.send("/btw and then");
+    ui.wait_until("the second side chat's approval", |window, cx, app| {
+        let asked = app
+            .side_chat(cx)
+            .is_some_and(|view| view.read(cx).session().state() == &RunState::NeedsAction);
+        asked && is_visible(window, "panel-tab-side-chat-2")
+    });
+    ui.act(|window, cx| window.hover("panel-tab-side-chat-2", cx));
+    ui.click("close-panel-tab-side-chat-2");
+    ui.wait_for_daemon("the waiting fork deleted", |fake| {
+        !fake.has_session("fork-2")
+    });
+
+    ui.click("open-surface-side-chat");
+    ui.wait_until("another side chat", |window, cx, app| {
+        app.side_chat(cx).is_some() && is_visible(window, "panel-tab-side-chat-3")
+    });
+    assert!(ui.fake().has_session("fork-3"));
+    assert_eq!(ui.fake().prompts("new-1"), 1, "the session took no prompt");
+}
+
 /// With Windows' window buttons drawn over the top row's right end, the
 /// control at that end still takes clicks: the title bar's panel toggle,
 /// then the panel's own.

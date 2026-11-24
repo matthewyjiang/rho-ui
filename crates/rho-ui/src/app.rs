@@ -46,6 +46,7 @@ use rho_ui_core::{
 };
 
 mod daemon_control;
+mod side_chat;
 
 use crate::machines::RemoteMachine;
 use crate::{
@@ -717,7 +718,20 @@ impl RhoApp {
             let runs = jobs.runs.of(&open.id.id);
             open.view.update(cx, |view, cx| view.set_runs(runs, cx));
         }
-        let active = jobs.active.as_slice();
+        // A side chat's job shows in its tab, not as a row of its own.
+        let active: Vec<Job> = jobs
+            .active
+            .iter()
+            .filter(|job| {
+                !self.sessions.iter().any(|open| {
+                    open.id.machine == *machine
+                        && open.id.id == *job.session()
+                        && open.view.read(cx).is_side()
+                })
+            })
+            .cloned()
+            .collect();
+        let active = active.as_slice();
         let Some(connection) = self.connection_mut(machine) else {
             return false;
         };
@@ -814,7 +828,7 @@ impl RhoApp {
         if shown {
             self.show(Pane::Empty, window, cx);
         }
-        self.sessions.retain(|open| open.id.machine != *machine);
+        self.drop_sessions(|open, _| open.id.machine == *machine, cx);
         if let Some(connection) = self.connection_mut(machine) {
             connection.jobs.clear();
         }
@@ -1584,14 +1598,34 @@ impl RhoApp {
         );
     }
 
+    /// Drops the open sessions `which` picks; the right panel closes the
+    /// tabs of the side chats among them.
+    fn drop_sessions(
+        &mut self,
+        which: impl Fn(&OpenSession, &App) -> bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let (dropped, kept): (Vec<OpenSession>, Vec<OpenSession>) =
+            std::mem::take(&mut self.sessions)
+                .into_iter()
+                .partition(|open| which(open, cx));
+        self.sessions = kept;
+        let dropped: Vec<Entity<SessionView>> = dropped.into_iter().map(|open| open.view).collect();
+        self.panel
+            .update(cx, |panel, cx| panel.close_side_chats(&dropped, cx));
+    }
+
     /// Drops the open session `id`, if any, with the subagents' sessions
-    /// opened under it, and empties the pane if it showed one of them.
+    /// and side chats opened under it, and empties the pane if it showed
+    /// one of them. The right panel closes the side chats' tabs.
     fn forget_session(&mut self, id: &SessionKey, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(closed) = self.opened(id).map(|open| open.view.clone()) else {
             return;
         };
-        self.sessions
-            .retain(|open| open.view != closed && !open.view.read(cx).descends_from(&closed, cx));
+        self.drop_sessions(
+            |open, cx| open.view == closed || open.view.read(cx).descends_from(&closed, cx),
+            cx,
+        );
         let gone = match &self.pane {
             Pane::Session(view) => !self.sessions.iter().any(|open| open.view == *view),
             Pane::Empty | Pane::Draft(_) => false,
@@ -1632,7 +1666,7 @@ impl RhoApp {
         for (ix, daemon) in let_go {
             let open = &self.sessions[ix];
             let id = open.id.clone();
-            if !open.view.read(cx).is_subagent() {
+            if open.view.read(cx).is_listed() {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.forget_live(&id, cx));
             }
@@ -1868,7 +1902,7 @@ impl RhoApp {
     }
 
     /// Adds `view` to the open sessions. The sidebar lists it, unless it is
-    /// a subagent's.
+    /// a subagent's or a side chat.
     fn insert_session(
         &mut self,
         id: SessionKey,
@@ -1881,7 +1915,7 @@ impl RhoApp {
             window,
             |this, view, event: &SessionEvent, window, cx| match event {
                 SessionEvent::LiveChanged => {
-                    if !view.read(cx).is_subagent() {
+                    if view.read(cx).is_listed() {
                         let live = view.read(cx).live();
                         this.sidebar
                             .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
@@ -1891,19 +1925,31 @@ impl RhoApp {
                     this.sync_following(window, cx);
                 }
                 SessionEvent::Prompted => {
-                    let id = view.read(cx).key();
-                    this.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
+                    if view.read(cx).is_listed() {
+                        let id = view.read(cx).key();
+                        this.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
+                    }
                 }
+                // A side chat's isn't listed.
                 SessionEvent::Saved => {
-                    let machine = view.read(cx).key().machine;
-                    this.refresh_sessions(&machine, cx);
+                    if !view.read(cx).is_side() {
+                        let machine = view.read(cx).key().machine;
+                        this.refresh_sessions(&machine, cx);
+                    }
                 }
                 SessionEvent::OpenSubagent { session, title } => {
                     this.open_subagent(view, session.clone(), title.clone(), window, cx);
                 }
                 SessionEvent::Show(target) => {
+                    // A side chat shows in the panel, beside its session.
+                    let target = target.upgrade().map(|target| {
+                        let side = target.read(cx).is_side();
+                        match target.read(cx).parent() {
+                            Some(parent) if side => parent,
+                            _ => target,
+                        }
+                    });
                     let open = target
-                        .upgrade()
                         .filter(|target| this.sessions.iter().any(|open| open.view == *target));
                     if let Some(target) = open {
                         this.show(Pane::Session(target), window, cx);
@@ -1919,9 +1965,16 @@ impl RhoApp {
                         panel.show_pull_request(id, window, cx);
                     });
                 }
+                SessionEvent::SideChat(prompt) => {
+                    this.start_side_chat(view, prompt.clone(), window, cx);
+                }
+                SessionEvent::Discard => {
+                    let id = view.read(cx).key();
+                    this.discard_side_chat(&id, window, cx);
+                }
             },
         );
-        if !view.read(cx).is_subagent() {
+        if view.read(cx).is_listed() {
             let live = view.read(cx).live();
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.set_live(live, cx));
@@ -2054,6 +2107,10 @@ impl RhoApp {
     /// The right panel's terminal, for UI tests.
     pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<crate::right_panel::TerminalView>> {
         self.panel.read(cx).terminal(cx)
+    }
+    /// The side chat the right panel shows, for UI tests.
+    pub(crate) fn side_chat(&self, cx: &App) -> Option<Entity<SessionView>> {
+        self.panel.read(cx).side_chat()
     }
     /// The panes of the right panel's terminal tab on screen, for UI tests.
     pub(crate) fn terminal_panes(&self, cx: &App) -> usize {
