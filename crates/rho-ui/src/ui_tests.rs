@@ -3660,8 +3660,8 @@ fn the_right_panel_opens_a_surface_that_follows_the_session() {
 
 /// `/side` forks the session into a side chat in the right panel: the
 /// fork asks its own approval and answers there, and the session itself
-/// takes no prompt. Closing the tab deletes the fork; the panel's list
-/// starts another.
+/// takes no prompt. Closing the tab deletes the fork, after stopping its
+/// turn if one waits; the panel's list starts another.
 #[test]
 fn a_side_chat_forks_the_session_into_the_right_panel() {
     let mut ui = Harness::start("side-chat", Script::default());
@@ -3717,10 +3717,7 @@ fn a_side_chat_forks_the_session_into_the_right_panel() {
     });
     // It forked the conversation, then asked its own question.
     assert!(matches!(&side.entries()[0], Entry::User(m) if m.text() == "list files"));
-    assert!(side
-        .entries()
-        .iter()
-        .any(|entry| matches!(entry, Entry::User(m) if m.text() == "why ls")));
+    assert!(matches!(&side.entries()[3], Entry::User(m) if m.text() == "why ls"));
     assert_eq!(ui.session().entries().len(), 3, "the session is untouched");
     assert_eq!(
         (ui.fake().prompts("new-1"), ui.fake().prompts("fork-1")),
@@ -3733,11 +3730,26 @@ fn a_side_chat_forks_the_session_into_the_right_panel() {
     ui.wait_for_daemon("the fork deleted", |fake| !fake.has_session("fork-1"));
     ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
 
+    // One closed while its turn waits on an approval goes too.
+    ui.send("/btw and then");
+    ui.wait_until("the second side chat's approval", |window, cx, app| {
+        let asked = app
+            .side_chat(cx)
+            .is_some_and(|view| view.read(cx).session().state() == &RunState::NeedsAction);
+        asked && is_visible(window, "panel-tab-side-chat-2")
+    });
+    ui.act(|window, cx| window.hover("panel-tab-side-chat-2", cx));
+    ui.click("close-panel-tab-side-chat-2");
+    ui.wait_for_daemon("the waiting fork deleted", |fake| {
+        !fake.has_session("fork-2")
+    });
+
     ui.click("open-surface-side-chat");
     ui.wait_until("another side chat", |window, cx, app| {
-        app.side_chat(cx).is_some() && is_visible(window, "panel-tab-side-chat-2")
+        app.side_chat(cx).is_some() && is_visible(window, "panel-tab-side-chat-3")
     });
-    assert!(ui.fake().has_session("fork-2"));
+    assert!(ui.fake().has_session("fork-3"));
+    assert_eq!(ui.fake().prompts("new-1"), 1, "the session took no prompt");
 }
 
 /// With Windows' window buttons drawn over the top row's right end, the

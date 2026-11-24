@@ -22,7 +22,7 @@
 //! `/side` or `/btw` in the composer, or from the right panel. It shows in
 //! a tab of the panel as a view of its own, with no title bar: the fork's
 //! conversation, and a composer that writes to the fork alone. Closing its
-//! tab stops its turn, if one runs, then deletes it ([`Self::discard`]).
+//! tab winds it down, then deletes it ([`SessionView::discard`]).
 //!
 //! Text selected in the transcript gets an "Add to prompt" button where the
 //! drag ended, which quotes it above the composer's text box; see
@@ -46,6 +46,8 @@
 //! bar. The view records the work as it starts and ends, and a session
 //! opened again after a restart lists what ended from that record (see
 //! [`crate::background_log`]).
+
+mod side_chat;
 
 use std::{rc::Rc, time::Duration};
 
@@ -79,6 +81,7 @@ use rho_ui_core::{
     TurnId, Unsteered,
 };
 
+use self::side_chat::{side_question, Discarding};
 use crate::{
     added_dirs::{AddedDirs, DirsAccess},
     auths::Auths,
@@ -134,17 +137,6 @@ pub(crate) enum SessionEvent {
     SideChat(Option<Prompt>),
     /// This side chat's tab closed and its turn has ended: delete it.
     Discard,
-}
-
-/// How far a side chat whose tab closed is from being deleted
-/// ([`SessionView::discard`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Discarding {
-    No,
-    /// Its turn is ending.
-    WhenIdle,
-    /// The app was asked to delete it, once.
-    Asked,
 }
 
 /// Who writes the session, and where its view sits.
@@ -583,62 +575,9 @@ impl SessionView {
         matches!(self.role, Role::Main)
     }
 
-    /// Whether the session can have side chats: rho forks neither a fork
-    /// nor a subagent's session.
-    pub(crate) fn offers_side_chats(&self) -> bool {
-        self.is_listed()
-    }
-
     /// Whether something in the view has the keyboard.
     pub(crate) fn has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.focus_handle.contains_focused(window, cx)
-    }
-
-    /// Asks the app for a side chat of this session, which sends `prompt`
-    /// first if given. rho forks only what the session saved, so until its
-    /// first prompt is accepted the view says so instead.
-    pub(crate) fn start_side_chat(&mut self, prompt: Option<Prompt>, cx: &mut Context<'_, Self>) {
-        if !self.offers_side_chats() {
-            return;
-        }
-        if self.prompted {
-            cx.emit(SessionEvent::SideChat(prompt));
-        } else {
-            self.error = Some("A side chat starts after the session's first message.".to_owned());
-            cx.notify();
-        }
-    }
-
-    /// The side chat's tab closed: cancels its turn, if one runs, and once
-    /// none does asks the app to delete it, as rho deletes no session
-    /// while its turn is under way. A prompt not sent yet is dropped.
-    pub(crate) fn discard(&mut self, cx: &mut Context<'_, Self>) {
-        if !self.is_side() || self.discarding != Discarding::No {
-            return;
-        }
-        self.discarding = Discarding::WhenIdle;
-        self.opening = None;
-        if matches!(self.outgoing, Some(Outgoing::Waiting { .. })) {
-            self.outgoing = None;
-        }
-        if self.session.state().is_busy() {
-            let daemon = self.daemon.clone();
-            let id = self.session.id().clone();
-            // Should the cancel fail, the turn runs to its end first.
-            cx.spawn(async move |_, _| {
-                let _ = daemon.cancel(&id).await;
-            })
-            .detach();
-        }
-        self.discard_when_idle(cx);
-    }
-
-    /// Asks the app to delete a discarded side chat once no turn runs.
-    fn discard_when_idle(&mut self, cx: &mut Context<'_, Self>) {
-        if self.discarding == Discarding::WhenIdle && !self.is_busy() {
-            self.discarding = Discarding::Asked;
-            cx.emit(SessionEvent::Discard);
-        }
     }
 
     /// The session at the top of this one's nesting: itself, unless it is
@@ -806,9 +745,7 @@ impl SessionView {
             Err(error) => {
                 self.loading = Loading::Failed(error.to_string());
                 self.give_back_waiting(window, cx);
-                if let Some(prompt) = self.opening.take() {
-                    self.give_back(prompt, window, cx);
-                }
+                self.give_back_opening(window, cx);
             }
         }
         self.after_change(window, cx);
@@ -1087,33 +1024,6 @@ impl SessionView {
             let ended = self.session.ended_turn().cloned();
             self.hold(prompt, ended, window, cx);
         }
-    }
-
-    /// Starts a side chat that asks `question`, with what the composer has
-    /// attached, from a `/side` the composer holds. Until the session is
-    /// saved, and in a side chat, which rho can't fork, the composer keeps
-    /// it and the view says why.
-    fn send_side_question(
-        &mut self,
-        question: String,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self.is_side() {
-            self.error = Some("A side chat can't start another side chat.".to_owned());
-            cx.notify();
-            return;
-        }
-        if !self.prompted {
-            self.start_side_chat(None, cx);
-            return;
-        }
-        let (_, attachments) = self
-            .composer
-            .update(cx, |composer, cx| composer.take(window, cx))
-            .into_parts();
-        let prompt = Prompt::new(question, attachments);
-        self.start_side_chat((!prompt.is_empty()).then_some(prompt), cx);
     }
 
     /// Sends `prompt` as the next prompt. A failed send puts it back in the
@@ -2228,19 +2138,6 @@ fn runs_as(agent: Option<&str>, model: Option<SharedString>) -> SharedString {
     }
 }
 
-/// The question of a prompt that asks for a side chat, `/side` or `/btw`
-/// and what follows, as rho's terminal UI reads them: the rest of the
-/// text, trimmed, which may be empty.
-fn side_question(text: &str) -> Option<&str> {
-    let rest = text.strip_prefix('/')?;
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    let (command, question) = rest.split_at(end);
-    ["side", "btw"]
-        .iter()
-        .any(|name| command.eq_ignore_ascii_case(name))
-        .then(|| question.trim())
-}
-
 /// Longest first-prompt title, in characters: rho's `FALLBACK_TITLE_CHARS`,
 /// so the header matches the title rho lists for an untitled session.
 const PROMPT_TITLE_CHARS: usize = 80;
@@ -2280,27 +2177,7 @@ fn first_prompt(session: &Session) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{runs_as, side_question};
-
-    /// `/side` and its alias `/btw` ask for a side chat, in any case, with
-    /// or without a question; a command that only starts so does not.
-    #[test]
-    fn a_side_question_is_the_text_after_side_or_btw() {
-        let cases = [
-            ("/side what is this lock", Some("what is this lock")),
-            ("/btw  why\nnot ", Some("why\nnot")),
-            ("/SIDE x", Some("x")),
-            ("/side", Some("")),
-            ("/side\nmulti line", Some("multi line")),
-            ("/sidebar open", None),
-            ("side note", None),
-            (" /side x", None),
-            ("//side x", None),
-        ];
-        for (text, question) in cases {
-            assert_eq!(side_question(text), question, "text {text:?}");
-        }
-    }
+    use super::runs_as;
 
     /// The default agent goes unnamed, and whichever of agent and model the
     /// daemon has said yet shows alone.

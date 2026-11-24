@@ -655,10 +655,10 @@ impl PromptKey {
 /// credentials opens signed out, for the user to sign in from it.
 ///
 /// This is the one place a session's setup is made, for `rho/session/new`,
-/// `rho/session/fork` and `rho/session/attach` alike. rho-ui draws the surfaces a session's
-/// `ui` tool shows (`surface.rs`), so it also asks for `surfaces: drawn`:
-/// a session it opens has the tool, and every attach counts it among the
-/// clients a waiting `ui` call can be answered in.
+/// `rho/session/fork` and `rho/session/attach` alike. rho-ui draws the
+/// surfaces a session's `ui` tool shows (`surface.rs`), so it also asks for
+/// `surfaces: drawn`: a session it opens has the tool, and every attach
+/// counts it among the clients a waiting `ui` call can be answered in.
 fn session_setup() -> rho_protocol::SessionSetup {
     rho_protocol::SessionSetup {
         idle_wake: IdleWake::Turn,

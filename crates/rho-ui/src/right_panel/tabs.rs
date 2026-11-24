@@ -12,10 +12,10 @@ use super::{
 use crate::{machines::Place, session_view::SessionView};
 
 /// Which tab of a session's: its surface, and its number among that
-/// surface's tabs there, from 1 and never reused. Terminal and Side chat
-/// open as many as asked ([`Surface::opens_many`]); Pull request opens
-/// [`TabKey::BRANCH_PR`] for the branch's PR and one more for each other
-/// PR linked to the session; the others are always 1.
+/// surface's tabs there, from 1 and never reused. Terminal opens as many as
+/// asked ([`Surface::opens_many`]), and Side chat one per fork; Pull
+/// request opens [`TabKey::BRANCH_PR`] for the branch's PR and one more for
+/// each other PR linked to the session; the others are always 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TabKey {
     pub(super) surface: Surface,
@@ -136,15 +136,11 @@ pub(super) struct TabSet {
     next_link: u32,
     /// The number the next side chat's tab gets.
     next_side_chat: u32,
-    /// Whether the session can have side chats
-    /// ([`SessionView::offers_side_chats`]).
-    side_chats: bool,
 }
 
 impl TabSet {
     pub(super) fn new(view: &Entity<SessionView>, turns: Subscription, cx: &App) -> Self {
         let live = view.read(cx).live();
-        let side_chats = view.read(cx).offers_side_chats();
         Self {
             place: Place::new(live.id.machine, live.cwd),
             view: view.downgrade(),
@@ -155,7 +151,6 @@ impl TabSet {
             next_terminal: 1,
             next_link: TabKey::BRANCH_PR.number + 1,
             next_side_chat: 1,
-            side_chats,
         }
     }
 
@@ -173,14 +168,23 @@ impl TabSet {
     }
 
     /// The surfaces + and the list offer: those that open many, and those
-    /// without a tab; Side chat only if the session can have side chats.
-    pub(super) fn openable(&self) -> impl Iterator<Item = Surface> + '_ {
-        Surface::ALL.into_iter().filter(|&surface| match surface {
-            Surface::SideChat => self.side_chats,
-            surface => {
-                surface.opens_many() || !self.tabs.iter().any(|tab| tab.key().surface == surface)
-            }
-        })
+    /// without a tab; Side chat while the session can start one
+    /// ([`SessionView::side_chat_refusal`]).
+    pub(super) fn openable(&self, cx: &App) -> Vec<Surface> {
+        let side_chats = self
+            .view
+            .upgrade()
+            .is_some_and(|view| view.read(cx).side_chat_refusal().is_none());
+        Surface::ALL
+            .into_iter()
+            .filter(|&surface| match surface {
+                Surface::SideChat => side_chats,
+                surface => {
+                    surface.opens_many()
+                        || !self.tabs.iter().any(|tab| tab.key().surface == surface)
+                }
+            })
+            .collect()
     }
 
     /// The key a new tab of `surface` gets.

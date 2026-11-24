@@ -4,9 +4,8 @@
 //!
 //! - `rho/session/new` returns "new-1", "new-2", ...
 //! - `rho/session/fork` returns "fork-1", "fork-2", ...: a saved session
-//!   in supervised mode that replays its parent's conversation up to its
-//!   last ended turn. The list leaves forks out, and deleting a session
-//!   deletes its forks. Forking a fork, a subagent's session or one that
+//!   in supervised mode that replays its parent's conversation. The list
+//!   leaves forks out, and deleting a session deletes its forks. Forking a fork, a subagent's session or one that
 //!   saved nothing is refused as rho refuses it.
 //! - `rho/session/list` returns pages of two: new sessions that have had a
 //!   prompt, newest first, then "s1" (titled "first") and "old" (untitled).
@@ -1076,24 +1075,15 @@ impl FakeSession {
         }
     }
 
-    /// A fork of `self`: its conversation up to its last ended turn, in
-    /// supervised mode, as `rho/session/fork` opens one.
+    /// A fork of `self`: its conversation, in supervised mode, as
+    /// `rho/session/fork` opens one. The tests fork only between turns.
     fn fork(&self, parent: &str) -> Self {
         let mut fork = Self::new(
             &self.cwd.to_string_lossy(),
             self.title.as_deref(),
             self.updated_at,
         );
-        let saved = match self.turn {
-            Some(_) => self
-                .history
-                .iter()
-                .rposition(|event| matches!(event, SessionEvent::TurnEnded { .. }))
-                // The turn's `State` event follows its end.
-                .map_or(0, |at| at + 2),
-            None => self.history.len(),
-        };
-        fork.history = self.history[..saved.min(self.history.len())].to_vec();
+        fork.history.clone_from(&self.history);
         fork.agent.clone_from(&self.agent);
         fork.settings.model = self.settings.model.clone();
         fork.settings.reasoning = self.settings.reasoning;

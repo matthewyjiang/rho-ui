@@ -18,7 +18,7 @@ A side chat asks something aside without changing the session. Start one with `/
 
 - **It's a fork.** It starts from the session's conversation as rho last saved it, so a turn still under way isn't in it, and works in the same folder as the same agent on the same model. Nothing in it goes back to the session.
 - **It asks before it acts.** It opens in Supervised mode, or Plan if the session is in Plan, and rho tells its model it's a side chat that should leave the workspace alone. Change its mode in its footer if you want it to edit.
-- **Closing its tab deletes it**, stopping its turn first. Side chats don't come back after rho-ui quits: rho keeps them, unlisted, until you delete their session, which deletes them too.
+- **Closing its tab deletes it**, stopping its turn and background work first. The panel's Files and Diff tabs reload when the session's turn ends, not a side chat's. Side chats don't come back after rho-ui quits: rho keeps them, unlisted, until you delete their session, which deletes them too.
 - **A session forks once its first message is sent.** A side chat can't start another, and neither can a subagent's session. It needs rho 3.5 or newer; an older rho refuses.
 
 ## Files and Diff
