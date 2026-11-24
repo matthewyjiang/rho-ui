@@ -944,7 +944,8 @@ impl Service for Fake {
         &self,
         params: SessionListParams,
     ) -> Result<SessionListDetailedResponse, RpcError> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.detailed_lists += 1;
         if state.session_lists == SessionLists::Plain {
             return Err(RpcError::new(
                 ErrorCode::MethodNotFound,

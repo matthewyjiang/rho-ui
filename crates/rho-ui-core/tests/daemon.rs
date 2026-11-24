@@ -522,7 +522,8 @@ fn list_follows_the_cursor_and_attach_replays_the_conversation() {
 
 /// The list and the job list name the session that started a session, so
 /// the sidebar can fold it under that one; a rho from before
-/// `list_detailed` still lists it, naming none.
+/// `list_detailed` still lists it, naming none, and is asked for
+/// `list_detailed` once a connection.
 #[test]
 fn the_session_list_names_the_session_that_started_each() {
     let fake = FakeDaemon::start(Script::default());
@@ -561,13 +562,16 @@ fn the_session_list_names_the_session_that_started_each() {
     older.start_session("s1", "w1", "Write the parser", Started::Idle);
     block_on(async {
         let (daemon, _events) = connect(&older).await;
-        let sessions = daemon.list_sessions().await.unwrap();
-        let parents: Vec<_> = sessions
-            .iter()
-            .map(|s| (s.id().as_str(), s.parent()))
-            .collect();
-        assert_eq!(parents, [("w1", None), ("s1", None), ("old", None)]);
+        for _ in 0..2 {
+            let sessions = daemon.list_sessions().await.unwrap();
+            let parents: Vec<_> = sessions
+                .iter()
+                .map(|s| (s.id().as_str(), s.parent()))
+                .collect();
+            assert_eq!(parents, [("w1", None), ("s1", None), ("old", None)]);
+        }
     });
+    assert_eq!(older.detailed_lists(), 1);
 }
 
 #[test]

@@ -15,6 +15,7 @@
 //!   records, as does that session's job in `rho/job/list`. With
 //!   [`Script::session_lists`] [`SessionLists::Plain`], the daemon is from
 //!   before `list_detailed`, which answers `MethodNotFound`.
+//!   [`FakeDaemon::detailed_lists`] counts the `list_detailed` requests.
 //! - Attaching to "old" replays one agent message, "replayed", then
 //!   [`Script::replay_turns`] turns, each a question, a thought, three tool
 //!   calls, an edit, and a Markdown answer.
@@ -541,6 +542,12 @@ impl FakeDaemon {
     /// How many hellos the daemon accepted: one per connection.
     pub fn hellos(&self) -> usize {
         self.service.lock().hellos
+    }
+
+    /// How many `rho/session/list_detailed` requests the daemon got, each
+    /// page and each refusal one.
+    pub fn detailed_lists(&self) -> usize {
+        self.service.lock().detailed_lists
     }
 
     /// Restarts the daemon in place, as rho does by itself once the
@@ -1756,6 +1763,9 @@ struct State {
     sessions: BTreeMap<String, FakeSession>,
     /// Whether it serves `rho/session/list_detailed`.
     session_lists: SessionLists,
+    /// How many `rho/session/list_detailed` requests it got, each page and
+    /// each refusal one.
+    detailed_lists: usize,
     /// How many of each the daemon has made, for their IDs.
     new_sessions: u64,
     forks: u64,
@@ -1899,6 +1909,7 @@ impl State {
         let mut state = Self {
             sessions,
             session_lists: script.session_lists,
+            detailed_lists: 0,
             new_sessions: 0,
             forks: 0,
             worktrees: 0,

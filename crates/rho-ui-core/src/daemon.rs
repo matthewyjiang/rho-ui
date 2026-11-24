@@ -23,7 +23,7 @@ use std::process::Command;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -492,6 +492,10 @@ pub struct Daemon {
     /// makes the session's whole process environment.
     environment: Arc<ClientEnvironment>,
     link: Option<Link>,
+    /// Set once the daemon answers `rho/session/list_detailed` with
+    /// `MethodNotFound`: this connection lists with `rho/session/list`
+    /// alone from then on, and a new one asks again.
+    plain_lists: Arc<AtomicBool>,
 }
 
 /// The machine the daemon runs on, as the sessions this client opens see it.
@@ -631,6 +635,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         info: Arc::new(info),
         environment: Arc::new(machine.environment),
         link: machine.link,
+        plain_lists: Arc::default(),
     };
     let events = DaemonEvents { notifications };
     Ok((daemon, events))
@@ -730,32 +735,36 @@ impl Daemon {
     /// Saved sessions in every workspace, newest first, each with the
     /// session that started it. A rho from before
     /// `rho/session/list_detailed` (`MethodNotFound`), as on a machine not
-    /// updated yet, lists them without.
+    /// updated yet, lists them without, and isn't asked for it again on
+    /// this connection.
     ///
     /// # Errors
     ///
     /// Fails if the daemon rejects the request or the connection is gone.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, DaemonError> {
-        let detailed = self
-            .list_pages::<methods::SessionListDetailed>(|page| {
+        if !self.plain_lists.load(Ordering::Relaxed) {
+            let detailed = self
+                .list_pages::<methods::SessionListDetailed>(|page| {
+                    let sessions = page.sessions.into_iter();
+                    let sessions = sessions.map(SessionSummary::from_detailed).collect();
+                    (sessions, page.next_cursor)
+                })
+                .await;
+            match detailed {
+                Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => {
+                    self.plain_lists.store(true, Ordering::Relaxed);
+                }
+                listed => return listed.map_err(DaemonError::from),
+            }
+        }
+        let sessions = self
+            .list_pages::<methods::SessionList>(|page| {
                 let sessions = page.sessions.into_iter();
-                let sessions = sessions.map(SessionSummary::from_detailed).collect();
+                let sessions = sessions.map(SessionSummary::from_wire).collect();
                 (sessions, page.next_cursor)
             })
-            .await;
-        match detailed {
-            Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => {
-                let sessions = self
-                    .list_pages::<methods::SessionList>(|page| {
-                        let sessions = page.sessions.into_iter();
-                        let sessions = sessions.map(SessionSummary::from_wire).collect();
-                        (sessions, page.next_cursor)
-                    })
-                    .await?;
-                Ok(sessions)
-            }
-            listed => listed.map_err(DaemonError::from),
-        }
+            .await?;
+        Ok(sessions)
     }
 
     /// Every page of the session list method `M`, from the first, each read
