@@ -94,7 +94,7 @@ use crate::{
     plan::PlanList,
     pr_mark::pr_pill,
     pull_requests::PullRequests,
-    session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
+    session_list::{Activity, Kind, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{model_summary, Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
@@ -111,7 +111,7 @@ const TICK: Duration = Duration::from_secs(1);
 
 /// What the app needs to hear from a session.
 pub(crate) enum SessionEvent {
-    /// Title or activity changed; see [`SessionView::live`].
+    /// What the sidebar shows of it changed; see [`SessionView::live`].
     LiveChanged,
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
@@ -272,10 +272,10 @@ pub(crate) struct SessionView {
     turn_began: Option<Instant>,
     /// When the oldest open request arrived.
     waiting_since: Option<Instant>,
-    /// Title and activity as last reported in [`SessionEvent::LiveChanged`];
+    /// What the sidebar was last told in [`SessionEvent::LiveChanged`];
     /// `None` once the view follows the session again, so the app hears of
     /// it when it has caught up, whatever changed.
-    reported: Option<(String, Activity)>,
+    reported: Option<LiveSession>,
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
     /// The surfaces the session's `ui` calls showed.
@@ -418,7 +418,7 @@ impl SessionView {
         };
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
-        view.reported = Some((view.title(), view.activity()));
+        view.reported = Some(view.live());
         view
     }
 
@@ -618,6 +618,7 @@ impl SessionView {
             title: self.name().map(SharedString::from),
             placeholder: self.placeholder(),
             activity: self.activity(),
+            kind: Kind::of(self.session.agent()),
         }
     }
 
@@ -979,10 +980,10 @@ impl SessionView {
         self.discard_when_idle(cx);
     }
 
-    /// Tells the app when the title or activity the sidebar shows changed,
-    /// and once a view that follows the session again has caught up.
+    /// Tells the app when what the sidebar shows of it changed, and once a
+    /// view that follows the session again has caught up.
     fn report_live(&mut self, cx: &mut Context<'_, Self>) {
-        let live = Some((self.title(), self.activity()));
+        let live = Some(self.live());
         if self.reported != live {
             self.reported = live;
             cx.emit(SessionEvent::LiveChanged);

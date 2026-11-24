@@ -3,7 +3,8 @@
 //! [`crate::session_list`]), then the Snoozed and Settled shelves, held at the
 //! bottom until opened shelves fill the list. Drafts of new sessions the
 //! user left with a message lead it, saying Draft; hovering one offers
-//! Discard. An active row shows the
+//! Discard. The active leads follow under a header of their own. An active
+//! row shows the
 //! workspace, the session's status or age, its title, its branch, and with
 //! more than one machine, the machine's label; hovering it swaps the status
 //! for Snooze and Settle, or Unpin. Pinned sessions lead the list, and a
@@ -69,8 +70,8 @@ use crate::{
     pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
     session_list::{
-        Activity, DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
-        SavedSession, SessionList, SHELF_PAGE,
+        Activity, DraftRow, Family, Fold, FoldLine, Item, JobSession, Kind, LiveSession, Pressing,
+        Row, SavedSession, SessionList, SHELF_PAGE,
     },
     settings::{self, Settings},
     shelf::{Shelf, Shelves},
@@ -113,6 +114,10 @@ const MACHINE_LABEL_REMS: f32 = 5.;
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
 
+/// A gap's height where the sidebar doesn't stretch it, as under the
+/// leads: half a header, a break that reads as one without a line.
+const BREAK_REMS: f32 = HEADER_REMS / 2.;
+
 /// The line under a session that started others: one line of text, padded
 /// as the lines of a row are apart.
 const FOLD_REMS: f32 = LINE_REMS + 2. * GAP_REMS + 2. * GUTTER_REMS;
@@ -134,15 +139,15 @@ pub(crate) use filter::SavedFilter;
 pub(crate) use rail::SidebarLayout;
 use rail::{toggle_button, Layout};
 
-/// Each item's height. The gap's comes from the list's height instead; see
-/// [`SidebarView::render_list`].
+/// Each item's height. The gap above the shelves takes its from the list's
+/// height instead; see [`SidebarView::render_list`].
 fn item_rems(item: Item) -> f32 {
     match item {
         Item::Draft(_) | Item::Session(_) => ROW_REMS,
         Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
-        Item::Header(_) => HEADER_REMS,
+        Item::Header(_) | Item::Leads => HEADER_REMS,
         Item::Fold(_) => FOLD_REMS,
-        Item::Gap => 0.,
+        Item::Gap => BREAK_REMS,
     }
 }
 
@@ -460,6 +465,7 @@ impl SidebarView {
                     parent: session
                         .parent()
                         .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
+                    kind: Kind::of(session.agent()),
                 })
                 .collect();
             workspaces.set_history(
@@ -946,6 +952,7 @@ impl SidebarView {
                     self.render_shelved(row, workspace, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
+                Item::Leads => Self::render_leads_header(),
                 Item::Fold(line) => self.render_fold(line, cx),
                 Item::More(which) => self.render_show_more(which, cx),
                 Item::Gap => div().into_any_element(),
@@ -1302,6 +1309,25 @@ impl SidebarView {
             .into_any_element()
     }
 
+    /// The header over the active leads, laid out as a shelf header is,
+    /// but it neither folds nor counts.
+    fn render_leads_header() -> AnyElement {
+        div()
+            .h(rems(HEADER_REMS))
+            .px_2()
+            .py(rems(GUTTER_REMS))
+            .child(
+                h_flex()
+                    .id("leads-header")
+                    .test_support()
+                    .size_full()
+                    .px_2()
+                    .text_sm()
+                    .child("Leads"),
+            )
+            .into_any_element()
+    }
+
     /// "⌄ 3 sessions · 1 needs you": the line under a session that started
     /// others, indented as they are, with the most pressing thing of its
     /// family: how many of them wait for the user, else are Done, else
@@ -1438,9 +1464,15 @@ impl SidebarView {
             .iter()
             .map(|&item| size(px(0.), rem * item_rems(item)))
             .collect();
-        // The gap takes whatever height the rows leave, pushing the shelves
-        // to the bottom; once they overflow it is gone.
-        if let Some(gap) = self.list.items().iter().position(|&item| item == Item::Gap) {
+        // The gap above the shelves takes whatever height the rows leave,
+        // pushing the shelves to the bottom; once they overflow it is gone.
+        let above_shelves = self
+            .list
+            .items()
+            .windows(2)
+            .position(|pair| matches!(pair, [Item::Gap, Item::Header(_)]));
+        if let Some(gap) = above_shelves {
+            sizes[gap].height = Pixels::ZERO;
             let rows: Pixels = sizes.iter().map(|size| size.height).sum();
             sizes[gap].height = (self.viewport - rows).max(Pixels::ZERO);
         }
@@ -2282,6 +2314,7 @@ mod tests {
             updated: 1,
             workspace: 0,
             parent: parent.map(SessionKey::local),
+            kind: Kind::Session,
         };
         let mut list = SessionList::default();
         let sessions = vec![
@@ -2297,6 +2330,7 @@ mod tests {
                 title: None,
                 placeholder: "",
                 activity: Activity::Working(Instant::now()),
+                kind: Kind::Session,
             };
             list.set_live(live, 0, 1);
         }
@@ -2322,6 +2356,7 @@ mod tests {
             updated: 1,
             workspace: 0,
             parent: parent.map(SessionKey::local),
+            kind: Kind::Session,
         };
         let (lead, worker) = (SessionKey::local("lead"), SessionKey::local("w1"));
         let mut list = SessionList::default();
