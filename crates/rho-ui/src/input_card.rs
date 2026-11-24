@@ -24,25 +24,44 @@ use gpui_kit::component::{
         Questionnaire, QuestionnaireActions, QuestionnaireChoice, QuestionnaireChoiceDefinition,
         QuestionnaireChoices, QuestionnaireDescription, QuestionnaireError, QuestionnaireEvent,
         QuestionnaireInput, QuestionnaireInputDefinition, QuestionnaireItem,
-        QuestionnaireItemDefinition, QuestionnaireItemStatus, QuestionnaireProgress,
-        QuestionnaireState, QuestionnaireSubmission, QuestionnaireSubmit, QuestionnaireTitle,
+        QuestionnaireItemDefinition, QuestionnaireItemStatus, QuestionnaireNext,
+        QuestionnairePrevious, QuestionnaireProgress, QuestionnaireSkip, QuestionnaireState,
+        QuestionnaireSubmission, QuestionnaireSubmit, QuestionnaireTitle,
     },
+    tag::Tag,
     tooltip::Tooltip,
-    v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+    v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, Task, Window,
+    div, relative, rems, AnyElement, App, AppContext as _, Context, Entity, EventEmitter,
+    FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    Render, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
+    Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, Questions,
-    SuggestionStyle, Timeout,
+    Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, Questions, Suggestion,
+    Timeout,
 };
 
 /// How often the countdown redraws.
 const TICK: Duration = Duration::from_secs(1);
+
+/// A questionnaire's text size, in rems: the app's small text. Kit's own
+/// sizes are in pixels, so they stay put when the UI scale changes; this
+/// one goes to Kit as [`Size::Size`], which sizes the choices' text,
+/// padding and indicators from it.
+const QUESTION_TEXT_REMS: f32 = 0.875;
+
+/// A choice's padding left of its indicator, as a share of Kit's
+/// [`Size::Size`]: its private `QuestionnaireMetrics::choice_padding_x`,
+/// to check when Kit changes. The text box starts on the same edge.
+const CHOICE_INSET: f32 = 0.75;
+
+/// A choice label's line height, as a share of its text size: the line
+/// Kit's private `answer_line_height` centers a choice's indicator on at
+/// [`Size::Size`], to check when Kit changes.
+const CHOICE_LINE: f32 = 1.5;
 
 /// What the user did with the card.
 pub(crate) enum InputCardEvent {
@@ -240,9 +259,8 @@ impl InputCard {
             .questions
             .iter()
             .find(|question| Some(question.id.as_str()) == item)?;
-        let suggestion = question.suggestion.as_ref()?;
-        let value = suggestion.choices.first()?;
-        (suggestion.style == SuggestionStyle::Marked).then_some((&question.id, value))
+        let value = question.marked()?.choices.first()?;
+        Some((&question.id, value))
     }
 
     /// The user started on the request: the first time, hold it if it
@@ -310,7 +328,9 @@ impl InputCard {
     }
 
     /// The title, then icons for who asks and what waits behind it, each
-    /// named by its tooltip.
+    /// named by its tooltip. Questions are no warning, and their title only
+    /// names the subject of the question under it, so both are quiet; of
+    /// several, it says which one shows.
     fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let queue = (self.queue.behind > 0).then(|| {
             let more = format!("{} more waiting", self.queue.behind);
@@ -334,21 +354,43 @@ impl InputCard {
                 })
                 .test_support()
         });
+        let questions = match &self.body {
+            Body::Questions { state, .. } => Some(state),
+            Body::Choices { .. } | Body::Unsupported => None,
+        };
+        let muted = cx.theme().muted_foreground;
+        let (icon, title) = match questions {
+            Some(_) => (
+                Icon::new(Lucide::MessageCircleQuestionMark).text_color(muted),
+                muted,
+            ),
+            None => (
+                Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning),
+                cx.theme().foreground,
+            ),
+        };
+        let progress = questions
+            .filter(|state| state.read(cx).total() > 1)
+            .map(|state| {
+                // Kit sizes this in pixels too; see `QUESTION_TEXT_REMS`.
+                QuestionnaireProgress::new(state)
+                    .flex_shrink_0()
+                    .text_xs()
+                    .line_height(rems(1.))
+            });
         h_flex()
             .gap_2()
-            .child(
-                Icon::new(IconName::TriangleAlert)
-                    .small()
-                    .text_color(cx.theme().warning),
-            )
+            .child(icon.small())
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
+                    .text_color(title)
                     .child(self.request.title().to_owned()),
             )
+            .children(progress)
             .when(self.request.from_subagent(), |this| {
                 this.child(
                     hint("input-subagent", "A subagent asks".into(), cx)
@@ -452,121 +494,153 @@ impl InputCard {
             .collect()
     }
 
+    /// The question that shows, then Decline on the left of the row, and
+    /// the moves between questions on its right.
     fn render_questions(
         &self,
         state: &Entity<QuestionnaireState>,
         decline: &InputChoice,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> AnyElement {
         let Form::Questions(questions) = self.request.form() else {
             return gpui_kit::Empty.into_any_element();
         };
+        let text = window.rem_size() * QUESTION_TEXT_REMS;
+        let items: Vec<_> = questions
+            .questions
+            .iter()
+            .map(|question| render_question(state, question, text, cx))
+            .collect();
         let navigation = state.read(cx).navigation_state();
-        let items = questions.questions.iter().map(|question| {
-            let item = SharedString::from(question.id.clone());
-            let choices = question.choices.iter().map(|choice| {
-                div()
-                    .id(SharedString::from(format!(
-                        "question-{}-{}",
-                        question.id, choice.value
-                    )))
-                    .test_support()
-                    .w_full()
-                    .child(
-                        // Kit's text column is a flex item as wide as its
-                        // unwrapped text; letting it shrink wraps a long
-                        // description instead of spilling out of the card.
-                        QuestionnaireChoice::new(state, item.clone(), choice.value.clone())
-                            .content_style(StyleRefinement::default().min_w_0()),
-                    )
-            });
-            QuestionnaireItem::new(state, item.clone())
-                .child(QuestionnaireTitle::new(state, item.clone()))
-                .child(QuestionnaireDescription::new(state, item.clone()))
-                .child(QuestionnaireChoices::new(state, item.clone()).children(choices))
-                .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "question-{}-other",
-                            question.id
-                        )))
-                        .test_support()
-                        .child(QuestionnaireInput::new(state, item.clone())),
-                )
-                .child(QuestionnaireError::new(state, item))
-        });
-        let nav = |id: &'static str, icon: Lucide, label: &'static str, step: Step| {
-            let state = state.clone();
-            Button::new(id)
-                .small()
-                .icon(icon)
-                .accessibility_label(label)
-                .tooltip(label)
-                .on_click(move |_, window, cx| {
-                    state.update(cx, |state, cx| match step {
-                        Step::Previous => state.go_previous(window, cx),
-                        Step::Skip => state.skip_current(window, cx),
-                        Step::Next => state.go_next(window, cx),
-                    });
-                })
-        };
         Questionnaire::new(state)
-            .small()
-            .when(questions.questions.len() > 1, |this| {
-                this.child(QuestionnaireProgress::new(state))
-            })
+            .with_size(Size::Size(text))
+            .text_size(text)
+            .line_height(relative(CHOICE_LINE))
             .children(items)
             .child(
                 QuestionnaireActions::new(state)
-                    .when(navigation.is_previous_visible(), |this| {
-                        let previous = nav(
-                            "questions-previous",
-                            Lucide::ChevronLeft,
-                            "Previous question",
-                            Step::Previous,
-                        );
-                        this.child(previous.outline())
-                    })
+                    .gap_2()
                     .children(self.buttons(std::slice::from_ref(decline), Emphasis::None, cx))
                     .child(div().flex_1())
+                    .when(navigation.is_previous_visible(), |this| {
+                        let previous = QuestionnairePrevious::new(state).small();
+                        this.child(action("questions-previous", previous))
+                    })
                     .when(navigation.is_skip_visible(), |this| {
-                        let skip = nav(
-                            "questions-skip",
-                            Lucide::SkipForward,
-                            "Skip this question",
-                            Step::Skip,
-                        );
-                        this.child(skip.ghost())
+                        let skip = QuestionnaireSkip::new(state).small();
+                        this.child(action("questions-skip", skip))
                     })
                     .when(navigation.is_next_visible(), |this| {
-                        let next = nav(
-                            "questions-next",
-                            Lucide::ChevronRight,
-                            "Next question",
-                            Step::Next,
-                        );
-                        this.child(next.primary())
+                        let next = QuestionnaireNext::new(state).small();
+                        this.child(action("questions-next", next))
                     })
                     // Submitting answers everything: it keeps its word.
                     .when(navigation.is_submit_visible(), |this| {
-                        this.child(
-                            div()
-                                .id("questions-submit")
-                                .test_support()
-                                .child(QuestionnaireSubmit::new(state).small()),
-                        )
+                        let submit = QuestionnaireSubmit::new(state).small();
+                        this.child(action("questions-submit", submit))
                     }),
             )
             .into_any_element()
     }
 }
 
-/// A move between a questionnaire's questions.
-#[derive(Clone, Copy)]
-enum Step {
-    Previous,
-    Skip,
-    Next,
+/// One of Kit's questionnaire buttons, named `id` for UI tests: Kit's own
+/// ID carries its state's entity ID.
+fn action(id: &'static str, button: impl IntoElement) -> impl IntoElement {
+    div().id(id).test_support().flex_shrink_0().child(button)
+}
+
+/// `question` as Kit draws the one that shows: what it asks, its choices,
+/// and a box for the user's own text. `text` is the questionnaire's text
+/// size.
+fn render_question(
+    state: &Entity<QuestionnaireState>,
+    question: &Question,
+    text: Pixels,
+    cx: &App,
+) -> QuestionnaireItem {
+    let item = SharedString::from(question.id.clone());
+    let muted = cx.theme().muted_foreground;
+    let suggested = question.marked();
+    let choices = question.choices.iter().map(|choice| {
+        let selected = state
+            .read(cx)
+            .choice_state(&question.id, &choice.value)
+            .is_some_and(|choice| choice.is_selected());
+        let label = h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(choice.label.clone()),
+            )
+            .when(
+                suggested.is_some_and(|it| it.names(&choice.value)),
+                |this| {
+                    // As tall as the label's line, so it adds nothing to the row.
+                    let tag = Tag::secondary().outline().small().text_xs();
+                    this.child(tag.flex_shrink_0().child("Suggested"))
+                },
+            );
+        let description = choice
+            .description
+            .clone()
+            .map(|description| div().text_color(muted).child(description));
+        div()
+            .id(SharedString::from(format!(
+                "question-{}-{}",
+                question.id, choice.value
+            )))
+            .test_support()
+            .w_full()
+            .child(
+                // Kit's text column is a flex item as wide as its
+                // unwrapped text; letting it shrink wraps a long
+                // description instead of spilling out of the card.
+                QuestionnaireChoice::new(state, item.clone(), choice.value.clone())
+                    .content_style(StyleRefinement::default().min_w_0())
+                    // Kit outlines an empty indicator in the color of an
+                    // input's border, which the card's background hides.
+                    .when(!selected, |this| {
+                        let outline = StyleRefinement::default().border_color(muted.opacity(0.6));
+                        this.indicator_style(outline)
+                    })
+                    .child(label)
+                    .children(description),
+            )
+    });
+    // What it asks and the help under it read as one heading; Kit spaces
+    // an item's parts evenly, and pads a title that has no help.
+    let heading = v_flex()
+        .gap_0p5()
+        .pb_1()
+        .child(
+            QuestionnaireTitle::new(state, item.clone())
+                .text_base()
+                .mb_0(),
+        )
+        .child(QuestionnaireDescription::new(state, item.clone()).text_size(text));
+    QuestionnaireItem::new(state, item.clone())
+        .gap_1p5()
+        .child(heading)
+        .child(
+            QuestionnaireChoices::new(state, item.clone())
+                .gap_1p5()
+                .children(choices),
+        )
+        // Only where there is a box: an empty wrapper would still take a gap.
+        .when(question.takes_text, |this| {
+            let other = SharedString::from(format!("question-{}-other", question.id));
+            // Kit's input has no height of its own at `Size::Size`, and a
+            // named size drops the choices' inset.
+            let input = QuestionnaireInput::new(state, item.clone())
+                .with_size(Size::Medium)
+                .pl(text * CHOICE_INSET);
+            this.child(div().id(other).test_support().child(input))
+        })
+        .child(QuestionnaireError::new(state, item))
 }
 
 /// Whether a row of buttons stresses the one Enter should pick.
@@ -577,9 +651,9 @@ enum Emphasis {
 }
 
 impl Render for InputCard {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let body = match &self.body {
-            Body::Questions { state, decline } => self.render_questions(state, decline, cx),
+            Body::Questions { state, decline } => self.render_questions(state, decline, window, cx),
             // The text box fills the buttons' row, so the card is no taller
             // for it.
             Body::Choices { choices, text } => h_flex()
@@ -606,7 +680,8 @@ impl Render for InputCard {
             .p_3()
             .rounded(cx.theme().radius_lg)
             .border_1()
-            .border_color(cx.theme().warning)
+            // The composer's frame, which the card sits on.
+            .border_color(cx.theme().input)
             .bg(cx.theme().secondary)
             // The first key, paste or click in the card starts on it.
             .capture_key_down(cx.listener(|this, _, _, cx| this.start(cx)))
@@ -659,23 +734,21 @@ fn questionnaire(
 
 /// `question` as Kit's questionnaire item. A suggestion to pick is picked:
 /// its choices selected, its own text in the text box. A suggestion to mark
-/// labels its choices "suggested", and shows its own text as the text box's
-/// placeholder.
+/// names its choices "suggested" to assistive technology, as their tag
+/// does on screen, and shows its own text as the text box's placeholder.
 fn item(question: &Question, window: &mut Window, cx: &mut App) -> QuestionnaireItemDefinition {
-    let suggestion = question.suggestion.as_ref();
-    let picks = suggestion.filter(|suggestion| suggestion.style == SuggestionStyle::Selected);
-    let marks = suggestion.filter(|suggestion| suggestion.style == SuggestionStyle::Marked);
-    let names = |suggested: Option<&rho_ui_core::Suggestion>, value: &str| {
-        suggested.is_some_and(|suggestion| suggestion.choices.iter().any(|v| v == value))
+    let (picked, marked) = (question.picked(), question.marked());
+    let names = |suggestion: Option<&Suggestion>, value: &str| {
+        suggestion.is_some_and(|suggestion| suggestion.names(value))
     };
     let choices = question.choices.iter().map(|choice| {
-        let label = if names(marks, &choice.value) {
+        let label = if names(marked, &choice.value) {
             format!("{} (suggested)", choice.label)
         } else {
             choice.label.clone()
         };
         let definition = QuestionnaireChoiceDefinition::new(choice.value.clone(), label)
-            .with_default_selected(names(picks, &choice.value));
+            .with_default_selected(names(picked, &choice.value));
         match &choice.description {
             Some(description) => definition.with_description(description.clone()),
             None => definition,
@@ -695,8 +768,8 @@ fn item(question: &Question, window: &mut Window, cx: &mut App) -> Questionnaire
         } else {
             "Or your own answer"
         };
-        let picked = picks.and_then(|suggestion| suggestion.own.clone());
-        let marked = marks.and_then(|suggestion| suggestion.own.as_deref());
+        let picked = picked.and_then(|suggestion| suggestion.own.clone());
+        let marked = marked.and_then(|suggestion| suggestion.own.as_deref());
         let state = cx.new(|cx| {
             let state = InputState::new(window, cx);
             match (picked, marked) {
