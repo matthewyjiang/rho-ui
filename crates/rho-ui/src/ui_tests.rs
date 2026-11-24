@@ -28,22 +28,25 @@ use gpui_kit::{
 use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{
-        report, subagent_result, write_program, FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH,
-        REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
+        report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script, TuiJob,
+        KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_TASK, TUI_SESSION,
+        UNCHECKED_KEY, WORKFLOW_ERROR,
     },
-    Attachment, BackgroundKind, BackgroundStatus, Checkout, Choices, Daemon, DaemonTarget, Delay,
-    Entry, ModelRef, PermissionMode, PromptKey, ReasoningLevel, RestartCost, RetryReason,
-    RhoInstall, RunState, Session, SessionId, SessionOptions, ToolStatus, WorktreeVerdict,
+    Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices, Daemon,
+    DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
+    PullRequestId, PullRequestLinkOrigin, PullRequestRead, PullRequestRollup, PullRequestState,
+    PullRequestSummary, PullRequestTrouble, ReasoningLevel, RestartCost, RetryReason, RhoInstall,
+    RunState, Session, SessionId, SessionOptions, SessionPullRequests, ToolStatus, WorktreeVerdict,
 };
 
 use gpui_kit::component::ActiveTheme as _;
 
 use crate::{
     app::{LaunchConfig, RhoApp},
-    forge::ForgeCli,
+    forge::{avatar::test::serve_pictures, Check, ForgeCli},
     machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
-    pull_requests::{BranchId, CheckStatus, Found, Lookup, PrLinks, RepoId, Target},
+    pull_requests::{Serving, Shown, Which},
     rho_install::Offer,
     right_panel::{Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, SmoothScroll, UiScale},
@@ -131,7 +134,6 @@ const WAIT: Duration = Duration::from_secs(10);
 /// clean up a temporary folder.
 #[cfg(unix)]
 static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell");
     std::fs::create_dir_all(&dir).expect("make the test shell's folder");
     let path = dir.join("sh");
@@ -139,9 +141,7 @@ static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
         export PS1='$ '\n\
         if [ -n \"$BASH_VERSION\" ]; then exec /bin/sh --noediting; fi\n\
         exec /bin/sh\n";
-    std::fs::write(&path, script).expect("write the test shell");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .expect("make the test shell executable");
+    write_program(&path, script);
     path
 });
 
@@ -1288,6 +1288,10 @@ fn composer_settings_change_the_session() {
         session
             .options()
             .is_some_and(|options| options.model().current() == &ModelRef::new("fake", "huge"))
+    });
+    // Closed before the click below, which would otherwise close it.
+    ui.wait_until("the panel to close", |window, _, _| {
+        !is_visible(window, "model-fake/huge")
     });
 
     // Reasoning and fast mode change in place; the panel stays open.
@@ -3771,169 +3775,122 @@ fn the_right_panels_tabs_open_from_a_menu_move_and_close() {
     ui.act(|window, _| assert!(is_visible(window, "panel-surface-list")));
 }
 
-/// The description of [`StubGh`]'s PR, with a diagram.
-const PR_BODY: &str = "Adds **widgets**.\n\n```mermaid\nflowchart LR\n  A --> B\n```\n";
-
-/// What [`StubGh`]'s API answers: PR 12 on `feature`, with a diagram in its
-/// description, a failed check and a passed one, a comment and an
-/// approval, an open thread and a resolved one. Their authors' pictures
-/// are at `pictures`, an address such as
-/// [`serve_pictures`](crate::forge::avatar::test::serve_pictures) returns.
-fn stub_answer(pictures: &str) -> String {
-    let summary = |checks: serde_json::Value| {
-        serde_json::json!({
-            "number": 12, "title": "Add widgets", "url": "https://github.com/acme/widgets/pull/12",
-            "state": "OPEN", "isDraft": false, "isCrossRepository": false,
-            "updatedAt": "2026-11-15T00:00:00Z", "headRefOid": "abc",
-            "commits": { "nodes": [{ "commit": { "statusCheckRollup": checks } }] },
-        })
-    };
-    let check = |name: &str, conclusion: &str| {
-        serde_json::json!({
-            "__typename": "CheckRun", "name": name, "status": "COMPLETED",
-            "conclusion": conclusion, "detailsUrl": null,
-            "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } },
-        })
-    };
-    // A comment and an approval; an open thread and a resolved one.
-    let author = |login: &str| serde_json::json!({ "login": login, "avatarUrl": format!("{pictures}/{login}.png") });
-    let post = |login: &str, at: &str, body: &str, url: &str| {
-        serde_json::json!({
-            "author": author(login), "body": body, "createdAt": at, "url": url
-        })
-    };
-    let thread = |id: &str, resolved: bool, path: &str, line: u32, body: &str| {
-        let url = format!("https://github.com/acme/widgets/pull/12#{id}");
-        serde_json::json!({
-            "id": id, "isResolved": resolved, "isOutdated": false, "path": path, "line": line,
-            "comments": {
-                "totalCount": 1,
-                "nodes": [post("octocat", "2026-11-14T23:00:00Z", body, &url)],
-            },
-        })
-    };
-    let mut detail = summary(serde_json::json!({
-        "state": "FAILURE",
-        "contexts": {
-            "totalCount": 2,
-            "nodes": [check("linux", "SUCCESS"), check("macos", "FAILURE")],
-        },
-    }));
-    let extra = serde_json::json!({
-        "body": PR_BODY, "author": { "login": "octocat" },
-        "headRefName": "feature", "baseRefName": "main",
-        "additions": 10, "deletions": 2, "changedFiles": 3, "reviewDecision": "APPROVED",
-        "mergeable": "MERGEABLE", "repository": {
-            "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": false,
-            "viewerDefaultMergeMethod": "SQUASH",
-        },
-        "comments": { "totalCount": 1, "nodes": [post(
-            "hubot", "2026-11-14T22:00:00Z",
-            "Looks good, one nit on the error path.",
-            "https://github.com/acme/widgets/pull/12#c1",
-        )] },
-        "reviews": { "totalCount": 1, "nodes": [{
-            "author": author("monalisa"), "body": "Ship it.", "state": "APPROVED",
-            "submittedAt": "2026-11-14T23:30:00Z",
-            "url": "https://github.com/acme/widgets/pull/12#r1",
-        }] },
-        "reviewThreads": { "totalCount": 2, "nodes": [
-            thread("t1", false, "src/lib.rs", 7, "Should this be `pub(crate)`?"),
-            thread("t2", true, "src/widgets/render.rs", 42, "Typo."),
-        ] },
-    });
-    if let (Some(detail), serde_json::Value::Object(extra)) = (detail.as_object_mut(), extra) {
-        detail.extend(extra);
-    }
-    let mut linked = summary(serde_json::json!({ "state": "FAILURE" }));
-    linked["title"] = serde_json::json!("Linked widgets");
-    serde_json::json!({ "data": {
-        "rateLimit": { "remaining": 4999, "resetAt": "2026-11-15T01:00:00Z" },
-        "r0": {
-            "defaultBranchRef": { "name": "main" },
-            "b0": { "nodes": [summary(serde_json::json!({ "state": "FAILURE" }))] },
-            "p0": detail,
-            // The same PR linked by hand, by another title.
-            "l0": linked,
-        },
-    } })
-    .to_string()
-}
-
-/// A checkout of `acme/widgets` on GitHub, on branch `feature`, and a gh
-/// signed in to github.com whose API answers with PR 12 on `feature`, a
-/// failed check and a passed one, and counts its queries. The pictures of
-/// the PR's people are served on this machine, which `curl` fetches.
+/// A gh for the tests that act on a PR: it writes the arguments of each
+/// `gh pr ...` it runs, and notes each `gh auth status`. It reads nothing:
+/// the daemon reads PRs.
 struct StubGh {
-    _checkout: tempfile::TempDir,
-    repo: PathBuf,
     bin: tempfile::TempDir,
 }
 
 impl StubGh {
+    /// One signed in to github.com as octocat.
     fn new() -> Self {
-        let checkout = tempfile::tempdir().unwrap();
-        let repo = rho_ui_core::platform::canonicalize(checkout.path()).unwrap();
-        let git = |args: &[&str]| crate::local::test::git(&repo, args);
-        git(&["init", "-q", "-b", "main"]);
-        git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "x"]);
-        git(&["checkout", "-q", "-b", "feature"]);
+        Self::with_hosts(
+            r#"{"github.com":[{"state":"success","active":true,"host":"github.com","login":"octocat"}]}"#,
+        )
+    }
 
+    /// One signed in nowhere, so it can't comment.
+    fn signed_out() -> Self {
+        Self::with_hosts("{}")
+    }
+
+    /// One whose `gh auth status --json hosts` gives `hosts`.
+    fn with_hosts(hosts: &str) -> Self {
         let bin = tempfile::tempdir().unwrap();
-        let queries = bin.path().join("queries");
-        let answer = stub_answer(&crate::forge::avatar::test::serve_pictures());
-        std::fs::write(bin.path().join("answer.json"), answer).unwrap();
-        let gh = bin.path().join("gh");
         let script = format!(
             "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
-             auth) echo '{{\"hosts\":{{\"github.com\":[{{\"state\":\"success\",\"active\":true,\"host\":\"github.com\",\"login\":\"octocat\"}}]}}}}' ;;\n  \
-             api) echo x >> '{}'; cat '{}' ;;\n  \
-             pr) printf '%s\\n' \"$@\" > '{}' ;;\nesac\n",
-            queries.display(),
-            bin.path().join("answer.json").display(),
-            bin.path().join("comment").display(),
+             auth) echo checked >> '{checks}'; echo '{{\"hosts\":{hosts}}}' ;;\n  \
+             pr) printf '%s\\n' \"$@\" > '{acted}' ;;\nesac\n",
+            checks = bin.path().join("checks").display(),
+            acted = bin.path().join("acted").display(),
         );
-        write_program(&gh, &script);
-        StubGh {
-            _checkout: checkout,
-            repo,
-            bin,
-        }
+        write_program(&bin.path().join("gh"), &script);
+        StubGh { bin }
     }
 
-    fn program(&self) -> PathBuf {
-        self.bin.path().join("gh")
+    /// How many times its accounts were checked.
+    fn checks(&self) -> usize {
+        std::fs::read_to_string(self.bin.path().join("checks"))
+            .map_or(0, |checks| checks.lines().count())
     }
 
-    /// How many API queries it answered.
-    fn asked(&self) -> usize {
-        std::fs::read_to_string(self.bin.path().join("queries"))
-            .map_or(0, |text| text.lines().count())
+    /// Settings that act through this gh on this machine.
+    fn settings(&self) -> Settings {
+        let mut settings = Settings::default();
+        let program = self.bin.path().join("gh");
+        settings
+            .local_cli
+            .set(ForgeCli::Gh, program.display().to_string());
+        settings
     }
 
     /// The arguments of its last `gh pr ...`, one a line.
     fn acted(&self) -> Option<String> {
-        std::fs::read_to_string(self.bin.path().join("comment")).ok()
-    }
-
-    /// Edits its API's answer.
-    fn edit_answer(&self, edit: impl FnOnce(&mut serde_json::Value)) {
-        let path = self.bin.path().join("answer.json");
-        let mut answer = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        edit(&mut answer);
-        std::fs::write(&path, answer.to_string()).unwrap();
+        std::fs::read_to_string(self.bin.path().join("acted")).ok()
     }
 }
 
-/// Opens the Pull request surface on `gh`'s checkout once the session's
-/// first turn ended, so that end reads nothing, and waits for PR 12 and
-/// its checks.
-fn open_pr_session(gh: &StubGh, name: &'static str) -> Harness {
-    let mut settings = Settings::default();
-    settings
-        .local_cli
-        .set(ForgeCli::Gh, gh.program().display().to_string());
+/// The session on screen.
+fn active_key(ui: &mut Harness) -> SessionKey {
+    let app = ui.app.clone();
+    ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session shows");
+        view.read(cx).live().id
+    })
+}
+
+/// The summary of the branch's PR in `set`.
+fn branch_pr(set: &mut SessionPullRequests) -> &mut PullRequestSummary {
+    match set.branch.as_mut().map(|branch| &mut branch.lookup) {
+        Some(BranchLookup::Found { pull_request }) => pull_request.as_mut(),
+        _ => panic!("the branch has a PR"),
+    }
+}
+
+/// How each `show` the fake daemon got for `session` read, oldest first.
+fn shows(ui: &Harness, session: &SessionKey) -> Vec<PullRequestRead> {
+    ui.fake().pull_request_shows(&session.id)
+}
+
+/// How many `show`s for `session` read GitHub afresh.
+fn fresh_shows(fake: &FakeDaemon, session: &SessionKey) -> usize {
+    let shows = fake.pull_request_shows(&session.id);
+    shows
+        .iter()
+        .filter(|read| **read == PullRequestRead::Fresh)
+        .count()
+}
+
+/// The numbers of the PRs the fake daemon links to `session`, in order.
+fn linked_numbers(fake: &FakeDaemon, session: &SessionKey) -> Vec<u32> {
+    let set = fake.pull_requests(&session.id);
+    set.linked.iter().map(|link| link.id.number).collect()
+}
+
+/// Moves the clock on by `step` at a time until `ready` holds: for a
+/// timer that starts as an answer lands, which may still be on its way.
+fn advance_until(
+    ui: &mut Harness,
+    step: Duration,
+    what: &str,
+    mut ready: impl FnMut(&mut Harness) -> bool,
+) {
+    ui.poll(
+        WAIT,
+        what,
+        |ui| {
+            ui.cx.advance_clock(step);
+            ui.frame();
+            ready(ui)
+        },
+        Harness::labels_seen,
+    );
+}
+
+/// A new session on this machine, its first turn ended, whose branch the
+/// daemon then finds PR 12 on. Returns its key.
+fn open_pr_session(name: &'static str, settings: Settings) -> (Harness, SessionKey) {
     let daemon = FakeDaemon::start(Script::default());
     let mut ui = Harness::open_with(
         name,
@@ -3942,7 +3899,6 @@ fn open_pr_session(gh: &StubGh, name: &'static str) -> Harness {
         Machines {
             shelves: Shelves::owning(["s1"]),
             settings,
-            workspace: Some(gh.repo.clone()),
             ..Machines::default()
         },
     );
@@ -3952,68 +3908,63 @@ fn open_pr_session(gh: &StubGh, name: &'static str) -> Harness {
     ui.wait_for_session("the turn to end", |session| {
         session.state() == &RunState::Idle
     });
-    ui
+    let key = active_key(&mut ui);
+    ui.fake().open_pull_request(&key.id, &serve_pictures());
+    (ui, key)
 }
 
 /// Opens the Pull request surface over a session made by
-/// [`open_pr_session`].
-fn open_pr_surface(gh: &StubGh, name: &'static str) -> Harness {
-    let mut ui = open_pr_session(gh, name);
+/// [`open_pr_session`], and waits for PR 12 and its checks.
+fn open_pr_surface(name: &'static str, settings: Settings) -> (Harness, SessionKey) {
+    let (mut ui, key) = open_pr_session(name, settings);
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.click("open-surface-pull-request");
     ui.wait_until("the PR and its checks", |window, _, _| {
         is_visible(window, "pull-request-check-1")
     });
-    ui
+    (ui, key)
 }
 
-/// The Pull request surface shows the PR of the session's branch, read
-/// through gh: one query finds it, one more reads its detail, then one
-/// every 30 seconds while it shows, and none while the panel is hidden or
-/// GitHub's limit is nearly spent, which it says.
+/// The Pull request surface shows the PR the daemon found on the session's
+/// branch, with its people's pictures. While it shows, it asks the daemon
+/// again every 30 seconds, so the daemon keeps reading it, and nothing
+/// while the panel is hidden; a change the daemon reports redraws it at
+/// once. A trouble the daemon reports shows over the PR it read last.
 #[test]
-#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn the_pull_request_surface_shows_the_branchs_pr() {
-    let gh = StubGh::new();
-    let asked = || gh.asked();
-    let mut ui = open_pr_surface(&gh, "pull-request");
-    let branch = BranchId {
-        repo: RepoId::from_url("git@github.com:acme/widgets.git").unwrap(),
-        branch: "feature".into(),
-    };
-    let (id, statuses) = ui.cx.update(|cx| {
+    let (mut ui, key) = open_pr_surface("pull-request", Settings::default());
+    // What [`FakeDaemon::open_pull_request`] opened.
+    let id = PullRequestId::new("github.com", "acme", "widgets", 12);
+    let set = ui.fake().pull_requests(&key.id);
+    ui.cx.update(|cx| {
         let prs = ui.app.read(cx).pull_requests().read(cx);
-        let Lookup::Found(Found::Pr(summary)) = prs.lookup(&Target::Branch(branch.clone())) else {
-            panic!("PR 12");
+        assert_eq!(prs.of(&key), Some(&set), "the daemon's set, whole");
+        let shown = Shown {
+            session: key.clone(),
+            which: Which::Branch,
         };
-        let detail = prs.detail(&summary.id).expect("its detail");
-        let statuses = detail
-            .checks
-            .iter()
-            .map(|check| check.status)
-            .collect::<Vec<_>>();
-        (summary.id.clone(), statuses)
-    });
-    assert_eq!(statuses, [CheckStatus::Failed, CheckStatus::Passed]);
-    // Those who posted show their pictures, fetched from where GitHub
-    // serves each.
-    ui.wait_until("the authors' pictures", |_, cx, app| {
-        let prs = app.pull_requests().read(cx);
-        let detail = prs.detail(&id).expect("its detail");
-        detail.every_post().all(|post| {
-            let url = post.avatar_url.as_ref().expect("the author's picture");
-            prs.avatar(url).is_some()
-        })
+        assert_eq!(prs.summary(&shown).map(|summary| &summary.id), Some(&id));
+        assert!(prs.detail(&key.machine, &id).is_some(), "its detail");
     });
     assert_eq!(
         ui.label("pull-request-title").as_deref(),
         Some("Add widgets")
     );
-    assert_eq!(asked(), 2, "one query found the PR, one read its detail");
+    // Those who posted show their pictures, fetched from where GitHub
+    // serves each.
+    ui.wait_until("the authors' pictures", |_, cx, app| {
+        let prs = app.pull_requests().read(cx);
+        let detail = prs.detail(&key.machine, &id).expect("its detail");
+        let comments = detail.threads.iter().flat_map(|thread| &thread.comments);
+        detail.posts.iter().chain(comments).all(|post| {
+            let url = post.avatar_url.as_deref().expect("the author's picture");
+            prs.avatar(url).is_some()
+        })
+    });
     // Its description draws its diagram, as a message does.
     let diagram = SharedString::from(format!(
         "diagram-{}",
-        PR_BODY.find("```mermaid").expect("a diagram")
+        PULL_REQUEST_BODY.find("```mermaid").expect("a diagram")
     ));
     ui.wait_until("the description's diagram", |window, _, _| {
         is_visible(window, diagram.clone())
@@ -4030,55 +3981,68 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
     });
     ui.shot("pr");
 
-    // On screen, it reads again every 30 seconds; its checks done, the
-    // PR's detail isn't read again.
+    // On screen, it asks again within the daemon's 30 seconds.
+    let asked = shows(&ui, &key).len();
     ui.cx.advance_clock(Duration::from_secs(30));
-    ui.wait_until("the next poll", |_, _, _| asked() == 3);
-    // A daemon reconnecting forgets the gh it found; the poll that finds
-    // it being checked again runs once it is.
-    let forges = ui.cx.update(|cx| ui.app.read(cx).forges().clone());
-    ui.cx.update(|cx| {
-        forges.update(cx, |forges, cx| forges.forget(&MachineId::local(), cx));
+    ui.wait_for_daemon("the next show", |fake| {
+        fake.pull_request_shows(&key.id).len() > asked
     });
-    ui.cx.advance_clock(Duration::from_secs(30));
-    ui.wait_until("a poll after gh's check", |_, _, _| asked() == 4);
+    assert_eq!(shows(&ui, &key).last(), Some(&PullRequestRead::Cached));
 
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    let asked = shows(&ui, &key).len();
     ui.cx.advance_clock(Duration::from_secs(120));
     ui.frame();
-    assert_eq!(asked(), 4, "a hidden panel polls nothing");
+    assert_eq!(shows(&ui, &key).len(), asked, "a hidden panel asks nothing");
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
-    ui.wait_until("a read as the panel shows", |_, _, _| asked() == 5);
-
-    // Down to GitHub's last points, polling waits for the limit to reset
-    // and says so over the PR it read.
-    gh.edit_answer(|answer| {
-        answer["data"]["rateLimit"] =
-            serde_json::json!({ "remaining": 10, "resetAt": "2099-01-01T00:00:00Z" });
+    ui.wait_for_daemon("a show as the panel shows", |fake| {
+        fake.pull_request_shows(&key.id).len() > asked
     });
-    ui.click("pull-request-refresh");
+
+    // A change the daemon reports redraws the PR with no wait.
+    ui.fake().edit_pull_requests(&key.id, |set| {
+        "Add widgets, renamed".clone_into(&mut branch_pr(set).title);
+    });
+    ui.wait_until("the new title", |window, _, _| {
+        window
+            .try_find("pull-request-title")
+            .is_some_and(|title| title.label() == Some("Add widgets, renamed"))
+    });
+
+    // The daemon paused its reads: it says so over the PR it read last.
+    ui.fake().edit_pull_requests(&key.id, |set| {
+        let branch = set.branch.as_mut().expect("the branch");
+        branch.trouble = Some(PullRequestTrouble::Paused {
+            host: "github.com".to_owned(),
+            remaining: 10,
+            floor: 50,
+            // 2099-01-01.
+            resets_at: 4_070_908_800,
+        });
+    });
     ui.wait_until("the pause", |window, _, _| {
         is_visible(window, "pull-request-trouble") && is_visible(window, "pull-request-title")
     });
-    assert_eq!(asked(), 6);
     ui.shot("paused");
-    ui.cx.advance_clock(Duration::from_secs(120));
-    ui.frame();
-    assert_eq!(asked(), 6, "a paused poll asks nothing");
 }
 
-/// An active session's row marks its PR, failing checks and all, read for
-/// the sidebar by one query of summaries, then again every five minutes.
+/// A row marks its session's PR, failing checks and all, for a session
+/// rho-ui lists but doesn't follow, so no event tells of it: listing
+/// finds it, and listing again within a minute finds its change.
 #[test]
-#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn a_sidebar_row_marks_its_pr() {
-    let gh = StubGh::new();
-    let mut ui = open_pr_session(&gh, "pull-request-row");
-    let key = ui.cx.update(|cx| {
-        let app = ui.app.read(cx);
-        app.active_session().expect("a session").read(cx).live().id
-    });
-    let mark = SharedString::from(format!("session-{key}-pr"));
+    let daemon = FakeDaemon::start(Script::default());
+    let old = SessionKey::local("old");
+    // Never shown, so its pictures are never fetched.
+    daemon.open_pull_request(&old.id, "http://127.0.0.1:9");
+    let mut ui = Harness::open(
+        "pull-request-row",
+        daemon.target(),
+        Some(daemon),
+        Shelves::owning(["s1", "old"]),
+        Projects::default(),
+    );
+    let mark = SharedString::from(format!("session-{old}-pr"));
     ui.wait_until("the row's PR", |window, _, _| {
         is_visible(window, mark.clone())
     });
@@ -4086,32 +4050,39 @@ fn a_sidebar_row_marks_its_pr() {
         ui.label(mark.clone()).as_deref(),
         Some("#12, checks failing")
     );
-    assert_eq!(gh.asked(), 1, "one query, without the PR's detail");
+    assert_eq!(
+        shows(&ui, &old),
+        Vec::<PullRequestRead>::new(),
+        "a list found it, not a show"
+    );
     ui.shot("mark");
 
-    ui.cx.advance_clock(Duration::from_secs(300));
-    ui.wait_until("the next read", |_, _, _| gh.asked() == 2);
+    let lists = ui.fake().pull_request_lists();
+    ui.fake().edit_pull_requests(&old.id, |set| {
+        branch_pr(set).rollup = PullRequestRollup::Passing;
+    });
+    advance_until(
+        &mut ui,
+        Duration::from_secs(60),
+        "the checks passing",
+        |ui| ui.label(mark.clone()).as_deref() == Some("#12"),
+    );
+    let rollup = ui.cx.update(|cx| {
+        let prs = ui.app.read(cx).pull_requests().read(cx);
+        prs.mark(&old).map(|pr| pr.rollup)
+    });
+    assert_eq!(rollup, Some(PullRequestRollup::Passing));
+    assert!(ui.fake().pull_request_lists() > lists);
 }
 
-/// PRs linked by hand each open a tab beside the branch's, named for its
-/// number, and stay linked across a restart's read of the state database;
-/// closing a linked PR's tab, or Unlink, unlinks it. What names no PR says
-/// so.
+/// Links go to the daemon, and tabs follow its links: each PR linked by
+/// hand or by the agent opens a tab of its own, except the branch's own
+/// PR, which has one, also while the daemon looks the branch up; what
+/// names no PR shows the daemon's refusal; closing a linked PR's tab, or
+/// Unlink, unlinks it.
 #[test]
-#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn pull_requests_link_by_hand() {
-    let gh = StubGh::new();
-    let mut ui = open_pr_surface(&gh, "pull-request-link");
-    let key = ui.cx.update(|cx| {
-        let app = ui.app.read(cx);
-        app.active_session().expect("a session").read(cx).live().id
-    });
-    let linked = |ui: &mut Harness| {
-        ui.cx.update(|cx| {
-            let links = cx.global::<PrLinks>().get(&key);
-            links.iter().map(|id| id.number).collect::<Vec<_>>()
-        })
-    };
+    let (mut ui, key) = open_pr_surface("pull-request-link", Settings::default());
     let link = |ui: &mut Harness, text: &str| {
         ui.click("pull-request-link");
         ui.act(|window, cx| {
@@ -4120,45 +4091,88 @@ fn pull_requests_link_by_hand() {
             window.press("enter", cx);
         });
     };
+    let linked = |ui: &Harness| linked_numbers(ui.fake(), &key);
     link(&mut ui, "widgets");
     ui.wait_until("why that's no PR", |window, _, _| {
         is_visible(window, "pull-request-link-error")
     });
+    assert_eq!(linked(&ui), Vec::<u32>::new());
     ui.shot("form");
     ui.act(|window, cx| window.press("secondary-a", cx));
 
+    // The branch's own PR, linked, keeps its one tab.
     link(&mut ui, "acme/widgets#12");
+    ui.wait_until("the form closed", |window, _, _| {
+        !is_visible(window, "pull-request-link-input")
+    });
+    assert_eq!(linked(&ui), [12]);
+    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
+    // A daemon that restarted looks the branch up again: until it has
+    // found the branch's PR, that PR, watched, gets no tab of its own
+    // either, to close again once it has.
+    let branch = ui.fake().pull_requests(&key.id).branch;
+    ui.fake().edit_pull_requests(&key.id, |set| {
+        set.branch.as_mut().expect("the branch").lookup = BranchLookup::Looking;
+        set.linked[0].watched = true;
+    });
+    ui.wait_until("the branch looked up again", |_, cx, app| {
+        let set = app.pull_requests().read(cx).of(&key);
+        set.and_then(|set| set.branch.as_ref())
+            .is_some_and(|branch| branch.lookup == BranchLookup::Looking)
+    });
+    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
+    ui.fake()
+        .edit_pull_requests(&key.id, move |set| set.branch = branch);
+    ui.wait_until("the branch's PR found again", |window, _, _| {
+        is_visible(window, "pull-request-title")
+    });
+
+    link(&mut ui, "#13");
     ui.wait_until("the linked PR in a tab of its own", |window, _, _| {
         is_visible(window, "panel-tab-pull-request-2")
-            && window
-                .try_find("pull-request-title")
-                .is_some_and(|title| title.label() == Some("Linked widgets"))
     });
-    link(&mut ui, "acme/widgets#13");
-    ui.wait_until("a second linked PR's tab", |window, _, _| {
+    assert_eq!(linked(&ui), [12, 13]);
+    // The agent links and watches a PR.
+    let id = PullRequestId::new("github.com", "acme", "widgets", 14);
+    let url = "https://github.com/acme/widgets/pull/14";
+    let mut agents =
+        LinkedPullRequest::new(id.clone(), url, PullRequestLinkOrigin::Agent, 1_767_312_100);
+    agents.watched = true;
+    agents.summary = Some(PullRequestSummary::new(
+        id,
+        "Agent's widgets",
+        url,
+        PullRequestState::Open,
+        PullRequestRollup::Passing,
+        "def",
+        "2026-11-16T00:00:00Z",
+    ));
+    ui.fake()
+        .edit_pull_requests(&key.id, |set| set.linked.push(agents));
+    ui.wait_until("the agent's PR in a tab", |window, _, _| {
         is_visible(window, "panel-tab-pull-request-3")
     });
     assert_eq!(ui.label("panel-tab-pull-request").as_deref(), Some("#12"));
-    assert_eq!(ui.label("panel-tab-pull-request-2").as_deref(), Some("#12"));
-    assert_eq!(ui.label("panel-tab-pull-request-3").as_deref(), Some("#13"));
-    assert_eq!(linked(&mut ui), [12, 13]);
-    let reloaded = PrLinks::load(&ui.state);
-    let reloaded: Vec<u32> = reloaded.get(&key).iter().map(|id| id.number).collect();
-    assert_eq!(reloaded, [12, 13], "a restart reads them back in order");
+    assert_eq!(ui.label("panel-tab-pull-request-2").as_deref(), Some("#13"));
+    assert_eq!(ui.label("panel-tab-pull-request-3").as_deref(), Some("#14"));
     ui.shot("linked");
 
-    ui.click("panel-tab-pull-request");
-    ui.wait_until("the branch's PR, still first", |window, _, _| {
-        window
-            .try_find("pull-request-title")
-            .is_some_and(|title| title.label() == Some("Add widgets"))
-    });
     ui.act(|window, cx| window.hover("panel-tab-pull-request-2", cx));
     ui.click("close-panel-tab-pull-request-2");
-    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
-    assert_eq!(linked(&mut ui), [13], "closing its tab unlinked it");
+    ui.wait_for_daemon("#13 unlinked", |fake| {
+        linked_numbers(fake, &key) == [12, 14]
+    });
+    ui.wait_until("its tab closed", |window, _, _| {
+        !is_visible(window, "panel-tab-pull-request-2")
+    });
 
     ui.click("panel-tab-pull-request-3");
+    ui.wait_until("the agent's PR", |window, _, _| {
+        window
+            .try_find("pull-request-title")
+            .is_some_and(|title| title.label() == Some("Agent's widgets"))
+    });
+    ui.shot("watched");
     ui.click("pull-request-unlink");
     ui.wait_until("the branch's PR again", |window, _, _| {
         !is_visible(window, "panel-tab-pull-request-3")
@@ -4166,62 +4180,104 @@ fn pull_requests_link_by_hand() {
                 .try_find("pull-request-title")
                 .is_some_and(|title| title.label() == Some("Add widgets"))
     });
-    assert_eq!(linked(&mut ui), Vec::<u32>::new());
+    assert_eq!(linked(&ui), [12]);
+}
+
+/// An unlink the daemon refuses shows why on the PR's own tab, and the
+/// tab stays: closing a linked tab never fails silently.
+#[test]
+fn a_refused_unlink_shows_on_its_tab() {
+    let (mut ui, key) = open_pr_surface("pull-request-unlink-refused", Settings::default());
+    let linked = |ui: &Harness| linked_numbers(ui.fake(), &key);
+    // A link on a host the daemon refuses can't be unlinked: closing its
+    // tab shows why there, and the tab stays.
+    let id = PullRequestId::new("ghe.acme.com", "acme", "widgets", 15);
+    let url = "https://ghe.acme.com/acme/widgets/pull/15";
+    let mut elsewhere =
+        LinkedPullRequest::new(id.clone(), url, PullRequestLinkOrigin::User, 1_767_312_200);
+    elsewhere.summary = Some(PullRequestSummary::new(
+        id,
+        "Widgets elsewhere",
+        url,
+        PullRequestState::Open,
+        PullRequestRollup::Passing,
+        "fed",
+        "2026-11-17T00:00:00Z",
+    ));
+    ui.fake()
+        .edit_pull_requests(&key.id, |set| set.linked.push(elsewhere));
+    ui.wait_until("its tab", |window, _, _| {
+        is_visible(window, "panel-tab-pull-request-2")
+    });
+    ui.click("panel-tab-pull-request-2");
+    ui.wait_until("its PR", |window, _, _| {
+        window
+            .try_find("pull-request-title")
+            .is_some_and(|title| title.label() == Some("Widgets elsewhere"))
+    });
+    ui.act(|window, _| assert!(!is_visible(window, "pull-request-trouble")));
+    ui.act(|window, cx| window.hover("panel-tab-pull-request-2", cx));
+    ui.click("close-panel-tab-pull-request-2");
+    ui.wait_until("the refusal on its tab", |window, _, _| {
+        is_visible(window, "pull-request-trouble")
+    });
+    ui.act(|window, _| assert!(is_visible(window, "panel-tab-pull-request-2")));
+    assert_eq!(linked(&ui), [15]);
 }
 
 /// Two sessions on one branch each have a Pull request tab of the same PR;
-/// switching between them, either way, leaves the one on screen polling,
-/// whatever order the panel tells their surfaces in.
+/// switching between them, either way, leaves the daemon asked about the
+/// one on screen and not the other, whatever order the panel tells their
+/// surfaces in.
 #[test]
-#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn sessions_on_one_branch_each_watch_their_pr() {
-    let gh = StubGh::new();
-    let mut ui = open_pr_surface(&gh, "pull-request-two-sessions");
-    let active = |ui: &mut Harness| {
-        ui.cx.update(|cx| {
-            let app = ui.app.read(cx);
-            app.active_session().expect("a session").read(cx).live().id
-        })
-    };
-    let first = active(&mut ui);
+    let (mut ui, first) = open_pr_surface("pull-request-two-sessions", Settings::default());
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.send("background");
     ui.wait_for_session("the second session's turn to end", |session| {
         session.state() == &RunState::Idle
     });
-    let second = active(&mut ui);
+    let second = active_key(&mut ui);
     assert_ne!(first, second);
+    ui.fake().open_pull_request(&second.id, &serve_pictures());
     ui.click("open-surface-pull-request");
     ui.wait_until("the second session's PR", |window, _, _| {
         is_visible(window, "pull-request-check-1")
     });
-    let watching = |ui: &mut Harness| {
-        ui.cx.update(|cx| {
-            let prs = ui.app.read(cx).pull_requests().read(cx);
-            prs.poster(cx).is_ok()
-        })
-    };
-    for session in [&first, &second, &first] {
+    for (session, other) in [(&first, &second), (&second, &first), (&first, &second)] {
+        let asked = shows(&ui, session).len();
         let row = SharedString::from(format!("session-{session}"));
         ui.act(|window, cx| window.click(row, cx));
+        ui.wait_for_daemon("a show for the session on screen", |fake| {
+            fake.pull_request_shows(&session.id).len() > asked
+        });
         ui.wait_until("its PR on screen", |window, _, _| {
             is_visible(window, "pull-request-check-1")
         });
-        assert_eq!(&active(&mut ui), session);
-        assert!(watching(&mut ui), "the PR on screen is watched");
+        assert_eq!(&active_key(&mut ui), session);
+
+        let (asked, hidden) = (shows(&ui, session).len(), shows(&ui, other).len());
+        advance_until(&mut ui, Duration::from_secs(30), "the show renewed", |ui| {
+            shows(ui, session).len() > asked
+        });
+        assert_eq!(
+            shows(&ui, other).len(),
+            hidden,
+            "the session off screen is not asked about"
+        );
     }
 }
 
 /// The PR's conversation: its comments and reviews, its threads on the
 /// code, open ones open and resolved ones closed until clicked; and a
-/// comment posted through the session machine's gh, after which the PR
-/// is read again to show it.
+/// comment posted through the session machine's gh, after which the daemon
+/// is asked to read the PR afresh.
 #[test]
 #[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn a_pull_request_conversation_takes_a_comment() {
     let gh = StubGh::new();
-    let mut ui = open_pr_surface(&gh, "pull-request-conversation");
+    let (mut ui, key) = open_pr_surface("pull-request-conversation", gh.settings());
     // Once the description's diagram replaces its code.
     ui.wait_until("the approval", |window, _, _| {
         is_visible(window, "pull-request-post-1")
@@ -4248,13 +4304,16 @@ fn a_pull_request_conversation_takes_a_comment() {
     ui.click("pull-request-comment-box");
     ui.act(|window, cx| window.input("Thanks!", cx));
     ui.shot("written");
+    let fresh = fresh_shows(ui.fake(), &key);
     ui.click("pull-request-comment");
     ui.wait_until("the comment", |_, _, _| gh.acted().is_some());
     assert_eq!(
         gh.acted().as_deref(),
         Some("pr\ncomment\n12\n--repo\ngithub.com/acme/widgets\n--body\nThanks!\n")
     );
-    ui.wait_until("the PR read again", |_, _, _| gh.asked() == 3);
+    ui.wait_for_daemon("a fresh show after the comment", |fake| {
+        fresh_shows(fake, &key) > fresh
+    });
 
     // Hidden with the keyboard in the comment box, the panel gives it
     // back to the pane, where the shortcut that shows it again works.
@@ -4267,13 +4326,13 @@ fn a_pull_request_conversation_takes_a_comment() {
 }
 
 /// An open PR merges the way its repository and the viewer prefer, once
-/// confirmed, through `gh pr merge` without deleting the branch; then it is
-/// read again.
+/// confirmed, through `gh pr merge` without deleting the branch, guarded
+/// by the head shown; then the daemon is asked to read it afresh.
 #[test]
 #[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
 fn a_pull_request_merges_once_confirmed() {
     let gh = StubGh::new();
-    let mut ui = open_pr_surface(&gh, "pull-request-merge");
+    let (mut ui, key) = open_pr_surface("pull-request-merge", gh.settings());
     ui.shot("open");
     ui.click("pull-request-merge");
     ui.wait_until("the confirmation", |window, _, _| {
@@ -4281,6 +4340,7 @@ fn a_pull_request_merges_once_confirmed() {
     });
     assert_eq!(gh.acted(), None, "one click merges nothing");
     ui.shot("confirm");
+    let fresh = fresh_shows(ui.fake(), &key);
     ui.click("pull-request-merge-confirm");
     ui.wait_until("the merge", |_, _, _| gh.acted().is_some());
     assert_eq!(
@@ -4289,7 +4349,86 @@ fn a_pull_request_merges_once_confirmed() {
             "pr\nmerge\n12\n--repo\ngithub.com/acme/widgets\n--squash\n--match-head-commit\nabc\n"
         )
     );
-    ui.wait_until("the PR read again", |_, _, _| gh.asked() == 3);
+    ui.wait_for_daemon("a fresh show after the merge", |fake| {
+        fresh_shows(fake, &key) > fresh
+    });
+}
+
+/// A turn's end has the daemon read the PR on screen afresh, but leaves
+/// alone the check of a gh that can't comment, which would run `gh auth
+/// status` on its machine after every turn; Refresh checks it again, as
+/// the user may have just signed in.
+#[test]
+#[cfg_attr(windows, ignore = "runs a fake gh written as a POSIX sh script")]
+fn a_turn_end_reads_the_pr_afresh_and_refresh_checks_gh() {
+    let gh = StubGh::signed_out();
+    let (mut ui, key) = open_pr_surface("pull-request-gh-check", gh.settings());
+    let checked = |cx: &App, app: &RhoApp| {
+        let forges = app.forges().read(cx);
+        matches!(
+            forges.check(&key.machine, ForgeCli::Gh),
+            Some(Check::Done(_))
+        )
+    };
+    ui.wait_until("gh checked", |_, cx, app| checked(cx, app));
+    let checks = gh.checks();
+
+    let fresh = fresh_shows(ui.fake(), &key);
+    ui.send("background");
+    ui.wait_for_daemon("a fresh show after the turn", |fake| {
+        fresh_shows(fake, &key) > fresh
+    });
+
+    ui.click("pull-request-refresh");
+    ui.wait_until("gh checked again", |_, cx, app| {
+        gh.checks() > checks && checked(cx, app)
+    });
+    assert_eq!(gh.checks(), checks + 1, "only Refresh checked gh again");
+}
+
+/// A daemon from before pull requests is asked once a connection: its
+/// rows have no marks and its panel says to update rho, and it is asked
+/// again only once it reconnects.
+#[test]
+fn an_older_daemon_serves_no_pull_requests() {
+    let script = Script {
+        pull_requests: PullRequestMethods::Unserved,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("pull-request-unserved", script);
+    let local = MachineId::local();
+    ui.wait_until("the daemon's refusal", |_, cx, app| {
+        app.pull_requests().read(cx).serving(&local) == Some(Serving::Unserved)
+    });
+    assert_eq!(ui.fake().pull_request_lists(), 1);
+
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-old")
+    });
+    ui.click("session-local-old");
+    ui.wait_for_session("old", |_| true);
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-pull-request");
+    ui.wait_until("the advice to update rho", |window, _, _| {
+        is_visible(window, "pull-request-unserved")
+    });
+    ui.act(|window, _| assert!(!is_visible(window, "session-local-old-pr")));
+    ui.shot("panel");
+
+    ui.cx.advance_clock(Duration::from_mins(3));
+    ui.frame();
+    let old = SessionKey::local("old");
+    assert_eq!(ui.fake().pull_request_lists(), 1, "asked once");
+    assert_eq!(
+        shows(&ui, &old),
+        Vec::<PullRequestRead>::new(),
+        "and never to show"
+    );
+
+    ui.fake().restart();
+    ui.wait_for_daemon("a list on the next connection", |fake| {
+        fake.pull_request_lists() == 2
+    });
 }
 
 /// The Diff surface shows the uncommitted changes where the session on

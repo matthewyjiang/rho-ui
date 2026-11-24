@@ -7,12 +7,12 @@
 //! Each surface opens as a tab in the panel's header; hovering a tab swaps
 //! its icon for × to close it, and dragging one onto another moves it
 //! there. Terminal opens as many tabs as asked, each named for the program
-//! it runs; Pull request opens one for the branch's PR and one for each PR
-//! linked by hand, each named for its number; the others open one. With
-//! none open, the panel lists the surfaces to open; + in the header opens a
-//! menu of the rest. Each session has its own tabs ([`TabSet`]): switching
-//! sessions switches tabs, and a session's first time on screen it has
-//! none.
+//! it runs; Pull request opens one for the branch's PR and one for each
+//! other PR linked to the session, by hand or by its agent, each named for
+//! its number; the others open one. With none open, the panel lists the
+//! surfaces to open; + in the header opens a menu of the rest. Each
+//! session has its own tabs ([`TabSet`]): switching sessions switches
+//! tabs, and a session's first time on screen it has none.
 //!
 //! Ghostty's shortcuts for tabs and splits ([`TerminalShortcut`]) act on
 //! the terminal with the keyboard, or else the one under the pointer.
@@ -50,10 +50,11 @@ use gpui_kit::{
     Global, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, ScrollHandle,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
 };
+use rho_ui_core::{PullRequestId, SessionPullRequests};
 
 use self::diff::DiffSurface;
 use self::files::FilesSurface;
-use self::pull_request::{PullRequestSurface, ShowLinked, Shows, Visibility};
+use self::pull_request::{unlink_tooltip, PullRequestSurface, ShowLinked, Visibility};
 use self::tabs::{Tab, TabKey, TabSet};
 pub(crate) use self::terminal::{Direction, PaneCommand, TerminalShell};
 use self::terminal::{Emptied, TerminalTab};
@@ -61,7 +62,7 @@ use self::terminal::{Emptied, TerminalTab};
 pub(crate) use self::terminal::{TerminalView, PROGRAM_POLL};
 use crate::{
     machines::{Place, SessionKey},
-    pull_requests::{PrId, PrLinks, PullRequests},
+    pull_requests::{PullRequests, Which},
     session_view::{SessionEvent, SessionView},
     store::{Key, StateDb},
     title_bar::TOP_ROW_REMS,
@@ -340,11 +341,12 @@ pub(crate) struct RightPanel {
     session: Option<(SessionKey, Subscription)>,
     /// The tab under the pointer, which shows × in place of its icon.
     hovered: Option<TabKey>,
-    /// What the Pull request surface reads PRs through.
+    /// What the Pull request surface reads PRs through, and which PRs are
+    /// linked to each session.
     prs: Entity<PullRequests>,
     /// Tells the Pull request surface when the panel shows or hides, and
     /// opens and closes the tabs of PRs as they are linked and unlinked.
-    _globals: [Subscription; 2],
+    _subscriptions: [Subscription; 2],
 }
 
 impl RightPanel {
@@ -354,6 +356,11 @@ impl RightPanel {
         prs: Entity<PullRequests>,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        let subscriptions = [
+            cx.observe_global::<PanelLayout>(|this, cx| this.sync_shown(cx)),
+            // A session's set of PRs answered or changed: its tabs follow.
+            cx.observe(&prs, |this, _, cx| this.sync_all_links(cx)),
+        ];
         Self {
             workspaces,
             shell,
@@ -361,10 +368,7 @@ impl RightPanel {
             session: None,
             hovered: None,
             prs,
-            _globals: [
-                cx.observe_global::<PanelLayout>(|this, cx| this.sync_shown(cx)),
-                cx.observe_global::<PrLinks>(Self::sync_all_links),
-            ],
+            _subscriptions: subscriptions,
         }
     }
 
@@ -393,8 +397,8 @@ impl RightPanel {
     }
 
     /// Tells each Pull request surface whether it is on screen: its tab
-    /// shown, for the session on screen, in a panel that shows. It polls
-    /// only then.
+    /// shown, for the session on screen, in a panel that shows. Its PR is
+    /// asked for only then.
     fn sync_shown(&self, cx: &mut Context<'_, Self>) {
         let shown = PanelLayout::get(cx);
         for (key, set) in &self.sets {
@@ -473,7 +477,7 @@ impl RightPanel {
     }
 
     /// Reads what `session`'s Diff and Files show again, and when its turn
-    /// ended, its PR on screen (which polls on its own as it comes back).
+    /// ended, its PR on screen (which is asked for again as it comes back).
     fn reload(&self, session: &SessionKey, why: Reload, cx: &mut Context<'_, Self>) {
         let Some(set) = self.sets.get(session) else {
             return;
@@ -541,7 +545,7 @@ impl RightPanel {
             Surface::Background => Tab::Background,
             Surface::Diff => Tab::Diff(cx.new(|cx| DiffSurface::new(workspaces, place, cx))),
             Surface::Files => Tab::Files(cx.new(|cx| FilesSurface::new(workspaces, place, cx))),
-            Surface::PullRequest => self.pr_tab(session, &place, key.number, None, cx),
+            Surface::PullRequest => self.pr_tab(session, key.number, None, cx),
             Surface::Terminal => {
                 let shell = self.shell.clone();
                 let tab = cx.new(|cx| TerminalTab::new(workspaces, shell, place, window, cx));
@@ -561,26 +565,25 @@ impl RightPanel {
         }
     }
 
-    /// A Pull request tab of `session`, which works in `place`, numbered
-    /// `number`: of PR `linked`, or with none, of its branch's.
+    /// A Pull request tab of `session`, numbered `number`: of PR `linked`,
+    /// or with none, of its branch's.
     fn pr_tab(
         &self,
         session: &SessionKey,
-        place: &Place,
         number: u32,
-        linked: Option<PrId>,
+        linked: Option<PullRequestId>,
         cx: &mut Context<'_, Self>,
     ) -> Tab {
-        let shows = linked.clone().map_or(Shows::Branch, Shows::Linked);
-        let (prs, workspaces) = (self.prs.clone(), &self.workspaces);
+        let which = linked.clone().map_or(Which::Branch, Which::Linked);
+        let prs = self.prs.clone();
         let key = session.clone();
-        let pr = cx.new(|cx| PullRequestSurface::new(prs, workspaces, key, place, shows, cx));
+        let pr = cx.new(|cx| PullRequestSurface::new(prs, key, which, cx));
         let session = session.clone();
         let subscriptions = [
             // Its label, the PR's number, comes once the PR is found.
             cx.observe(&pr, |_, _, cx| cx.notify()),
             cx.subscribe(&pr, move |this, _, ShowLinked(id): &ShowLinked, cx| {
-                // Its link may not have reached the observer of [`PrLinks`].
+                // Its link may not have reached the observer of `prs` yet.
                 this.sync_links(&session, cx);
                 this.show_link(&session, id, cx);
             }),
@@ -603,27 +606,32 @@ impl RightPanel {
 
     /// Opens a tab for each PR linked to `session` that has none, after its
     /// other Pull request tabs, and closes the tab of each unlinked; while
-    /// its branch's Pull request tab is open, which they go with.
+    /// its branch's Pull request tab is open, which they go with. The links
+    /// are the daemon's ([`PullRequests::linked_tabs`]), the agent's too;
+    /// until it has looked the session's branch up, as before its machine
+    /// answers, its tabs stay as they are.
     fn sync_links(&mut self, session: &SessionKey, cx: &mut Context<'_, Self>) {
+        let Some(linked) = self.prs.read(cx).linked_tabs(session) else {
+            return;
+        };
         let Some(set) = self.sets.get_mut(session) else {
             return;
         };
         if set.tab(TabKey::BRANCH_PR).is_none() {
             return;
         }
-        let (unlinked, missing) = set.link_changes(cx.global::<PrLinks>().get(session));
+        let (unlinked, missing) = set.link_changes(&linked);
         if unlinked.is_empty() && missing.is_empty() {
             return;
         }
         set.remove(|key| unlinked.contains(&key));
-        let place = set.place.clone();
-        let numbered: Vec<(u32, PrId)> = missing
+        let numbered: Vec<(u32, PullRequestId)> = missing
             .into_iter()
             .map(|id| (set.next_link(), id))
             .collect();
         let tabs: Vec<Tab> = numbered
             .into_iter()
-            .map(|(number, id)| self.pr_tab(session, &place, number, Some(id), cx))
+            .map(|(number, id)| self.pr_tab(session, number, Some(id), cx))
             .collect();
         if let Some(set) = self.sets.get_mut(session) {
             for tab in tabs {
@@ -635,15 +643,27 @@ impl RightPanel {
         cx.notify();
     }
 
-    /// Shows the tab of PR `id`, linked to `session`, if it is on screen.
-    fn show_link(&mut self, session: &SessionKey, id: &PrId, cx: &mut Context<'_, Self>) {
+    /// Shows the tab of PR `id`, linked to `session`, if it is on screen:
+    /// the branch's tab when `id` is the branch's own PR, which has no
+    /// linked tab of its own.
+    fn show_link(&mut self, session: &SessionKey, id: &PullRequestId, cx: &mut Context<'_, Self>) {
         if self.on_screen() != Some(session) {
             return;
         }
+        let is_branch_pr = self
+            .prs
+            .read(cx)
+            .of(session)
+            .and_then(SessionPullRequests::branch_pull_request)
+            .is_some_and(|pr| pr.id == *id);
         let Some(set) = self.set() else {
             return;
         };
-        let Some(index) = set.tabs.iter().position(|tab| tab.linked() == Some(id)) else {
+        let shows = |tab: &Tab| match tab.linked() {
+            Some(linked) => linked == id,
+            None => is_branch_pr && tab.key() == TabKey::BRANCH_PR,
+        };
+        let Some(index) = set.tabs.iter().position(shows) else {
             return;
         };
         set.scroll.scroll_to_item(index);
@@ -660,14 +680,21 @@ impl RightPanel {
     }
 
     /// Closes `session`'s tab `key`. The branch's Pull request tab takes
-    /// the tabs of PRs linked by hand with it, which stay linked; closing
-    /// one of those unlinks it, and the observer of [`PrLinks`] closes it.
+    /// the tabs of linked PRs with it, which stay linked; closing one of
+    /// those unlinks it through its surface (ending the agent's watch, if
+    /// it watches it), and the observer of `prs` closes it once the
+    /// daemon's set no longer links it. A refusal shows on that surface.
     fn close(&mut self, session: &SessionKey, key: TabKey, cx: &mut Context<'_, Self>) {
         let Some(set) = self.sets.get_mut(session) else {
             return;
         };
-        if let Some(id) = set.tab(key).and_then(Tab::linked).cloned() {
-            cx.update_global::<PrLinks, _>(|links, _| links.remove(session, &id));
+        if let Some(Tab::PullRequest {
+            linked: Some(_),
+            view,
+            ..
+        }) = set.tab(key)
+        {
+            view.clone().update(cx, PullRequestSurface::unlink);
             return;
         }
         if key == TabKey::BRANCH_PR {
@@ -872,20 +899,29 @@ impl RightPanel {
         let (surface, id) = (key.surface, key.id());
         let label = tab.label(cx);
         // × replaces the icon while hovered, so the tab keeps its width.
-        let lead = if let (true, Some((session, _))) = (self.hovered == Some(key), &self.session) {
+        // On a linked PR's tab it unlinks, which asks the daemon: it is
+        // offered only while the daemon can be asked, as Unlink is.
+        let prs = self.prs.read(cx);
+        let close = self
+            .session
+            .as_ref()
+            .filter(|_| self.hovered == Some(key))
+            .and_then(|(session, _)| match tab.linked() {
+                Some(linked) => prs.asks(&session.machine).then(|| {
+                    let link = prs.of(session).and_then(|set| set.link(linked));
+                    (session, "Unlink", unlink_tooltip(link))
+                }),
+                None => Some((session, "Close", "Close")),
+            });
+        let lead = if let Some((session, close, tooltip)) = close {
             let session = session.clone();
-            let close = if tab.linked().is_some() {
-                "Unlink"
-            } else {
-                "Close"
-            };
             Button::new(SharedString::from(format!("close-panel-tab-{id}")))
                 .ghost()
                 .xsmall()
                 .compact()
                 .icon(IconName::Close)
                 .accessibility_label(close)
-                .tooltip(close)
+                .tooltip(tooltip)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     // Kit's Button passes the click on, and the tab's own
                     // click would open the surface again.

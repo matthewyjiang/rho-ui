@@ -21,7 +21,7 @@ use rho_ui_core::{platform, Daemon, Link};
 use crate::{
     folders::Reader,
     machines::{MachineId, Place},
-    repo::{self, Head, Repo},
+    repo::{self, Repo},
 };
 
 /// How often branches are re-read. A branch switch shows within this long.
@@ -72,11 +72,6 @@ impl Workspace {
     /// Its repository's origin remote URL, which clones it elsewhere.
     pub(crate) fn origin(&self) -> Option<&str> {
         self.repo.origin.as_deref()
-    }
-
-    /// What is checked out, outside a git repository `None`.
-    pub(crate) fn head(&self) -> Option<&Head> {
-        self.repo.head.as_ref()
     }
 
     /// The folder of the project it belongs to, on its machine; see

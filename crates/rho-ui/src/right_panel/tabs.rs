@@ -3,18 +3,19 @@
 //! session has a [`TabSet`] of its own.
 
 use gpui_kit::{App, Entity, ScrollHandle, SharedString, Subscription, WeakEntity};
+use rho_ui_core::PullRequestId;
 
 use super::{
     diff::DiffSurface, files::FilesSurface, pull_request::PullRequestSurface,
     terminal::TerminalTab, Surface,
 };
-use crate::{machines::Place, pull_requests::PrId, session_view::SessionView};
+use crate::{machines::Place, session_view::SessionView};
 
 /// Which tab of a session's: its surface, and its number among that
 /// surface's tabs there, from 1 and never reused. Terminal opens as many as
 /// asked ([`Surface::opens_many`]); Pull request opens
-/// [`TabKey::BRANCH_PR`] for the branch's PR and one more for each PR
-/// linked by hand; the others are always 1.
+/// [`TabKey::BRANCH_PR`] for the branch's PR and one more for each other
+/// PR linked to the session; the others are always 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TabKey {
     pub(super) surface: Surface,
@@ -22,8 +23,8 @@ pub(super) struct TabKey {
 }
 
 impl TabKey {
-    /// The Pull request tab of the session's branch, which the tabs of PRs
-    /// linked by hand open and close with.
+    /// The Pull request tab of the session's branch, which the tabs of
+    /// linked PRs open and close with.
     pub(super) const BRANCH_PR: TabKey = TabKey {
         surface: Surface::PullRequest,
         number: 1,
@@ -45,12 +46,12 @@ pub(super) enum Tab {
     Diff(Entity<DiffSurface>),
     Files(Entity<FilesSurface>),
     /// A PR of the session, by its number ([`TabKey::BRANCH_PR`] for its
-    /// branch's), the PR it shows if linked by hand, and the subscriptions
-    /// that redraw the panel as its label changes and show the tab of a PR
-    /// just linked.
+    /// branch's), the linked PR it shows if it is not the branch's, and
+    /// the subscriptions that redraw the panel as its label changes and
+    /// show the tab of a PR just linked.
     PullRequest {
         number: u32,
-        linked: Option<PrId>,
+        linked: Option<PullRequestId>,
         view: Entity<PullRequestSurface>,
         _subscriptions: [Subscription; 2],
     },
@@ -89,8 +90,8 @@ impl Tab {
         }
     }
 
-    /// The PR linked by hand that the tab shows, if it shows one.
-    pub(super) fn linked(&self) -> Option<&PrId> {
+    /// The linked PR that the tab shows, if it shows one.
+    pub(super) fn linked(&self) -> Option<&PullRequestId> {
         match self {
             Tab::PullRequest { linked, .. } => linked.as_ref(),
             Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::Terminal { .. } => None,
@@ -115,7 +116,7 @@ pub(super) struct TabSet {
     pub(super) scroll: ScrollHandle,
     /// The number the next terminal tab gets.
     next_terminal: u32,
-    /// The number the next tab of a PR linked by hand gets.
+    /// The number the next tab of a linked PR gets.
     next_link: u32,
 }
 
@@ -168,7 +169,7 @@ impl TabSet {
         TabKey { surface, number }
     }
 
-    /// The number the next tab of a PR linked by hand gets.
+    /// The number the next tab of a linked PR gets.
     pub(super) fn next_link(&mut self) -> u32 {
         self.next_link += 1;
         self.next_link - 1
@@ -210,7 +211,10 @@ impl TabSet {
 
     /// How its tabs differ from the PRs `linked` to the session: the tabs
     /// of PRs no longer linked, and the PRs linked without a tab.
-    pub(super) fn link_changes(&self, linked: &[PrId]) -> (Vec<TabKey>, Vec<PrId>) {
+    pub(super) fn link_changes(
+        &self,
+        linked: &[PullRequestId],
+    ) -> (Vec<TabKey>, Vec<PullRequestId>) {
         let unlinked = self
             .tabs
             .iter()

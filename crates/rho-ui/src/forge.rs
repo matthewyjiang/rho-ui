@@ -8,41 +8,44 @@
 //! To add a CLI: add a [`ForgeCli`] variant, with its check script and
 //! parser in a module of its own, as [`gh`] has.
 //!
+//! Each machine's rho daemon reads pull requests, with the `gh` on its own
+//! `PATH`; rho-ui only acts on one, through the CLI here ([`act`]), so the
+//! program Settings name steers that alone.
+//!
 //! People's pictures come from where the forge serves them, without its
 //! CLI; see [`avatar`].
 
 pub(crate) mod avatar;
 mod gh;
-mod gh_pulls;
+mod gh_actions;
 
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
-    fmt,
     path::PathBuf,
     pin::pin,
     time::Duration,
 };
 
 use futures::future::{self, Either};
-use gpui_kit::{Context, Entity, SharedString, Task};
-
-use gpui_kit::BackgroundExecutor;
+use gpui_kit::{BackgroundExecutor, Context, Entity, SharedString, Task};
+use rho_ui_core::PullRequestId;
 
 use crate::{
     folders::{Deadline, Reader},
     machines::MachineId,
-    pull_requests::model::{Batch, FetchPlan, PrAction, PrId},
     settings::Settings,
     workspaces::Workspaces,
 };
 
+pub(crate) use gh_actions::PrAction;
+
 /// How long a CLI may take to answer before rho-ui calls it stuck: a
 /// tripwire, as long as a script over ssh gets. Checking gh took 0.35 s
 /// here (53 ms for `--version`, 283 ms for `auth status`, which asks
-/// GitHub), and a batched PR query 0.6 to 0.9 s. A run on this machine that
-/// goes past it, as when packets to GitHub are dropped, keeps its `gh`
-/// running until that gives up.
+/// GitHub), and a batched PR query, back when rho-ui read them, 0.6 to
+/// 0.9 s. A run on this machine that goes past it, as when packets to
+/// GitHub are dropped, keeps its `gh` running until that gives up.
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Something a CLI does on a machine, with the same arguments either way:
@@ -84,67 +87,29 @@ async fn run(
     }
 }
 
-/// Why a PR query got no answer.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum QueryError {
-    /// The forge refused the CLI's token, or it has none: a new check of
-    /// the CLI would see that.
-    SignedOut(String),
-    Failed(String),
-}
-
-impl fmt::Display for QueryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            QueryError::SignedOut(why) | QueryError::Failed(why) => f.write_str(why),
-        }
-    }
-}
-
-/// Asks `host`, through `gh` at `program` run by `reader`, what `plan`
-/// asks: one query, however much it holds. Pull requests are GitHub's
-/// alone so far, so they take no [`ForgeCli`].
-///
-/// # Errors
-///
-/// When nothing in the query was answered, and why.
-pub(crate) async fn query_prs(
-    reader: Reader,
-    program: PathBuf,
-    host: &str,
-    plan: &FetchPlan,
-    executor: &BackgroundExecutor,
-) -> Result<Batch, QueryError> {
-    let query = gh_pulls::query(plan);
-    let args = vec![program.into_os_string(), host.into(), query.into()];
-    let output = run(ForgeCli::Gh, reader, &gh_pulls::API, args, executor)
-        .await
-        .map_err(QueryError::Failed)?;
-    gh_pulls::parse(plan, &output)
-}
-
 /// Does `action` to PR `pr` through `gh` at `program`, run by `reader`.
+/// Pull requests are GitHub's alone so far, so this takes no [`ForgeCli`].
 ///
 /// # Errors
 ///
-/// When it didn't: what `gh` said.
+/// When it didn't: what `gh` said, or that this rho-ui doesn't know the
+/// merge method asked for.
 pub(crate) async fn act(
     reader: Reader,
     program: PathBuf,
-    pr: &PrId,
+    pr: &PullRequestId,
     action: &PrAction,
     executor: &BackgroundExecutor,
 ) -> Result<(), String> {
-    let repo = &pr.repo;
     let mut args = vec![
         program.into_os_string(),
-        repo.host.clone().into(),
-        format!("{}/{}", repo.owner, repo.name).into(),
+        pr.host.clone().into(),
+        format!("{}/{}", pr.owner, pr.name).into(),
         pr.number.to_string().into(),
     ];
-    args.extend(gh_pulls::action_args(action));
-    let output = run(ForgeCli::Gh, reader, &gh_pulls::ACTION, args, executor).await?;
-    gh_pulls::parse_action(&output)
+    args.extend(gh_actions::action_args(action)?);
+    let output = run(ForgeCli::Gh, reader, &gh_actions::ACTION, args, executor).await?;
+    gh_actions::parse_action(&output)
 }
 
 /// A forge's command-line tool that rho-ui knows how to drive.

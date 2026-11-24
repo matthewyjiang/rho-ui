@@ -121,7 +121,10 @@ impl FakeAuth {
             message: "HTTP 404".to_owned(),
         });
         self.signed_in.insert(auth);
-        Ok(AuthKeyResponse { unchecked })
+        Ok(AuthKeyResponse {
+            unchecked,
+            ..AuthKeyResponse::default()
+        })
     }
 
     pub(super) fn logout(&mut self, params: &AuthLogoutParams) -> AuthLogoutResponse {

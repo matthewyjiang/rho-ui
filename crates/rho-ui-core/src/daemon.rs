@@ -64,8 +64,10 @@ use crate::{
 };
 
 mod auth;
+mod pull_requests;
 mod worktrees;
 
+pub use pull_requests::PullRequestError;
 pub use worktrees::ReportedWorktree;
 
 /// How to reach the daemon.

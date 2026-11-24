@@ -1,5 +1,4 @@
-//! Wall-clock helpers: Unix seconds, RFC 3339 parsing, compact ages and
-//! turn lengths.
+//! Wall-clock helpers: Unix seconds, compact ages and turn lengths.
 
 use std::time::Duration;
 
@@ -12,30 +11,6 @@ pub(crate) fn now_unix() -> i64 {
         .ok()
         .and_then(|now| i64::try_from(now.as_secs()).ok())
         .unwrap_or(0)
-}
-
-/// Unix seconds of a UTC RFC 3339 time as GitHub writes it,
-/// `2026-11-15T05:11:35Z`. `None` for any other form.
-pub(crate) fn parse_utc(text: &str) -> Option<i64> {
-    let text = text.strip_suffix('Z')?;
-    let (date, time) = text.split_once('T')?;
-    let mut date = date.splitn(3, '-').map(str::parse::<i64>);
-    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
-    let mut time = time.splitn(3, ':').map(str::parse::<i64>);
-    let (hour, minute, second) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    // Days from 1970-01-01 to the date, by Howard Hinnant's
-    // `days_from_civil`: years start in March, so a leap day ends one.
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_from_march = (month + 9) % 12;
-    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 /// Compact age for `seconds` ago: "now", "5m", "3h", "2d", "6w", "1y".
@@ -118,24 +93,6 @@ mod tests {
         assert_eq!(took(ms(59_600)), "1m");
         assert_eq!(took(ms(80_000)), "1m 20s");
         assert_eq!(took(ms(7_500_000)), "2h 5m");
-    }
-
-    /// GitHub's times read as the Unix seconds `date -u` gives, leap days
-    /// and the epoch's edge included; other forms read as none.
-    #[test]
-    fn utc_times_parse() {
-        let cases = [
-            ("1970-01-01T00:00:00Z", Some(0)),
-            ("1969-12-31T23:59:59Z", Some(-1)),
-            ("2000-02-29T12:00:00Z", Some(951_825_600)),
-            ("2026-11-15T05:11:35Z", Some(1_794_719_495)),
-            ("2026-11-15T05:11:35+01:00", None),
-            ("2026-13-01T00:00:00Z", None),
-            ("soon", None),
-        ];
-        for (text, unix) in cases {
-            assert_eq!(parse_utc(text), unix, "{text}");
-        }
     }
 
     #[test]

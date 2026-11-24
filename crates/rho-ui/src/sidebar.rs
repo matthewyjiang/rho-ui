@@ -55,14 +55,14 @@ use gpui_kit::{
     Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
     Subscription, Task, WeakEntity, Window,
 };
-use rho_ui_core::{Job, SessionSummary};
+use rho_ui_core::{Job, PullRequestRollup, PullRequestSummary, SessionSummary};
 
 use crate::{
     app_update::{self, AppUpdate},
     badge::Badge,
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
     projects::Projects,
-    pull_requests::{PrLinks, PrSummary, PullRequests, Rollup, Target, Watch},
+    pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
     right_panel::state_look,
     session_list::{
@@ -326,7 +326,7 @@ pub(crate) struct SidebarView {
     /// The list's height in the last frame, which the gap above the
     /// shelves fills up to.
     viewport: Pixels,
-    _subscriptions: [Subscription; 8],
+    _subscriptions: [Subscription; 7],
     _tick: Task<()>,
 }
 
@@ -383,9 +383,8 @@ impl SidebarView {
             }),
             cx.observe(&installs, |_, _, cx| cx.notify()),
             cx.observe(&app_update, |_, _, cx| cx.notify()),
+            // A set of PRs answered or changed: the marks follow.
             cx.observe(&prs, |_, _, cx| cx.notify()),
-            // A PR linked or unlinked: the row follows another.
-            cx.observe_global::<PrLinks>(Self::rebuild),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -626,38 +625,18 @@ impl SidebarView {
             let workspace = workspaces.get(ix);
             (workspace.name.as_ref(), workspace.root_path())
         });
-        // The active rows shown have their PRs read.
-        let links = cx.global::<PrLinks>();
+        // The active rows shown have their PRs listed by their daemons.
         let listed = self
             .list
             .items()
             .iter()
             .filter_map(|item| match *item {
-                Item::Session(ix) => Some(self.list.row_at(ix)),
+                Item::Session(ix) => Some(self.list.row_at(ix).id.clone()),
                 _ => None,
-            })
-            .filter_map(|row| {
-                let workspace = workspaces.get(row.workspace);
-                let target = Target::of(&row.id, workspace, links).ok()?;
-                Some(Watch {
-                    machine: row.id.machine.clone(),
-                    target,
-                })
             })
             .collect();
         self.prs.update(cx, |prs, cx| prs.set_listed(listed, cx));
         cx.notify();
-    }
-
-    /// The PR of `row`'s session, once found.
-    fn pr_of<'a>(
-        &self,
-        row: &Row,
-        workspace: &Workspace,
-        cx: &'a gpui_kit::App,
-    ) -> Option<&'a PrSummary> {
-        let target = Target::of(&row.id, workspace, cx.global::<PrLinks>()).ok()?;
-        self.prs.read(cx).pr(&target)
     }
 
     fn toggle(&mut self, which: Shelf, cx: &mut Context<'_, Self>) {
@@ -967,7 +946,7 @@ impl SidebarView {
             }))
             .child(branch_line(
                 workspace,
-                self.pr_of(row, workspace, cx).map(|pr| {
+                self.prs.read(cx).mark(&row.id).map(|pr| {
                     pr_mark(format!("{}-pr", row.element_id).into(), pr, theme).into_any_element()
                 }),
                 machine.map(|label| (format!("{}-machine", row.element_id).into(), label)),
@@ -1859,11 +1838,11 @@ fn branch_line(
 
 /// A row's PR: its state's icon and its number, with a red dot while its
 /// checks fail. `id` is its element ID.
-fn pr_mark(id: SharedString, pr: &PrSummary, theme: &Theme) -> impl IntoElement {
+fn pr_mark(id: SharedString, pr: &PullRequestSummary, theme: &Theme) -> impl IntoElement {
     let (_, icon, color) = state_look(pr.state);
     // As the surface's tag colors its text.
     let color = color.scale(if theme.is_dark() { 300 } else { 600 });
-    let failing = pr.change.rollup == Rollup::Failing;
+    let failing = pr.rollup == PullRequestRollup::Failing;
     h_flex()
         .id(id)
         .test_support()
