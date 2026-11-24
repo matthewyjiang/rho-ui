@@ -1770,8 +1770,6 @@ impl RhoApp {
         cx: &mut Context<'_, Self>,
     ) -> Entity<SessionView> {
         let id = SessionKey::new(cwd.machine.clone(), session.id().clone());
-        // Made here, so rho-ui's own from the start, even if the prompt fails.
-        self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
         let workspace = WorkspaceRef::new(&self.workspaces, cwd, cx);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let (auths, prs) = (self.auths.clone(), self.prs.clone());
@@ -1923,12 +1921,6 @@ impl RhoApp {
                     // Off screen, a turn that ended, or the replay that
                     // caught up, may leave it idle.
                     this.sync_following(window, cx);
-                }
-                SessionEvent::Prompted => {
-                    if view.read(cx).is_listed() {
-                        let id = view.read(cx).key();
-                        this.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
-                    }
                 }
                 // A side chat's isn't listed.
                 SessionEvent::Saved => {

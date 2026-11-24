@@ -53,6 +53,7 @@ use crate::{
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
     store::{Key, StateDb},
+    time,
     title_bar::TOP_ROW_REMS,
     turn_times::TurnTimes,
     unseen::Unseen,
@@ -175,6 +176,16 @@ esac
     write_program(path, &script);
 }
 
+/// Shelves that keep `ids`, sessions on this machine, as of now, so they
+/// list as active however long ago the fake daemon dates them.
+fn kept<S: AsRef<str>>(ids: impl IntoIterator<Item = S>) -> Shelves {
+    let mut shelves = Shelves::default();
+    for id in ids {
+        shelves.restore(&SessionKey::local(id.as_ref()), time::now_unix());
+    }
+    shelves
+}
+
 /// One app window and its context.
 struct Harness {
     cx: HeadlessAppContext,
@@ -190,10 +201,9 @@ struct Harness {
 
 impl Harness {
     /// Opens the app at 1200x800 against a fake daemon holding `script`.
-    /// The fake's saved sessions count as started in rho-ui, so they list
-    /// as active.
+    /// The fake's saved sessions are kept, so they list as active.
     fn start(name: &'static str, script: Script) -> Self {
-        Self::start_with(name, script, Shelves::owning(["s1", "old"]))
+        Self::start_with(name, script, kept(["s1", "old"]))
     }
 
     /// Closes the app and opens it again on the same daemon and state
@@ -783,7 +793,8 @@ fn bounds(window: &Window, id: &'static str) -> Option<Bounds<Pixels>> {
         .map(|element| element.bounds())
 }
 
-/// Sidebar, new session draft, prompt, approval, tool card, reply, idle.
+/// Sidebar, new session draft, prompt, approval, tool card, reply, idle,
+/// and the session in another rho-ui's sidebar.
 #[test]
 fn new_session_runs_a_turn_through_an_approval() {
     let mut ui = Harness::start("turn", Script::default());
@@ -845,7 +856,7 @@ fn new_session_runs_a_turn_through_an_approval() {
         );
     });
 
-    // Saved once prompted, and listed as rho-ui's own.
+    // Saved once prompted, and listed.
     ui.wait_until("the new session in the sidebar", |window, _, _| {
         is_visible(window, "session-local-new-1")
     });
@@ -884,6 +895,13 @@ fn new_session_runs_a_turn_through_an_approval() {
         is_visible(window, "usage-details")
     });
     ui.shot("usage");
+
+    // Another rho-ui on the daemon, with no marks of its own, lists the
+    // session as active too: the daemon dates a session, whoever started it.
+    let mut ui = ui.reopen("new-session-elsewhere", Shelves::default());
+    ui.wait_until("the session active in another rho-ui", |window, _, _| {
+        is_visible(window, "session-local-new-1")
+    });
 }
 
 /// Opens a new session and sends it `prompt`.
@@ -1577,10 +1595,10 @@ fn the_row_menu_renames_pins_and_copies_a_session() {
     assert_eq!(copied.as_deref(), Some("s1"));
 }
 
-/// Sessions from elsewhere start settled. A draft makes no session until
+/// Sessions quiet for long start settled. A draft makes no session until
 /// its first message, and leaving it drops it. A session can be deleted.
 #[test]
-fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
+fn drafts_are_free_quiet_sessions_start_settled_and_sessions_delete() {
     let mut ui = Harness::start_with("drafts", Script::default(), Shelves::default());
     ui.wait_until("the settled entry", |window, _, _| {
         is_visible(window, "toggle-settled") && !is_visible(window, "session-local-s1")
@@ -1603,7 +1621,7 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
         !is_visible(window, "draft-view") && app.active_session().is_some()
     });
 
-    // A draft that gets a message becomes rho-ui's own session.
+    // A draft that gets a message becomes a session.
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.act(|window, cx| {
@@ -1623,7 +1641,7 @@ fn drafts_are_free_outside_sessions_start_settled_and_sessions_delete() {
     ui.wait_for_session("the turn to end", |session| {
         session.state() == &RunState::Idle
     });
-    ui.wait_until("the new session listed as active", |window, _, _| {
+    ui.wait_until("the new session listed", |window, _, _| {
         is_visible(window, "session-local-new-2")
     });
     ui.act(|window, _| {
@@ -2563,7 +2581,7 @@ fn an_update_installs_then_restarts_the_daemon_on_request() {
     };
     let daemon = FakeDaemon::start(script);
     let machines = Machines {
-        shelves: Shelves::owning(["s1", "old"]),
+        shelves: kept(["s1", "old"]),
         rho: Some(rho),
         ..Machines::default()
     };
@@ -2915,7 +2933,7 @@ fn a_stopped_daemon_stays_stopped_until_started() {
 }
 
 /// A turn rho's terminal UI started shows in the sidebar as running, though
-/// the session is not rho-ui's. Opening it attaches mid-turn, and the
+/// its session was long quiet. Opening it attaches mid-turn, and the
 /// composer steers the turn: a steer waits above the box until the model
 /// reads it, and can be taken back until then.
 #[test]
@@ -2975,10 +2993,6 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
     );
     ui.act(|window, _| {
         assert!(!is_visible(window, "steer-0"), "nothing is left queued");
-        assert!(
-            is_visible(window, "session-local-tui-1"),
-            "steered here, so the session is rho-ui's and stays listed"
-        );
     });
     ui.shot("steered");
 }
@@ -3049,7 +3063,7 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
         tui_job: TuiJob::Running,
         ..Script::default()
     };
-    let shelves = Shelves::owning([TUI_SESSION, "s1", "old"]);
+    let shelves = kept([TUI_SESSION, "s1", "old"]);
     let mut ui = Harness::start_with("done", script, shelves);
     ui.wait_until("the running job among the sessions", |window, _, _| {
         is_visible(window, "session-local-s1")
@@ -3368,7 +3382,7 @@ fn pictures_show_in_place_and_open_in_the_lightbox() {
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: Shelves::owning(["s1", "old"]),
+            shelves: kept(["s1", "old"]),
             workspace: Some(folder),
             ..Machines::default()
         },
@@ -3991,7 +4005,7 @@ fn open_pr_session(name: &'static str, settings: Settings) -> (Harness, SessionK
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: Shelves::owning(["s1"]),
+            shelves: kept(["s1"]),
             settings,
             ..Machines::default()
         },
@@ -4138,7 +4152,7 @@ fn a_sidebar_row_marks_its_pr() {
         "pull-request-row",
         daemon.target(),
         Some(daemon),
-        Shelves::owning(["old"]),
+        kept(["old"]),
         Projects::default(),
     );
     let mark = SharedString::from(format!("session-{old}-pr"));
@@ -4618,7 +4632,7 @@ fn the_diff_surface_follows_the_sessions_changes() {
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: Shelves::owning(["s1"]),
+            shelves: kept(["s1"]),
             workspace: Some(repo.clone()),
             ..Machines::default()
         },
@@ -4666,7 +4680,7 @@ fn the_files_surface_opens_the_sessions_files() {
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: Shelves::owning(["s1"]),
+            shelves: kept(["s1"]),
             workspace: Some(repo.clone()),
             ..Machines::default()
         },
@@ -5093,7 +5107,7 @@ fn the_right_panel_resizes_from_its_edge() {
         "the panel follows the pointer: {before:?} became {wider:?}"
     );
 
-    let mut ui = ui.reopen("right-panel-resize", Shelves::owning(["s1"]));
+    let mut ui = ui.reopen("right-panel-resize", kept(["s1"]));
     assert_eq!(
         panel(&mut ui).size.width,
         wider.size.width,
@@ -5151,7 +5165,7 @@ fn the_sidebar_resizes_from_its_edge() {
         "the sidebar follows the pointer: {before:?} became {wider:?}"
     );
 
-    let mut ui = ui.reopen("sidebar-resize", Shelves::owning(["s1"]));
+    let mut ui = ui.reopen("sidebar-resize", kept(["s1"]));
     ui.wait_until("saved sessions again", |window, _, _| {
         is_visible(window, "session-local-s1")
     });
@@ -5344,10 +5358,7 @@ fn restart_and_open_the_ended_run(mut ui: Harness, parent: &SessionId) {
         session.state() == &RunState::Idle && session.background().is_empty()
     });
 
-    let mut ui = ui.reopen(
-        "subagent-restarted",
-        Shelves::owning(["s1", "old", parent.as_str()]),
-    );
+    let mut ui = ui.reopen("subagent-restarted", kept(["s1", "old", parent.as_str()]));
     let row: &'static str =
         Box::leak(format!("session-local-{}", parent.as_str()).into_boxed_str());
     ui.wait_until("the parent in the sidebar", |window, _, _| {
@@ -5758,7 +5769,7 @@ fn images_go_with_the_message() {
     ui.act(|window, _| assert_eq!(composer_attachments(window).len(), 1, "its tile is back"));
 
     // Opened afresh, the session replays its messages with their images.
-    let mut ui = ui.reopen("images-replayed", Shelves::owning(["s1", "old", "new-1"]));
+    let mut ui = ui.reopen("images-replayed", kept(["s1", "old", "new-1"]));
     ui.wait_until("the session in the sidebar", |window, _, _| {
         is_visible(window, "session-local-new-1")
     });
@@ -5902,7 +5913,7 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
         "project",
         daemon.target(),
         Some(daemon),
-        Shelves::owning(["s1", "old"]),
+        kept(["s1", "old"]),
         // Added in this order; /w/a has the newer session.
         Projects::of(["/w/b", "/w/a"]),
     );
@@ -6007,7 +6018,7 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
         "project-add",
         daemon.target(),
         Some(daemon),
-        Shelves::owning(["s1", "old"]),
+        kept(["s1", "old"]),
         Projects::of(["/w/b", "/w/a"]),
     );
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
@@ -6430,9 +6441,10 @@ fn machines_list_side_by_side() {
     let mut settings = Settings::default();
     settings.machines = vec![workstation, RemoteMachine::new("gone")];
     let there = MachineId::remote("workstation");
-    let mut shelves = Shelves::owning(["s1", "old"]);
+    let mut shelves = kept(["s1", "old"]);
     for id in ["s1", "old"] {
-        shelves.own(&SessionKey::new(there.clone(), SessionId::from(id)));
+        let there = SessionKey::new(there.clone(), SessionId::from(id));
+        shelves.restore(&there, time::now_unix());
     }
     let mut projects = Projects::default();
     projects.add(Place::new(there.clone(), "/srv/app"));
@@ -6619,11 +6631,11 @@ fn a_machine_added_in_settings_lists_its_sessions() {
     let DaemonTarget::Socket(remote_socket) = remote.target() else {
         panic!("a fake daemon listens on a socket");
     };
-    let mut shelves = Shelves::owning(["s1", "old"]);
-    shelves.own(&SessionKey::new(
-        MachineId::remote("box"),
-        SessionId::from("s1"),
-    ));
+    let mut shelves = kept(["s1", "old"]);
+    shelves.restore(
+        &SessionKey::new(MachineId::remote("box"), SessionId::from("s1")),
+        time::now_unix(),
+    );
     let mut ui = Harness::open_with(
         "add-machine",
         local.target(),
@@ -6720,7 +6732,7 @@ fn source_control_shows_this_machines_gh() {
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: Shelves::owning(["s1"]),
+            shelves: kept(["s1"]),
             settings,
             ..Machines::default()
         },
@@ -6777,7 +6789,7 @@ fn rho_settings_write_and_follow_the_daemon() {
         "rho-settings",
         fake.target(),
         None,
-        Shelves::owning(["s1", "old"]),
+        kept(["s1", "old"]),
         Projects::default(),
     );
     open_settings(&mut ui);

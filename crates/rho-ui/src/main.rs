@@ -380,7 +380,7 @@ fn open_app(launch: LaunchConfig, db: &StateDb, settings: Settings, cx: &mut App
     let options = window_options(cx);
     gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| {
-            let sidebar = SidebarState::load(db, time::now_unix());
+            let sidebar = SidebarState::load(db);
             let projects = Projects::load(db);
             RhoApp::new(launch, sidebar, projects, window, cx)
         })

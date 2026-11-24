@@ -4,7 +4,9 @@ Sessions belong to the rho daemon, not to rho-ui. The sidebar lists every saved 
 
 ## Pinned, snoozed and settled
 
-Pinning, snoozing and settling are rho-ui's own; rho has no such state, so rho's terminal UI doesn't see them. Sessions that started outside rho-ui begin settled, so the sidebar doesn't fill with your old terminal history. A session with work under way always shows as active, and a settled one comes back when it has new activity.
+Pinning, snoozing and settling are rho-ui's own; rho has no such state, so rho's terminal UI doesn't see them, and neither does rho-ui on another computer.
+
+A session you haven't marked is active for a week after its last activity, whichever client started it, and settled from then on, so the sidebar doesn't fill with old history. That goes by the daemon's record of the session, so every rho-ui shows the same. A session with work under way always shows as active, and one you settled comes back when it has new activity. Restoring or unpinning a session, or a snooze that ends, keeps it active for a week from then.
 
 The active list reads as an inbox. Under the pinned sessions, which stay on top whatever they are doing, come the sessions that need you, then the Done ones, then the idle ones, and last those working, waiting on their own background work, or watching a pull request. A session moves as its state changes: it sinks when you send it a prompt and rises when its turn ends.
 

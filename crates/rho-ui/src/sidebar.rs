@@ -290,9 +290,9 @@ pub(crate) struct SidebarState {
 }
 
 impl SidebarState {
-    pub(crate) fn load(db: &StateDb, now: i64) -> Self {
+    pub(crate) fn load(db: &StateDb) -> Self {
         Self {
-            shelves: Shelves::load(db, now),
+            shelves: Shelves::load(db),
             unseen: Unseen::load(db),
             layout: SidebarLayout::load(db),
             filter: SavedFilter::load(db),
@@ -528,12 +528,6 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    /// Marks a session as started or continued here, so it stays active.
-    pub(crate) fn own(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
-        self.shelves.own(id);
-        self.rebuild(cx);
-    }
-
     /// Drops a session that was deleted.
     pub(crate) fn remove(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         self.list.remove(id);
@@ -672,7 +666,7 @@ impl SidebarView {
         match action {
             ShelfAction::Settle => self.shelves.settle(id, now),
             ShelfAction::Snooze(snooze) => self.shelves.snooze(id, now + snooze.seconds),
-            ShelfAction::Restore => self.shelves.restore(id),
+            ShelfAction::Restore => self.shelves.restore(id, now),
         }
         // The row moves away from the pointer.
         self.hover = None;
@@ -680,9 +674,10 @@ impl SidebarView {
     }
 
     fn set_pinned(&mut self, id: &SessionKey, pin: Pin, cx: &mut Context<'_, Self>) {
+        let now = time::now_unix();
         match pin {
-            Pin::Pin => self.shelves.pin(id, time::now_unix()),
-            Pin::Unpin => self.shelves.unpin(id),
+            Pin::Pin => self.shelves.pin(id, now),
+            Pin::Unpin => self.shelves.unpin(id, now),
         }
         self.hover = None;
         self.rebuild(cx);

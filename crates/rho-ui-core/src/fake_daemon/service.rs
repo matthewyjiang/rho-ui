@@ -118,7 +118,9 @@ fn start_prompt(
         return Err(busy());
     }
     session.saved = true;
-    session.updated_at = newest + 1;
+    // Now, as a daemon's clock says, and still after a session prompted
+    // within the same second.
+    session.updated_at = (newest + 1).max(unix_now());
     if prompt == "busy" && !session.refused_busy {
         session.refused_busy = true;
         session.wake(turn, "Nothing new from the background.");
@@ -269,6 +271,14 @@ fn reply(answer: &InputAnswer) -> String {
         InputAnswer::Decline => "you declined".to_owned(),
         _ => "you chose something else".to_owned(),
     }
+}
+
+/// The time in Unix seconds, as a daemon stamps a session's last activity.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_secs()
 }
 
 /// What the prompt `prompt` asks, if it asks something other than to run
