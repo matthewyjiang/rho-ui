@@ -18,6 +18,12 @@
 //! does a message with attachments, as a steer carries only text, and any
 //! message after one waiting, which would otherwise overtake it.
 //!
+//! A side chat is a fork of the session (`rho/session/fork`), started with
+//! `/side` or `/btw` in the composer, or from the right panel. It shows in
+//! a tab of the panel as a view of its own, with no title bar: the fork's
+//! conversation, and a composer that writes to the fork alone. Closing its
+//! tab stops its turn, if one runs, then deletes it ([`Self::discard`]).
+//!
 //! Text selected in the transcript gets an "Add to prompt" button where the
 //! drag ended, which quotes it above the composer's text box; see
 //! [`ComposerState::add_quote`].
@@ -123,6 +129,34 @@ pub(crate) enum SessionEvent {
     /// Show this session's pull request in the right panel, from the
     /// title bar.
     ShowPullRequest(PullRequestId),
+    /// Start a side chat of this session, sending the prompt first if
+    /// there is one; see [`SessionView::start_side_chat`].
+    SideChat(Option<Prompt>),
+    /// This side chat's tab closed and its turn has ended: delete it.
+    Discard,
+}
+
+/// How far a side chat whose tab closed is from being deleted
+/// ([`SessionView::discard`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Discarding {
+    No,
+    /// Its turn is ending.
+    WhenIdle,
+    /// The app was asked to delete it, once.
+    Asked,
+}
+
+/// Who writes the session, and where its view sits.
+enum Role {
+    /// A session the user started or opened, in the main pane.
+    Main,
+    /// A subagent's session, nested under the session that started it.
+    /// Only the subagent writes to it, so the view only watches.
+    Subagent(WeakEntity<SessionView>),
+    /// A side chat: a fork of the session, shown in a tab of its right
+    /// panel.
+    Side(WeakEntity<SessionView>),
 }
 
 /// How the session's events reach the view, as its machine's connection
@@ -201,9 +235,9 @@ pub(crate) struct SessionView {
     cwd: Place,
     /// The workspace and branch, for the header.
     workspace: WorkspaceRef,
-    /// For a subagent's session, the session that started it: the view
-    /// then only watches.
-    parent: Option<WeakEntity<SessionView>>,
+    role: Role,
+    /// How far a side chat whose tab closed is from being deleted.
+    discarding: Discarding,
     /// The daemon stopped sending an observed session's events, as when a
     /// subagent's run ends: what it shows is all there is until it is
     /// observed again.
@@ -225,6 +259,9 @@ pub(crate) struct SessionView {
     card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt on its way to the daemon.
     outgoing: Option<Outgoing>,
+    /// A side chat's first prompt, sent once the replay of the conversation
+    /// it forked has caught up, so its turn is the newest.
+    opening: Option<Prompt>,
     /// How the session's events reach the view.
     link: Link,
     /// How many attaches have answered: a prompt's try that failed as the
@@ -347,7 +384,8 @@ impl SessionView {
             session,
             cwd,
             workspace,
-            parent: None,
+            role: Role::Main,
+            discarding: Discarding::No,
             unloaded: false,
             // A resumed session is already saved.
             prompted: matches!(loading, Loading::Attaching),
@@ -360,6 +398,7 @@ impl SessionView {
             prs: None,
             card: None,
             outgoing: None,
+            opening: None,
             link: Link::Following,
             attachments: 0,
             stopping: Vec::new(),
@@ -438,9 +477,40 @@ impl SessionView {
             cx,
         );
         Self {
-            parent: Some(parent.downgrade()),
+            role: Role::Subagent(parent.downgrade()),
             added_dirs,
             _above: renamed,
+            ..view
+        }
+    }
+
+    /// A side chat of `parent`: its fork, whose attach has not answered
+    /// yet. It works where its parent does, and sends `prompt` once the
+    /// attach answers.
+    pub(crate) fn side(
+        daemon: Daemon,
+        session: Session,
+        parent: &Entity<SessionView>,
+        prompt: Option<Prompt>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let (workspace, remote) = {
+            let parent = parent.read(cx);
+            (parent.workspace.clone(), parent.composer.read(cx).remote())
+        };
+        let view = Self::new(
+            daemon,
+            session,
+            workspace,
+            remote,
+            Loading::Attaching,
+            window,
+            cx,
+        );
+        Self {
+            role: Role::Side(parent.downgrade()),
+            opening: prompt,
             ..view
         }
     }
@@ -488,19 +558,91 @@ impl SessionView {
         SessionKey::new(self.cwd.machine.clone(), self.session.id().clone())
     }
 
-    /// The session that started this one, for a subagent's session whose
-    /// parent is still open.
+    /// The session that started this one, or that a side chat forks, while
+    /// it is open.
     pub(crate) fn parent(&self) -> Option<Entity<SessionView>> {
-        self.parent.as_ref().and_then(WeakEntity::upgrade)
+        match &self.role {
+            Role::Main => None,
+            Role::Subagent(parent) | Role::Side(parent) => parent.upgrade(),
+        }
     }
 
     /// Whether this is a subagent's session, which the view only watches.
     pub(crate) fn is_subagent(&self) -> bool {
-        self.parent.is_some()
+        matches!(self.role, Role::Subagent(_))
+    }
+
+    /// Whether this is a side chat, in the right panel.
+    pub(crate) fn is_side(&self) -> bool {
+        matches!(self.role, Role::Side(_))
+    }
+
+    /// Whether the sidebar lists the session: not a subagent's, nor a side
+    /// chat, which show under the session they belong to.
+    pub(crate) fn is_listed(&self) -> bool {
+        matches!(self.role, Role::Main)
+    }
+
+    /// Whether the session can have side chats: rho forks neither a fork
+    /// nor a subagent's session.
+    pub(crate) fn offers_side_chats(&self) -> bool {
+        self.is_listed()
+    }
+
+    /// Whether something in the view has the keyboard.
+    pub(crate) fn has_keyboard(&self, window: &Window, cx: &App) -> bool {
+        self.focus_handle.contains_focused(window, cx)
+    }
+
+    /// Asks the app for a side chat of this session, which sends `prompt`
+    /// first if given. rho forks only what the session saved, so until its
+    /// first prompt is accepted the view says so instead.
+    pub(crate) fn start_side_chat(&mut self, prompt: Option<Prompt>, cx: &mut Context<'_, Self>) {
+        if !self.offers_side_chats() {
+            return;
+        }
+        if self.prompted {
+            cx.emit(SessionEvent::SideChat(prompt));
+        } else {
+            self.error = Some("A side chat starts after the session's first message.".to_owned());
+            cx.notify();
+        }
+    }
+
+    /// The side chat's tab closed: cancels its turn, if one runs, and once
+    /// none does asks the app to delete it, as rho deletes no session
+    /// while its turn is under way. A prompt not sent yet is dropped.
+    pub(crate) fn discard(&mut self, cx: &mut Context<'_, Self>) {
+        if !self.is_side() || self.discarding != Discarding::No {
+            return;
+        }
+        self.discarding = Discarding::WhenIdle;
+        self.opening = None;
+        if matches!(self.outgoing, Some(Outgoing::Waiting { .. })) {
+            self.outgoing = None;
+        }
+        if self.session.state().is_busy() {
+            let daemon = self.daemon.clone();
+            let id = self.session.id().clone();
+            // Should the cancel fail, the turn runs to its end first.
+            cx.spawn(async move |_, _| {
+                let _ = daemon.cancel(&id).await;
+            })
+            .detach();
+        }
+        self.discard_when_idle(cx);
+    }
+
+    /// Asks the app to delete a discarded side chat once no turn runs.
+    fn discard_when_idle(&mut self, cx: &mut Context<'_, Self>) {
+        if self.discarding == Discarding::WhenIdle && !self.is_busy() {
+            self.discarding = Discarding::Asked;
+            cx.emit(SessionEvent::Discard);
+        }
     }
 
     /// The session at the top of this one's nesting: itself, unless it is
-    /// a subagent's.
+    /// a subagent's or a side chat.
     pub(crate) fn root_id(&self, cx: &App) -> SessionKey {
         match self.parent() {
             Some(parent) => parent.read(cx).root_id(cx),
@@ -664,6 +806,9 @@ impl SessionView {
             Err(error) => {
                 self.loading = Loading::Failed(error.to_string());
                 self.give_back_waiting(window, cx);
+                if let Some(prompt) = self.opening.take() {
+                    self.give_back(prompt, window, cx);
+                }
             }
         }
         self.after_change(window, cx);
@@ -749,10 +894,12 @@ impl SessionView {
     /// daemon's own turn to give the model its result, and no message is
     /// held or on its way. The view stays, with what was typed in it, and
     /// showing it follows the session again. One with nothing to follow
-    /// (see [`Self::follows_again`]) has nothing to let go.
+    /// (see [`Self::follows_again`]) has nothing to let go, and a side chat
+    /// is followed while its tab is open.
     pub(crate) fn can_let_go(&self) -> bool {
         let session = &self.session;
-        self.prompted
+        !self.is_side()
+            && self.prompted
             && self.follows_again()
             && matches!(self.loading, Loading::Ready)
             && !session.is_replaying()
@@ -889,7 +1036,13 @@ impl SessionView {
             .record(&key, &self.session, &mut self.recorded);
         self.report_live(cx);
         cx.notify();
+        if matches!(self.loading, Loading::Ready) {
+            if let Some(prompt) = self.opening.take() {
+                self.submit(prompt, window, cx);
+            }
+        }
         self.send_held(window, cx);
+        self.discard_when_idle(cx);
     }
 
     /// Tells the app when the title or activity the sidebar shows changed,
@@ -917,6 +1070,11 @@ impl SessionView {
         if self.composer.read(cx).prompt(cx).is_empty() {
             return;
         }
+        let side = side_question(self.composer.read(cx).prompt(cx).text()).map(str::to_owned);
+        if let Some(question) = side {
+            self.send_side_question(question, window, cx);
+            return;
+        }
         let prompt = self
             .composer
             .update(cx, |composer, cx| composer.take(window, cx));
@@ -929,6 +1087,33 @@ impl SessionView {
             let ended = self.session.ended_turn().cloned();
             self.hold(prompt, ended, window, cx);
         }
+    }
+
+    /// Starts a side chat that asks `question`, with what the composer has
+    /// attached, from a `/side` the composer holds. Until the session is
+    /// saved, and in a side chat, which rho can't fork, the composer keeps
+    /// it and the view says why.
+    fn send_side_question(
+        &mut self,
+        question: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.is_side() {
+            self.error = Some("A side chat can't start another side chat.".to_owned());
+            cx.notify();
+            return;
+        }
+        if !self.prompted {
+            self.start_side_chat(None, cx);
+            return;
+        }
+        let (_, attachments) = self
+            .composer
+            .update(cx, |composer, cx| composer.take(window, cx))
+            .into_parts();
+        let prompt = Prompt::new(question, attachments);
+        self.start_side_chat((!prompt.is_empty()).then_some(prompt), cx);
     }
 
     /// Sends `prompt` as the next prompt. A failed send puts it back in the
@@ -1968,7 +2153,10 @@ impl Render for SessionView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
             .size_full()
-            .child(self.render_title_bar(cx))
+            // A side chat's tab names it.
+            .when(!self.is_side(), |this| {
+                this.child(self.render_title_bar(cx))
+            })
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }
@@ -2040,6 +2228,19 @@ fn runs_as(agent: Option<&str>, model: Option<SharedString>) -> SharedString {
     }
 }
 
+/// The question of a prompt that asks for a side chat, `/side` or `/btw`
+/// and what follows, as rho's terminal UI reads them: the rest of the
+/// text, trimmed, which may be empty.
+fn side_question(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let (command, question) = rest.split_at(end);
+    ["side", "btw"]
+        .iter()
+        .any(|name| command.eq_ignore_ascii_case(name))
+        .then(|| question.trim())
+}
+
 /// Longest first-prompt title, in characters: rho's `FALLBACK_TITLE_CHARS`,
 /// so the header matches the title rho lists for an untitled session.
 const PROMPT_TITLE_CHARS: usize = 80;
@@ -2079,7 +2280,27 @@ fn first_prompt(session: &Session) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::runs_as;
+    use super::{runs_as, side_question};
+
+    /// `/side` and its alias `/btw` ask for a side chat, in any case, with
+    /// or without a question; a command that only starts so does not.
+    #[test]
+    fn a_side_question_is_the_text_after_side_or_btw() {
+        let cases = [
+            ("/side what is this lock", Some("what is this lock")),
+            ("/btw  why\nnot ", Some("why\nnot")),
+            ("/SIDE x", Some("x")),
+            ("/side", Some("")),
+            ("/side\nmulti line", Some("multi line")),
+            ("/sidebar open", None),
+            ("side note", None),
+            (" /side x", None),
+            ("//side x", None),
+        ];
+        for (text, question) in cases {
+            assert_eq!(side_question(text), question, "text {text:?}");
+        }
+    }
 
     /// The default agent goes unnamed, and whichever of agent and model the
     /// daemon has said yet shows alone.

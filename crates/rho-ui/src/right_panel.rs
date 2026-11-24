@@ -7,7 +7,9 @@
 //! Each surface opens as a tab in the panel's header; hovering a tab swaps
 //! its icon for × to close it, and dragging one onto another moves it
 //! there. Terminal opens as many tabs as asked, each named for the program
-//! it runs; Pull request opens one for the branch's PR and one for each
+//! it runs; Side chat as many, each a fork of the session in a view of its
+//! own, which the app makes and follows (see [`crate::session_view`]), and
+//! which closing its tab deletes; Pull request opens one for the branch's PR and one for each
 //! other PR linked to the session, by hand or by its agent, each named for
 //! its number; the others open one. With none open, the panel lists the
 //! surfaces to open; + in the header opens a menu of the rest. Each
@@ -96,13 +98,16 @@ pub(crate) enum Surface {
     PullRequest,
     /// A shell in the session's folder.
     Terminal,
+    /// A side conversation: a fork of the session.
+    SideChat,
 }
 
 impl Surface {
     /// Every surface, in the order the panel lists them.
-    const ALL: [Surface; 5] = [
+    const ALL: [Surface; 6] = [
         Surface::Files,
         Surface::Terminal,
+        Surface::SideChat,
         Surface::Diff,
         Surface::PullRequest,
         Surface::Background,
@@ -116,6 +121,7 @@ impl Surface {
             Surface::Files => "files",
             Surface::PullRequest => "pull-request",
             Surface::Terminal => "terminal",
+            Surface::SideChat => "side-chat",
         }
     }
 
@@ -126,6 +132,7 @@ impl Surface {
             Surface::Files => "Files",
             Surface::PullRequest => "Pull request",
             Surface::Terminal => "Terminal",
+            Surface::SideChat => "Side chat",
         }
     }
 
@@ -136,14 +143,15 @@ impl Surface {
             Surface::Files => Lucide::FolderTree,
             Surface::PullRequest => Lucide::GitPullRequest,
             Surface::Terminal => Lucide::SquareTerminal,
+            Surface::SideChat => Lucide::MessagesSquare,
         }
     }
 
     /// Whether the surface opens a tab each time it is asked: each terminal
-    /// runs shells of its own, where another tab of the others would show
-    /// the same thing twice.
+    /// runs shells of its own, and each side chat is a fork of its own,
+    /// where another tab of the others would show the same thing twice.
     fn opens_many(self) -> bool {
-        matches!(self, Surface::Terminal)
+        matches!(self, Surface::Terminal | Surface::SideChat)
     }
 }
 
@@ -397,6 +405,7 @@ impl RightPanel {
         tabs.any(|tab| match tab {
             Tab::PullRequest { view, .. } => view.read(cx).has_keyboard(window, cx),
             Tab::Terminal { view, .. } => view.read(cx).has_keyboard_anywhere(window, cx),
+            Tab::SideChat { view, .. } => view.read(cx).has_keyboard(window, cx),
             Tab::Background | Tab::Diff(_) | Tab::Files(_) => false,
         })
     }
@@ -494,7 +503,10 @@ impl RightPanel {
                 Tab::PullRequest { view, .. } if why == Reload::TurnEnded => {
                     view.update(cx, PullRequestSurface::turn_ended);
                 }
-                Tab::Background | Tab::PullRequest { .. } | Tab::Terminal { .. } => {}
+                Tab::Background
+                | Tab::PullRequest { .. }
+                | Tab::Terminal { .. }
+                | Tab::SideChat { .. } => {}
             }
         }
     }
@@ -502,7 +514,9 @@ impl RightPanel {
     /// Shows `surface` for the session on screen: a new tab of a surface
     /// that opens many, else its tab, opened if it has none. Pull request
     /// opens the tabs of the PRs linked to it too. Returns the tab shown,
-    /// or `None` with no session on screen.
+    /// or `None` with no session on screen. Side chat asks the session for
+    /// a fork instead, whose tab opens once the fork does
+    /// ([`Self::open_side_chat`]).
     fn open(
         &mut self,
         surface: Surface,
@@ -511,6 +525,11 @@ impl RightPanel {
     ) -> Option<TabKey> {
         let session = self.on_screen()?.clone();
         let set = self.sets.get_mut(&session)?;
+        if surface == Surface::SideChat {
+            let view = set.view.upgrade()?;
+            view.update(cx, |view, cx| view.start_side_chat(None, cx));
+            return None;
+        }
         let open = set
             .tabs
             .iter()
@@ -523,7 +542,7 @@ impl RightPanel {
                 let place = set.place.clone();
                 // Made apart from the set, as the tab takes the panel's
                 // own entities.
-                let tab = self.new_tab(&session, &place, key, window, cx);
+                let tab = self.new_tab(&session, &place, key, window, cx)?;
                 self.sets.get_mut(&session)?.push(tab);
                 if surface == Surface::PullRequest {
                     self.sync_links(&session, cx);
@@ -551,7 +570,9 @@ impl RightPanel {
         self.show_link(&session, id, cx);
     }
 
-    /// A new tab `key` of `session`, which works in `place`.
+    /// A new tab `key` of `session`, which works in `place`; none for a
+    /// side chat, whose tab takes the view of a fork the app opened
+    /// ([`Self::open_side_chat`]).
     fn new_tab(
         &self,
         session: &SessionKey,
@@ -559,10 +580,10 @@ impl RightPanel {
         key: TabKey,
         window: &Window,
         cx: &mut Context<'_, Self>,
-    ) -> Tab {
+    ) -> Option<Tab> {
         let workspaces = self.workspaces.clone();
         let place = place.clone();
-        match key.surface {
+        let tab = match key.surface {
             Surface::Background => Tab::Background,
             Surface::Diff => Tab::Diff(cx.new(|cx| DiffSurface::new(workspaces, place, cx))),
             Surface::Files => Tab::Files(cx.new(|cx| FilesSurface::new(workspaces, place, cx))),
@@ -583,7 +604,54 @@ impl RightPanel {
                     _subscriptions: subscriptions,
                 }
             }
+            Surface::SideChat => return None,
+        };
+        Some(tab)
+    }
+
+    /// Opens a tab for `view`, a side chat of `session`, the app made, and
+    /// shows it with the keyboard in its composer if `session` is on
+    /// screen.
+    pub(crate) fn open_side_chat(
+        &mut self,
+        session: &SessionKey,
+        view: Entity<SessionView>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(set) = self.sets.get_mut(session) else {
+            return;
+        };
+        let key = set.next_key(Surface::SideChat);
+        let composer = view.read(cx).focus_target(cx);
+        set.push(Tab::SideChat {
+            number: key.number,
+            view,
+        });
+        if self.on_screen() == Some(session) {
+            self.show(key, cx);
+            window.focus(&composer, cx);
+        } else {
+            cx.notify();
         }
+    }
+
+    /// Closes the tabs of side chats `closed`, whose views the app dropped.
+    pub(crate) fn close_side_chats(&mut self, closed: &[SessionKey], cx: &mut Context<'_, Self>) {
+        for set in self.sets.values_mut() {
+            let keys: Vec<TabKey> = set
+                .tabs
+                .iter()
+                .filter(|tab| match tab {
+                    Tab::SideChat { view, .. } => closed.contains(&view.read(cx).key()),
+                    _ => false,
+                })
+                .map(Tab::key)
+                .collect();
+            set.remove(|key| keys.contains(&key));
+        }
+        self.forget_closed_hover();
+        cx.notify();
     }
 
     /// A Pull request tab of `session`, numbered `number`: of PR `linked`,
@@ -705,10 +773,14 @@ impl RightPanel {
     /// those unlinks it through its surface (ending the agent's watch, if
     /// it watches it), and the observer of `prs` closes it once the
     /// daemon's set no longer links it. A refusal shows on that surface.
+    /// A side chat's view is discarded, which deletes the fork.
     fn close(&mut self, session: &SessionKey, key: TabKey, cx: &mut Context<'_, Self>) {
         let Some(set) = self.sets.get_mut(session) else {
             return;
         };
+        if let Some(Tab::SideChat { view, .. }) = set.tab(key) {
+            view.clone().update(cx, SessionView::discard);
+        }
         if let Some(Tab::PullRequest {
             linked: Some(_),
             view,
@@ -837,6 +909,15 @@ impl RightPanel {
     pub(crate) fn terminal(&self, cx: &App) -> Option<Entity<TerminalView>> {
         match self.active_tab()? {
             Tab::Terminal { view, .. } => view.read(cx).current(cx),
+            _ => None,
+        }
+    }
+
+    /// The side chat on screen, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn side_chat(&self) -> Option<Entity<SessionView>> {
+        match self.active_tab()? {
+            Tab::SideChat { view, .. } => Some(view.clone()),
             _ => None,
         }
     }
@@ -1112,6 +1193,7 @@ impl RightPanel {
             Tab::Files(files) => files.clone().into_any_element(),
             Tab::PullRequest { view, .. } => view.clone().into_any_element(),
             Tab::Terminal { view, .. } => view.clone().into_any_element(),
+            Tab::SideChat { view, .. } => view.clone().into_any_element(),
         }
     }
 }

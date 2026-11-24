@@ -24,14 +24,14 @@ use rho_protocol::{
     QuestionAsk, RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
     SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
     SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
-    SessionEvent, SessionHoldParams, SessionHoldResponse, SessionNewParams, SessionNewResponse,
-    SessionPromptParams, SessionPromptResponse, SessionPullRequestLinkParams,
-    SessionPullRequestLinkResponse, SessionPullRequestListParams, SessionPullRequestListResponse,
-    SessionPullRequestShowParams, SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
-    SessionPullRequestUnlinkResponse, SessionSteerParams, SessionSteerResponse,
-    SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
-    SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
-    WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
+    SessionEvent, SessionForkParams, SessionForkResponse, SessionHoldParams, SessionHoldResponse,
+    SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
+    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
+    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
+    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSteerParams,
+    SessionSteerResponse, SessionSurfaceActionParams, SessionSurfaceActionResponse,
+    SessionWorktree, SettingsService, SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome,
+    UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -523,6 +523,35 @@ impl Service for Fake {
         })
     }
 
+    async fn fork_session(
+        &self,
+        params: SessionForkParams,
+    ) -> Result<SessionForkResponse, RpcError> {
+        let mut state = self.lock();
+        let parent = state.session(&params.session)?;
+        if !parent.saved {
+            return Err(RpcError::new(
+                ErrorCode::SessionNotFound,
+                format!("session {} has saved nothing yet", params.session),
+            ));
+        }
+        if parent.fork_of.is_some() || parent.subagent {
+            return Err(RpcError::new(
+                ErrorCode::SessionOpenFailed,
+                "a fork or a subagent's session can't be forked",
+            ));
+        }
+        let fork = parent.fork(params.session.as_str());
+        let options = fork.settings.options();
+        state.forks += 1;
+        let id = format!("fork-{}", state.forks);
+        state.sessions.insert(id.clone(), fork);
+        Ok(SessionForkResponse {
+            session: SessionId::new(id),
+            options,
+        })
+    }
+
     async fn prompt_session(
         &self,
         params: SessionPromptParams,
@@ -857,7 +886,7 @@ impl Service for Fake {
         let mut saved: Vec<(&String, &FakeSession)> = state
             .sessions
             .iter()
-            .filter(|(_, session)| session.saved)
+            .filter(|(_, session)| session.saved && session.fork_of.is_none())
             .collect();
         saved.sort_by_key(|(_, session)| std::cmp::Reverse(session.updated_at));
         let start = match params.cursor.as_deref().map(str::parse::<usize>) {
@@ -920,9 +949,18 @@ impl Service for Fake {
                 "a client is attached to the session",
             ));
         }
-        if let Some(session) = state.sessions.remove(params.session.as_str()) {
-            for publisher in session.publishers {
-                publisher.close(DetachReason::Deleted);
+        let id = params.session.as_str();
+        let forks: Vec<String> = state
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.fork_of.as_deref() == Some(id))
+            .map(|(fork, _)| fork.clone())
+            .collect();
+        for gone in forks.iter().map(String::as_str).chain([id]) {
+            if let Some(session) = state.sessions.remove(gone) {
+                for publisher in session.publishers {
+                    publisher.close(DetachReason::Deleted);
+                }
             }
         }
         Ok(SessionDeleteResponse {})

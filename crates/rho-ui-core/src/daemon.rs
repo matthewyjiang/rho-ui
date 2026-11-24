@@ -36,10 +36,10 @@ use rho_protocol::{
     IdempotencyKey, IdleWake, JobListParams, LoginId, LoginOutcome, LoginPrompt, ModelListParams,
     Notifications, RestartParams, SessionAnswerParams, SessionAttachParams,
     SessionBackgroundStopParams, SessionCancelParams, SessionChange, SessionConfigureParams,
-    SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
-    SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
-    SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn,
-    StatusParams, StopParams, TurnOutcome, UnsteerOutcome,
+    SessionDeleteParams, SessionDetachParams, SessionForkParams, SessionHoldParams,
+    SessionListParams, SessionNewParams, SessionObserveParams, SessionPromptParams,
+    SessionRenameParams, SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams,
+    SettingChange, SignIn, StatusParams, StopParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -654,8 +654,8 @@ impl PromptKey {
 /// finishes; and `sign_in: later`, so a session whose model has no
 /// credentials opens signed out, for the user to sign in from it.
 ///
-/// This is the one place a session's setup is made, for `rho/session/new`
-/// and `rho/session/attach` alike. rho-ui draws the surfaces a session's
+/// This is the one place a session's setup is made, for `rho/session/new`,
+/// `rho/session/fork` and `rho/session/attach` alike. rho-ui draws the surfaces a session's
 /// `ui` tool shows (`surface.rs`), so it also asks for `surfaces: drawn`:
 /// a session it opens has the tool, and every attach counts it among the
 /// clients a waiting `ui` call can be answered in.
@@ -828,6 +828,33 @@ impl Daemon {
                 branch: worktree.branch,
                 path: worktree.path,
             }),
+        })
+    }
+
+    /// Opens a fork of saved session `id`: a side chat that starts from its
+    /// conversation as last saved and never writes back to it. It works
+    /// where `id` does, as its agent, on its model, in supervised mode (or
+    /// plan mode, when `id` is in it). Nothing follows it yet: create its
+    /// [`crate::Session`], then [`Self::attach`], which replays the
+    /// conversation it forked. The daemon lists no fork, and deleting `id`
+    /// deletes its forks.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `id` has saved nothing yet, is a fork itself or a
+    /// subagent's session, another process has it open, the daemon is
+    /// older than forks (`MethodNotFound`), or the connection is gone.
+    pub async fn fork_session(&self, id: &SessionId) -> Result<SessionSetup, DaemonError> {
+        let params = SessionForkParams {
+            session: id.to_wire(),
+            environment: ClientEnvironment::clone(&self.environment),
+            setup: session_setup(),
+        };
+        let response = self.client.request::<methods::SessionFork>(&params).await?;
+        Ok(SessionSetup {
+            id: response.session.into(),
+            options: response.options,
+            worktree: None,
         })
     }
 

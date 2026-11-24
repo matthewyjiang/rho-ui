@@ -187,6 +187,7 @@ gpui_kit::assets::icon_assets!(
         CircleMinus,
         CircleSlash,
         MessageSquare,
+        MessagesSquare,
         Link,
         Unlink,
         KeyRound,

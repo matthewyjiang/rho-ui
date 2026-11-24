@@ -12,8 +12,8 @@ use super::{
 use crate::{machines::Place, session_view::SessionView};
 
 /// Which tab of a session's: its surface, and its number among that
-/// surface's tabs there, from 1 and never reused. Terminal opens as many as
-/// asked ([`Surface::opens_many`]); Pull request opens
+/// surface's tabs there, from 1 and never reused. Terminal and Side chat
+/// open as many as asked ([`Surface::opens_many`]); Pull request opens
 /// [`TabKey::BRANCH_PR`] for the branch's PR and one more for each other
 /// PR linked to the session; the others are always 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +63,12 @@ pub(super) enum Tab {
         view: Entity<TerminalTab>,
         _subscriptions: [Subscription; 2],
     },
+    /// One of any number of side chats, by its number: the view of a fork
+    /// of the session, which the app follows as an open session.
+    SideChat {
+        number: u32,
+        view: Entity<SessionView>,
+    },
 }
 
 impl Tab {
@@ -73,12 +79,14 @@ impl Tab {
             Tab::Files(_) => (Surface::Files, 1),
             Tab::PullRequest { number, .. } => (Surface::PullRequest, *number),
             Tab::Terminal { number, .. } => (Surface::Terminal, *number),
+            Tab::SideChat { number, .. } => (Surface::SideChat, *number),
         };
         TabKey { surface, number }
     }
 
     /// What the tab says: a terminal's names the program it runs, as `vim`,
-    /// and a PR's its number, as `#12`.
+    /// a PR's its number, as `#12`, and a side chat after the first its
+    /// own, as `Side chat 2`.
     pub(super) fn label(&self, cx: &App) -> SharedString {
         match self {
             Tab::Terminal { view, .. } => view
@@ -86,6 +94,10 @@ impl Tab {
                 .program(cx)
                 .unwrap_or_else(|| Surface::Terminal.label().into()),
             Tab::PullRequest { view, .. } => view.read(cx).label(cx),
+            Tab::SideChat { number: 1, .. } => Surface::SideChat.label().into(),
+            Tab::SideChat { number, .. } => {
+                format!("{} {number}", Surface::SideChat.label()).into()
+            }
             Tab::Background | Tab::Diff(_) | Tab::Files(_) => self.key().surface.label().into(),
         }
     }
@@ -94,7 +106,11 @@ impl Tab {
     pub(super) fn linked(&self) -> Option<&PullRequestId> {
         match self {
             Tab::PullRequest { linked, .. } => linked.as_ref(),
-            Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::Terminal { .. } => None,
+            Tab::Background
+            | Tab::Diff(_)
+            | Tab::Files(_)
+            | Tab::Terminal { .. }
+            | Tab::SideChat { .. } => None,
         }
     }
 }
@@ -118,11 +134,17 @@ pub(super) struct TabSet {
     next_terminal: u32,
     /// The number the next tab of a linked PR gets.
     next_link: u32,
+    /// The number the next side chat's tab gets.
+    next_side_chat: u32,
+    /// Whether the session can have side chats
+    /// ([`SessionView::offers_side_chats`]).
+    side_chats: bool,
 }
 
 impl TabSet {
     pub(super) fn new(view: &Entity<SessionView>, turns: Subscription, cx: &App) -> Self {
         let live = view.read(cx).live();
+        let side_chats = view.read(cx).offers_side_chats();
         Self {
             place: Place::new(live.id.machine, live.cwd),
             view: view.downgrade(),
@@ -132,6 +154,8 @@ impl TabSet {
             scroll: ScrollHandle::new(),
             next_terminal: 1,
             next_link: TabKey::BRANCH_PR.number + 1,
+            next_side_chat: 1,
+            side_chats,
         }
     }
 
@@ -149,10 +173,13 @@ impl TabSet {
     }
 
     /// The surfaces + and the list offer: those that open many, and those
-    /// without a tab.
+    /// without a tab; Side chat only if the session can have side chats.
     pub(super) fn openable(&self) -> impl Iterator<Item = Surface> + '_ {
-        Surface::ALL.into_iter().filter(|&surface| {
-            surface.opens_many() || !self.tabs.iter().any(|tab| tab.key().surface == surface)
+        Surface::ALL.into_iter().filter(|&surface| match surface {
+            Surface::SideChat => self.side_chats,
+            surface => {
+                surface.opens_many() || !self.tabs.iter().any(|tab| tab.key().surface == surface)
+            }
         })
     }
 
@@ -162,6 +189,10 @@ impl TabSet {
             Surface::Terminal => {
                 self.next_terminal += 1;
                 self.next_terminal - 1
+            }
+            Surface::SideChat => {
+                self.next_side_chat += 1;
+                self.next_side_chat - 1
             }
             Surface::PullRequest => TabKey::BRANCH_PR.number,
             Surface::Background | Surface::Diff | Surface::Files => 1,

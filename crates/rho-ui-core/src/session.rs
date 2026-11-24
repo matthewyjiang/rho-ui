@@ -79,7 +79,8 @@ pub enum Continuity {
     Replaced(Vec<Entry>),
 }
 
-/// What `rho/session/new` returned. Hand it to [`Session::from_setup`].
+/// What `rho/session/new` or `rho/session/fork` returned. Hand it to
+/// [`Session::from_setup`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSetup {
     pub(crate) id: SessionId,
