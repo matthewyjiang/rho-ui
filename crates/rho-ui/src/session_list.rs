@@ -713,10 +713,13 @@ impl SessionList {
                     Family::Top(_) | Family::Started => None,
                 })
                 .collect();
-            // Stable, so families that tie keep their order, newest first.
+            // The active by pin, then by what presses most; each shelf's
+            // ties by the newest activity in the family.
             match shelf {
-                Shelf::Active => shown
-                    .sort_by_key(|&(ix, marks)| (Reverse(self.rows[ix].pinned), marks.attention)),
+                Shelf::Active => shown.sort_by_key(|&(ix, marks)| {
+                    let pinned = Reverse(self.rows[ix].pinned);
+                    (pinned, marks.attention, Reverse(marks.updated))
+                }),
                 Shelf::Snoozed | Shelf::Settled => {
                     shown.sort_by_key(|&(_, marks)| Reverse(marks.updated));
                 }
@@ -735,9 +738,9 @@ impl SessionList {
                 continue;
             }
             let limit = self.limit(shelf);
-            for &(ix, marks) in shown.iter().take(limit) {
+            for &(ix, _) in shown.iter().take(limit) {
                 items.push(Item::row(shelf, ix));
-                self.push_family(&mut items, &families, ix, marks, &passes);
+                self.push_family(&mut items, &families, ix, &passes);
             }
             if count > limit {
                 items.push(Item::More(shelf));

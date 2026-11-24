@@ -209,6 +209,15 @@ impl ShelfAction {
         Self::offered(row.shelf)
     }
 
+    /// Marks `session` in `shelves` as this move puts it, as of `now`.
+    fn apply(self, shelves: &mut Shelves, session: &SessionKey, now: i64) {
+        match self {
+            ShelfAction::Settle => shelves.settle(session, now),
+            ShelfAction::Snooze(snooze) => shelves.snooze(session, now + snooze.seconds),
+            ShelfAction::Restore => shelves.restore(session, now),
+        }
+    }
+
     fn offered(shelf: Shelf) -> &'static [ShelfAction] {
         match shelf {
             Shelf::Active => &Self::ON_ACTIVE,
@@ -691,10 +700,9 @@ impl SidebarView {
 
     fn shelve(&mut self, id: &SessionKey, action: ShelfAction, cx: &mut Context<'_, Self>) {
         let now = time::now_unix();
-        match action {
-            ShelfAction::Settle => self.shelves.settle(id, now),
-            ShelfAction::Snooze(snooze) => self.shelves.snooze(id, now + snooze.seconds),
-            ShelfAction::Restore => self.shelves.restore(id, now),
+        // A family moves as one.
+        for session in self.list.family(id) {
+            action.apply(&mut self.shelves, &session, now);
         }
         // The row moves away from the pointer.
         self.hover = None;
@@ -2301,5 +2309,34 @@ mod tests {
         }
         assert_eq!(ShelfAction::offered(Shelf::Settled), [ShelfAction::Restore]);
         assert!(ShelfAction::offered(Shelf::Snoozed).contains(&ShelfAction::Restore));
+    }
+
+    /// Settling a starter settles the sessions under it too, so they stay
+    /// settled when the starter is deleted, not back among the active.
+    #[test]
+    fn a_settled_familys_sessions_stay_settled_without_their_starter() {
+        let session = |id: &str, parent: Option<&str>| SavedSession {
+            id: SessionKey::local(id),
+            cwd: PathBuf::from("/w"),
+            title: None,
+            updated: 1,
+            workspace: 0,
+            parent: parent.map(SessionKey::local),
+        };
+        let (lead, worker) = (SessionKey::local("lead"), SessionKey::local("w1"));
+        let mut list = SessionList::default();
+        let sessions = vec![session("w1", Some("lead")), session("lead", None)];
+        list.set_saved(&MachineId::local(), sessions);
+        let mut shelves = Shelves::default();
+        for session in list.family(&lead) {
+            ShelfAction::Settle.apply(&mut shelves, &session, 2);
+        }
+        list.remove(&lead);
+        list.rebuild(&shelves, 3, &HashSet::new(), |_| ("w", Path::new("/w")));
+        let row = list.row(&worker).expect("listed");
+        assert_eq!(
+            (row.family == Family::Started, row.shelf),
+            (false, Shelf::Settled)
+        );
     }
 }
