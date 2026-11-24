@@ -1489,7 +1489,7 @@ fn a_long_shelf_shows_25_sessions_at_a_time() {
         past_sessions: 30,
         ..Script::default()
     };
-    // Nobody's: all 32 sessions start settled.
+    // Long quiet: all 32 sessions start settled.
     let mut ui = Harness::start_with("shelf-pages", script, Shelves::default());
     ui.wait_until("the settled entry", |window, _, _| {
         is_visible(window, "toggle-settled")
@@ -3063,8 +3063,7 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
         tui_job: TuiJob::Running,
         ..Script::default()
     };
-    let shelves = kept([TUI_SESSION, "s1", "old"]);
-    let mut ui = Harness::start_with("done", script, shelves);
+    let mut ui = Harness::start("done", script);
     ui.wait_until("the running job among the sessions", |window, _, _| {
         is_visible(window, "session-local-s1")
             && window

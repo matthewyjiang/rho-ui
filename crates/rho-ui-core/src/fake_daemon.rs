@@ -140,7 +140,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rho_protocol::{
@@ -1870,6 +1870,18 @@ impl State {
             state.sessions.insert(TUI_SESSION.to_owned(), session);
         }
         state
+    }
+
+    /// The date of a session that saves something now: the time, as a
+    /// daemon's clock says, and after every session's date, so sessions
+    /// saved within one second keep their order.
+    fn next_date(&self) -> u64 {
+        let newest = self.sessions.values().map(|session| session.updated_at);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_secs();
+        newest.max().map_or(now, |newest| now.max(newest + 1))
     }
 
     fn next_turn(&mut self) -> Turn {

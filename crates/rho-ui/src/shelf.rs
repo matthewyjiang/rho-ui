@@ -22,10 +22,10 @@ use crate::{
 };
 
 /// How long a session stays active after its last activity, in seconds: a
-/// week. In 98 days of one daemon's model requests (528 sessions), 97 of the
-/// 98 returns to a session idle for an hour or more came within 32 hours and
-/// the last after 9 days, so a week loses what three days would, and it
-/// outlasts a long weekend.
+/// week. One daemon's model requests over 98 days (528 sessions) hold 98
+/// returns to a session idle for an hour or more: 97 within 32 hours and one
+/// after 9 days. Three days would catch the same 97; a week also outlasts a
+/// long weekend.
 pub(crate) const QUIET_AFTER: i64 = 7 * 24 * 60 * 60;
 
 /// Which list a session shows in.
@@ -139,32 +139,38 @@ impl Shelves {
 
     /// Pins `id` to the top of the active list.
     pub(crate) fn pin(&mut self, id: &SessionKey, now: i64) {
-        self.set(id, Some(Mark::Pinned(now)));
+        self.set(id, Mark::Pinned(now));
     }
 
     /// Unpins `id`, keeping it active.
     pub(crate) fn unpin(&mut self, id: &SessionKey, now: i64) {
         if self.pinned(id).is_some() {
-            self.set(id, Some(Mark::Kept(now)));
+            self.set(id, Mark::Kept(now));
         }
     }
 
     pub(crate) fn settle(&mut self, id: &SessionKey, now: i64) {
-        self.set(id, Some(Mark::Settled(now)));
+        self.set(id, Mark::Settled(now));
     }
 
     pub(crate) fn snooze(&mut self, id: &SessionKey, until: i64) {
-        self.set(id, Some(Mark::Snoozed(until)));
+        self.set(id, Mark::Snoozed(until));
     }
 
     /// Moves `id` to the active list, where it stays as if active at `now`.
     pub(crate) fn restore(&mut self, id: &SessionKey, now: i64) {
-        self.set(id, Some(Mark::Kept(now)));
+        self.set(id, Mark::Kept(now));
     }
 
     /// Forgets a deleted session.
     pub(crate) fn forget(&mut self, id: &SessionKey) {
-        self.set(id, None);
+        if let Ok(at) = self.find(id) {
+            self.marks.remove(at);
+            self.db.execute(
+                "DELETE FROM shelves WHERE machine = ?1 AND session_id = ?2",
+                (id.machine.as_str(), id.id.as_str()),
+            );
+        }
     }
 
     fn find(&self, id: &SessionKey) -> Result<usize, usize> {
@@ -175,26 +181,15 @@ impl Shelves {
         self.find(id).ok().map(|at| self.marks[at].1)
     }
 
-    /// Gives `id` the mark, or none, and saves it if that changed anything.
-    /// Best effort: losing a write only moves a session between lists.
-    fn set(&mut self, id: &SessionKey, mark: Option<Mark>) {
-        let key = (id.machine.as_str(), id.id.as_str());
-        match (self.find(id), mark) {
-            (Ok(at), Some(mark)) if self.marks[at].1 == mark => return,
-            (Ok(at), Some(mark)) => self.marks[at].1 = mark,
-            (Ok(at), None) => {
-                self.marks.remove(at);
-            }
-            (Err(at), Some(mark)) => self.marks.insert(at, (id.clone(), mark)),
-            (Err(_), None) => return,
+    /// Gives `id` the mark, in place of any it had, and saves it if that
+    /// changed anything. Best effort: losing a write only moves a session
+    /// between lists.
+    fn set(&mut self, id: &SessionKey, mark: Mark) {
+        match self.find(id) {
+            Ok(at) if self.marks[at].1 == mark => return,
+            Ok(at) => self.marks[at].1 = mark,
+            Err(at) => self.marks.insert(at, (id.clone(), mark)),
         }
-        let Some(mark) = mark else {
-            self.db.execute(
-                "DELETE FROM shelves WHERE machine = ?1 AND session_id = ?2",
-                key,
-            );
-            return;
-        };
         let (settled, snoozed, pinned, kept) = match mark {
             Mark::Settled(at) => (Some(at), None, None, None),
             Mark::Snoozed(until) => (None, Some(until), None, None),
@@ -205,7 +200,14 @@ impl Shelves {
             "INSERT OR REPLACE INTO shelves \
              (machine, session_id, settled_at, snoozed_until, pinned_at, kept_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            (key.0, key.1, settled, snoozed, pinned, kept),
+            (
+                id.machine.as_str(),
+                id.id.as_str(),
+                settled,
+                snoozed,
+                pinned,
+                kept,
+            ),
         );
     }
 }

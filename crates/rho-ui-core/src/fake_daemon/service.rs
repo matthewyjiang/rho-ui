@@ -105,12 +105,7 @@ fn start_prompt(
             "the session is being deleted",
         ));
     }
-    let newest = state
-        .sessions
-        .values()
-        .map(|session| session.updated_at)
-        .max()
-        .unwrap_or_default();
+    let date = state.next_date();
     let turn = state.next_turn();
     let turn_id = turn.id.clone();
     let session = state.session(&params.session)?;
@@ -118,9 +113,7 @@ fn start_prompt(
         return Err(busy());
     }
     session.saved = true;
-    // Now, as a daemon's clock says, and still after a session prompted
-    // within the same second.
-    session.updated_at = (newest + 1).max(unix_now());
+    session.updated_at = date;
     if prompt == "busy" && !session.refused_busy {
         session.refused_busy = true;
         session.wake(turn, "Nothing new from the background.");
@@ -271,14 +264,6 @@ fn reply(answer: &InputAnswer) -> String {
         InputAnswer::Decline => "you declined".to_owned(),
         _ => "you chose something else".to_owned(),
     }
-}
-
-/// The time in Unix seconds, as a daemon stamps a session's last activity.
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is past 1970")
-        .as_secs()
 }
 
 /// What the prompt `prompt` asks, if it asks something other than to run
@@ -637,6 +622,7 @@ impl Service for Fake {
         let mut state = self.lock();
         state.steers += 1;
         let id = SteerId::new(format!("steer-{}", state.steers));
+        let date = state.next_date();
         let session = state.session(&params.session)?;
         let Some(turn) = session.turn.as_mut().filter(|turn| turn.input.is_none()) else {
             return Err(not_steerable());
@@ -652,6 +638,8 @@ impl Service for Fake {
             }],
             steer: Some(id.clone()),
         });
+        // The steer is saved with the session, as a prompt is.
+        session.updated_at = date;
         if params.text == "keep going" {
             return Ok(SessionSteerResponse { id });
         }
