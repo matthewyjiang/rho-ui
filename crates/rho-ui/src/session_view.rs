@@ -68,8 +68,9 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     surface::SurfaceAction, Answer, Attached, Attachment, BackgroundId, BackgroundStatus,
-    Continuity, Cursor, Daemon, DaemonError, Entry, InputId, JobActivity, Prompt, PromptKey, Run,
-    RunState, Session, SessionId, SessionUpdate, SteerId, SurfaceActionError, TurnId, Unsteered,
+    Continuity, Cursor, Daemon, DaemonError, Entry, InputId, JobActivity, Prompt, PromptKey,
+    PullRequestId, Run, RunState, Session, SessionId, SessionUpdate, SteerId, SurfaceActionError,
+    TurnId, Unsteered,
 };
 
 use crate::{
@@ -82,6 +83,8 @@ use crate::{
     machines::{Place, SessionKey},
     pictures::{PictureRead, Pictures},
     plan::PlanList,
+    pr_mark::pr_pill,
+    pull_requests::PullRequests,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{model_summary, Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
@@ -117,6 +120,9 @@ pub(crate) enum SessionEvent {
     Show(WeakEntity<SessionView>),
     /// Start a new session in this one's project, from the title bar.
     NewSession,
+    /// Show this session's pull request in the right panel, from the
+    /// title bar.
+    ShowPullRequest(PullRequestId),
 }
 
 /// How the session's events reach the view, as its machine's connection
@@ -212,6 +218,9 @@ pub(crate) struct SessionView {
     /// The directories the session reaches besides its workspace, in the
     /// title bar.
     added_dirs: Entity<AddedDirs>,
+    /// Where the title bar reads the session's pull request, redrawn as
+    /// it changes; see [`Self::with_pull_requests`].
+    prs: Option<(Entity<PullRequests>, Subscription)>,
     /// The oldest open request, while there is one, and its events.
     card: Option<(Entity<InputCard>, Subscription)>,
     /// A prompt on its way to the daemon.
@@ -348,6 +357,7 @@ impl SessionView {
             settings,
             sign_in: None,
             added_dirs,
+            prs: None,
             card: None,
             outgoing: None,
             link: Link::Following,
@@ -452,6 +462,19 @@ impl SessionView {
             window,
             cx,
         ));
+        self
+    }
+
+    /// Marks the session's pull request in its title bar, as `prs` has it.
+    /// A subagent's session gets none: the sidebar, which has the PRs of
+    /// its sessions listed, doesn't list it.
+    pub(crate) fn with_pull_requests(
+        mut self,
+        prs: Entity<PullRequests>,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let redraw = cx.observe(&prs, |_, _, cx| cx.notify());
+        self.prs = Some((prs, redraw));
         self
     }
 
@@ -1824,9 +1847,22 @@ impl SessionView {
         })
     }
 
+    /// The session's pull request, marked as its sidebar row marks it. A
+    /// click shows it in the right panel.
+    fn render_pr_mark(&self, cx: &Context<'_, Self>) -> Option<Button> {
+        let (prs, _) = self.prs.as_ref()?;
+        let mark = prs.read(cx).mark(&self.key())?;
+        let id = mark.pr.id.clone();
+        Some(
+            pr_pill("title-pr", &mark, cx.theme()).on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(SessionEvent::ShowPullRequest(id.clone()));
+            })),
+        )
+    }
+
     /// The project, which starts a new session in it, the sessions above
-    /// this one, each a link to it, and this one's title, with its added
-    /// directories and ended background work at the right.
+    /// this one, each a link to it, and this one's title, with its pull
+    /// request, added directories and ended background work at the right.
     fn render_title_bar(&self, cx: &mut Context<'_, Self>) -> TitleBar {
         let mut above = Vec::new();
         let mut next = self.parent();
@@ -1856,6 +1892,7 @@ impl SessionView {
         bar.trailing(Some(
             h_flex()
                 .gap_1()
+                .children(self.render_pr_mark(cx))
                 .child(self.added_dirs.clone())
                 .children(ended),
         ))

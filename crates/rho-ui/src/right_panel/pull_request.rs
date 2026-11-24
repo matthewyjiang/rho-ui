@@ -37,7 +37,6 @@ use gpui_kit::{
 };
 use rho_ui_core::{PullRequestDetail, PullRequestId, PullRequestSummary};
 
-pub(crate) use self::header::state_look;
 pub(super) use self::header::unlink_tooltip;
 pub(super) use self::link::ShowLinked;
 use self::{

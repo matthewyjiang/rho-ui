@@ -55,16 +55,16 @@ use gpui_kit::{
     Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
     Subscription, Task, WeakEntity, Window,
 };
-use rho_ui_core::{Job, PullRequestRollup, PullRequestSummary, SessionSummary};
+use rho_ui_core::{Job, SessionSummary};
 
 use crate::{
     app_update::{self, AppUpdate},
     badge::Badge,
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
+    pr_mark::{mark_label, pr_mark},
     projects::Projects,
     pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
-    right_panel::state_look,
     session_list::{
         Activity, DraftRow, Item, JobSession, LiveSession, Row, SavedSession, SessionList,
         SHELF_PAGE,
@@ -309,7 +309,8 @@ pub(crate) struct SidebarView {
     /// A newer rho-ui, which the footer offers to install.
     app_update: Entity<AppUpdate>,
     projects: Entity<Projects>,
-    /// Each active row's PR, which its branch line marks.
+    /// Each active row's PR, which its branch line marks, and whether its
+    /// agent watches one, which its status says.
     prs: Entity<PullRequests>,
     shelves: Shelves,
     layout: SidebarLayout,
@@ -383,8 +384,9 @@ impl SidebarView {
             }),
             cx.observe(&installs, |_, _, cx| cx.notify()),
             cx.observe(&app_update, |_, _, cx| cx.notify()),
-            // A set of PRs answered or changed: the marks follow.
-            cx.observe(&prs, |_, _, cx| cx.notify()),
+            // A set of PRs answered or changed: the marks follow, and the
+            // rows whose agents took up a watch or ended one move.
+            cx.observe(&prs, |this, _, cx| this.rebuild(cx)),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -559,11 +561,9 @@ impl SidebarView {
     pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.active != id {
             self.active = id;
-            if self.mark_active_seen() {
-                self.rebuild(cx);
-            } else {
-                cx.notify();
-            }
+            self.mark_active_seen();
+            // Its PR is listed, whichever shelf it is on.
+            self.rebuild(cx);
         }
     }
 
@@ -573,11 +573,11 @@ impl SidebarView {
     }
 
     /// The session on screen has no Done to show: its turn ended in view.
-    /// Returns whether it had one, so the list needs a rebuild.
-    fn mark_active_seen(&mut self) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|active| self.list.mark_seen(active))
+    /// The list needs a rebuild after it.
+    fn mark_active_seen(&mut self) {
+        if let Some(active) = &self.active {
+            self.list.mark_seen(active);
+        }
     }
 
     /// How wide the app lays the sidebar out: on macOS, never too narrow
@@ -621,12 +621,15 @@ impl SidebarView {
 
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
         let workspaces = self.workspaces.read(cx);
-        self.list.rebuild(&self.shelves, time::now_unix(), |ix| {
-            let workspace = workspaces.get(ix);
-            (workspace.name.as_ref(), workspace.root_path())
-        });
-        // The active rows shown have their PRs listed by their daemons.
-        let listed = self
+        let watching = self.prs.read(cx).watching();
+        self.list
+            .rebuild(&self.shelves, time::now_unix(), &watching, |ix| {
+                let workspace = workspaces.get(ix);
+                (workspace.name.as_ref(), workspace.root_path())
+            });
+        // The active rows shown have their PRs listed by their daemons,
+        // and so has the session on screen, for its title bar.
+        let mut listed: Vec<SessionKey> = self
             .list
             .items()
             .iter()
@@ -635,6 +638,11 @@ impl SidebarView {
                 _ => None,
             })
             .collect();
+        if let Some(active) = &self.active {
+            if !listed.contains(active) {
+                listed.push(active.clone());
+            }
+        }
         self.prs.update(cx, |prs, cx| prs.set_listed(listed, cx));
         cx.notify();
     }
@@ -946,8 +954,15 @@ impl SidebarView {
             }))
             .child(branch_line(
                 workspace,
-                self.prs.read(cx).mark(&row.id).map(|pr| {
-                    pr_mark(format!("{}-pr", row.element_id).into(), pr, theme).into_any_element()
+                self.prs.read(cx).mark(&row.id).map(|mark| {
+                    pr_mark(&mark, theme)
+                        // Apart from the branch before it.
+                        .when(workspace.branch.is_some(), Styled::ml_1)
+                        .id(SharedString::from(format!("{}-pr", row.element_id)))
+                        .test_support()
+                        .aria_label(mark_label(&mark))
+                        .flex_shrink_0()
+                        .into_any_element()
                 }),
                 machine.map(|label| (format!("{}-machine", row.element_id).into(), label)),
                 theme,
@@ -1836,34 +1851,11 @@ fn branch_line(
         })
 }
 
-/// A row's PR: its state's icon and its number, with a red dot while its
-/// checks fail. `id` is its element ID.
-fn pr_mark(id: SharedString, pr: &PullRequestSummary, theme: &Theme) -> impl IntoElement {
-    let (_, icon, color) = state_look(pr.state);
-    // As the surface's tag colors its text.
-    let color = color.scale(if theme.is_dark() { 300 } else { 600 });
-    let failing = pr.rollup == PullRequestRollup::Failing;
-    h_flex()
-        .id(id)
-        .test_support()
-        .aria_label(SharedString::from(format!(
-            "#{}{}",
-            pr.id.number,
-            if failing { ", checks failing" } else { "" }
-        )))
-        .flex_shrink_0()
-        .gap_0p5()
-        .child(Icon::new(icon).xsmall().text_color(color))
-        .child(format!("#{}", pr.id.number))
-        .when(failing, |this| {
-            this.child(div().size_1p5().rounded_full().bg(theme.red))
-        })
-}
-
-/// "Working 24m", "Needs you 9m", "Waiting" on background work, "Done", or the age: "3h", after a pin on a
-/// pinned row. Icons are static: an animated one would redraw the whole
-/// sidebar every frame. So Working gets a symmetric dashed circle, not a
-/// spinner frozen mid-turn.
+/// "Working 24m", "Needs you 9m", "Waiting" on background work, "Watching"
+/// while its agent watches a pull request, "Done", or the age: "3h", after
+/// a pin on a pinned row. Icons are static: an animated one would redraw
+/// the whole sidebar every frame. So Working gets a symmetric dashed
+/// circle, not a spinner frozen mid-turn.
 fn status(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
     let status = activity(row, clock, theme);
     if row.pinned.is_none() {
@@ -1921,6 +1913,18 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .text_color(theme.muted_foreground)
             .child(Icon::new(Lucide::Hourglass).xsmall())
             .child("Waiting")
+            .into_any_element(),
+        // Its agent wakes when the PR changes: no turn runs, but it isn't
+        // done. The row's mark below says which PR.
+        Activity::Idle if row.watching => h_flex()
+            .id(SharedString::from(format!("{}-watching", row.element_id)))
+            .test_support()
+            .aria_label("Watching a pull request")
+            .flex_shrink_0()
+            .gap_1()
+            .text_color(theme.muted_foreground)
+            .child(Icon::new(Lucide::Eye).xsmall())
+            .child("Watching")
             .into_any_element(),
         Activity::Idle if row.done => h_flex()
             .id(SharedString::from(format!("{}-done", row.element_id)))

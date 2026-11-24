@@ -1,8 +1,8 @@
 //! Pull requests: each session's, as its machine's rho daemon reads them
-//! with its own `gh`. rho-ui only asks: `list` for the sidebar's rows,
-//! `show` for the PR on screen, `link` and `unlink` for the user's links;
-//! and each change to a followed session's set arrives as an event
-//! ([`PullRequests::replaced`]). What rho-ui does *to* a PR (comment,
+//! with its own `gh`. rho-ui only asks: `list` for the sidebar's rows and
+//! the title bar, `show` for the PR on the Pull request surface, `link`
+//! and `unlink` for the user's links; and each change to a followed
+//! session's set arrives as an event ([`PullRequests::replaced`]). What rho-ui does *to* a PR (comment,
 //! merge, ready, draft) still runs `gh` on the session's machine
 //! ([`PullRequests::act`]); see [`PullRequests`].
 
@@ -79,6 +79,17 @@ pub(crate) enum Which {
 pub(crate) struct Shown {
     pub(crate) session: SessionKey,
     pub(crate) which: Which,
+}
+
+/// A session's pull request as its sidebar row and its title bar mark it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mark<'a> {
+    /// Its branch's, else the first linked one read.
+    pub(crate) pr: &'a PullRequestSummary,
+    /// Whether the session's agent watches `pr`.
+    pub(crate) watched: bool,
+    /// How many more the session links: those with tabs of their own.
+    pub(crate) more: usize,
 }
 
 /// Whether a machine's daemon serves pull requests.
@@ -412,12 +423,12 @@ impl MachinePrs {
 
 /// Each session's pull requests, as each machine's daemon serves them.
 /// Two request loops keep the daemons reading what is on screen: `list`
-/// per machine for the sidebar's rows, every [`LIST_EVERY`], and `show`
-/// for the Pull request surface, every [`SHOW_EVERY`]. Each runs one
-/// request at a time: a request asked for while one is in flight is folded
-/// into one more after it. Neither runs while the window is unfocused, for
-/// a machine that isn't connected, or for one whose daemon is
-/// [`Serving::Unserved`].
+/// per machine for the sidebar's rows and the title bar, every
+/// [`LIST_EVERY`], and `show` for the Pull request surface, every
+/// [`SHOW_EVERY`]. Each runs one request at a time: a request asked for
+/// while one is in flight is folded into one more after it. Neither runs
+/// while the window is unfocused, for a machine that isn't connected, or
+/// for one whose daemon is [`Serving::Unserved`].
 pub(crate) struct PullRequests {
     /// The `gh` that acts: [`Self::poster`].
     forges: Entity<Forges>,
@@ -425,7 +436,7 @@ pub(crate) struct PullRequests {
     workspaces: Entity<Workspaces>,
     machines: HashMap<MachineId, MachinePrs>,
     connections: u64,
-    /// The sidebar's sessions.
+    /// The sidebar's sessions, and the one on screen.
     listed: Vec<SessionKey>,
     shown: Option<Shown>,
     /// The surface that asked for `shown`: two may show the same, and only
@@ -560,8 +571,8 @@ impl PullRequests {
         }
     }
 
-    /// Lists `listed` for the sidebar: its sessions, each on its machine. A
-    /// machine that gained one is listed at once.
+    /// Lists `listed` for the sidebar: its sessions and the one on screen,
+    /// each on its machine. A machine that gained one is listed at once.
     pub(crate) fn set_listed(&mut self, listed: Vec<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.listed == listed {
             return;
@@ -686,12 +697,39 @@ impl PullRequests {
         self.machines.get(machine)?.details.get(id)
     }
 
-    /// The PR a sidebar row marks: its branch's, else the first linked one
-    /// read.
-    pub(crate) fn mark(&self, session: &SessionKey) -> Option<&PullRequestSummary> {
+    /// The PR that marks `session` on its sidebar row and in its title
+    /// bar: its branch's, else the first linked one read.
+    pub(crate) fn mark(&self, session: &SessionKey) -> Option<Mark<'_>> {
         let set = self.of(session)?;
-        set.branch_pull_request()
-            .or_else(|| set.linked.iter().find_map(|linked| linked.summary.as_ref()))
+        let pr = set
+            .branch_pull_request()
+            .or_else(|| set.linked.iter().find_map(|linked| linked.summary.as_ref()))?;
+        Some(Mark {
+            pr,
+            watched: set.link(&pr.id).is_some_and(|link| link.watched),
+            more: set
+                .linked
+                .iter()
+                .filter(|linked| linked.id != pr.id)
+                .count(),
+        })
+    }
+
+    /// Every session whose agent watches a pull request, as the daemons
+    /// last said: its daemon wakes it when the PR changes, so the session
+    /// isn't done while it does. Of a session no longer listed, that is
+    /// what its daemon said while it was.
+    pub(crate) fn watching(&self) -> HashSet<SessionKey> {
+        self.machines
+            .iter()
+            .flat_map(|(machine, entry)| {
+                entry
+                    .sessions
+                    .iter()
+                    .filter(|(_, set)| set.linked.iter().any(|linked| linked.watched))
+                    .map(|(session, _)| SessionKey::new(machine.clone(), session.clone()))
+            })
+            .collect()
     }
 
     /// The linked PRs that get tabs of their own, in the order linked: all

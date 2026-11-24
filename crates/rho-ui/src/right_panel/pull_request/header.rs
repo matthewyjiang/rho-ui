@@ -7,7 +7,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     tag::Tag,
-    v_flex, ActiveTheme as _, ColorName, Icon, IconName, Sizable as _, StyledExt as _,
+    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -15,12 +15,14 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _,
 };
 use rho_ui_core::{
-    LinkedPullRequest, PullRequestDetail, PullRequestId, PullRequestReview, PullRequestState,
-    PullRequestSummary,
+    LinkedPullRequest, PullRequestDetail, PullRequestId, PullRequestReview, PullRequestSummary,
 };
 
 use super::PullRequestSurface;
-use crate::pull_requests::{PullRequests, Reading, Seen, Which};
+use crate::{
+    pr_mark::state_look,
+    pull_requests::{PullRequests, Reading, Seen, Which},
+};
 
 /// What Unlink says it does to the session's `link`, here and on its tab:
 /// it ends the agent's watch too, while the agent watches it.
@@ -116,19 +118,6 @@ pub(super) fn toolbar(
             )
         })
         .when(asks, |this| this.child(refresh_button(cx)))
-}
-
-/// How a PR's state reads, here and on its sidebar row: its word, icon
-/// and color.
-pub(crate) fn state_look(state: PullRequestState) -> (&'static str, Lucide, ColorName) {
-    match state {
-        PullRequestState::Open => ("Open", Lucide::GitPullRequest, ColorName::Green),
-        PullRequestState::Draft => ("Draft", Lucide::GitPullRequestDraft, ColorName::Gray),
-        PullRequestState::Merged => ("Merged", Lucide::GitMerge, ColorName::Purple),
-        PullRequestState::Closed => ("Closed", Lucide::GitPullRequestClosed, ColorName::Red),
-        // A state a newer rho sends.
-        _ => ("Unknown", Lucide::CircleQuestionMark, ColorName::Gray),
-    }
 }
 
 /// The title, then its state, author and branches, then its size and
