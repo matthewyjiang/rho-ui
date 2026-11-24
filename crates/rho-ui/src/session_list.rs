@@ -4,8 +4,9 @@
 //! active sessions, ranked as an inbox by what they want of the user
 //! ([`Attention`]), a gap, then each shelf's header
 //! and, when it's open, its newest [`SHELF_PAGE`] sessions, then a Show
-//! more that adds as many again. A [`Filter`] hides machines and keeps
-//! to chosen projects. Plain data with no GUI code; [`crate::sidebar`] draws
+//! more that adds as many again. A session another session started folds
+//! under that one ([`family`]). A [`Filter`] hides machines and keeps to
+//! chosen projects. Plain data with no GUI code; [`crate::sidebar`] draws
 //! it.
 
 use std::{
@@ -25,6 +26,11 @@ use crate::{
     shelf::{Shelf, Shelves},
     unseen::Unseen,
 };
+
+mod family;
+
+use family::Families;
+pub(crate) use family::{Family, Fold, FoldLine};
 
 /// What a session is doing, for the status at the right of its row.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,6 +77,8 @@ pub(crate) struct SavedSession {
     pub(crate) updated: i64,
     /// Index into [`crate::workspaces::Workspaces`].
     pub(crate) workspace: usize,
+    /// The session that started it, as the daemon's list says.
+    pub(crate) parent: Option<SessionKey>,
 }
 
 /// What an open session knows that the saved list may not have yet.
@@ -99,6 +107,8 @@ pub(crate) struct JobSession {
     pub(crate) turn_elapsed: Option<Duration>,
     /// Index into [`crate::workspaces::Workspaces`].
     pub(crate) workspace: usize,
+    /// The session that started it, as the daemon's jobs say.
+    pub(crate) parent: Option<SessionKey>,
 }
 
 /// A new session's draft the user left with a message in its composer,
@@ -142,6 +152,7 @@ impl DraftRow {
 struct JobClock {
     id: SessionKey,
     activity: Activity,
+    parent: Option<SessionKey>,
 }
 
 /// The title of a saved session the agent hasn't named.
@@ -178,6 +189,12 @@ pub(crate) struct Row {
     /// keeps what a shelved session watches current. As of the last
     /// rebuild.
     pub(crate) watching: bool,
+    /// The session that started it, as the daemon's list or jobs say,
+    /// which the list may not hold.
+    pub(crate) parent: Option<SessionKey>,
+    /// Whether it folds under the session that started it. As of the last
+    /// rebuild.
+    pub(crate) family: Family,
 }
 
 impl Row {
@@ -207,6 +224,10 @@ pub(crate) enum Item {
     Session(usize),
     /// A snoozed or settled session, drawn as one line.
     Shelved(usize),
+    /// Under a session that started others: how many, and whether they
+    /// show, under it as [`Item::Session`] or [`Item::Shelved`] by its
+    /// shelf. A click opens or closes it.
+    Fold(FoldLine),
     /// A shelf's header, with its count; it opens and folds the shelf.
     Header(Shelf),
     /// Under an open shelf that holds back sessions: shows
@@ -217,6 +238,16 @@ pub(crate) enum Item {
     /// only rise as opened shelves fill it. Search results have none: they
     /// read from the top.
     Gap,
+}
+
+impl Item {
+    /// Row `ix`, as `shelf` draws it.
+    fn row(shelf: Shelf, ix: usize) -> Self {
+        match shelf {
+            Shelf::Active => Item::Session(ix),
+            Shelf::Snoozed | Shelf::Settled => Item::Shelved(ix),
+        }
+    }
 }
 
 pub(crate) struct SessionList {
@@ -242,6 +273,10 @@ pub(crate) struct SessionList {
     more: [usize; 3],
     query: String,
     filter: Filter,
+    /// The starters whose fold the user opened, for this run.
+    open_folds: HashSet<SessionKey>,
+    /// The session on screen, until a rebuild opens the fold it's under.
+    reveal: Option<SessionKey>,
 }
 
 /// How many sessions an opened shelf shows, and how many each Show more
@@ -280,6 +315,8 @@ impl SessionList {
             more: [0; 3],
             query: String::new(),
             filter: Filter::default(),
+            open_folds: HashSet::new(),
+            reveal: None,
         }
     }
 
@@ -307,6 +344,8 @@ impl SessionList {
                 activity: self.activity(&session.id),
                 done: false,
                 watching: false,
+                parent: session.parent.or_else(|| self.job_parent(&session.id)),
+                family: Family::Top,
                 id: session.id,
                 cwd: session.cwd,
                 workspace: session.workspace,
@@ -345,6 +384,8 @@ impl SessionList {
                 0,
                 Row {
                     element_id: format!("session-{}", live.id).into(),
+                    parent: self.job_parent(&live.id),
+                    family: Family::Top,
                     id: live.id,
                     title: live.title,
                     placeholder: live.placeholder,
@@ -372,6 +413,12 @@ impl SessionList {
             Some(live) => live.activity,
             None => job().map_or_default(|job| job.activity),
         }
+    }
+
+    /// The session that started session `id`, as the daemon's jobs say.
+    fn job_parent(&self, id: &SessionKey) -> Option<SessionKey> {
+        let job = self.jobs.iter().find(|job| job.id == *id)?;
+        job.parent.clone()
     }
 
     /// Replaces the jobs of `machine`'s daemon. A session that isn't open
@@ -406,6 +453,7 @@ impl SessionList {
         self.jobs.extend(jobs.iter().map(|job| JobClock {
             id: job.id.clone(),
             activity: began(job),
+            parent: job.parent.clone(),
         }));
         let is_open = |id: &SessionKey| self.live.iter().any(|live| live.id == *id);
         let has_job = |id: &SessionKey| self.jobs.iter().any(|job| job.id == *id);
@@ -431,10 +479,17 @@ impl SessionList {
                     pinned: None,
                     done: false,
                     watching: false,
+                    parent: job.parent,
+                    family: Family::Top,
                 },
             );
         }
         for ix in 0..self.rows.len() {
+            // The saved list of a rho from before parents, or one that
+            // hasn't listed the session yet, may not say.
+            if self.rows[ix].parent.is_none() {
+                self.rows[ix].parent = self.job_parent(&self.rows[ix].id);
+            }
             let activity = self.activity(&self.rows[ix].id);
             // As in `set_live`: a turn that just ended is new activity,
             // before the daemon's list dates the session by it.
@@ -512,6 +567,7 @@ impl SessionList {
     /// Drops a deleted session.
     pub(crate) fn remove(&mut self, id: &SessionKey) {
         self.unseen.remove(id);
+        self.open_folds.remove(id);
         self.rows.retain(|row| row.id != *id);
         self.live.retain(|live| live.id != *id);
         self.jobs.retain(|job| job.id != *id);
@@ -535,6 +591,7 @@ impl SessionList {
     pub(crate) fn remove_machine(&mut self, machine: &MachineId) {
         self.clear_live(machine);
         self.rows.retain(|row| row.id.machine != *machine);
+        self.open_folds.retain(|id| id.machine != *machine);
     }
 
     pub(crate) fn filter(&self) -> &Filter {
@@ -585,7 +642,10 @@ impl SessionList {
     /// whose agent watches a pull request. A busy session is always active.
     /// Pinned sessions lead the active list, the latest pinned first; the
     /// rest follow by [`Attention`], newest first within each. An open shelf
-    /// shows its newest sessions up to its limit, then a Show more.
+    /// shows its newest sessions up to its limit, then a Show more. A
+    /// session another started folds under the top-most starter listed, on
+    /// its shelf: the family is active while any of it is busy, and ranks
+    /// and ages by its most pressing and newest session.
     pub(crate) fn rebuild<'a>(
         &mut self,
         shelves: &Shelves,
@@ -593,22 +653,20 @@ impl SessionList {
         watching: &HashSet<SessionKey>,
         workspace: impl Fn(usize) -> (&'a str, &'a Path),
     ) {
-        for row in &mut self.rows {
-            row.shelf = if row.activity.is_idle() {
-                shelves.shelf(&row.id, row.updated, now)
-            } else {
-                Shelf::Active
-            };
-            row.pinned = shelves.pinned(&row.id);
-            row.done = self.unseen.contains(&row.id);
-            row.watching = row.shelf == Shelf::Active && watching.contains(&row.id);
-        }
+        let families = Families::of(&self.rows);
+        self.open_revealed(&families);
+        self.shelve(&families, shelves, now, watching);
         let matches = |machine: &MachineId, title: Option<&str>, ix: usize| {
             let (name, root) = workspace(ix);
             let matches = |text: &str| contains_ignore_case(text, &self.query);
             self.filter.shows(machine, root)
                 && (self.query.is_empty() || title.is_some_and(matches) || matches(name))
         };
+        let matched: Vec<bool> = self
+            .rows
+            .iter()
+            .map(|row| matches(&row.id.machine, row.title.as_deref(), row.workspace))
+            .collect();
         let mut items = Vec::with_capacity(self.drafts.len() + self.rows.len() + 2);
         items.extend(
             self.drafts
@@ -621,40 +679,46 @@ impl SessionList {
         );
         let mut counts = [0; 3];
         for shelf in [Shelf::Active, Shelf::Snoozed, Shelf::Settled] {
-            let start = items.len();
+            // A family shows when its starter or any session of it matches.
             let mut shown: Vec<usize> = (0..self.rows.len())
                 .filter(|&ix| {
-                    let row = &self.rows[ix];
-                    row.shelf == shelf
-                        && matches(&row.id.machine, row.title.as_deref(), row.workspace)
+                    self.rows[ix].family == Family::Top
+                        && self.rows[ix].shelf == shelf
+                        && (matched[ix] || families.members(ix).iter().any(|&m| matched[m]))
                 })
                 .collect();
             if shelf == Shelf::Active {
                 // Stable, so rows that tie keep their order, newest first.
                 shown.sort_by_key(|&ix| {
-                    let row = &self.rows[ix];
-                    (Reverse(row.pinned), row.attention())
+                    let rows = &self.rows;
+                    let attention = families
+                        .members(ix)
+                        .iter()
+                        .map(|&m| rows[m].attention())
+                        .fold(rows[ix].attention(), std::cmp::min);
+                    (Reverse(rows[ix].pinned), attention)
                 });
             }
-            counts[slot(shelf)] = shown.len();
-            items.extend(shown.into_iter().map(|ix| match shelf {
-                Shelf::Active => Item::Session(ix),
-                Shelf::Snoozed | Shelf::Settled => Item::Shelved(ix),
-            }));
-            let count = counts[slot(shelf)];
+            let count = shown.len();
+            counts[slot(shelf)] = count;
             // An emptied shelf folds, so it comes back folded.
             if count == 0 && self.query.is_empty() {
                 self.open[slot(shelf)] = false;
                 self.more[slot(shelf)] = 0;
             }
             if shelf != Shelf::Active && count > 0 {
-                if !self.is_open(shelf) {
-                    items.truncate(start);
-                } else if count > self.limit(shelf) {
-                    items.truncate(start + self.limit(shelf));
-                    items.push(Item::More(shelf));
-                }
-                items.insert(start, Item::Header(shelf));
+                items.push(Item::Header(shelf));
+            }
+            if !self.is_open(shelf) {
+                continue;
+            }
+            let limit = self.limit(shelf);
+            for &ix in shown.iter().take(limit) {
+                items.push(Item::row(shelf, ix));
+                self.push_family(&mut items, ix, families.members(ix), &matched);
+            }
+            if count > limit {
+                items.push(Item::More(shelf));
             }
         }
         let first_header = items
@@ -704,12 +768,7 @@ impl SessionList {
     pub(crate) fn busy(&self) -> Busy {
         let mut busy = Busy::default();
         for row in &self.rows {
-            match row.activity {
-                Activity::Waiting(_) => busy.waiting += 1,
-                Activity::Working(_) => busy.working += 1,
-                // Nobody needs to look at work that runs by itself.
-                Activity::Background | Activity::Idle => {}
-            }
+            busy.add(row.activity);
         }
         busy
     }
@@ -802,6 +861,18 @@ pub(crate) struct Busy {
     pub(crate) working: usize,
 }
 
+impl Busy {
+    /// Counts a session doing `activity`.
+    fn add(&mut self, activity: Activity) {
+        match activity {
+            Activity::Waiting(_) => self.waiting += 1,
+            Activity::Working(_) => self.working += 1,
+            // Nobody needs to look at work that runs by itself.
+            Activity::Background | Activity::Idle => {}
+        }
+    }
+}
+
 /// Whether `haystack` contains `needle`, ignoring case in any script, so
 /// `É` finds `é`: how every list's search matches. Compares lowercase
 /// chars as it goes and allocates nothing, so filtering on every
@@ -837,6 +908,15 @@ mod tests {
             title: title.map(SharedString::from),
             updated,
             workspace: 0,
+            parent: None,
+        }
+    }
+
+    /// A saved session that session `parent` started.
+    fn started(text: &str, title: &str, updated: i64, parent: &str) -> SavedSession {
+        SavedSession {
+            parent: Some(id(parent)),
+            ..saved(text, Some(title), updated)
         }
     }
 
@@ -850,14 +930,31 @@ mod tests {
         }
     }
 
-    /// What the list shows: session titles, shelf headers as `[Settled 2]`,
-    /// and the gap above them as `~`.
+    /// What the list shows: session titles, indented under the session
+    /// that started them, fold lines as `› 2 started, 1 waiting, 0
+    /// working` (`⌄` when open), shelf headers as `[Settled 2]`, and the gap
+    /// above them as `~`.
     fn shown(list: &SessionList) -> Vec<String> {
         list.items()
             .iter()
             .map(|&item| match item {
                 Item::Draft(ix) => format!("draft {}", list.draft_at(ix).title()),
-                Item::Session(ix) | Item::Shelved(ix) => list.row_at(ix).title().to_string(),
+                Item::Session(ix) | Item::Shelved(ix) => {
+                    let row = list.row_at(ix);
+                    match row.family {
+                        Family::Top => row.title().to_string(),
+                        Family::Started(_) => format!("  {}", row.title()),
+                    }
+                }
+                Item::Fold(line) => {
+                    let chevron = match line.fold {
+                        Fold::Open => "⌄",
+                        Fold::Closed => "›",
+                    };
+                    let FoldLine { sessions, busy, .. } = line;
+                    let Busy { waiting, working } = busy;
+                    format!("{chevron} {sessions} started, {waiting} waiting, {working} working")
+                }
                 Item::Header(shelf) => format!("[{} {}]", shelf.label(), list.count(shelf)),
                 Item::More(shelf) => format!("[{} more {}]", shelf.label(), list.held_back(shelf)),
                 Item::Gap => "~".to_owned(),
@@ -883,6 +980,7 @@ mod tests {
             activity,
             turn_elapsed: elapsed.map(Duration::from_secs),
             workspace: 0,
+            parent: None,
         }
     }
 
@@ -1118,6 +1216,104 @@ mod tests {
         assert!(!list.row(&id("working")).expect("the row").watching);
     }
 
+    /// Sessions a session started fold under it, on its shelf: a settled
+    /// family stays settled together, until one of it is busy, a session
+    /// with no saved row yet included, which makes it active and ranks it
+    /// by the one that asks.
+    #[test]
+    fn a_family_lives_on_its_starters_shelf_and_a_busy_member_keeps_it_active() {
+        let mut shelves = Shelves::default();
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                started("w2", "Test", 5, "lead"),
+                started("w1", "Write", 4, "lead"),
+                saved("lead", Some("Lead"), 3),
+                saved("other", Some("Other"), 2),
+            ],
+        );
+        shelves.settle(&id("lead"), 10);
+        rebuild(&mut list, &shelves, 10);
+        assert_eq!(shown(&list), ["Other", "~", "[Settled 1]"]);
+        list.toggle(Shelf::Settled);
+        list.toggle_fold(&id("lead"));
+        rebuild(&mut list, &shelves, 10);
+        assert_eq!(
+            shown(&list),
+            [
+                "Other",
+                "~",
+                "[Settled 1]",
+                "Lead",
+                "⌄ 2 started, 0 waiting, 0 working",
+                "  Test",
+                "  Write"
+            ]
+        );
+
+        let asks = JobSession {
+            parent: Some(id("lead")),
+            ..job("w3", JobActivity::Waiting, None)
+        };
+        list.set_jobs(&here(), vec![asks], Instant::now(), 11);
+        list.toggle_fold(&id("lead"));
+        rebuild(&mut list, &shelves, 11);
+        assert_eq!(
+            shown(&list),
+            ["Lead", "› 3 started, 1 waiting, 0 working", "Other"]
+        );
+        list.toggle_fold(&id("lead"));
+        rebuild(&mut list, &shelves, 11);
+        assert_eq!(
+            shown(&list),
+            [
+                "Lead",
+                "⌄ 3 started, 1 waiting, 0 working",
+                "  job w3",
+                "  Test",
+                "  Write",
+                "Other"
+            ]
+        );
+    }
+
+    /// A search that matches only sessions a session started shows their
+    /// starter with the fold open and only those sessions; one that matches
+    /// the starter shows its whole family, folded as the user left it.
+    #[test]
+    fn a_search_that_matches_a_member_shows_its_starter_with_the_fold_open() {
+        let shelves = Shelves::default();
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                started("w2", "Test the parser", 5, "lead"),
+                started("w1", "Write the parser", 4, "lead"),
+                saved("lead", Some("Plan the release"), 3),
+                saved("other", Some("Other work"), 2),
+            ],
+        );
+        list.set_query("write");
+        rebuild(&mut list, &shelves, 10);
+        assert_eq!(
+            shown(&list),
+            [
+                "Plan the release",
+                "⌄ 1 started, 0 waiting, 0 working",
+                "  Write the parser"
+            ]
+        );
+        assert_eq!(list.count(Shelf::Active), 1);
+
+        list.set_query("plan");
+        rebuild(&mut list, &shelves, 10);
+        assert_eq!(
+            shown(&list),
+            ["Plan the release", "› 2 started, 0 waiting, 0 working"]
+        );
+    }
+
     /// A turn that stops working marks its row Done until the session is
     /// seen or works again, across restarts too; waiting on a person is not
     /// Done, and a turn that leaves background work running waits on it
@@ -1282,6 +1478,7 @@ mod tests {
             title: Some(SharedString::from(format!("there {text}"))),
             updated,
             workspace: 1,
+            parent: None,
         };
         let shelves = Shelves::default();
         let mut list = SessionList::default();

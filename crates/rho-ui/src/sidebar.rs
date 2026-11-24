@@ -10,8 +10,10 @@
 //! turn that finished off screen shows Done until its session is opened.
 //! Right-click a row for its menu, which also renames it in place. A shelf
 //! opens from its header into one-line rows, its newest 25 at first, and
-//! Show more under them adds 25 more at a time. Hovering a row shows its
-//! details in a card. The filter beside the
+//! Show more under them adds 25 more at a time. A session another session
+//! started is drawn indented under it, behind a line that counts them and
+//! opens on a click, or by itself when one of them comes on screen.
+//! Hovering a row shows its details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
 //! which machines aren't connected, with what would fix it (Retry, a
 //! restart of a daemon too old for rho-ui or of another build, Start for
@@ -66,8 +68,8 @@ use crate::{
     pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
     session_list::{
-        Activity, DraftRow, Item, JobSession, LiveSession, Row, SavedSession, SessionList,
-        SHELF_PAGE,
+        Activity, Busy, DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Row,
+        SavedSession, SessionList, SHELF_PAGE,
     },
     settings::{self, Settings},
     shelf::{Shelf, Shelves},
@@ -110,6 +112,14 @@ const MACHINE_LABEL_REMS: f32 = 5.;
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
 
+/// The line under a session that started others: one line of text, padded
+/// as the lines of a row are apart.
+const FOLD_REMS: f32 = LINE_REMS + 2. * GAP_REMS + 2. * GUTTER_REMS;
+
+/// How far the sessions a session started, and the line over them, sit in
+/// from its row: about a badge's width.
+const NEST_REMS: f32 = 1.25;
+
 /// The sidebar's top row, open or collapsed, so the toggle sits at the same
 /// height in both, and as tall as the main pane's title bar.
 fn top_row() -> Rems {
@@ -130,6 +140,7 @@ fn item_rems(item: Item) -> f32 {
         Item::Draft(_) | Item::Session(_) => ROW_REMS,
         Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
         Item::Header(_) => HEADER_REMS,
+        Item::Fold(_) => FOLD_REMS,
         Item::Gap => 0.,
     }
 }
@@ -188,9 +199,10 @@ impl ShelfAction {
 
     /// What a row offers, inline and in its menu. A busy session offers
     /// nothing: it shows as active until its turn ends. Nor does a pinned
-    /// one, which stays active until unpinned.
+    /// one, which stays active until unpinned, or one a session started,
+    /// which moves with that one.
     fn for_row(row: &Row) -> &'static [ShelfAction] {
-        if row.pinned.is_some() {
+        if row.pinned.is_some() || matches!(row.family, Family::Started(_)) {
             return &[];
         }
         Self::offered(row.shelf, row.activity)
@@ -438,6 +450,9 @@ impl SidebarView {
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(|title| title.to_owned().into()),
                     updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
+                    parent: session
+                        .parent()
+                        .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
                 })
                 .collect();
             workspaces.set_history(
@@ -500,6 +515,9 @@ impl SidebarView {
                     title: job.title().map(|title| title.to_owned().into()),
                     activity: job.activity(),
                     turn_elapsed: job.turn_elapsed(),
+                    parent: job
+                        .parent()
+                        .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
                 })
                 .collect()
         });
@@ -553,8 +571,12 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
+    /// Puts session `id` on screen, opening the fold it is under.
     pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.active != id {
+            if let Some(id) = &id {
+                self.list.reveal(id);
+            }
             self.active = id;
             self.mark_active_seen();
             // Its PR is listed, whichever shelf it is on.
@@ -649,6 +671,11 @@ impl SidebarView {
 
     fn show_more(&mut self, which: Shelf, cx: &mut Context<'_, Self>) {
         self.list.show_more(which);
+        self.rebuild(cx);
+    }
+
+    fn toggle_fold(&mut self, starter: &SessionKey, cx: &mut Context<'_, Self>) {
+        self.list.toggle_fold(starter);
         self.rebuild(cx);
     }
 
@@ -911,6 +938,7 @@ impl SidebarView {
                     self.render_shelved(row, workspace, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
+                Item::Fold(line) => self.render_fold(line, cx),
                 Item::More(which) => self.render_show_more(which, cx),
                 Item::Gap => div().into_any_element(),
             })
@@ -1063,10 +1091,11 @@ impl SidebarView {
         }
     }
 
-    /// What every session row shares: its slot in the list, the highlight,
-    /// hover tracking, a click that opens the session and the context menu.
-    /// Kit has no list-item element with a fixed height for
-    /// `v_virtual_list`, so rows are laid out by hand.
+    /// What every session row shares: its slot in the list, indented under
+    /// the session that started it, the highlight, hover tracking, a click
+    /// that opens the session and the context menu. Kit has no list-item
+    /// element with a fixed height for `v_virtual_list`, so rows are laid
+    /// out by hand.
     fn row_frame<E>(
         height: Rems,
         row: &Row,
@@ -1103,6 +1132,9 @@ impl SidebarView {
         div()
             .h(height)
             .px_2()
+            .when(matches!(row.family, Family::Started(_)), |this| {
+                this.pl(rems(NEST_REMS))
+            })
             .py(rems(GUTTER_REMS))
             .child(inner.context_menu(move |popup, window, cx| {
                 let (view, row) = &menu;
@@ -1256,6 +1288,69 @@ impl SidebarView {
                             .text_color(theme.muted_foreground),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(which, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// "⌄ 3 sessions · 1 needs you": the line under a session that started
+    /// others, indented as they are, with how many of them wait for the
+    /// user or else work; a click opens or closes the fold. Kit's
+    /// `Collapsible` owns its content, which here is separate rows of the
+    /// virtual list, so the line is laid out by hand, as a shelf header is.
+    fn render_fold(&self, line: FoldLine, cx: &Context<'_, Self>) -> AnyElement {
+        let theme = cx.theme();
+        let starter = self.list.row_at(line.starter);
+        let chevron = match line.fold {
+            Fold::Open => IconName::ChevronDown,
+            Fold::Closed => IconName::ChevronRight,
+        };
+        let count = match line.sessions {
+            1 => "1 session".to_owned(),
+            sessions => format!("{sessions} sessions"),
+        };
+        // As their rows say it, in their colors.
+        let busy = match line.busy {
+            Busy {
+                waiting: 0,
+                working: 0,
+            } => None,
+            Busy {
+                waiting: 0,
+                working,
+            } => Some((theme.blue, format!("{working} working"))),
+            Busy { waiting: 1, .. } => Some((theme.warning, "1 needs you".to_owned())),
+            Busy { waiting, .. } => Some((theme.warning, format!("{waiting} need you"))),
+        };
+        let label = match &busy {
+            Some((_, busy)) => format!("{count} · {busy}"),
+            None => count.clone(),
+        };
+        let hover = theme.sidebar_accent.opacity(0.5);
+        let key = starter.id.clone();
+        div()
+            .h(rems(FOLD_REMS))
+            .px_2()
+            .pl(rems(NEST_REMS))
+            .py(rems(GUTTER_REMS))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("{}-fold", starter.element_id)))
+                    .test_support()
+                    .aria_label(label)
+                    .size_full()
+                    .px_2()
+                    .gap_1()
+                    .rounded(theme.radius)
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .hover(move |style| style.bg(hover))
+                    .child(Icon::new(chevron).xsmall())
+                    .child(count)
+                    .when_some(busy, |this, (color, busy)| {
+                        this.child("·").child(div().text_color(color).child(busy))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_fold(&key, cx))),
             )
             .into_any_element()
     }
@@ -1971,7 +2066,8 @@ enum Pin {
     Unpin,
 }
 
-/// The right-click menu: Rename, Pin, the moves the hover buttons offer,
+/// The right-click menu: Rename, Pin unless the session moves with the one
+/// that started it, the moves the hover buttons offer,
 /// Copy, and Delete, which a busy session can't do.
 fn row_menu(
     menu: PopupMenu,
@@ -1980,28 +2076,28 @@ fn row_menu(
     window: &mut Window,
     cx: &mut Context<'_, PopupMenu>,
 ) -> PopupMenu {
-    let (pin, pin_icon, pin_label) = if row.pinned {
-        (Pin::Unpin, Lucide::PinOff, "Unpin")
-    } else {
-        (Pin::Pin, Lucide::Pin, "Pin")
-    };
     let id = row.id.clone();
-    let mut menu = menu
-        .item(
-            PopupMenuItem::new("Rename…")
-                .icon(Icon::new(Lucide::Pencil))
-                .on_click(on_view(view, move |this, window, cx| {
-                    this.start_rename(&id, window, cx);
-                })),
-        )
-        .item({
-            let id = row.id.clone();
+    let mut menu = menu.item(
+        PopupMenuItem::new("Rename…")
+            .icon(Icon::new(Lucide::Pencil))
+            .on_click(on_view(view, move |this, window, cx| {
+                this.start_rename(&id, window, cx);
+            })),
+    );
+    if let Some(pin) = row.pin {
+        let (pin_icon, pin_label) = match pin {
+            Pin::Unpin => (Lucide::PinOff, "Unpin"),
+            Pin::Pin => (Lucide::Pin, "Pin"),
+        };
+        let id = row.id.clone();
+        menu = menu.item(
             PopupMenuItem::new(pin_label)
                 .icon(Icon::new(pin_icon))
                 .on_click(on_view(view, move |this, _, cx| {
                     this.set_pinned(&id, pin, cx);
-                }))
-        });
+                })),
+        );
+    }
     menu = snooze_menu(menu, view, row, window, cx);
     for &action in row.offered {
         if !matches!(action, ShelfAction::Snooze(_)) {
@@ -2131,7 +2227,9 @@ struct MenuRow {
     title: SharedString,
     cwd: PathBuf,
     offered: &'static [ShelfAction],
-    pinned: bool,
+    /// What the menu offers: a session a session started has no pin of its
+    /// own, as it moves with that one.
+    pin: Option<Pin>,
     /// Busy sessions can't be deleted.
     busy: bool,
 }
@@ -2143,7 +2241,11 @@ impl MenuRow {
             title: row.title(),
             cwd: row.cwd.clone(),
             offered: ShelfAction::for_row(row),
-            pinned: row.pinned.is_some(),
+            pin: match (&row.family, row.pinned) {
+                (Family::Started(_), _) => None,
+                (Family::Top, Some(_)) => Some(Pin::Unpin),
+                (Family::Top, None) => Some(Pin::Pin),
+            },
             busy: !row.activity.is_idle(),
         }
     }
