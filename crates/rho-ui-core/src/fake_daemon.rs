@@ -2,7 +2,8 @@
 //! Unix socket, or named pipe on Windows, with no model behind it.
 //! rho-ui-core's daemon tests and rho-ui's headless UI tests both run it.
 //!
-//! - `rho/session/new` returns "new-1", "new-2", ...
+//! - `rho/session/new` returns "new-1", "new-2", ..., each as the agent
+//!   it names, else `default` ([`FakeDaemon::agent`]).
 //! - `rho/session/fork` returns "fork-1", "fork-2", ...: a saved session
 //!   in supervised mode that replays its parent's conversation. The list
 //!   leaves forks out, and deleting a session deletes its forks. Forking a fork, a subagent's session or one that
@@ -45,7 +46,7 @@
 //!   answers at once, leaving it running in a session of its own,
 //!   "sub-N", as agent [`SUBAGENT_AGENT`] on [`SUBAGENT_MODEL`], which
 //!   can be observed but not attached to. Every other session runs as the
-//!   default agent.
+//!   default agent, but for a new one that names its own.
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
 //!   whole result as a card, [`subagent_result`], and the parent's daemon
 //!   turn tells the model, as for a process.
@@ -601,6 +602,17 @@ impl FakeDaemon {
     /// The title session `id` has saved, if it has one.
     pub fn title(&self, id: &str) -> Option<String> {
         self.service.lock().sessions.get(id)?.title.clone()
+    }
+
+    /// The agent session `id` runs as: the one it was opened as, else
+    /// `default`.
+    pub fn agent(&self, id: &str) -> Option<String> {
+        Some(self.service.lock().sessions.get(id)?.agent.clone())
+    }
+
+    /// The workspace session `id` runs in.
+    pub fn cwd(&self, id: &str) -> Option<PathBuf> {
+        Some(self.service.lock().sessions.get(id)?.cwd.clone())
     }
 
     /// Has session `parent` start session `id` through session control, as

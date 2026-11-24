@@ -257,6 +257,10 @@ impl DaemonInfo {
     }
 }
 
+/// rho's built-in agent that runs a goal through other sessions it starts,
+/// by id. Its sessions are leads.
+pub const LEAD_AGENT: &str = "lead";
+
 /// A saved session from `rho/session/list_detailed`, or from
 /// `rho/session/list` on a rho from before it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,17 +269,19 @@ pub struct SessionSummary {
     cwd: PathBuf,
     title: Option<String>,
     updated_at: u64,
+    agent: Option<String>,
     parent: Option<SessionId>,
 }
 
 impl SessionSummary {
-    /// A row of `rho/session/list`, which names no parent.
+    /// A row of `rho/session/list`, which names no agent or parent.
     fn from_wire(session: rho_protocol::SessionSummary) -> Self {
         Self {
             id: session.session.into(),
             cwd: session.cwd,
             title: session.title.or(session.first_user_message),
             updated_at: session.updated_at,
+            agent: None,
             parent: None,
         }
     }
@@ -283,6 +289,7 @@ impl SessionSummary {
     /// A row of `rho/session/list_detailed`.
     fn from_detailed(session: rho_protocol::DetailedSessionSummary) -> Self {
         Self {
+            agent: session.agent,
             parent: session.parent.map(SessionId::from),
             ..Self::from_wire(session.summary)
         }
@@ -307,6 +314,13 @@ impl SessionSummary {
     /// When the session was last saved, in Unix seconds.
     pub fn updated_at(&self) -> u64 {
         self.updated_at
+    }
+
+    /// The agent the session runs as, by id (`default` for the default
+    /// agent, [`LEAD_AGENT`] for a lead); `None` from a rho that
+    /// doesn't say.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
     }
 
     /// The session that started this one through session control, as rho's
@@ -732,11 +746,11 @@ impl Daemon {
         self.link.as_ref()
     }
 
-    /// Saved sessions in every workspace, newest first, each with the
-    /// session that started it. A rho from before
+    /// Saved sessions in every workspace, newest first, each with the agent
+    /// it runs as and the session that started it. A rho from before
     /// `rho/session/list_detailed` (`MethodNotFound`), as on a machine not
-    /// updated yet, lists them without, and isn't asked for it again on
-    /// this connection.
+    /// updated yet, lists them with neither, and isn't asked for it again
+    /// on this connection.
     ///
     /// # Errors
     ///
@@ -878,10 +892,34 @@ impl Daemon {
         cwd: &Path,
         checkout: Checkout,
     ) -> Result<SessionSetup, DaemonError> {
+        self.open_session(cwd, None, checkout).await
+    }
+
+    /// Opens a new session as [`LEAD_AGENT`] in `cwd`, the lead's own
+    /// folder, which must exist. It is followed and saved as
+    /// [`Self::new_session`] says.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `cwd` is not an absolute path to an existing directory, the
+    /// daemon's rho has no lead agent (an older rho refuses it as an unknown
+    /// agent), or the connection is gone.
+    pub async fn new_lead(&self, cwd: &Path) -> Result<SessionSetup, DaemonError> {
+        self.open_session(cwd, Some(LEAD_AGENT), Checkout::Local)
+            .await
+    }
+
+    /// Sends `rho/session/new` as `agent`, or the default agent with `None`.
+    async fn open_session(
+        &self,
+        cwd: &Path,
+        agent: Option<&str>,
+        checkout: Checkout,
+    ) -> Result<SessionSetup, DaemonError> {
         let params = SessionNewParams {
             cwd: cwd.to_path_buf(),
             environment: ClientEnvironment::clone(&self.environment),
-            agent: None,
+            agent: agent.map(str::to_owned),
             setup: session_setup(),
             parent: None,
             grant: None,
@@ -895,6 +933,7 @@ impl Daemon {
                 branch: worktree.branch,
                 path: worktree.path,
             }),
+            agent: params.agent,
         })
     }
 
@@ -922,6 +961,7 @@ impl Daemon {
             id: response.session.into(),
             options: response.options,
             worktree: None,
+            agent: None,
         })
     }
 

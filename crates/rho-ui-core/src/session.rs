@@ -86,6 +86,8 @@ pub struct SessionSetup {
     pub(crate) id: SessionId,
     pub(crate) options: WireOptions,
     pub(crate) worktree: Option<Worktree>,
+    /// The agent the session was opened as, when the request named one.
+    pub(crate) agent: Option<String>,
 }
 
 impl SessionSetup {
@@ -637,6 +639,7 @@ impl Session {
     pub fn from_setup(setup: SessionSetup) -> Self {
         let mut session = Self::new(setup.id);
         session.apply_options(setup.options);
+        session.agent = setup.agent;
         session
     }
 
@@ -828,9 +831,11 @@ impl Session {
     }
 
     /// The id of the agent the session runs as, such as `worker`, or
-    /// `default` for the default agent. The daemon says it at the start of
-    /// every replay, and again when an `/agent:` first prompt changes it;
-    /// a daemon older than rho-protocol 1.4 never does.
+    /// `default` for the default agent. A session opened as a named agent,
+    /// as [`crate::Daemon::new_lead`] opens one, knows it from the start.
+    /// The daemon says it at the start of every replay, and again when an
+    /// `/agent:` first prompt changes it; a daemon older than rho-protocol
+    /// 1.4 never does.
     pub fn agent(&self) -> Option<&str> {
         self.agent.as_deref()
     }
