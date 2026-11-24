@@ -42,7 +42,7 @@ use gpui_kit::component::{
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
     resizable::{resize_handle, HandleEdge},
     v_flex, ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Selectable as _,
-    Sizable as _, StyledExt as _,
+    Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -1075,9 +1075,7 @@ impl RightPanel {
             .size_full()
             .items_center()
             .justify_center()
-            .gap_3()
             .px_4()
-            .child(div().font_medium().child("Open a surface"))
             .child(v_flex().w_full().max_w(rems(18.)).gap_0p5().children(open))
     }
 
