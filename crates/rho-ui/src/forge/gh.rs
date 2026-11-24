@@ -362,15 +362,12 @@ mod tests {
     /// A `gh` that prints `auth` for `gh auth status`, and what a real one
     /// prints for its version.
     fn fake_gh(dir: &Path, name: &str, auth: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let path = dir.join(name);
         let script = format!(
             "#!/bin/sh\ncase $1 in\n  --version) echo 'gh version 2.99.0 (2026-09-01)' ;;\n  \
              auth) echo '{auth}' ;;\nesac\n"
         );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        rho_ui_core::fake_daemon::write_program(&path, &script);
         path
     }
 
@@ -418,7 +415,6 @@ mod tests {
     /// else where the login shell finds it, else nowhere.
     #[test]
     fn the_check_finds_gh_as_the_setting_says() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
         let on_path = dir.join("bin");
@@ -434,15 +430,13 @@ mod tests {
         // A login shell whose PATH holds `login-bin`, printing a greeting
         // first, as login files do.
         let shell = dir.join("login-sh");
-        std::fs::write(
+        rho_ui_core::fake_daemon::write_program(
             &shell,
-            format!(
+            &format!(
                 "#!/bin/sh\necho 'welcome'\nPATH={}:/usr/bin:/bin\nexec /bin/sh -c \"$3\"\n",
                 login_bin.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let no_shell = dir.join("no-shell");
 
         let found = |probe: CliProbe| match probe {

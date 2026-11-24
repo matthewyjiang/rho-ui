@@ -134,7 +134,6 @@ const WAIT: Duration = Duration::from_secs(10);
 /// clean up a temporary folder.
 #[cfg(unix)]
 static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-shell");
     std::fs::create_dir_all(&dir).expect("make the test shell's folder");
     let path = dir.join("sh");
@@ -142,9 +141,7 @@ static TEST_SHELL: LazyLock<PathBuf> = LazyLock::new(|| {
         export PS1='$ '\n\
         if [ -n \"$BASH_VERSION\" ]; then exec /bin/sh --noediting; fi\n\
         exec /bin/sh\n";
-    std::fs::write(&path, script).expect("write the test shell");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .expect("make the test shell executable");
+    write_program(&path, script);
     path
 });
 
@@ -1291,6 +1288,10 @@ fn composer_settings_change_the_session() {
         session
             .options()
             .is_some_and(|options| options.model().current() == &ModelRef::new("fake", "huge"))
+    });
+    // Closed before the click below, which would otherwise close it.
+    ui.wait_until("the panel to close", |window, _, _| {
+        !is_visible(window, "model-fake/huge")
     });
 
     // Reasoning and fast mode change in place; the panel stays open.
