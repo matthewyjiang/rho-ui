@@ -180,6 +180,15 @@ pub struct Question {
 }
 
 impl Question {
+    /// Whether the agent's suggestion marks the choice of value `value`,
+    /// rather than picking it.
+    pub fn marks(&self, value: &str) -> bool {
+        self.suggestion.as_ref().is_some_and(|suggestion| {
+            suggestion.style == SuggestionStyle::Marked
+                && suggestion.choices.iter().any(|choice| choice == value)
+        })
+    }
+
     /// The label of the choice of value `value`, if one has it.
     fn label_of(&self, value: &str) -> Option<&str> {
         let choice = self.choices.iter().find(|choice| choice.value == value)?;
