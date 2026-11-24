@@ -122,26 +122,22 @@ impl SessionList {
             let updated = members
                 .iter()
                 .fold(rows[ix].updated, |newest, &m| newest.max(rows[m].updated));
-            let shelf = if busy(&ix) || members.iter().any(busy) {
+            self.rows[ix].shelf = if busy(&ix) || members.iter().any(busy) {
                 Shelf::Active
             } else {
                 shelves.shelf(&rows[ix].id, updated, now)
             };
-            self.rows[ix].shelf = shelf;
         }
         for ix in 0..self.rows.len() {
-            let (shelf, family, pinned) = match families.starters[ix] {
-                Some(starter) => {
-                    let starter = &self.rows[starter];
-                    (starter.shelf, Family::Started(starter.id.clone()), None)
-                }
-                None => {
-                    let row = &self.rows[ix];
-                    (row.shelf, Family::Top, shelves.pinned(&row.id))
-                }
+            let (placed, family, pinned) = if let Some(starter) = families.starters[ix] {
+                let starter = &self.rows[starter];
+                (starter.shelf, Family::Started(starter.id.clone()), None)
+            } else {
+                let row = &self.rows[ix];
+                (row.shelf, Family::Top, shelves.pinned(&row.id))
             };
             let row = &mut self.rows[ix];
-            row.shelf = shelf;
+            row.shelf = placed;
             row.family = family;
             row.pinned = pinned;
             row.done = self.unseen.contains(&row.id);
@@ -164,13 +160,13 @@ impl SessionList {
         if family.is_empty() {
             return;
         }
-        let shelf = self.rows[starter].shelf;
+        let placed = self.rows[starter].shelf;
         let mut shown: Vec<usize> = family
             .iter()
             .copied()
             .filter(|&ix| matched[starter] || matched[ix])
             .collect();
-        if shelf == Shelf::Active {
+        if placed == Shelf::Active {
             // Stable, so sessions that tie keep their order, newest first.
             shown.sort_by_key(|&ix| self.rows[ix].attention());
         }
@@ -190,7 +186,7 @@ impl SessionList {
             fold,
         }));
         if fold == Fold::Open {
-            items.extend(shown.into_iter().map(|ix| Item::row(shelf, ix)));
+            items.extend(shown.into_iter().map(|ix| Item::row(placed, ix)));
         }
     }
 }
@@ -251,7 +247,10 @@ mod tests {
             .map(|&(id, parent, _)| (SessionKey::local(id), parent.map(SessionKey::local)))
             .chain([(SessionKey::local("far"), Some(there))])
             .collect();
-        let rows: Vec<_> = keys.iter().map(|(id, parent)| (id, parent.as_ref())).collect();
+        let rows: Vec<_> = keys
+            .iter()
+            .map(|(id, parent)| (id, parent.as_ref()))
+            .collect();
         let expected: Vec<_> = table
             .iter()
             .map(|&(_, _, starter)| starter)

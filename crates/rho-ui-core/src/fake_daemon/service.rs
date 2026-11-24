@@ -86,14 +86,16 @@ impl Fake {
     }
 }
 
+/// One page of the saved sessions, by id, and the next page's cursor.
+struct SavedPage<'state> {
+    sessions: Vec<(&'state str, &'state FakeSession)>,
+    next_cursor: Option<String>,
+}
+
 impl State {
     /// The page of saved sessions after `cursor` that `rho/session/list`
-    /// and `list_detailed` answer, newest first and leaving forks out, and
-    /// the next page's cursor.
-    fn saved_page(
-        &self,
-        cursor: Option<&str>,
-    ) -> Result<(Vec<(&str, &FakeSession)>, Option<String>), RpcError> {
+    /// and `list_detailed` answer, newest first and leaving forks out.
+    fn saved_page(&self, cursor: Option<&str>) -> Result<SavedPage<'_>, RpcError> {
         /// Small, so two sessions already exercise the cursor.
         const PAGE: usize = 2;
         let mut saved: Vec<(&str, &FakeSession)> = self
@@ -110,9 +112,12 @@ impl State {
                 return Err(RpcError::new(ErrorCode::InvalidParams, "not a list cursor"));
             }
         };
-        let next = (start + PAGE < saved.len()).then(|| (start + PAGE).to_string());
-        let page = saved.into_iter().skip(start).take(PAGE).collect();
-        Ok((page, next))
+        let next_cursor = (start + PAGE < saved.len()).then(|| (start + PAGE).to_string());
+        let sessions = saved.into_iter().skip(start).take(PAGE).collect();
+        Ok(SavedPage {
+            sessions,
+            next_cursor,
+        })
     }
 }
 
@@ -924,10 +929,14 @@ impl Service for Fake {
         params: SessionListParams,
     ) -> Result<SessionListResponse, RpcError> {
         let state = self.lock();
-        let (page, next_cursor) = state.saved_page(params.cursor.as_deref())?;
+        let page = state.saved_page(params.cursor.as_deref())?;
         Ok(SessionListResponse {
-            sessions: page.iter().map(|(id, session)| summary(id, session)).collect(),
-            next_cursor,
+            sessions: page
+                .sessions
+                .iter()
+                .map(|(id, session)| summary(id, session))
+                .collect(),
+            next_cursor: page.next_cursor,
         })
     }
 
@@ -942,8 +951,8 @@ impl Service for Fake {
                 "this rho daemon does not serve rho/session/list_detailed",
             ));
         }
-        let (page, next_cursor) = state.saved_page(params.cursor.as_deref())?;
-        let sessions = page.iter().map(|(id, session)| {
+        let page = state.saved_page(params.cursor.as_deref())?;
+        let sessions = page.sessions.iter().map(|(id, session)| {
             DetailedSessionSummary::new(
                 summary(id, session),
                 Some(session.agent.clone()),
@@ -952,7 +961,7 @@ impl Service for Fake {
         });
         Ok(SessionListDetailedResponse::new(
             sessions.collect(),
-            next_cursor,
+            page.next_cursor,
         ))
     }
 
@@ -1098,7 +1107,10 @@ impl Service for Fake {
             state: session.state,
             workspace: session.cwd.clone(),
             // A session another started runs under that session's job.
-            parent: session.parent.as_ref().map(|p| JobId::new(format!("job-{p}"))),
+            parent: session
+                .parent
+                .as_ref()
+                .map(|p| JobId::new(format!("job-{p}"))),
             grant: None,
             grant_limit: None,
             session: Some(SessionId::new(id.as_str())),

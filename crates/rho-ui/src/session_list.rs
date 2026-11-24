@@ -656,7 +656,7 @@ impl SessionList {
         let families = Families::of(&self.rows);
         self.open_revealed(&families);
         self.shelve(&families, shelves, now, watching);
-        let matches = |machine: &MachineId, title: Option<&str>, ix: usize| {
+        let fits = |machine: &MachineId, title: Option<&str>, ix: usize| {
             let (name, root) = workspace(ix);
             let matches = |text: &str| contains_ignore_case(text, &self.query);
             self.filter.shows(machine, root)
@@ -665,7 +665,7 @@ impl SessionList {
         let matched: Vec<bool> = self
             .rows
             .iter()
-            .map(|row| matches(&row.id.machine, row.title.as_deref(), row.workspace))
+            .map(|row| fits(&row.id.machine, row.title.as_deref(), row.workspace))
             .collect();
         let mut items = Vec::with_capacity(self.drafts.len() + self.rows.len() + 2);
         items.extend(
@@ -673,7 +673,7 @@ impl SessionList {
                 .iter()
                 .enumerate()
                 .filter(|(_, draft)| {
-                    matches(&draft.cwd.machine, draft.title.as_deref(), draft.workspace)
+                    fits(&draft.cwd.machine, draft.title.as_deref(), draft.workspace)
                 })
                 .map(|(ix, _)| Item::Draft(ix)),
         );

@@ -29,8 +29,8 @@ use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
         report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script, Started,
-        TuiJob, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT, SUBAGENT_MODEL,
-        SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
+        TuiJob, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
+        SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices, Daemon,
     DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
@@ -1646,10 +1646,13 @@ fn sessions_a_session_started_fold_under_it() {
             app.open_session(w2, PathBuf::from("/w/a"), None, window, cx);
         });
     });
-    ui.wait_until("the fold open on the session on screen", |window, cx, app| {
-        let on_screen = app.active_session().map(|view| view.read(cx).live().id);
-        is_visible(window, "session-local-w2") && on_screen == Some(SessionKey::local("w2"))
-    });
+    ui.wait_until(
+        "the fold open on the session on screen",
+        |window, cx, app| {
+            let on_screen = app.active_session().map(|view| view.read(cx).live().id);
+            is_visible(window, "session-local-w2") && on_screen == Some(SessionKey::local("w2"))
+        },
+    );
 }
 
 /// Sessions quiet for long start settled. A draft makes no session until
