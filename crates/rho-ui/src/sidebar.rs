@@ -386,13 +386,7 @@ impl SidebarView {
             cx.observe(&app_update, |_, _, cx| cx.notify()),
             // A set of PRs answered or changed: the marks follow, and the
             // rows whose agents took up a watch or ended one move.
-            cx.observe(&prs, |this, prs, cx| {
-                if this.list.set_watching(prs.read(cx).watching()) {
-                    this.rebuild(cx);
-                } else {
-                    cx.notify();
-                }
-            }),
+            cx.observe(&prs, |this, _, cx| this.rebuild(cx)),
         ];
         let tick = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TICK).await;
@@ -627,10 +621,12 @@ impl SidebarView {
 
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
         let workspaces = self.workspaces.read(cx);
-        self.list.rebuild(&self.shelves, time::now_unix(), |ix| {
-            let workspace = workspaces.get(ix);
-            (workspace.name.as_ref(), workspace.root_path())
-        });
+        let watching = self.prs.read(cx).watching();
+        self.list
+            .rebuild(&self.shelves, time::now_unix(), &watching, |ix| {
+                let workspace = workspaces.get(ix);
+                (workspace.name.as_ref(), workspace.root_path())
+            });
         // The active rows shown have their PRs listed by their daemons,
         // and so has the session on screen, for its title bar.
         let mut listed: Vec<SessionKey> = self
@@ -961,7 +957,7 @@ impl SidebarView {
                 self.prs.read(cx).mark(&row.id).map(|mark| {
                     pr_mark(&mark, theme)
                         // Apart from the branch before it.
-                        .ml_1()
+                        .when(workspace.branch.is_some(), Styled::ml_1)
                         .id(SharedString::from(format!("{}-pr", row.element_id)))
                         .test_support()
                         .aria_label(mark_label(&mark))
@@ -1897,18 +1893,18 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .child(text)
             .into_any_element()
     };
-    match (row.activity, row.watching) {
-        (Activity::Working(since), _) => busy(
+    match row.activity {
+        Activity::Working(since) => busy(
             theme.blue,
             Icon::new(Lucide::CircleDashed),
             label("Working", since),
         ),
-        (Activity::Waiting(since), _) => busy(
+        Activity::Waiting(since) => busy(
             theme.warning,
             Icon::new(Lucide::CircleAlert),
             label("Needs you", since),
         ),
-        (Activity::Background, _) => h_flex()
+        Activity::Background => h_flex()
             .id(SharedString::from(format!("{}-background", row.element_id)))
             .test_support()
             .aria_label("Waiting on background work")
@@ -1920,7 +1916,7 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .into_any_element(),
         // Its agent wakes when the PR changes: no turn runs, but it isn't
         // done. The row's mark below says which PR.
-        (Activity::Idle, true) => h_flex()
+        Activity::Idle if row.watching => h_flex()
             .id(SharedString::from(format!("{}-watching", row.element_id)))
             .test_support()
             .aria_label("Watching a pull request")
@@ -1930,7 +1926,7 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .child(Icon::new(Lucide::Eye).xsmall())
             .child("Watching")
             .into_any_element(),
-        (Activity::Idle, false) if row.done => h_flex()
+        Activity::Idle if row.done => h_flex()
             .id(SharedString::from(format!("{}-done", row.element_id)))
             .test_support()
             .aria_label("Done")
@@ -1940,7 +1936,7 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .child(Icon::new(Lucide::CircleCheck).xsmall())
             .child("Done")
             .into_any_element(),
-        (Activity::Idle, false) => div()
+        Activity::Idle => div()
             .flex_shrink_0()
             .text_color(theme.muted_foreground)
             .when(row.updated > 0, |this| {

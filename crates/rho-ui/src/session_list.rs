@@ -174,7 +174,9 @@ pub(crate) struct Row {
     /// row says Done once no work runs. As of the last rebuild.
     pub(crate) done: bool,
     /// Its agent watches a pull request, which the row says instead of
-    /// Done or its age while no work runs. As of the last rebuild.
+    /// Done or its age while no work runs. An active row's only: nothing
+    /// keeps what a shelved session watches current. As of the last
+    /// rebuild.
     pub(crate) watching: bool,
 }
 
@@ -230,9 +232,6 @@ pub(crate) struct SessionList {
     jobs: Vec<JobClock>,
     /// Sessions whose turn finished since they were last on screen.
     unseen: Unseen,
-    /// Sessions whose agent watches a pull request, as their daemons last
-    /// said.
-    watching: HashSet<SessionKey>,
     /// What the list shows, filtered by the search.
     items: Vec<Item>,
     /// Sessions matching the search on each shelf, indexed by [`slot`].
@@ -275,7 +274,6 @@ impl SessionList {
             live: Vec::new(),
             jobs: Vec::new(),
             unseen,
-            watching: HashSet::new(),
             items: Vec::new(),
             counts: [0; 3],
             open: [false; 3],
@@ -500,18 +498,8 @@ impl SessionList {
         }
     }
 
-    /// Replaces the sessions whose agent watches a pull request. Returns
-    /// whether anything changed, so the list needs a rebuild.
-    pub(crate) fn set_watching(&mut self, watching: HashSet<SessionKey>) -> bool {
-        if self.watching == watching {
-            return false;
-        }
-        self.watching = watching;
-        true
-    }
-
-    /// Clears session `id`'s Done, as it is on screen. Returns whether it
-    /// had one, so the list needs a rebuild.
+    /// Clears session `id`'s Done, as it is on screen: whether it had one.
+    /// The list needs a rebuild after it.
     pub(crate) fn mark_seen(&mut self, id: &SessionKey) -> bool {
         self.unseen.remove(id)
     }
@@ -588,7 +576,8 @@ impl SessionList {
 
     /// Puts every row on its shelf and rebuilds the items and counts.
     /// `workspace` gives a workspace's name, for the search, and its
-    /// project's folder, for the filter. A busy session is always active.
+    /// project's folder, for the filter; `watching` holds the sessions
+    /// whose agent watches a pull request. A busy session is always active.
     /// Pinned sessions lead the active list, the latest pinned first; the
     /// rest follow by [`Attention`], newest first within each. An open shelf
     /// shows its newest sessions up to its limit, then a Show more.
@@ -596,6 +585,7 @@ impl SessionList {
         &mut self,
         shelves: &Shelves,
         now: i64,
+        watching: &HashSet<SessionKey>,
         workspace: impl Fn(usize) -> (&'a str, &'a Path),
     ) {
         for row in &mut self.rows {
@@ -606,7 +596,7 @@ impl SessionList {
             };
             row.pinned = shelves.pinned(&row.id);
             row.done = self.unseen.contains(&row.id);
-            row.watching = self.watching.contains(&row.id);
+            row.watching = row.shelf == Shelf::Active && watching.contains(&row.id);
         }
         let matches = |machine: &MachineId, title: Option<&str>, ix: usize| {
             let (name, root) = workspace(ix);
@@ -876,7 +866,13 @@ mod tests {
     }
 
     fn rebuild(list: &mut SessionList, shelves: &Shelves, now: i64) {
-        list.rebuild(shelves, now, |_| ("atlas", Path::new("/w")));
+        rebuild_watching(list, shelves, now, &[]);
+    }
+
+    /// [`rebuild`], with the agents of `watching` watching a pull request.
+    fn rebuild_watching(list: &mut SessionList, shelves: &Shelves, now: i64, watching: &[&str]) {
+        let watching = watching.iter().map(|text| id(text)).collect();
+        list.rebuild(shelves, now, &watching, |_| ("atlas", Path::new("/w")));
     }
 
     fn job(text: &str, activity: JobActivity, elapsed: Option<u64>) -> JobSession {
@@ -1072,8 +1068,8 @@ mod tests {
     /// asks comes first, then the Done ones, then those at rest, and the
     /// ones that run by themselves last; newest first within each. A pin
     /// holds its row on top whatever the session does. A session whose
-    /// agent watches a pull request runs by itself, Done or not, until the
-    /// watch ends.
+    /// agent watches a pull request runs by itself, Done or not, while it
+    /// is active: a settled one's watch isn't kept current.
     #[test]
     fn the_active_list_ranks_sessions_as_an_inbox() {
         let now = Instant::now();
@@ -1114,20 +1110,15 @@ mod tests {
         );
 
         // Its agent watches a PR: it will wake by itself, so it isn't Done.
-        let watching = HashSet::from([id("working")]);
-        assert!(list.set_watching(watching.clone()));
-        assert!(!list.set_watching(watching), "nothing changed");
-        rebuild(&mut list, &shelves, 21);
+        rebuild_watching(&mut list, &shelves, 21, &["working"]);
         assert_eq!(
             shown(&list),
             ["pinned", "asking", "done", "idle", "working", "background"]
         );
-        assert!(list.set_watching(HashSet::new()));
-        rebuild(&mut list, &shelves, 21);
-        assert_eq!(
-            shown(&list),
-            ["pinned", "asking", "working", "done", "idle", "background"]
-        );
+        // Settled, nothing keeps its watch current: the row doesn't say.
+        shelves.settle(&id("working"), 21);
+        rebuild_watching(&mut list, &shelves, 21, &["working"]);
+        assert!(!list.row(&id("working")).expect("the row").watching);
     }
 
     /// A turn that stops working marks its row Done until the session is
@@ -1310,24 +1301,24 @@ mod tests {
             0 => ("atlas", Path::new("/w")),
             _ => ("srv", Path::new("/srv")),
         };
-        list.rebuild(&owned, 4, roots);
+        list.rebuild(&owned, 4, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["here a", "there a", "here b"]);
 
         // A second answer from one machine replaces only its rows.
         list.set_saved(&there, vec![theirs("a", 5)]);
-        list.rebuild(&owned, 6, roots);
+        list.rebuild(&owned, 6, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["there a", "here a", "here b"]);
 
         let mut filter = Filter::default();
         filter.toggle_machine(&there);
         list.set_filter(filter.clone());
-        list.rebuild(&owned, 6, roots);
+        list.rebuild(&owned, 6, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["here a", "here b"]);
 
         filter.toggle_machine(&there);
         filter.toggle_project(&Place::new(there.clone(), "/srv"));
         list.set_filter(filter.clone());
-        list.rebuild(&owned, 6, roots);
+        list.rebuild(&owned, 6, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["there a"]);
 
         // What the menu no longer offers stops filtering, so nothing stays

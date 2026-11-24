@@ -26,8 +26,6 @@ mod diff;
 mod files;
 mod pull_request;
 mod tabs;
-
-pub(crate) use self::pull_request::state_look;
 mod terminal;
 
 use std::{cmp::Ordering, collections::HashMap};

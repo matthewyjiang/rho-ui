@@ -2,12 +2,28 @@
 //! title bar: its state's icon and its number, a dot for how its checks
 //! stand, and how many more the session links.
 
-use gpui_kit::component::{h_flex, Icon, Sizable as _, Theme};
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::{
+    button::Button, h_flex, separator::Separator, ColorName, Icon, Sizable as _, Theme,
+};
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{div, Div, ParentElement as _, Styled as _};
+use gpui_kit::{div, Div, ElementId, ParentElement as _, Styled as _};
 use rho_ui_core::{PullRequestRollup, PullRequestState, PullRequestSummary};
 
-use crate::{pull_requests::Mark, right_panel::state_look};
+use crate::pull_requests::Mark;
+
+/// How a PR's state reads, on the Pull request surface and in its mark:
+/// its word, icon and color.
+pub(crate) fn state_look(state: PullRequestState) -> (&'static str, Lucide, ColorName) {
+    match state {
+        PullRequestState::Open => ("Open", Lucide::GitPullRequest, ColorName::Green),
+        PullRequestState::Draft => ("Draft", Lucide::GitPullRequestDraft, ColorName::Gray),
+        PullRequestState::Merged => ("Merged", Lucide::GitMerge, ColorName::Purple),
+        PullRequestState::Closed => ("Closed", Lucide::GitPullRequestClosed, ColorName::Red),
+        // A state a newer rho sends.
+        _ => ("Unknown", Lucide::CircleQuestionMark, ColorName::Gray),
+    }
+}
 
 /// How a PR's checks stand, where one line marks it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,4 +99,25 @@ pub(crate) fn pr_mark(mark: &Mark<'_>, theme: &Theme) -> Div {
         )
         .children(Checks::of(mark.pr).map(|checks| checks.dot(theme)))
         .when(mark.more > 0, |this| this.child(format!("+{}", mark.more)))
+}
+
+/// `mark` as the title bar's button `id`: [`pr_mark`] in a pill that says
+/// "watched" while the agent watches the PR, as the Pull request surface
+/// does, with the PR's state and title for a tooltip.
+pub(crate) fn pr_pill(id: impl Into<ElementId>, mark: &Mark<'_>, theme: &Theme) -> Button {
+    let (state, ..) = state_look(mark.pr.state);
+    let mut label = mark_label(mark);
+    if mark.watched {
+        label.push_str(", watched by the agent");
+    }
+    let line = pr_mark(mark, theme).when(mark.watched, |this| {
+        this.child(Separator::vertical().h_3())
+            .child(div().text_color(theme.muted_foreground).child("watched"))
+    });
+    Button::new(id)
+        .outline()
+        .xsmall()
+        .accessibility_label(label)
+        .tooltip(format!("{state}: {}", mark.pr.title))
+        .child(line)
 }

@@ -8,7 +8,7 @@ Pinning, snoozing and settling are rho-ui's own; rho has no such state, so rho's
 
 The active list reads as an inbox. Under the pinned sessions, which stay on top whatever they are doing, come the sessions that need you, then the Done ones, then the idle ones, and last those working, waiting on their own background work, or watching a pull request. A session moves as its state changes: it sinks when you send it a prompt and rises when its turn ends.
 
-A session whose agent watches a pull request isn't Done: rho wakes it when the pull request changes, so it reads **Watching** until the watch ends. Watching doesn't keep a session active, though; you can still snooze or settle one.
+A session whose agent watches a pull request isn't Done: rho wakes it when the pull request changes, so on the active list it reads **Watching** until the watch ends. Watching doesn't keep a session active, though; you can still snooze or settle one.
 
 A session stays Done until you open it, even across restarts of rho-ui. A turn that finishes while rho-ui is closed doesn't mark its session Done, since rho-ui didn't see it end.
 

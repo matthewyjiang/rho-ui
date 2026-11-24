@@ -83,9 +83,8 @@ use crate::{
     machines::{Place, SessionKey},
     pictures::{PictureRead, Pictures},
     plan::PlanList,
-    pr_mark::{mark_label, pr_mark},
+    pr_mark::pr_pill,
     pull_requests::PullRequests,
-    right_panel::state_look,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{model_summary, Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
@@ -1848,35 +1847,16 @@ impl SessionView {
         })
     }
 
-    /// The session's pull request as its sidebar row marks it, in a pill
-    /// that says "watched" while the agent watches it, as the Pull request
-    /// surface does. A click shows it in the right panel.
+    /// The session's pull request, marked as its sidebar row marks it. A
+    /// click shows it in the right panel.
     fn render_pr_mark(&self, cx: &Context<'_, Self>) -> Option<Button> {
-        let theme = cx.theme();
-        let key = self.key();
         let (prs, _) = self.prs.as_ref()?;
-        let mark = prs.read(cx).mark(&key)?;
-        let (state, _, _) = state_look(mark.pr.state);
-        let mut label = mark_label(&mark);
-        if mark.watched {
-            label.push_str(", watched by the agent");
-        }
-        let tooltip = format!("{state}: {}", mark.pr.title);
+        let mark = prs.read(cx).mark(&self.key())?;
         let id = mark.pr.id.clone();
-        let line = pr_mark(&mark, theme).when(mark.watched, |this| {
-            this.child(div().h_3().w_px().bg(theme.border))
-                .child(div().text_color(theme.muted_foreground).child("watched"))
-        });
         Some(
-            Button::new("title-pr")
-                .outline()
-                .xsmall()
-                .accessibility_label(label)
-                .tooltip(tooltip)
-                .child(line)
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.emit(SessionEvent::ShowPullRequest(id.clone()));
-                })),
+            pr_pill("title-pr", &mark, cx.theme()).on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(SessionEvent::ShowPullRequest(id.clone()));
+            })),
         )
     }
 

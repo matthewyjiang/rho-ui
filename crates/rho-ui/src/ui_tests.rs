@@ -4030,18 +4030,21 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
 /// rho-ui lists but doesn't follow, so no event tells of it: listing
 /// finds it, and listing again within a minute finds its change. Once
 /// its agent watches the PR, the row says so, as the session will wake by
-/// itself; and on screen its title bar marks the PR with the panel
-/// hidden, where a click shows it in the panel.
+/// itself. A settled session, which no row lists, has its PR listed once
+/// it is on screen: its title bar marks the PR with the panel hidden,
+/// where a click shows it in the panel.
 #[test]
 fn a_sidebar_row_marks_its_pr() {
     let daemon = FakeDaemon::start(Script::default());
-    let old = SessionKey::local("old");
-    daemon.open_pull_request(&old.id, &serve_pictures());
+    let (old, settled) = (SessionKey::local("old"), SessionKey::local("s1"));
+    let pictures = serve_pictures();
+    daemon.open_pull_request(&old.id, &pictures);
+    daemon.open_pull_request(&settled.id, &pictures);
     let mut ui = Harness::open(
         "pull-request-row",
         daemon.target(),
         Some(daemon),
-        Shelves::owning(["s1", "old"]),
+        Shelves::owning(["old"]),
         Projects::default(),
     );
     let mark = SharedString::from(format!("session-{old}-pr"));
@@ -4076,8 +4079,8 @@ fn a_sidebar_row_marks_its_pr() {
     assert_eq!(rollup, Some(PullRequestRollup::Passing));
     assert!(ui.fake().pull_request_lists() > lists);
 
-    // The agent watches the PR, which links it.
-    ui.fake().edit_pull_requests(&old.id, |set| {
+    // Each agent watches its PR, which links it.
+    let watch = |set: &mut SessionPullRequests| {
         let pr = branch_pr(set).clone();
         let mut link = LinkedPullRequest::new(
             pr.id.clone(),
@@ -4088,7 +4091,9 @@ fn a_sidebar_row_marks_its_pr() {
         link.watched = true;
         link.summary = Some(pr);
         set.linked.push(link);
-    });
+    };
+    ui.fake().edit_pull_requests(&old.id, watch);
+    ui.fake().edit_pull_requests(&settled.id, watch);
     let status = SharedString::from(format!("session-{old}-watching"));
     advance_until(&mut ui, Duration::from_secs(60), "the row's watch", |ui| {
         ui.label(status.clone()).is_some()
@@ -4103,11 +4108,23 @@ fn a_sidebar_row_marks_its_pr() {
     assert_eq!((watching, marked), (true, Some(true)));
     ui.shot("watching");
 
-    let row = SharedString::from(format!("session-{old}"));
+    let marked = |ui: &mut Harness, session: &SessionKey| {
+        ui.cx.update(|cx| {
+            let prs = ui.app.read(cx).pull_requests().read(cx);
+            prs.mark(session).map(|mark| mark.watched)
+        })
+    };
+    assert_eq!(marked(&mut ui, &settled), None, "no row listed it");
+    ui.click("toggle-settled");
+    let row = SharedString::from(format!("session-{settled}"));
+    ui.wait_until("the settled session", |window, _, _| {
+        is_visible(window, row.clone())
+    });
     ui.act(|window, cx| window.click(row, cx));
     ui.wait_until("the title bar's PR", |window, cx, _| {
         is_visible(window, "title-pr") && !PanelLayout::get(cx)
     });
+    assert_eq!(marked(&mut ui, &settled), Some(true));
     ui.shot("title");
     ui.click("title-pr");
     ui.wait_until("the PR in the panel", |window, cx, _| {
