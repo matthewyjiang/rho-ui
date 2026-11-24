@@ -1962,12 +1962,15 @@ impl SessionView {
         }
         let mut bar = TitleBar::new(self.workspace.read(cx), self.title());
         let this = cx.entity().downgrade();
-        bar = bar.on_project({
-            let this = this.clone();
-            move |_, cx| {
-                let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::NewSession));
-            }
-        });
+        // A lead's folder is no project to start a session in.
+        if Kind::of(self.session.agent()) == Kind::Session {
+            bar = bar.on_project({
+                let this = this.clone();
+                move |_, cx| {
+                    let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::NewSession));
+                }
+            });
+        }
         for view in above.into_iter().rev() {
             let (this, target) = (this.clone(), view.downgrade());
             bar = bar.parent(view.read(cx).title(), move |_, cx| {

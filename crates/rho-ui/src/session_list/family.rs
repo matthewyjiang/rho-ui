@@ -293,7 +293,7 @@ mod tests {
         machines::{MachineId, Place},
         session_list::{
             tests::{here, id, job, rebuild, saved, shown},
-            Filter, JobSession, SavedSession,
+            Filter, JobSession, Kind, SavedSession,
         },
         shelf::Shelves,
     };
@@ -424,6 +424,41 @@ mod tests {
             "  Test",
         ];
         assert_eq!(shown(&list)[..5], revealed);
+    }
+
+    /// Active leads list first, under their header, each over the sessions
+    /// it started, then the other active sessions, which alone the active
+    /// shelf counts; a settled lead lists on its shelf.
+    #[test]
+    fn active_leads_list_apart_over_their_families() {
+        let lead = |text: &str, title: &str, updated: i64| SavedSession {
+            kind: Kind::Lead,
+            ..saved(text, Some(title), updated)
+        };
+        let mut shelves = Shelves::default();
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                saved("other", Some("Other"), 6),
+                started("w1", "Write", 5, "lead"),
+                lead("lead", "Lead", 3),
+                lead("past", "Past", 2),
+            ],
+        );
+        shelves.settle(&id("past"), 10);
+        rebuild(&mut list, &shelves, 10);
+        let listed = [
+            "[Leads]",
+            "Lead",
+            "› 1 started",
+            "~",
+            "Other",
+            "~",
+            "[Settled 1]",
+        ];
+        assert_eq!(shown(&list), listed);
+        assert_eq!(list.count(Shelf::Active), 1);
     }
 
     /// A search or a filter that shows only sessions a session started

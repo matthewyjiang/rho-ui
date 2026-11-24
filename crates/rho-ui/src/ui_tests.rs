@@ -1665,7 +1665,7 @@ fn sessions_a_session_started_fold_under_it() {
 /// A lead starts as rho's lead agent in a folder of its own, named from its
 /// first message, made in the rho home's leads. It lists under the Leads
 /// header, above the other active sessions, whatever project the filter
-/// keeps to, and the sessions it starts fold under it.
+/// keeps to.
 #[test]
 fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
     let rho_home = tempfile::tempdir().expect("a rho home");
@@ -1709,25 +1709,6 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
             .map(|id| bounds(window, id).map(|bounds| bounds.top()));
         tops.iter().all(Option::is_some) && tops.is_sorted()
     });
-
-    ui.fake()
-        .start_session("new-2", "w1", "Write the parser", Started::Working);
-    // The job poll finds it.
-    ui.poll(
-        WAIT,
-        "the session it started folded under it",
-        |ui| {
-            ui.cx.advance_clock(Duration::from_secs(1));
-            ui.frame();
-            ui.cx
-                .update_window(ui.window, |_, window, _| {
-                    is_visible(window, "session-local-new-2-fold")
-                        && !is_visible(window, "session-local-w1")
-                })
-                .expect("window is open")
-        },
-        Harness::labels_seen,
-    );
     ui.shot("listed");
 }
 
