@@ -9,15 +9,16 @@ use rho_ui_core::{
     agent_settings::{SettingChange, SettingKey, SettingValue},
     fake_daemon::{
         surface::{FORM_SURFACE, REFUSED_EVENT},
-        FakeDaemon, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
+        FakeDaemon, PullRequestMethods, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL,
+        TUI_SESSION,
     },
     surface::{Node, SurfaceStore},
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
     BackgroundWork, Checkout, ChoiceKind, Choices, Continuity, Daemon, DaemonError, DaemonEvent,
     DaemonEvents, DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity,
-    LoginOutcome, OptionChange, PermissionMode, Prompt, PromptKey, RestartCost, RunState, Session,
-    SessionId, SurfaceActionError, ToolStatus, Unsteered, VersionFix, WorktreeVerdict,
-    MAX_PROMPT_ATTACHMENT_BYTES,
+    LoginOutcome, OptionChange, PermissionMode, Prompt, PromptKey, PullRequestError, PullRequestId,
+    RestartCost, RunState, Session, SessionId, SurfaceActionError, ToolStatus, Unsteered,
+    VersionFix, WorktreeVerdict, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -448,6 +449,44 @@ fn checked_worktrees_name_their_sessions() {
                 ("rho/gone".to_owned(), None),
             ]
         );
+    });
+}
+
+/// A daemon from before pull requests reads as one that serves none, not
+/// as a failure to retry, and text that names no pull request as the
+/// daemon's reason, for a person; a link the daemon takes names its pull
+/// request and comes back in the session's links.
+#[test]
+fn pull_request_refusals_read_as_what_they_are() {
+    let older = FakeDaemon::start(Script {
+        pull_requests: PullRequestMethods::Unserved,
+        ..Script::default()
+    });
+    let served = FakeDaemon::start(Script::default());
+    let s1 = SessionId::from("s1");
+    let widgets = PullRequestId::new("github.com", "acme", "widgets", 12);
+    block_on(async {
+        let (daemon, _events) = connect(&older).await;
+        let unserved = daemon.list_pull_requests(&[SessionId::from("s1")]).await;
+        assert_eq!(unserved, Err(PullRequestError::Unserved));
+
+        let (daemon, _events) = connect(&served).await;
+        let refused = daemon.link_pull_request(&s1, "widgets").await;
+        assert!(
+            matches!(refused, Err(PullRequestError::Invalid(_))),
+            "{refused:?}"
+        );
+        let linked = daemon
+            .link_pull_request(&s1, "acme/widgets#12")
+            .await
+            .expect("the daemon links acme/widgets#12");
+        let links: Vec<_> = linked
+            .pull_requests
+            .linked
+            .iter()
+            .map(|link| &link.id)
+            .collect();
+        assert_eq!((&linked.pull_request, links), (&widgets, vec![&widgets]));
     });
 }
 

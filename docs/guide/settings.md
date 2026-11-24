@@ -8,7 +8,7 @@ rho-ui's own settings live in `~/.config/rho-ui/settings`, apart from rho's: the
 
 ## Source control
 
-The Pull request panel reads GitHub through `gh`. rho-ui looks for it on `PATH`, then through your login shell; set **Program** if it lives elsewhere. Signing in to `gh` asks questions in a terminal, so run `gh auth login` there.
+The Pull request panel's comments and merges run `gh`. rho-ui looks for it on `PATH`, then through your login shell; set **Program** if it lives elsewhere. Reading the PR is rho's job: each machine's rho daemon runs the `gh` on its own `PATH`, whatever **Program** says. Signing in to `gh` asks questions in a terminal, so run `gh auth login` there.
 
 rho-ui runs `gh` without a login shell. Variables such as `GH_TOKEN`, or a proxy set only in a login profile, don't reach it:
 

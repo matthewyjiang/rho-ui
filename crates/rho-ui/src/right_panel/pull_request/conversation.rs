@@ -18,11 +18,13 @@ use gpui_kit::{
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window,
 };
 
-use super::{header::web_url, quiet, row, PullRequestSurface};
-use crate::{
-    pull_requests::{Post, PrAction, PrDetail, Thread, ThreadState, Verdict},
-    time,
+use rho_ui_core::{
+    PullRequestDetail, PullRequestPost, PullRequestThread, PullRequestThreadState,
+    PullRequestVerdict,
 };
+
+use super::{header::web_url, quiet, row, PullRequestSurface};
+use crate::{forge::PrAction, pull_requests, time};
 
 /// Where the comment being written stands.
 pub(super) enum Posting {
@@ -115,11 +117,7 @@ impl PullRequestSurface {
             (Posting::Failed(why), _) => (why.clone(), theme.red),
             (_, Err(why)) => (why.clone(), theme.muted_foreground),
             (_, Ok(poster)) => {
-                let from = if poster.machine.is_local() {
-                    "this machine".to_owned()
-                } else {
-                    poster.machine.to_string()
-                };
+                let from = pull_requests::on(&poster.machine);
                 let note = format!("As @{} from {from}", poster.login);
                 (note.into(), theme.muted_foreground)
             }
@@ -170,7 +168,7 @@ impl PullRequestSurface {
     /// The comments and reviews, oldest first.
     pub(super) fn conversation(
         &self,
-        detail: &PrDetail,
+        detail: &PullRequestDetail,
         now: i64,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
@@ -193,20 +191,26 @@ impl PullRequestSurface {
     fn post(
         &self,
         id: SharedString,
-        post: &Post,
+        post: &PullRequestPost,
         now: i64,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let verdict = post.verdict.map(|verdict| match verdict {
-            Verdict::Approved => ("approved", Lucide::CircleCheck, theme.green),
-            Verdict::ChangesRequested => ("requested changes", Lucide::CircleX, theme.red),
-            Verdict::Commented => ("reviewed", Lucide::Eye, theme.muted_foreground),
-            Verdict::Dismissed => (
+        let verdict = post.verdict.and_then(|verdict| match verdict {
+            PullRequestVerdict::Approved => Some(("approved", Lucide::CircleCheck, theme.green)),
+            PullRequestVerdict::ChangesRequested => {
+                Some(("requested changes", Lucide::CircleX, theme.red))
+            }
+            PullRequestVerdict::Commented => {
+                Some(("reviewed", Lucide::Eye, theme.muted_foreground))
+            }
+            PullRequestVerdict::Dismissed => Some((
                 "review dismissed",
                 Lucide::CircleSlash,
                 theme.muted_foreground,
-            ),
+            )),
+            // A verdict a newer rho sends goes unsaid.
+            _ => None,
         });
         let url = web_url(&post.url);
         let muted = theme.muted_foreground;
@@ -272,7 +276,7 @@ impl PullRequestSurface {
     /// See [`open_threads`] for the heading's count.
     pub(super) fn threads(
         &self,
-        detail: &PrDetail,
+        detail: &PullRequestDetail,
         now: i64,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
@@ -295,31 +299,35 @@ impl PullRequestSurface {
     }
 
     /// A thread: a row naming its file and line, which opens and closes
-    /// it, over its comments.
+    /// it, over its comments. One in a state a newer rho sends draws as
+    /// open.
     fn thread(
         &self,
         ix: usize,
-        thread: &Thread,
+        thread: &PullRequestThread,
         now: i64,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let resolved = thread.state == ThreadState::Resolved;
+        let resolved = thread.state == PullRequestThreadState::Resolved;
         let open = resolved == self.flipped.contains(&thread.id);
         let (dir, file) = match thread.path.rsplit_once('/') {
             Some((dir, file)) => (Some(dir.to_owned()), file.to_owned()),
-            None => (None, thread.path.to_string()),
+            None => (None, thread.path.clone()),
         };
         let place = match thread.line {
             Some(line) => format!("{file}:{line}"),
             None => file,
         };
         let state = match thread.state {
-            ThreadState::Open => None,
-            ThreadState::Outdated => Some("Outdated"),
-            ThreadState::Resolved => Some("Resolved"),
+            PullRequestThreadState::Outdated => Some("Outdated"),
+            PullRequestThreadState::Resolved => Some("Resolved"),
+            // Open, or a state a newer rho sends.
+            _ => None,
         };
-        let count = u32::try_from(thread.comments.len()).unwrap_or(u32::MAX) + thread.more_comments;
+        let count = u32::try_from(thread.comments.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(thread.more_comments);
         let id = thread.id.clone();
         let muted = theme.muted_foreground;
         v_flex()
@@ -400,11 +408,11 @@ impl PullRequestSurface {
 }
 
 /// How many of the PR's threads are open: "2 open", or "All resolved".
-pub(super) fn open_threads(detail: &PrDetail) -> String {
+pub(super) fn open_threads(detail: &PullRequestDetail) -> String {
     let open = detail
         .threads
         .iter()
-        .filter(|thread| thread.state != ThreadState::Resolved)
+        .filter(|thread| thread.state != PullRequestThreadState::Resolved)
         .count();
     match open {
         0 => "All resolved".to_owned(),

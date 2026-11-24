@@ -123,8 +123,7 @@ impl FakeAuth {
         self.signed_in.insert(auth);
         Ok(AuthKeyResponse {
             unchecked,
-            // The fake keeps no model lists to fetch.
-            refreshed: Vec::new(),
+            ..AuthKeyResponse::default()
         })
     }
 

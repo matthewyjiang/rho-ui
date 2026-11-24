@@ -7,7 +7,8 @@
 //! A subagent's session opens from its row in the background work, nested
 //! under the session that started it. Only the subagent writes to it, so
 //! its view only watches: no composer, no approvals (the subagent's
-//! questions go to its parent), and no stopping its work.
+//! questions go to its parent), and no stopping its work. Where the
+//! composer would be, it names the agent and model the subagent runs as.
 //!
 //! While a turn runs, whoever started it, the composer steers it: Enter adds
 //! the text to the turn's next model request, and it waits above the box
@@ -82,7 +83,7 @@ use crate::{
     pictures::{PictureRead, Pictures},
     plan::PlanList,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
-    session_settings::{Availability, SessionSettings, SettingsEvent},
+    session_settings::{model_summary, Availability, SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
@@ -1649,6 +1650,7 @@ impl SessionView {
         if self.is_subagent() {
             return footer
                 .children(self.render_background(cx))
+                .child(self.render_subagent_status(cx))
                 .into_any_element();
         }
         let busy = self.is_busy();
@@ -1707,6 +1709,35 @@ impl SessionView {
                 .usage(self.session.usage().cloned().map(UsageRing::new)),
             )
             .into_any_element()
+    }
+
+    /// Where a subagent's session would have its composer: the agent and
+    /// model it runs as and how full its context is. Read-only, as only the
+    /// subagent writes.
+    fn render_subagent_status(&self, cx: &App) -> impl IntoElement {
+        let label = runs_as(
+            self.session.agent(),
+            self.session.options().and_then(model_summary),
+        );
+        h_flex()
+            .id("subagent-status")
+            .test_support()
+            .gap_2()
+            .px_3()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(Lucide::Bot).xsmall())
+            .child(
+                div()
+                    .id("subagent-runs-as")
+                    .test_support()
+                    .aria_label(label.clone())
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(label),
+            )
+            .children(self.session.usage().cloned().map(UsageRing::new))
     }
 
     /// The steers the turn has taken that the model has not read yet,
@@ -1958,6 +1989,20 @@ fn held_summary(held: &Prompt) -> String {
     }
 }
 
+/// "explorer · Claude Opus 5.5 · High": the agent a subagent's session runs
+/// as, then its [`model_summary`]. The default agent goes unnamed, as every
+/// session the user starts runs as it. "Subagent" while the daemon has said
+/// neither.
+fn runs_as(agent: Option<&str>, model: Option<SharedString>) -> SharedString {
+    let agent = agent.filter(|agent| *agent != "default");
+    match (agent, model) {
+        (Some(agent), Some(model)) => format!("{agent} · {model}").into(),
+        (Some(agent), None) => SharedString::from(agent.to_owned()),
+        (None, Some(model)) => model,
+        (None, None) => "Subagent".into(),
+    }
+}
+
 /// Longest first-prompt title, in characters: rho's `FALLBACK_TITLE_CHARS`,
 /// so the header matches the title rho lists for an untitled session.
 const PROMPT_TITLE_CHARS: usize = 80;
@@ -1993,4 +2038,26 @@ fn first_prompt(session: &Session) -> Option<String> {
         line.push('…');
     }
     Some(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runs_as;
+
+    /// The default agent goes unnamed, and whichever of agent and model the
+    /// daemon has said yet shows alone.
+    #[test]
+    fn a_subagent_names_its_agent_unless_it_is_the_default() {
+        let model = || Some("Huge · High".into());
+        let cases = [
+            (Some("explorer"), model(), "explorer · Huge · High"),
+            (Some("default"), model(), "Huge · High"),
+            (Some("explorer"), None, "explorer"),
+            (None, model(), "Huge · High"),
+            (Some("default"), None, "Subagent"),
+        ];
+        for (agent, model, label) in cases {
+            assert_eq!(runs_as(agent, model).as_ref(), label, "agent {agent:?}");
+        }
+    }
 }

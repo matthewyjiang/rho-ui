@@ -25,7 +25,10 @@ use rho_protocol::{
     SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
     SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
     SessionEvent, SessionHoldParams, SessionHoldResponse, SessionNewParams, SessionNewResponse,
-    SessionPromptParams, SessionPromptResponse, SessionSteerParams, SessionSteerResponse,
+    SessionPromptParams, SessionPromptResponse, SessionPullRequestLinkParams,
+    SessionPullRequestLinkResponse, SessionPullRequestListParams, SessionPullRequestListResponse,
+    SessionPullRequestShowParams, SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
+    SessionPullRequestUnlinkResponse, SessionSteerParams, SessionSteerResponse,
     SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
     SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
     WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
@@ -960,6 +963,34 @@ impl Service for Fake {
         Ok(AuthChooseStoreResponse {
             credential_store: self.lock().auth.choose_store(params.store),
         })
+    }
+
+    async fn list_session_pull_requests(
+        &self,
+        params: SessionPullRequestListParams,
+    ) -> Result<SessionPullRequestListResponse, RpcError> {
+        self.lock().list_pull_requests(&params)
+    }
+
+    async fn show_session_pull_request(
+        &self,
+        params: SessionPullRequestShowParams,
+    ) -> Result<SessionPullRequestShowResponse, RpcError> {
+        self.lock().show_pull_request(&params)
+    }
+
+    async fn link_session_pull_request(
+        &self,
+        params: SessionPullRequestLinkParams,
+    ) -> Result<SessionPullRequestLinkResponse, RpcError> {
+        self.lock().link_pull_request(&params)
+    }
+
+    async fn unlink_session_pull_request(
+        &self,
+        params: SessionPullRequestUnlinkParams,
+    ) -> Result<SessionPullRequestUnlinkResponse, RpcError> {
+        self.lock().unlink_pull_request(&params)
     }
 
     async fn prune_worktrees(
