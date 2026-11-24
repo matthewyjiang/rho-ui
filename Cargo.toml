@@ -95,9 +95,3 @@ enum_glob_use = "allow"                  # use Enum::* inside a function that ma
 [profile.dev.package."*"]
 opt-level = 3
 debug = "line-tables-only"
-
-# REMOVE AT RELEASE(rho-protocol 1.4.0): pull requests need rho-protocol 1.4.0,
-# which reaches crates.io with rho's next release (matthewyjiang/rho#2009, merged).
-# Then delete this section and run `cargo update -p rho-protocol`.
-[patch.crates-io]
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", branch = "main" }
