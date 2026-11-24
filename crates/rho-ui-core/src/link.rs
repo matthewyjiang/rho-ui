@@ -91,7 +91,10 @@ impl Link {
             let why = match error {
                 ScriptError::Session(error) => return error,
                 ScriptError::TimedOut(deadline) => {
-                    format!("a script on {name} ran past {} s", deadline.as_secs())
+                    format!(
+                        "a script on {name} didn't finish within {} s",
+                        deadline.as_secs()
+                    )
                 }
                 ScriptError::Cut => format!("the connection to {name} closed while a script ran"),
                 ScriptError::Refused => {
@@ -137,7 +140,8 @@ impl Link {
 /// Why a script didn't succeed. Callers word it for what the script did.
 #[derive(Debug)]
 pub(crate) enum ScriptError {
-    /// It ran past its deadline, this one.
+    /// It didn't finish by its deadline, this one, which covers any wait
+    /// for the machine to take one more script.
     TimedOut(Duration),
     /// The link closed with no word of how the script ended, as when the
     /// connection died.

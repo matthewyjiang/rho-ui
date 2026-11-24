@@ -8,7 +8,9 @@
 //! the login environment ([`crate::setup`]), then opens a `direct-streamlocal`
 //! channel to the daemon's socket, as `ssh -W` does, and speaks rho's
 //! protocol over it. Every script after that runs in a session channel
-//! of its own on the same connection ([`script`]). The terminals' login
+//! of its own on the same connection ([`script`]), 5 at once, half the
+//! sessions sshd allows a connection by default; the rest wait their
+//! turn. The terminals' login
 //! shells, under a pseudo-terminal there ([`shell`]), run on a second
 //! connection, made when the first terminal opens, so they never take the sessions
 //! scripts need; [`MAX_SHELLS`] at most. A new connection costs a key

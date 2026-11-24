@@ -1,7 +1,7 @@
 //! Running a POSIX `sh` script on a host, in a session channel of its
 //! own on the host's shared connection.
 
-use std::{pin::pin, time::Duration};
+use std::{pin::pin, sync::Arc, time::Duration};
 
 use russh::{ChannelMsg, ChannelReadHalf, Sig};
 
@@ -12,7 +12,8 @@ use crate::{
 };
 
 /// Runs `input` with `sh -s` on the connection's host, within `deadline`
-/// if any, and returns what it printed. It runs only on a live
+/// if any, which covers its wait for a slot among the connection's
+/// scripts, and returns what it printed. It runs only on a live
 /// connection: once that is gone this fails rather than connect again,
 /// which could ask the user's key agent for another approval. Runs on the
 /// I/O runtime; dropping the future closes the channel, which stops the
@@ -23,7 +24,7 @@ use crate::{
 /// Fails if the connection is gone, the host refuses a session or `sh`,
 /// the script exits with an error, or it runs past `deadline`.
 pub(super) async fn run(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     input: &[u8],
     deadline: Option<Duration>,
 ) -> Result<Vec<u8>, ScriptError> {
@@ -38,8 +39,9 @@ pub(super) async fn run(
     output.result()
 }
 
-/// Runs `sh -s` in a new session channel, feeds it `input`, and collects
-/// what it prints until the channel closes, or sshd refuses to run `sh`.
+/// Runs `sh -s` in a new session channel, once the connection has a slot
+/// for one more script, feeds it `input`, and collects what it prints
+/// until the channel closes, or sshd refuses to run `sh`.
 /// The input goes while the output comes, so neither side waits on a full
 /// window. Dropping the future closes the channel, so a deadline around
 /// this covers sending the input too, and channels don't pile up against
@@ -48,8 +50,9 @@ pub(super) async fn run(
 /// # Errors
 ///
 /// Fails if the connection is gone, or the host refuses a session.
-pub(super) async fn sh(connection: &Connection, input: &[u8]) -> Result<Output, DaemonError> {
-    let (mut read, write) = connection.session().await?;
+pub(super) async fn sh(connection: &Arc<Connection>, input: &[u8]) -> Result<Output, DaemonError> {
+    let slot = connection.script_slot().await;
+    let (mut read, write) = connection.session(slot).await?;
     let channel = write.channel();
     let mut send = pin!(async {
         channel.exec(true, "sh -s").await?;

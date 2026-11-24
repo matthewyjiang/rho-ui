@@ -172,8 +172,9 @@ pub(crate) struct Workspaces {
     remotes: Vec<Remote>,
     /// Workspaces [`Self::index`] added this effect cycle, read together
     /// at its end: a session list of a remote machine names many at once,
-    /// and reading each alone would open an ssh session per workspace,
-    /// past the 10 that sshd's default `MaxSessions` allows on a connection.
+    /// and reading each alone would run an ssh script per workspace, ahead
+    /// of everything else read there: the connection runs only a few
+    /// scripts at once.
     unread: Vec<usize>,
     _reread: Task<()>,
 }

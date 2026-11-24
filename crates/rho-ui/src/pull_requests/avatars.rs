@@ -45,8 +45,8 @@ pub(super) struct Avatars {
     /// Fetches waiting their turn: where each picture is, and the machine
     /// that fetches it. One runs
     /// at a time: on a remote machine each is an ssh session on the shared
-    /// connection, which sshd's default `MaxSessions` holds to 10, and the
-    /// daemon connection, the Files surface and git need some too.
+    /// connection, which runs only a few scripts at once, and the Files
+    /// surface and git need some too.
     queue: VecDeque<(MachineId, SharedString)>,
     fetching: bool,
 }

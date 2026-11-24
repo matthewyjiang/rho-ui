@@ -184,22 +184,20 @@ impl Asked {
 /// it `start`; then forwards what it prints to `output`, and `requests` to
 /// it, at once, so a write waiting on the host's window never stops the
 /// reading. Runs on the I/O runtime; returns when the shell ends, and
-/// closes the channel. Dropped, it closes the channel too, and frees the
-/// slot.
+/// closes the channel, which frees the slot. Dropped, it does both too.
 ///
 /// # Errors
 ///
 /// As [`ShellEnded::wait`].
 async fn run(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     start: Start<'_>,
     output: &mpsc::Sender<Vec<u8>>,
     requests: &mut mpsc::UnboundedReceiver<Request>,
 ) -> Result<(), ShellError> {
-    // Held while this runs.
-    let _slot = connection.shell_slot().map_err(ShellError::NotStarted)?;
+    let slot = connection.shell_slot().map_err(ShellError::NotStarted)?;
     let (mut read, write) = connection
-        .session()
+        .session(slot)
         .await
         .map_err(|error| ShellError::NotStarted(error.to_string()))?;
     let channel = write.channel();
