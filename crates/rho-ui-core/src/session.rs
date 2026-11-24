@@ -523,6 +523,8 @@ pub struct Session {
     state: RunState,
     usage: Option<Usage>,
     options: Option<SessionOptions>,
+    /// The agent the session runs as, by id, as the daemon last said.
+    agent: Option<String>,
     commands: Vec<CommandInfo>,
     /// The directories the session's tools reach besides its workspace.
     added_dirs: Vec<PathBuf>,
@@ -607,6 +609,7 @@ impl Session {
             state: RunState::Idle,
             usage: None,
             options: None,
+            agent: None,
             commands: Vec::new(),
             added_dirs: Vec::new(),
             plan: Vec::new(),
@@ -821,6 +824,14 @@ impl Session {
     /// Settings the user can change, such as mode and model, once known.
     pub fn options(&self) -> Option<&SessionOptions> {
         self.options.as_ref()
+    }
+
+    /// The id of the agent the session runs as, such as `worker`, or
+    /// `default` for the default agent. The daemon says it at the start of
+    /// every replay, and again when an `/agent:` first prompt changes it;
+    /// a daemon older than rho-protocol 1.4 never does.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
     }
 
     /// The auth profile the session's model runs on, once its settings
@@ -1127,6 +1138,10 @@ impl Session {
             }
             SessionEvent::TitleChanged { title } => {
                 self.title = Some(title);
+                None
+            }
+            SessionEvent::Agent { id } => {
+                self.agent = Some(id);
                 None
             }
             SessionEvent::Usage {
