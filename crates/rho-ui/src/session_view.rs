@@ -113,9 +113,6 @@ const TICK: Duration = Duration::from_secs(1);
 pub(crate) enum SessionEvent {
     /// Title or activity changed; see [`SessionView::live`].
     LiveChanged,
-    /// The daemon took a prompt or a steer from here, so the session is
-    /// rho-ui's.
-    Prompted,
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
     Saved,
@@ -1080,7 +1077,6 @@ impl SessionView {
                 match result {
                     Ok(turn) => {
                         this.session.turn_began(&turn);
-                        cx.emit(SessionEvent::Prompted);
                         if !this.prompted {
                             this.prompted = true;
                             cx.emit(SessionEvent::Saved);
@@ -1139,8 +1135,6 @@ impl SessionView {
                         if !dropped.is_empty() {
                             this.give_back(dropped.join("\n").into(), window, cx);
                         }
-                        // Continued from here, so the session is rho-ui's.
-                        cx.emit(SessionEvent::Prompted);
                     }
                     // The turn is past its last model request, or ended.
                     Err(DaemonError::Busy(error)) => {
