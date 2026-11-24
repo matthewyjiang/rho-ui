@@ -257,19 +257,21 @@ impl SessionSettings {
     }
 }
 
-/// "Claude Opus 5.5 · High": the model and its reasoning level. Fast mode is
-/// the button's icon instead.
+/// The panel button's label: [`model_summary`], or "Settings" when there is
+/// none.
 fn summary(options: &SessionOptions) -> SharedString {
+    model_summary(options).unwrap_or_else(|| "Settings".into())
+}
+
+/// "Claude Opus 5.5 · High": the model and its reasoning level, when the
+/// options name either. Fast mode is the panel button's icon instead.
+pub(crate) fn model_summary(options: &SessionOptions) -> Option<SharedString> {
     let model = options.model().current_choice().map(ModelChoice::label);
     let reasoning = options
         .reasoning()
         .map(|reasoning| reasoning.current().label());
     let parts: Vec<&str> = model.into_iter().chain(reasoning).collect();
-    if parts.is_empty() {
-        "Settings".into()
-    } else {
-        parts.join(" · ").into()
-    }
+    (!parts.is_empty()).then(|| parts.join(" · ").into())
 }
 
 fn setting_name(change: &OptionChange) -> &'static str {
