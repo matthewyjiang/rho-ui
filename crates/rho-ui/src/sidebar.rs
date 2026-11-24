@@ -257,6 +257,8 @@ pub(crate) enum SidebarEvent {
         title: Option<SharedString>,
     },
     NewSession,
+    /// Show a draft for a new lead.
+    NewLead,
     /// Show a listed draft.
     OpenDraft(EntityId),
     /// Drop a listed draft, message and all.
@@ -1435,6 +1437,7 @@ impl SidebarView {
                 .moves_window(DragArea::SidebarTitle, window, cx)
                 .child("Rho"),
         )
+        .child(new_lead_button(cx))
         .child(new_session_button(cx))
     }
 
@@ -1838,6 +1841,16 @@ fn new_session_button(cx: &Context<'_, SidebarView>) -> Button {
         .accessibility_label("New session")
         .tooltip_with_action("New session", &crate::NewSession, Some("RhoApp"))
         .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewSession)))
+}
+
+fn new_lead_button(cx: &Context<'_, SidebarView>) -> Button {
+    Button::new("new-lead")
+        .ghost()
+        .small()
+        .icon(Lucide::Network)
+        .accessibility_label("New lead")
+        .tooltip("New lead")
+        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewLead)))
 }
 
 fn settings_button(cx: &Context<'_, SidebarView>) -> Button {

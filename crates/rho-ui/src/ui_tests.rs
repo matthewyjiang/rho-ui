@@ -32,11 +32,12 @@ use rho_ui_core::{
         TuiJob, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
         SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
-    Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices, Daemon,
-    DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
+    platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
+    Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
     PullRequestId, PullRequestLinkOrigin, PullRequestRead, PullRequestRollup, PullRequestState,
     PullRequestSummary, PullRequestTrouble, ReasoningLevel, RestartCost, RetryReason, RhoInstall,
     RunState, Session, SessionId, SessionOptions, SessionPullRequests, ToolStatus, WorktreeVerdict,
+    LEAD_AGENT,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -283,6 +284,7 @@ impl Harness {
             remote_sockets,
             workspace,
             rho,
+            rho_home,
         } = machines;
         let rho = rho.map(|rho| RhoInstall::Here { rho });
         // Never the user's gh, which would ask GitHub about their account.
@@ -331,6 +333,8 @@ impl Harness {
             }),
             // Not the user's shell, whose files may print or ask things.
             shell: TerminalShell(TEST_SHELL.clone()),
+            // Never the user's rho home, where leads would make folders.
+            rho_home: Some(rho_home.unwrap_or_else(|| PathBuf::from("/nonexistent/rho"))),
         };
         let sidebar = SidebarState {
             shelves,
@@ -767,6 +771,9 @@ struct Machines {
     /// update; with `None`, rho-ui leaves rho alone, as for any daemon
     /// reached at a socket.
     rho: Option<PathBuf>,
+    /// This machine's rho home, where leads keep their folders; one that
+    /// isn't there, so none can be made, when `None`.
+    rho_home: Option<PathBuf>,
 }
 
 /// How [`Harness::send_from_elsewhere`] sends its message.
@@ -1653,6 +1660,75 @@ fn sessions_a_session_started_fold_under_it() {
             is_visible(window, "session-local-w2") && on_screen == Some(SessionKey::local("w2"))
         },
     );
+}
+
+/// A lead starts as rho's lead agent in a folder of its own, named from its
+/// first message, made in the rho home's leads. It lists under the Leads
+/// header, above the other active sessions, whatever project the filter
+/// keeps to, and the sessions it starts fold under it.
+#[test]
+fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
+    let rho_home = tempfile::tempdir().expect("a rho home");
+    let state = StateDb::in_memory();
+    // The filter keeps to /w/a, which holds s1 and not old, nor the lead.
+    state.execute(
+        "INSERT INTO filter_projects (machine, path) VALUES (?1, ?2)",
+        (MachineId::local().as_str().to_owned(), b"/w/a".to_vec()),
+    );
+    let daemon = FakeDaemon::start(Script::default());
+    let target = daemon.target();
+    let machines = Machines {
+        shelves: kept(["s1", "old"]),
+        projects: Projects::of(["/w/a"]),
+        rho_home: Some(rho_home.path().to_path_buf()),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_on("leads", target, Some(daemon), machines, state);
+    ui.wait_until("the filtered sidebar", |window, _, _| {
+        is_visible(window, "session-local-s1") && !is_visible(window, "session-local-old")
+    });
+
+    ui.click("new-lead");
+    ui.wait_until("the lead's draft", |_, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).session_key().is_some())
+    });
+    ui.send("Fix the parser!");
+    ui.wait_for_session("the lead", |session| session.id().as_str() == "new-2");
+    let leads = platform::canonicalize(&rho_home.path().join("leads")).expect("the leads root");
+    let folder = leads.join("fix-the-parser");
+    assert_eq!(
+        (ui.fake().agent("new-2"), ui.fake().cwd("new-2")),
+        (Some(LEAD_AGENT.to_owned()), Some(folder.clone()))
+    );
+    assert!(folder.is_dir(), "the lead's folder is made");
+
+    // Under the header, above s1, though the filter keeps to /w/a.
+    ui.wait_until("the lead under the header", |window, _, _| {
+        let tops = ["leads-header", "session-local-new-2", "session-local-s1"]
+            .map(|id| bounds(window, id).map(|bounds| bounds.top()));
+        tops.iter().all(Option::is_some) && tops.is_sorted()
+    });
+
+    ui.fake()
+        .start_session("new-2", "w1", "Write the parser", Started::Working);
+    // The job poll finds it.
+    ui.poll(
+        WAIT,
+        "the session it started folded under it",
+        |ui| {
+            ui.cx.advance_clock(Duration::from_secs(1));
+            ui.frame();
+            ui.cx
+                .update_window(ui.window, |_, window, _| {
+                    is_visible(window, "session-local-new-2-fold")
+                        && !is_visible(window, "session-local-w1")
+                })
+                .expect("window is open")
+        },
+        Harness::labels_seen,
+    );
+    ui.shot("listed");
 }
 
 /// Sessions quiet for long start settled. A draft makes no session until

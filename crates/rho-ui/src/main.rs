@@ -32,6 +32,7 @@ mod folders;
 mod forge;
 mod input_card;
 mod kinetic;
+mod leads;
 mod lightbox;
 mod local;
 mod machines;
@@ -306,6 +307,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
         },
         remote: Rc::new(RemoteMachine::ssh_reach),
         shell: TerminalShell::from_env(),
+        rho_home: rho_ui_core::platform::rho_home(),
     })
 }
 

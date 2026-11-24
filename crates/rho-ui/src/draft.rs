@@ -19,6 +19,11 @@
 //! message goes: the app then opens a session in a new worktree, gives it
 //! the draft's settings, and sends the message there, so choosing New
 //! worktree and back leaves no worktree behind.
+//!
+//! A lead's draft ([`Kind::Lead`]) picks no project: its session is a lead
+//! in the leads root (see [`crate::leads`]), with the lead agent's
+//! settings, and the first message starts the lead in a folder of its own,
+//! named from the message, the same way.
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{alert::Alert, input::InputEvent, v_flex, Sizable as _};
@@ -38,7 +43,7 @@ use crate::{
     machines::{Machines, Place, SessionKey},
     project_picker::{PickerEvent, ProjectPicker},
     projects::Projects,
-    session_list::NEW_SESSION,
+    session_list::{Kind, NEW_SESSION},
     session_settings::{SessionSettings, SettingsEvent},
     sign_in::SignInSlot,
     title_bar::TitleBar,
@@ -53,10 +58,11 @@ pub(crate) enum DraftEvent {
         session: Box<Session>,
         prompt: Prompt,
     },
-    /// Open a session in a new worktree of the draft's directory, give it
-    /// `options`, the draft session's settings, then show it and send
-    /// `prompt` as its first. [`DraftView::launch_failed`] says it couldn't.
-    StartInWorktree {
+    /// Open a session where `target` says, give it `options`, the draft
+    /// session's settings, then show it and send `prompt` as its first.
+    /// [`DraftView::launch_failed`] says it couldn't.
+    StartIn {
+        target: Target,
         options: Option<SessionOptions>,
         prompt: Prompt,
     },
@@ -64,6 +70,22 @@ pub(crate) enum DraftEvent {
     /// project changed.
     OpenSession,
 }
+
+/// Where a draft's first message starts a session other than the draft's
+/// own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// In a new worktree of the draft's directory.
+    NewWorktree,
+    /// As a lead, in a folder of its own named from the message.
+    Lead,
+}
+
+/// The placeholder of a lead's composer, which says what to write there.
+const LEAD_PLACEHOLDER: &str = "What should this lead get done?";
+
+/// What the title bar calls a lead's draft.
+const NEW_LEAD: &str = "New lead";
 
 /// The draft's session.
 enum SessionState {
@@ -85,7 +107,10 @@ enum SessionState {
 }
 
 pub(crate) struct DraftView {
-    /// Where the session will work.
+    /// A session's draft, or a lead's.
+    kind: Kind,
+    /// Where the session will work: for a lead's draft, the leads root its
+    /// session works in until the first message, as best rho-ui knows it.
     cwd: Place,
     machines: Entity<Machines>,
     /// Every machine's sign-ins, for the session's.
@@ -99,7 +124,8 @@ pub(crate) struct DraftView {
     request: u64,
     /// The user sent while the session was opening; it goes out once open.
     queued: bool,
-    /// The first message went to the app to start in a new worktree.
+    /// The first message went to the app to start in a session of its own
+    /// ([`DraftEvent::StartIn`]).
     launching: bool,
     /// Why opening the session, or a settings change, failed.
     error: Option<String>,
@@ -156,6 +182,7 @@ impl DraftView {
             }),
         ];
         Self {
+            kind: Kind::Session,
             cwd,
             machines: machines.clone(),
             auths,
@@ -170,6 +197,32 @@ impl DraftView {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// A lead's draft on the machine of `cwd`, the leads root there; see
+    /// [`Self::new`].
+    pub(crate) fn new_lead(
+        cwd: Place,
+        workspaces: &Entity<Workspaces>,
+        projects: &Entity<Projects>,
+        machines: &Entity<Machines>,
+        auths: Entity<Auths>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let draft = Self {
+            kind: Kind::Lead,
+            ..Self::new(cwd, workspaces, projects, machines, auths, window, cx)
+        };
+        let input = draft.composer.read(cx).input().clone();
+        input.update(cx, |input, cx| {
+            input.set_placeholder(LEAD_PLACEHOLDER, window, cx);
+        });
+        draft
+    }
+
+    pub(crate) fn kind(&self) -> Kind {
+        self.kind
     }
 
     pub(crate) fn cwd(&self) -> &Place {
@@ -279,12 +332,12 @@ impl DraftView {
     }
 
     /// Whether the draft still waits for its first message to start in a
-    /// new worktree.
+    /// session of its own.
     pub(crate) fn launching(&self) -> bool {
         self.launching
     }
 
-    /// The new worktree's session couldn't be started; the message stays in
+    /// The session of its own couldn't be started; the message stays in
     /// the composer for another try.
     pub(crate) fn launch_failed(&mut self, error: String, cx: &mut Context<'_, Self>) {
         self.launching = false;
@@ -450,22 +503,32 @@ impl DraftView {
         if prompt.is_empty() {
             return;
         }
-        let checkout = self.picker.read(cx).checkout(cx);
+        let target = match self.kind {
+            Kind::Lead => Some(Target::Lead),
+            Kind::Session => match self.picker.read(cx).checkout(cx) {
+                Checkout::Local => None,
+                Checkout::NewWorktree => Some(Target::NewWorktree),
+            },
+        };
         match (
             std::mem::replace(&mut self.state, SessionState::Started),
-            checkout,
+            target,
         ) {
-            (SessionState::Open { session, .. }, Checkout::Local) => {
+            (SessionState::Open { session, .. }, None) => {
                 cx.emit(DraftEvent::Start { session, prompt });
             }
             // The draft's session stays, with its settings, until the
-            // worktree's session takes over.
-            (state @ SessionState::Open { .. }, Checkout::NewWorktree) => {
+            // new session takes over.
+            (state @ SessionState::Open { .. }, Some(target)) => {
                 if let SessionState::Open { session, .. } = &state {
                     let options = session.options().cloned();
                     self.launching = true;
                     self.error = None;
-                    cx.emit(DraftEvent::StartInWorktree { options, prompt });
+                    cx.emit(DraftEvent::StartIn {
+                        target,
+                        options,
+                        prompt,
+                    });
                 }
                 self.state = state;
             }
@@ -537,15 +600,19 @@ impl Render for DraftView {
                 .leading(SessionSettings::render_mode(settings, cx))
                 .trailing(SessionSettings::render_panel_button(settings, cx));
         }
+        let title = match self.kind {
+            Kind::Session => NEW_SESSION,
+            Kind::Lead => NEW_LEAD,
+        };
         v_flex()
             .id("draft-view")
             .test_support()
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(TitleBar::new(self.workspace.read(cx), NEW_SESSION))
+            .child(TitleBar::new(self.workspace.read(cx), title))
             .child(
                 // The project list, centered in the space above the
-                // composer, at its width.
+                // composer, at its width; a lead picks none.
                 v_flex()
                     .flex_1()
                     .min_h_0()
@@ -556,7 +623,9 @@ impl Render for DraftView {
                     .px_4()
                     .pt_4()
                     .pb_4()
-                    .child(self.picker.clone()),
+                    .when(self.kind == Kind::Session, |this| {
+                        this.child(self.picker.clone())
+                    }),
             )
             .child(
                 v_flex()

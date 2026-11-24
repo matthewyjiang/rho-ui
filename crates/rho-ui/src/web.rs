@@ -87,6 +87,7 @@ pub(crate) fn main() {
             Rc::new(move |remote: &RemoteMachine| remote.server_reach(&server))
         },
         shell: TerminalShell::from_env(),
+        rho_home: None,
     };
     gpui_kit::platform::single_threaded_web()
         .with_assets(Assets::new(&origin))
