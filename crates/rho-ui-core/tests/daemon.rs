@@ -9,8 +9,8 @@ use rho_ui_core::{
     agent_settings::{SettingChange, SettingKey, SettingValue},
     fake_daemon::{
         surface::{FORM_SURFACE, REFUSED_EVENT},
-        FakeDaemon, PullRequestMethods, Script, TuiJob, KEY_AUTH, LOGIN_AUTH, LOGIN_URL,
-        TUI_SESSION,
+        FakeDaemon, PullRequestMethods, Script, SessionLists, Started, TuiJob, KEY_AUTH,
+        LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
     },
     surface::{Node, SurfaceStore},
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
@@ -517,6 +517,60 @@ fn list_follows_the_cursor_and_attach_replays_the_conversation() {
         old.attached(daemon.attach(old.id(), None).await.unwrap());
         until(&mut events, &mut old, |s| !s.is_replaying()).await;
         assert!(matches!(old.entries(), [Entry::Agent(m)] if m.text() == "replayed"));
+    });
+}
+
+/// The list and the job list name the session that started a session, so
+/// the sidebar can fold it under that one; a rho from before
+/// `list_detailed` still lists it, naming none.
+#[test]
+fn the_session_list_names_the_session_that_started_each() {
+    let fake = FakeDaemon::start(Script::default());
+    fake.start_session("s1", "w1", "Write the parser", Started::Idle);
+    fake.start_session("s1", "w2", "Test the parser", Started::Working);
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let sessions = daemon.list_sessions().await.unwrap();
+        let parents: Vec<_> = sessions
+            .iter()
+            .map(|s| (s.id().as_str(), s.parent().map(SessionId::as_str)))
+            .collect();
+        assert_eq!(
+            parents,
+            [
+                ("w2", Some("s1")),
+                ("w1", Some("s1")),
+                ("s1", None),
+                ("old", None)
+            ]
+        );
+        assert_eq!(sessions[0].agent(), Some("default"));
+
+        // The job list names it too, for a session that saved nothing yet.
+        let jobs = daemon.jobs().await.unwrap().active;
+        let [job] = jobs.as_slice() else {
+            panic!("one job runs: {jobs:?}")
+        };
+        assert_eq!(job.session().as_str(), "w2");
+        assert_eq!(job.parent().map(SessionId::as_str), Some("s1"));
+    });
+
+    let older = FakeDaemon::start(Script {
+        session_lists: SessionLists::Plain,
+        ..Script::default()
+    });
+    older.start_session("s1", "w1", "Write the parser", Started::Idle);
+    block_on(async {
+        let (daemon, _events) = connect(&older).await;
+        let sessions = daemon.list_sessions().await.unwrap();
+        let parents: Vec<_> = sessions
+            .iter()
+            .map(|s| (s.id().as_str(), s.parent(), s.agent()))
+            .collect();
+        assert_eq!(
+            parents,
+            [("w1", None, None), ("s1", None, None), ("old", None, None)]
+        );
     });
 }
 

@@ -58,6 +58,7 @@ pub struct Job {
     title: Option<String>,
     activity: JobActivity,
     turn_elapsed: Option<Duration>,
+    parent: Option<SessionId>,
 }
 
 impl Job {
@@ -88,6 +89,15 @@ impl Job {
         self.turn_elapsed
     }
 
+    /// The session that started this one through session control, as
+    /// rho's `sessions` tool does: the session of the nearest session job
+    /// up the job's parents, as a subagent or workflow node that starts a
+    /// session runs in its session's turn. It names a session that saved
+    /// nothing yet too, which the saved list can't.
+    pub fn parent(&self) -> Option<&SessionId> {
+        self.parent.as_ref()
+    }
+
     /// Whether `other` is this job as an earlier or later listing would
     /// show it: everything but [`Self::turn_elapsed`] is the same. Two
     /// listings that differ only in elapsed time changed nothing to show.
@@ -96,6 +106,7 @@ impl Job {
             && self.cwd == other.cwd
             && self.title == other.title
             && self.activity == other.activity
+            && self.parent == other.parent
     }
 
     /// The sessions with work under way among `jobs`, a whole listing.
@@ -106,15 +117,21 @@ impl Job {
             .filter(|job| job.kind != JobKind::Session && job.state.in_progress())
             .filter_map(|job| job.parent.as_ref())
             .collect();
+        let by_id: HashMap<&JobId, &JobSummary> = jobs.iter().map(|job| (&job.id, job)).collect();
         jobs.iter()
-            .filter_map(|job| Self::from_wire(job, &started))
+            .filter_map(|job| Self::from_wire(job, &started, &by_id))
             .collect()
     }
 
     /// The job as the sidebar needs it, or `None` for one that is not a
     /// session with work under way. `started` holds the jobs whose
-    /// subagent or workflow runs are under way.
-    fn from_wire(job: &JobSummary, started: &HashSet<&JobId>) -> Option<Self> {
+    /// subagent or workflow runs are under way; `by_id` is the whole
+    /// listing, for the job's parents.
+    fn from_wire(
+        job: &JobSummary,
+        started: &HashSet<&JobId>,
+        by_id: &HashMap<&JobId, &JobSummary>,
+    ) -> Option<Self> {
         // A subagent's or workflow's session belongs to the session that
         // started it, and can't be attached to.
         if job.kind != JobKind::Session {
@@ -138,8 +155,28 @@ impl Job {
                 .map(Duration::from_millis),
             title: live.and_then(|live| live.title.clone()),
             activity,
+            parent: starter(job, by_id),
         })
     }
+}
+
+/// The session of the nearest [`JobKind::Session`] job up `job`'s parents
+/// in `by_id`, a whole listing; `None` once a parent isn't listed, or the
+/// parents loop.
+fn starter(job: &JobSummary, by_id: &HashMap<&JobId, &JobSummary>) -> Option<SessionId> {
+    let mut seen = HashSet::new();
+    let mut next = job.parent.as_ref();
+    while let Some(id) = next {
+        if !seen.insert(id) {
+            return None;
+        }
+        let parent = by_id.get(id)?;
+        if parent.kind == JobKind::Session {
+            return parent.session.clone().map(SessionId::from);
+        }
+        next = parent.parent.as_ref();
+    }
+    None
 }
 
 /// The subagent and workflow runs in a job listing, to put together for the
@@ -405,6 +442,41 @@ mod tests {
             let activities: Vec<_> = Job::from_list(&jobs).iter().map(Job::activity).collect();
             assert_eq!(activities, Vec::from_iter(want), "a {state} {kind}");
         }
+    }
+
+    /// A session another session started names that session, even when a
+    /// subagent of it started the session; a parent the listing lacks, or
+    /// parents that loop, name none.
+    #[test]
+    fn a_started_session_names_the_nearest_session_up_its_parents() {
+        let idle = || json!(null);
+        let running = || live(5, &json!([]));
+        let jobs = vec![
+            summary("lead", "session", "completed", None, &idle()),
+            summary("sub", "subagent", "running", Some("lead"), &idle()),
+            summary("x", "subagent", "running", Some("y"), &idle()),
+            summary("y", "subagent", "running", Some("x"), &idle()),
+            summary("direct", "session", "running", Some("lead"), &running()),
+            summary("by-sub", "session", "running", Some("sub"), &running()),
+            summary("orphan", "session", "running", Some("gone"), &running()),
+            summary("looped", "session", "running", Some("x"), &running()),
+        ];
+        let parents: Vec<_> = Job::from_list(&jobs)
+            .iter()
+            .map(|job| (job.session().as_str().to_owned(), job.parent().cloned()))
+            .collect();
+        let lead = Some(SessionId::from("s-lead"));
+        assert_eq!(
+            parents,
+            [
+                // Its subagent runs keep the lead waiting on them.
+                ("s-lead".to_owned(), None),
+                ("s-direct".to_owned(), lead.clone()),
+                ("s-by-sub".to_owned(), lead),
+                ("s-orphan".to_owned(), None),
+                ("s-looped".to_owned(), None),
+            ]
+        );
     }
 
     /// Each session's runs nest as the daemon's parents say, and carry

@@ -19,23 +19,25 @@ use rho_protocol::{
     AuthLoginCancelResponse, AuthLoginParams, AuthLoginResponse, AuthLogoutParams,
     AuthLogoutResponse, BackgroundStatus, BuildId, ClientInfo, ConfigGetParams, ConfigSchema,
     ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus, DetachReason,
-    ErrorCode, InputAnswer, InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream,
-    ModelListParams, ModelWatch, Operation, PermissionMode, PlanApprovalAsk, ProtocolVersion,
-    QuestionAsk, RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
-    SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
-    SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
-    SessionEvent, SessionForkParams, SessionForkResponse, SessionHoldParams, SessionHoldResponse,
-    SessionNewParams, SessionNewResponse, SessionPromptParams, SessionPromptResponse,
-    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
-    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
-    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSteerParams,
-    SessionSteerResponse, SessionSurfaceActionParams, SessionSurfaceActionResponse,
-    SessionWorktree, SettingsService, SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome,
-    UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
+    DetailedSessionSummary, ErrorCode, InputAnswer, InputAsker, InputRequest, InputRequestId,
+    InputTimeout, LoginStream, ModelListParams, ModelWatch, Operation, PermissionMode,
+    PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
+    SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
+    SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
+    SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
+    SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionNewParams,
+    SessionNewResponse, SessionPromptParams, SessionPromptResponse, SessionPullRequestLinkParams,
+    SessionPullRequestLinkResponse, SessionPullRequestListParams, SessionPullRequestListResponse,
+    SessionPullRequestShowParams, SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
+    SessionPullRequestUnlinkResponse, SessionSteerParams, SessionSteerResponse,
+    SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
+    SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
+    WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
-    report, shell_card, shell_output, surface, FakeSession, State, Turn, KEY_AUTH, TOOL_IMAGE,
+    report, shell_card, shell_output, surface, FakeSession, SessionLists, State, Turn, KEY_AUTH,
+    TOOL_IMAGE,
 };
 
 #[derive(Debug)]
@@ -81,6 +83,49 @@ impl Fake {
     /// unloaded `unloads` times: a restart, or a reload, starts another.
     fn stream(&self, unloads: u64) -> StreamId {
         StreamId::new(format!("stream-{}-{unloads}", *self.restarted.borrow()))
+    }
+}
+
+impl State {
+    /// The page of saved sessions after `cursor` that `rho/session/list`
+    /// and `list_detailed` answer, newest first and leaving forks out, and
+    /// the next page's cursor.
+    fn saved_page(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<(&str, &FakeSession)>, Option<String>), RpcError> {
+        /// Small, so two sessions already exercise the cursor.
+        const PAGE: usize = 2;
+        let mut saved: Vec<(&str, &FakeSession)> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.saved && session.fork_of.is_none())
+            .map(|(id, session)| (id.as_str(), session))
+            .collect();
+        saved.sort_by_key(|(_, session)| std::cmp::Reverse(session.updated_at));
+        let start = match cursor.map(str::parse::<usize>) {
+            None => 0,
+            Some(Ok(start)) => start,
+            Some(Err(_)) => {
+                return Err(RpcError::new(ErrorCode::InvalidParams, "not a list cursor"));
+            }
+        };
+        let next = (start + PAGE < saved.len()).then(|| (start + PAGE).to_string());
+        let page = saved.into_iter().skip(start).take(PAGE).collect();
+        Ok((page, next))
+    }
+}
+
+/// Session `id` as a row of `rho/session/list`.
+fn summary(id: &str, session: &FakeSession) -> SessionSummary {
+    SessionSummary {
+        session: SessionId::new(id),
+        cwd: session.cwd.clone(),
+        added_dirs: Vec::new(),
+        title: session.title.clone(),
+        first_user_message: None,
+        last_user_message: None,
+        updated_at: session.updated_at,
     }
 }
 
@@ -878,39 +923,37 @@ impl Service for Fake {
         &self,
         params: SessionListParams,
     ) -> Result<SessionListResponse, RpcError> {
-        /// Small, so two sessions already exercise the cursor.
-        const PAGE: usize = 2;
         let state = self.lock();
-        let mut saved: Vec<(&String, &FakeSession)> = state
-            .sessions
-            .iter()
-            .filter(|(_, session)| session.saved && session.fork_of.is_none())
-            .collect();
-        saved.sort_by_key(|(_, session)| std::cmp::Reverse(session.updated_at));
-        let start = match params.cursor.as_deref().map(str::parse::<usize>) {
-            None => 0,
-            Some(Ok(start)) => start,
-            Some(Err(_)) => {
-                return Err(RpcError::new(ErrorCode::InvalidParams, "not a list cursor"));
-            }
-        };
-        let sessions = saved
-            .iter()
-            .skip(start)
-            .take(PAGE)
-            .map(|(id, session)| SessionSummary {
-                session: SessionId::new(id.as_str()),
-                cwd: session.cwd.clone(),
-                added_dirs: Vec::new(),
-                title: session.title.clone(),
-                first_user_message: None,
-                last_user_message: None,
-                updated_at: session.updated_at,
-            });
+        let (page, next_cursor) = state.saved_page(params.cursor.as_deref())?;
         Ok(SessionListResponse {
-            sessions: sessions.collect(),
-            next_cursor: (start + PAGE < saved.len()).then(|| (start + PAGE).to_string()),
+            sessions: page.iter().map(|(id, session)| summary(id, session)).collect(),
+            next_cursor,
         })
+    }
+
+    async fn list_sessions_detailed(
+        &self,
+        params: SessionListParams,
+    ) -> Result<SessionListDetailedResponse, RpcError> {
+        let state = self.lock();
+        if state.session_lists == SessionLists::Plain {
+            return Err(RpcError::new(
+                ErrorCode::MethodNotFound,
+                "this rho daemon does not serve rho/session/list_detailed",
+            ));
+        }
+        let (page, next_cursor) = state.saved_page(params.cursor.as_deref())?;
+        let sessions = page.iter().map(|(id, session)| {
+            DetailedSessionSummary::new(
+                summary(id, session),
+                Some(session.agent.clone()),
+                session.parent.as_deref().map(SessionId::new),
+            )
+        });
+        Ok(SessionListDetailedResponse::new(
+            sessions.collect(),
+            next_cursor,
+        ))
     }
 
     /// Refuses a blank title or one with a control character, as rho does.
@@ -1054,7 +1097,8 @@ impl Service for Fake {
             },
             state: session.state,
             workspace: session.cwd.clone(),
-            parent: None,
+            // A session another started runs under that session's job.
+            parent: session.parent.as_ref().map(|p| JobId::new(format!("job-{p}"))),
             grant: None,
             grant_limit: None,
             session: Some(SessionId::new(id.as_str())),
