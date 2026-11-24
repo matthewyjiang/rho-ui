@@ -776,6 +776,12 @@ impl Session {
         self.title = title;
     }
 
+    /// Sets the agent the session runs as, such as one from
+    /// [`crate::SessionSummary::agent`], until the daemon says it.
+    pub fn set_agent(&mut self, agent: Option<String>) {
+        self.agent = agent;
+    }
+
     /// Marks a prompt that the daemon refused before its turn began. Only
     /// for a session at rest: a refusal says nothing about a turn another
     /// client has under way.
@@ -832,10 +838,10 @@ impl Session {
 
     /// The id of the agent the session runs as, such as `worker`, or
     /// `default` for the default agent. A session opened as a named agent,
-    /// as [`crate::Daemon::new_lead`] opens one, knows it from the start.
-    /// The daemon says it at the start of every replay, and again when an
-    /// `/agent:` first prompt changes it; a daemon older than rho-protocol
-    /// 1.4 never does.
+    /// as [`crate::Daemon::new_lead`] opens one, knows it from the start,
+    /// and a saved one knows what [`Self::set_agent`] said. The daemon says
+    /// it at the start of every replay, and again when an `/agent:` first
+    /// prompt changes it; a daemon older than rho-protocol 1.4 never does.
     pub fn agent(&self) -> Option<&str> {
         self.agent.as_deref()
     }
