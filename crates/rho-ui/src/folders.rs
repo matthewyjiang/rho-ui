@@ -427,6 +427,15 @@ pub(crate) fn after<'a>(output: &'a [u8], marker: &[u8]) -> Option<&'a [u8]> {
     output.get(at + marker.len()..)
 }
 
+/// The path a script printed last, as a field ended by a NUL, after
+/// whatever a login file printed.
+pub(crate) fn last_path(output: &[u8]) -> Option<PathBuf> {
+    output
+        .split(|&byte| byte == 0)
+        .rfind(|field| !field.is_empty())
+        .map(platform::path_from_bytes)
+}
+
 /// Looks `typed` up with `reader`, doing file I/O on `executor`.
 ///
 /// # Errors

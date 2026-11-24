@@ -236,12 +236,7 @@ pub(crate) async fn clone(
         clone_here(&source.url, &folder, &name, &home, &projects)
     };
     let parse = |output: Vec<u8>| {
-        // The last field is the path, after whatever a login file printed.
-        let mut fields = output.split(|&byte| byte == 0).filter(|f| !f.is_empty());
-        fields
-            .next_back()
-            .map(platform::path_from_bytes)
-            .ok_or_else(|| "the clone script printed no path".to_owned())
+        folders::last_path(&output).ok_or_else(|| "the clone script printed no path".to_owned())
     };
     reader
         .query(&executor, here, SCRIPT, args, Deadline::Never, parse)
@@ -475,10 +470,10 @@ mod tests {
                 .env_remove("RHO_HOME")
                 .output()
                 .unwrap();
-            output.status.success().then(|| {
-                let path = output.stdout.split(|&b| b == 0).rfind(|f| !f.is_empty());
-                platform::path_from_bytes(path.unwrap())
-            })
+            output
+                .status
+                .success()
+                .then(|| folders::last_path(&output.stdout).unwrap())
         });
     }
 }
