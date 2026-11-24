@@ -16,8 +16,9 @@ rust-version = "1.98"
 # 1.2 builds the client for the browser (`Client::handshake_with_io`).
 # 1.4 serves a session's pull requests, names the agent a session runs
 # as (`SessionEvent::Agent`), and lists the models a model setting may
-# take (`rho/model/list`).
-rho-protocol = "1.4.0"
+# take (`rho/model/list`). 1.5 forks a session (`rho/session/fork`), for
+# side chats.
+rho-protocol = "1.5.0"
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 
@@ -97,3 +98,7 @@ enum_glob_use = "allow"                  # use Enum::* inside a function that ma
 [profile.dev.package."*"]
 opt-level = 3
 debug = "line-tables-only"
+
+# TEMP: rho-protocol 1.5.0 is merged in rho but not yet on crates.io.
+[patch.crates-io]
+rho-protocol = { path = "../rho-session-fork/crates/rho-protocol" }
