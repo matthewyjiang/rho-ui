@@ -48,7 +48,7 @@ use crate::{
     projects::Projects,
     pull_requests::{Serving, Shown, Which},
     rho_install::Offer,
-    right_panel::{Surface, TerminalShell, TerminalView, PROGRAM_POLL},
+    right_panel::{PanelLayout, Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, SmoothScroll, UiScale},
     shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
@@ -4028,13 +4028,15 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
 
 /// A row marks its session's PR, failing checks and all, for a session
 /// rho-ui lists but doesn't follow, so no event tells of it: listing
-/// finds it, and listing again within a minute finds its change.
+/// finds it, and listing again within a minute finds its change. Once
+/// its agent watches the PR, the row says so, as the session will wake by
+/// itself; and on screen its title bar marks the PR with the panel
+/// hidden, where a click shows it in the panel.
 #[test]
 fn a_sidebar_row_marks_its_pr() {
     let daemon = FakeDaemon::start(Script::default());
     let old = SessionKey::local("old");
-    // Never shown, so its pictures are never fetched.
-    daemon.open_pull_request(&old.id, "http://127.0.0.1:9");
+    daemon.open_pull_request(&old.id, &serve_pictures());
     let mut ui = Harness::open(
         "pull-request-row",
         daemon.target(),
@@ -4065,14 +4067,56 @@ fn a_sidebar_row_marks_its_pr() {
         &mut ui,
         Duration::from_secs(60),
         "the checks passing",
-        |ui| ui.label(mark.clone()).as_deref() == Some("#12"),
+        |ui| ui.label(mark.clone()).as_deref() == Some("#12, checks passing"),
     );
     let rollup = ui.cx.update(|cx| {
         let prs = ui.app.read(cx).pull_requests().read(cx);
-        prs.mark(&old).map(|pr| pr.rollup)
+        prs.mark(&old).map(|mark| mark.pr.rollup)
     });
     assert_eq!(rollup, Some(PullRequestRollup::Passing));
     assert!(ui.fake().pull_request_lists() > lists);
+
+    // The agent watches the PR, which links it.
+    ui.fake().edit_pull_requests(&old.id, |set| {
+        let pr = branch_pr(set).clone();
+        let mut link = LinkedPullRequest::new(
+            pr.id.clone(),
+            pr.url.clone(),
+            PullRequestLinkOrigin::Agent,
+            1_767_312_100,
+        );
+        link.watched = true;
+        link.summary = Some(pr);
+        set.linked.push(link);
+    });
+    let status = SharedString::from(format!("session-{old}-watching"));
+    advance_until(&mut ui, Duration::from_secs(60), "the row's watch", |ui| {
+        ui.label(status.clone()).is_some()
+    });
+    let (watching, marked) = ui.cx.update(|cx| {
+        let prs = ui.app.read(cx).pull_requests().read(cx);
+        (
+            prs.watching().contains(&old),
+            prs.mark(&old).map(|mark| mark.watched),
+        )
+    });
+    assert_eq!((watching, marked), (true, Some(true)));
+    ui.shot("watching");
+
+    let row = SharedString::from(format!("session-{old}"));
+    ui.act(|window, cx| window.click(row, cx));
+    ui.wait_until("the title bar's PR", |window, cx, _| {
+        is_visible(window, "title-pr") && !PanelLayout::get(cx)
+    });
+    ui.shot("title");
+    ui.click("title-pr");
+    ui.wait_until("the PR in the panel", |window, cx, _| {
+        PanelLayout::get(cx) && is_visible(window, "pull-request-title")
+    });
+    assert_eq!(
+        ui.label("pull-request-title").as_deref(),
+        Some("Add widgets")
+    );
 }
 
 /// Links go to the daemon, and tabs follow its links: each PR linked by

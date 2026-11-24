@@ -211,6 +211,13 @@ impl PanelLayout {
         rems(fit(width, row - sidebar - MIN_PANE_REMS, cx))
     }
 
+    /// Shows the panel if it is hidden, and saves that.
+    pub(crate) fn show(cx: &mut App) {
+        if !Self::get(cx) {
+            Self::toggle(cx);
+        }
+    }
+
     /// Shows the panel, or hides it, and saves which.
     pub(crate) fn toggle(cx: &mut App) {
         cx.update_global(|this: &mut Self, _| {
@@ -528,6 +535,22 @@ impl RightPanel {
         };
         self.show(key, cx);
         Some(key)
+    }
+
+    /// Shows PR `id` of the session on screen, as its title bar asks: its
+    /// Pull request tabs open if they weren't, and the one of `id` shows,
+    /// or the branch's while `id` has none yet.
+    pub(crate) fn show_pull_request(
+        &mut self,
+        id: &PullRequestId,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(session) = self.on_screen().cloned() else {
+            return;
+        };
+        self.open(Surface::PullRequest, window, cx);
+        self.show_link(&session, id, cx);
     }
 
     /// A new tab `key` of `session`, which works in `place`.

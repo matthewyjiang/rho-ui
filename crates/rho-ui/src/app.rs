@@ -237,7 +237,8 @@ pub(crate) struct RhoApp {
     app_update: Entity<AppUpdate>,
     /// The forge CLIs on each machine, for Settings and pull requests.
     forges: Entity<Forges>,
-    /// The pull requests the right panel shows.
+    /// The pull requests the right panel shows, and the sidebar and the
+    /// title bar mark.
     prs: Entity<PullRequests>,
     /// The epoch the next connection gets; see [`Connection::epoch`].
     next_epoch: u64,
@@ -1739,7 +1740,7 @@ impl RhoApp {
         self.sidebar.update(cx, |sidebar, cx| sidebar.own(&id, cx));
         let workspace = WorkspaceRef::new(&self.workspaces, cwd, cx);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
-        let auths = self.auths.clone();
+        let (auths, prs) = (self.auths.clone(), self.prs.clone());
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon,
@@ -1751,6 +1752,7 @@ impl RhoApp {
                 cx,
             )
             .with_sign_in(auths, window, cx)
+            .with_pull_requests(prs, cx)
         });
         self.insert_session(id, view.clone(), window, cx);
         view.update(cx, |view, cx| view.submit(prompt, window, cx));
@@ -1789,7 +1791,7 @@ impl RhoApp {
         let cwd = Place::new(id.machine.clone(), cwd);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
-        let auths = self.auths.clone();
+        let (auths, prs) = (self.auths.clone(), self.prs.clone());
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon.clone(),
@@ -1801,6 +1803,7 @@ impl RhoApp {
                 cx,
             )
             .with_sign_in(auths, window, cx)
+            .with_pull_requests(prs, cx)
         });
         self.insert_session(id.clone(), view.clone(), window, cx);
         self.show(Pane::Session(view), window, cx);
@@ -1909,6 +1912,13 @@ impl RhoApp {
                 // Only the session on screen shows its title bar, so the
                 // new one starts in its project.
                 SessionEvent::NewSession => this.new_session(window, cx),
+                // And so the panel shows this session's tabs.
+                SessionEvent::ShowPullRequest(id) => {
+                    PanelLayout::show(cx);
+                    this.panel.update(cx, |panel, cx| {
+                        panel.show_pull_request(id, window, cx);
+                    });
+                }
             },
         );
         if !view.read(cx).is_subagent() {

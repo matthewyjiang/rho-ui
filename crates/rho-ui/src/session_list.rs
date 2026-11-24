@@ -10,7 +10,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -57,7 +57,8 @@ enum Attention {
     Done,
     /// At rest, and seen.
     Rests,
-    /// A turn, or the background work one left, runs without the user.
+    /// A turn, or the background work one left, runs without the user, or
+    /// its agent watches a pull request, which wakes it without the user.
     Runs,
 }
 
@@ -172,6 +173,9 @@ pub(crate) struct Row {
     /// Its turn finished since it was last on screen (see [`Unseen`]): the
     /// row says Done once no work runs. As of the last rebuild.
     pub(crate) done: bool,
+    /// Its agent watches a pull request, which the row says instead of
+    /// Done or its age while no work runs. As of the last rebuild.
+    pub(crate) watching: bool,
 }
 
 impl Row {
@@ -184,6 +188,7 @@ impl Row {
     fn attention(&self) -> Attention {
         match self.activity {
             Activity::Waiting(_) => Attention::Asks,
+            Activity::Idle if self.watching => Attention::Runs,
             Activity::Idle if self.done => Attention::Done,
             Activity::Idle => Attention::Rests,
             Activity::Working(_) | Activity::Background => Attention::Runs,
@@ -225,6 +230,9 @@ pub(crate) struct SessionList {
     jobs: Vec<JobClock>,
     /// Sessions whose turn finished since they were last on screen.
     unseen: Unseen,
+    /// Sessions whose agent watches a pull request, as their daemons last
+    /// said.
+    watching: HashSet<SessionKey>,
     /// What the list shows, filtered by the search.
     items: Vec<Item>,
     /// Sessions matching the search on each shelf, indexed by [`slot`].
@@ -267,6 +275,7 @@ impl SessionList {
             live: Vec::new(),
             jobs: Vec::new(),
             unseen,
+            watching: HashSet::new(),
             items: Vec::new(),
             counts: [0; 3],
             open: [false; 3],
@@ -299,6 +308,7 @@ impl SessionList {
                 placeholder: live.map_or(UNTITLED, |live| live.placeholder),
                 activity: self.activity(&session.id),
                 done: false,
+                watching: false,
                 id: session.id,
                 cwd: session.cwd,
                 workspace: session.workspace,
@@ -348,6 +358,7 @@ impl SessionList {
                     saved: false,
                     pinned: None,
                     done: false,
+                    watching: false,
                 },
             );
         }
@@ -421,6 +432,7 @@ impl SessionList {
                     saved: false,
                     pinned: None,
                     done: false,
+                    watching: false,
                 },
             );
         }
@@ -486,6 +498,16 @@ impl SessionList {
         if let Some(row) = self.rows.iter_mut().find(|row| row.id == *id) {
             row.title = Some(title);
         }
+    }
+
+    /// Replaces the sessions whose agent watches a pull request. Returns
+    /// whether anything changed, so the list needs a rebuild.
+    pub(crate) fn set_watching(&mut self, watching: HashSet<SessionKey>) -> bool {
+        if self.watching == watching {
+            return false;
+        }
+        self.watching = watching;
+        true
     }
 
     /// Clears session `id`'s Done, as it is on screen. Returns whether it
@@ -584,6 +606,7 @@ impl SessionList {
             };
             row.pinned = shelves.pinned(&row.id);
             row.done = self.unseen.contains(&row.id);
+            row.watching = self.watching.contains(&row.id);
         }
         let matches = |machine: &MachineId, title: Option<&str>, ix: usize| {
             let (name, root) = workspace(ix);
@@ -1048,7 +1071,9 @@ mod tests {
     /// The active list reads as an inbox: under the pins, a session that
     /// asks comes first, then the Done ones, then those at rest, and the
     /// ones that run by themselves last; newest first within each. A pin
-    /// holds its row on top whatever the session does.
+    /// holds its row on top whatever the session does. A session whose
+    /// agent watches a pull request runs by itself, Done or not, until the
+    /// watch ends.
     #[test]
     fn the_active_list_ranks_sessions_as_an_inbox() {
         let now = Instant::now();
@@ -1082,6 +1107,22 @@ mod tests {
 
         // Its turn over, a session rises to the Done ones, newest first.
         list.set_live(live("working", None, Activity::Idle), 0, 21);
+        rebuild(&mut list, &shelves, 21);
+        assert_eq!(
+            shown(&list),
+            ["pinned", "asking", "working", "done", "idle", "background"]
+        );
+
+        // Its agent watches a PR: it will wake by itself, so it isn't Done.
+        let watching = HashSet::from([id("working")]);
+        assert!(list.set_watching(watching.clone()));
+        assert!(!list.set_watching(watching), "nothing changed");
+        rebuild(&mut list, &shelves, 21);
+        assert_eq!(
+            shown(&list),
+            ["pinned", "asking", "done", "idle", "working", "background"]
+        );
+        assert!(list.set_watching(HashSet::new()));
         rebuild(&mut list, &shelves, 21);
         assert_eq!(
             shown(&list),
