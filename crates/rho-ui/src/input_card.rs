@@ -40,8 +40,8 @@ use gpui_kit::{
     Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, Questions,
-    SuggestionStyle, Timeout,
+    Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, Questions, Suggestion,
+    Timeout,
 };
 
 /// How often the countdown redraws.
@@ -54,8 +54,14 @@ const TICK: Duration = Duration::from_secs(1);
 const QUESTION_TEXT_REMS: f32 = 0.875;
 
 /// A choice's padding left of its indicator, as a share of Kit's
-/// [`Size::Size`]. The text box starts on the same edge.
+/// [`Size::Size`]: its private `QuestionnaireMetrics::choice_padding_x`,
+/// to check when Kit changes. The text box starts on the same edge.
 const CHOICE_INSET: f32 = 0.75;
+
+/// A choice label's line height, as a share of its text size: the line
+/// Kit's private `answer_line_height` centers a choice's indicator on at
+/// [`Size::Size`], to check when Kit changes.
+const CHOICE_LINE: f32 = 1.5;
 
 /// What the user did with the card.
 pub(crate) enum InputCardEvent {
@@ -253,9 +259,8 @@ impl InputCard {
             .questions
             .iter()
             .find(|question| Some(question.id.as_str()) == item)?;
-        let suggestion = question.suggestion.as_ref()?;
-        let value = suggestion.choices.first()?;
-        (suggestion.style == SuggestionStyle::Marked).then_some((&question.id, value))
+        let value = question.marked()?.choices.first()?;
+        Some((&question.id, value))
     }
 
     /// The user started on the request: the first time, hold it if it
@@ -353,18 +358,22 @@ impl InputCard {
             Body::Questions { state, .. } => Some(state),
             Body::Choices { .. } | Body::Unsupported => None,
         };
-        let icon = match questions {
-            Some(_) => {
-                Icon::new(Lucide::MessageCircleQuestionMark).text_color(cx.theme().muted_foreground)
-            }
-            None => Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning),
+        let muted = cx.theme().muted_foreground;
+        let (icon, title) = match questions {
+            Some(_) => (
+                Icon::new(Lucide::MessageCircleQuestionMark).text_color(muted),
+                muted,
+            ),
+            None => (
+                Icon::new(IconName::TriangleAlert).text_color(cx.theme().warning),
+                cx.theme().foreground,
+            ),
         };
         let progress = questions
             .filter(|state| state.read(cx).total() > 1)
             .map(|state| {
                 // Kit sizes this in pixels too; see `QUESTION_TEXT_REMS`.
                 QuestionnaireProgress::new(state)
-                    .small()
                     .flex_shrink_0()
                     .text_xs()
                     .line_height(rems(1.))
@@ -378,9 +387,7 @@ impl InputCard {
                     .min_w_0()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .when(questions.is_some(), |this| {
-                        this.text_color(cx.theme().muted_foreground)
-                    })
+                    .text_color(title)
                     .child(self.request.title().to_owned()),
             )
             .children(progress)
@@ -508,9 +515,8 @@ impl InputCard {
         let navigation = state.read(cx).navigation_state();
         Questionnaire::new(state)
             .with_size(Size::Size(text))
-            // Kit centers a choice's indicator on a line this tall.
             .text_size(text)
-            .line_height(relative(1.5))
+            .line_height(relative(CHOICE_LINE))
             .children(items)
             .child(
                 QuestionnaireActions::new(state)
@@ -556,6 +562,7 @@ fn render_question(
 ) -> QuestionnaireItem {
     let item = SharedString::from(question.id.clone());
     let muted = cx.theme().muted_foreground;
+    let suggested = question.marked();
     let choices = question.choices.iter().map(|choice| {
         let selected = state
             .read(cx)
@@ -569,11 +576,14 @@ fn render_question(
                     .font_weight(FontWeight::MEDIUM)
                     .child(choice.label.clone()),
             )
-            .when(question.marks(&choice.value), |this| {
-                // As tall as the label's line, so it adds nothing to the row.
-                let tag = Tag::secondary().outline().small().text_xs();
-                this.child(tag.flex_shrink_0().child("Suggested"))
-            });
+            .when(
+                suggested.is_some_and(|it| it.names(&choice.value)),
+                |this| {
+                    // As tall as the label's line, so it adds nothing to the row.
+                    let tag = Tag::secondary().outline().small().text_xs();
+                    this.child(tag.flex_shrink_0().child("Suggested"))
+                },
+            );
         let description = choice
             .description
             .clone()
@@ -623,6 +633,8 @@ fn render_question(
         // Only where there is a box: an empty wrapper would still take a gap.
         .when(question.takes_text, |this| {
             let other = SharedString::from(format!("question-{}-other", question.id));
+            // Kit's input has no height of its own at `Size::Size`, and a
+            // named size drops the choices' inset.
             let input = QuestionnaireInput::new(state, item.clone())
                 .with_size(Size::Medium)
                 .pl(text * CHOICE_INSET);
@@ -725,18 +737,18 @@ fn questionnaire(
 /// names its choices "suggested" to assistive technology, as their tag
 /// does on screen, and shows its own text as the text box's placeholder.
 fn item(question: &Question, window: &mut Window, cx: &mut App) -> QuestionnaireItemDefinition {
-    let suggestion = question.suggestion.as_ref();
-    let picks = suggestion.filter(|suggestion| suggestion.style == SuggestionStyle::Selected);
-    let marks = suggestion.filter(|suggestion| suggestion.style == SuggestionStyle::Marked);
+    let (picked, marked) = (question.picked(), question.marked());
+    let names = |suggestion: Option<&Suggestion>, value: &str| {
+        suggestion.is_some_and(|suggestion| suggestion.names(value))
+    };
     let choices = question.choices.iter().map(|choice| {
-        let label = if question.marks(&choice.value) {
+        let label = if names(marked, &choice.value) {
             format!("{} (suggested)", choice.label)
         } else {
             choice.label.clone()
         };
-        let picked = picks.is_some_and(|suggestion| suggestion.choices.contains(&choice.value));
         let definition = QuestionnaireChoiceDefinition::new(choice.value.clone(), label)
-            .with_default_selected(picked);
+            .with_default_selected(names(picked, &choice.value));
         match &choice.description {
             Some(description) => definition.with_description(description.clone()),
             None => definition,
@@ -756,8 +768,8 @@ fn item(question: &Question, window: &mut Window, cx: &mut App) -> Questionnaire
         } else {
             "Or your own answer"
         };
-        let picked = picks.and_then(|suggestion| suggestion.own.clone());
-        let marked = marks.and_then(|suggestion| suggestion.own.as_deref());
+        let picked = picked.and_then(|suggestion| suggestion.own.clone());
+        let marked = marked.and_then(|suggestion| suggestion.own.as_deref());
         let state = cx.new(|cx| {
             let state = InputState::new(window, cx);
             match (picked, marked) {

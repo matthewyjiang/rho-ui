@@ -180,13 +180,20 @@ pub struct Question {
 }
 
 impl Question {
-    /// Whether the agent's suggestion marks the choice of value `value`,
-    /// rather than picking it.
-    pub fn marks(&self, value: &str) -> bool {
-        self.suggestion.as_ref().is_some_and(|suggestion| {
-            suggestion.style == SuggestionStyle::Marked
-                && suggestion.choices.iter().any(|choice| choice == value)
-        })
+    /// The agent's suggestion, if it is picked already.
+    pub fn picked(&self) -> Option<&Suggestion> {
+        self.suggested(SuggestionStyle::Selected)
+    }
+
+    /// The agent's suggestion, if it is only marked.
+    pub fn marked(&self) -> Option<&Suggestion> {
+        self.suggested(SuggestionStyle::Marked)
+    }
+
+    fn suggested(&self, style: SuggestionStyle) -> Option<&Suggestion> {
+        self.suggestion
+            .as_ref()
+            .filter(|suggestion| suggestion.style == style)
     }
 
     /// The label of the choice of value `value`, if one has it.
@@ -219,6 +226,13 @@ pub struct Suggestion {
     pub own: Option<String>,
     /// How to offer it.
     pub style: SuggestionStyle,
+}
+
+impl Suggestion {
+    /// Whether it names the choice of value `value`.
+    pub fn names(&self, value: &str) -> bool {
+        self.choices.iter().any(|choice| choice == value)
+    }
 }
 
 /// How a host offers a [`Suggestion`].
