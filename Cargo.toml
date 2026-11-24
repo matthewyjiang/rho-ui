@@ -99,6 +99,7 @@ enum_glob_use = "allow"                  # use Enum::* inside a function that ma
 opt-level = 3
 debug = "line-tables-only"
 
-# TEMP: rho-protocol 1.5.0 is merged in rho but not yet on crates.io.
+# TEMP: rho-protocol 1.5.0 is merged in rho (#2017) but not yet on
+# crates.io; take it from git until it is, then drop this.
 [patch.crates-io]
-rho-protocol = { path = "../rho-session-fork/crates/rho-protocol" }
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "166fa2bcf0899bd7f9626ef2cecff63123de32cb" }
