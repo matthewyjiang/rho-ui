@@ -23,9 +23,9 @@ use crate::{machines::MachineId, repo};
 /// drops a search's task when the next one starts, so a burst of keys runs
 /// one ssh script, not one a key: each takes one of the few sessions the
 /// shared connection runs scripts in at once, which everything else read
-/// on the machine waits for too. 150 ms is longer than the gap between keys at 80 words a
-/// minute (about 400 keys a minute, 150 ms apart) and short enough to read
-/// as instant.
+/// on the machine waits for too. 150 ms is longer than the gap between
+/// keys at 80 words a minute (about 400 keys a minute, 150 ms apart) and
+/// short enough to read as instant.
 const REMOTE_PAUSE: Duration = Duration::from_millis(150);
 
 /// The rules a machine's paths follow.

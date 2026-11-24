@@ -268,7 +268,11 @@ fn a_script_dropped_while_its_session_opens_closes_it() {
                 futures::poll!(&mut script).is_pending(),
                 "the script waits for its session"
             );
-            within("the script's session being asked for", sshd.session_asked()).await;
+            within(
+                "the script's session being asked for",
+                sshd.sessions_asked(1),
+            )
+            .await;
         }
         sshd.confirm_sessions();
         within(
@@ -279,8 +283,8 @@ fn a_script_dropped_while_its_session_opens_closes_it() {
     });
 }
 
-/// Twice the scripts at once that sshd allows a connection sessions all
-/// run: a connection runs only a few at a time, and the rest wait their
+/// Twice as many scripts at once as sshd allows a connection sessions all
+/// run: the connection runs a few at a time and the rest wait their
 /// turn, where sshd would refuse those past its `MaxSessions`.
 #[cfg(unix)]
 #[test]
@@ -298,7 +302,7 @@ fn scripts_past_sshds_sessions_wait_their_turn() {
             (0..2 * MAX_SESSIONS).map(|_| ssh.run_script("true", &[""; 0])),
         );
         let confirm = async {
-            sshd.session_asked().await;
+            sshd.sessions_asked(1).await;
             // A round trip behind the sessions the scripts asked for, so
             // sshd has counted each, and refused those past its limit,
             // before it confirms any.

@@ -75,7 +75,7 @@ pub const MAX_SHELLS: usize = SSHD_SESSIONS;
 /// none of 10,200. A script given up on while it runs leaves its slot at
 /// once, though sshd holds its session until the script's process ends,
 /// so sshd may still refuse one, with an error that names `MaxSessions`.
-const SCRIPTS_AT_ONCE: usize = SSHD_SESSIONS / 2;
+pub(super) const SCRIPTS_AT_ONCE: usize = SSHD_SESSIONS / 2;
 
 /// What a connection to a host carries. Scripts burst to a handful of
 /// sessions at once as a session's turn ends, and a terminal pane keeps a
@@ -344,11 +344,11 @@ impl Connection {
             .expect("nothing closes the scripts' semaphore")
     }
 
-    /// A slot for one more terminal's shell, of [`MAX_SHELLS`]; the shell
-    /// holds it while it runs, and dropping it frees it. sshd frees the
-    /// shell's session a moment later, once the shell has gone, so a
-    /// terminal opened at once in its place may meet sshd's own refusal,
-    /// whose error names `MaxSessions` too.
+    /// A slot for one more terminal's shell, of [`MAX_SHELLS`]; the
+    /// shell's channel holds it ([`Self::session`]) until it is told to
+    /// close. sshd frees the shell's session a moment later, once the
+    /// shell has gone, so a terminal opened at once in its place may meet
+    /// sshd's own refusal, whose error names `MaxSessions` too.
     ///
     /// # Errors
     ///
@@ -369,8 +369,6 @@ impl Connection {
 
     /// A stream to the Unix socket `socket` on the host, such as the Rho
     /// daemon's, over a `direct-streamlocal` channel, as `ssh -W` opens.
-    ///
-    /// # Errors
     ///
     /// The open runs to its end whether or not the caller still waits, as
     /// [`Self::session`]'s does: the stream closes its channel when

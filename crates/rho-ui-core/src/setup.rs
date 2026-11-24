@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::{
     daemon::DaemonError,
-    link::{quote, Link, ScriptError},
+    link::{self, quote, Link, ScriptError},
     rho_install::find_rho_sh,
 };
 
@@ -63,6 +63,10 @@ pub(crate) async fn run(link: &Link, rho: &str) -> Result<Setup, DaemonError> {
                     "{host} didn't finish starting rho within {} s: check that a login shell \
                      there starts without waiting for input",
                     deadline.as_secs()
+                ),
+                ScriptError::NoSlot { waited, at_once } => format!(
+                    "couldn't start the Rho daemon: {}",
+                    link::no_slot(host, waited, at_once)
                 ),
                 ScriptError::Cut => {
                     format!("the connection to {host} closed while starting rho there")

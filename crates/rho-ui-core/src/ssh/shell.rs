@@ -21,8 +21,8 @@
 //! once, without sending the input still queued, and sshd hangs up on
 //! the shell. Clones of [`ShellInput`] don't keep it. One machine runs at
 //! most [`MAX_SHELLS`](crate::MAX_SHELLS) shells at once, the sessions
-//! sshd allows on their connection by default; a shell's slot frees when
-//! its task ends.
+//! sshd allows on their connection by default; a shell's slot frees once
+//! its channel is told to close.
 //!
 //! russh's session loop hands each channel what arrives for it through a
 //! queue of `channel_buffer_size` messages (100, `client::Config`'s
