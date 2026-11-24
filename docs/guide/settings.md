@@ -32,6 +32,8 @@ Lists the worktrees rho added for sessions, and **Remove** prunes them as `rho w
 
 rho's own settings, as each machine's daemon describes them, so settings a newer rho adds show up without a new rho-ui. Each says when a change applies. If `config.toml` changed elsewhere since the page read it, rho refuses the write and the page shows the settings as they are now.
 
+A model setting lists the models that machine's rho can run with its sign-ins, and the list follows each sign-in and sign-out. If rho can't list them, the page says why and shows the model without a picker. A rho too old to list them also shows the model alone: change it with `/config` in rho's terminal UI.
+
 ## The daemon
 
 **Settings → About** shows each machine's daemon, with **Restart** and **Stop**.

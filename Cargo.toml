@@ -14,8 +14,9 @@ rust-version = "1.98"
 [workspace.dependencies]
 # rho's daemon protocol: wire types and the client, released with rho 3.
 # 1.2 builds the client for the browser (`Client::handshake_with_io`).
-# 1.4 serves a session's pull requests, and names the agent a session runs
-# as (`SessionEvent::Agent`).
+# 1.4 serves a session's pull requests, names the agent a session runs
+# as (`SessionEvent::Agent`), and lists the models a model setting may
+# take (`rho/model/list`).
 rho-protocol = "1.4.0"
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }

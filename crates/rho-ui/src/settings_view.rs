@@ -249,7 +249,7 @@ impl SettingsView {
             ],
         };
         view.sync_machine_fields(window, cx);
-        view.sync_rho_inputs(window, cx);
+        view.sync_rho_controls(window, cx);
         view
     }
 

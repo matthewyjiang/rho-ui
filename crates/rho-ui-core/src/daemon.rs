@@ -33,19 +33,19 @@ use rho_protocol::{
     methods, Client, ClientEnvironment, ClientError, ClientHello, ClientInfo, ConfigGetParams,
     ConfigLayer, ConfigNamespace, ConfigRevision, ConfigSchemaParams, ConfigSetParams,
     ConfigWriter, DaemonNotification, DetachReason, ErrorCode, FrameError, HelloResponse,
-    IdempotencyKey, IdleWake, JobListParams, LoginId, LoginOutcome, LoginPrompt, Notifications,
-    RestartParams, SessionAnswerParams, SessionAttachParams, SessionBackgroundStopParams,
-    SessionCancelParams, SessionChange, SessionConfigureParams, SessionDeleteParams,
-    SessionDetachParams, SessionHoldParams, SessionListParams, SessionNewParams,
-    SessionObserveParams, SessionPromptParams, SessionRenameParams, SessionSteerParams,
-    SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn, StatusParams,
-    StopParams, TurnOutcome, UnsteerOutcome,
+    IdempotencyKey, IdleWake, JobListParams, LoginId, LoginOutcome, LoginPrompt, ModelListParams,
+    Notifications, RestartParams, SessionAnswerParams, SessionAttachParams,
+    SessionBackgroundStopParams, SessionCancelParams, SessionChange, SessionConfigureParams,
+    SessionDeleteParams, SessionDetachParams, SessionHoldParams, SessionListParams,
+    SessionNewParams, SessionObserveParams, SessionPromptParams, SessionRenameParams,
+    SessionSteerParams, SessionSurfaceActionParams, SessionUnsteerParams, SettingChange, SignIn,
+    StatusParams, StopParams, TurnOutcome, UnsteerOutcome,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    agent_settings::{AgentSettings, AgentSettingsChanged},
+    agent_settings::{AgentSettings, AgentSettingsChanged, Changed, ListedModels},
     background::BackgroundId,
     exec,
     input::{Answer, InputId},
@@ -359,9 +359,9 @@ pub enum DaemonEvent {
         reason: Detached,
     },
     /// rho's own settings on the daemon's machine changed, by any client
-    /// or a hand edit of `config.toml`. Sent once
-    /// [`Daemon::agent_settings`] has read them; apply it with
-    /// [`AgentSettings::apply`].
+    /// or a hand edit of `config.toml`, or the models a model setting may
+    /// take did, as a sign-in does. Sent once [`Daemon::agent_settings`]
+    /// has read them; apply it with [`AgentSettings::apply`].
     AgentSettingsChanged(AgentSettingsChanged),
     /// What the user must do to finish a login [`Daemon::login`] started:
     /// open a page, and for a device code enter the code there.
@@ -426,7 +426,12 @@ impl DaemonEvents {
                     if changed.namespace == ConfigNamespace::Agent =>
                 {
                     return Some(DaemonEvent::AgentSettingsChanged(AgentSettingsChanged(
-                        changed,
+                        Changed::Config(changed),
+                    )));
+                }
+                DaemonNotification::ModelsChanged(models) => {
+                    return Some(DaemonEvent::AgentSettingsChanged(AgentSettingsChanged(
+                        Changed::Models(models),
                     )));
                 }
                 DaemonNotification::LoginPrompt(prompt) => {
@@ -1186,14 +1191,19 @@ impl Daemon {
     }
 
     /// rho's own settings on the daemon's machine: every setting the daemon
-    /// describes, with its value. From then on the connection sends
-    /// [`DaemonEvent::AgentSettingsChanged`] whenever a value or the file's
-    /// problems change, whoever changed them; reading again replaces that.
+    /// describes, with its value, and the models a model setting may take.
+    /// From then on the connection sends
+    /// [`DaemonEvent::AgentSettingsChanged`] whenever a value, the file's
+    /// problems or the models change, whoever changed them; reading again
+    /// replaces that.
     ///
     /// # Errors
     ///
     /// Fails if the daemon has no settings to describe, as an older rho, or
-    /// the connection is gone.
+    /// the connection is gone. A daemon that can't list the models still
+    /// gives the settings, and [`AgentSettings::models`] says why; the
+    /// list stays failed until a [`DaemonEvent::AgentSettingsChanged`]
+    /// brings one, or the next read.
     pub async fn agent_settings(&self) -> Result<AgentSettings, DaemonError> {
         let schema = self
             .client
@@ -1203,7 +1213,24 @@ impl Daemon {
             namespace: ConfigNamespace::Agent,
         };
         let read = self.client.request::<methods::ConfigGet>(&params).await?;
-        Ok(AgentSettings::new(schema, read))
+        let params = ModelListParams {
+            environment: ClientEnvironment::clone(&self.environment),
+        };
+        let models = match self
+            .client
+            .request::<methods::ModelListMethod>(&params)
+            .await
+        {
+            Ok(models) => ListedModels::Listed(models),
+            Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => {
+                ListedModels::Unsupported
+            }
+            Err(error) => match DaemonError::from(error) {
+                DaemonError::Closed => return Err(DaemonError::Closed),
+                error => ListedModels::Failed(error.to_string()),
+            },
+        };
+        Ok(AgentSettings::new(schema, read, models))
     }
 
     /// Writes `changes` to the user's own `config.toml`, all of them or
