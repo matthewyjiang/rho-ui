@@ -1856,20 +1856,18 @@ fn sessions_a_session_started_fold_under_it() {
     );
 }
 
-/// A lead starts as rho's lead agent in a folder of its own, named from its
-/// first message, made in the rho home's leads, and lists under the Leads
-/// header. A new session from it starts in a project, not in its folder.
-#[test]
-fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
+/// Starts a lead, "new-2", from the sidebar with the first message "Fix
+/// the parser!", in a rho home of its own, which the lead's folder is
+/// made in: keep it for as long as the test reads that folder.
+fn start_lead(shots: &'static str) -> (Harness, tempfile::TempDir) {
     let rho_home = tempfile::tempdir().expect("a rho home");
     let daemon = FakeDaemon::start(Script::default());
     let machines = Machines {
         rho_home: Some(rho_home.path().to_path_buf()),
         ..Machines::default()
     };
-    let mut ui = Harness::open_with("leads", daemon.target(), Some(daemon), machines);
+    let mut ui = Harness::open_with(shots, daemon.target(), Some(daemon), machines);
     ui.wait_until("the sidebar", |window, _, _| is_visible(window, "new-lead"));
-
     ui.click("new-lead");
     ui.wait_until("the lead's draft", |_, cx, app| {
         app.draft()
@@ -1877,6 +1875,15 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
     });
     ui.send("Fix the parser!");
     ui.wait_for_session("the lead", |session| session.id().as_str() == "new-2");
+    (ui, rho_home)
+}
+
+/// A lead starts as rho's lead agent in a folder of its own, named from its
+/// first message, made in the rho home's leads, and lists under the Leads
+/// header. A new session from it starts in a project, not in its folder.
+#[test]
+fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
+    let (mut ui, rho_home) = start_lead("leads");
     let leads = platform::canonicalize(&rho_home.path().join("leads")).expect("the leads root");
     let folder = leads.join("fix-the-parser");
     assert_eq!(
@@ -1964,6 +1971,106 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
     assert_eq!(
         ui.fake().added_dirs("new-2"),
         Some(vec![project.path().to_path_buf()])
+    );
+}
+
+/// A lead's panel starts on Work, beside Brief. Work lists the sessions
+/// the lead started and the PRs linked to it, and a session's row opens
+/// that session, whose panel offers neither. Brief reads the lead's
+/// `brief.md` again as its turn ends.
+#[test]
+fn a_leads_panel_shows_its_work_and_brief() {
+    let (mut ui, _rho_home) = start_lead("lead-view");
+    ui.wait_until("the lead's tabs", |_, cx, app| {
+        app.panel_tabs(cx) == [Surface::Work, Surface::Brief]
+    });
+    let app = ui.app.clone();
+    ui.act(|_, cx| {
+        assert_eq!(
+            app.read(cx).brief_text(cx),
+            None,
+            "no brief before the lead writes one"
+        );
+    });
+
+    // In its first turn the lead writes its brief, starts a session that
+    // works and one that has finished its turn, and links a PR open and one
+    // merged.
+    let lead = SessionKey::local("new-2");
+    let folder = ui.fake().cwd("new-2").expect("the lead's folder");
+    let brief = "# Fix the parser\n\nOne session writes it, one tests it.\n";
+    std::fs::write(folder.join("brief.md"), brief).expect("write the brief");
+    ui.fake()
+        .start_session("new-2", "w1", "Write the parser", Started::Working);
+    ui.fake()
+        .start_session("new-2", "w2", "Test the parser", Started::Idle);
+    let open = linked_pr(
+        "github.com",
+        14,
+        "Ship the parser",
+        PullRequestLinkOrigin::Agent,
+    );
+    let mut merged = linked_pr(
+        "github.com",
+        15,
+        "Fix the lexer",
+        PullRequestLinkOrigin::Agent,
+    );
+    if let Some(summary) = &mut merged.summary {
+        summary.state = PullRequestState::Merged;
+    }
+    ui.fake()
+        .edit_pull_requests(&lead.id, |set| set.linked.extend([open, merged]));
+    // Its turn ends after the brief is written, which the panel reads.
+    ui.wait_until("the approval card", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.click("approval-allow-once");
+    ui.wait_for_session("the lead's turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.wait_until("Work showing, beside Brief", |window, cx, app| {
+        is_visible(window, "lead-work") && app.panel_tabs(cx) == [Surface::Work, Surface::Brief]
+    });
+    let items = [
+        "lead-work-item-local-w1",
+        "lead-work-item-local-w2",
+        "lead-work-item-acme/widgets#14",
+        "lead-work-item-acme/widgets#15",
+    ];
+    // The daemon's jobs, polled each second, list the sessions it started.
+    advance_until(&mut ui, Duration::from_secs(1), "the lead's work", |ui| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                items.iter().all(|id| is_visible(window, *id))
+            })
+            .expect("window is open")
+    });
+    // The jobs also say which of them works, which the shot shows.
+    ui.wait_for_label("session-local-new-2-fold", "2 sessions · 1 working");
+    ui.shot("work");
+
+    ui.click("panel-tab-brief");
+    ui.wait_until("the lead's brief", |window, cx, app| {
+        is_visible(window, "brief-text") && app.brief_text(cx).as_deref() == Some(brief)
+    });
+    ui.shot("brief");
+
+    ui.click("panel-tab-work");
+    ui.click("lead-work-item-local-w1");
+    ui.wait_for_session("the started session open", |session| {
+        session.id().as_str() == "w1"
+    });
+    ui.wait_until(
+        "its panel, offering no lead's surfaces",
+        |window, cx, app| {
+            app.panel_tabs(cx).is_empty()
+                && is_visible(window, "open-surface-files")
+                && !is_visible(window, "open-surface-work")
+                && !is_visible(window, "open-surface-brief")
+        },
     );
 }
 

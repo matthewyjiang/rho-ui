@@ -1,6 +1,6 @@
 # The right panel
 
-The panel beside the transcript (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>) holds a terminal, side chats, the session's files, its diff, its pull request, and its background work. Each session has its own tabs, and they stay alive while you look at another session, terminal shells included, until rho-ui quits. Everything in the panel runs on the session's machine.
+The panel beside the transcript (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>) holds a terminal, side chats, the session's files, its diff, its pull request, and its background work, and for a lead, its work and its brief (see [Leads](./sessions#leads)). Each session has its own tabs, and they stay alive while you look at another session, terminal shells included, until rho-ui quits. Everything in the panel runs on the session's machine.
 
 ![A pull request in the panel, beside its session](/shots/pull-request-pr.webp)
 

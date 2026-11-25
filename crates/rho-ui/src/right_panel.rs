@@ -11,10 +11,12 @@
 //! and follows (see [`crate::session_view`]); closing its tab deletes the
 //! fork. Pull request opens one, named for the number of the PR it shows,
 //! and switches between the session's PRs in place; the others open one.
-//! With none open, the panel lists the surfaces to open; + in the header
-//! opens a menu of the rest. Each
+//! Work and Brief are a lead's alone ([`crate::leads::Kind`]): what it
+//! started, and its `brief.md`. With none open, the panel lists the
+//! surfaces to open; + in the header opens a menu of the rest. Each
 //! session has its own tabs ([`TabSet`]): switching sessions switches
-//! tabs, and a session's first time on screen it has none.
+//! tabs, and a session's first time on screen it has none, but a lead's
+//! has Work and Brief, Work showing.
 //!
 //! Ghostty's shortcuts for tabs and splits ([`TerminalShortcut`]) act on
 //! the terminal with the keyboard, or else the one under the pointer.
@@ -24,8 +26,10 @@
 //! such as [`diff::DiffSurface`], is a view of its own, made when its tab
 //! opens ([`Tab`]) for the session the tab belongs to.
 
+mod brief;
 mod diff;
 mod files;
+mod lead_work;
 mod pull_request;
 mod tabs;
 mod terminal;
@@ -52,8 +56,10 @@ use gpui_kit::{
 };
 use rho_ui_core::PullRequestId;
 
+use self::brief::BriefSurface;
 use self::diff::DiffSurface;
 use self::files::FilesSurface;
+use self::lead_work::WorkSurface;
 use self::pull_request::{PullRequestSurface, Visibility};
 use self::tabs::{Tab, TabKey, TabSet};
 pub(crate) use self::terminal::{Direction, PaneCommand, TerminalShell};
@@ -61,9 +67,11 @@ use self::terminal::{Emptied, TerminalTab};
 #[cfg(test)]
 pub(crate) use self::terminal::{TerminalView, PROGRAM_POLL};
 use crate::{
+    leads::Kind,
     machines::{Place, SessionKey},
     pull_requests::PullRequests,
     session_view::{SessionEvent, SessionView},
+    sidebar::SidebarView,
     store::{Key, StateDb},
     title_bar::TOP_ROW_REMS,
     window_chrome::{self, DragArea, MovesWindow as _},
@@ -100,11 +108,18 @@ pub(crate) enum Surface {
     Terminal,
     /// A side conversation: a fork of the session.
     SideChat,
+    /// A lead's work: the sessions it started and the PRs linked to it.
+    Work,
+    /// A lead's `brief.md`, which it reads at the start of every turn.
+    Brief,
 }
 
 impl Surface {
-    /// Every surface, in the order the panel lists them.
-    const ALL: [Surface; 6] = [
+    /// Every surface, in the order the panel lists them: a lead's own
+    /// first.
+    const ALL: [Surface; 8] = [
+        Surface::Work,
+        Surface::Brief,
         Surface::Files,
         Surface::Terminal,
         Surface::SideChat,
@@ -112,6 +127,10 @@ impl Surface {
         Surface::PullRequest,
         Surface::Background,
     ];
+
+    /// A lead's own surfaces, which no other session offers, in the order
+    /// its tabs open them.
+    const LEAD: [Surface; 2] = [Surface::Work, Surface::Brief];
 
     /// The surface's part of its elements' IDs.
     fn id(self) -> &'static str {
@@ -122,6 +141,8 @@ impl Surface {
             Surface::PullRequest => "pull-request",
             Surface::Terminal => "terminal",
             Surface::SideChat => "side-chat",
+            Surface::Work => "work",
+            Surface::Brief => "brief",
         }
     }
 
@@ -133,6 +154,8 @@ impl Surface {
             Surface::PullRequest => "Pull request",
             Surface::Terminal => "Terminal",
             Surface::SideChat => "Side chat",
+            Surface::Work => "Work",
+            Surface::Brief => "Brief",
         }
     }
 
@@ -144,6 +167,8 @@ impl Surface {
             Surface::PullRequest => Lucide::GitPullRequest,
             Surface::Terminal => Lucide::SquareTerminal,
             Surface::SideChat => Lucide::MessagesSquare,
+            Surface::Work => Lucide::LayoutList,
+            Surface::Brief => Lucide::NotebookText,
         }
     }
 
@@ -354,10 +379,21 @@ pub(crate) struct RightPanel {
     session: Option<(SessionKey, Subscription)>,
     /// The tab under the pointer, which shows × in place of its icon.
     hovered: Option<TabKey>,
-    /// What the Pull request surface reads PRs through.
+    /// What the Pull request and Work surfaces read PRs through.
     prs: Entity<PullRequests>,
+    /// What the Work surface reads a lead's sessions through, and opens
+    /// them with.
+    sidebar: Entity<SidebarView>,
     /// Tells the Pull request surface when the panel shows or hides.
     _layout: Subscription,
+}
+
+/// What a lead's own surfaces ([`Surface::LEAD`]) read through, the
+/// panel's.
+struct LeadSources<'a> {
+    workspaces: &'a Entity<Workspaces>,
+    prs: &'a Entity<PullRequests>,
+    sidebar: &'a Entity<SidebarView>,
 }
 
 impl RightPanel {
@@ -365,6 +401,7 @@ impl RightPanel {
         workspaces: Entity<Workspaces>,
         shell: TerminalShell,
         prs: Entity<PullRequests>,
+        sidebar: Entity<SidebarView>,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let layout = cx.observe_global::<PanelLayout>(|this, cx| this.sync_shown(cx));
@@ -375,6 +412,7 @@ impl RightPanel {
             session: None,
             hovered: None,
             prs,
+            sidebar,
             _layout: layout,
         }
     }
@@ -400,7 +438,7 @@ impl RightPanel {
             Tab::PullRequest { view, .. } => view.read(cx).has_keyboard(window, cx),
             Tab::Terminal { view, .. } => view.read(cx).has_keyboard_anywhere(window, cx),
             Tab::SideChat { view, .. } => view.read(cx).has_keyboard(window, cx),
-            Tab::Background | Tab::Diff(_) | Tab::Files(_) => false,
+            Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::Work(_) | Tab::Brief(_) => false,
         })
     }
 
@@ -427,8 +465,8 @@ impl RightPanel {
     }
 
     /// Shows the tabs of `session`, the one on screen, or none. Its first
-    /// time on screen, it has none open; coming back, its Diff and Files
-    /// read again.
+    /// time on screen, it has none open but a lead's own; coming back, its
+    /// Diff, Files and Brief read again.
     pub(crate) fn set_session(
         &mut self,
         session: Option<Entity<SessionView>>,
@@ -463,8 +501,44 @@ impl RightPanel {
                 // What changed while it was away shows.
                 self.reload(&key, Reload::Shown, cx);
             }
-            let redraw = cx.observe(&view, |_, _, cx| cx.notify());
+            self.decide_kind(&key, cx);
+            let redraw = cx.observe(&view, {
+                let key = key.clone();
+                move |this, _, cx| {
+                    this.decide_kind(&key, cx);
+                    cx.notify();
+                }
+            });
             self.session = Some((key, redraw));
+        }
+        self.sync_shown(cx);
+        cx.notify();
+    }
+
+    /// Decides `session`'s kind ([`TabSet::kind`]) if its view now knows
+    /// it, and for a lead opens [`Surface::LEAD`], the first showing unless
+    /// another tab is.
+    fn decide_kind(&mut self, session: &SessionKey, cx: &mut Context<'_, Self>) {
+        let Some(set) = self.sets.get_mut(session) else {
+            return;
+        };
+        if set.kind.is_some() {
+            return;
+        }
+        set.kind = set.known_kind(cx);
+        if set.kind != Some(Kind::Lead) {
+            return;
+        }
+        // Borrowed apart from the set, which stays borrowed.
+        let sources = LeadSources {
+            workspaces: &self.workspaces,
+            prs: &self.prs,
+            sidebar: &self.sidebar,
+        };
+        for surface in Surface::LEAD {
+            let tab = Self::lead_tab(surface, session, &set.place, &sources, cx);
+            set.active = set.active.or(Some(tab.key()));
+            set.push(tab);
         }
         self.sync_shown(cx);
         cx.notify();
@@ -484,8 +558,9 @@ impl RightPanel {
         })
     }
 
-    /// Reads what `session`'s Diff and Files show again, and when its turn
-    /// ended, its PR on screen (which is asked for again as it comes back).
+    /// Reads what `session`'s Diff, Files and Brief show again, and when
+    /// its turn ended, its PR on screen (which is asked for again as it
+    /// comes back).
     fn reload(&self, session: &SessionKey, why: Reload, cx: &mut Context<'_, Self>) {
         let Some(set) = self.sets.get(session) else {
             return;
@@ -494,10 +569,12 @@ impl RightPanel {
             match tab {
                 Tab::Diff(diff) => diff.update(cx, DiffSurface::reload),
                 Tab::Files(files) => files.update(cx, FilesSurface::reload),
+                Tab::Brief(brief) => brief.update(cx, BriefSurface::reload),
                 Tab::PullRequest { view, .. } if why == Reload::TurnEnded => {
                     view.update(cx, PullRequestSurface::turn_ended);
                 }
                 Tab::Background
+                | Tab::Work(_)
                 | Tab::PullRequest { .. }
                 | Tab::Terminal { .. }
                 | Tab::SideChat { .. } => {}
@@ -619,6 +696,43 @@ impl RightPanel {
                 }
             }
             Surface::SideChat => unreachable!("open() asks the session for a fork"),
+            Surface::Work | Surface::Brief => {
+                let sources = LeadSources {
+                    workspaces: &self.workspaces,
+                    prs: &self.prs,
+                    sidebar: &self.sidebar,
+                };
+                Self::lead_tab(key.surface, session, &place, &sources, cx)
+            }
+        }
+    }
+
+    /// A new tab of `surface`, one of [`Surface::LEAD`], of lead `lead`,
+    /// which works in `place`. It needs no window: a lead's tabs open as
+    /// its kind is decided, where there is none.
+    fn lead_tab(
+        surface: Surface,
+        lead: &SessionKey,
+        place: &Place,
+        sources: &LeadSources<'_>,
+        cx: &mut Context<'_, Self>,
+    ) -> Tab {
+        match surface {
+            Surface::Work => {
+                let (sidebar, prs) = (sources.sidebar.clone(), sources.prs.clone());
+                let (lead, panel) = (lead.clone(), cx.entity().downgrade());
+                Tab::Work(cx.new(|cx| WorkSurface::new(lead, sidebar, prs, panel, cx)))
+            }
+            Surface::Brief => {
+                let (workspaces, place) = (sources.workspaces.clone(), place.clone());
+                Tab::Brief(cx.new(|cx| BriefSurface::new(workspaces, place, cx)))
+            }
+            Surface::Background
+            | Surface::Diff
+            | Surface::Files
+            | Surface::PullRequest
+            | Surface::Terminal
+            | Surface::SideChat => unreachable!("{surface:?} is not a lead's own"),
         }
     }
 
@@ -791,6 +905,15 @@ impl RightPanel {
     pub(crate) fn open_file(&self, cx: &App) -> Option<(String, String)> {
         self.set()?.tabs.iter().find_map(|tab| match tab {
             Tab::Files(files) => files.read(cx).open_file_text(cx),
+            _ => None,
+        })
+    }
+
+    /// The text the Brief surface shows, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn brief_text(&self, cx: &App) -> Option<String> {
+        self.set()?.tabs.iter().find_map(|tab| match tab {
+            Tab::Brief(brief) => brief.read(cx).text(),
             _ => None,
         })
     }
@@ -1070,6 +1193,8 @@ impl RightPanel {
             ),
             Tab::Diff(diff) => diff.clone().into_any_element(),
             Tab::Files(files) => files.clone().into_any_element(),
+            Tab::Work(work) => work.clone().into_any_element(),
+            Tab::Brief(brief) => brief.clone().into_any_element(),
             Tab::PullRequest { view, .. } => view.clone().into_any_element(),
             Tab::Terminal { view, .. } => view.clone().into_any_element(),
             Tab::SideChat { view, .. } => view.clone().into_any_element(),

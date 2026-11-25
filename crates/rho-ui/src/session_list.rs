@@ -237,13 +237,54 @@ impl Row {
             .unwrap_or_else(|| self.placeholder.into())
     }
 
-    fn attention(&self) -> Attention {
+    /// What the row says of its session at its right; `None` when it says
+    /// only its age.
+    pub(crate) fn status(&self) -> Option<Status> {
         match self.activity {
-            Activity::Waiting(_) => Attention::Asks,
-            Activity::Idle if self.watching => Attention::Runs,
-            Activity::Idle if self.done => Attention::Done,
-            Activity::Idle => Attention::Rests,
-            Activity::Working(_) | Activity::Background => Attention::Runs,
+            Activity::Working(since) => Some(Status::Working(since)),
+            Activity::Waiting(since) => Some(Status::NeedsYou(since)),
+            Activity::Background => Some(Status::Background),
+            Activity::Idle if self.watching => Some(Status::Watching),
+            Activity::Idle if self.done => Some(Status::Done),
+            Activity::Idle => None,
+        }
+    }
+
+    fn attention(&self) -> Attention {
+        match self.status() {
+            Some(Status::NeedsYou(_)) => Attention::Asks,
+            Some(Status::Done) => Attention::Done,
+            Some(Status::Working(_) | Status::Background | Status::Watching) => Attention::Runs,
+            None => Attention::Rests,
+        }
+    }
+}
+
+/// What a row says of its session, short of its age: its [`Activity`],
+/// and at rest, whether its agent watches a PR or its turn is Done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Status {
+    /// A turn runs; it started at this moment.
+    Working(Instant),
+    /// It waits for the user; the first request arrived at this moment.
+    NeedsYou(Instant),
+    /// No turn runs, but background work a turn started does.
+    Background,
+    /// Its agent watches a pull request, which wakes it.
+    Watching,
+    /// Its turn finished since it was last on screen.
+    Done,
+}
+
+impl Status {
+    /// The word the sidebar's row says it with, and the Work surface's.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Status::Working(_) => "Working",
+            Status::NeedsYou(_) => "Needs you",
+            Status::Background => "Waiting",
+            Status::Watching => "Watching",
+            Status::Done => "Done",
         }
     }
 }
@@ -937,6 +978,18 @@ impl SessionList {
 
     pub(crate) fn row(&self, id: &SessionKey) -> Option<&Row> {
         self.rows.iter().find(|row| row.id == *id)
+    }
+
+    /// The rows of the sessions `starter` started itself, not those they
+    /// started in turn, in the list's order, whatever the search and the
+    /// filter show.
+    pub(crate) fn started_by<'a>(
+        &'a self,
+        starter: &'a SessionKey,
+    ) -> impl Iterator<Item = &'a Row> + 'a {
+        self.rows
+            .iter()
+            .filter(move |row| row.parent.as_ref() == Some(starter))
     }
 
     /// How many sessions wait for a person and how many are working,

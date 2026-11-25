@@ -5,10 +5,10 @@
 use gpui_kit::{App, Entity, ScrollHandle, SharedString, Subscription, WeakEntity};
 
 use super::{
-    diff::DiffSurface, files::FilesSurface, pull_request::PullRequestSurface,
-    terminal::TerminalTab, Surface,
+    brief::BriefSurface, diff::DiffSurface, files::FilesSurface, lead_work::WorkSurface,
+    pull_request::PullRequestSurface, terminal::TerminalTab, Surface,
 };
-use crate::{machines::Place, session_view::SessionView};
+use crate::{leads::Kind, machines::Place, session_view::SessionView};
 
 /// Which tab of a session's: its surface, and its number among that
 /// surface's tabs there, from 1 and never reused. Terminal opens as many as
@@ -36,6 +36,10 @@ pub(super) enum Tab {
     Background,
     Diff(Entity<DiffSurface>),
     Files(Entity<FilesSurface>),
+    /// A lead's work: the sessions it started and the PRs linked to it.
+    Work(Entity<WorkSurface>),
+    /// A lead's `brief.md`.
+    Brief(Entity<BriefSurface>),
     /// The session's PRs, one at a time, with the subscription that
     /// redraws the panel as its label changes.
     PullRequest {
@@ -64,6 +68,8 @@ impl Tab {
             Tab::Background => (Surface::Background, 1),
             Tab::Diff(_) => (Surface::Diff, 1),
             Tab::Files(_) => (Surface::Files, 1),
+            Tab::Work(_) => (Surface::Work, 1),
+            Tab::Brief(_) => (Surface::Brief, 1),
             Tab::PullRequest { .. } => (Surface::PullRequest, 1),
             Tab::Terminal { number, .. } => (Surface::Terminal, *number),
             Tab::SideChat { number, .. } => (Surface::SideChat, *number),
@@ -85,7 +91,9 @@ impl Tab {
             Tab::SideChat { number, .. } => {
                 format!("{} {number}", Surface::SideChat.label()).into()
             }
-            Tab::Background | Tab::Diff(_) | Tab::Files(_) => self.key().surface.label().into(),
+            Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::Work(_) | Tab::Brief(_) => {
+                self.key().surface.label().into()
+            }
         }
     }
 }
@@ -109,6 +117,11 @@ pub(super) struct TabSet {
     next_terminal: u32,
     /// The number the next side chat's tab gets.
     next_side_chat: u32,
+    /// The session's own kind: a lead alone offers [`Surface::LEAD`],
+    /// which open as that is decided. `None` until its agent is known,
+    /// which may be after the set is made; decided once, so tabs the user
+    /// closed stay closed.
+    pub(super) kind: Option<Kind>,
 }
 
 impl TabSet {
@@ -123,6 +136,7 @@ impl TabSet {
             scroll: ScrollHandle::new(),
             next_terminal: 1,
             next_side_chat: 1,
+            kind: None,
         }
     }
 
@@ -139,16 +153,32 @@ impl TabSet {
         self.tabs.iter().position(|tab| tab.key() == key)
     }
 
+    /// The session's kind as its view knows it now, for [`Self::kind`]:
+    /// `None` while its agent isn't known. A lead's subagent or side chat
+    /// is no lead itself ([`SessionView::kind`]).
+    pub(super) fn known_kind(&self, cx: &App) -> Option<Kind> {
+        let view = self.view.upgrade()?;
+        let view = view.read(cx);
+        if view.parent().is_some() {
+            Some(Kind::Session)
+        } else {
+            view.agent_kind()
+        }
+    }
+
     /// The surfaces + and the list offer: those that open many, and those
     /// without a tab; Side chat while the session can start one
-    /// ([`SessionView::side_chat_refusal`]).
+    /// ([`SessionView::side_chat_refusal`]); [`Surface::LEAD`] for a lead
+    /// alone.
     pub(super) fn openable(&self, cx: &App) -> Vec<Surface> {
         let side_chats = self
             .view
             .upgrade()
             .is_some_and(|view| view.read(cx).side_chat_refusal().is_none());
+        let lead = self.kind == Some(Kind::Lead);
         Surface::ALL
             .into_iter()
+            .filter(|surface| lead || !Surface::LEAD.contains(surface))
             .filter(|&surface| match surface {
                 Surface::SideChat => side_chats,
                 surface => {
@@ -170,7 +200,12 @@ impl TabSet {
                 self.next_side_chat += 1;
                 self.next_side_chat - 1
             }
-            Surface::PullRequest | Surface::Background | Surface::Diff | Surface::Files => 1,
+            Surface::PullRequest
+            | Surface::Background
+            | Surface::Diff
+            | Surface::Files
+            | Surface::Work
+            | Surface::Brief => 1,
         };
         TabKey { surface, number }
     }
