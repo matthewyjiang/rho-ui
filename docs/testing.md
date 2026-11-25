@@ -29,6 +29,12 @@ Set `RHO_UI_LIVE_ATTACH` to the ID of a session whose turn waits on an approval,
 RHO_UI_LIVE_RHO=/path/to/rho cargo test -p rho-ui live_background -- --ignored --nocapture
 ```
 
+`live_lead` checks a lead the same way, with a rho that has the `lead` agent: a lead started from the sidebar starts one worker in the git repository `RHO_UI_LIVE_REPO` names and ends its turn while the worker sleeps; the daemon's own turn then tells it the worker is done. The test prints both turns' entries and the lead's reply for you to check. The repository needs one commit and no remote, and the rho home must be in `bypass`:
+
+```bash
+RHO_UI_LIVE_RHO=/path/to/rho RHO_UI_LIVE_REPO=/path/to/repo cargo test -p rho-ui live_lead -- --ignored --nocapture
+```
+
 `a_live_daemon_over_ssh` reaches the daemon on an ssh host with your own ssh setup, twice, and prints how long each connect took; the second rides the first's connection. The host must have rho installed and its key in `known_hosts`. Set `RHO_UI_LIVE_SSH_RHO` when rho is not on the PATH of a non-interactive ssh command there. To point it at `localhost` with a `known_hosts` of its own, give it a `Host` entry in `~/.ssh/config` with `HostName localhost` and `UserKnownHostsFile`:
 
 ```bash
