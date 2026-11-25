@@ -33,7 +33,7 @@ use rho_protocol::{
 
 use crate::{
     background::{BackgroundKind, BackgroundStatus, BackgroundWork},
-    daemon::SessionId,
+    daemon::{SessionId, SessionMark},
     input::{InputId, InputRequest},
     options::{commands, CommandInfo, SessionOptions, StartedSessionDefaults},
     prompt::{Attachment, Image, Prompt},
@@ -56,6 +56,21 @@ impl SessionUpdate {
     pub fn pull_requests(&self) -> Option<&SessionPullRequests> {
         match &self.event {
             SessionEvent::PullRequests { pull_requests } => Some(pull_requests.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// The session's mark, when this update says it changed: set by any
+    /// client, this one too, or by the daemon itself. `Some(None)` once
+    /// cleared, or set to a kind this client does not know. Saved
+    /// conversations hold none, so a replay may carry only the changes
+    /// since the last save. [`Session::apply`] ignores it; a session holds
+    /// no mark.
+    pub fn mark_changed(&self) -> Option<Option<SessionMark>> {
+        match &self.event {
+            SessionEvent::MarkChanged { mark } => {
+                Some(mark.as_ref().and_then(SessionMark::from_wire))
+            }
             _ => None,
         }
     }

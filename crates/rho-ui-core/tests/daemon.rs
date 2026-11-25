@@ -16,10 +16,10 @@ use rho_ui_core::{
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
     BackgroundWork, Checkout, ChoiceKind, Choices, Continuity, Daemon, DaemonError, DaemonEvent,
     DaemonEvents, DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity,
-    LoginOutcome, ModelRef, OptionChange, PermissionMode, Prompt, PromptKey, PullRequestError,
-    PullRequestId, RestartCost, RunState, Session, SessionId, StartedMode, StartedSessionChange,
-    StartedSessionDefaults, SurfaceActionError, ToolStatus, Unsteered, VersionFix, WorktreeVerdict,
-    MAX_PROMPT_ATTACHMENT_BYTES,
+    LoginOutcome, ModelRef, NewSessionMark, OptionChange, PermissionMode, Prompt, PromptKey,
+    PullRequestError, PullRequestId, RestartCost, RunState, Session, SessionId, SessionMark,
+    SessionSummary, StartedMode, StartedSessionChange, StartedSessionDefaults, SurfaceActionError,
+    ToolStatus, Unsteered, VersionFix, WorktreeVerdict, MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -644,6 +644,63 @@ fn the_session_list_names_the_session_that_started_each() {
         }
     });
     assert_eq!(older.detailed_lists(), 1);
+}
+
+/// A mark one client saves is listed with the session, and a client
+/// attached to the session hears it as it changes.
+#[test]
+fn a_mark_is_listed_and_reaches_the_sessions_followers() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let (follower, mut events) = connect(&fake).await;
+        let s1 = SessionId::from("s1");
+        let mut session = Session::new(s1.clone());
+        session.attached(follower.attach(&s1, None).await.unwrap());
+        until(&mut events, &mut session, |s| !s.is_replaying()).await;
+
+        daemon
+            .mark_session(&s1, NewSessionMark::Done)
+            .await
+            .unwrap();
+        let listed = daemon.list_sessions().await.unwrap();
+        let mark = listed
+            .iter()
+            .find(|listed| *listed.id() == s1)
+            .and_then(SessionSummary::mark);
+        assert!(matches!(mark, Some(SessionMark::Done { .. })), "{mark:?}");
+        let heard = loop {
+            match next(&mut events).await {
+                DaemonEvent::Update { update, .. } => {
+                    if let Some(mark) = update.mark_changed() {
+                        break mark;
+                    }
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+        assert_eq!(heard, mark, "the follower hears the mark as listed");
+    });
+}
+
+/// A daemon from before marks refuses one, with an error the user can
+/// read rather than the protocol's.
+#[test]
+fn a_daemon_from_before_marks_refuses_one() {
+    let fake = FakeDaemon::start(Script {
+        session_lists: SessionLists::Plain,
+        ..Script::default()
+    });
+    block_on(async {
+        let (daemon, _events) = connect(&fake).await;
+        let refused = daemon
+            .mark_session(&SessionId::from("s1"), NewSessionMark::Done)
+            .await;
+        assert!(
+            matches!(refused, Err(DaemonError::Refused(_))),
+            "{refused:?}"
+        );
+    });
 }
 
 #[test]

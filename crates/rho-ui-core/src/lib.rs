@@ -35,8 +35,8 @@ pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
     Detached, PendingUpgrade, PromptKey, PullRequestError, ReportedWorktree, RestartCost,
-    SessionId, SessionSummary, SurfaceActionError, Unsteered, VersionFix, VersionMismatch,
-    LEAD_AGENT,
+    SessionId, SessionMark, SessionSummary, SurfaceActionError, Unsteered, VersionFix,
+    VersionMismatch, LEAD_AGENT,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -57,6 +57,8 @@ pub use remote_shell::{
     RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput,
 };
 pub use rho_install::{RhoCheck, RhoInstall, Update};
+/// The mark [`Daemon::mark_session`] sets, as rho-protocol has it.
+pub use rho_protocol::NewSessionMark;
 /// The auth profiles, logins and credential store [`Daemon`]'s sign-in
 /// methods speak of, as rho-protocol has them.
 pub use rho_protocol::{

@@ -17,6 +17,12 @@
 //!   [`Script::session_lists`] [`SessionLists::Plain`], the daemon is from
 //!   before `list_detailed`, which answers `MethodNotFound`.
 //!   [`FakeDaemon::detailed_lists`] counts the `list_detailed` requests.
+//! - `rho/session/mark` saves a session's mark, stamped with the time,
+//!   which `rho/session/list_detailed` lists and its followers hear of.
+//!   No session starts with a mark. [`FakeDaemon::set_mark`] marks one as
+//!   another client, or the daemon itself, would. A daemon from before
+//!   `list_detailed` ([`SessionLists::Plain`]) is from before marks too,
+//!   and answers `MethodNotFound`.
 //! - Attaching to "old" replays one agent message, "replayed", then
 //!   [`Script::replay_turns`] turns, each a question, a thought, three tool
 //!   calls, an edit, and a Markdown answer.
@@ -193,7 +199,7 @@ use tokio::{
     sync::watch,
 };
 
-use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId};
+use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId, SessionMark};
 
 mod auth;
 mod config;
@@ -360,14 +366,15 @@ pub struct Script {
     pub pull_requests: PullRequestMethods,
 }
 
-/// Whether the fake daemon serves `rho/session/list_detailed`.
+/// Whether the fake daemon serves `rho/session/list_detailed`, and with it
+/// `rho/session/mark`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionLists {
     /// It serves `list_detailed` as well as `list`.
     #[default]
     Detailed,
     /// As a daemon from before `list_detailed`: it serves `list` alone, and
-    /// `list_detailed` answers `MethodNotFound`.
+    /// `list_detailed` and `mark` answer `MethodNotFound`.
     Plain,
 }
 
@@ -699,6 +706,28 @@ impl FakeDaemon {
             .get_mut(id.as_str())
             .unwrap_or_else(|| panic!("the fake daemon has no session {id}"));
         session.started = choice;
+    }
+
+    /// The mark session `id` has saved, if it has one.
+    pub fn mark(&self, id: &str) -> Option<SessionMark> {
+        let mark = self.service.lock().sessions.get(id)?.mark.clone()?;
+        SessionMark::from_wire(&mark)
+    }
+
+    /// Saves `mark` as session `id`'s, stamped with the time, as another
+    /// client or the daemon itself does, and tells the session's followers.
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `id`, or doesn't know the mark's kind.
+    pub fn set_mark(&self, id: &str, mark: &rho_protocol::NewSessionMark) {
+        let mut state = self.service.lock();
+        let session = state
+            .sessions
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("the fake daemon has no session {id}"));
+        let mark = SessionMark::stamp(mark, unix_now()).expect("a mark the fake daemon knows");
+        session.remark(Some(mark));
     }
 
     /// How many worktrees the daemon has added for new sessions.
@@ -1148,6 +1177,8 @@ struct FakeSession {
     title: Option<String>,
     /// Unix seconds, for the list's order.
     updated_at: u64,
+    /// What `rho/session/mark` saved; a fork starts with none.
+    mark: Option<rho_protocol::SessionMark>,
     /// Listed by `rho/session/list`: a new session is once it has a prompt.
     saved: bool,
     /// The id of the agent it runs as, which a reset replay starts with.
@@ -1196,6 +1227,7 @@ impl FakeSession {
             cwd: PathBuf::from(cwd),
             title: title.map(str::to_owned),
             updated_at,
+            mark: None,
             saved: true,
             agent: "default".to_owned(),
             settings: Settings::new(),
@@ -1309,9 +1341,9 @@ impl FakeSession {
     /// transcripts hold none (rho replays them only for a turn in
     /// progress, which the fake doesn't keep apart): the attach response
     /// lists the work as it is now, without work whose result the model
-    /// has. Nor do they hold pull requests, which a client asks for, or
-    /// changes to the choice for started sessions. Nor does it mark
-    /// steers, as rho's doesn't.
+    /// has. Nor do they hold pull requests, which a client asks for,
+    /// marks, which the list reports, or changes to the choice for started
+    /// sessions. Nor does it mark steers, as rho's doesn't.
     fn transcript(&self) -> Vec<(Seq, SessionEvent)> {
         let agent = SessionEvent::Agent {
             id: self.agent.clone(),
@@ -1326,6 +1358,7 @@ impl FakeSession {
                     SessionEvent::Background { .. }
                         | SessionEvent::PullRequests { .. }
                         | SessionEvent::StartedSessionDefaults(_)
+                        | SessionEvent::MarkChanged { .. }
                 )
             })
             .cloned();
@@ -1346,6 +1379,15 @@ impl FakeSession {
             .enumerate()
             .map(|(ix, event)| (Seq(if ix == last { self.live_seq } else { 0 }), event))
             .collect()
+    }
+
+    /// Saves `mark` in place of the session's own, and tells its followers
+    /// if that changed it, as rho does.
+    fn remark(&mut self, mark: Option<rho_protocol::SessionMark>) {
+        if self.mark != mark {
+            self.mark.clone_from(&mark);
+            self.publish(SessionEvent::MarkChanged { mark });
+        }
     }
 
     /// Records `event` and sends it to every attached client.
@@ -1671,6 +1713,14 @@ fn card(status: ToolStatus, family: ToolFamily, header: ToolHeader) -> ToolCard 
 }
 
 /// The card of shell command `command`, which printed `output` once done.
+/// The time as the fake daemon's clock says, in Unix seconds.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_secs()
+}
+
 fn shell_card(command: &str, status: ToolStatus, output: Option<&str>) -> ToolCard {
     let header = ToolHeader::shell("$", Some(command.to_owned()));
     let mut card = card(status, ToolFamily::FileCommand, header);
@@ -2110,10 +2160,7 @@ impl State {
     /// saved within one second keep their order.
     fn next_date(&self) -> u64 {
         let newest = self.sessions.values().map(|session| session.updated_at);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("the clock is past 1970")
-            .as_secs();
+        let now = unix_now();
         newest.max().map_or(now, |newest| now.max(newest + 1))
     }
 

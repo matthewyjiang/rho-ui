@@ -59,7 +59,7 @@ use gpui_kit::{
     Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
     Subscription, Task, WeakEntity, Window,
 };
-use rho_ui_core::{Job, SessionSummary};
+use rho_ui_core::{Job, NewSessionMark, SessionMark, SessionSummary};
 
 use crate::{
     app_update::{self, AppUpdate},
@@ -75,7 +75,7 @@ use crate::{
         SavedSession, SessionList, SHELF_PAGE,
     },
     settings::{self, Settings},
-    shelf::{Shelf, Shelves},
+    shelf::{self, Shelf},
     store::StateDb,
     time,
     title_bar::TOP_ROW_REMS,
@@ -165,7 +165,7 @@ struct Snooze {
     short: &'static str,
     /// The label in the context menu's Snooze submenu.
     long: &'static str,
-    seconds: i64,
+    seconds: u64,
 }
 
 const SNOOZES: [Snooze; 3] = [
@@ -208,21 +208,13 @@ impl ShelfAction {
     /// What a row offers, inline and in its menu. A busy session offers
     /// nothing: it shows as active until its turn ends, as does a session
     /// whose family is busy. Nor does a pinned one, which stays active
-    /// until unpinned, or one a session started, which moves with that one.
+    /// until unpinned, one a session started, which moves with that one, or
+    /// one its daemon has saved nothing of, which it keeps no mark for.
     fn for_row(row: &Row) -> &'static [ShelfAction] {
-        if row.pinned.is_some() || row.family == Family::Started || row.busy() {
+        if row.pinned.is_some() || row.family == Family::Started || row.busy() || !row.saved {
             return &[];
         }
         Self::offered(row.shelf)
-    }
-
-    /// Marks `session` in `shelves` as this move puts it, as of `now`.
-    fn apply(self, shelves: &mut Shelves, session: &SessionKey, now: i64) {
-        match self {
-            ShelfAction::Settle => shelves.settle(session, now),
-            ShelfAction::Snooze(snooze) => shelves.snooze(session, now + snooze.seconds),
-            ShelfAction::Restore => shelves.restore(session, now),
-        }
     }
 
     fn offered(shelf: Shelf) -> &'static [ShelfAction] {
@@ -246,6 +238,20 @@ impl ShelfAction {
             ShelfAction::Settle => Icon::new(IconName::Check),
             ShelfAction::Snooze(_) => Icon::new(Lucide::AlarmClock),
             ShelfAction::Restore => Icon::new(IconName::Undo2),
+        }
+    }
+
+    /// The mark that makes the move at `now`, which the daemon is asked to
+    /// save. A restore keeps the session rather than clearing its mark, so
+    /// the daemon doesn't settle it again for a pull request that merged
+    /// before.
+    fn mark(self, now: u64) -> NewSessionMark {
+        match self {
+            ShelfAction::Settle => NewSessionMark::Done,
+            ShelfAction::Snooze(snooze) => NewSessionMark::Snoozed {
+                until: now.saturating_add(snooze.seconds),
+            },
+            ShelfAction::Restore => NewSessionMark::Kept,
         }
     }
 }
@@ -274,6 +280,13 @@ pub(crate) enum SidebarEvent {
     Rename {
         id: SessionKey,
         title: SharedString,
+    },
+    /// Save `mark` as the mark of each of `sessions`, a session and the
+    /// sessions it started, in their daemon. Their rows show it already
+    /// when the machine is connected.
+    Mark {
+        sessions: Vec<SessionKey>,
+        mark: NewSessionMark,
     },
     OpenSettings,
     /// Collapse the sidebar to its rail, or open it again; see
@@ -310,10 +323,10 @@ struct Renaming {
 }
 
 /// What the sidebar remembers between runs, each part loaded from the
-/// state database: settled and snoozed sessions, the ones Done and not yet
-/// seen, whether it is collapsed, and its filter.
+/// state database: the sessions Done and not yet seen, whether it is
+/// collapsed, and its filter. Pinned, settled and snoozed sessions are their
+/// daemons' to keep (see [`crate::shelf`]).
 pub(crate) struct SidebarState {
-    pub(crate) shelves: Shelves,
     pub(crate) unseen: Unseen,
     pub(crate) layout: SidebarLayout,
     pub(crate) filter: SavedFilter,
@@ -322,7 +335,6 @@ pub(crate) struct SidebarState {
 impl SidebarState {
     pub(crate) fn load(db: &StateDb) -> Self {
         Self {
-            shelves: Shelves::load(db),
             unseen: Unseen::load(db),
             layout: SidebarLayout::load(db),
             filter: SavedFilter::load(db),
@@ -342,7 +354,6 @@ pub(crate) struct SidebarView {
     /// Each active row's PR, which its branch line marks, and whether its
     /// agent watches one, which its status says.
     prs: Entity<PullRequests>,
-    shelves: Shelves,
     layout: SidebarLayout,
     saved_filter: SavedFilter,
     active: Option<SessionKey>,
@@ -434,7 +445,6 @@ impl SidebarView {
             app_update,
             projects,
             prs,
-            shelves: state.shelves,
             layout: state.layout,
             saved_filter: state.filter,
             active: None,
@@ -471,6 +481,7 @@ impl SidebarView {
                         .parent()
                         .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
                     kind: session.agent().map_or(Kind::Session, Kind::of),
+                    mark: session.mark(),
                 })
                 .collect();
             workspaces.set_history(
@@ -569,7 +580,6 @@ impl SidebarView {
     /// Drops a session that was deleted.
     pub(crate) fn remove(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         self.list.remove(id);
-        self.shelves.forget(id);
         if self.active.as_ref() == Some(id) {
             self.active = None;
         }
@@ -657,11 +667,10 @@ impl SidebarView {
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
         let workspaces = self.workspaces.read(cx);
         let watching = self.prs.read(cx).watching();
-        self.list
-            .rebuild(&self.shelves, time::now_unix(), &watching, |ix| {
-                let workspace = workspaces.get(ix);
-                (workspace.name.as_ref(), workspace.root_path())
-            });
+        self.list.rebuild(time::now_unix(), &watching, |ix| {
+            let workspace = workspaces.get(ix);
+            (workspace.name.as_ref(), workspace.root_path())
+        });
         // Every session on the active shelf the filter shows has its PRs
         // listed by its daemon, under a closed fold too, as what it watches
         // ranks its family; so has every row drawn there, a starter shown
@@ -711,24 +720,47 @@ impl SidebarView {
     }
 
     fn shelve(&mut self, id: &SessionKey, action: ShelfAction, cx: &mut Context<'_, Self>) {
-        let now = time::now_unix();
         // A family moves as one.
-        for session in self.list.family(id) {
-            action.apply(&mut self.shelves, &session, now);
-        }
-        // The row moves away from the pointer.
-        self.hover = None;
-        self.rebuild(cx);
+        let family = self.list.family(id);
+        self.mark(family, action.mark(now()), cx);
     }
 
     fn set_pinned(&mut self, id: &SessionKey, pin: Pin, cx: &mut Context<'_, Self>) {
-        let now = time::now_unix();
-        match pin {
-            Pin::Pin => self.shelves.pin(id, now),
-            Pin::Unpin => self.shelves.unpin(id, now),
+        self.mark(vec![id.clone()], pin.mark(), cx);
+    }
+
+    /// Asks the app to save `mark` as the mark of each of `sessions`, a
+    /// session and the sessions it started, in their daemon; each is one it
+    /// has saved, as a row offers no move otherwise and
+    /// [`SessionList::family`] leaves the others out. They show it at once,
+    /// stamped with this machine's time until the daemon's own comes, only
+    /// when the daemon can take it, as a rename is; the daemon's next list
+    /// replaces it either way, so a mark it refused goes.
+    fn mark(
+        &mut self,
+        sessions: Vec<SessionKey>,
+        mark: NewSessionMark,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let machines = self.machines.read(cx);
+        let connected = sessions.first().is_some_and(|id| {
+            matches!(
+                machines.status(&id.machine),
+                Some(MachineStatus::Ready { .. })
+            )
+        });
+        if let Some(shown) = SessionMark::stamped(&mark, now()).filter(|_| connected) {
+            let mut moved = false;
+            for id in &sessions {
+                moved |= self.list.set_mark(id, shown);
+            }
+            if moved {
+                // The row moves away from the pointer.
+                self.hover = None;
+                self.rebuild(cx);
+            }
         }
-        self.hover = None;
-        self.rebuild(cx);
+        cx.emit(SidebarEvent::Mark { sessions, mark });
     }
 
     /// Turns `id`'s title into a text box holding it, all selected.
@@ -1178,7 +1210,7 @@ impl SidebarView {
     ) -> AnyElement {
         let theme = cx.theme();
         let state = self.row_state(row);
-        let wakes = self.shelves.wakes(&row.id);
+        let wakes = shelf::wakes(row.mark);
         let offered = ShelfAction::for_row(row);
         let right = if state.hovered && !offered.is_empty() {
             // Icon-only: the row is one line.
@@ -2119,6 +2151,23 @@ enum Pin {
     Unpin,
 }
 
+impl Pin {
+    /// As [`ShelfAction::mark`]. An unpinned session is kept, on the
+    /// active list for a while.
+    fn mark(self) -> NewSessionMark {
+        match self {
+            Pin::Pin => NewSessionMark::Pinned,
+            Pin::Unpin => NewSessionMark::Kept,
+        }
+    }
+}
+
+/// This machine's time, in Unix seconds: what a snooze counts from, and
+/// what a mark made here is shown with until its daemon stamps its own.
+fn now() -> u64 {
+    u64::try_from(time::now_unix()).unwrap_or(0)
+}
+
 /// The right-click menu: Rename, Pin unless the session moves with the one
 /// that started it, the moves the hover buttons offer,
 /// Copy, and Delete, which a busy session can't do, nor one whose family is
@@ -2283,7 +2332,8 @@ struct MenuRow {
     cwd: PathBuf,
     offered: &'static [ShelfAction],
     /// What the menu offers: a session a session started has no pin of its
-    /// own, as it moves with that one.
+    /// own, as it moves with that one, and one its daemon has saved nothing
+    /// of can't be pinned, as the daemon keeps no mark for it.
     pin: Option<Pin>,
     /// Busy sessions can't be deleted, nor a starter while any of its
     /// family is busy: as with moves, it waits for them.
@@ -2300,7 +2350,7 @@ impl MenuRow {
             pin: match (row.family, row.pinned) {
                 (Family::Started, _) => None,
                 (Family::Top(_), Some(_)) => Some(Pin::Unpin),
-                (Family::Top(_), None) => Some(Pin::Pin),
+                (Family::Top(_), None) => row.saved.then_some(Pin::Pin),
             },
             busy: row.busy(),
         }
@@ -2315,14 +2365,16 @@ mod tests {
 
     /// A busy session offers no moves, nor a starter at rest while a
     /// session it started works, as its family stays active until then;
-    /// shelves offer a way back.
+    /// nor does a session the daemon has saved nothing of, or a pin, as the
+    /// daemon would refuse its mark. Shelves offer a way back.
     #[test]
-    fn busy_sessions_offer_no_moves_and_shelves_offer_a_way_back() {
+    fn busy_and_unsaved_sessions_offer_no_moves_and_shelves_offer_a_way_back() {
         let session = |id: &str, parent: Option<&str>| SavedSession {
             id: SessionKey::local(id),
             cwd: PathBuf::from("/w"),
             title: None,
             updated: 1,
+            mark: None,
             workspace: 0,
             parent: parent.map(SessionKey::local),
             kind: Kind::Session,
@@ -2332,57 +2384,39 @@ mod tests {
             session("busy", None),
             session("w1", Some("lead")),
             session("lead", None),
+            session("idle", None),
         ];
         list.set_saved(&MachineId::local(), sessions);
-        for id in ["busy", "w1"] {
+        let working = Activity::Working(Instant::now());
+        // "fresh" is a session of this run that has had no prompt.
+        for (id, activity) in [
+            ("busy", working),
+            ("w1", working),
+            ("fresh", Activity::Idle),
+        ] {
             let live = LiveSession {
                 id: SessionKey::local(id),
                 cwd: PathBuf::from("/w"),
                 title: None,
                 placeholder: "",
-                activity: Activity::Working(Instant::now()),
+                activity,
                 kind: Some(Kind::Session),
             };
             list.set_live(live, 0, 1);
         }
-        list.rebuild(&Shelves::default(), 1, &HashSet::new(), |_| {
-            ("w", Path::new("/w"))
-        });
-        for id in ["busy", "lead"] {
+        list.rebuild(1, &HashSet::new(), |_| ("w", Path::new("/w")));
+        for id in ["busy", "lead", "fresh"] {
             let row = list.row(&SessionKey::local(id)).expect("listed");
             assert_eq!(ShelfAction::for_row(row), [], "{id}");
         }
+        let menu = |id: &str| MenuRow::new(list.row(&SessionKey::local(id)).expect("listed"));
+        assert_eq!(menu("fresh").pin, None);
+        assert_eq!(
+            (menu("idle").offered, menu("idle").pin),
+            (&ShelfAction::ON_ACTIVE[..], Some(Pin::Pin)),
+            "a saved session at rest offers them all"
+        );
         assert_eq!(ShelfAction::offered(Shelf::Settled), [ShelfAction::Restore]);
         assert!(ShelfAction::offered(Shelf::Snoozed).contains(&ShelfAction::Restore));
-    }
-
-    /// Settling a starter settles the sessions under it too, so they stay
-    /// settled when the starter is deleted, not back among the active.
-    #[test]
-    fn a_settled_familys_sessions_stay_settled_without_their_starter() {
-        let session = |id: &str, parent: Option<&str>| SavedSession {
-            id: SessionKey::local(id),
-            cwd: PathBuf::from("/w"),
-            title: None,
-            updated: 1,
-            workspace: 0,
-            parent: parent.map(SessionKey::local),
-            kind: Kind::Session,
-        };
-        let (lead, worker) = (SessionKey::local("lead"), SessionKey::local("w1"));
-        let mut list = SessionList::default();
-        let sessions = vec![session("w1", Some("lead")), session("lead", None)];
-        list.set_saved(&MachineId::local(), sessions);
-        let mut shelves = Shelves::default();
-        for session in list.family(&lead) {
-            ShelfAction::Settle.apply(&mut shelves, &session, 2);
-        }
-        list.remove(&lead);
-        list.rebuild(&shelves, 3, &HashSet::new(), |_| ("w", Path::new("/w")));
-        let row = list.row(&worker).expect("listed");
-        assert_eq!(
-            (row.family == Family::Started, row.shelf),
-            (false, Shelf::Settled)
-        );
     }
 }

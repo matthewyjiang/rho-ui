@@ -78,7 +78,7 @@ On macOS, Cmd takes the place of Ctrl in these, and the menu bar lists them, wit
 ## Files
 
 - `~/.config/rho-ui/settings`: theme, scale, fonts, machines
-- `~/.local/state/rho-ui/state.sqlite3`: your projects, settled and snoozed sessions, turn times, and the sidebar's layout and filter
+- `~/.local/state/rho-ui/state.sqlite3`: your projects, turn times, and the sidebar's layout and filter
 
 These follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set, on macOS too.
 
