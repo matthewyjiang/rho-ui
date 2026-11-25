@@ -1,13 +1,20 @@
 //! The directories a session's tools reach besides its workspace, behind a
 //! button in the session's title bar. The button counts them and opens
-//! their list, with a box to add one: an absolute or `~/` path, by the
+//! their list, with the user's projects the session doesn't reach yet (see
+//! [`Projects`]) and a box for any other: an absolute or `~/` path, by the
 //! rules of the session's machine. rho saves each with the session and
 //! sends every client that follows it the session's options, which hold
 //! the list ([`rho_ui_core::Session::added_dirs`]), so this shows what the
 //! daemon says. An add sent while a turn runs waits for the turn to end,
 //! as a settings change does. A subagent's session only lists them.
+//!
+//! rho tells a lead that the directories it reaches are the repositories it
+//! may work in, so a lead's button names them as projects ([`Wording`]).
 
-use std::path::PathBuf;
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -15,6 +22,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    list::ListItem,
     popover::Popover,
     v_flex, ActiveTheme as _, Sizable as _, StyledExt as _,
 };
@@ -24,21 +32,52 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
 };
-use rho_ui_core::{Daemon, SessionId};
+use rho_ui_core::{Daemon, Session, SessionId};
 
 use crate::{
     folders::{PathStyle, Typed},
+    leads::Kind,
     machines::Place,
-    workspaces::{tilde, Workspaces},
+    project_picker::{project_row, MAX_ROWS, ROW_REMS},
+    projects::Projects,
+    workspaces::{tilde, WorkspaceRef, Workspaces},
 };
 
 /// Whether the user can add a directory to the session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) enum DirsAccess {
-    /// The user's own session.
-    Add,
+    /// The user's own session, which is offered the user's projects, these,
+    /// to add.
+    Add(Entity<Projects>),
     /// A subagent's session, which only its run changes.
     ListOnly,
+}
+
+/// How the button names the directories.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wording {
+    /// A folder icon and their count, for an ordinary session.
+    Directories,
+    /// "Add projects", then how many, for a lead: rho tells it they are the
+    /// repositories it may work in.
+    Projects,
+}
+
+impl From<Kind> for Wording {
+    fn from(kind: Kind) -> Self {
+        match kind {
+            Kind::Session => Wording::Directories,
+            Kind::Lead => Wording::Projects,
+        }
+    }
+}
+
+/// Where an add came from: the box, which empties once the daemon takes
+/// it, or the list of projects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Typed,
+    Project,
 }
 
 /// One session's added directories, and the box that adds one.
@@ -47,43 +86,46 @@ pub(crate) struct AddedDirs {
     session: SessionId,
     /// The session's workspace, on its machine.
     cwd: Place,
-    /// Where the machine's home is, which `~` stands for.
+    /// Where the machine's home is, which `~` stands for, and what each
+    /// project is called.
     workspaces: Entity<Workspaces>,
     /// As the session last listed them.
     dirs: Vec<PathBuf>,
+    wording: Wording,
     /// `None` in a subagent's session, which only its run changes.
     form: Option<AddForm>,
 }
 
-/// The box that adds a directory.
+/// The projects and the box that add a directory.
 struct AddForm {
     input: Entity<InputState>,
     /// Why the last add failed.
     error: Option<SharedString>,
     /// An add is on its way to the daemon.
     adding: bool,
-    _events: Subscription,
+    /// The user's projects, the ones offered among them.
+    projects: Entity<Projects>,
+    /// The projects offered, by index into the workspaces, most recently
+    /// used first; see [`to_offer`].
+    offered: Vec<usize>,
+    _subscriptions: [Subscription; 3],
 }
 
-impl AddedDirs {
-    pub(crate) fn new(
-        daemon: Daemon,
-        session: SessionId,
-        cwd: Place,
-        workspaces: Entity<Workspaces>,
-        access: DirsAccess,
+impl AddForm {
+    fn new(
+        projects: Entity<Projects>,
+        workspaces: &Entity<Workspaces>,
         window: &mut Window,
-        cx: &mut Context<'_, Self>,
+        cx: &mut Context<'_, AddedDirs>,
     ) -> Self {
-        let form = (access == DirsAccess::Add).then(|| {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Add a directory: /path or ~/path")
-            });
-            let events = cx.subscribe_in(
+        let input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Add a directory: /path or ~/path"));
+        let subscriptions = [
+            cx.subscribe_in(
                 &input,
                 window,
-                |this: &mut Self, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { .. } => this.add(window, cx),
+                |this: &mut AddedDirs, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.add_typed(window, cx),
                     InputEvent::Change => {
                         if let Some(form) = &mut this.form {
                             form.error = None;
@@ -92,22 +134,59 @@ impl AddedDirs {
                     }
                     _ => {}
                 },
-            );
-            AddForm {
-                input,
-                error: None,
-                adding: false,
-                _events: events,
-            }
-        });
+            ),
+            // A project added, removed, or found in a clone folder.
+            cx.observe(&projects, |this, _, cx| this.refresh_offer(cx)),
+            // A project's name, read from its repository, or its last use.
+            cx.observe(workspaces, |this, _, cx| {
+                this.refresh_offer(cx);
+                cx.notify();
+            }),
+        ];
         Self {
-            daemon,
-            session,
-            cwd,
-            workspaces,
-            dirs: Vec::new(),
-            form,
+            input,
+            error: None,
+            adding: false,
+            projects,
+            offered: Vec::new(),
+            _subscriptions: subscriptions,
         }
+    }
+}
+
+impl AddedDirs {
+    /// The added directories of `session`, which works in `workspace`,
+    /// with its button worded as `wording` says until
+    /// [`Self::set_wording`].
+    pub(crate) fn of_session(
+        daemon: &Daemon,
+        session: &Session,
+        workspace: &WorkspaceRef,
+        access: DirsAccess,
+        wording: Wording,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let cwd = workspace.read(cx).place().clone();
+        let workspaces = workspace.table().clone();
+        let (daemon, id) = (daemon.clone(), session.id().clone());
+        cx.new(|cx| {
+            let form = match access {
+                DirsAccess::Add(projects) => Some(AddForm::new(projects, &workspaces, window, cx)),
+                DirsAccess::ListOnly => None,
+            };
+            let mut this = Self {
+                daemon,
+                session: id,
+                cwd,
+                workspaces,
+                dirs: session.added_dirs().to_vec(),
+                wording,
+                form,
+            };
+            this.refresh_offer(cx);
+            this
+        })
     }
 
     /// Sends adds to `daemon` from now on, as once the session's machine
@@ -120,12 +199,43 @@ impl AddedDirs {
     pub(crate) fn sync(&mut self, dirs: &[PathBuf], cx: &mut Context<'_, Self>) {
         if self.dirs != dirs {
             self.dirs = dirs.to_vec();
+            self.refresh_offer(cx);
+            cx.notify();
+        }
+    }
+
+    /// Words the button as `wording` says, as the session's kind becomes
+    /// known.
+    pub(crate) fn set_wording(&mut self, wording: Wording, cx: &mut Context<'_, Self>) {
+        if self.wording != wording {
+            self.wording = wording;
+            cx.notify();
+        }
+    }
+
+    /// Lists again the projects to offer, as the user's projects or the
+    /// session's directories change.
+    fn refresh_offer(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(form) = &mut self.form else {
+            return;
+        };
+        let roots = to_offer(form.projects.read(cx).roots(), &self.cwd, &self.dirs);
+        let offered = self.workspaces.update(cx, |workspaces, cx| {
+            let mut offered: Vec<usize> = roots
+                .iter()
+                .map(|root| workspaces.index(root, cx))
+                .collect();
+            offered.sort_by_key(|&ix| Reverse(workspaces.last_used_in(workspaces.get(ix).place())));
+            offered
+        });
+        if form.offered != offered {
+            form.offered = offered;
             cx.notify();
         }
     }
 
     /// Sends the typed path to the daemon, or says why it isn't one.
-    fn add(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn add_typed(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(form) = &mut self.form else {
             return;
         };
@@ -140,12 +250,29 @@ impl AddedDirs {
             cx.notify();
             return;
         };
+        self.add(typed.path, Source::Typed, window, cx);
+    }
+
+    /// Sends `path` to the daemon, unless an add is on its way already.
+    fn add(
+        &mut self,
+        path: PathBuf,
+        source: Source,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = &mut self.form else {
+            return;
+        };
+        if form.adding {
+            return;
+        }
         form.adding = true;
         form.error = None;
         cx.notify();
         let (daemon, session) = (self.daemon.clone(), self.session.clone());
         cx.spawn_in(window, async move |this, cx| {
-            let result = daemon.add_directory(&session, &typed.path).await;
+            let result = daemon.add_directory(&session, &path).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(form) = &mut this.form else {
                     return;
@@ -153,9 +280,10 @@ impl AddedDirs {
                 form.adding = false;
                 match result {
                     // The list itself comes with the session's options.
-                    Ok(()) => form
+                    Ok(()) if source == Source::Typed => form
                         .input
                         .update(cx, |input, cx| input.set_value("", window, cx)),
+                    Ok(()) => {}
                     Err(error) => form.error = Some(error.to_string().into()),
                 }
                 cx.notify();
@@ -164,83 +292,173 @@ impl AddedDirs {
         .detach();
     }
 
-    /// The popover's list and box, read from `this` as it is now.
+    /// The popover's list, projects and box, read from `this` as it is now.
     fn render_content(this: &WeakEntity<Self>, cx: &App) -> AnyElement {
         let Some(this_entity) = this.upgrade() else {
             return div().into_any_element();
         };
         let dirs = this_entity.read(cx);
-        let theme = cx.theme();
-        let home = dirs.workspaces.read(cx).home(&dirs.cwd.machine);
-        let list = v_flex()
-            .id("added-dirs-list")
-            .max_h(rems(16.))
-            .overflow_y_scroll()
-            .gap_1()
-            .when(dirs.dirs.is_empty(), |list| {
-                list.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("Its tools reach only its workspace."),
-                )
-            })
-            .children(dirs.dirs.iter().enumerate().map(|(ix, dir)| {
-                div()
-                    .id(SharedString::from(format!("added-dir-{ix}")))
-                    .test_support()
-                    .text_sm()
-                    .truncate()
-                    .child(tilde(dir, home.as_deref()))
-            }));
+        let heading = match dirs.wording {
+            Wording::Directories => "Directories beside the workspace",
+            Wording::Projects => "Projects this lead works in",
+        };
         v_flex()
             .w(rems(26.))
             .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(theme.muted_foreground)
-                    .child("Directories beside the workspace"),
-            )
-            .child(list)
+            .child(section_heading(heading, cx))
+            .child(dirs.render_listed(cx))
             .when_some(dirs.form.as_ref(), |content, form| {
-                let add = this.clone();
                 content
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("added-dirs-input")
-                                    .test_support()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(&form.input).small()),
-                            )
-                            .child(
-                                Button::new("added-dirs-add")
-                                    .primary()
-                                    .small()
-                                    .label("Add")
-                                    .loading(form.adding)
-                                    .on_click(move |_, window, cx| {
-                                        let _ = add.update(cx, |this, cx| this.add(window, cx));
-                                    }),
-                            ),
-                    )
+                    .children(dirs.render_offer(this, form, cx))
+                    .child(render_box(this, form))
                     .when_some(form.error.clone(), |content, why| {
                         content.child(
                             div()
                                 .id("added-dirs-error")
                                 .test_support()
                                 .text_xs()
-                                .text_color(theme.red)
+                                .text_color(cx.theme().red)
                                 .child(why),
                         )
                     })
             })
             .into_any_element()
+    }
+
+    /// The directories the session reaches besides its workspace.
+    fn render_listed(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let home = self.workspaces.read(cx).home(&self.cwd.machine);
+        let empty = match self.wording {
+            Wording::Directories => "Its tools reach only its workspace.",
+            Wording::Projects => "None yet.",
+        };
+        v_flex()
+            .id("added-dirs-list")
+            .max_h(rems(16.))
+            .overflow_y_scroll()
+            .gap_1()
+            .when(self.dirs.is_empty(), |list| {
+                list.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(empty),
+                )
+            })
+            .children(self.dirs.iter().enumerate().map(|(ix, dir)| {
+                div()
+                    .id(SharedString::from(format!("added-dir-{ix}")))
+                    .test_support()
+                    .text_sm()
+                    .truncate()
+                    .child(tilde(dir, home.as_deref()))
+            }))
+    }
+
+    /// The projects `form` offers, each added with a click, as the project
+    /// picker draws them; nothing when none is left to offer.
+    fn render_offer(
+        &self,
+        this: &WeakEntity<Self>,
+        form: &AddForm,
+        cx: &App,
+    ) -> Option<impl IntoElement> {
+        if form.offered.is_empty() {
+            return None;
+        }
+        let workspaces = self.workspaces.read(cx);
+        let rows = form.offered.iter().enumerate().map(|(n, &ix)| {
+            let workspace = workspaces.get(ix);
+            let (this, path) = (this.clone(), workspace.cwd().to_path_buf());
+            ListItem::new(SharedString::from(format!("add-project-{n}")))
+                .accessibility_label(format!("Add {}", workspace.name))
+                .rounded(cx.theme().radius)
+                .px_2()
+                .disabled(form.adding)
+                .on_click(move |_, window, cx| {
+                    let path = path.clone();
+                    let _ = this.update(cx, |this, cx| {
+                        this.add(path, Source::Project, window, cx);
+                    });
+                })
+                .child(project_row(workspace, cx))
+        });
+        Some(
+            v_flex()
+                .gap_1()
+                .child(section_heading("Your projects", cx))
+                .child(
+                    // As many rows as the project picker shows before it
+                    // scrolls.
+                    v_flex()
+                        .id("add-projects-list")
+                        .max_h(rems(ROW_REMS * f32::from(MAX_ROWS)))
+                        .overflow_y_scroll()
+                        .children(rows),
+                ),
+        )
+    }
+}
+
+/// A small heading over a part of the popover.
+fn section_heading(text: &'static str, cx: &App) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_semibold()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
+/// The box that takes a path, and its Add button.
+fn render_box(this: &WeakEntity<AddedDirs>, form: &AddForm) -> impl IntoElement {
+    let add = this.clone();
+    h_flex()
+        .gap_2()
+        .child(
+            div()
+                .id("added-dirs-input")
+                .test_support()
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(&form.input).small()),
+        )
+        .child(
+            Button::new("added-dirs-add")
+                .primary()
+                .small()
+                .label("Add")
+                .loading(form.adding)
+                .on_click(move |_, window, cx| {
+                    let _ = add.update(cx, |this, cx| this.add_typed(window, cx));
+                }),
+        )
+}
+
+/// The projects of `known` that a session in `cwd`, which reaches `added`
+/// too, could add: those on its machine that are in nothing it reaches.
+fn to_offer<'a>(
+    known: impl Iterator<Item = &'a Place>,
+    cwd: &Place,
+    added: &[PathBuf],
+) -> Vec<Place> {
+    let reached = |root: &Path| {
+        std::iter::once(&cwd.path)
+            .chain(added)
+            .any(|dir| root.starts_with(dir))
+    };
+    known
+        .filter(|root| root.machine == cwd.machine && !reached(&root.path))
+        .cloned()
+        .collect()
+}
+
+/// What a lead's button reads, with `count` projects added.
+fn projects_label(count: usize) -> String {
+    match count {
+        0 => "Add projects".to_owned(),
+        1 => "1 project".to_owned(),
+        n => format!("{n} projects"),
     }
 }
 
@@ -252,20 +470,54 @@ impl Render for AddedDirs {
         }
         let this = cx.entity().downgrade();
         let focus = self.form.as_ref().map(|form| form.input.focus_handle(cx));
+        let button = Button::new("added-dirs-button")
+            .ghost()
+            .xsmall()
+            .icon(Lucide::FolderPlus);
+        let button = match self.wording {
+            Wording::Directories => button
+                .when(!self.dirs.is_empty(), |button| {
+                    button.label(self.dirs.len().to_string())
+                })
+                .tooltip("Directories beside the workspace"),
+            Wording::Projects => button.label(projects_label(self.dirs.len())),
+        };
         Popover::new("added-dirs")
             .anchor(Anchor::TopRight)
             .when_some(focus, |popover, focus| popover.track_focus(&focus))
-            .trigger(
-                Button::new("added-dirs-button")
-                    .ghost()
-                    .xsmall()
-                    .icon(Lucide::FolderPlus)
-                    .when(!self.dirs.is_empty(), |button| {
-                        button.label(self.dirs.len().to_string())
-                    })
-                    .tooltip("Directories beside the workspace"),
-            )
+            .trigger(button)
             .content(move |_, _, cx| Self::render_content(&this, cx))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::machines::MachineId;
+
+    /// A session is offered its machine's projects that nothing it reaches
+    /// holds: not its workspace, an added directory, or a folder in one.
+    #[test]
+    fn projects_on_offer_are_those_the_session_does_not_reach() {
+        let there = Place::new(MachineId::remote("workstation"), "/w/web");
+        let known = [
+            Place::local("/w/app"),
+            Place::local("/w/lib"),
+            Place::local("/w/lib/vendor"),
+            Place::local("/w/web"),
+            there,
+            // Named like the workspace, but beside it.
+            Place::local("/w/application"),
+        ];
+        let offered = to_offer(
+            known.iter(),
+            &Place::local("/w/app"),
+            &[PathBuf::from("/w/lib")],
+        );
+        assert_eq!(
+            offered,
+            [Place::local("/w/web"), Place::local("/w/application")]
+        );
     }
 }

@@ -23,9 +23,11 @@
 //!
 //! A lead's draft ([`Kind::Lead`]) has no project picker: its session is a
 //! lead in the leads root (see [`crate::leads`]), with the lead agent's
-//! settings, and the draft shows no folder until that session is open. The
-//! first message starts the lead in a folder of its own, named from the
-//! message, the same way.
+//! settings, and the draft shows no folder until that session is open.
+//! Once it is, the title bar adds the projects the lead works in to that
+//! session ([`AddedDirs`]), as a started lead's does. The first message
+//! starts the lead in a folder of its own, named from the message, the
+//! same way, with the directories added to the draft's session.
 
 use std::path::PathBuf;
 
@@ -43,6 +45,7 @@ use rho_ui_core::{
 };
 
 use crate::{
+    added_dirs::{AddedDirs, DirsAccess, Wording},
     auths::Auths,
     composer::{Composer, ComposerMode, ComposerState},
     leads::Kind,
@@ -83,16 +86,19 @@ pub(crate) enum DraftEvent {
 enum DraftKind {
     /// A session's, which `picker` moves between projects and checkouts.
     Session { picker: Entity<ProjectPicker> },
-    /// A lead's, which picks no project.
-    Lead,
+    /// A lead's, which picks no project but adds the user's `projects`
+    /// to its session for the lead to work in.
+    Lead { projects: Entity<Projects> },
 }
 
 /// What a draft's session was set to, for the session that takes over from
-/// it: its own settings, and its choice for the sessions it starts.
+/// it: its own settings, its choice for the sessions it starts, and the
+/// directories added to it, a lead's projects.
 #[derive(Clone)]
 pub(crate) struct DraftSettings {
     pub(crate) options: Option<SessionOptions>,
     pub(crate) started: Option<StartedSessionDefaults>,
+    pub(crate) added_dirs: Vec<PathBuf>,
 }
 
 /// The draft's session.
@@ -103,6 +109,9 @@ enum SessionState {
         daemon: Daemon,
         session: Box<Session>,
         settings: Entity<SessionSettings>,
+        /// A lead's projects, in its title bar; a session's draft picks
+        /// its project instead.
+        added_dirs: Option<Entity<AddedDirs>>,
         /// The sign-in its model's auth profile needs, while it is signed
         /// out.
         sign_in: Box<SignInSlot>,
@@ -162,16 +171,21 @@ impl DraftView {
     }
 
     /// A lead's draft on `machine`, whose session opens in the leads root
-    /// there; see [`Self::new`].
+    /// there, and which offers `projects` for the lead to work in; see
+    /// [`Self::new`].
     pub(crate) fn new_lead(
         machine: MachineId,
         workspaces: &Entity<Workspaces>,
+        projects: &Entity<Projects>,
         machines: &Entity<Machines>,
         auths: Entity<Auths>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let (kind, cwd) = (DraftKind::Lead, Place::new(machine, PathBuf::new()));
+        let kind = DraftKind::Lead {
+            projects: projects.clone(),
+        };
+        let cwd = Place::new(machine, PathBuf::new());
         Self::of_kind(kind, cwd, workspaces, machines, auths, window, cx)
     }
 
@@ -213,7 +227,7 @@ impl DraftView {
                 subscriptions.push(cx.subscribe_in(picker, window, Self::on_picker_event));
                 Some(WorkspaceRef::new(workspaces, &cwd, cx))
             }
-            DraftKind::Lead => {
+            DraftKind::Lead { .. } => {
                 input.update(cx, |input, cx| {
                     input.set_placeholder(Kind::Lead.placeholder(), window, cx);
                 });
@@ -241,7 +255,7 @@ impl DraftView {
     pub(crate) fn kind(&self) -> Kind {
         match self.kind {
             DraftKind::Session { .. } => Kind::Session,
-            DraftKind::Lead => Kind::Lead,
+            DraftKind::Lead { .. } => Kind::Lead,
         }
     }
 
@@ -249,7 +263,7 @@ impl DraftView {
     fn picker(&self) -> Option<&Entity<ProjectPicker>> {
         match &self.kind {
             DraftKind::Session { picker } => Some(picker),
-            DraftKind::Lead => None,
+            DraftKind::Lead { .. } => None,
         }
     }
 
@@ -458,10 +472,26 @@ impl DraftView {
             cx,
         ));
         let subscription = cx.subscribe_in(&settings, window, Self::on_settings_event);
+        let added_dirs = match &self.kind {
+            DraftKind::Lead { projects } => {
+                let workspace = WorkspaceRef::new(&self.workspaces, &self.cwd, cx);
+                Some(AddedDirs::of_session(
+                    &daemon,
+                    &session,
+                    &workspace,
+                    DirsAccess::Add(projects.clone()),
+                    Wording::from(Kind::Lead),
+                    window,
+                    cx,
+                ))
+            }
+            DraftKind::Session { .. } => None,
+        };
         self.state = SessionState::Open {
             daemon,
             session: Box::new(session),
             settings,
+            added_dirs,
             sign_in,
             _subscription: subscription,
         };
@@ -492,7 +522,10 @@ impl DraftView {
             (
                 Ok(attached),
                 SessionState::Open {
-                    session, settings, ..
+                    session,
+                    settings,
+                    added_dirs,
+                    ..
                 },
             ) => {
                 session.attached(attached);
@@ -500,6 +533,9 @@ impl DraftView {
                     settings.sync(session.options(), window, cx);
                     settings.sync_started(session.started_session_defaults(), cx);
                 });
+                if let Some(added_dirs) = added_dirs {
+                    added_dirs.update(cx, |dirs, cx| dirs.sync(session.added_dirs(), cx));
+                }
                 self.composer.update(cx, |composer, cx| {
                     composer.set_commands(session.commands(), cx);
                 });
@@ -517,7 +553,10 @@ impl DraftView {
         cx: &mut Context<'_, Self>,
     ) {
         if let SessionState::Open {
-            session, settings, ..
+            session,
+            settings,
+            added_dirs,
+            ..
         } = &mut self.state
         {
             session.apply(update);
@@ -525,6 +564,9 @@ impl DraftView {
                 settings.sync(session.options(), window, cx);
                 settings.sync_started(session.started_session_defaults(), cx);
             });
+            if let Some(added_dirs) = added_dirs {
+                added_dirs.update(cx, |dirs, cx| dirs.sync(session.added_dirs(), cx));
+            }
             self.composer.update(cx, |composer, cx| {
                 composer.set_commands(session.commands(), cx);
             });
@@ -577,6 +619,7 @@ impl DraftView {
                     let settings = Box::new(DraftSettings {
                         options: session.options().cloned(),
                         started: session.started_session_defaults().cloned(),
+                        added_dirs: session.added_dirs().to_vec(),
                     });
                     self.launching = true;
                     self.error = None;
@@ -630,14 +673,21 @@ impl Render for DraftView {
         } else {
             ComposerMode::Send
         };
-        let (settings, sign_in) = match &self.state {
+        let (settings, added_dirs, sign_in) = match &self.state {
             SessionState::Open {
                 settings,
+                added_dirs,
                 sign_in,
                 session,
                 ..
-            } => (Some(settings), sign_in.card(session.auth(), cx)),
-            SessionState::Opening | SessionState::Failed | SessionState::Started => (None, None),
+            } => (
+                Some(settings),
+                added_dirs.clone(),
+                sign_in.card(session.auth(), cx),
+            ),
+            SessionState::Opening | SessionState::Failed | SessionState::Started => {
+                (None, None, None)
+            }
         };
         let mut composer = Composer::new(
             &self.composer,
@@ -657,7 +707,9 @@ impl Render for DraftView {
             Kind::Lead => NEW_LEAD,
         };
         let workspace = self.workspace.as_ref().map(|workspace| workspace.read(cx));
-        let title_bar = TitleBar::new(workspace, title);
+        // A lead's projects, at the right, where a session's title bar has
+        // its added directories.
+        let title_bar = TitleBar::new(workspace, title).trailing(added_dirs);
         v_flex()
             .id("draft-view")
             .test_support()

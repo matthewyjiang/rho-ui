@@ -641,6 +641,20 @@ impl FakeDaemon {
         Some(self.service.lock().sessions.get(id)?.cwd.clone())
     }
 
+    /// The directories session `id`'s tools reach besides its workspace,
+    /// in the order added.
+    pub fn added_dirs(&self, id: &str) -> Option<Vec<PathBuf>> {
+        Some(
+            self.service
+                .lock()
+                .sessions
+                .get(id)?
+                .settings
+                .added_dirs
+                .clone(),
+        )
+    }
+
     /// Has session `parent` start session `id` through session control, as
     /// rho's `sessions` tool does: saved now in `parent`'s workspace,
     /// titled `title`, and doing what `started` says. The list and its job
