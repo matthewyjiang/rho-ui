@@ -270,9 +270,8 @@ pub(crate) enum Item {
     /// only rise as opened shelves fill it. Search results have none: they
     /// read from the top.
     Gap,
-    /// The break between the active leads and the active sessions under
-    /// them, of a height of its own.
-    Break,
+    /// The header over the active sessions that follow the active leads.
+    Sessions,
 }
 
 impl Item {
@@ -806,7 +805,7 @@ impl SessionList {
     }
 
     /// Pushes the leads among `shown`, the active families in order, each
-    /// with its family, under their header, then the break above the other
+    /// with its family, under their header, then the header of the other
     /// active families when any follow. Returns those others: the active
     /// shelf counts only them.
     fn push_leads(
@@ -828,7 +827,7 @@ impl SessionList {
             self.push_family(items, families, ix, passes);
         }
         if !rest.is_empty() {
-            items.push(Item::Break);
+            items.push(Item::Sessions);
         }
         rest
     }
@@ -1123,7 +1122,7 @@ mod tests {
                 Item::Leads => "[Leads]".to_owned(),
                 Item::More(shelf) => format!("[{} more {}]", shelf.label(), list.held_back(shelf)),
                 Item::Gap => "~".to_owned(),
-                Item::Break => "-".to_owned(),
+                Item::Sessions => "[Sessions]".to_owned(),
             })
             .collect()
     }
