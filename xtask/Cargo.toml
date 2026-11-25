@@ -1,7 +1,7 @@
 [package]
 name = "xtask"
 version = "0.1.0"
-description = "rho-ui's build tasks: `cargo xtask web`, `dist` and `clippy-web`"
+description = "rho-ui's build tasks: `cargo xtask web`, `dist`, `clippy-web` and `dev`"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -7,6 +7,8 @@
 //!   `rho-ui serve` to serve from anywhere. On Windows, where there is no
 //!   `rho-ui serve`, just the release `rho-ui`.
 //! - `clippy-web`: clippy on the code the web build compiles, as CI runs it.
+//! - `dev --rho CHECKOUT [-- ARGS]`: rho-ui against a rho checkout's
+//!   daemon and rho-protocol, for a change that needs both; see [`dev`].
 //!
 //! The wasm build needs one thing stable Rust doesn't give:
 //! `wasm_thread`, under GPUI's web platform, names a nightly feature even
@@ -22,7 +24,7 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
 };
 
 use anyhow::{bail, ensure, Context as _, Result};
@@ -34,7 +36,10 @@ const USAGE: &str = "usage: cargo xtask TASK
                 quicker to build); `cargo run -p rho-ui -- serve` serves it
   dist          build target/release/rho-ui with the web build in it
                 (on Windows, which has no `rho-ui serve`, without)
-  clippy-web    run clippy on the web build's code, as CI does";
+  clippy-web    run clippy on the web build's code, as CI does
+  dev --rho CHECKOUT [-- ARGS]
+                run rho-ui with ARGS against the daemon and rho-protocol
+                of the rho checkout CHECKOUT, in a rho home of its own";
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
@@ -70,6 +75,8 @@ fn main() -> ExitCode {
         ["web", "--dev"] => web(Profile::Dev),
         ["dist"] => dist(),
         ["clippy-web"] => clippy_web(),
+        ["dev", "--rho", checkout] => dev(Path::new(checkout), &[]),
+        ["dev", "--rho", checkout, "--", args @ ..] => dev(Path::new(checkout), args),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -330,4 +337,113 @@ fn clippy_web_config() -> Result<PathBuf> {
     )
     .context("couldn't write the web build's clippy.toml")?;
     Ok(dir)
+}
+
+/// Runs rho-ui against an unreleased rho: the daemon built from the rho
+/// checkout `checkout`, and rho-protocol from its source, so a change that
+/// spans both can be tried before rho releases it. `args` go to rho-ui.
+///
+/// Everything stays apart from your own rho and rho-ui:
+///
+/// - The daemon runs in the rho home `target/dev/rho-home`, which gets a
+///   daemon of its own, as each rho home does, so yours and its sessions
+///   carry on untouched. A dev daemon from an earlier run is stopped
+///   first, so rho-ui starts the one just built. It keeps running after
+///   rho-ui quits, until the next run.
+/// - rho-ui remembers things in `target/dev/state`, so a dev build that
+///   bumps the state database's schema doesn't empty yours (not on
+///   Windows, where that folder follows `%APPDATA%`). Its settings are
+///   yours.
+/// - Cargo takes rho-protocol from the checkout through `--config`, and
+///   `Cargo.lock`, which that rewrites, is put back after the build.
+fn dev(checkout: &Path, args: &[&str]) -> Result<()> {
+    let checkout = std::path::absolute(checkout)
+        .with_context(|| format!("couldn't find the rho checkout {}", checkout.display()))?;
+    let protocol = checkout.join("crates/rho-protocol");
+    ensure!(
+        protocol.join("Cargo.toml").is_file(),
+        "{} isn't a rho checkout: it has no crates/rho-protocol",
+        checkout.display()
+    );
+
+    run(cargo(&["build", "--bin", "rho"]).current_dir(&checkout))?;
+    let rho = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| checkout.join("target"), PathBuf::from)
+        .join("debug")
+        .join(format!("rho{}", std::env::consts::EXE_SUFFIX));
+
+    let dev = root().join("target/dev");
+    let home = dev.join("rho-home");
+    seed(&home)?;
+    let daemon = |verb: &str| {
+        let mut command = Command::new(&rho);
+        command.args(["daemon", verb]).env("RHO_HOME", &home);
+        command
+    };
+    let running = daemon("status")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if running {
+        run(&mut daemon("stop"))?;
+    }
+
+    let lock_file = root().join("Cargo.lock");
+    let lock = fs::read(&lock_file).context("couldn't read Cargo.lock")?;
+    let built = run(cargo(&["build", "-p", "rho-ui", "--config"]).arg(format!(
+        "patch.crates-io.rho-protocol.path='{}'",
+        protocol.display()
+    )));
+    if fs::read(&lock_file).ok().as_ref() != Some(&lock) {
+        fs::write(&lock_file, &lock).context("couldn't put Cargo.lock back")?;
+    }
+    built?;
+
+    if cfg!(windows) {
+        eprintln!("xtask: rho-ui's state in %APPDATA% is your installed rho-ui's too");
+    }
+    run(Command::new(
+        target_dir()
+            .join("debug")
+            .join(format!("rho-ui{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .arg("--rho")
+    .arg(&rho)
+    .args(args)
+    .env("RHO_HOME", &home)
+    .env("XDG_STATE_HOME", dev.join("state")))
+}
+
+/// Gives the dev rho home `home` what it lacks of your rho home: a copy of
+/// its settings, to change freely there, and a link to its credentials,
+/// so a provider token that one daemon refreshes stays good for the other.
+fn seed(home: &Path) -> Result<()> {
+    let yours = your_rho_home()
+        .context("couldn't find your rho home to seed the dev one: set RHO_HOME or HOME")?;
+    fs::create_dir_all(home).with_context(|| format!("couldn't make {}", home.display()))?;
+    let config = home.join("config.toml");
+    if !config.exists() && yours.join("config.toml").is_file() {
+        fs::copy(yours.join("config.toml"), &config).context("couldn't copy your rho settings")?;
+    }
+    let credentials = home.join("credentials");
+    if credentials.symlink_metadata().is_err() && yours.join("credentials").is_dir() {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(yours.join("credentials"), &credentials);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(yours.join("credentials"), &credentials);
+        linked.context("couldn't link your rho credentials")?;
+    }
+    Ok(())
+}
+
+/// The rho home `rho` uses: `$RHO_HOME`, else `.rho` in `$HOME` (on
+/// Windows, else in `%USERPROFILE%`).
+fn your_rho_home() -> Option<PathBuf> {
+    let set = |name| std::env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(home) = set("RHO_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    let home = set("HOME").or_else(|| set("USERPROFILE").filter(|_| cfg!(windows)))?;
+    Some(PathBuf::from(home).join(".rho"))
 }
