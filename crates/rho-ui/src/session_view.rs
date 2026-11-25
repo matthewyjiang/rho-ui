@@ -83,7 +83,7 @@ use rho_ui_core::{
 
 use self::side_chat::{side_question, Discarding};
 use crate::{
-    added_dirs::{AddedDirs, DirsAccess, Wording},
+    added_dirs::{AddedDirs, DirsAccess},
     auths::Auths,
     background::{BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler},
     background_log::{BackgroundLog, Recorded},
@@ -278,8 +278,9 @@ pub(crate) struct SessionView {
     /// `None` once the view follows the session again, so the app hears of
     /// it when it has caught up, whatever changed.
     reported: Option<LiveSession>,
-    /// The kind of session the composer's placeholder is worded for.
-    placeholder: Kind,
+    /// The kind of session the composer's placeholder and the added
+    /// directories are worded for.
+    kind: Kind,
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
     /// The surfaces the session's `ui` calls showed.
@@ -347,7 +348,7 @@ impl SessionView {
             &session,
             &workspace,
             DirsAccess::ListOnly,
-            Wording::Directories,
+            Kind::Session,
             window,
             cx,
         );
@@ -402,7 +403,7 @@ impl SessionView {
             turn_began: None,
             waiting_since: None,
             reported: None,
-            placeholder: Kind::Session,
+            kind: Kind::Session,
             error: None,
             surfaces: Surfaces::default(),
             plan: Disclosure::default(),
@@ -424,7 +425,7 @@ impl SessionView {
         };
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
-        view.sync_placeholder(window, cx);
+        view.sync_kind(window, cx);
         view.reported = Some(view.live());
         view
     }
@@ -515,7 +516,7 @@ impl SessionView {
             &self.session,
             &self.workspace,
             DirsAccess::Add(projects.clone()),
-            self.kind(cx).into(),
+            self.kind(cx),
             window,
             cx,
         );
@@ -952,7 +953,7 @@ impl SessionView {
             self.transcript.set_delay(self.session.delay());
         }
         self.sync_settings(window, cx);
-        self.sync_placeholder(window, cx);
+        self.sync_kind(window, cx);
         self.sync_card(window, cx);
         // Until the attachment has caught up, the session's state is the
         // conversation's past: no turn starts or ends in it now.
@@ -1568,17 +1569,17 @@ impl SessionView {
         });
     }
 
-    /// Words the empty composer, and the added directories' button, for
-    /// the kind of session this is, which a session opened from the list
-    /// may only learn as its replay says its agent.
-    fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Words the empty composer, and the added directories, for the kind
+    /// of session this is, which a session opened from the list may only
+    /// learn as its replay says its agent.
+    fn sync_kind(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let kind = self.kind(cx);
-        self.added_dirs
-            .update(cx, |dirs, cx| dirs.set_wording(kind.into(), cx));
-        if kind == self.placeholder {
+        if kind == self.kind {
             return;
         }
-        self.placeholder = kind;
+        self.kind = kind;
+        self.added_dirs
+            .update(cx, |dirs, cx| dirs.set_kind(kind, cx));
         let input = self.composer.read(cx).input().clone();
         input.update(cx, |input, cx| {
             input.set_placeholder(kind.placeholder(), window, cx);
@@ -2092,7 +2093,7 @@ impl SessionView {
     /// The kind of session the empty composer is worded for, for UI tests.
     #[cfg(test)]
     pub(crate) fn composer_placeholder(&self) -> Kind {
-        self.placeholder
+        self.kind
     }
 
     /// The message the composer holds, attachments and all, for UI tests.

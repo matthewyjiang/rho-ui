@@ -38,7 +38,7 @@ use rho_protocol::{
 
 use super::{
     report, shell_card, shell_output, started::StartedChange, surface, FakeSession, SessionLists,
-    State, Turn, KEY_AUTH, TOOL_IMAGE,
+    Settings, State, Turn, KEY_AUTH, TOOL_IMAGE,
 };
 
 #[derive(Debug)]
@@ -424,7 +424,11 @@ impl FakeSession {
             SessionChange::Model { model, .. } => self.settings.model = model,
             SessionChange::Reasoning { level } => self.settings.reasoning = level,
             SessionChange::FastMode { enabled } => self.settings.fast = enabled,
-            SessionChange::AddDirectory { path } => self.settings.add_directory(path)?,
+            // rho saves the session it adds a directory to.
+            SessionChange::AddDirectory { path } => {
+                self.settings.add_directory(path)?;
+                self.saved = true;
+            }
             _ => {
                 return Err(RpcError::new(
                     ErrorCode::MethodNotFound,
@@ -571,6 +575,7 @@ impl Service for Fake {
                 format!("sign in to {KEY_AUTH} first"),
             ));
         }
+        let settings = Settings::opened_with(params.setup.additional_directories)?;
         state.new_sessions += 1;
         state.new_session_environment = Some(params.environment.clone());
         let id = format!("new-{}", state.new_sessions);
@@ -591,6 +596,7 @@ impl Service for Fake {
             .map_or(&params.cwd, |worktree| &worktree.path);
         let mut session = FakeSession::new(&cwd.to_string_lossy(), None, 0);
         session.saved = false;
+        session.settings = settings;
         if let Some(agent) = params.agent {
             session.agent = agent;
         }

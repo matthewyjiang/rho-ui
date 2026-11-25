@@ -31,7 +31,7 @@ A lead is a session that runs as rho's `lead` agent: it takes a goal to merged p
 - **A folder of its own.** A lead works in `~/.rho/leads/<name>/` on its machine (under `$RHO_HOME` if you set one), named from its first message, with `-2`, `-3`… when that name is taken.
 - **The brief is yours too.** The lead keeps what it knows between turns in `brief.md` in that folder: the goal, where it may work, what it may decide without you, its pull requests and its decisions. Edit it at any time; the lead reads it at the start of every turn.
 - **In no project.** A lead's folder belongs to no project, so the project filter doesn't hide it; the machine filter and search still do.
-- **Its projects are where it may work.** The projects you add to a lead are the directories its tools reach and the repositories rho tells it it may work in. Add them in its draft, before the first message, so its first turn knows them.
+- **Its projects are where it may work.** The projects you pick for a lead are the directories its tools reach, and rho lists them to it. Pick them in its draft: the lead gets them as its first message starts it, so its first turn knows them. After that, add more from the lead's title bar, as any session's directories.
 - **Its sessions fold under it**, as any session's do (see above).
 
 ## Projects

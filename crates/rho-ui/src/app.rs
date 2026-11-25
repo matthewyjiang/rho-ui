@@ -1507,9 +1507,9 @@ impl RhoApp {
     /// Starts `draft`'s first message, `prompt`, in a session of its own,
     /// as [`Self::opening`] says: for a session's draft, in a new worktree
     /// of its directory; for a lead's, as a lead in a folder made for it,
-    /// named from `prompt`. Opens it, gives it `settings`, the draft
-    /// session's own, its choice for the sessions it starts and the
-    /// directories added to it, follows it, then shows it and sends
+    /// named from `prompt`, reaching the projects its draft picked. Opens
+    /// it, gives it `settings`, the draft session's own and its choice for
+    /// the sessions it starts, follows it, then shows it and sends
     /// `prompt`. Until then the draft stays, with its own session, so a
     /// failure leaves it as it was: only a session that starts keeps its
     /// worktree, and a lead's folder goes again while it is empty.
@@ -1528,7 +1528,10 @@ impl RhoApp {
         } = settings;
         let cwd = draft.read(cx).cwd().clone();
         let machine = cwd.machine.clone();
-        let opening = self.opening(draft.read(cx), Some(&prompt), cx);
+        // A lead's projects go with its open, so its first turn knows them.
+        let opening = self
+            .opening(draft.read(cx), Some(&prompt), cx)
+            .with_added_dirs(added_dirs);
         let Some((daemon, epoch)) = self.ready(&machine) else {
             return;
         };
@@ -1553,17 +1556,6 @@ impl RhoApp {
                         .map(|()| options),
                     (matched, _) => matched,
                 };
-                // The draft session's added directories, a lead's projects,
-                // go before the first prompt, so its first turn knows them;
-                // the attach's options list them.
-                let matched = async {
-                    let options = matched?;
-                    for dir in &added_dirs {
-                        daemon.add_directory(session.id(), dir).await?;
-                    }
-                    Ok::<_, DaemonError>(options)
-                }
-                .await;
                 let attached = match matched {
                     Ok(options) => {
                         if let Some(options) = options {

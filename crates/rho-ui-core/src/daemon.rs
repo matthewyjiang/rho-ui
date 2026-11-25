@@ -717,7 +717,8 @@ impl PromptKey {
 /// credentials opens signed out, for the user to sign in from it.
 ///
 /// This is the one place a session's setup is made, for `rho/session/new`,
-/// `rho/session/fork` and `rho/session/attach` alike. rho-ui draws the
+/// `rho/session/fork` and `rho/session/attach` alike; a new lead's adds the
+/// directories it reaches ([`Daemon::new_lead`]). rho-ui draws the
 /// surfaces a session's `ui` tool shows (`surface.rs`), so it also asks for
 /// `surfaces: drawn`: a session it opens has the tool, and every attach
 /// counts it among the clients a waiting `ui` call can be answered in.
@@ -906,35 +907,47 @@ impl Daemon {
         cwd: &Path,
         checkout: Checkout,
     ) -> Result<SessionSetup, DaemonError> {
-        self.open_session(cwd, None, checkout).await
+        self.open_session(cwd, None, checkout, &[]).await
     }
 
     /// Opens a new session as [`LEAD_AGENT`] in `cwd`, the lead's own
-    /// folder, which must exist. It is followed and saved as
-    /// [`Self::new_session`] says.
+    /// folder, which must exist, whose tools reach `added_dirs` too: the
+    /// projects it may work in, which its first turn knows and its options
+    /// list ([`crate::Session::added_dirs`]). It is followed and saved as
+    /// [`Self::new_session`] says: the directories are saved with it at its
+    /// first prompt, not before.
     ///
     /// # Errors
     ///
-    /// Fails if `cwd` is not an absolute path to an existing directory, the
-    /// daemon's rho has no lead agent (an older rho refuses it as an unknown
-    /// agent), or the connection is gone.
-    pub async fn new_lead(&self, cwd: &Path) -> Result<SessionSetup, DaemonError> {
-        self.open_session(cwd, Some(LEAD_AGENT), Checkout::Local)
+    /// Fails if `cwd` or one of `added_dirs` is not an absolute path to an
+    /// existing directory, the daemon's rho has no lead agent (an older rho
+    /// refuses it as an unknown agent), or the connection is gone.
+    pub async fn new_lead(
+        &self,
+        cwd: &Path,
+        added_dirs: &[PathBuf],
+    ) -> Result<SessionSetup, DaemonError> {
+        self.open_session(cwd, Some(LEAD_AGENT), Checkout::Local, added_dirs)
             .await
     }
 
-    /// Sends `rho/session/new` as `agent`, or the default agent with `None`.
+    /// Sends `rho/session/new` as `agent`, or the default agent with `None`,
+    /// for a session whose tools reach `added_dirs` besides `cwd`.
     async fn open_session(
         &self,
         cwd: &Path,
         agent: Option<&str>,
         checkout: Checkout,
+        added_dirs: &[PathBuf],
     ) -> Result<SessionSetup, DaemonError> {
         let params = SessionNewParams {
             cwd: cwd.to_path_buf(),
             environment: ClientEnvironment::clone(&self.environment),
             agent: agent.map(str::to_owned),
-            setup: session_setup(),
+            setup: rho_protocol::SessionSetup {
+                additional_directories: added_dirs.to_vec(),
+                ..session_setup()
+            },
             parent: None,
             grant: None,
             worktree: checkout == Checkout::NewWorktree,
@@ -1494,10 +1507,10 @@ impl Daemon {
 
     /// Lets session `id`'s tools reach the directory `path`, an absolute
     /// path on the daemon's machine, from its next turn on. The daemon
-    /// saves it with the session and sends every attached client the
-    /// session's options with it, which [`crate::Session::added_dirs`]
-    /// then lists. While a turn runs, the daemon adds it, and answers,
-    /// once the turn ends.
+    /// saves it with the session, saving even a session no prompt has
+    /// yet, and sends every attached client the session's options with
+    /// it, which [`crate::Session::added_dirs`] then lists. While a turn
+    /// runs, the daemon adds it, and answers, once the turn ends.
     ///
     /// # Errors
     ///

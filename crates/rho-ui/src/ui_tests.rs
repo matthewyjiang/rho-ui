@@ -1909,9 +1909,10 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
     });
 }
 
-/// A project added with a click in a lead's draft goes to the draft's
-/// session, and the lead that the first message starts in a session of its
-/// own reaches it from its first turn.
+/// A project picked in a lead's draft stays in the draft, not on the
+/// draft's own session, which is not the lead's; a pick can be taken out
+/// again. The lead that the first message starts reaches the picks from
+/// its first turn.
 #[test]
 fn a_leads_draft_hands_its_projects_to_the_lead() {
     let rho_home = tempfile::tempdir().expect("a rho home");
@@ -1926,8 +1927,9 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
     ui.wait_until("the sidebar", |window, _, _| is_visible(window, "new-lead"));
 
     ui.click("new-lead");
-    ui.wait_until("the lead's draft open", |window, _, _| {
-        is_visible(window, "added-dirs-button")
+    ui.wait_until("the lead's draft open", |_, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).session_key().is_some())
     });
     ui.click("added-dirs-button");
     ui.wait_until("the project offered", |window, _, _| {
@@ -1935,7 +1937,19 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
     });
     ui.shot("offered");
     ui.click("add-project-0");
-    ui.wait_for_label("added-dirs-button", "1 project");
+    ui.wait_until("the project picked", |window, _, _| {
+        is_visible(window, "added-dir-0") && !is_visible(window, "add-project-0")
+    });
+    assert_eq!(ui.fake().added_dirs("new-1"), Some(Vec::new()));
+
+    ui.click("added-dir-remove-0");
+    ui.wait_until("the project offered again", |window, _, _| {
+        is_visible(window, "add-project-0") && !is_visible(window, "added-dir-0")
+    });
+    ui.click("add-project-0");
+    ui.wait_until("the project picked again", |window, _, _| {
+        is_visible(window, "added-dir-0")
+    });
 
     let app = ui.app.clone();
     ui.act(|window, cx| {
@@ -1944,12 +1958,13 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
         window.focus(&composer, cx);
     });
     ui.send("Fix the parser!");
-    ui.wait_for_session("the lead", |session| session.id().as_str() == "new-2");
+    ui.wait_for_session("the lead, reaching the project", |session| {
+        session.id().as_str() == "new-2" && session.added_dirs() == [project.path()]
+    });
     assert_eq!(
         ui.fake().added_dirs("new-2"),
         Some(vec![project.path().to_path_buf()])
     );
-    ui.wait_for_label("added-dirs-button", "1 project");
 }
 
 /// Sessions quiet for long start settled. A draft makes no session until
@@ -3524,11 +3539,11 @@ fn a_session_adds_a_directory_from_its_title_bar() {
     let dir = tempfile::tempdir().expect("a directory to add");
     let project = tempfile::tempdir().expect("a project to add");
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1", "old"]);
     let mut ui = Harness::open(
         "added-dirs",
         daemon.target(),
         Some(daemon),
-        kept(["s1", "old"]),
         Projects::of([project.path()]),
     );
     ui.wait_until("saved sessions", |window, _, _| {
@@ -3561,8 +3576,12 @@ fn a_session_adds_a_directory_from_its_title_bar() {
     ui.shot("added");
 
     ui.click("add-project-0");
-    ui.wait_for_session("the project added", |session| {
-        session.added_dirs() == [dir.path(), project.path()]
+    let mut both = vec![dir.path().to_path_buf(), project.path().to_path_buf()];
+    // In the daemon's order.
+    both.sort();
+    ui.wait_for_session("the project added", |session| session.added_dirs() == both);
+    ui.wait_until("it is listed, and no longer offered", |window, _, _| {
+        is_visible(window, "added-dir-1") && !is_visible(window, "add-project-0")
     });
 }
 

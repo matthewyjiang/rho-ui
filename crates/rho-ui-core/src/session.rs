@@ -925,8 +925,9 @@ impl Session {
         &self.commands
     }
 
-    /// The directories the session's tools reach besides its workspace,
-    /// which [`crate::Daemon::add_directory`] adds to.
+    /// The directories the session's tools reach besides its workspace:
+    /// those [`crate::Daemon::new_lead`] opened it with, and those
+    /// [`crate::Daemon::add_directory`] added.
     pub fn added_dirs(&self) -> &[PathBuf] {
         &self.added_dirs
     }
