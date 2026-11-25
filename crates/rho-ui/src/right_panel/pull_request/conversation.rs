@@ -27,12 +27,12 @@ use super::{header::web_url, quiet, row, PullRequestSurface};
 use crate::{forge::PrAction, pull_requests, time};
 
 /// Where the comment being written stands.
+#[derive(Default)]
 pub(super) enum Posting {
+    #[default]
     Idle,
     /// Posting it; dropping the task stops it.
-    Sending {
-        _task: Task<()>,
-    },
+    Sending { _task: Task<()> },
     /// It wasn't posted, and why; the box still holds it.
     Failed(SharedString),
 }
@@ -43,7 +43,7 @@ const COMMENT_ROWS: usize = 8;
 impl PullRequestSurface {
     /// Makes the comment box, once.
     pub(super) fn ensure_comment_box(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.comment_box.is_some() {
+        if self.pr.comment_box.is_some() {
             return;
         }
         let input = cx.new(|cx| {
@@ -63,17 +63,17 @@ impl PullRequestSurface {
                     _ => {}
                 },
             );
-        self.comment_box = Some((input, events));
+        self.pr.comment_box = Some((input, events));
     }
 
     /// Posts what the comment box holds on the PR on screen, and empties
     /// the box once it is posted.
     fn send_comment(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((input, _)) = &self.comment_box else {
+        let Some((input, _)) = &self.pr.comment_box else {
             return;
         };
         let body = input.read(cx).value().trim().to_owned();
-        if body.is_empty() || matches!(self.posting, Posting::Sending { .. }) {
+        if body.is_empty() || matches!(self.pr.posting, Posting::Sending { .. }) {
             return;
         }
         let Some(id) = self.shown_pr(cx) else {
@@ -91,7 +91,7 @@ impl PullRequestSurface {
                     // gone.
                     return;
                 }
-                this.posting = match result {
+                this.pr.posting = match result {
                     Ok(()) => {
                         input.update(cx, |input, cx| input.set_value("", window, cx));
                         Posting::Idle
@@ -101,19 +101,19 @@ impl PullRequestSurface {
                 cx.notify();
             });
         });
-        self.posting = Posting::Sending { _task: task };
+        self.pr.posting = Posting::Sending { _task: task };
         cx.notify();
     }
 
     /// The comment box, with who it posts as, or why it can't, and the
     /// button that posts it.
     fn comment_form(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
-        let (input, _) = self.comment_box.as_ref()?;
+        let (input, _) = self.pr.comment_box.as_ref()?;
         let theme = cx.theme();
-        let sending = matches!(self.posting, Posting::Sending { .. });
+        let sending = matches!(self.pr.posting, Posting::Sending { .. });
         let empty = input.read(cx).value().trim().is_empty();
         let poster = self.prs.read(cx).poster(cx);
-        let (note, color) = match (&self.posting, &poster) {
+        let (note, color) = match (&self.pr.posting, &poster) {
             (Posting::Failed(why), _) => (why.clone(), theme.red),
             (_, Err(why)) => (why.clone(), theme.muted_foreground),
             (_, Ok(poster)) => {
@@ -310,7 +310,7 @@ impl PullRequestSurface {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let resolved = thread.state == PullRequestThreadState::Resolved;
-        let open = resolved == self.flipped.contains(&thread.id);
+        let open = resolved == self.pr.flipped.contains(&thread.id);
         let (dir, file) = match thread.path.rsplit_once('/') {
             Some((dir, file)) => (Some(dir.to_owned()), file.to_owned()),
             None => (None, thread.path.clone()),
@@ -337,8 +337,8 @@ impl PullRequestSurface {
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.secondary))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.flipped.remove(&id) {
-                            this.flipped.insert(id.clone());
+                        if !this.pr.flipped.remove(&id) {
+                            this.pr.flipped.insert(id.clone());
                         }
                         cx.notify();
                     }))

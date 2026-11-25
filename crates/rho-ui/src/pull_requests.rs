@@ -84,11 +84,11 @@ pub(crate) struct Shown {
 /// A session's pull request as its sidebar row and its title bar mark it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Mark<'a> {
-    /// Its branch's, else the first linked one read.
+    /// Its branch's, else the last linked one read.
     pub(crate) pr: &'a PullRequestSummary,
     /// Whether the session's agent watches `pr`.
     pub(crate) watched: bool,
-    /// How many more the session links: those with tabs of their own.
+    /// How many more the session links.
     pub(crate) more: usize,
 }
 
@@ -262,6 +262,34 @@ pub(crate) fn on(machine: &MachineId) -> String {
 fn unserved(machine: &MachineId) -> SharedString {
     let on = on(machine);
     format!("Update rho on {on} to see its pull requests here.").into()
+}
+
+/// [`PullRequests::which`] of a session whose set is `set`, if known.
+fn next_which(set: Option<&SessionPullRequests>, shown: &Which) -> Which {
+    let Some(set) = set else {
+        return shown.clone();
+    };
+    let branch = set.branch_pull_request().map(|pr| &pr.id);
+    match shown {
+        Which::Linked(id) if Some(id) == branch => return Which::Branch,
+        Which::Linked(id) if set.link(id).is_some() => return shown.clone(),
+        Which::Linked(_) | Which::Branch => {}
+    }
+    // A lookup that can't finish (gh missing or signed out) has a
+    // trouble: it finds nothing.
+    let looking = set.branch.as_ref().is_none_or(|branch| {
+        matches!(branch.lookup, BranchLookup::Looking) && branch.trouble.is_none()
+    });
+    if branch.is_some() || looking {
+        return Which::Branch;
+    }
+    let read = set
+        .linked
+        .iter()
+        .rev()
+        .find(|linked| linked.summary.is_some());
+    read.or(set.linked.last())
+        .map_or(Which::Branch, |linked| Which::Linked(linked.id.clone()))
 }
 
 /// What is said of a machine that isn't connected.
@@ -661,15 +689,6 @@ impl PullRequests {
         self.machines.get(machine).map(|entry| entry.serving)
     }
 
-    /// Whether `machine`'s daemon can be asked about pull requests: it is
-    /// connected, and not from before them.
-    pub(crate) fn asks(&self, machine: &MachineId) -> bool {
-        matches!(
-            self.serving(machine),
-            Some(Serving::Asking | Serving::Served)
-        )
-    }
-
     /// `session`'s set, once its daemon answered with one.
     pub(crate) fn of(&self, session: &SessionKey) -> Option<&SessionPullRequests> {
         self.machines
@@ -698,12 +717,16 @@ impl PullRequests {
     }
 
     /// The PR that marks `session` on its sidebar row and in its title
-    /// bar: its branch's, else the first linked one read.
+    /// bar: its branch's, else the last linked one read, which the Pull
+    /// request surface opens on ([`Self::which`]).
     pub(crate) fn mark(&self, session: &SessionKey) -> Option<Mark<'_>> {
         let set = self.of(session)?;
-        let pr = set
-            .branch_pull_request()
-            .or_else(|| set.linked.iter().find_map(|linked| linked.summary.as_ref()))?;
+        let pr = set.branch_pull_request().or_else(|| {
+            set.linked
+                .iter()
+                .rev()
+                .find_map(|linked| linked.summary.as_ref())
+        })?;
         Some(Mark {
             pr,
             watched: set.link(&pr.id).is_some_and(|link| link.watched),
@@ -732,30 +755,40 @@ impl PullRequests {
             .collect()
     }
 
-    /// The linked PRs that get tabs of their own, in the order linked: all
-    /// but the branch's own, which the agent's watch links too and which
-    /// has the branch's tab. `None`, so tabs stay as they are, until the
-    /// daemon has looked the branch up: before that, a watched branch's
-    /// PR would open a tab of its own, then close it.
-    pub(crate) fn linked_tabs(&self, session: &SessionKey) -> Option<Vec<PullRequestId>> {
-        let set = self.of(session)?;
-        // While the branch's lookup is under way its PR may be among the
-        // links, and would flash up as a tab of its own. A lookup that
-        // can't finish (gh missing or signed out) has a trouble: tabs
-        // follow the links then.
-        let branch = set.branch.as_ref()?;
-        if matches!(branch.lookup, BranchLookup::Looking) && branch.trouble.is_none() {
-            return None;
-        }
-        let branch = set.branch_pull_request().map(|pr| &pr.id);
-        let tabs = set
+    /// Which of `session`'s PRs its Pull request surface shows next, as
+    /// it shows `shown`: the same PR while the session still has it, so a
+    /// PR the agent links never takes the tab; the branch's when `shown`
+    /// is the branch's PR as a link. Else, as when it was unlinked or the
+    /// branch's lookup found nothing: the branch's PR, while it has one
+    /// or is still being looked up; else the PR linked last, read if one
+    /// is ([`Self::mark`]'s); else the branch's empty state, which offers
+    /// to link one. While the session's set isn't known, as while its
+    /// machine reconnects, `shown` stays.
+    pub(crate) fn which(&self, session: &SessionKey, shown: &Which) -> Which {
+        next_which(self.of(session), shown)
+    }
+
+    /// The PRs the Pull request surface can switch between: the branch's,
+    /// then the rest linked, in the order linked, each with its title once
+    /// read.
+    pub(crate) fn choices(&self, session: &SessionKey) -> Vec<(&PullRequestId, Option<&str>)> {
+        let Some(set) = self.of(session) else {
+            return Vec::new();
+        };
+        let branch = set.branch_pull_request();
+        let linked = set
             .linked
             .iter()
-            .map(|linked| &linked.id)
-            .filter(|id| Some(*id) != branch)
-            .cloned()
-            .collect();
-        Some(tabs)
+            .filter(|linked| branch.is_none_or(|pr| pr.id != linked.id))
+            .map(|linked| {
+                let title = linked.summary.as_ref().map(|pr| pr.title.as_str());
+                (&linked.id, title)
+            });
+        branch
+            .map(|pr| (&pr.id, Some(pr.title.as_str())))
+            .into_iter()
+            .chain(linked)
+            .collect()
     }
 
     /// Links the PR `text` names to `session`, as the user typed it; the
@@ -1181,5 +1214,127 @@ impl PullRequests {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_ui_core::{
+        BranchLookup, BranchPullRequest, LinkedPullRequest, PullRequestId, PullRequestLinkOrigin,
+        PullRequestRollup, PullRequestState, PullRequestSummary, PullRequestTrouble,
+        SessionPullRequests,
+    };
+
+    use super::{next_which, Which};
+
+    fn id(number: u32) -> PullRequestId {
+        PullRequestId::new("github.com", "acme", "widgets", number)
+    }
+
+    fn summary(number: u32) -> PullRequestSummary {
+        PullRequestSummary::new(
+            id(number),
+            "Widgets",
+            format!("https://github.com/acme/widgets/pull/{number}"),
+            PullRequestState::Open,
+            PullRequestRollup::Passing,
+            "abc",
+            "2026-11-16T00:00:00Z",
+        )
+    }
+
+    /// A link to PR `number`, not read yet.
+    fn unread(number: u32) -> LinkedPullRequest {
+        let url = format!("https://github.com/acme/widgets/pull/{number}");
+        LinkedPullRequest::new(id(number), url, PullRequestLinkOrigin::Agent, 1_767_312_100)
+    }
+
+    /// A link to PR `number`, read.
+    fn link(number: u32) -> LinkedPullRequest {
+        let mut link = unread(number);
+        link.summary = Some(summary(number));
+        link
+    }
+
+    /// A set whose branch's lookup is `lookup`, with `trouble`, linking
+    /// `linked`.
+    fn set(
+        lookup: BranchLookup,
+        trouble: Option<PullRequestTrouble>,
+        linked: Vec<LinkedPullRequest>,
+    ) -> SessionPullRequests {
+        let branch = BranchPullRequest::new(Some("feature".to_owned()), lookup, trouble);
+        SessionPullRequests::new(Some(branch), linked)
+    }
+
+    fn found(number: u32) -> BranchLookup {
+        BranchLookup::Found {
+            pull_request: Box::new(summary(number)),
+        }
+    }
+
+    /// The surface keeps what it shows until the user or an unlink moves
+    /// it, never flashing to another PR on a passing state; and falls back
+    /// to the PR the user most likely wants.
+    #[test]
+    fn the_pr_shown_stays_until_it_goes() {
+        let linked = Which::Linked(id(13));
+        let cases = [
+            (
+                "a machine reconnecting keeps the PR",
+                None,
+                linked.clone(),
+                linked.clone(),
+            ),
+            (
+                "the agent linking another keeps the PR",
+                Some(set(BranchLookup::None, None, vec![link(13), link(14)])),
+                linked.clone(),
+                linked.clone(),
+            ),
+            (
+                "the branch's PR picked as a link is the branch's",
+                Some(set(found(12), None, vec![link(12)])),
+                Which::Linked(id(12)),
+                Which::Branch,
+            ),
+            (
+                "the branch's PR stays the branch's while it is looked up again",
+                Some(set(BranchLookup::Looking, None, vec![link(12)])),
+                Which::Branch,
+                Which::Branch,
+            ),
+            (
+                "unlinked, the branch's PR shows",
+                Some(set(found(12), None, vec![])),
+                linked.clone(),
+                Which::Branch,
+            ),
+            (
+                "with no branch PR, the last link read shows",
+                Some(set(BranchLookup::None, None, vec![link(13), unread(14)])),
+                Which::Branch,
+                linked.clone(),
+            ),
+            (
+                "a lookup that can't finish finds nothing",
+                Some(set(
+                    BranchLookup::Looking,
+                    Some(PullRequestTrouble::NotInstalled),
+                    vec![link(13)],
+                )),
+                Which::Branch,
+                linked,
+            ),
+            (
+                "with nothing linked, the branch's empty state shows",
+                Some(set(BranchLookup::None, None, vec![])),
+                Which::Branch,
+                Which::Branch,
+            ),
+        ];
+        for (case, set, shown, next) in cases {
+            assert_eq!(next_which(set.as_ref(), &shown), next, "{case}");
+        }
     }
 }

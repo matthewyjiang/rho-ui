@@ -90,7 +90,7 @@ impl PullRequests {
             }
             Which::Linked(id) => {
                 let Some(link) = set.link(id) else {
-                    // Not in the set yet, or just unlinked: its tab closes.
+                    // Not in the set yet, or just unlinked: the surface moves on.
                     return looking;
                 };
                 match (&link.summary, &link.trouble) {

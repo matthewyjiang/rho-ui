@@ -23,7 +23,9 @@ use super::PullRequestSurface;
 use crate::forge::PrAction;
 
 /// Where an action on the PR stands.
+#[derive(Default)]
 pub(super) enum Acting {
+    #[default]
     Idle,
     /// A merge this way was asked for, of the head commit then on screen;
     /// a second click does it.
@@ -32,9 +34,7 @@ pub(super) enum Acting {
         head: String,
     },
     /// Doing it; dropping the task stops waiting for it.
-    Running {
-        _task: Task<()>,
-    },
+    Running { _task: Task<()> },
     /// It wasn't done, and why.
     Failed(SharedString),
 }
@@ -55,21 +55,21 @@ impl PullRequestSurface {
                     // What it says is about a PR no longer on screen.
                     return;
                 }
-                this.acting = match result {
+                this.pr.acting = match result {
                     Ok(()) => Acting::Idle,
                     Err(why) => Acting::Failed(why),
                 };
                 cx.notify();
             });
         });
-        self.acting = Acting::Running { _task: task };
+        self.pr.acting = Acting::Running { _task: task };
         cx.notify();
     }
 
     /// Whether an action runs, or no machine's account can act: the
     /// comment box says why.
     fn busy(&self, cx: &Context<'_, Self>) -> bool {
-        matches!(self.acting, Acting::Running { .. }) || self.prs.read(cx).poster(cx).is_err()
+        matches!(self.pr.acting, Acting::Running { .. }) || self.prs.read(cx).poster(cx).is_err()
     }
 
     /// Asks to confirm a merge `method`'s way of the head of the PR on
@@ -80,7 +80,7 @@ impl PullRequestSurface {
             return;
         };
         let head = detail.summary.head_oid.clone();
-        self.acting = Acting::Confirming { method, head };
+        self.pr.acting = Acting::Confirming { method, head };
         cx.notify();
     }
 
@@ -92,7 +92,7 @@ impl PullRequestSurface {
         cx: &Context<'_, Self>,
     ) -> Option<AnyElement> {
         let busy = self.busy(cx);
-        let buttons = match (detail.summary.state, &self.acting) {
+        let buttons = match (detail.summary.state, &self.pr.acting) {
             (PullRequestState::Draft, _) => h_flex().child(
                 Button::new("pull-request-ready")
                     .small()
@@ -119,7 +119,7 @@ impl PullRequestSurface {
             _ => return None,
         };
         let theme = cx.theme();
-        let note = match &self.acting {
+        let note = match &self.pr.acting {
             Acting::Failed(why) => Some((why.clone(), theme.red)),
             _ if detail.mergeable == PullRequestMergeable::Conflicting
                 && detail.summary.state == PullRequestState::Open =>
@@ -252,7 +252,7 @@ fn confirm(
                 .ghost()
                 .label("Cancel")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.acting = Acting::Idle;
+                    this.pr.acting = Acting::Idle;
                     cx.notify();
                 })),
         )

@@ -1,10 +1,9 @@
 //! Linking PRs to a session by hand, for those the branch doesn't find: a
 //! fork's, one from another branch, or one in another repository. The
 //! session's daemon keeps each link, the agent's too, until it is
-//! unlinked, and each shows in a tab of its own, which
-//! [`super::super::RightPanel`] opens and closes as the daemon's links
-//! change. Unlinking, from the toolbar or the tab's ×, goes through the
-//! surface that shows the PR, which shows why the daemon refused.
+//! unlinked, and the surface's toolbar switches between them. Unlinking is
+//! the toolbar's alone: closing the tab never unlinks. A refusal shows on
+//! the surface.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -20,14 +19,9 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
     Subscription, Task, Window,
 };
-use rho_ui_core::{LinkedPullRequest, PullRequestId};
+use rho_ui_core::LinkedPullRequest;
 
 use super::PullRequestSurface;
-
-/// Asks [`super::super::RightPanel`] to show the tab of this PR, which the
-/// user just linked, or named when it was linked already.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::right_panel) struct ShowLinked(pub(in crate::right_panel) PullRequestId);
 
 /// The form to link a PR, while it is open.
 pub(super) struct LinkForm {
@@ -47,12 +41,12 @@ impl LinkForm {
 }
 
 /// The surface's last unlink of the PR it shows.
+#[derive(Default)]
 pub(super) enum Unlinking {
+    #[default]
     Idle,
     /// Asked of the daemon, until it answers; dropping it stops waiting.
-    Asking {
-        _answer: Task<()>,
-    },
+    Asking { _answer: Task<()> },
     /// The daemon refused, and why, until it unlinks again or the
     /// daemon's link to the PR changes from `link`, as the refusal may no
     /// longer hold.
@@ -108,7 +102,7 @@ impl PullRequestSurface {
     }
 
     /// Asks the session's daemon to link the PR the form names, as typed:
-    /// the daemon reads it. Once linked, the form closes and its tab shows;
+    /// the daemon reads it. Once linked, the form closes and the PR shows;
     /// a refusal shows under the form.
     fn link(&mut self, cx: &mut Context<'_, Self>) {
         let Some(form) = &self.link_form else {
@@ -126,7 +120,7 @@ impl PullRequestSurface {
                 match result {
                     Ok(id) => {
                         this.link_form = None;
-                        cx.emit(ShowLinked(id));
+                        this.pick(id, cx);
                     }
                     Err(why) => {
                         if let Some(form) = &mut this.link_form {
@@ -145,13 +139,13 @@ impl PullRequestSurface {
         cx.notify();
     }
 
-    /// Asks the session's daemon to unlink the PR it shows, which closes
-    /// its tab once it answers; a refusal shows as its trouble.
-    pub(in crate::right_panel) fn unlink(&mut self, cx: &mut Context<'_, Self>) {
+    /// Asks the session's daemon to unlink the PR it shows, after which
+    /// another of the session's shows; a refusal shows as its trouble.
+    pub(super) fn unlink(&mut self, cx: &mut Context<'_, Self>) {
         let Some(id) = self.linked().cloned() else {
             return;
         };
-        if matches!(self.unlinking, Unlinking::Asking { .. }) {
+        if matches!(self.pr.unlinking, Unlinking::Asking { .. }) {
             return;
         }
         let session = self.session.clone();
@@ -159,7 +153,7 @@ impl PullRequestSurface {
         let task = cx.spawn(async move |this, cx| {
             let result = unlinked.await;
             let _ = this.update(cx, |this, cx| {
-                this.unlinking = match result {
+                this.pr.unlinking = match result {
                     Ok(()) => Unlinking::Idle,
                     Err(why) => Unlinking::Refused {
                         why,
@@ -169,19 +163,19 @@ impl PullRequestSurface {
                 cx.notify();
             });
         });
-        self.unlinking = Unlinking::Asking { _answer: task };
+        self.pr.unlinking = Unlinking::Asking { _answer: task };
         cx.notify();
     }
 
     /// Forgets the refusal of the last unlink once the daemon's link to
     /// the PR changed since.
     pub(super) fn forget_stale_refusal(&mut self, cx: &App) {
-        let stale = match &self.unlinking {
+        let stale = match &self.pr.unlinking {
             Unlinking::Refused { link, .. } => self.shown_link(cx) != link.as_deref(),
             Unlinking::Idle | Unlinking::Asking { .. } => false,
         };
         if stale {
-            self.unlinking = Unlinking::Idle;
+            self.pr.unlinking = Unlinking::Idle;
         }
     }
 

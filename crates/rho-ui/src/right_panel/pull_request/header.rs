@@ -6,12 +6,13 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
     tag::Tag,
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    div, Anchor, AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _,
 };
 use rho_ui_core::{
@@ -24,9 +25,9 @@ use crate::{
     pull_requests::{PullRequests, Reading, Seen, Which},
 };
 
-/// What Unlink says it does to the session's `link`, here and on its tab:
-/// it ends the agent's watch too, while the agent watches it.
-pub(in crate::right_panel) fn unlink_tooltip(link: Option<&LinkedPullRequest>) -> &'static str {
+/// What Unlink says it does to the session's `link`: it ends the agent's
+/// watch too, while the agent watches it.
+fn unlink_tooltip(link: Option<&LinkedPullRequest>) -> &'static str {
     if link.is_some_and(|link| link.watched) {
         "Unlink and end the agent's watch"
     } else {
@@ -35,12 +36,14 @@ pub(in crate::right_panel) fn unlink_tooltip(link: Option<&LinkedPullRequest>) -
 }
 
 /// The strip above the PR the surface shows, by its `reading`: the PR's
-/// repository and number, and the buttons to open it on the forge, to link
-/// another, to unlink one linked, and to read it again. While the daemon
-/// can't be asked, it offers nothing that asks it.
+/// repository and number, a menu of the session's other PRs (`choices`,
+/// [`PullRequests::choices`]) when it has others, and the buttons to open
+/// it on the forge, to link another, to unlink one linked, and to read it
+/// again. While the daemon can't be asked, it offers nothing that asks it.
 pub(super) fn toolbar(
     reading: &Reading<'_>,
     which: &Which,
+    choices: &[(&PullRequestId, Option<&str>)],
     cx: &Context<'_, PullRequestSurface>,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -57,6 +60,12 @@ pub(super) fn toolbar(
     let id: Option<&PullRequestId> = pr.map(|pr| &pr.id).or(linked);
     let watched = reading.link.is_some_and(|link| link.watched);
     let asks = reading.seen.asks();
+    let others = choices.iter().any(|(choice, _)| Some(*choice) != id);
+    let name = if others {
+        Some(pr_menu(id, choices, cx))
+    } else {
+        id.map(|id| pr_name(id, cx))
+    };
     h_flex()
         .flex_shrink_0()
         .h_8()
@@ -66,20 +75,7 @@ pub(super) fn toolbar(
         .border_color(theme.border)
         .text_xs()
         .text_color(theme.muted_foreground)
-        .when_some(id, |this, id| {
-            this.child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .child(format!("{}/{}", id.owner, id.name)),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(theme.foreground)
-                    .child(format!("#{}", id.number)),
-            )
-        })
+        .children(name)
         .when(linked.is_some(), |this| {
             this.child(div().flex_shrink_0().child("· linked"))
         })
@@ -118,6 +114,73 @@ pub(super) fn toolbar(
             )
         })
         .when(asks, |this| this.child(refresh_button(cx)))
+}
+
+/// The PR `id` names: its repository, then its number.
+fn pr_name(id: &PullRequestId, cx: &Context<'_, PullRequestSurface>) -> AnyElement {
+    h_flex()
+        .min_w_0()
+        .gap_1()
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(format!("{}/{}", id.owner, id.name)),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(cx.theme().foreground)
+                .child(format!("#{}", id.number)),
+        )
+        .into_any_element()
+}
+
+/// The PR `id` names, as a menu of the session's PRs (`choices`), which
+/// shows the one picked.
+fn pr_menu(
+    id: Option<&PullRequestId>,
+    choices: &[(&PullRequestId, Option<&str>)],
+    cx: &Context<'_, PullRequestSurface>,
+) -> AnyElement {
+    let label = id.map_or_else(
+        || "Pull requests".to_owned(),
+        |id| format!("{}/{} #{}", id.owner, id.name, id.number),
+    );
+    let shown = id.cloned();
+    let choices: Vec<(PullRequestId, String)> = choices
+        .iter()
+        .map(|(choice, title)| {
+            let name = format!("{}/{}#{}", choice.owner, choice.name, choice.number);
+            let name = if choice.host == "github.com" {
+                name
+            } else {
+                format!("{}/{name}", choice.host)
+            };
+            let label = title.map_or_else(|| name.clone(), |title| format!("{name}  {title}"));
+            ((*choice).clone(), label)
+        })
+        .collect();
+    let surface = cx.entity().downgrade();
+    Button::new("pull-request-pick")
+        .ghost()
+        .xsmall()
+        .label(label)
+        .dropdown_caret(true)
+        .accessibility_label("Pull requests of this session")
+        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+            choices.iter().fold(menu, |menu, (choice, label)| {
+                let (surface, choice) = (surface.clone(), choice.clone());
+                menu.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(shown.as_ref() == Some(&choice))
+                        .on_click(move |_, _, cx| {
+                            let _ = surface.update(cx, |this, cx| this.pick(choice.clone(), cx));
+                        }),
+                )
+            })
+        })
+        .into_any_element()
 }
 
 /// The title, then its state, author and branches, then its size and

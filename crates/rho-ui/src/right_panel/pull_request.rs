@@ -1,7 +1,8 @@
-//! The Pull request surface: one of a session's PRs, as its machine's rho
-//! daemon reads it ([`PullRequests`]): the one whose head is its branch, or
-//! one linked to the session, by hand ([`link`]) or by its agent, each in a
-//! tab of its own ([`Which`]). It shows what the PR is ([`header`]), its
+//! The Pull request surface: one of a session's PRs at a time, as its
+//! machine's rho daemon reads it ([`PullRequests`]): the one whose head is
+//! its branch, or one linked to the session, by hand ([`link`]) or by its
+//! agent. Its toolbar switches between them ([`Which`],
+//! [`PullRequests::which`]). It shows what the PR is ([`header`]), its
 //! checks ([`checks`]), its description, and its threads on the code and
 //! conversation, with a box to comment in ([`conversation`]). It asks the
 //! daemon to keep reading the PR only while it shows; the session's turn
@@ -31,14 +32,11 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, relative, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity,
-    EventEmitter, Focusable as _, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Render, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window,
+    Focusable as _, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{PullRequestDetail, PullRequestId, PullRequestSummary};
 
-pub(super) use self::header::unlink_tooltip;
-pub(super) use self::link::ShowLinked;
 use self::{
     actions::Acting,
     checks::{check_counts, checks},
@@ -66,6 +64,8 @@ pub(super) struct PullRequestSurface {
     prs: Entity<PullRequests>,
     /// Its session.
     session: SessionKey,
+    /// What it shows, kept by [`PullRequests::which`] as the session's
+    /// PRs change.
     which: Which,
     /// Whether it is on screen: the tab shown in a panel that shows.
     visibility: Visibility,
@@ -74,6 +74,18 @@ pub(super) struct PullRequestSurface {
     texts: HashMap<SharedString, (SharedString, Entity<TextViewState>)>,
     /// The diagrams in those texts.
     diagrams: DiagramState,
+    /// What the user has under way on the PR on screen.
+    pr: PrState,
+    /// The form to link a PR by hand, while it is open.
+    link_form: Option<LinkForm>,
+    _subscriptions: [Subscription; 1],
+}
+
+/// What the user has under way on the one PR on screen, which the next PR
+/// starts without, so nothing meant for one lands on another. Dropping it
+/// stops waiting on what it asked.
+#[derive(Default)]
+struct PrState {
     /// The comment threads on the code the user opened or closed, by id:
     /// those resolved start closed, the rest open.
     flipped: HashSet<String>,
@@ -81,21 +93,18 @@ pub(super) struct PullRequestSurface {
     /// first render, which has the window it needs.
     comment_box: Option<(Entity<TextareaState>, Subscription)>,
     posting: Posting,
-    /// The form to link a PR by hand, while it is open.
-    link_form: Option<LinkForm>,
     unlinking: Unlinking,
     acting: Acting,
-    _subscriptions: [Subscription; 1],
 }
 
 impl PullRequestSurface {
     pub(super) fn new(
         prs: Entity<PullRequests>,
         session: SessionKey,
-        which: Which,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let subscriptions = [cx.observe(&prs, |this, _, cx| {
+            this.sync_which(cx);
             this.sync_texts(cx);
             this.forget_stale_refusal(cx);
             cx.notify();
@@ -106,6 +115,7 @@ impl PullRequestSurface {
             this.prs.update(cx, |prs, cx| prs.hide(surface, cx));
         })
         .detach();
+        let which = prs.read(cx).which(&session, &Which::Branch);
         let mut this = Self {
             prs,
             session,
@@ -113,12 +123,8 @@ impl PullRequestSurface {
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
             diagrams: DiagramState::new(),
-            flipped: HashSet::new(),
-            comment_box: None,
-            posting: Posting::Idle,
+            pr: PrState::default(),
             link_form: None,
-            unlinking: Unlinking::Idle,
-            acting: Acting::Idle,
             _subscriptions: subscriptions,
         };
         this.watch(cx);
@@ -140,8 +146,33 @@ impl PullRequestSurface {
         }
     }
 
+    /// Shows PR `id` of the session's: its branch's or a linked one.
+    pub(super) fn pick(&mut self, id: PullRequestId, cx: &mut Context<'_, Self>) {
+        self.show(&Which::Linked(id), cx);
+    }
+
+    /// Follows [`PullRequests::which`] as the session's PRs change: a PR
+    /// unlinked falls back to another, and the branch's lookup finding
+    /// none shows the PR linked last.
+    fn sync_which(&mut self, cx: &mut Context<'_, Self>) {
+        self.show(&self.which.clone(), cx);
+    }
+
+    /// Shows `which`, as [`PullRequests::which`] has it. What was under
+    /// way on the PR it showed is dropped, so a comment or merge meant for
+    /// it can't land on the next.
+    fn show(&mut self, which: &Which, cx: &mut Context<'_, Self>) {
+        let which = self.prs.read(cx).which(&self.session, which);
+        if which == self.which {
+            return;
+        }
+        self.which = which;
+        self.pr = PrState::default();
+        self.watch(cx);
+    }
+
     /// The linked PR that it shows, if it shows one.
-    pub(super) fn linked(&self) -> Option<&PullRequestId> {
+    fn linked(&self) -> Option<&PullRequestId> {
         match &self.which {
             Which::Branch => None,
             Which::Linked(id) => Some(id),
@@ -189,6 +220,7 @@ impl PullRequestSurface {
     /// Whether the comment box, or the form to link a PR, has the keyboard.
     pub(super) fn has_keyboard(&self, window: &Window, cx: &App) -> bool {
         let comment = self
+            .pr
             .comment_box
             .as_ref()
             .is_some_and(|(input, _)| input.focus_handle(cx).is_focused(window));
@@ -411,8 +443,6 @@ fn message(
         .into_any_element()
 }
 
-impl EventEmitter<ShowLinked> for PullRequestSurface {}
-
 impl Render for PullRequestSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.ensure_comment_box(window, cx);
@@ -424,6 +454,7 @@ impl Render for PullRequestSurface {
         let trouble = match &reading.seen {
             Seen::Disconnected(_) | Seen::Unserved(_) => None,
             Seen::Looking | Seen::Nothing(_) | Seen::Pr(_) => self
+                .pr
                 .unlinking
                 .refusal()
                 .cloned()
@@ -456,7 +487,12 @@ impl Render for PullRequestSurface {
             .id("pull-request")
             .test_support()
             .size_full()
-            .child(toolbar(&reading, &self.which, cx))
+            .child(toolbar(
+                &reading,
+                &self.which,
+                &prs.choices(&self.session),
+                cx,
+            ))
             .children(self.link_form(cx))
             .child(
                 v_flex()

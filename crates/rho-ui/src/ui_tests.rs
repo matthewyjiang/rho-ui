@@ -4514,11 +4514,53 @@ fn a_sidebar_row_marks_its_pr() {
     );
 }
 
-/// Links go to the daemon, and tabs follow its links: each PR linked by
-/// hand or by the agent opens a tab of its own, except the branch's own
-/// PR, which has one, also while the daemon looks the branch up; what
-/// names no PR shows the daemon's refusal; closing a linked PR's tab, or
-/// Unlink, unlinks it.
+/// A PR linked to the session by `origin`, read as open with passing
+/// checks, titled `title`, at `host`.
+fn linked_pr(
+    host: &str,
+    number: u32,
+    title: &str,
+    origin: PullRequestLinkOrigin,
+) -> LinkedPullRequest {
+    let id = PullRequestId::new(host, "acme", "widgets", number);
+    let url = format!("https://{host}/acme/widgets/pull/{number}");
+    let mut link = LinkedPullRequest::new(id.clone(), url.clone(), origin, 1_767_312_100);
+    link.summary = Some(PullRequestSummary::new(
+        id,
+        title,
+        url,
+        PullRequestState::Open,
+        PullRequestRollup::Passing,
+        "def",
+        "2026-11-16T00:00:00Z",
+    ));
+    link
+}
+
+/// What the Pull request tab says, as `#12`.
+fn pr_tab_label(ui: &mut Harness) -> Option<String> {
+    ui.label("panel-tab-pull-request")
+}
+
+/// Whether the Pull request surface shows the PR titled `title`.
+fn shows_pr(window: &Window, title: &str) -> bool {
+    window
+        .try_find("pull-request-title")
+        .is_some_and(|shown| shown.label() == Some(title))
+}
+
+/// Picks the session's PR whose menu item says `label` from the Pull
+/// request surface's menu.
+fn pick_pr(ui: &mut Harness, label: &str) {
+    ui.click("pull-request-pick");
+    click_menu_item(ui, label);
+}
+
+/// Links go to the daemon, and the one Pull request tab follows them: what
+/// names no PR shows the daemon's refusal; a PR linked by hand shows at
+/// once, in that tab; its menu switches between the session's PRs, the
+/// agent's too, which never takes the tab from the one shown; Unlink
+/// unlinks the one shown and shows the branch's again.
 #[test]
 fn pull_requests_link_by_hand() {
     let (mut ui, key) = open_pr_surface("pull-request-link", Settings::default());
@@ -4539,129 +4581,140 @@ fn pull_requests_link_by_hand() {
     ui.shot("form");
     ui.act(|window, cx| window.press("secondary-a", cx));
 
-    // The branch's own PR, linked, keeps its one tab.
+    // The branch's own PR, linked, is still the branch's: there is nothing
+    // to switch to.
     link(&mut ui, "acme/widgets#12");
     ui.wait_until("the form closed", |window, _, _| {
         !is_visible(window, "pull-request-link-input")
     });
     assert_eq!(linked(&ui), [12]);
-    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
-    // A daemon that restarted looks the branch up again: until it has
-    // found the branch's PR, that PR, watched, gets no tab of its own
-    // either, to close again once it has.
-    let branch = ui.fake().pull_requests(&key.id).branch;
-    ui.fake().edit_pull_requests(&key.id, |set| {
-        set.branch.as_mut().expect("the branch").lookup = BranchLookup::Looking;
-        set.linked[0].watched = true;
-    });
-    ui.wait_until("the branch looked up again", |_, cx, app| {
-        let set = app.pull_requests().read(cx).of(&key);
-        set.and_then(|set| set.branch.as_ref())
-            .is_some_and(|branch| branch.lookup == BranchLookup::Looking)
-    });
-    ui.act(|window, _| assert!(!is_visible(window, "panel-tab-pull-request-2")));
-    ui.fake()
-        .edit_pull_requests(&key.id, move |set| set.branch = branch);
-    ui.wait_until("the branch's PR found again", |window, _, _| {
-        is_visible(window, "pull-request-title")
-    });
+    ui.act(|window, _| assert!(!is_visible(window, "pull-request-pick")));
 
     link(&mut ui, "#13");
-    ui.wait_until("the linked PR in a tab of its own", |window, _, _| {
-        is_visible(window, "panel-tab-pull-request-2")
+    ui.wait_until("#13 in the same tab", |window, _, _| {
+        window
+            .try_find("panel-tab-pull-request")
+            .is_some_and(|tab| tab.label() == Some("#13"))
     });
     assert_eq!(linked(&ui), [12, 13]);
-    // The agent links and watches a PR.
-    let id = PullRequestId::new("github.com", "acme", "widgets", 14);
-    let url = "https://github.com/acme/widgets/pull/14";
-    let mut agents =
-        LinkedPullRequest::new(id.clone(), url, PullRequestLinkOrigin::Agent, 1_767_312_100);
-    agents.watched = true;
-    agents.summary = Some(PullRequestSummary::new(
-        id,
+    let tabs = ui.cx.update(|cx| ui.app.read(cx).panel_tabs(cx));
+    assert_eq!(tabs, [Surface::PullRequest], "one tab for every PR");
+
+    // The agent links and watches a PR: it joins the menu, and the tab
+    // stays on the PR the user chose.
+    let mut agents = linked_pr(
+        "github.com",
+        14,
         "Agent's widgets",
-        url,
-        PullRequestState::Open,
-        PullRequestRollup::Passing,
-        "def",
-        "2026-11-16T00:00:00Z",
-    ));
+        PullRequestLinkOrigin::Agent,
+    );
+    agents.watched = true;
+    let id = agents.id.clone();
     ui.fake()
         .edit_pull_requests(&key.id, |set| set.linked.push(agents));
-    ui.wait_until("the agent's PR in a tab", |window, _, _| {
-        is_visible(window, "panel-tab-pull-request-3")
+    ui.wait_until("the agent's link", |_, cx, app| {
+        let prs = app.pull_requests().read(cx);
+        prs.of(&key).is_some_and(|set| set.link(&id).is_some())
     });
-    assert_eq!(ui.label("panel-tab-pull-request").as_deref(), Some("#12"));
-    assert_eq!(ui.label("panel-tab-pull-request-2").as_deref(), Some("#13"));
-    assert_eq!(ui.label("panel-tab-pull-request-3").as_deref(), Some("#14"));
-    ui.shot("linked");
-
-    ui.act(|window, cx| window.hover("panel-tab-pull-request-2", cx));
-    ui.click("close-panel-tab-pull-request-2");
-    ui.wait_for_daemon("#13 unlinked", |fake| {
-        linked_numbers(fake, &key) == [12, 14]
-    });
-    ui.wait_until("its tab closed", |window, _, _| {
-        !is_visible(window, "panel-tab-pull-request-2")
-    });
-
-    ui.click("panel-tab-pull-request-3");
+    assert_eq!(pr_tab_label(&mut ui).as_deref(), Some("#13"));
+    pick_pr(&mut ui, "acme/widgets#14  Agent's widgets");
     ui.wait_until("the agent's PR", |window, _, _| {
-        window
-            .try_find("pull-request-title")
-            .is_some_and(|title| title.label() == Some("Agent's widgets"))
+        shows_pr(window, "Agent's widgets")
     });
+    assert_eq!(pr_tab_label(&mut ui).as_deref(), Some("#14"));
     ui.shot("watched");
+
     ui.click("pull-request-unlink");
     ui.wait_until("the branch's PR again", |window, _, _| {
-        !is_visible(window, "panel-tab-pull-request-3")
-            && window
-                .try_find("pull-request-title")
-                .is_some_and(|title| title.label() == Some("Add widgets"))
+        shows_pr(window, "Add widgets")
     });
-    assert_eq!(linked(&ui), [12]);
+    assert_eq!(pr_tab_label(&mut ui).as_deref(), Some("#12"));
+    assert_eq!(linked(&ui), [12, 13]);
 }
 
-/// An unlink the daemon refuses shows why on the PR's own tab, and the
-/// tab stays: closing a linked tab never fails silently.
+/// A session whose branch has no PR but which links some, as an agent's
+/// watches leave behind, opens one Pull request tab on the PR linked last,
+/// not an empty tab beside a tab per link; closing it closes just it, and
+/// unlinks nothing.
 #[test]
-fn a_refused_unlink_shows_on_its_tab() {
+fn a_branch_without_a_pr_shows_the_pr_linked_last() {
+    let daemon = FakeDaemon::start(Script::default());
+    let mut ui = Harness::open_with(
+        "pull-request-no-branch-pr",
+        daemon.target(),
+        Some(daemon),
+        Machines {
+            shelves: kept(["s1"]),
+            ..Machines::default()
+        },
+    );
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the turn to end", |session| {
+        session.state() == &RunState::Idle
+    });
+    let key = active_key(&mut ui);
+    // Its workspace is in no git repository: its branch has no PR.
+    ui.fake().edit_pull_requests(&key.id, |set| {
+        let agent = PullRequestLinkOrigin::Agent;
+        set.linked
+            .push(linked_pr("github.com", 13, "Old widgets", agent));
+        set.linked
+            .push(linked_pr("github.com", 14, "New widgets", agent));
+    });
+
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.click("open-surface-pull-request");
+    ui.wait_until("the PR linked last", |window, _, _| {
+        shows_pr(window, "New widgets")
+    });
+    assert_eq!(pr_tab_label(&mut ui).as_deref(), Some("#14"));
+    let tabs = ui.cx.update(|cx| ui.app.read(cx).panel_tabs(cx));
+    assert_eq!(tabs, [Surface::PullRequest], "one tab for every PR");
+    ui.click("pull-request-pick");
+    ui.shot("menu");
+    click_menu_item(&mut ui, "acme/widgets#13  Old widgets");
+    ui.wait_until("the other PR", |window, _, _| {
+        shows_pr(window, "Old widgets")
+    });
+
+    ui.act(|window, cx| window.hover("panel-tab-pull-request", cx));
+    ui.click("close-panel-tab-pull-request");
+    ui.wait_until("the tab closed", |window, _, _| {
+        !is_visible(window, "panel-tab-pull-request")
+    });
+    assert_eq!(linked_numbers(ui.fake(), &key), [13, 14]);
+}
+
+/// An unlink the daemon refuses shows why on the surface, which stays on
+/// the PR: Unlink never fails silently.
+#[test]
+fn a_refused_unlink_shows_on_its_pr() {
     let (mut ui, key) = open_pr_surface("pull-request-unlink-refused", Settings::default());
-    let linked = |ui: &Harness| linked_numbers(ui.fake(), &key);
-    // A link on a host the daemon refuses can't be unlinked: closing its
-    // tab shows why there, and the tab stays.
-    let id = PullRequestId::new("ghe.acme.com", "acme", "widgets", 15);
-    let url = "https://ghe.acme.com/acme/widgets/pull/15";
-    let mut elsewhere =
-        LinkedPullRequest::new(id.clone(), url, PullRequestLinkOrigin::User, 1_767_312_200);
-    elsewhere.summary = Some(PullRequestSummary::new(
-        id,
+    // A link on a host the daemon refuses can't be unlinked.
+    let elsewhere = linked_pr(
+        "ghe.acme.com",
+        15,
         "Widgets elsewhere",
-        url,
-        PullRequestState::Open,
-        PullRequestRollup::Passing,
-        "fed",
-        "2026-11-17T00:00:00Z",
-    ));
+        PullRequestLinkOrigin::User,
+    );
     ui.fake()
         .edit_pull_requests(&key.id, |set| set.linked.push(elsewhere));
-    ui.wait_until("its tab", |window, _, _| {
-        is_visible(window, "panel-tab-pull-request-2")
+    ui.wait_until("the menu of PRs", |window, _, _| {
+        is_visible(window, "pull-request-pick")
     });
-    ui.click("panel-tab-pull-request-2");
+    pick_pr(&mut ui, "ghe.acme.com/acme/widgets#15  Widgets elsewhere");
     ui.wait_until("its PR", |window, _, _| {
-        window
-            .try_find("pull-request-title")
-            .is_some_and(|title| title.label() == Some("Widgets elsewhere"))
+        shows_pr(window, "Widgets elsewhere")
     });
     ui.act(|window, _| assert!(!is_visible(window, "pull-request-trouble")));
-    ui.act(|window, cx| window.hover("panel-tab-pull-request-2", cx));
-    ui.click("close-panel-tab-pull-request-2");
-    ui.wait_until("the refusal on its tab", |window, _, _| {
+    ui.click("pull-request-unlink");
+    ui.wait_until("the refusal", |window, _, _| {
         is_visible(window, "pull-request-trouble")
     });
-    ui.act(|window, _| assert!(is_visible(window, "panel-tab-pull-request-2")));
-    assert_eq!(linked(&ui), [15]);
+    ui.act(|window, _| assert!(shows_pr(window, "Widgets elsewhere")));
+    assert_eq!(linked_numbers(ui.fake(), &key), [15]);
 }
 
 /// Two sessions on one branch each have a Pull request tab of the same PR;
