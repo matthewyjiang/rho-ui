@@ -516,13 +516,28 @@ impl RightPanel {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> Option<TabKey> {
-        let session = self.on_screen()?.clone();
-        let set = self.sets.get_mut(&session)?;
         if surface == Surface::SideChat {
-            let view = set.view.upgrade()?;
+            let view = self.set()?.view.upgrade()?;
             view.update(cx, SessionView::start_side_chat);
             return None;
         }
+        let key = self.tab_for(surface, window, cx)?;
+        self.show(key, cx);
+        Some(key)
+    }
+
+    /// The tab of `surface` that [`Self::open`] shows, of the session on
+    /// screen: a new one of a surface that opens many, else its tab, made
+    /// if it has none. Not for Side chat, whose tab the session's fork
+    /// opens.
+    fn tab_for(
+        &mut self,
+        surface: Surface,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<TabKey> {
+        let session = self.on_screen()?.clone();
+        let set = self.sets.get_mut(&session)?;
         let open = set
             .tabs
             .iter()
@@ -540,25 +555,27 @@ impl RightPanel {
                 key
             }
         };
-        self.show(key, cx);
         Some(key)
     }
 
     /// Shows PR `id` of the session on screen, as its title bar asks: its
-    /// Pull request tab opens if it wasn't, showing `id`.
+    /// Pull request tab opens if it wasn't, showing `id`. It picks `id`
+    /// before it shows, so the daemon is asked for `id` alone, not first
+    /// for the PR the tab showed.
     pub(crate) fn show_pull_request(
         &mut self,
         id: &PullRequestId,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(key) = self.open(Surface::PullRequest, window, cx) else {
+        let Some(key) = self.tab_for(Surface::PullRequest, window, cx) else {
             return;
         };
         if let Some(Tab::PullRequest { view, .. }) = self.tab(key) {
             view.clone()
                 .update(cx, |view, cx| view.pick(id.clone(), cx));
         }
+        self.show(key, cx);
     }
 
     /// A new tab `key` of `session`, which works in `place`.

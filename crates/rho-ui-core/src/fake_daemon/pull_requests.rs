@@ -69,6 +69,9 @@ pub(super) struct FakePullRequests {
     /// Each `show` clients sent, the unserved ones too: its session and
     /// how it read.
     shows: Vec<(String, PullRequestRead)>,
+    /// The pull request each `show` it answered was of, by its session:
+    /// `None` for a branch with none.
+    shown: Vec<(String, Option<PullRequestId>)>,
     /// How many links clients made.
     links: u64,
 }
@@ -81,6 +84,7 @@ impl FakePullRequests {
             details: HashMap::new(),
             lists: 0,
             shows: Vec::new(),
+            shown: Vec::new(),
             links: 0,
         }
     }
@@ -268,6 +272,9 @@ impl State {
                 ))
             }
         };
+        self.pull_requests
+            .shown
+            .push((session.to_owned(), id.clone()));
         let detail = id
             .and_then(|id| self.pull_requests.details.get(&id).cloned())
             .map(Box::new);
@@ -376,6 +383,20 @@ impl FakeDaemon {
             .iter()
             .filter(|(shown, _)| shown == session.as_str())
             .map(|&(_, read)| read)
+            .collect()
+    }
+
+    /// The pull request each `rho/session/pull_request/show` for `session`
+    /// that the fake answered was of, oldest first: `None` for a branch
+    /// with none.
+    pub fn pull_requests_shown(&self, session: &UiSessionId) -> Vec<Option<PullRequestId>> {
+        self.service
+            .lock()
+            .pull_requests
+            .shown
+            .iter()
+            .filter(|(shown, _)| shown == session.as_str())
+            .map(|(_, id)| id.clone())
             .collect()
     }
 }

@@ -4634,8 +4634,10 @@ fn pull_requests_link_by_hand() {
 
 /// A session whose branch has no PR but which links some, as an agent's
 /// watches leave behind, opens one Pull request tab on the PR linked last,
-/// not an empty tab beside a tab per link; closing it closes just it, and
-/// unlinks nothing.
+/// not an empty tab beside a tab per link. The title bar's mark shows its
+/// PR in that tab, asking the daemon for that PR alone, not first for the
+/// one the tab showed. Closing the tab closes just it, and unlinks
+/// nothing.
 #[test]
 fn a_branch_without_a_pr_shows_the_pr_linked_last() {
     let daemon = FakeDaemon::start(Script::default());
@@ -4678,6 +4680,26 @@ fn a_branch_without_a_pr_shows_the_pr_linked_last() {
     ui.wait_until("the other PR", |window, _, _| {
         shows_pr(window, "Old widgets")
     });
+
+    // With the panel hidden, the title bar marks the PR linked last. A
+    // minute on, the daemon's read of the tab's PR is due again.
+    ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    ui.cx.advance_clock(Duration::from_secs(60));
+    ui.frame();
+    let asked = ui.fake().pull_requests_shown(&key.id).len();
+    ui.click("title-pr");
+    ui.wait_until("the marked PR in the panel", |window, cx, _| {
+        PanelLayout::get(cx) && shows_pr(window, "New widgets")
+    });
+    ui.wait_for_daemon("the marked PR asked for", |fake| {
+        fake.pull_requests_shown(&key.id).len() > asked
+    });
+    let new = PullRequestId::new("github.com", "acme", "widgets", 14);
+    assert_eq!(
+        ui.fake().pull_requests_shown(&key.id)[asked..],
+        [Some(new)],
+        "only the marked PR is asked for"
+    );
 
     ui.act(|window, cx| window.hover("panel-tab-pull-request", cx));
     ui.click("close-panel-tab-pull-request");
