@@ -1220,10 +1220,13 @@ impl Session {
                 self.set_background(work);
                 None
             }
+            SessionEvent::Compaction { status, .. } => self.track_compaction(&status),
             event @ (SessionEvent::ProviderRequest
             | SessionEvent::ResponseDiscarded
-            | SessionEvent::ProviderRetry { .. }
-            | SessionEvent::Compaction { .. }) => self.track_provider(event),
+            | SessionEvent::ProviderRetry { .. }) => {
+                self.track_provider(&event);
+                None
+            }
             // Cache warming, and what a newer daemon adds, is not shown.
             _ => None,
         }
@@ -1248,11 +1251,10 @@ impl Session {
     }
 
     /// Follows the turn's requests to the provider: where each response
-    /// begins, a response the provider discarded, and what holds the turn
-    /// up, a retry or a compaction. A finished compaction adds its entry,
-    /// whose index this returns.
-    fn track_provider(&mut self, event: SessionEvent) -> Option<usize> {
-        match event {
+    /// begins, a response the provider discarded, and a retry that holds
+    /// the turn up.
+    fn track_provider(&mut self, event: &SessionEvent) {
+        match *event {
             SessionEvent::ProviderRequest => self.turn.attempt = Some(self.entries.len()),
             SessionEvent::ResponseDiscarded => self.discard_attempt(),
             // A wait read from history has passed already.
@@ -1265,24 +1267,28 @@ impl Session {
                     until: retry_after_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
                 });
             }
-            SessionEvent::Compaction { status, .. } => {
-                self.turn.delay = None;
-                match status {
-                    CompactionStatus::Started { trigger } => {
-                        self.turn.delay = Some(Delay::Compacting);
-                        self.turn.compacts |= trigger == Some(CompactionTrigger::Command);
-                    }
-                    CompactionStatus::Completed { counts } => {
-                        let compaction = Compaction::from_wire(&counts);
-                        self.entries.push(Entry::Compaction(compaction));
-                        return Some(self.entries.len() - 1);
-                    }
-                    _ => {}
-                }
-            }
             _ => {}
         }
-        None
+    }
+
+    /// Follows a compaction: it holds the turn up from its start to its
+    /// end, and one that finished is an entry, whose index this returns. A
+    /// `/compact` turn's reply only says again what it did, so is left out.
+    fn track_compaction(&mut self, status: &CompactionStatus) -> Option<usize> {
+        self.turn.delay = None;
+        match status {
+            CompactionStatus::Started { trigger } => {
+                self.turn.delay = Some(Delay::Compacting);
+                self.turn.compacts |= *trigger == Some(CompactionTrigger::Command);
+                None
+            }
+            CompactionStatus::Completed { counts } => {
+                self.entries
+                    .push(Entry::Compaction(Compaction::from_wire(counts)));
+                Some(self.entries.len() - 1)
+            }
+            _ => None,
+        }
     }
 
     /// Drops what the response the provider discarded had streamed: its

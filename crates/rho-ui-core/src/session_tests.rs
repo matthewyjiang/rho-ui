@@ -242,6 +242,70 @@ fn a_compaction_lasts_until_it_ends() {
     assert_eq!(session.delay(), None);
 }
 
+/// A finished compaction is a row where it happened, live or replayed as rho
+/// replays a saved one, its end alone. Only a `/compact` turn's reply, which
+/// says the same again, is left out.
+#[test]
+fn a_compaction_is_a_row_and_only_a_command_drops_its_reply() {
+    let started = |trigger: &str| {
+        json!({"type": "compaction", "id": "c1",
+            "status": {"type": "started", "trigger": trigger}})
+    };
+    let completed = json!({"type": "compaction", "id": "c1", "status": {"type": "completed",
+        "counts": {"previous_messages": 9, "current_messages": 2,
+            "previous_tokens": 900, "current_tokens": 200}}});
+    let prompt = json!({"type": "user_message", "message": "u1",
+        "content": [{"type": "text", "text": "go"}]});
+    let reply = json!({"type": "agent_message_chunk", "message": "m1", "text": "done"});
+    let replayed = vec![prompt.clone(), completed.clone(), reply.clone()];
+    let automatic = vec![
+        prompt.clone(),
+        started("automatic"),
+        completed.clone(),
+        reply.clone(),
+    ];
+    let command = vec![prompt, started("command"), completed, reply];
+    for (name, events, kinds) in [
+        ("replayed", replayed, &["user", "compaction", "agent"][..]),
+        ("automatic", automatic, &["user", "compaction", "agent"]),
+        ("command", command, &["user", "compaction"]),
+    ] {
+        let mut session = Session::new(SessionId::from("s1"));
+        let replayed_events = if name == "replayed" { 3 } else { 0 };
+        session.attached(attach_response(JobState::Idle, replayed_events));
+        if name != "replayed" {
+            session.apply(update(json!({"type": "state", "state": "running"})));
+        }
+        for event in events {
+            session.apply(update(event));
+        }
+        let shown: Vec<_> = texts(&session).into_iter().map(|(kind, _)| kind).collect();
+        assert_eq!(shown, kinds, "{name}");
+        let compaction = session
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Compaction(compaction) => Some(*compaction),
+                _ => None,
+            })
+            .expect("a compaction row");
+        assert_eq!(
+            compaction,
+            Compaction {
+                before: ContextSize {
+                    messages: 9,
+                    tokens: 900
+                },
+                after: ContextSize {
+                    messages: 2,
+                    tokens: 200
+                },
+            },
+            "{name}"
+        );
+    }
+}
+
 /// The daemon sends an edit as the old and new text; viewers read a patch,
 /// which names the file from the session's workspace.
 #[test]

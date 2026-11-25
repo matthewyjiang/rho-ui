@@ -54,7 +54,9 @@
 //!   in a session. Its two agent nodes are in the job list only: one
 //!   queued second in line, one failed with the error [`WORKFLOW_ERROR`].
 //! - The prompt "/compact" compacts the context from [`COMPACTED`]'s
-//!   before to its after, and answers saying so, as rho does.
+//!   before to its after, and answers saying so, as rho does. The prompt
+//!   "long" reads a file, compacts the same automatically, reads it again,
+//!   and answers.
 //! - The prompt "flaky" sets a plan of three steps, one done, one under
 //!   way and one to do, then streams half an answer that the provider
 //!   discards, and waits 30 s to retry, rate limited. The turn runs on
@@ -1421,24 +1423,66 @@ impl FakeSession {
     /// then a reply that says again what it did.
     fn compact(&mut self, turn: Turn, echo: SessionEvent) {
         let id = turn.id.clone();
-        let compaction = CompactionId::new(format!("c-{id}"));
         self.turn = Some(turn);
         self.state(JobState::Running);
         self.publish(echo);
+        self.compacted(&format!("c-{id}"), CompactionTrigger::Command);
+        let CompactionCounts {
+            previous_messages,
+            current_messages,
+            previous_tokens,
+            current_tokens,
+            ..
+        } = COMPACTED;
+        self.answer(
+            &format!("m-{id}"),
+            &format!(
+                "context compacted: {previous_messages} → {current_messages} messages, \
+                 {previous_tokens} → {current_tokens} tokens"
+            ),
+        );
+    }
+
+    /// Runs the turn of the prompt "long", one whose context fills: a read,
+    /// an automatic compaction, another read, and an answer.
+    fn long(&mut self, turn: Turn, echo: SessionEvent) {
+        let id = turn.id.clone();
+        self.turn = Some(turn);
+        self.state(JobState::Running);
+        self.publish(echo);
+        let read = |session: &mut Self, n: u8| {
+            session.tool(
+                &ToolCallId::new(format!("r-{id}-{n}")),
+                ("read_file(src/lib.rs)", ToolKind::Read),
+                ToolStatus::Completed,
+                vec![text("fn main() {}")],
+                card(
+                    ToolStatus::Completed,
+                    ToolFamily::FileCommand,
+                    ToolHeader::call("read_file", Some("src/lib.rs".to_owned())),
+                ),
+            );
+        };
+        read(self, 1);
+        self.compacted(&format!("c-{id}"), CompactionTrigger::Automatic);
+        read(self, 2);
+        self.answer(&format!("m-{id}"), "Read it twice.");
+    }
+
+    /// Compaction `id`, started by `trigger`, from [`COMPACTED`]'s before
+    /// to its after.
+    fn compacted(&mut self, id: &str, trigger: CompactionTrigger) {
+        let id = CompactionId::new(id);
         self.publish(SessionEvent::Compaction {
-            id: compaction.clone(),
+            id: id.clone(),
             status: CompactionStatus::Started {
-                trigger: Some(CompactionTrigger::Command),
+                trigger: Some(trigger),
             },
         });
         self.publish(SessionEvent::Compaction {
-            id: compaction,
+            id,
             status: CompactionStatus::Completed { counts: COMPACTED },
         });
-        self.answer(
-            &format!("m-{id}"),
-            "context compacted: 263 → 65 messages, 247276 → 54798 tokens",
-        );
     }
 
     /// Starts the turn of the prompt "flaky": the provider discards what

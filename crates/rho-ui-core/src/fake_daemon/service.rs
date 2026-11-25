@@ -185,6 +185,10 @@ fn start_prompt(
         session.compact(turn, echo(&turn_id, params));
         return Ok(SessionPromptResponse { turn: turn_id });
     }
+    if prompt == "long" {
+        session.long(turn, echo(&turn_id, params));
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
     if prompt == "flaky" {
         session.flaky(turn, echo(&turn_id, params));
         return Ok(SessionPromptResponse { turn: turn_id });

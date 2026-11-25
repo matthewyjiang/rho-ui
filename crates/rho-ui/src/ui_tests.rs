@@ -6816,8 +6816,8 @@ fn the_composer_completes_commands_and_skills() {
 }
 
 /// A compaction leaves a divider in the transcript saying how far the
-/// context shrank. A `/compact` turn's reply, which says the same again,
-/// stays out.
+/// context shrank. One in the middle of a turn's work stays out of the
+/// working that folds when the turn ends.
 #[test]
 fn a_compaction_shows_as_a_divider() {
     let mut ui = Harness::start("compaction", Script::default());
@@ -6827,35 +6827,46 @@ fn a_compaction_shows_as_a_divider() {
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.send("/compact");
-    ui.wait_for_session("the turn's end", |session| {
-        session.state() == &RunState::Idle
-            && session
-                .entries()
-                .iter()
-                .any(|entry| matches!(entry, Entry::Compaction(_)))
-    });
-    let entries = ui.session().entries().to_vec();
-    let expected = Compaction {
-        before: ContextSize {
-            messages: COMPACTED.previous_messages,
-            tokens: COMPACTED.previous_tokens,
-        },
-        after: ContextSize {
-            messages: COMPACTED.current_messages,
-            tokens: COMPACTED.current_tokens,
-        },
-    };
-    assert!(
-        matches!(
-            entries.as_slice(),
-            [Entry::User(_), Entry::Compaction(shown)] if *shown == expected
-        ),
-        "the prompt and its compaction: {entries:?}"
-    );
+    // Entries: prompt, compaction; the reply says it again, so stays out.
     ui.wait_until("the divider", |window, _, _| {
         is_visible(window, "compaction-1")
     });
+    assert_eq!(
+        ui.label("compaction-1").as_deref(),
+        Some("Context compacted · 263 → 65 messages · 247k → 54k tokens"),
+        "COMPACTED's counts, tokens shortened"
+    );
+    ui.wait_for_session("the turn's end", |session| {
+        session.state() == &RunState::Idle
+    });
     ui.shot("divider");
+
+    ui.send("long");
+    // Entries: prompt, read, compaction, read, answer.
+    ui.wait_for_session("the long turn's end", |session| {
+        session.state() == &RunState::Idle && session.entries().len() == 7
+    });
+    assert_eq!(
+        ui.session().entries()[4],
+        Entry::Compaction(Compaction {
+            before: ContextSize {
+                messages: COMPACTED.previous_messages,
+                tokens: COMPACTED.previous_tokens,
+            },
+            after: ContextSize {
+                messages: COMPACTED.current_messages,
+                tokens: COMPACTED.current_tokens,
+            },
+        })
+    );
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the work folded, the divider not", |window, _, _| {
+        is_visible(window, "worked-1")
+            && !is_visible(window, "step-3")
+            && !is_visible(window, "step-5")
+            && is_visible(window, "compaction-4")
+    });
+    ui.shot("folded");
 }
 
 /// Two machines list their sessions side by side, though their daemons

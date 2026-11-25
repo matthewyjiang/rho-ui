@@ -311,6 +311,16 @@ impl Transcript {
         }
     }
 
+    /// Whether row `row` is a compaction's. It stays out of its turn's
+    /// folded working: the model sees what came before it only as a
+    /// summary, which matters after the turn too.
+    fn is_compaction_row(&self, row: usize, entries: &[Entry]) -> bool {
+        matches!(
+            self.timeline.rows().get(row),
+            Some(Row::Message(entry)) if matches!(entries.get(*entry), Some(Entry::Compaction(_)))
+        )
+    }
+
     /// The surface row `row` is for, if it is a surface's row.
     fn surface_row<'a>(&self, row: usize, entries: &'a [Entry]) -> Option<&'a SurfaceRef> {
         let Row::Message(entry) = self.timeline.rows().get(row)? else {
@@ -708,7 +718,9 @@ impl Transcript {
                 .into_any_element();
         };
         let working = self.timeline.working(turn);
-        if working.as_ref().is_some_and(|rows| rows.contains(&row)) {
+        if working.as_ref().is_some_and(|rows| rows.contains(&row))
+            && !self.is_compaction_row(row, entries)
+        {
             let shows = if self.is_finished(turn) {
                 self.worked[turn]
             } else {
