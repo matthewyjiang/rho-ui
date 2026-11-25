@@ -182,7 +182,8 @@ impl Leads {
     /// empty, as when its lead didn't start, so a retry takes its name
     /// again: with [`unmake_here`] on this machine and [`UNMAKE_SCRIPT`] on
     /// a remote one. Best effort: a folder that holds anything stays, and a
-    /// failure goes unsaid.
+    /// failure goes unsaid, as when the link the start began on has since
+    /// dropped.
     pub(crate) async fn unmake(&self, dir: &Path) {
         let args = vec![dir.as_os_str().to_owned()];
         let dir = dir.to_path_buf();
