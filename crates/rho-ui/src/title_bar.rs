@@ -137,28 +137,10 @@ impl RenderOnce for TitleBar {
                     .child(shorten(&label));
                 [step.into_any_element(), slash().into_any_element()]
             });
-        // The same text with or without a click, so the bar reads alike in
-        // every pane; a link, as the steps after it are.
         let on_project = self.on_project;
-        let project = self.project.map(|(initials, name)| {
-            let project = h_flex()
-                .flex_shrink_0()
-                .gap_2()
-                .text_color(muted)
-                .child(Badge::new(initials, rems(BADGE_REMS)))
-                .child(name.clone());
-            match on_project {
-                Some(go) => project
-                    .id("title-project")
-                    .test_support()
-                    .aria_label(format!("New session in {name}"))
-                    .cursor_pointer()
-                    .hover(move |style| style.text_color(foreground))
-                    .on_click(move |_, window, cx| go(window, cx))
-                    .into_any_element(),
-                None => project.into_any_element(),
-            }
-        });
+        let project = self
+            .project
+            .map(|(initials, name)| project_step(initials, &name, on_project, cx));
         let has_project = project.is_some();
         let repo_page = self.repo_page.map(|url| {
             Button::new("title-repo")
@@ -221,6 +203,36 @@ impl RenderOnce for TitleBar {
                 Some(room) if !PanelLayout::get(cx) => bar.child(room),
                 _ => bar.pr_4(),
             })
+    }
+}
+
+/// The project at the head of the bar: the same text with or without a
+/// click, so the bar reads alike in every pane; with `go`, a link, as the
+/// steps after it are.
+fn project_step(
+    initials: SharedString,
+    name: &SharedString,
+    go: Option<Go>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let (muted, foreground) = (theme.muted_foreground, theme.foreground);
+    let project = h_flex()
+        .flex_shrink_0()
+        .gap_2()
+        .text_color(muted)
+        .child(Badge::new(initials, rems(BADGE_REMS)))
+        .child(name.clone());
+    match go {
+        Some(go) => project
+            .id("title-project")
+            .test_support()
+            .aria_label(format!("New session in {name}"))
+            .cursor_pointer()
+            .hover(move |style| style.text_color(foreground))
+            .on_click(move |_, window, cx| go(window, cx))
+            .into_any_element(),
+        None => project.into_any_element(),
     }
 }
 
