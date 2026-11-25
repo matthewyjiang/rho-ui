@@ -63,7 +63,7 @@ use crate::{
     session_list::contains_ignore_case,
     store::{Key, StateDb},
     time,
-    workspaces::{self, Workspaces},
+    workspaces::{self, Workspace, Workspaces},
 };
 
 /// The search field's height: Kit's medium input is `h_8`, 2 rem, over a
@@ -71,9 +71,11 @@ use crate::{
 const SEARCH_REMS: f32 = 2.;
 /// A row's height: measured at 51.5 px with a 16 px rem (3.219 rem) and
 /// 64.5 px with a 20 px rem (3.225 rem), in the default font and Noto Sans.
-const ROW_REMS: f32 = 3.22;
-/// Rows the list shows before it scrolls.
-const MAX_ROWS: u8 = 5;
+/// The added directories' list of projects draws the same rows.
+pub(crate) const ROW_REMS: f32 = 3.22;
+/// Rows the list shows before it scrolls; the added directories' list of
+/// projects shows as many.
+pub(crate) const MAX_ROWS: u8 = 5;
 /// Rows the list keeps room for, so the empty state has space.
 const MIN_ROWS: u8 = 2;
 
@@ -996,22 +998,17 @@ impl ProjectList {
                 cx.notify();
             }))
             .child(
-                row(
-                    Badge::new(workspace.initials.clone(), rems(1.75)).into_any_element(),
-                    workspace.name.clone(),
-                    div().truncate().child(workspace.path.clone()),
-                    cx,
-                )
-                .child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(trailing)
-                        .child(check),
-                )
-                .context_menu(move |menu, _, cx| with_remove(menu, &projects, &root, cx)),
+                project_row(workspace, cx)
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(trailing)
+                            .child(check),
+                    )
+                    .context_menu(move |menu, _, cx| with_remove(menu, &projects, &root, cx)),
             )
     }
 
@@ -1247,6 +1244,18 @@ impl ListDelegate for ProjectList {
     ) {
         // ListState keeps the selection; rows read it when it renders them.
     }
+}
+
+/// A project's row: its badge, its name, and under it its path, with the
+/// home directory as `~`. Callers add what goes on the right. The added
+/// directories' list of projects draws the same.
+pub(crate) fn project_row(workspace: &Workspace, cx: &App) -> Div {
+    row(
+        Badge::new(workspace.initials.clone(), rems(1.75)).into_any_element(),
+        workspace.name.clone(),
+        div().truncate().child(workspace.path.clone()),
+        cx,
+    )
 }
 
 /// One two-line row: a tile, the name, and under it the path. Callers add
