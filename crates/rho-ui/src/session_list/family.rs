@@ -473,7 +473,7 @@ mod tests {
             "[Leads]",
             "Lead",
             "› 1 started",
-            "-",
+            "[Sessions]",
             "Other",
             "~",
             "[Settled 1]",

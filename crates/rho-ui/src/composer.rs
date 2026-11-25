@@ -45,6 +45,7 @@ use rho_ui_core::{
 
 use crate::{
     attachments::{self, Preview},
+    leads::Kind,
     usage::UsageRing,
 };
 
@@ -127,7 +128,7 @@ impl ComposerState {
             TextareaState::new(window, cx)
                 .auto_grow(1, MAX_ROWS)
                 .submit_on_enter(true)
-                .placeholder("Ask Rho to do something")
+                .placeholder(Kind::Session.placeholder())
         });
         // The text box notifies when its text or cursor moves.
         let subscription = cx.observe(&input, |this, _, cx| this.update_menu(cx));

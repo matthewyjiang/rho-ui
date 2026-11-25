@@ -115,10 +115,6 @@ const MACHINE_LABEL_REMS: f32 = 5.;
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
 
-/// The break's height under the leads: half a header, which reads as a
-/// break without a line.
-const BREAK_REMS: f32 = HEADER_REMS / 2.;
-
 /// The line under a session that started others: one line of text, padded
 /// as the lines of a row are apart.
 const FOLD_REMS: f32 = LINE_REMS + 2. * GAP_REMS + 2. * GUTTER_REMS;
@@ -146,10 +142,9 @@ fn item_rems(item: Item) -> f32 {
     match item {
         Item::Draft(_) | Item::Session(_) => ROW_REMS,
         Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
-        Item::Header(_) | Item::Leads => HEADER_REMS,
+        Item::Header(_) | Item::Leads | Item::Sessions => HEADER_REMS,
         Item::Fold(_) => FOLD_REMS,
         Item::Gap => 0.,
-        Item::Break => BREAK_REMS,
     }
 }
 
@@ -990,10 +985,11 @@ impl SidebarView {
                     self.render_shelved(row, workspace, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
-                Item::Leads => Self::render_leads_header(),
+                Item::Leads => Self::render_kind_header("leads-header", "Leads"),
+                Item::Sessions => Self::render_kind_header("sessions-header", "Sessions"),
                 Item::Fold(line) => self.render_fold(line, cx),
                 Item::More(which) => self.render_show_more(which, cx),
-                Item::Gap | Item::Break => div().into_any_element(),
+                Item::Gap => div().into_any_element(),
             })
             .collect()
     }
@@ -1347,21 +1343,22 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// The header over the active leads, laid out as a shelf header is,
-    /// but it neither folds nor counts.
-    fn render_leads_header() -> AnyElement {
+    /// The header over the active leads, or over the active sessions that
+    /// follow them, laid out as a shelf header is, but it neither folds
+    /// nor counts.
+    fn render_kind_header(id: &'static str, label: &'static str) -> AnyElement {
         div()
             .h(rems(HEADER_REMS))
             .px_2()
             .py(rems(GUTTER_REMS))
             .child(
                 h_flex()
-                    .id("leads-header")
+                    .id(id)
                     .test_support()
                     .size_full()
                     .px_2()
                     .text_sm()
-                    .child("Leads"),
+                    .child(label),
             )
             .into_any_element()
     }

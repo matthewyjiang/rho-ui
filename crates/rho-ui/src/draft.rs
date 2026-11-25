@@ -79,9 +79,6 @@ pub(crate) enum DraftEvent {
     OpenSession,
 }
 
-/// The placeholder of a lead's composer, which says what to write there.
-const LEAD_PLACEHOLDER: &str = "What should this lead get done?";
-
 /// A session's draft, or a lead's.
 enum DraftKind {
     /// A session's, which `picker` moves between projects and checkouts.
@@ -218,7 +215,7 @@ impl DraftView {
             }
             DraftKind::Lead => {
                 input.update(cx, |input, cx| {
-                    input.set_placeholder(LEAD_PLACEHOLDER, window, cx);
+                    input.set_placeholder(Kind::Lead.placeholder(), window, cx);
                 });
                 None
             }
