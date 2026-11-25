@@ -93,6 +93,17 @@
 //!   `prove-it-works`. A session adds a directory that is one on this
 //!   machine, once, and refuses others as rho does.
 //!   [`FakeDaemon::followers`] counts the clients following a session.
+//! - A session keeps the mode and model a client chose for the sessions it
+//!   starts, and sends them after its agent in every reset replay and
+//!   again whenever they change. It refuses `unknown` as a mode and a model
+//!   it doesn't offer, but not `auto` without a permission-classifier
+//!   model. [`FakeDaemon::save_unreadable_started_choice`] gives a session
+//!   a saved choice the daemon can't read, under which any model is
+//!   refused until a mode replaces it;
+//!   [`FakeDaemon::save_unknown_started_mode`] one whose mode it doesn't
+//!   know, with a model. A change to the choice sent while the session's
+//!   turn runs is applied, and answered, when the turn ends, as rho does;
+//!   a change to its own settings is not held.
 //! - rho's own settings are two pages. "General" holds
 //!   `general.auto_compact` (on/off, on by default), `general.permission_mode`
 //!   (a choice of auto, plan or supervised) and, under "Models",
@@ -160,7 +171,8 @@ use rho_protocol::{
         JobId, JobKind, JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef,
         PendingUpgrade, PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions,
         Replay, Seq, SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams,
-        SessionWorktree, SteerId, StreamId, ToolCallId, ToolCallUpdate, TurnId,
+        SessionWorktree, StartedSessionDefaults, SteerId, StreamId, ToolCallId, ToolCallUpdate,
+        TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, ContentBlock, Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
@@ -183,6 +195,7 @@ mod config;
 mod listener;
 mod pull_requests;
 mod service;
+mod started;
 pub mod surface;
 
 use auth::FakeAuth;
@@ -192,6 +205,7 @@ use listener::Listener;
 use pull_requests::FakePullRequests;
 pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
 use service::Fake;
+use started::{HeldChange, StartedChoice};
 
 /// The session [`Script::tui_job`] runs.
 pub const TUI_SESSION: &str = "tui-1";
@@ -646,6 +660,42 @@ impl FakeDaemon {
         state.sessions.insert(id.to_owned(), session);
     }
 
+    /// Gives session `id` a saved choice for the sessions it starts that
+    /// the daemon can't read, as one a newer rho saved: the next reset
+    /// replay reports its mode as `unknown`.
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `id`: the test has a bug.
+    pub fn save_unreadable_started_choice(&self, id: &UiSessionId) {
+        self.save_started_choice(id, StartedChoice::Unreadable);
+    }
+
+    /// Gives session `id` a saved choice for the sessions it starts whose
+    /// mode the daemon doesn't know, as one a newer rho saved, with the
+    /// model `fake/large`: the next reset replay reports its mode as
+    /// `unknown`, with the model, and a model change is taken.
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `id`: the test has a bug.
+    pub fn save_unknown_started_mode(&self, id: &UiSessionId) {
+        let chosen = StartedSessionDefaults {
+            permission_mode: Some(PermissionMode::Unknown),
+            model: Some(model("large")),
+        };
+        self.save_started_choice(id, StartedChoice::Chosen(chosen));
+    }
+
+    fn save_started_choice(&self, id: &UiSessionId, choice: StartedChoice) {
+        let mut state = self.service.lock();
+        let session = state
+            .sessions
+            .get_mut(id.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {id}"));
+        session.started = choice;
+    }
+
     /// How many worktrees the daemon has added for new sessions.
     pub fn worktrees(&self) -> usize {
         self.service.lock().worktrees
@@ -1098,6 +1148,11 @@ struct FakeSession {
     /// The id of the agent it runs as, which a reset replay starts with.
     agent: String,
     settings: Settings,
+    /// What a client chose for the sessions it starts, kept apart from its
+    /// own settings.
+    started: StartedChoice,
+    /// Changes to `started` sent while a turn ran, waiting for its end.
+    held_started: Vec<HeldChange>,
     state: JobState,
     turn: Option<Turn>,
     /// Every event so far, which an attach replays.
@@ -1139,6 +1194,8 @@ impl FakeSession {
             saved: true,
             agent: "default".to_owned(),
             settings: Settings::new(),
+            started: StartedChoice::Chosen(StartedSessionDefaults::default()),
+            held_started: Vec::new(),
             state: JobState::Idle,
             turn: None,
             history: Vec::new(),
@@ -1242,27 +1299,33 @@ impl FakeSession {
     }
 
     /// The whole session, as a reset replays it, after the agent it runs
-    /// as, which no saved transcript holds. It leaves out background
-    /// events, as rho's saved transcripts hold none (rho replays them only
-    /// for a turn in progress, which the fake doesn't keep apart): the
-    /// attach response lists the work as it is now, without work whose
-    /// result the model has. Nor do they hold pull requests, which a
-    /// client asks for. Nor does it mark steers, as rho's doesn't.
+    /// as and the choice for the sessions it starts, which no saved
+    /// transcript holds. It leaves out background events, as rho's saved
+    /// transcripts hold none (rho replays them only for a turn in
+    /// progress, which the fake doesn't keep apart): the attach response
+    /// lists the work as it is now, without work whose result the model
+    /// has. Nor do they hold pull requests, which a client asks for, or
+    /// changes to the choice for started sessions. Nor does it mark
+    /// steers, as rho's doesn't.
     fn transcript(&self) -> Vec<(Seq, SessionEvent)> {
         let agent = SessionEvent::Agent {
             id: self.agent.clone(),
         };
+        let started = SessionEvent::StartedSessionDefaults(self.started.reported());
         let history = self
             .history
             .iter()
             .filter(|event| {
                 !matches!(
                     event,
-                    SessionEvent::Background { .. } | SessionEvent::PullRequests { .. }
+                    SessionEvent::Background { .. }
+                        | SessionEvent::PullRequests { .. }
+                        | SessionEvent::StartedSessionDefaults(_)
                 )
             })
             .cloned();
-        let replay: Vec<SessionEvent> = std::iter::once(agent)
+        let replay: Vec<SessionEvent> = [agent, started]
+            .into_iter()
             .chain(history)
             .map(|mut event| {
                 if let SessionEvent::UserMessage { steer, .. } = &mut event {
@@ -1438,6 +1501,7 @@ impl FakeSession {
             state,
             turn: Some(turn.id),
         });
+        self.apply_held_started();
     }
 
     /// Reads an image with `read_file`, whose card is text and whose

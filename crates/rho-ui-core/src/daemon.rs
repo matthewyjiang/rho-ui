@@ -51,7 +51,9 @@ use crate::{
     input::{Answer, InputId},
     jobs::Jobs,
     link::Link,
-    options::{OptionChange, SessionOptions},
+    options::{
+        OptionChange, SessionOptions, StartedMode, StartedSessionChange, StartedSessionDefaults,
+    },
     prompt::{mebibytes, Prompt},
     server::{self, ServerTarget},
     session::{Attached, Checkout, Cursor, SessionSetup, SessionUpdate, SteerId, TurnId, Worktree},
@@ -1270,9 +1272,72 @@ impl Daemon {
         id: &SessionId,
         change: OptionChange,
     ) -> Result<SessionOptions, DaemonError> {
+        self.configure(id, change.into_wire()).await
+    }
+
+    /// Applies `change` to what the sessions session `id` starts through
+    /// session control open with, returning the session's own settings,
+    /// which stay as they are. The session hears of the new choice as an
+    /// event, which [`crate::Session::started_session_defaults`] follows.
+    /// While a turn runs, the daemon applies the change, and answers, once
+    /// the turn ends: the sessions that turn starts meanwhile open with the
+    /// choice as it was.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon rejects the change, as `auto` with no
+    /// permission-classifier model, or a model while the session keeps a
+    /// choice the daemon can't read, or if the connection is gone.
+    pub async fn set_started_session_default(
+        &self,
+        id: &SessionId,
+        change: StartedSessionChange,
+    ) -> Result<SessionOptions, DaemonError> {
+        self.configure(id, change.into_wire()).await
+    }
+
+    /// Gives session `id`, which has chosen nothing for the sessions it
+    /// starts, the parts `wanted` chose, such as another session's: the
+    /// mode, then the model. An unknown mode is not copied.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the daemon rejects a part or the connection is gone; a mode
+    /// set before a refused model stays.
+    pub async fn match_started_session_defaults(
+        &self,
+        id: &SessionId,
+        wanted: &StartedSessionDefaults,
+    ) -> Result<(), DaemonError> {
+        match wanted.mode() {
+            StartedMode::Chosen(mode) => {
+                self.set_started_session_default(
+                    id,
+                    StartedSessionChange::PermissionMode(Some(mode)),
+                )
+                .await?;
+            }
+            StartedMode::Default | StartedMode::Unknown => {
+                // Nothing chosen, or a mode this client can't name.
+            }
+        }
+        if let Some(model) = wanted.model() {
+            self.set_started_session_default(id, StartedSessionChange::Model(Some(model.clone())))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Sends `change` for session `id`, returning the session's settings
+    /// as the daemon answered.
+    async fn configure(
+        &self,
+        id: &SessionId,
+        change: SessionChange,
+    ) -> Result<SessionOptions, DaemonError> {
         let params = SessionConfigureParams {
             session: id.to_wire(),
-            change: change.into_wire(),
+            change,
         };
         let response = self
             .client

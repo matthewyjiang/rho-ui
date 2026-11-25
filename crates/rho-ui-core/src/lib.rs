@@ -46,7 +46,8 @@ pub use jobs::{Job, JobActivity, Jobs, Run, RunStatus, Runs};
 pub use link::Link;
 pub use options::{
     Choices, CommandInfo, CommandKind, ModelChoice, ModelOptions, ModelRef, OptionChange,
-    PermissionMode, ReasoningLevel, SessionOptions,
+    PermissionMode, ReasoningLevel, SessionOptions, StartedMode, StartedSessionChange,
+    StartedSessionDefaults,
 };
 pub use prompt::{
     check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
