@@ -637,15 +637,21 @@ impl SessionView {
             title: self.name().map(SharedString::from),
             placeholder: self.placeholder(),
             activity: self.activity(),
-            kind: self.session.agent().map(Kind::of),
+            kind: self.agent_kind(),
         }
+    }
+
+    /// By the agent it runs as, once the session says which: `None` until
+    /// then, which [`Self::kind`] takes for a plain session.
+    pub(crate) fn agent_kind(&self) -> Option<Kind> {
+        self.session.agent().map(Kind::of)
     }
 
     /// A lead's, if it is a lead or a view above it is: a lead's subagent
     /// or side chat works in the lead's folder, which is in no project. A
     /// session whose agent isn't known yet counts as a plain one.
     pub(crate) fn kind(&self, cx: &App) -> Kind {
-        let own = self.session.agent().map_or(Kind::Session, Kind::of);
+        let own = self.agent_kind().unwrap_or(Kind::Session);
         match self.parent() {
             Some(parent) if own == Kind::Session => parent.read(cx).kind(cx),
             _ => own,

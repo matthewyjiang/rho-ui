@@ -363,6 +363,32 @@ mod tests {
         assert_eq!(starters(&rows), expected);
     }
 
+    /// A session's started sessions are those it started itself, not those
+    /// they started in turn, which fold under the same top row; a starter
+    /// another session started has its own.
+    #[test]
+    fn started_by_lists_only_the_sessions_a_session_started_itself() {
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                started("leaf", "Check", 5, "w1"),
+                started("w2", "Test", 4, "lead"),
+                started("w1", "Write", 3, "lead"),
+                saved("lead", Some("Lead"), 2),
+            ],
+        );
+        let table: [(&str, &[&str]); 2] = [("lead", &["w2", "w1"]), ("w1", &["leaf"])];
+        for (starter, expected) in table {
+            let got: Vec<SessionKey> = list
+                .started_by(&id(starter))
+                .map(|row| row.id.clone())
+                .collect();
+            let expected: Vec<SessionKey> = expected.iter().copied().map(id).collect();
+            assert_eq!(got, expected, "started by {starter}");
+        }
+    }
+
     /// Sessions a session started fold under it, on its shelf: a settled
     /// family stays settled together, dated by its newest session, until
     /// one of it is busy, a session with no saved row yet included, which

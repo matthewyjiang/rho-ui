@@ -71,8 +71,8 @@ use crate::{
     pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
     session_list::{
-        Activity, DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
-        SavedSession, SessionList, SHELF_PAGE,
+        DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
+        SavedSession, SessionList, Status, SHELF_PAGE,
     },
     settings::{self, Settings},
     shelf::{self, Shelf},
@@ -612,6 +612,15 @@ impl SidebarView {
         self.list.row(id)?.title.clone()
     }
 
+    /// The rows of the sessions `starter` started itself, in the list's
+    /// order, whatever the search and the filter show.
+    pub(crate) fn started_by<'a>(
+        &'a self,
+        starter: &'a SessionKey,
+    ) -> impl Iterator<Item = &'a Row> + 'a {
+        self.list.started_by(starter)
+    }
+
     /// The session on screen has no Done to show: its turn ended in view.
     /// The list needs a rebuild after it.
     fn mark_active_seen(&mut self) {
@@ -703,7 +712,9 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    fn open(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
+    /// Asks the app to open listed session `id`, as a click on its row
+    /// does.
+    pub(crate) fn open(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         if let Some(row) = self.list.row(id) {
             cx.emit(SidebarEvent::Open {
                 id: row.id.clone(),
@@ -2088,18 +2099,28 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .child(text)
             .into_any_element()
     };
-    match row.activity {
-        Activity::Working(since) => busy(
+    let Some(status) = row.status() else {
+        return div()
+            .flex_shrink_0()
+            .text_color(theme.muted_foreground)
+            .when(row.updated > 0, |this| {
+                this.child(time::relative_age(clock.now - row.updated))
+            })
+            .into_any_element();
+    };
+    let word = status.word();
+    match status {
+        Status::Working(since) => busy(
             theme.blue,
             Icon::new(Lucide::CircleDashed),
-            label("Working", since),
+            label(word, since),
         ),
-        Activity::Waiting(since) => busy(
+        Status::NeedsYou(since) => busy(
             theme.warning,
             Icon::new(Lucide::CircleAlert),
-            label("Needs you", since),
+            label(word, since),
         ),
-        Activity::Background => h_flex()
+        Status::Background => h_flex()
             .id(SharedString::from(format!("{}-background", row.element_id)))
             .test_support()
             .aria_label("Waiting on background work")
@@ -2107,11 +2128,11 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .gap_1()
             .text_color(theme.muted_foreground)
             .child(Icon::new(Lucide::Hourglass).xsmall())
-            .child("Waiting")
+            .child(word)
             .into_any_element(),
         // Its agent wakes when the PR changes: no turn runs, but it isn't
         // done. The row's mark below says which PR.
-        Activity::Idle if row.watching => h_flex()
+        Status::Watching => h_flex()
             .id(SharedString::from(format!("{}-watching", row.element_id)))
             .test_support()
             .aria_label("Watching a pull request")
@@ -2119,24 +2140,17 @@ fn activity(row: &Row, clock: Clock, theme: &Theme) -> AnyElement {
             .gap_1()
             .text_color(theme.muted_foreground)
             .child(Icon::new(Lucide::Eye).xsmall())
-            .child("Watching")
+            .child(word)
             .into_any_element(),
-        Activity::Idle if row.done => h_flex()
+        Status::Done => h_flex()
             .id(SharedString::from(format!("{}-done", row.element_id)))
             .test_support()
-            .aria_label("Done")
+            .aria_label(word)
             .flex_shrink_0()
             .gap_1()
             .text_color(theme.success)
             .child(Icon::new(Lucide::CircleCheck).xsmall())
-            .child("Done")
-            .into_any_element(),
-        Activity::Idle => div()
-            .flex_shrink_0()
-            .text_color(theme.muted_foreground)
-            .when(row.updated > 0, |this| {
-                this.child(time::relative_age(clock.now - row.updated))
-            })
+            .child(word)
             .into_any_element(),
     }
 }
@@ -2359,6 +2373,7 @@ mod tests {
     use std::{collections::HashSet, path::Path};
 
     use super::*;
+    use crate::session_list::Activity;
 
     /// A busy session offers no moves, nor a starter at rest while a
     /// session it started works, as its family stays active until then;

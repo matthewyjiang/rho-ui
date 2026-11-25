@@ -334,7 +334,8 @@ impl RhoApp {
             |this, _, action: &DaemonAction, window, cx| this.daemon_action(action, window, cx),
         );
         let shell = launch.shell.clone();
-        let panel = cx.new(|cx| RightPanel::new(workspaces.clone(), shell, prs.clone(), cx));
+        let panel = cx
+            .new(|cx| RightPanel::new(workspaces.clone(), shell, prs.clone(), sidebar.clone(), cx));
         let mut app = Self {
             launch,
             machines,
@@ -2264,6 +2265,11 @@ impl RhoApp {
     /// shows, for UI tests.
     pub(crate) fn open_file(&self, cx: &App) -> Option<(String, String)> {
         self.panel.read(cx).open_file(cx)
+    }
+    /// The text the right panel's Brief surface shows, if it is open, for
+    /// UI tests.
+    pub(crate) fn brief_text(&self, cx: &App) -> Option<String> {
+        self.panel.read(cx).brief_text(cx)
     }
     /// The right panel's tabs, in order, for UI tests.
     pub(crate) fn panel_tabs(&self, cx: &App) -> Vec<crate::right_panel::Surface> {
