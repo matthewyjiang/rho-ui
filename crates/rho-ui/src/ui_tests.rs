@@ -28,9 +28,9 @@ use gpui_kit::{
 use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
-        report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script, TuiJob,
-        KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT, SUBAGENT_MODEL,
-        SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
+        report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script, Started,
+        TuiJob, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
+        SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices, Daemon,
     DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
@@ -1597,6 +1597,62 @@ fn the_row_menu_renames_pins_and_copies_a_session() {
         .cx
         .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
     assert_eq!(copied.as_deref(), Some("s1"));
+}
+
+/// Sessions a session started fold under it, behind a line that counts
+/// them: closed at first, opened by a click, and opened by itself when one
+/// of them comes on screen from elsewhere. A row under the fold opens its
+/// session as any row does.
+#[test]
+fn sessions_a_session_started_fold_under_it() {
+    let fake = FakeDaemon::start(Script::default());
+    fake.start_session("s1", "w1", "Write the parser", Started::Idle);
+    fake.start_session("s1", "w2", "Test the parser", Started::Idle);
+    fake.start_session("s1", "w3", "Review the parser", Started::Working);
+    let shelves = kept(["s1", "old"]);
+    let target = fake.target();
+    let mut ui = Harness::open("started", target, Some(fake), shelves, Projects::default());
+    let started = ["session-local-w1", "session-local-w2", "session-local-w3"];
+    ui.wait_until("the fold, closed, under the starter", |window, _, _| {
+        is_visible(window, "session-local-s1-fold")
+            && started.iter().all(|id| !is_visible(window, *id))
+    });
+    ui.wait_for_label("session-local-s1-fold", "3 sessions · 1 working");
+
+    ui.click("session-local-s1-fold");
+    ui.wait_until("the sessions it started", |window, _, _| {
+        started.iter().all(|id| is_visible(window, *id))
+    });
+    ui.shot("open");
+
+    ui.click("session-local-w1");
+    ui.wait_for_session("the started session open", |session| {
+        session.id().as_str() == "w1"
+    });
+
+    // Closed with one of its sessions on screen, it stays closed.
+    ui.click("session-local-s1-fold");
+    ui.wait_until("the fold closed", |window, _, _| {
+        started.iter().all(|id| !is_visible(window, *id))
+    });
+    ui.click("session-local-old");
+    ui.wait_for_session("another session open", |session| {
+        session.id().as_str() == "old"
+    });
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        app.update(cx, |app, cx| {
+            let w2 = SessionKey::local("w2");
+            app.open_session(w2, PathBuf::from("/w/a"), None, window, cx);
+        });
+    });
+    ui.wait_until(
+        "the fold open on the session on screen",
+        |window, cx, app| {
+            let on_screen = app.active_session().map(|view| view.read(cx).live().id);
+            is_visible(window, "session-local-w2") && on_screen == Some(SessionKey::local("w2"))
+        },
+    );
 }
 
 /// Sessions quiet for long start settled. A draft makes no session until

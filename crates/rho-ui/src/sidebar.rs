@@ -10,8 +10,11 @@
 //! turn that finished off screen shows Done until its session is opened.
 //! Right-click a row for its menu, which also renames it in place. A shelf
 //! opens from its header into one-line rows, its newest 25 at first, and
-//! Show more under them adds 25 more at a time. Hovering a row shows its
-//! details in a card. The filter beside the
+//! Show more under them adds 25 more at a time. A session another session
+//! started is drawn indented under it, behind a line that counts them and
+//! opens on a click, or by itself when one of them comes on screen, or
+//! while the search or the filter shows some of them and not their starter.
+//! Hovering a row shows its details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
 //! which machines aren't connected, with what would fix it (Retry, a
 //! restart of a daemon too old for rho-ui or of another build, Start for
@@ -66,8 +69,8 @@ use crate::{
     pull_requests::PullRequests,
     rho_install::{render_offer, Installs},
     session_list::{
-        Activity, DraftRow, Item, JobSession, LiveSession, Row, SavedSession, SessionList,
-        SHELF_PAGE,
+        Activity, DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
+        SavedSession, SessionList, SHELF_PAGE,
     },
     settings::{self, Settings},
     shelf::{Shelf, Shelves},
@@ -110,6 +113,14 @@ const MACHINE_LABEL_REMS: f32 = 5.;
 /// A shelf header's height.
 const HEADER_REMS: f32 = 2.5;
 
+/// The line under a session that started others: one line of text, padded
+/// as the lines of a row are apart.
+const FOLD_REMS: f32 = LINE_REMS + 2. * GAP_REMS + 2. * GUTTER_REMS;
+
+/// How far the sessions a session started, and the line over them, sit in
+/// from its row: about a badge's width.
+const NEST_REMS: f32 = 1.25;
+
 /// The sidebar's top row, open or collapsed, so the toggle sits at the same
 /// height in both, and as tall as the main pane's title bar.
 fn top_row() -> Rems {
@@ -130,6 +141,7 @@ fn item_rems(item: Item) -> f32 {
         Item::Draft(_) | Item::Session(_) => ROW_REMS,
         Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
         Item::Header(_) => HEADER_REMS,
+        Item::Fold(_) => FOLD_REMS,
         Item::Gap => 0.,
     }
 }
@@ -187,19 +199,26 @@ impl ShelfAction {
     ];
 
     /// What a row offers, inline and in its menu. A busy session offers
-    /// nothing: it shows as active until its turn ends. Nor does a pinned
-    /// one, which stays active until unpinned.
+    /// nothing: it shows as active until its turn ends, as does a session
+    /// whose family is busy. Nor does a pinned one, which stays active
+    /// until unpinned, or one a session started, which moves with that one.
     fn for_row(row: &Row) -> &'static [ShelfAction] {
-        if row.pinned.is_some() {
+        if row.pinned.is_some() || row.family == Family::Started || row.busy() {
             return &[];
         }
-        Self::offered(row.shelf, row.activity)
+        Self::offered(row.shelf)
     }
 
-    fn offered(shelf: Shelf, activity: Activity) -> &'static [ShelfAction] {
-        if !activity.is_idle() {
-            return &[];
+    /// Marks `session` in `shelves` as this move puts it, as of `now`.
+    fn apply(self, shelves: &mut Shelves, session: &SessionKey, now: i64) {
+        match self {
+            ShelfAction::Settle => shelves.settle(session, now),
+            ShelfAction::Snooze(snooze) => shelves.snooze(session, now + snooze.seconds),
+            ShelfAction::Restore => shelves.restore(session, now),
         }
+    }
+
+    fn offered(shelf: Shelf) -> &'static [ShelfAction] {
         match shelf {
             Shelf::Active => &Self::ON_ACTIVE,
             Shelf::Snoozed => &[ShelfAction::Restore, ShelfAction::Settle],
@@ -438,6 +457,9 @@ impl SidebarView {
                     cwd: session.cwd().to_path_buf(),
                     title: session.title().map(|title| title.to_owned().into()),
                     updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
+                    parent: session
+                        .parent()
+                        .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
                 })
                 .collect();
             workspaces.set_history(
@@ -479,6 +501,7 @@ impl SidebarView {
             .as_ref()
             .is_some_and(|active| active.machine == *machine)
         {
+            self.list.reveal(None);
             self.active = None;
         }
         self.rebuild(cx);
@@ -500,6 +523,9 @@ impl SidebarView {
                     title: job.title().map(|title| title.to_owned().into()),
                     activity: job.activity(),
                     turn_elapsed: job.turn_elapsed(),
+                    parent: job
+                        .parent()
+                        .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
                 })
                 .collect()
         });
@@ -548,13 +574,16 @@ impl SidebarView {
             .as_ref()
             .is_some_and(|active| active.machine == *machine)
         {
+            self.list.reveal(None);
             self.active = None;
         }
         self.rebuild(cx);
     }
 
+    /// Puts session `id` on screen, opening the fold it is under.
     pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
         if self.active != id {
+            self.list.reveal(id.as_ref());
             self.active = id;
             self.mark_active_seen();
             // Its PR is listed, whichever shelf it is on.
@@ -622,20 +651,22 @@ impl SidebarView {
                 let workspace = workspaces.get(ix);
                 (workspace.name.as_ref(), workspace.root_path())
             });
-        // The active rows shown have their PRs listed by their daemons,
-        // and so has the session on screen, for its title bar.
-        let mut listed: Vec<SessionKey> = self
+        // Every session on the active shelf the filter shows has its PRs
+        // listed by its daemon, under a closed fold too, as what it watches
+        // ranks its family; so has every row drawn there, a starter shown
+        // for its sessions included, and the session on screen, for its
+        // title bar.
+        let drawn = self.list.items().iter().filter_map(|item| match *item {
+            Item::Session(ix) => Some(self.list.row_at(ix).id.clone()),
+            _ => None,
+        });
+        let active = self
             .list
-            .items()
-            .iter()
-            .filter_map(|item| match *item {
-                Item::Session(ix) => Some(self.list.row_at(ix).id.clone()),
-                _ => None,
-            })
-            .collect();
-        if let Some(active) = &self.active {
-            if !listed.contains(active) {
-                listed.push(active.clone());
+            .on_active_shelf(|ix| workspaces.get(ix).root_path());
+        let mut listed: Vec<SessionKey> = Vec::new();
+        for id in active.into_iter().chain(drawn).chain(self.active.clone()) {
+            if !listed.contains(&id) {
+                listed.push(id);
             }
         }
         self.prs.update(cx, |prs, cx| prs.set_listed(listed, cx));
@@ -652,6 +683,11 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
+    fn toggle_fold(&mut self, starter: &SessionKey, cx: &mut Context<'_, Self>) {
+        self.list.toggle_fold(starter);
+        self.rebuild(cx);
+    }
+
     fn open(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         if let Some(row) = self.list.row(id) {
             cx.emit(SidebarEvent::Open {
@@ -664,10 +700,9 @@ impl SidebarView {
 
     fn shelve(&mut self, id: &SessionKey, action: ShelfAction, cx: &mut Context<'_, Self>) {
         let now = time::now_unix();
-        match action {
-            ShelfAction::Settle => self.shelves.settle(id, now),
-            ShelfAction::Snooze(snooze) => self.shelves.snooze(id, now + snooze.seconds),
-            ShelfAction::Restore => self.shelves.restore(id, now),
+        // A family moves as one.
+        for session in self.list.family(id) {
+            action.apply(&mut self.shelves, &session, now);
         }
         // The row moves away from the pointer.
         self.hover = None;
@@ -911,6 +946,7 @@ impl SidebarView {
                     self.render_shelved(row, workspace, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
+                Item::Fold(line) => self.render_fold(line, cx),
                 Item::More(which) => self.render_show_more(which, cx),
                 Item::Gap => div().into_any_element(),
             })
@@ -1063,10 +1099,11 @@ impl SidebarView {
         }
     }
 
-    /// What every session row shares: its slot in the list, the highlight,
-    /// hover tracking, a click that opens the session and the context menu.
-    /// Kit has no list-item element with a fixed height for
-    /// `v_virtual_list`, so rows are laid out by hand.
+    /// What every session row shares: its slot in the list, indented under
+    /// the session that started it, the highlight, hover tracking, a click
+    /// that opens the session and the context menu. Kit has no list-item
+    /// element with a fixed height for `v_virtual_list`, so rows are laid
+    /// out by hand.
     fn row_frame<E>(
         height: Rems,
         row: &Row,
@@ -1103,6 +1140,9 @@ impl SidebarView {
         div()
             .h(height)
             .px_2()
+            .when(row.family == Family::Started, |this| {
+                this.pl(rems(NEST_REMS))
+            })
             .py(rems(GUTTER_REMS))
             .child(inner.context_menu(move |popup, window, cx| {
                 let (view, row) = &menu;
@@ -1214,7 +1254,9 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// "Snoozed 1 ⌄": the shelf's name and count; a click opens or folds it.
+    /// "Snoozed 1 ⌄": the shelf's name and how many families it holds, a
+    /// session and those it started counting once; a click opens or folds
+    /// it.
     /// Kit's `Accordion` owns its items, which here are separate rows of
     /// the virtual list, so the header is laid out by hand.
     fn render_shelf_header(&self, which: Shelf, cx: &Context<'_, Self>) -> AnyElement {
@@ -1256,6 +1298,69 @@ impl SidebarView {
                             .text_color(theme.muted_foreground),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(which, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// "⌄ 3 sessions · 1 needs you": the line under a session that started
+    /// others, indented as they are, with the most pressing thing of its
+    /// family: how many of them wait for the user, else are Done, else
+    /// work. A click opens or closes the fold, unless the search or the
+    /// filter holds it open, which leaves out the chevron. Kit's
+    /// `Collapsible` owns its content, which here is separate rows of the
+    /// virtual list, so the line is laid out by hand, as a shelf header is.
+    fn render_fold(&self, line: FoldLine, cx: &Context<'_, Self>) -> AnyElement {
+        let theme = cx.theme();
+        let starter = self.list.row_at(line.starter);
+        let chevron = match line.fold {
+            Fold::Open => Some(IconName::ChevronDown),
+            Fold::Closed => Some(IconName::ChevronRight),
+            Fold::Showing => None,
+        };
+        let count = match line.sessions {
+            1 => "1 session".to_owned(),
+            sessions => format!("{sessions} sessions"),
+        };
+        // As their rows say it, in their colors.
+        let pressing = line.pressing.map(|pressing| match pressing {
+            Pressing::Waiting(1) => (theme.warning, "1 needs you".to_owned()),
+            Pressing::Waiting(waiting) => (theme.warning, format!("{waiting} need you")),
+            Pressing::Done(done) => (theme.success, format!("{done} done")),
+            Pressing::Working(working) => (theme.blue, format!("{working} working")),
+        });
+        let label = match &pressing {
+            Some((_, pressing)) => format!("{count} · {pressing}"),
+            None => count.clone(),
+        };
+        let hover = theme.sidebar_accent.opacity(0.5);
+        let key = starter.id.clone();
+        div()
+            .h(rems(FOLD_REMS))
+            .px_2()
+            .pl(rems(NEST_REMS))
+            .py(rems(GUTTER_REMS))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("{}-fold", starter.element_id)))
+                    .test_support()
+                    .aria_label(label)
+                    .size_full()
+                    .px_2()
+                    .gap_1()
+                    .rounded(theme.radius)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .when_some(chevron, |this, chevron| {
+                        this.cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .child(Icon::new(chevron).xsmall())
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_fold(&key, cx)))
+                    })
+                    .child(count)
+                    .when_some(pressing, |this, (color, pressing)| {
+                        this.child("·")
+                            .child(div().text_color(color).child(pressing))
+                    }),
             )
             .into_any_element()
     }
@@ -1971,8 +2076,10 @@ enum Pin {
     Unpin,
 }
 
-/// The right-click menu: Rename, Pin, the moves the hover buttons offer,
-/// Copy, and Delete, which a busy session can't do.
+/// The right-click menu: Rename, Pin unless the session moves with the one
+/// that started it, the moves the hover buttons offer,
+/// Copy, and Delete, which a busy session can't do, nor one whose family is
+/// busy.
 fn row_menu(
     menu: PopupMenu,
     view: &WeakEntity<SidebarView>,
@@ -1980,28 +2087,28 @@ fn row_menu(
     window: &mut Window,
     cx: &mut Context<'_, PopupMenu>,
 ) -> PopupMenu {
-    let (pin, pin_icon, pin_label) = if row.pinned {
-        (Pin::Unpin, Lucide::PinOff, "Unpin")
-    } else {
-        (Pin::Pin, Lucide::Pin, "Pin")
-    };
     let id = row.id.clone();
-    let mut menu = menu
-        .item(
-            PopupMenuItem::new("Rename…")
-                .icon(Icon::new(Lucide::Pencil))
-                .on_click(on_view(view, move |this, window, cx| {
-                    this.start_rename(&id, window, cx);
-                })),
-        )
-        .item({
-            let id = row.id.clone();
+    let mut menu = menu.item(
+        PopupMenuItem::new("Rename…")
+            .icon(Icon::new(Lucide::Pencil))
+            .on_click(on_view(view, move |this, window, cx| {
+                this.start_rename(&id, window, cx);
+            })),
+    );
+    if let Some(pin) = row.pin {
+        let (pin_icon, pin_label) = match pin {
+            Pin::Unpin => (Lucide::PinOff, "Unpin"),
+            Pin::Pin => (Lucide::Pin, "Pin"),
+        };
+        let id = row.id.clone();
+        menu = menu.item(
             PopupMenuItem::new(pin_label)
                 .icon(Icon::new(pin_icon))
                 .on_click(on_view(view, move |this, _, cx| {
                     this.set_pinned(&id, pin, cx);
-                }))
-        });
+                })),
+        );
+    }
     menu = snooze_menu(menu, view, row, window, cx);
     for &action in row.offered {
         if !matches!(action, ShelfAction::Snooze(_)) {
@@ -2099,7 +2206,8 @@ fn copy_menu(
     )
 }
 
-/// Delete…, which asks first, and is greyed out while the session is busy.
+/// Delete…, which asks first, and is greyed out while the session is busy,
+/// or for a starter, while any of its family is.
 fn delete_item(view: &WeakEntity<SidebarView>, row: &MenuRow) -> PopupMenuItem {
     let (view, id, title) = (view.clone(), row.id.clone(), row.title.clone());
     PopupMenuItem::new("Delete…")
@@ -2131,8 +2239,11 @@ struct MenuRow {
     title: SharedString,
     cwd: PathBuf,
     offered: &'static [ShelfAction],
-    pinned: bool,
-    /// Busy sessions can't be deleted.
+    /// What the menu offers: a session a session started has no pin of its
+    /// own, as it moves with that one.
+    pin: Option<Pin>,
+    /// Busy sessions can't be deleted, nor a starter while any of its
+    /// family is busy: as with moves, it waits for them.
     busy: bool,
 }
 
@@ -2143,28 +2254,89 @@ impl MenuRow {
             title: row.title(),
             cwd: row.cwd.clone(),
             offered: ShelfAction::for_row(row),
-            pinned: row.pinned.is_some(),
-            busy: !row.activity.is_idle(),
+            pin: match (row.family, row.pinned) {
+                (Family::Started, _) => None,
+                (Family::Top(_), Some(_)) => Some(Pin::Unpin),
+                (Family::Top(_), None) => Some(Pin::Pin),
+            },
+            busy: row.busy(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, path::Path};
+
     use super::*;
 
+    /// A busy session offers no moves, nor a starter at rest while a
+    /// session it started works, as its family stays active until then;
+    /// shelves offer a way back.
     #[test]
     fn busy_sessions_offer_no_moves_and_shelves_offer_a_way_back() {
+        let session = |id: &str, parent: Option<&str>| SavedSession {
+            id: SessionKey::local(id),
+            cwd: PathBuf::from("/w"),
+            title: None,
+            updated: 1,
+            workspace: 0,
+            parent: parent.map(SessionKey::local),
+        };
+        let mut list = SessionList::default();
+        let sessions = vec![
+            session("busy", None),
+            session("w1", Some("lead")),
+            session("lead", None),
+        ];
+        list.set_saved(&MachineId::local(), sessions);
+        for id in ["busy", "w1"] {
+            let live = LiveSession {
+                id: SessionKey::local(id),
+                cwd: PathBuf::from("/w"),
+                title: None,
+                placeholder: "",
+                activity: Activity::Working(Instant::now()),
+            };
+            list.set_live(live, 0, 1);
+        }
+        list.rebuild(&Shelves::default(), 1, &HashSet::new(), |_| {
+            ("w", Path::new("/w"))
+        });
+        for id in ["busy", "lead"] {
+            let row = list.row(&SessionKey::local(id)).expect("listed");
+            assert_eq!(ShelfAction::for_row(row), [], "{id}");
+        }
+        assert_eq!(ShelfAction::offered(Shelf::Settled), [ShelfAction::Restore]);
+        assert!(ShelfAction::offered(Shelf::Snoozed).contains(&ShelfAction::Restore));
+    }
+
+    /// Settling a starter settles the sessions under it too, so they stay
+    /// settled when the starter is deleted, not back among the active.
+    #[test]
+    fn a_settled_familys_sessions_stay_settled_without_their_starter() {
+        let session = |id: &str, parent: Option<&str>| SavedSession {
+            id: SessionKey::local(id),
+            cwd: PathBuf::from("/w"),
+            title: None,
+            updated: 1,
+            workspace: 0,
+            parent: parent.map(SessionKey::local),
+        };
+        let (lead, worker) = (SessionKey::local("lead"), SessionKey::local("w1"));
+        let mut list = SessionList::default();
+        let sessions = vec![session("w1", Some("lead")), session("lead", None)];
+        list.set_saved(&MachineId::local(), sessions);
+        let mut shelves = Shelves::default();
+        for session in list.family(&lead) {
+            ShelfAction::Settle.apply(&mut shelves, &session, 2);
+        }
+        list.remove(&lead);
+        list.rebuild(&shelves, 3, &HashSet::new(), |_| ("w", Path::new("/w")));
+        let row = list.row(&worker).expect("listed");
         assert_eq!(
-            ShelfAction::offered(Shelf::Active, Activity::Working(Instant::now())),
-            []
-        );
-        assert_eq!(
-            ShelfAction::offered(Shelf::Settled, Activity::Idle),
-            [ShelfAction::Restore]
-        );
-        assert!(
-            ShelfAction::offered(Shelf::Snoozed, Activity::Idle).contains(&ShelfAction::Restore)
+            (row.family == Family::Started, row.shelf),
+            (false, Shelf::Settled)
         );
     }
 }

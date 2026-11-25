@@ -10,6 +10,12 @@
 //! - `rho/session/list` returns pages of two: new sessions that have had a
 //!   prompt, newest first, then "s1" (titled "first") and "old" (untitled).
 //!   `rho/session/delete` drops one, and `rho/session/rename` titles one.
+//!   `rho/session/list_detailed` pages the same, each with its agent and
+//!   the session that started it, which [`FakeDaemon::start_session`]
+//!   records, as does that session's job in `rho/job/list`. With
+//!   [`Script::session_lists`] [`SessionLists::Plain`], the daemon is from
+//!   before `list_detailed`, which answers `MethodNotFound`.
+//!   [`FakeDaemon::detailed_lists`] counts the `list_detailed` requests.
 //! - Attaching to "old" replays one agent message, "replayed", then
 //!   [`Script::replay_turns`] turns, each a question, a thought, three tool
 //!   calls, an edit, and a Markdown answer.
@@ -324,11 +330,34 @@ pub struct Script {
     /// How many more saved sessions, `past-0` and on, each an hour older
     /// than the last and older than "old", to fill long lists.
     pub past_sessions: usize,
+    /// Whether the daemon lists sessions with the session that started
+    /// each, or is from before that.
+    pub session_lists: SessionLists,
     /// Whether [`KEY_AUTH`], which every session runs on, starts signed
     /// out, so a session opens only with `sign_in: later`.
     pub signed_out: bool,
     /// Whether the daemon serves pull requests, or is from before them.
     pub pull_requests: PullRequestMethods,
+}
+
+/// Whether the fake daemon serves `rho/session/list_detailed`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionLists {
+    /// It serves `list_detailed` as well as `list`.
+    #[default]
+    Detailed,
+    /// As a daemon from before `list_detailed`: it serves `list` alone, and
+    /// `list_detailed` answers `MethodNotFound`.
+    Plain,
+}
+
+/// What a session [`FakeDaemon::start_session`] starts is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Started {
+    /// Its first turn ended.
+    Idle,
+    /// Its first turn runs, until a steer ends it.
+    Working,
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -515,6 +544,12 @@ impl FakeDaemon {
         self.service.lock().hellos
     }
 
+    /// How many `rho/session/list_detailed` requests the daemon got, each
+    /// page and each refusal one.
+    pub fn detailed_lists(&self) -> usize {
+        self.service.lock().detailed_lists
+    }
+
     /// Restarts the daemon in place, as rho does by itself once the
     /// upgrade it waits for has nothing to cut short.
     pub fn restart(&self) {
@@ -566,6 +601,37 @@ impl FakeDaemon {
     /// The title session `id` has saved, if it has one.
     pub fn title(&self, id: &str) -> Option<String> {
         self.service.lock().sessions.get(id)?.title.clone()
+    }
+
+    /// Has session `parent` start session `id` through session control, as
+    /// rho's `sessions` tool does: saved now in `parent`'s workspace,
+    /// titled `title`, and doing what `started` says. The list and its job
+    /// name `parent` as the session that started it.
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `parent`: the test has a bug.
+    pub fn start_session(&self, parent: &str, id: &str, title: &str, started: Started) {
+        let mut state = self.service.lock();
+        let date = state.next_date();
+        let cwd = state
+            .sessions
+            .get(parent)
+            .unwrap_or_else(|| panic!("the fake daemon has no session {parent}"))
+            .cwd
+            .to_string_lossy()
+            .into_owned();
+        let mut session = FakeSession::new(&cwd, Some(title), date);
+        session.parent = Some(parent.to_owned());
+        if started == Started::Working {
+            session.turn = Some(state.next_turn());
+            session.state(JobState::Running);
+        }
+        session.publish(user_message(&format!("{id}-u1"), title));
+        if started == Started::Idle {
+            session.say(&format!("{id}-m1"), "Started.");
+        }
+        state.sessions.insert(id.to_owned(), session);
     }
 
     /// How many worktrees the daemon has added for new sessions.
@@ -1045,6 +1111,9 @@ struct FakeSession {
     subagent: bool,
     /// For a fork, the session it forked.
     fork_of: Option<String>,
+    /// The session that started it through session control
+    /// ([`FakeDaemon::start_session`]).
+    parent: Option<String>,
     /// The actions clients sent on its surfaces.
     surface_actions: Vec<SessionSurfaceActionParams>,
 }
@@ -1071,6 +1140,7 @@ impl FakeSession {
             refused_busy: false,
             subagent: false,
             fork_of: None,
+            parent: None,
             surface_actions: Vec::new(),
         }
     }
@@ -1691,6 +1761,11 @@ fn cards(session: &mut FakeSession) {
 #[derive(Debug)]
 struct State {
     sessions: BTreeMap<String, FakeSession>,
+    /// Whether it serves `rho/session/list_detailed`.
+    session_lists: SessionLists,
+    /// How many `rho/session/list_detailed` requests it got, each page and
+    /// each refusal one.
+    detailed_lists: usize,
     /// How many of each the daemon has made, for their IDs.
     new_sessions: u64,
     forks: u64,
@@ -1833,6 +1908,8 @@ impl State {
         }
         let mut state = Self {
             sessions,
+            session_lists: script.session_lists,
+            detailed_lists: 0,
             new_sessions: 0,
             forks: 0,
             worktrees: 0,

@@ -23,7 +23,7 @@ use std::process::Command;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -257,16 +257,37 @@ impl DaemonInfo {
     }
 }
 
-/// A saved session from `rho/session/list`.
+/// A saved session from `rho/session/list_detailed`, or from
+/// `rho/session/list` on a rho from before it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSummary {
     id: SessionId,
     cwd: PathBuf,
     title: Option<String>,
     updated_at: u64,
+    parent: Option<SessionId>,
 }
 
 impl SessionSummary {
+    /// A row of `rho/session/list`, which names no parent.
+    fn from_wire(session: rho_protocol::SessionSummary) -> Self {
+        Self {
+            id: session.session.into(),
+            cwd: session.cwd,
+            title: session.title.or(session.first_user_message),
+            updated_at: session.updated_at,
+            parent: None,
+        }
+    }
+
+    /// A row of `rho/session/list_detailed`.
+    fn from_detailed(session: rho_protocol::DetailedSessionSummary) -> Self {
+        Self {
+            parent: session.parent.map(SessionId::from),
+            ..Self::from_wire(session.summary)
+        }
+    }
+
     /// Pass to [`Daemon::attach`].
     pub fn id(&self) -> &SessionId {
         &self.id
@@ -286,6 +307,14 @@ impl SessionSummary {
     /// When the session was last saved, in Unix seconds.
     pub fn updated_at(&self) -> u64 {
         self.updated_at
+    }
+
+    /// The session that started this one through session control, as rho's
+    /// `sessions` tool does. The list may not hold it: it may be deleted, a
+    /// fork, unsaved or elsewhere, and a caller treats one it can't find as
+    /// none. `None` from a rho that doesn't say.
+    pub fn parent(&self) -> Option<&SessionId> {
+        self.parent.as_ref()
     }
 }
 
@@ -463,6 +492,10 @@ pub struct Daemon {
     /// makes the session's whole process environment.
     environment: Arc<ClientEnvironment>,
     link: Option<Link>,
+    /// Set once the daemon answers `rho/session/list_detailed` with
+    /// `MethodNotFound`: this connection lists with `rho/session/list`
+    /// alone from then on, and a new one asks again.
+    plain_lists: Arc<AtomicBool>,
 }
 
 /// The machine the daemon runs on, as the sessions this client opens see it.
@@ -602,6 +635,7 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         info: Arc::new(info),
         environment: Arc::new(machine.environment),
         link: machine.link,
+        plain_lists: Arc::default(),
     };
     let events = DaemonEvents { notifications };
     Ok((daemon, events))
@@ -698,12 +732,50 @@ impl Daemon {
         self.link.as_ref()
     }
 
-    /// Saved sessions in every workspace, newest first.
+    /// Saved sessions in every workspace, newest first, each with the
+    /// session that started it. A rho from before
+    /// `rho/session/list_detailed` (`MethodNotFound`), as on a machine not
+    /// updated yet, lists them without, and isn't asked for it again on
+    /// this connection.
     ///
     /// # Errors
     ///
     /// Fails if the daemon rejects the request or the connection is gone.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, DaemonError> {
+        if !self.plain_lists.load(Ordering::Relaxed) {
+            let detailed = self
+                .list_pages::<methods::SessionListDetailed>(|page| {
+                    let sessions = page.sessions.into_iter();
+                    let sessions = sessions.map(SessionSummary::from_detailed).collect();
+                    (sessions, page.next_cursor)
+                })
+                .await;
+            match detailed {
+                Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => {
+                    self.plain_lists.store(true, Ordering::Relaxed);
+                }
+                listed => return listed.map_err(DaemonError::from),
+            }
+        }
+        let sessions = self
+            .list_pages::<methods::SessionList>(|page| {
+                let sessions = page.sessions.into_iter();
+                let sessions = sessions.map(SessionSummary::from_wire).collect();
+                (sessions, page.next_cursor)
+            })
+            .await?;
+        Ok(sessions)
+    }
+
+    /// Every page of the session list method `M`, from the first, each read
+    /// by `read` into its sessions and the next page's cursor.
+    async fn list_pages<M>(
+        &self,
+        read: impl Fn(M::Result) -> (Vec<SessionSummary>, Option<String>),
+    ) -> Result<Vec<SessionSummary>, ClientError>
+    where
+        M: methods::Method<Params = SessionListParams>,
+    {
         let mut sessions = Vec::new();
         let mut cursor = None;
         loop {
@@ -712,14 +784,9 @@ impl Daemon {
                 cursor,
                 limit: None,
             };
-            let page = self.client.request::<methods::SessionList>(&params).await?;
-            sessions.extend(page.sessions.into_iter().map(|session| SessionSummary {
-                id: session.session.into(),
-                cwd: session.cwd,
-                title: session.title.or(session.first_user_message),
-                updated_at: session.updated_at,
-            }));
-            match page.next_cursor {
+            let (page, next) = read(self.client.request::<M>(&params).await?);
+            sessions.extend(page);
+            match next {
                 Some(next) => cursor = Some(next),
                 None => return Ok(sessions),
             }
