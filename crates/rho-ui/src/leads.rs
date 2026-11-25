@@ -37,6 +37,14 @@ impl Kind {
             Kind::Session
         }
     }
+
+    /// What the empty composer of such a session reads.
+    pub(crate) fn placeholder(self) -> &'static str {
+        match self {
+            Kind::Session => "Ask Rho to do something",
+            Kind::Lead => "What should this lead get done?",
+        }
+    }
 }
 
 /// The longest a lead's folder name runs, in characters, before [`slug`]

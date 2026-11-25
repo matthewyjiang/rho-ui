@@ -277,6 +277,8 @@ pub(crate) struct SessionView {
     /// `None` once the view follows the session again, so the app hears of
     /// it when it has caught up, whatever changed.
     reported: Option<LiveSession>,
+    /// The kind of session the composer's placeholder is worded for.
+    placeholder: Kind,
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
     /// The surfaces the session's `ui` calls showed.
@@ -398,6 +400,7 @@ impl SessionView {
             turn_began: None,
             waiting_since: None,
             reported: None,
+            placeholder: Kind::Session,
             error: None,
             surfaces: Surfaces::default(),
             plan: Disclosure::default(),
@@ -419,6 +422,7 @@ impl SessionView {
         };
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
+        view.sync_placeholder(window, cx);
         view.reported = Some(view.live());
         view
     }
@@ -935,6 +939,7 @@ impl SessionView {
             self.transcript.set_delay(self.session.delay());
         }
         self.sync_settings(window, cx);
+        self.sync_placeholder(window, cx);
         self.sync_card(window, cx);
         // Until the attachment has caught up, the session's state is the
         // conversation's past: no turn starts or ends in it now.
@@ -1550,6 +1555,21 @@ impl SessionView {
         });
     }
 
+    /// Words the empty composer for the kind of session this is, which a
+    /// session opened from the list may only learn as its replay says its
+    /// agent.
+    fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let kind = self.kind(cx);
+        if kind == self.placeholder {
+            return;
+        }
+        self.placeholder = kind;
+        let input = self.composer.read(cx).input().clone();
+        input.update(cx, |input, cx| {
+            input.set_placeholder(kind.placeholder(), window, cx);
+        });
+    }
+
     fn on_settings_event(
         &mut self,
         _: &Entity<SessionSettings>,
@@ -2052,6 +2072,12 @@ impl SessionView {
     /// What the composer holds, for UI tests.
     pub(crate) fn composer_text(&self, cx: &App) -> String {
         self.composer.read(cx).input().read(cx).value().to_string()
+    }
+
+    /// The kind of session the empty composer is worded for, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn composer_placeholder(&self) -> Kind {
+        self.placeholder
     }
 
     /// The message the composer holds, attachments and all, for UI tests.

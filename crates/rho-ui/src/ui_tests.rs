@@ -1800,6 +1800,11 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
         (Some(LEAD_AGENT.to_owned()), Some(folder.clone()))
     );
     assert!(folder.is_dir(), "the lead's folder is made");
+    let app = ui.app.clone();
+    ui.act(|_, cx| {
+        let lead = app.read(cx).active_session().expect("the lead's view");
+        assert_eq!(lead.read(cx).composer_placeholder(), Kind::Lead);
+    });
     ui.wait_until("the lead under the header", |window, _, _| {
         is_visible(window, "leads-header") && is_visible(window, "session-local-new-2")
     });
