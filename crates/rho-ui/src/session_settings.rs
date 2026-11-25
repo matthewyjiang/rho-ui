@@ -1,13 +1,20 @@
 //! The session settings in the composer footer, laid out by what rho lets a
 //! session change. The permission mode sits on the left as a menu. On the
 //! right, one button names the model and its reasoning and opens a panel: the
-//! model list with search, beside the reasoning levels and fast mode.
+//! model list with search, beside the reasoning levels and fast mode. Under
+//! them, once the session has said what they open with, the mode and model of
+//! the sessions it starts.
 //!
 //! The daemon owns the values. [`SessionSettings`] sends a user change itself
 //! and tells its owner, a session or a new session's draft, what the daemon
 //! answered; options the daemon pushes come in through [`SessionSettings::sync`].
 //! A change made while a turn runs applies, and is answered, when the turn
-//! ends; the controls wait for it.
+//! ends; the controls wait for it. The sessions it starts are the same, but
+//! their choice comes back as a session event, through
+//! [`SessionSettings::sync_started`], not in the answer, and the section says
+//! when a change to it waits for the turn.
+
+mod started;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
@@ -28,10 +35,11 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     Choices, Daemon, ModelChoice, ModelRef, OptionChange, PermissionMode, ReasoningLevel,
-    SessionId, SessionOptions,
+    SessionId, SessionOptions, StartedSessionChange, StartedSessionDefaults,
 };
 
 use crate::session_list::contains_ignore_case;
+use started::Applies;
 
 /// Whether the user can change settings right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,9 +49,19 @@ pub(crate) enum Availability {
     Disabled,
 }
 
+/// Whether the session's turn is under way, which holds a change back
+/// until it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Turn {
+    Idle,
+    UnderWay,
+}
+
 /// What the daemon answered to a change.
 pub(crate) enum SettingsEvent {
-    /// The daemon took it; these are all the options now.
+    /// The daemon took it; these are all the options now. A change to the
+    /// sessions it starts leaves them as they were, and the session hears
+    /// of the choice as an event.
     Changed(SessionOptions),
     /// The daemon refused it, in these words; the controls show the old
     /// values again.
@@ -57,12 +75,19 @@ pub(crate) struct SessionSettings {
     /// Whether the owner lets the user change settings: not until a saved
     /// session's attach has answered.
     allowed: Availability,
-    /// `set_option` calls in flight. Controls wait for the answer.
-    pending: usize,
+    /// Whether the session's turn is under way, as its owner last said.
+    turn: Turn,
+    /// The change on its way, one at a time. Controls wait for the answer.
+    in_flight: Option<Change>,
     /// The options as the daemon last sent them.
     synced: Option<SessionOptions>,
     /// What the controls show: `synced` plus a change on its way.
     shown: Option<SessionOptions>,
+    /// What the sessions this one starts open with, as the session last
+    /// heard. `None` leaves their controls out until the daemon has said.
+    started: Option<StartedSessionDefaults>,
+    /// What those controls show: `started` plus a change on its way.
+    started_shown: Option<StartedSessionDefaults>,
     /// The model picker list, kept so its search and scroll survive a value
     /// update.
     models: Option<ModelPicker>,
@@ -91,9 +116,12 @@ impl SessionSettings {
             daemon,
             session,
             allowed: Availability::Enabled,
-            pending: 0,
+            turn: Turn::Idle,
+            in_flight: None,
             synced: None,
             shown: None,
+            started: None,
+            started_shown: None,
             models: None,
             open: false,
         };
@@ -114,11 +142,29 @@ impl SessionSettings {
         }
     }
 
+    /// Says whether the session's turn is under way: a change sent then
+    /// waits for its end.
+    pub(crate) fn set_turn(&mut self, turn: Turn, cx: &mut Context<'_, Self>) {
+        if self.turn != turn {
+            self.turn = turn;
+            cx.notify();
+        }
+    }
+
     fn availability(&self) -> Availability {
-        if self.pending == 0 {
+        if self.in_flight.is_none() {
             self.allowed
         } else {
             Availability::Disabled
+        }
+    }
+
+    /// When the change to the sessions it starts on its way applies: once
+    /// the turn under way ends, if there is one.
+    fn started_applies(&self) -> Applies {
+        match (&self.in_flight, self.turn) {
+            (Some(Change::Started(_)), Turn::UnderWay) => Applies::WhenTurnEnds,
+            _ => Applies::Now,
         }
     }
 
@@ -156,28 +202,64 @@ impl SessionSettings {
         }
     }
 
+    /// Makes the controls for the sessions this one starts show `defaults`,
+    /// the session's choice, once it differs from the one they last had,
+    /// dropping any change still shown as requested. Until then a change
+    /// the daemon took stays shown: its answer doesn't carry the choice,
+    /// and the session's event may come after it. `None` leaves them out:
+    /// the daemon hasn't said yet.
+    pub(crate) fn sync_started(
+        &mut self,
+        defaults: Option<&StartedSessionDefaults>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.started.as_ref() == defaults {
+            return;
+        }
+        self.started = defaults.cloned();
+        self.started_shown = defaults.cloned();
+        cx.notify();
+    }
+
     /// Sends a change. Until the daemon answers, the controls show it and
     /// take no other.
-    fn request(&mut self, change: OptionChange, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn request(&mut self, change: Change, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.availability() == Availability::Disabled {
             return;
         }
-        if let Some(shown) = &mut self.shown {
-            shown.apply_change(&change);
+        match &change {
+            Change::Own(change) => {
+                if let Some(shown) = &mut self.shown {
+                    shown.apply_change(change);
+                }
+                if let (Some(picker), OptionChange::Model(model)) = (&self.models, change) {
+                    set_current_model(&picker.list, model, window, cx);
+                }
+            }
+            Change::Started(change) => {
+                if let Some(shown) = &mut self.started_shown {
+                    shown.apply_change(change);
+                }
+            }
         }
-        if let (Some(picker), OptionChange::Model(model)) = (&self.models, &change) {
-            set_current_model(&picker.list, model, window, cx);
-        }
-        self.pending += 1;
+        self.in_flight = Some(change.clone());
         cx.notify();
 
         let daemon = self.daemon.clone();
         let session = self.session.clone();
         let name = setting_name(&change);
         cx.spawn_in(window, async move |this, cx| {
-            let result = daemon.set_option(&session, change).await;
+            // A change to the sessions it starts is answered with the
+            // session's own options, unchanged; what the section shows stays
+            // until the session's event brings the choice.
+            let result = match change {
+                Change::Own(change) => daemon.set_option(&session, change).await,
+                Change::Started(change) => {
+                    daemon.set_started_session_default(&session, change).await
+                }
+            };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.pending -= 1;
+                this.in_flight = None;
                 match result {
                     Ok(options) => {
                         this.sync(Some(&options), window, cx);
@@ -187,6 +269,8 @@ impl SessionSettings {
                         // Put back what the daemon still has.
                         let synced = this.synced.take();
                         this.sync(synced.as_ref(), window, cx);
+                        let started = this.started.take();
+                        this.sync_started(started.as_ref(), cx);
                         cx.emit(SettingsEvent::Failed(format!(
                             "Couldn't change {name}: {error}"
                         )));
@@ -225,6 +309,8 @@ impl SessionSettings {
     pub(crate) fn render_panel_button(this: &Entity<Self>, cx: &App) -> Option<impl IntoElement> {
         let settings = this.read(cx);
         let options = settings.shown.clone()?;
+        let started = settings.started_shown.clone();
+        let applies = settings.started_applies();
         let list = settings.models.as_ref()?.list.clone();
         let focus = list.focus_handle(cx);
         let availability = settings.availability();
@@ -252,7 +338,17 @@ impl SessionSettings {
                         .dropdown_caret(true)
                         .disabled(availability == Availability::Disabled),
                 )
-                .content(move |_, _, cx| render_panel(&list, &options, availability, &weak, cx)),
+                .content(move |_, _, cx| {
+                    render_panel(
+                        &list,
+                        &options,
+                        started.as_ref(),
+                        applies,
+                        availability,
+                        &weak,
+                        cx,
+                    )
+                }),
         )
     }
 }
@@ -274,12 +370,23 @@ pub(crate) fn model_summary(options: &SessionOptions) -> Option<SharedString> {
     (!parts.is_empty()).then(|| parts.join(" · ").into())
 }
 
-fn setting_name(change: &OptionChange) -> &'static str {
+/// A change the controls send: to the session's own settings, or to what
+/// the sessions it starts open with.
+#[derive(Clone, Debug)]
+enum Change {
+    Own(OptionChange),
+    Started(StartedSessionChange),
+}
+
+/// What `change` changes, for the message that says the daemon refused it.
+fn setting_name(change: &Change) -> &'static str {
     match change {
-        OptionChange::PermissionMode(_) => "mode",
-        OptionChange::Model(_) => "model",
-        OptionChange::Reasoning(_) => "reasoning",
-        OptionChange::FastMode(_) => "fast mode",
+        Change::Own(OptionChange::PermissionMode(_)) => "mode",
+        Change::Own(OptionChange::Model(_)) => "model",
+        Change::Own(OptionChange::Reasoning(_)) => "reasoning",
+        Change::Own(OptionChange::FastMode(_)) => "fast mode",
+        Change::Started(StartedSessionChange::PermissionMode(_)) => "the started sessions' mode",
+        Change::Started(StartedSessionChange::Model(_)) => "the started sessions' model",
     }
 }
 
@@ -307,6 +414,52 @@ fn footer_button(cx: &App) -> ButtonCustomVariant {
         .active(foreground.alpha(0.12))
 }
 
+/// One entry of a [`choice_menu`].
+struct MenuChoice {
+    label: SharedString,
+    /// Whether it is the choice in effect, which the menu checks.
+    checked: bool,
+    change: Change,
+}
+
+/// Opens a menu of `choices` from `button`, its `anchor` corner at the
+/// button's; choosing one sends its change. A long menu scrolls within
+/// 18rem, less than the panel's 22rem model list, so one opened from the
+/// panel stays inside it: a press outside the panel closes the panel before
+/// the menu's item takes the click. The menu stays on a disabled button, as
+/// a change in flight disables it: taking the menu away then would drop it
+/// before it hands the keyboard back.
+fn choice_menu(
+    button: Button,
+    availability: Availability,
+    anchor: Anchor,
+    choices: Vec<MenuChoice>,
+    settings: &WeakEntity<SessionSettings>,
+) -> impl IntoElement {
+    let settings = settings.clone();
+    button
+        .dropdown_caret(true)
+        .disabled(availability == Availability::Disabled)
+        .dropdown_menu_with_anchor(anchor, move |menu, window, _| {
+            let menu = menu
+                .scrollable(true)
+                .max_h(rems(18.).to_pixels(window.rem_size()));
+            choices.iter().fold(menu, |menu, choice| {
+                let settings = settings.clone();
+                let change = choice.change.clone();
+                menu.item(
+                    PopupMenuItem::new(choice.label.clone())
+                        .checked(choice.checked)
+                        .on_click(move |_, window, cx| {
+                            let _ = settings.update(cx, |this, cx| {
+                                this.request(change.clone(), window, cx);
+                            });
+                        }),
+                )
+            })
+        })
+}
+
 /// A footer button naming the current permission mode, opening a menu of the
 /// others.
 fn mode_menu(
@@ -316,35 +469,58 @@ fn mode_menu(
     cx: &App,
 ) -> impl IntoElement {
     let current = modes.current();
-    let available = modes.available().to_vec();
-    let settings = settings.clone();
-    Button::new("config-mode")
-        .custom(footer_button(cx))
-        .small()
-        .icon(Lucide::Shield)
-        .label(current.label())
-        .dropdown_caret(true)
-        .accessibility_label("Mode")
-        .disabled(availability == Availability::Disabled)
-        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-            available.iter().copied().fold(menu, |menu, mode| {
-                let settings = settings.clone();
-                menu.item(
-                    PopupMenuItem::new(mode.label())
-                        .checked(mode == current)
-                        .on_click(move |_, window, cx| {
-                            let _ = settings.update(cx, |this, cx| {
-                                this.request(OptionChange::PermissionMode(mode), window, cx);
-                            });
-                        }),
-                )
-            })
+    let choices = modes
+        .available()
+        .iter()
+        .map(|&mode| MenuChoice {
+            label: mode.label().into(),
+            checked: mode == current,
+            change: Change::Own(OptionChange::PermissionMode(mode)),
         })
+        .collect();
+    choice_menu(
+        Button::new("config-mode")
+            .custom(footer_button(cx))
+            .small()
+            .icon(Lucide::Shield)
+            .label(current.label())
+            .accessibility_label("Mode"),
+        availability,
+        Anchor::BottomLeft,
+        choices,
+        settings,
+    )
 }
 
 /// The panel's content: models on the left, reasoning and fast mode on the
-/// right.
+/// right, and under them the sessions it starts, once `started` says what
+/// they open with.
 fn render_panel(
+    models: &Entity<ListState<ModelList>>,
+    options: &SessionOptions,
+    started: Option<&StartedSessionDefaults>,
+    applies: Applies,
+    availability: Availability,
+    settings: &WeakEntity<SessionSettings>,
+    cx: &App,
+) -> impl IntoElement {
+    v_flex()
+        .gap_3()
+        .child(render_own(models, options, availability, settings, cx))
+        .when_some(started, |this, defaults| {
+            this.child(Separator::horizontal()).child(started::render(
+                defaults,
+                applies,
+                options,
+                availability,
+                settings,
+                cx,
+            ))
+        })
+}
+
+/// The session's own model, reasoning and fast mode.
+fn render_own(
     models: &Entity<ListState<ModelList>>,
     options: &SessionOptions,
     availability: Availability,
@@ -397,7 +573,7 @@ fn render_panel(
                                         .on_change(move |on: &bool, window, cx| {
                                             let _ = settings.update(cx, |this, cx| {
                                                 this.request(
-                                                    OptionChange::FastMode(*on),
+                                                    Change::Own(OptionChange::FastMode(*on)),
                                                     window,
                                                     cx,
                                                 );
@@ -441,7 +617,7 @@ fn render_reasoning(
             .child(level.label())
             .on_click(move |_, window, cx| {
                 let _ = settings.update(cx, |this, cx| {
-                    this.request(OptionChange::Reasoning(level), window, cx);
+                    this.request(Change::Own(OptionChange::Reasoning(level)), window, cx);
                 });
             })
         }))
@@ -465,7 +641,7 @@ fn new_model_picker(
                     return;
                 };
                 this.close_panel(cx);
-                this.request(OptionChange::Model(model), window, cx);
+                this.request(Change::Own(OptionChange::Model(model)), window, cx);
             }
             ListEvent::Cancel => this.close_panel(cx),
             ListEvent::Select(_) => {}

@@ -1,5 +1,7 @@
 //! A session's typed settings built from the daemon's `SessionOptions`, and
-//! the typed changes sent back with [`crate::Daemon::set_option`].
+//! the typed changes sent back with [`crate::Daemon::set_option`]; and what
+//! the sessions it starts open with, changed with
+//! [`crate::Daemon::set_started_session_default`].
 
 use std::fmt;
 
@@ -365,6 +367,110 @@ impl OptionChange {
                 level: level.to_wire(),
             },
             Self::FastMode(enabled) => rho_protocol::SessionChange::FastMode { enabled },
+        }
+    }
+}
+
+/// What a person chose for the sessions a session starts through session
+/// control (the `sessions` tool's `new`), as the daemon last reported it.
+/// The sessions those start take it on too. The session's own settings
+/// ([`SessionOptions`]) are apart from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartedSessionDefaults {
+    mode: StartedMode,
+    model: Option<ModelRef>,
+}
+
+impl StartedSessionDefaults {
+    /// A choice of `mode` and `model`; `None` leaves the model to the
+    /// config.
+    pub fn new(mode: StartedMode, model: Option<ModelRef>) -> Self {
+        Self { mode, model }
+    }
+
+    /// The permission mode they open in.
+    pub fn mode(&self) -> StartedMode {
+        self.mode
+    }
+
+    /// The model they open on, unless their agent names its own; `None`
+    /// when not chosen, so they take the config's.
+    pub fn model(&self) -> Option<&ModelRef> {
+        self.model.as_ref()
+    }
+
+    /// Shows `change` in place, before the daemon reports it. A mode
+    /// replaces an unknown one; a model leaves the mode as it is.
+    pub fn apply_change(&mut self, change: &StartedSessionChange) {
+        match change {
+            StartedSessionChange::PermissionMode(mode) => self.mode = StartedMode::from(*mode),
+            StartedSessionChange::Model(model) => self.model.clone_from(model),
+        }
+    }
+
+    pub(crate) fn from_wire(defaults: &rho_protocol::StartedSessionDefaults) -> Self {
+        let mode = match defaults.permission_mode {
+            None => StartedMode::Default,
+            Some(rho_protocol::PermissionMode::Unknown) => StartedMode::Unknown,
+            // A mode the protocol crate knows but this client doesn't.
+            Some(mode) => {
+                PermissionMode::from_wire(mode).map_or(StartedMode::Unknown, StartedMode::Chosen)
+            }
+        };
+        Self {
+            mode,
+            model: defaults.model.as_ref().map(ModelRef::from_wire),
+        }
+    }
+}
+
+/// The permission mode the sessions a session starts open in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum StartedMode {
+    /// Not chosen: they take the config's.
+    #[default]
+    Default,
+    /// This mode.
+    Chosen(PermissionMode),
+    /// A mode this client can't name. The daemon sends `unknown` for a
+    /// saved choice it can't read at all, with no model, under which it
+    /// starts no session and refuses a model until a mode replaces it, and
+    /// for a saved mode name it doesn't know, which keeps its model and
+    /// takes a new one. A mode a newer daemon knows and this client doesn't
+    /// reads as unknown too, and sessions start under it. The client can't
+    /// tell them apart.
+    Unknown,
+}
+
+impl From<Option<PermissionMode>> for StartedMode {
+    fn from(mode: Option<PermissionMode>) -> Self {
+        mode.map_or(Self::Default, Self::Chosen)
+    }
+}
+
+/// One change to what the sessions a session starts open with, sent with
+/// [`crate::Daemon::set_started_session_default`]. `None` clears the choice,
+/// so they take the config's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartedSessionChange {
+    /// Open them in this mode, one of the session's
+    /// [`SessionOptions::permission_mode`] choices.
+    PermissionMode(Option<PermissionMode>),
+    /// Open them on this model, one of [`ModelOptions::available`].
+    Model(Option<ModelRef>),
+}
+
+impl StartedSessionChange {
+    pub(crate) fn into_wire(self) -> rho_protocol::SessionChange {
+        match self {
+            Self::PermissionMode(mode) => {
+                rho_protocol::SessionChange::StartedSessionPermissionMode {
+                    mode: mode.map(PermissionMode::to_wire),
+                }
+            }
+            Self::Model(model) => rho_protocol::SessionChange::StartedSessionModel {
+                model: model.map(ModelRef::into_wire),
+            },
         }
     }
 }

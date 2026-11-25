@@ -35,7 +35,7 @@ use crate::{
     background::{BackgroundKind, BackgroundStatus, BackgroundWork},
     daemon::SessionId,
     input::{InputId, InputRequest},
-    options::{commands, CommandInfo, SessionOptions},
+    options::{commands, CommandInfo, SessionOptions, StartedSessionDefaults},
     prompt::{Attachment, Image, Prompt},
     surface::{PlacedSurface, SurfaceRef},
     tool_card::ToolCard,
@@ -528,6 +528,8 @@ pub struct Session {
     options: Option<SessionOptions>,
     /// The agent the session runs as, by id, as the daemon last said.
     agent: Option<String>,
+    /// What the sessions it starts open with, as the daemon last said.
+    started_defaults: Option<StartedSessionDefaults>,
     commands: Vec<CommandInfo>,
     /// The directories the session's tools reach besides its workspace.
     added_dirs: Vec<PathBuf>,
@@ -613,6 +615,7 @@ impl Session {
             usage: None,
             options: None,
             agent: None,
+            started_defaults: None,
             commands: Vec::new(),
             added_dirs: Vec::new(),
             plan: Vec::new(),
@@ -844,6 +847,14 @@ impl Session {
     /// prompt changes it; a daemon older than rho-protocol 1.4 never does.
     pub fn agent(&self) -> Option<&str> {
         self.agent.as_deref()
+    }
+
+    /// What a person chose for the sessions this one starts through session
+    /// control, which [`crate::Daemon::set_started_session_default`]
+    /// changes. The daemon says it in every replay, after the agent, and
+    /// again whenever it changes; `None` until it has.
+    pub fn started_session_defaults(&self) -> Option<&StartedSessionDefaults> {
+        self.started_defaults.as_ref()
     }
 
     /// The auth profile the session's model runs on, once its settings
@@ -1140,20 +1151,12 @@ impl Session {
                 self.end_turn(outcome);
                 None
             }
-            SessionEvent::Plan { entries } => {
-                self.plan = entries.into_iter().map(plan_item).collect();
-                None
-            }
-            SessionEvent::OptionsChanged { options } => {
-                self.apply_options(*options);
-                None
-            }
-            SessionEvent::TitleChanged { title } => {
-                self.title = Some(title);
-                None
-            }
-            SessionEvent::Agent { id } => {
-                self.agent = Some(id);
+            event @ (SessionEvent::Plan { .. }
+            | SessionEvent::OptionsChanged { .. }
+            | SessionEvent::TitleChanged { .. }
+            | SessionEvent::Agent { .. }
+            | SessionEvent::StartedSessionDefaults(_)) => {
+                self.track_settings(event);
                 None
             }
             SessionEvent::Usage {
@@ -1184,6 +1187,24 @@ impl Session {
             }
             // Cache warming, and what a newer daemon adds, is not shown.
             _ => None,
+        }
+    }
+
+    /// Keeps what the session says of itself beside its transcript: its
+    /// plan, options, title, agent, and the choice for the sessions it
+    /// starts.
+    fn track_settings(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Plan { entries } => {
+                self.plan = entries.into_iter().map(plan_item).collect();
+            }
+            SessionEvent::OptionsChanged { options } => self.apply_options(*options),
+            SessionEvent::TitleChanged { title } => self.title = Some(title),
+            SessionEvent::Agent { id } => self.agent = Some(id),
+            SessionEvent::StartedSessionDefaults(defaults) => {
+                self.started_defaults = Some(StartedSessionDefaults::from_wire(&defaults));
+            }
+            _ => {}
         }
     }
 

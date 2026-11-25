@@ -17,8 +17,9 @@
 //! The draft's own session always works in the checkout: it holds the
 //! settings while the user writes. A worktree is made only when the first
 //! message goes: the app then opens a session in a new worktree, gives it
-//! the draft's settings, and sends the message there, so choosing New
-//! worktree and back leaves no worktree behind.
+//! the draft's settings and its choice for the sessions it starts, and
+//! sends the message there, so choosing New worktree and back leaves no
+//! worktree behind.
 //!
 //! A lead's draft ([`Kind::Lead`]) has no project picker: its session is a
 //! lead in the leads root (see [`crate::leads`]), with the lead agent's
@@ -38,6 +39,7 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     Attached, Checkout, Daemon, DaemonError, Prompt, Session, SessionOptions, SessionUpdate,
+    StartedSessionDefaults,
 };
 
 use crate::{
@@ -64,11 +66,12 @@ pub(crate) enum DraftEvent {
     },
     /// Open a session of its own for the first message, `prompt`: in a new
     /// worktree of the draft's directory, or for a lead's draft, a lead in
-    /// a folder named from it. Give it `options`, the draft session's
-    /// settings, then show it and send `prompt` as its first.
-    /// [`DraftView::launch_failed`] says it couldn't.
+    /// a folder named from it. Give it `settings`, the draft session's own
+    /// and its choice for the sessions it starts, then show it and send
+    /// `prompt` as its first. [`DraftView::launch_failed`] says it
+    /// couldn't.
     StartIn {
-        options: Option<SessionOptions>,
+        settings: Box<DraftSettings>,
         prompt: Prompt,
     },
     /// Open a session in the draft's directory: the first failed, or the
@@ -85,6 +88,14 @@ enum DraftKind {
     Session { picker: Entity<ProjectPicker> },
     /// A lead's, which picks no project.
     Lead,
+}
+
+/// What a draft's session was set to, for the session that takes over from
+/// it: its own settings, and its choice for the sessions it starts.
+#[derive(Clone)]
+pub(crate) struct DraftSettings {
+    pub(crate) options: Option<SessionOptions>,
+    pub(crate) started: Option<StartedSessionDefaults>,
 }
 
 /// The draft's session.
@@ -432,13 +443,15 @@ impl DraftView {
             self.workspace = Some(WorkspaceRef::new(&self.workspaces, &self.cwd, cx));
         }
         let settings = cx.new(|cx| {
-            SessionSettings::new(
+            let mut settings = SessionSettings::new(
                 daemon.clone(),
                 session.id().clone(),
                 session.options(),
                 window,
                 cx,
-            )
+            );
+            settings.sync_started(session.started_session_defaults(), cx);
+            settings
         });
         let sign_in = Box::new(SignInSlot::new(
             self.auths.clone(),
@@ -488,6 +501,7 @@ impl DraftView {
                 session.attached(attached);
                 settings.update(cx, |settings, cx| {
                     settings.sync(session.options(), window, cx);
+                    settings.sync_started(session.started_session_defaults(), cx);
                 });
                 self.composer.update(cx, |composer, cx| {
                     composer.set_commands(session.commands(), cx);
@@ -512,6 +526,7 @@ impl DraftView {
             session.apply(update);
             settings.update(cx, |settings, cx| {
                 settings.sync(session.options(), window, cx);
+                settings.sync_started(session.started_session_defaults(), cx);
             });
             self.composer.update(cx, |composer, cx| {
                 composer.set_commands(session.commands(), cx);
@@ -562,10 +577,13 @@ impl DraftView {
             // new session takes over.
             (state @ SessionState::Open { .. }, false) => {
                 if let SessionState::Open { session, .. } = &state {
-                    let options = session.options().cloned();
+                    let settings = Box::new(DraftSettings {
+                        options: session.options().cloned(),
+                        started: session.started_session_defaults().cloned(),
+                    });
                     self.launching = true;
                     self.error = None;
-                    cx.emit(DraftEvent::StartIn { options, prompt });
+                    cx.emit(DraftEvent::StartIn { settings, prompt });
                 }
                 self.state = state;
             }

@@ -36,8 +36,8 @@ use rho_ui_core::{
     Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
     PullRequestId, PullRequestLinkOrigin, PullRequestRead, PullRequestRollup, PullRequestState,
     PullRequestSummary, PullRequestTrouble, ReasoningLevel, RestartCost, RetryReason, RhoInstall,
-    RunState, Session, SessionId, SessionOptions, SessionPullRequests, ToolStatus, WorktreeVerdict,
-    LEAD_AGENT,
+    RunState, Session, SessionId, SessionOptions, SessionPullRequests, StartedMode,
+    StartedSessionDefaults, ToolStatus, WorktreeVerdict, LEAD_AGENT,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -1270,6 +1270,13 @@ fn permission_mode(session: &Session) -> Option<PermissionMode> {
         .map(Choices::current)
 }
 
+/// The mode the sessions `session` starts open in, once it has said.
+fn started_mode(session: &Session) -> Option<StartedMode> {
+    session
+        .started_session_defaults()
+        .map(StartedSessionDefaults::mode)
+}
+
 /// The composer's settings: the mode menu on the left, and a button naming
 /// the model and reasoning that opens the model list (with search) beside
 /// the reasoning levels and fast mode. Each change reaches the daemon.
@@ -1358,6 +1365,108 @@ fn composer_settings_change_the_session() {
         permission_mode(session) == Some(PermissionMode::Plan)
     });
     ui.shot("changed");
+}
+
+/// The settings panel chooses the mode and model of the sessions a session
+/// starts. A mode the daemon reports as unknown warns, and leaves the model
+/// open to change: one the daemon refuses goes back, with its reason. A
+/// change made while a turn runs says it waits for the turn, and applies as
+/// the turn ends.
+#[test]
+fn the_settings_panel_chooses_for_the_sessions_it_starts() {
+    let mut ui = Harness::start("started-sessions", Script::default());
+    let old = SessionId::from("old");
+    ui.fake().save_unreadable_started_choice(&old);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-old")
+    });
+    ui.click("session-local-old");
+    let started = |session: &Session| session.started_session_defaults().cloned();
+    let enabled = |window: &Window, id: &'static str| {
+        window
+            .try_find(id)
+            .is_some_and(|control| control.visible() && control.disabled() != Some(true))
+    };
+    let label = |window: &Window, id: &'static str| {
+        window
+            .try_find(id)
+            .and_then(|button| button.label().map(str::to_owned))
+    };
+    let unknown = StartedSessionDefaults::new(StartedMode::Unknown, None);
+    ui.wait_for_session("the unknown mode", |session| {
+        started(session).as_ref() == Some(&unknown)
+    });
+    ui.wait_until("the session settings, open to change", |window, _, _| {
+        enabled(window, "config-panel")
+    });
+    ui.click("config-panel");
+    ui.wait_until("the warning, the model open to change", |window, _, _| {
+        is_visible(window, "config-started-unreadable") && enabled(window, "config-started-model")
+    });
+    ui.shot("unknown");
+
+    // The fake keeps a saved choice it can't read, and refuses a model.
+    ui.click("config-started-model");
+    click_menu_item(&mut ui, "Large");
+    ui.wait_until("the refusal, the model as it was", |window, _, _| {
+        is_visible(window, "session-error")
+            && enabled(window, "config-started-model")
+            && label(window, "config-started-model").as_deref() == Some("Default")
+    });
+    assert_eq!(started(&ui.session()), Some(unknown));
+
+    ui.click("config-started-mode");
+    click_menu_item(&mut ui, "Plan");
+    let plan = StartedMode::Chosen(PermissionMode::Plan);
+    ui.wait_for_session("plan for the sessions it starts", |session| {
+        started(session) == Some(StartedSessionDefaults::new(plan, None))
+    });
+    ui.wait_until("the warning and the refusal gone", |window, _, _| {
+        !is_visible(window, "config-started-unreadable")
+            && !is_visible(window, "session-error")
+            && enabled(window, "config-started-model")
+    });
+    ui.click("config-started-model");
+    click_menu_item(&mut ui, "Large");
+    let large = Some(ModelRef::new("fake", "large"));
+    ui.wait_for_session("large for the sessions it starts", |session| {
+        started(session) == Some(StartedSessionDefaults::new(plan, large.clone()))
+    });
+    ui.wait_until("the controls naming the choice", |window, _, _| {
+        label(window, "config-started-mode").as_deref() == Some("Plan")
+            && label(window, "config-started-model").as_deref() == Some("Large")
+    });
+    ui.shot("chosen");
+
+    // While a turn runs, the daemon holds a change until the turn ends.
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.wait_until("the panel to close", |window, _, _| {
+        !is_visible(window, "config-started-mode")
+    });
+    ui.send("flaky");
+    ui.wait_for_session("the turn under way", |session| session.state().is_busy());
+    ui.click("config-panel");
+    ui.wait_until("the sessions it starts", |window, _, _| {
+        enabled(window, "config-started-mode")
+    });
+    ui.click("config-started-mode");
+    click_menu_item(&mut ui, "Supervised");
+    ui.wait_until("the change waiting for the turn", |window, _, _| {
+        is_visible(window, "config-started-waiting")
+    });
+    assert_eq!(
+        started(&ui.session()),
+        Some(StartedSessionDefaults::new(plan, large.clone()))
+    );
+    ui.shot("waiting");
+    ui.fake().finish_retry(&old);
+    let supervised = StartedMode::Chosen(PermissionMode::Supervised);
+    ui.wait_for_session("supervised once the turn ended", |session| {
+        started(session) == Some(StartedSessionDefaults::new(supervised, large.clone()))
+    });
+    ui.wait_until("no change waiting", |window, _, _| {
+        !is_visible(window, "config-started-waiting")
+    });
 }
 
 /// A socket that takes the app's connection but passes it on to `daemon`
@@ -1877,6 +1986,32 @@ fn click_label(ui: &mut Harness, label: &str) {
         })
         .expect("window is open")
         .unwrap_or_else(|| panic!("nothing labelled {label:?}"));
+    ui.act(|window, cx| {
+        window.pointer_down(center, MouseButton::Left, cx);
+        window.pointer_up(center, MouseButton::Left, cx);
+    });
+}
+
+/// Clicks the open menu's item labelled `label`, as [`click_label`] does,
+/// not something else that shares the label, such as a sidebar row's
+/// machine or a row of the model list.
+fn click_menu_item(ui: &mut Harness, label: &str) {
+    let item = |window: &Window| {
+        window
+            .find_all_by_role(gpui_kit::Role::MenuItem)
+            .into_iter()
+            .find(|item| item.label() == Some(label))
+            .map(|item| item.bounds().center())
+    };
+    ui.wait_until(
+        &format!("a menu item labelled {label:?}"),
+        |window, _, _| item(window).is_some(),
+    );
+    let center = ui
+        .cx
+        .update_window(ui.window, |_, window, _| item(window))
+        .expect("window is open")
+        .unwrap_or_else(|| panic!("no menu item labelled {label:?}"));
     ui.act(|window, cx| {
         window.pointer_down(center, MouseButton::Left, cx);
         window.pointer_up(center, MouseButton::Left, cx);
@@ -6354,8 +6489,9 @@ fn the_clone_folders_folders_are_projects() {
 /// when the first message goes: switching to New worktree and back makes
 /// none and keeps the draft's session, and a folder git doesn't track works
 /// in Local without forgetting the choice. The message then starts a session
-/// in a new worktree with the draft's settings, and runs there. New drafts
-/// keep the last choice, after a restart too.
+/// in a new worktree with the draft's settings, its choice for the sessions
+/// it starts too, and runs there. New drafts keep the last choice, after a
+/// restart too.
 #[test]
 fn a_new_session_can_work_in_a_new_worktree() {
     let dir = std::env::temp_dir().join(format!("rho-ui-worktree-{}", std::process::id()));
@@ -6375,27 +6511,10 @@ fn a_new_session_can_work_in_a_new_worktree() {
     ui.click("new-session");
     ui.wait_until("the project", |window, _, _| is_visible(window, main_row));
     ui.click(main_row);
-    let in_checkout = |dir: &Path, checkout: Checkout| {
-        let dir = dir.to_path_buf();
-        move |_: &Window, cx: &App, app: &RhoApp| {
-            app.draft().is_some_and(|draft| {
-                let draft = draft.read(cx);
-                draft.cwd().path == dir
-                    && draft.session_key().is_some()
-                    && draft.checkout(cx) == checkout
-            })
-        }
-    };
     ui.wait_until(
         "the draft in the project",
         in_checkout(&main, Checkout::Local),
     );
-    let draft_session = |ui: &mut Harness| {
-        ui.cx.update(|cx| {
-            let draft = ui.app.read(cx).draft().expect("a draft");
-            draft.read(cx).session_key()
-        })
-    };
     let opened = draft_session(&mut ui);
 
     // Choosing New worktree, and back, makes no worktree and keeps the
@@ -6426,8 +6545,9 @@ fn a_new_session_can_work_in_a_new_worktree() {
     ui.click(main_row);
     ui.wait_until("back in it", in_checkout(&main, Checkout::NewWorktree));
 
-    // With Plan mode set in the draft, the first message starts a session
-    // in a new worktree, in Plan mode.
+    // With Plan mode set in the draft, and Supervised for the sessions it
+    // starts, the first message starts a session in a new worktree with both.
+    let supervised = Some(StartedMode::Chosen(PermissionMode::Supervised));
     ui.click("config-mode");
     click_label(&mut ui, "Plan");
     ui.wait_until("Plan mode in the draft", |_, cx, app| {
@@ -6435,6 +6555,18 @@ fn a_new_session_can_work_in_a_new_worktree() {
             .and_then(|draft| draft.read(cx).session().and_then(permission_mode))
             == Some(PermissionMode::Plan)
     });
+    ui.click("config-panel");
+    ui.wait_until("the sessions it starts", |window, _, _| {
+        is_visible(window, "config-started-mode")
+    });
+    ui.click("config-started-mode");
+    click_menu_item(&mut ui, "Supervised");
+    ui.wait_until("Supervised for the sessions it starts", |_, cx, app| {
+        app.draft()
+            .and_then(|draft| draft.read(cx).session().and_then(started_mode))
+            == supervised
+    });
+    ui.act(|window, cx| window.press("escape", cx));
     ui.send("list files");
     ui.wait_until("the session in its worktree, in Plan mode", |_, cx, app| {
         app.active_session().is_some_and(|view| {
@@ -6446,6 +6578,7 @@ fn a_new_session_can_work_in_a_new_worktree() {
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().starts_with("project-"))
                 && plan
+                && started_mode(view.session()) == supervised
         })
     });
     assert_eq!(ui.fake().worktrees(), 1);
@@ -6465,6 +6598,28 @@ fn a_new_session_can_work_in_a_new_worktree() {
     ui.click(main_row);
     ui.wait_until("remembered", in_checkout(&main, Checkout::NewWorktree));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether the app shows a draft whose session is open in `dir`, to start
+/// in `checkout`.
+fn in_checkout(dir: &Path, checkout: Checkout) -> impl Fn(&Window, &App, &RhoApp) -> bool {
+    let dir = dir.to_path_buf();
+    move |_, cx, app| {
+        app.draft().is_some_and(|draft| {
+            let draft = draft.read(cx);
+            draft.cwd().path == dir
+                && draft.session_key().is_some()
+                && draft.checkout(cx) == checkout
+        })
+    }
+}
+
+/// The draft's open session.
+fn draft_session(ui: &mut Harness) -> Option<SessionKey> {
+    ui.cx.update(|cx| {
+        let draft = ui.app.read(cx).draft().expect("a draft");
+        draft.read(cx).session_key()
+    })
 }
 
 /// Whether the app shows a draft for a session in `dir`.
@@ -6581,26 +6736,6 @@ fn the_composer_completes_commands_and_skills() {
     ui.act(|window, cx| window.press("escape", cx));
     ui.wait_for_session("the next Escape to stop the turn", |session| {
         session.state() != &RunState::NeedsAction
-    });
-}
-
-/// Clicks the menu item labelled `label`, not a sidebar row's part that
-/// shares it, such as a machine's label.
-fn click_menu_item(ui: &mut Harness, label: &str) {
-    let center = ui
-        .cx
-        .update_window(ui.window, |_, window, _| {
-            window
-                .find_all_by_label(label)
-                .into_iter()
-                .find(|item| !format!("{:?}", item.path()).contains("sessions"))
-                .map(|item| item.bounds().center())
-        })
-        .expect("window is open")
-        .unwrap_or_else(|| panic!("no menu item labelled {label:?}"));
-    ui.act(|window, cx| {
-        window.pointer_down(center, MouseButton::Left, cx);
-        window.pointer_up(center, MouseButton::Left, cx);
     });
 }
 

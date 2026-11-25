@@ -96,7 +96,7 @@ use crate::{
     pr_mark::pr_pill,
     pull_requests::PullRequests,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
-    session_settings::{model_summary, Availability, SessionSettings, SettingsEvent},
+    session_settings::{model_summary, Availability, SessionSettings, SettingsEvent, Turn},
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
@@ -1531,9 +1531,16 @@ impl SessionView {
         } else {
             Availability::Disabled
         };
+        let turn = if self.session.state().is_busy() {
+            Turn::UnderWay
+        } else {
+            Turn::Idle
+        };
         self.settings.update(cx, |settings, cx| {
             settings.sync(self.session.options(), window, cx);
+            settings.sync_started(self.session.started_session_defaults(), cx);
             settings.set_allowed(allowed, cx);
+            settings.set_turn(turn, cx);
         });
         self.composer.update(cx, |composer, cx| {
             composer.set_commands(self.session.commands(), cx);

@@ -42,7 +42,7 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     Attached, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs, PendingUpgrade, Prompt,
-    Session, SessionId, SessionOptions, VersionFix, VersionMismatch, LEAD_AGENT,
+    Session, SessionId, VersionFix, VersionMismatch, LEAD_AGENT,
 };
 
 mod daemon_control;
@@ -55,7 +55,7 @@ use crate::{
     auths::Auths,
     background_log::BackgroundLog,
     cloning,
-    draft::{DraftEvent, DraftView},
+    draft::{DraftEvent, DraftSettings, DraftView},
     forge::Forges,
     kinetic::Kinetic,
     leads::Kind,
@@ -1243,8 +1243,8 @@ impl RhoApp {
                             cx,
                         );
                     }
-                    DraftEvent::StartIn { options, prompt } => {
-                        this.start_in(draft, options.clone(), prompt.clone(), window, cx);
+                    DraftEvent::StartIn { settings, prompt } => {
+                        this.start_in(draft, (**settings).clone(), prompt.clone(), window, cx);
                     }
                     DraftEvent::OpenSession => this.open_draft_session(draft, window, cx),
                 },
@@ -1491,19 +1491,21 @@ impl RhoApp {
     /// Starts `draft`'s first message, `prompt`, in a session of its own,
     /// as [`Self::opening`] says: for a session's draft, in a new worktree
     /// of its directory; for a lead's, as a lead in a folder made for it,
-    /// named from `prompt`. Opens it, gives it `options`, the draft
-    /// session's settings, follows it, then shows it and sends `prompt`.
-    /// Until then the draft stays, with its own session, so a failure
-    /// leaves it as it was: only a session that starts keeps its worktree,
-    /// and a lead's folder goes again while it is empty.
+    /// named from `prompt`. Opens it, gives it `settings`, the draft
+    /// session's own and its choice for the sessions it starts, follows
+    /// it, then shows it and sends `prompt`. Until then the draft stays,
+    /// with its own session, so a failure leaves it as it was: only a
+    /// session that starts keeps its worktree, and a lead's folder goes
+    /// again while it is empty.
     fn start_in(
         &mut self,
         draft: &Entity<DraftView>,
-        options: Option<SessionOptions>,
+        settings: DraftSettings,
         prompt: Prompt,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let DraftSettings { options, started } = settings;
         let cwd = draft.read(cx).cwd().clone();
         let machine = cwd.machine.clone();
         let opening = self.opening(draft.read(cx), Some(&prompt), cx);
@@ -1523,6 +1525,13 @@ impl RhoApp {
                         .await
                         .map(Some),
                     _ => Ok(None),
+                };
+                let matched = match (matched, &started) {
+                    (Ok(options), Some(wanted)) => daemon
+                        .match_started_session_defaults(session.id(), wanted)
+                        .await
+                        .map(|()| options),
+                    (matched, _) => matched,
                 };
                 let attached = match matched {
                     Ok(options) => {

@@ -72,6 +72,7 @@ One message carries at most 16 MiB of attachments, as the daemon reads a message
 ## Things to know
 
 - **Settings changes wait for the turn.** A model or permission change made while a turn runs applies when it ends.
+- **Sessions a session starts have their own mode and model.** The sessions a session starts through rho's `sessions` tool open in the permission mode and on the model you choose for them in its settings panel, apart from its own, or rho's config's if you choose none. A choice made while a turn runs applies to the sessions started after that turn ends: the ones the turn starts meanwhile open with the choice as it was. Each started session passes the choice on to the sessions it starts, and an agent that names its own model keeps that model. The choice is saved with the session.
 - **Drafts last for this run.** A draft you leave with something typed waits in the sidebar until rho-ui quits.
 - **Sessions you leave are let go.** Once a session you left has nothing under way, rho-ui stops following it, so the daemon can unload it and rho's terminal UI can open it. Switching back shows it as you left it, scroll position and typed text included, while rho-ui catches up with the daemon; you can send once it has. A `ui` panel above where you were is rebuilt, which can move the scroll.
 - **Extra directories are saved with the session.** Directories added from the title bar's folder button reach the model from its next turn on.

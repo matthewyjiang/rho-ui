@@ -16,9 +16,10 @@ use rho_ui_core::{
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
     BackgroundWork, Checkout, ChoiceKind, Choices, Continuity, Daemon, DaemonError, DaemonEvent,
     DaemonEvents, DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity,
-    LoginOutcome, OptionChange, PermissionMode, Prompt, PromptKey, PullRequestError, PullRequestId,
-    RestartCost, RunState, Session, SessionId, SurfaceActionError, ToolStatus, Unsteered,
-    VersionFix, WorktreeVerdict, MAX_PROMPT_ATTACHMENT_BYTES,
+    LoginOutcome, ModelRef, OptionChange, PermissionMode, Prompt, PromptKey, PullRequestError,
+    PullRequestId, RestartCost, RunState, Session, SessionId, StartedMode, StartedSessionChange,
+    StartedSessionDefaults, SurfaceActionError, ToolStatus, Unsteered, VersionFix, WorktreeVerdict,
+    MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -402,6 +403,76 @@ fn a_session_takes_another_sessions_settings() {
             .await
             .expect("the fake takes the settings");
         assert_eq!(matched, planned);
+    });
+}
+
+/// What a person chose for the sessions a session starts reaches the
+/// session as the daemon reports it, on each change and in a later
+/// client's replay; `None` clears a part, and a mode the daemon reports as
+/// unknown keeps the model it sent.
+#[test]
+fn a_session_follows_the_choice_for_the_sessions_it_starts() {
+    let fake = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, mut events) = connect(&fake).await;
+        let mut session = new_session(&daemon).await;
+        let unchosen = StartedSessionDefaults::default();
+        until(&mut events, &mut session, |s| {
+            s.started_session_defaults() == Some(&unchosen)
+        })
+        .await;
+
+        let large = ModelRef::new("fake", "large");
+        for change in [
+            StartedSessionChange::PermissionMode(Some(PermissionMode::Plan)),
+            StartedSessionChange::Model(Some(large.clone())),
+        ] {
+            daemon
+                .set_started_session_default(session.id(), change)
+                .await
+                .expect("the fake takes the choice");
+        }
+        let chosen = StartedSessionDefaults::new(
+            StartedMode::Chosen(PermissionMode::Plan),
+            Some(large.clone()),
+        );
+        until(&mut events, &mut session, |s| {
+            s.started_session_defaults() == Some(&chosen)
+        })
+        .await;
+
+        let (other, mut other_events) = connect(&fake).await;
+        let mut replayed = Session::new(session.id().clone());
+        replayed.attached(other.attach(replayed.id(), None).await.unwrap());
+        until(&mut other_events, &mut replayed, |s| !s.is_replaying()).await;
+        assert_eq!(replayed.started_session_defaults(), Some(&chosen));
+
+        for change in [
+            StartedSessionChange::PermissionMode(None),
+            StartedSessionChange::Model(None),
+        ] {
+            daemon
+                .set_started_session_default(session.id(), change)
+                .await
+                .expect("the fake clears the choice");
+        }
+        until(&mut events, &mut session, |s| {
+            s.started_session_defaults() == Some(&unchosen)
+        })
+        .await;
+
+        let saved = SessionId::from("s1");
+        fake.save_unknown_started_mode(&saved);
+        let mut unknown = Session::new(saved);
+        unknown.attached(daemon.attach(unknown.id(), None).await.unwrap());
+        until(&mut events, &mut unknown, |s| !s.is_replaying()).await;
+        assert_eq!(
+            unknown.started_session_defaults(),
+            Some(&StartedSessionDefaults::new(
+                StartedMode::Unknown,
+                Some(large)
+            ))
+        );
     });
 }
 

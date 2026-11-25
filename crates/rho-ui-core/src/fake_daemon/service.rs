@@ -36,8 +36,8 @@ use rho_protocol::{
 };
 
 use super::{
-    report, shell_card, shell_output, surface, FakeSession, SessionLists, State, Turn, KEY_AUTH,
-    TOOL_IMAGE,
+    report, shell_card, shell_output, started::StartedChange, surface, FakeSession, SessionLists,
+    State, Turn, KEY_AUTH, TOOL_IMAGE,
 };
 
 #[derive(Debug)]
@@ -405,6 +405,29 @@ impl FakeSession {
             request: Box::new(request),
         });
         self.state(JobState::WaitingForInput);
+    }
+
+    /// Applies `change` to the session's own settings at once, and tells
+    /// clients its options.
+    fn configure(&mut self, change: SessionChange) -> Result<SessionConfigureResponse, RpcError> {
+        match change {
+            SessionChange::PermissionMode { mode } => self.settings.mode = mode,
+            SessionChange::Model { model, .. } => self.settings.model = model,
+            SessionChange::Reasoning { level } => self.settings.reasoning = level,
+            SessionChange::FastMode { enabled } => self.settings.fast = enabled,
+            SessionChange::AddDirectory { path } => self.settings.add_directory(path)?,
+            _ => {
+                return Err(RpcError::new(
+                    ErrorCode::MethodNotFound,
+                    "the fake daemon does not serve that session change",
+                ))
+            }
+        }
+        let options = self.settings.options();
+        self.publish(SessionEvent::OptionsChanged {
+            options: Box::new(options.clone()),
+        });
+        Ok(SessionConfigureResponse { options })
     }
 }
 
@@ -838,26 +861,24 @@ impl Service for Fake {
         &self,
         params: SessionConfigureParams,
     ) -> Result<SessionConfigureResponse, RpcError> {
-        let mut state = self.lock();
-        let session = state.session(&params.session)?;
-        match params.change {
-            SessionChange::PermissionMode { mode } => session.settings.mode = mode,
-            SessionChange::Model { model, .. } => session.settings.model = model,
-            SessionChange::Reasoning { level } => session.settings.reasoning = level,
-            SessionChange::FastMode { enabled } => session.settings.fast = enabled,
-            SessionChange::AddDirectory { path } => session.settings.add_directory(path)?,
-            _ => {
-                return Err(RpcError::new(
-                    ErrorCode::MethodNotFound,
-                    "the fake daemon does not serve that session change",
-                ))
-            }
-        }
-        let options = session.settings.options();
-        session.publish(SessionEvent::OptionsChanged {
-            options: Box::new(options.clone()),
-        });
-        Ok(SessionConfigureResponse { options })
+        // Answered once the turn under way, if any, ends; the lock goes
+        // first, so the turn can.
+        let answered = {
+            let mut state = self.lock();
+            let session = state.session(&params.session)?;
+            let change = match params.change {
+                SessionChange::StartedSessionPermissionMode { mode } => StartedChange::Mode(mode),
+                SessionChange::StartedSessionModel { model } => StartedChange::Model(model),
+                change => return session.configure(change),
+            };
+            session.change_started(change)
+        };
+        answered.await.unwrap_or_else(|_| {
+            Err(RpcError::new(
+                ErrorCode::InternalError,
+                "the session went before its turn ended",
+            ))
+        })
     }
 
     async fn attach_session(
