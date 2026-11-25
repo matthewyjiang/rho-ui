@@ -101,7 +101,10 @@
 //!   three reasoning levels, and fast mode. Every session offers the slash
 //!   commands `compact` and `prompt:review` and the skills `pstack` and
 //!   `prove-it-works`. A session adds a directory that is one on this
-//!   machine, once, and refuses others as rho does.
+//!   machine, once, and refuses others as rho does; an add saves the
+//!   session, and the list stays sorted. `rho/session/new` takes its
+//!   setup's directories as the new session's, unsaved, and refuses one
+//!   that is not a directory.
 //!   [`FakeDaemon::followers`] counts the clients following a session.
 //! - A session keeps the mode and model a client chose for the sessions it
 //!   starts, and sends them after its agent in every reset replay and
@@ -641,6 +644,20 @@ impl FakeDaemon {
         Some(self.service.lock().sessions.get(id)?.cwd.clone())
     }
 
+    /// The directories session `id`'s tools reach besides its workspace,
+    /// sorted, as rho keeps them.
+    pub fn added_dirs(&self, id: &str) -> Option<Vec<PathBuf>> {
+        Some(
+            self.service
+                .lock()
+                .sessions
+                .get(id)?
+                .settings
+                .added_dirs
+                .clone(),
+        )
+    }
+
     /// Has session `parent` start session `id` through session control, as
     /// rho's `sessions` tool does: saved now in `parent`'s workspace,
     /// titled `title`, and doing what `started` says. The list and its job
@@ -1079,18 +1096,36 @@ impl Settings {
         }
     }
 
-    /// Adds `path` as rho does: refuses one that is not a directory, or
-    /// that the session reaches already.
+    /// Adds `path` where it sorts, as rho does: refuses one that is not a
+    /// directory, or that the session reaches already.
     fn add_directory(&mut self, path: PathBuf) -> Result<(), RpcError> {
-        let refuse = |why: String| Err(RpcError::new(ErrorCode::InvalidParams, why));
         if !path.is_dir() {
-            return refuse(format!("{} is not a directory", path.display()));
+            return Err(not_a_directory(&path));
         }
-        if self.added_dirs.contains(&path) {
-            return refuse(format!("the session already reaches {}", path.display()));
+        match self.added_dirs.binary_search(&path) {
+            Ok(_) => Err(RpcError::new(
+                ErrorCode::InvalidParams,
+                format!("the session already reaches {}", path.display()),
+            )),
+            Err(ix) => {
+                self.added_dirs.insert(ix, path);
+                Ok(())
+            }
         }
-        self.added_dirs.push(path);
-        Ok(())
+    }
+
+    /// The settings of a session `rho/session/new` opens with `dirs`, as
+    /// rho takes them: sorted, a repeat folded in, and one that is not a
+    /// directory refused.
+    fn opened_with(dirs: Vec<PathBuf>) -> Result<Self, RpcError> {
+        if let Some(path) = dirs.iter().find(|path| !path.is_dir()) {
+            return Err(not_a_directory(path));
+        }
+        let mut settings = Self::new();
+        settings.added_dirs = dirs;
+        settings.added_dirs.sort();
+        settings.added_dirs.dedup();
+        Ok(settings)
     }
 
     fn options(&self) -> SessionOptions {
@@ -1149,6 +1184,14 @@ impl Settings {
     }
 }
 
+/// rho's refusal of `path` as a directory a session reaches.
+fn not_a_directory(path: &Path) -> RpcError {
+    RpcError::new(
+        ErrorCode::InvalidParams,
+        format!("{} is not a directory", path.display()),
+    )
+}
+
 /// The turn a session runs.
 #[derive(Debug)]
 struct Turn {
@@ -1179,7 +1222,8 @@ struct FakeSession {
     updated_at: u64,
     /// What `rho/session/mark` saved; a fork starts with none.
     mark: Option<rho_protocol::SessionMark>,
-    /// Listed by `rho/session/list`: a new session is once it has a prompt.
+    /// Listed by `rho/session/list`: a new session is once it has a prompt
+    /// or an added directory.
     saved: bool,
     /// The id of the agent it runs as, which a reset replay starts with.
     agent: String,

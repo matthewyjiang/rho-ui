@@ -23,9 +23,11 @@
 //!
 //! A lead's draft ([`Kind::Lead`]) has no project picker: its session is a
 //! lead in the leads root (see [`crate::leads`]), with the lead agent's
-//! settings, and the draft shows no folder until that session is open. The
+//! settings, and the draft shows no folder until that session is open.
+//! Its title bar picks the projects the lead will work in ([`AddedDirs`]),
+//! kept in the draft, not on that session, which is not the lead's. The
 //! first message starts the lead in a folder of its own, named from the
-//! message, the same way.
+//! message, the same way, reaching the projects picked.
 
 use std::path::PathBuf;
 
@@ -43,6 +45,7 @@ use rho_ui_core::{
 };
 
 use crate::{
+    added_dirs::AddedDirs,
     auths::Auths,
     composer::{Composer, ComposerMode, ComposerState},
     leads::Kind,
@@ -66,10 +69,10 @@ pub(crate) enum DraftEvent {
     },
     /// Open a session of its own for the first message, `prompt`: in a new
     /// worktree of the draft's directory, or for a lead's draft, a lead in
-    /// a folder named from it. Give it `settings`, the draft session's own
-    /// and its choice for the sessions it starts, then show it and send
-    /// `prompt` as its first. [`DraftView::launch_failed`] says it
-    /// couldn't.
+    /// a folder named from it, reaching the projects picked. Give it
+    /// `settings`, the draft session's own and its choice for the sessions
+    /// it starts, then show it and send `prompt` as its first.
+    /// [`DraftView::launch_failed`] says it couldn't.
     StartIn {
         settings: Box<DraftSettings>,
         prompt: Prompt,
@@ -83,16 +86,19 @@ pub(crate) enum DraftEvent {
 enum DraftKind {
     /// A session's, which `picker` moves between projects and checkouts.
     Session { picker: Entity<ProjectPicker> },
-    /// A lead's, which picks no project.
-    Lead,
+    /// A lead's, which picks no project to start in but, in `added_dirs`,
+    /// the projects the lead works in, for the whole of the draft's life.
+    Lead { added_dirs: Entity<AddedDirs> },
 }
 
-/// What a draft's session was set to, for the session that takes over from
-/// it: its own settings, and its choice for the sessions it starts.
+/// What a draft was set to, for the session that takes over from it: its
+/// session's own settings, its choice for the sessions it starts, and for
+/// a lead's draft, the projects picked, which the lead's tools reach.
 #[derive(Clone)]
 pub(crate) struct DraftSettings {
     pub(crate) options: Option<SessionOptions>,
     pub(crate) started: Option<StartedSessionDefaults>,
+    pub(crate) added_dirs: Vec<PathBuf>,
 }
 
 /// The draft's session.
@@ -162,16 +168,21 @@ impl DraftView {
     }
 
     /// A lead's draft on `machine`, whose session opens in the leads root
-    /// there; see [`Self::new`].
+    /// there, and which offers `projects` for the lead to work in; see
+    /// [`Self::new`].
     pub(crate) fn new_lead(
         machine: MachineId,
         workspaces: &Entity<Workspaces>,
+        projects: &Entity<Projects>,
         machines: &Entity<Machines>,
         auths: Entity<Auths>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let (kind, cwd) = (DraftKind::Lead, Place::new(machine, PathBuf::new()));
+        let added_dirs =
+            AddedDirs::pending(machine.clone(), workspaces, projects.clone(), window, cx);
+        let kind = DraftKind::Lead { added_dirs };
+        let cwd = Place::new(machine, PathBuf::new());
         Self::of_kind(kind, cwd, workspaces, machines, auths, window, cx)
     }
 
@@ -213,7 +224,7 @@ impl DraftView {
                 subscriptions.push(cx.subscribe_in(picker, window, Self::on_picker_event));
                 Some(WorkspaceRef::new(workspaces, &cwd, cx))
             }
-            DraftKind::Lead => {
+            DraftKind::Lead { .. } => {
                 input.update(cx, |input, cx| {
                     input.set_placeholder(Kind::Lead.placeholder(), window, cx);
                 });
@@ -241,7 +252,7 @@ impl DraftView {
     pub(crate) fn kind(&self) -> Kind {
         match self.kind {
             DraftKind::Session { .. } => Kind::Session,
-            DraftKind::Lead => Kind::Lead,
+            DraftKind::Lead { .. } => Kind::Lead,
         }
     }
 
@@ -249,7 +260,16 @@ impl DraftView {
     fn picker(&self) -> Option<&Entity<ProjectPicker>> {
         match &self.kind {
             DraftKind::Session { picker } => Some(picker),
-            DraftKind::Lead => None,
+            DraftKind::Lead { .. } => None,
+        }
+    }
+
+    /// The projects a lead's draft picks for its lead; a session's draft
+    /// picks its project instead.
+    fn added_dirs(&self) -> Option<&Entity<AddedDirs>> {
+        match &self.kind {
+            DraftKind::Session { .. } => None,
+            DraftKind::Lead { added_dirs } => Some(added_dirs),
         }
     }
 
@@ -574,9 +594,11 @@ impl DraftView {
             // new session takes over.
             (state @ SessionState::Open { .. }, false) => {
                 if let SessionState::Open { session, .. } = &state {
+                    let added_dirs = self.added_dirs().map(|dirs| dirs.read(cx).dirs().to_vec());
                     let settings = Box::new(DraftSettings {
                         options: session.options().cloned(),
                         started: session.started_session_defaults().cloned(),
+                        added_dirs: added_dirs.unwrap_or_default(),
                     });
                     self.launching = true;
                     self.error = None;
@@ -657,7 +679,9 @@ impl Render for DraftView {
             Kind::Lead => NEW_LEAD,
         };
         let workspace = self.workspace.as_ref().map(|workspace| workspace.read(cx));
-        let title_bar = TitleBar::new(workspace, title);
+        // A lead's projects, at the right, where a session's title bar has
+        // its added directories.
+        let title_bar = TitleBar::new(workspace, title).trailing(self.added_dirs().cloned());
         v_flex()
             .id("draft-view")
             .test_support()

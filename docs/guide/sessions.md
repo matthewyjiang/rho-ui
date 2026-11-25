@@ -31,6 +31,7 @@ A lead is a session that runs as rho's `lead` agent: it takes a goal to merged p
 - **A folder of its own.** A lead works in `~/.rho/leads/<name>/` on its machine (under `$RHO_HOME` if you set one), named from its first message, with `-2`, `-3`… when that name is taken.
 - **The brief is yours too.** The lead keeps what it knows between turns in `brief.md` in that folder: the goal, where it may work, what it may decide without you, its pull requests and its decisions. Edit it at any time; the lead reads it at the start of every turn.
 - **In no project.** A lead's folder belongs to no project, so the project filter doesn't hide it; the machine filter and search still do.
+- **Its projects are where it may work.** The projects you pick for a lead are the directories its tools reach, and rho lists them to it. Pick them in its draft: the lead gets them as its first message starts it, so its first turn knows them. After that, add more from the lead's title bar, as any session's directories.
 - **Its sessions fold under it**, as any session's do (see above).
 
 ## Projects
@@ -75,4 +76,4 @@ One message carries at most 16 MiB of attachments, as the daemon reads a message
 - **Sessions a session starts have their own mode and model.** The sessions a session starts through rho's `sessions` tool open in the permission mode and on the model you choose for them in its settings panel, apart from its own, or rho's config's if you choose none. A choice made while a turn runs applies to the sessions started after that turn ends: the ones the turn starts meanwhile open with the choice as it was. Each started session passes the choice on to the sessions it starts, and an agent that names its own model keeps that model. The choice is saved with the session.
 - **Drafts last for this run.** A draft you leave with something typed waits in the sidebar until rho-ui quits.
 - **Sessions you leave are let go.** Once a session you left has nothing under way, rho-ui stops following it, so the daemon can unload it and rho's terminal UI can open it. Switching back shows it as you left it, scroll position and typed text included, while rho-ui catches up with the daemon; you can send once it has. A `ui` panel above where you were is rebuilt, which can move the scroll.
-- **Extra directories are saved with the session.** Directories added from the title bar's folder button reach the model from its next turn on.
+- **Extra directories are saved with the session.** Directories added from the title bar's folder button, a lead's projects among them, reach the model from its next turn on.

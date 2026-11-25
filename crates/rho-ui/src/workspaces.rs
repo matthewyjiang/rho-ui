@@ -11,6 +11,7 @@
 //! picker.
 
 use std::{
+    cmp::Reverse,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -315,6 +316,19 @@ impl Workspaces {
             .map(|workspace| workspace.last_used)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Orders the workspaces at `ixs` as projects are listed: most recently
+    /// used first ([`Self::last_used_in`]), then by name, then by path.
+    pub(crate) fn sort_by_use(&self, ixs: &mut [usize]) {
+        ixs.sort_by_cached_key(|&ix| {
+            let workspace = self.get(ix);
+            (
+                Reverse(self.last_used_in(workspace.place())),
+                workspace.name.clone(),
+                workspace.cwd().to_path_buf(),
+            )
+        });
     }
 
     /// The workspace whose directory is one of `places`, if any.

@@ -17,8 +17,13 @@ use crate::{
 pub(super) enum Opening {
     /// A plain session, in the draft's directory checked out so.
     Plain(Checkout),
-    /// A lead, in the folder of the leads root that [`Leads`] makes.
-    Lead(Leads, Folder),
+    /// A lead, in the folder of the leads root that [`Leads`] makes, whose
+    /// tools reach `added_dirs` too: the projects its draft picked.
+    Lead {
+        leads: Leads,
+        folder: Folder,
+        added_dirs: Vec<PathBuf>,
+    },
 }
 
 impl Opening {
@@ -32,7 +37,7 @@ impl Opening {
     /// Says why, in the file system's, ssh's or the daemon's words, if the
     /// machine isn't connected, a lead's folder can't be made, or the
     /// daemon won't open the session, as a rho without the lead agent
-    /// won't open a lead.
+    /// won't open a lead, or one with a directory that no longer exists.
     pub(super) async fn open(
         &self,
         daemon: &Daemon,
@@ -44,9 +49,13 @@ impl Opening {
                 .await
                 .map(|setup| (setup, cwd.to_path_buf()))
                 .map_err(|error| error.to_string()),
-            Opening::Lead(leads, folder) => {
+            Opening::Lead {
+                leads,
+                folder,
+                added_dirs,
+            } => {
                 let dir = leads.make(folder).await?;
-                match daemon.new_lead(&dir).await {
+                match daemon.new_lead(&dir, added_dirs).await {
                     Ok(setup) => Ok((setup, dir)),
                     Err(error) => {
                         self.unmake(&dir).await;
@@ -62,8 +71,26 @@ impl Opening {
     /// didn't start, so a retry takes its name again. The leads root and a
     /// plain session's directory stay.
     pub(super) async fn unmake(&self, dir: &Path) {
-        if let Opening::Lead(leads, Folder::Lead(_)) = self {
+        if let Opening::Lead {
+            leads,
+            folder: Folder::Lead(_),
+            ..
+        } = self
+        {
             leads.unmake(dir).await;
+        }
+    }
+
+    /// The same opening, for a lead whose tools reach `dirs` too. A plain
+    /// session's draft picks no directories, so its opening takes none.
+    pub(super) fn with_added_dirs(self, dirs: Vec<PathBuf>) -> Self {
+        match self {
+            Opening::Lead { leads, folder, .. } => Opening::Lead {
+                leads,
+                folder,
+                added_dirs: dirs,
+            },
+            plain @ Opening::Plain(_) => plain,
         }
     }
 }
@@ -81,10 +108,11 @@ impl RhoApp {
                 let reader = self.workspaces.read(cx).reader(&draft.cwd().machine);
                 let executor = cx.background_executor().clone();
                 let leads = Leads::new(reader, self.launch.rho_home.clone(), executor);
-                Opening::Lead(
+                Opening::Lead {
                     leads,
-                    first.map_or(Folder::Root, |first| Folder::named_from(first.text())),
-                )
+                    folder: first.map_or(Folder::Root, |first| Folder::named_from(first.text())),
+                    added_dirs: Vec::new(),
+                }
             }
         }
     }

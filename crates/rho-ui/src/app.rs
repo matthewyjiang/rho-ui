@@ -1213,11 +1213,9 @@ impl RhoApp {
     /// on the machine a new session would start on.
     fn new_draft(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<'_, Self>) {
         // A clone or a folder made since the last New session is a project
-        // now.
-        if kind == Kind::Session {
-            for connection in &self.connections {
-                self.find_projects(&connection.machine, cx);
-            }
+        // now, for a session to start in or a lead to work in.
+        for connection in &self.connections {
+            self.find_projects(&connection.machine, cx);
         }
         // An empty draft of the kind on screen is reused, so its settings
         // survive; one with a message is left for the sidebar, in place of
@@ -1235,7 +1233,15 @@ impl RhoApp {
         let auths = self.auths.clone();
         let view = cx.new(|cx| match kind {
             Kind::Session => DraftView::new(cwd, workspaces, projects, machines, auths, window, cx),
-            Kind::Lead => DraftView::new_lead(cwd.machine, workspaces, machines, auths, window, cx),
+            Kind::Lead => DraftView::new_lead(
+                cwd.machine,
+                workspaces,
+                projects,
+                machines,
+                auths,
+                window,
+                cx,
+            ),
         });
         let subscriptions = [
             cx.subscribe_in(
@@ -1501,12 +1507,12 @@ impl RhoApp {
     /// Starts `draft`'s first message, `prompt`, in a session of its own,
     /// as [`Self::opening`] says: for a session's draft, in a new worktree
     /// of its directory; for a lead's, as a lead in a folder made for it,
-    /// named from `prompt`. Opens it, gives it `settings`, the draft
-    /// session's own and its choice for the sessions it starts, follows
-    /// it, then shows it and sends `prompt`. Until then the draft stays,
-    /// with its own session, so a failure leaves it as it was: only a
-    /// session that starts keeps its worktree, and a lead's folder goes
-    /// again while it is empty.
+    /// named from `prompt`, reaching the projects its draft picked. Opens
+    /// it, gives it `settings`, the draft session's own and its choice for
+    /// the sessions it starts, follows it, then shows it and sends
+    /// `prompt`. Until then the draft stays, with its own session, so a
+    /// failure leaves it as it was: only a session that starts keeps its
+    /// worktree, and a lead's folder goes again while it is empty.
     fn start_in(
         &mut self,
         draft: &Entity<DraftView>,
@@ -1515,10 +1521,17 @@ impl RhoApp {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let DraftSettings { options, started } = settings;
+        let DraftSettings {
+            options,
+            started,
+            added_dirs,
+        } = settings;
         let cwd = draft.read(cx).cwd().clone();
         let machine = cwd.machine.clone();
-        let opening = self.opening(draft.read(cx), Some(&prompt), cx);
+        // A lead's projects go with its open, so its first turn knows them.
+        let opening = self
+            .opening(draft.read(cx), Some(&prompt), cx)
+            .with_added_dirs(added_dirs);
         let Some((daemon, epoch)) = self.ready(&machine) else {
             return;
         };
@@ -1925,7 +1938,7 @@ impl RhoApp {
         let id = SessionKey::new(cwd.machine.clone(), session.id().clone());
         let workspace = WorkspaceRef::new(&self.workspaces, cwd, cx);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
-        let (auths, prs) = (self.auths.clone(), self.prs.clone());
+        let (auths, prs, projects) = (self.auths.clone(), self.prs.clone(), self.projects.clone());
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon,
@@ -1936,6 +1949,7 @@ impl RhoApp {
                 window,
                 cx,
             )
+            .with_projects(&projects, window, cx)
             .with_sign_in(auths, window, cx)
             .with_pull_requests(prs, cx)
         });
@@ -1981,7 +1995,7 @@ impl RhoApp {
         let cwd = Place::new(id.machine.clone(), cwd);
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         let workspace = WorkspaceRef::new(&self.workspaces, &cwd, cx);
-        let (auths, prs) = (self.auths.clone(), self.prs.clone());
+        let (auths, prs, projects) = (self.auths.clone(), self.prs.clone(), self.projects.clone());
         let view = cx.new(|cx| {
             SessionView::new(
                 daemon.clone(),
@@ -1992,6 +2006,7 @@ impl RhoApp {
                 window,
                 cx,
             )
+            .with_projects(&projects, window, cx)
             .with_sign_in(auths, window, cx)
             .with_pull_requests(prs, cx)
         });
