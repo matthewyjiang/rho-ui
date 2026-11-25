@@ -181,6 +181,14 @@ fn start_prompt(
         session.answer(&format!("m-{turn_id}"), "Started `sleep 30`.");
         return Ok(SessionPromptResponse { turn: turn_id });
     }
+    if prompt == "/compact" {
+        session.compact(turn, echo(&turn_id, params));
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
+    if prompt == "long" {
+        session.long(turn, echo(&turn_id, params));
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
     if prompt == "flaky" {
         session.flaky(turn, echo(&turn_id, params));
         return Ok(SessionPromptResponse { turn: turn_id });

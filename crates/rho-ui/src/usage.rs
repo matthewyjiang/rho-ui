@@ -109,7 +109,7 @@ impl RenderOnce for UsageRing {
 
 /// A token count in at most three figures: "950", "2.5k", "200k", "1.2M".
 /// Rounds down, so a count never reads as more than it is.
-fn tokens(count: u64) -> String {
+pub(crate) fn tokens(count: u64) -> String {
     let (unit, scale) = match count {
         0..1_000 => return count.to_string(),
         1_000..1_000_000 => ("k", 1_000),

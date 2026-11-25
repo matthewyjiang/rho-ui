@@ -2169,6 +2169,7 @@ fn first_prompt(session: &Session) -> Option<String> {
         | Entry::Thought(_)
         | Entry::Tool(_)
         | Entry::Notice(_)
+        | Entry::Compaction(_)
         | Entry::Surface(_)
         | Entry::Wake => None,
     })?;

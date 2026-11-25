@@ -28,6 +28,7 @@ use gpui_kit::component::{
     h_flex,
     message::{Message, MessageAlignment, MessageContent},
     message_scroller::MessageScrollerState,
+    separator::Separator,
     text::{MarkdownExtensions, TextView, TextViewState, TextViewStyle},
     v_flex, ActiveTheme as _, Colorize as _, Icon, Sizable as _, StyledExt as _,
 };
@@ -38,7 +39,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window,
 };
 use rho_ui_core::{
-    surface::SurfaceRef, Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent, UserMessage,
+    surface::SurfaceRef, Compaction, Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent,
+    UserMessage,
 };
 
 use crate::{
@@ -50,6 +52,7 @@ use crate::{
     pictures::{self, PictureRead, Pictures},
     surface_view::Surfaces,
     turn_times::TurnTimes,
+    usage,
     work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
 
@@ -306,6 +309,16 @@ impl Transcript {
                 }
             }
         }
+    }
+
+    /// Whether row `row` is a compaction's. It stays out of its turn's
+    /// folded working: the model sees what came before it only as a
+    /// summary, which matters after the turn too.
+    fn is_compaction_row(&self, row: usize, entries: &[Entry]) -> bool {
+        matches!(
+            self.timeline.rows().get(row),
+            Some(Row::Message(entry)) if matches!(entries.get(*entry), Some(Entry::Compaction(_)))
+        )
     }
 
     /// The surface row `row` is for, if it is a surface's row.
@@ -705,7 +718,9 @@ impl Transcript {
                 .into_any_element();
         };
         let working = self.timeline.working(turn);
-        if working.as_ref().is_some_and(|rows| rows.contains(&row)) {
+        if working.as_ref().is_some_and(|rows| rows.contains(&row))
+            && !self.is_compaction_row(row, entries)
+        {
             let shows = if self.is_finished(turn) {
                 self.worked[turn]
             } else {
@@ -1042,13 +1057,49 @@ fn markdown_parts(entry: &Entry) -> Vec<&str> {
         Entry::Agent(message) => return parts::split(message.text()),
         Entry::User(message) => Some(message.text()).filter(|text| !text.is_empty()),
         Entry::Notice(notice) => notice.description(),
-        Entry::Thought(_) | Entry::Tool(_) | Entry::Surface(_) | Entry::Wake => None,
+        Entry::Thought(_)
+        | Entry::Tool(_)
+        | Entry::Compaction(_)
+        | Entry::Surface(_)
+        | Entry::Wake => None,
     };
     whole.into_iter().collect()
 }
 
-/// Builds the row for a user message or a reply: entry `ix`, with what
-/// `shown` holds. Tool calls and thoughts are drawn by [`crate::work`].
+/// Compaction `ix`: a dashed rule across the transcript, since the model
+/// now sees what came before it only as a summary, with how far the context
+/// shrank. The counts are rho's: messages, and tokens it estimates locally.
+fn compaction_divider(ix: usize, compaction: Compaction, cx: &App) -> AnyElement {
+    let Compaction { before, after } = compaction;
+    let label = if before == after {
+        "Context unchanged by compaction".to_owned()
+    } else {
+        format!(
+            "Context compacted · {} → {} messages · {} → {} tokens",
+            before.messages,
+            after.messages,
+            usage::tokens(before.tokens),
+            usage::tokens(after.tokens),
+        )
+    };
+    let rule = || Separator::horizontal_dashed().flex_1().min_w_4();
+    h_flex()
+        .id(SharedString::from(format!("compaction-{ix}")))
+        .test_support()
+        .aria_label(label.clone())
+        .w_full()
+        .gap_2()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(rule())
+        .child(Icon::new(Lucide::FoldVertical).xsmall().flex_shrink_0())
+        .child(div().min_w_0().truncate().child(label))
+        .child(rule())
+        .into_any_element()
+}
+
+/// Builds the row for a user message, a reply, a wake or a compaction:
+/// entry `ix`, with what `shown` holds. Tool calls and thoughts are drawn by [`crate::work`].
 fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyElement {
     let Shown {
         text,
@@ -1131,6 +1182,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
             .child(Icon::new(Lucide::Bell).xsmall())
             .child("Rho continued on its own")
             .into_any_element(),
+        Entry::Compaction(compaction) => compaction_divider(ix, *compaction, cx),
         // The timeline puts these in work rows, never message rows, and
         // the transcript draws notices and surfaces itself.
         Entry::Thought(_) | Entry::Tool(_) | Entry::Notice(_) | Entry::Surface(_) => {

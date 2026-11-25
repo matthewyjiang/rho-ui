@@ -403,6 +403,7 @@ fn kinds(session: &Session, from: usize) -> Vec<&'static str> {
             Entry::Thought(_) => "thought",
             Entry::Tool(_) => "tool",
             Entry::Notice(_) => "notice",
+            Entry::Compaction(_) => "compaction",
             Entry::Surface(_) => "surface",
             Entry::Wake => "wake",
         })

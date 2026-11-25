@@ -1,5 +1,5 @@
-//! A transcript's rows and turns. A user message, a reply, a notice or a
-//! surface is a row of its own; each run of tool calls and thoughts between
+//! A transcript's rows and turns. A user message, a reply, a notice, a
+//! compaction or a surface is a row of its own; each run of tool calls and thoughts between
 //! them is one work row, which a UI draws as a single line that expands. A
 //! surface's row comes right after the work row its `ui` call ends, and
 //! lies within its turn's working: a UI that folds the working keeps the
@@ -29,6 +29,7 @@ impl Entry {
             Entry::User(_)
             | Entry::Agent(_)
             | Entry::Notice(_)
+            | Entry::Compaction(_)
             | Entry::Surface(_)
             | Entry::Wake => None,
         }
@@ -38,7 +39,8 @@ impl Entry {
 /// One transcript row: entry indices into the session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
-    /// A user message, a reply, a notice, a surface, or a turn's wake.
+    /// A user message, a reply, a notice, a compaction, a surface, or a
+    /// turn's wake.
     Message(usize),
     /// Consecutive tool calls and thoughts.
     Work(Range<usize>),

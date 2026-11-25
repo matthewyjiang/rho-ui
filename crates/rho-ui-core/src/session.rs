@@ -26,7 +26,7 @@ use std::{
 use web_time::Instant;
 
 use rho_protocol::{
-    AnswerStop, CardTone, CompactionStatus, JobState, Replay, Resolution, Seq,
+    AnswerStop, CardTone, CompactionStatus, CompactionTrigger, JobState, Replay, Resolution, Seq,
     SessionAttachResponse, SessionEvent, SessionOptions as WireOptions, SessionPullRequests,
     StreamId, ToolCallUpdate, TurnOutcome,
 };
@@ -405,6 +405,41 @@ impl Notice {
     }
 }
 
+/// A compaction that finished: the model's context before and after it.
+/// One that removed nothing has the same size on both sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Compaction {
+    /// The context it compacted.
+    pub before: ContextSize,
+    /// The context it left.
+    pub after: ContextSize,
+}
+
+impl Compaction {
+    fn from_wire(counts: &rho_protocol::CompactionCounts) -> Self {
+        Self {
+            before: ContextSize {
+                messages: counts.previous_messages,
+                tokens: counts.previous_tokens,
+            },
+            after: ContextSize {
+                messages: counts.current_messages,
+                tokens: counts.current_tokens,
+            },
+        }
+    }
+}
+
+/// The size of the model's context, as rho counts it: messages, and the
+/// tokens it estimates locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextSize {
+    /// Messages in the context.
+    pub messages: u64,
+    /// Tokens, as rho estimates them.
+    pub tokens: u64,
+}
+
 /// One row of the transcript.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
@@ -418,6 +453,9 @@ pub enum Entry {
     Tool(ToolCall),
     /// A notice from the agent.
     Notice(Notice),
+    /// The model's context was compacted: what came before it reaches the
+    /// model only as a summary.
+    Compaction(Compaction),
     /// A surface a `ui` tool call showed, placed after the call. Its
     /// messages wait in [`Session::take_placed_surfaces`]. It draws only
     /// while the [`SurfaceStore`](crate::surface::SurfaceStore) says the
@@ -585,6 +623,9 @@ struct LiveTurn {
     attempt: Option<usize>,
     /// What holds up the turn's answer, if anything does.
     delay: Option<Delay>,
+    /// The turn is a `/compact` command's, whose reply only says again
+    /// what its compaction did, which [`Entry::Compaction`] shows.
+    compacts: bool,
 }
 
 /// How far the session's attachment has come.
@@ -1116,6 +1157,7 @@ impl Session {
                     steer: is_steer,
                 }))
             }
+            SessionEvent::AgentMessageChunk { .. } if self.turn.compacts => None,
             SessionEvent::AgentMessageChunk { message, text } => {
                 Some(self.append_message(message.as_str(), &text, Entry::Agent))
             }
@@ -1178,11 +1220,11 @@ impl Session {
                 self.set_background(work);
                 None
             }
+            SessionEvent::Compaction { status, .. } => self.track_compaction(&status),
             event @ (SessionEvent::ProviderRequest
             | SessionEvent::ResponseDiscarded
-            | SessionEvent::ProviderRetry { .. }
-            | SessionEvent::Compaction { .. }) => {
-                self.track_provider(event);
+            | SessionEvent::ProviderRetry { .. }) => {
+                self.track_provider(&event);
                 None
             }
             // Cache warming, and what a newer daemon adds, is not shown.
@@ -1209,10 +1251,10 @@ impl Session {
     }
 
     /// Follows the turn's requests to the provider: where each response
-    /// begins, a response the provider discarded, and what holds the turn
-    /// up, a retry or a compaction.
-    fn track_provider(&mut self, event: SessionEvent) {
-        match event {
+    /// begins, a response the provider discarded, and a retry that holds
+    /// the turn up.
+    fn track_provider(&mut self, event: &SessionEvent) {
+        match *event {
             SessionEvent::ProviderRequest => self.turn.attempt = Some(self.entries.len()),
             SessionEvent::ResponseDiscarded => self.discard_attempt(),
             // A wait read from history has passed already.
@@ -1225,13 +1267,27 @@ impl Session {
                     until: retry_after_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
                 });
             }
-            SessionEvent::Compaction { status, .. } => {
-                self.turn.delay = match status {
-                    CompactionStatus::Started { .. } => Some(Delay::Compacting),
-                    _ => None,
-                };
-            }
             _ => {}
+        }
+    }
+
+    /// Follows a compaction: it holds the turn up from its start to its
+    /// end, and one that finished is an entry, whose index this returns. A
+    /// `/compact` turn's reply only says again what it did, so is left out.
+    fn track_compaction(&mut self, status: &CompactionStatus) -> Option<usize> {
+        self.turn.delay = None;
+        match status {
+            CompactionStatus::Started { trigger } => {
+                self.turn.delay = Some(Delay::Compacting);
+                self.turn.compacts |= *trigger == Some(CompactionTrigger::Command);
+                None
+            }
+            CompactionStatus::Completed { counts } => {
+                self.entries
+                    .push(Entry::Compaction(Compaction::from_wire(counts)));
+                Some(self.entries.len() - 1)
+            }
+            _ => None,
         }
     }
 
@@ -1249,7 +1305,11 @@ impl Session {
         let streamed = |entry: &Entry| match entry {
             Entry::Agent(_) | Entry::Thought(_) => true,
             Entry::Tool(tool) => tool.status == ToolStatus::Pending,
-            Entry::User(_) | Entry::Notice(_) | Entry::Surface(_) | Entry::Wake => false,
+            Entry::User(_)
+            | Entry::Notice(_)
+            | Entry::Compaction(_)
+            | Entry::Surface(_)
+            | Entry::Wake => false,
         };
         let Some(first) = self.entries[start..].iter().position(streamed) else {
             return;
@@ -1576,7 +1636,11 @@ fn opening(event: &SessionEvent) -> Option<Opening> {
         SessionEvent::UserMessage { steer: Some(_), .. }
         | SessionEvent::AgentMessageChunk { .. }
         | SessionEvent::ThoughtChunk { .. }
-        | SessionEvent::ToolCall(_) => Some(Opening::Wake),
+        | SessionEvent::ToolCall(_)
+        | SessionEvent::Compaction {
+            status: CompactionStatus::Completed { .. },
+            ..
+        } => Some(Opening::Wake),
         _ => None,
     }
 }
