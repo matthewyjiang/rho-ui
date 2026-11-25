@@ -5,8 +5,8 @@ use std::time::Duration;
 use gpui_kit::test::TestWindowExt as _;
 use rho_ui_core::{BackgroundStatus, DaemonTarget, Entry, RunState, Session, ToolStatus};
 
-use super::{is_visible, labels, Harness};
-use crate::{projects::Projects, shelf::Shelves};
+use super::{is_visible, labels, Harness, Machines};
+use crate::{projects::Projects, shelf::Shelves, store::StateDb};
 
 /// The app against a real rho daemon and model, not a pass/fail unit test:
 /// it proves the wire works end to end, and saves screenshots. It starts
@@ -322,5 +322,89 @@ fn labels_of(ui: &mut Harness, part: &str) -> Vec<String> {
         .expect("window is open")
         .into_iter()
         .filter(|label| label.contains(part))
+        .collect()
+}
+
+/// A lead against a real rho daemon and model, not a pass/fail unit test:
+/// a lead started from the sidebar makes its folder, starts a worker
+/// session in the git repository `RHO_UI_LIVE_REPO` names and ends its
+/// turn while the worker sleeps; when the worker's turn ends, the daemon's
+/// own turn tells the lead, with no prompt from here. It prints the
+/// entries of both turns, what the lead replied and the fold line the
+/// sidebar shows, for a person to check. Runs as [`live_daemon`] does,
+/// through `RHO_UI_LIVE_RHO`, a rho with the `lead` agent, in a rho home
+/// set to `bypass`; it takes a few minutes.
+#[test]
+#[ignore = "needs a real rho daemon and a signed-in model; see docs/testing.md"]
+fn live_lead() {
+    /// A lead's turn and its worker's, with room for a slow provider: the
+    /// whole test took two minutes when written, the worker's sleep
+    /// included.
+    const LEAD_TURN: Duration = Duration::from_mins(6);
+
+    let rho = std::env::var("RHO_UI_LIVE_RHO").expect("RHO_UI_LIVE_RHO names a rho 3 program");
+    let repo = std::env::var("RHO_UI_LIVE_REPO").expect("RHO_UI_LIVE_REPO names a git repository");
+    let target = DaemonTarget::rho(rho).expect("RHO_HOME or HOME names the rho home");
+    let machines = Machines {
+        rho_home: rho_ui_core::platform::rho_home(),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_on("live-lead", target, None, machines, StateDb::in_memory());
+    ui.wait_within(LEAD_TURN, "the daemon", |window, _, _| {
+        is_visible(window, "new-lead")
+    });
+    ui.click("new-lead");
+    ui.wait_within(LEAD_TURN, "the lead's draft", |_, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).session_key().is_some())
+    });
+    ui.send(&format!(
+        "Goal: in the git repository at {repo}, add a file HELLO.md whose only line is `hello \
+         from a worker`, committed on a new branch. The repository has no remote: push nothing \
+         and open no pull request. Use exactly one worker session and ask me nothing. Tell the \
+         worker to run `sleep 90` before anything else, so that your turn ends while it works. \
+         Once the worker has committed, reply with the name of its branch and stop."
+    ));
+    ui.wait_within(LEAD_TURN, "the lead's first turn to end", |_, cx, app| {
+        app.active_session().is_some_and(|view| {
+            let session = view.read(cx).session();
+            idle(session) && matches!(session.entries().last(), Some(Entry::Agent(_)))
+        })
+    });
+    let first = ui.session();
+    let (sent, said) = (prompts(&first), first.entries().len());
+    eprintln!("the lead's turn: {:?}", kinds(&first, 0));
+    ui.shot("started");
+    ui.wait_within(LEAD_TURN, "the daemon's own turn to end", |_, cx, app| {
+        app.active_session().is_some_and(|view| {
+            let session = view.read(cx).session();
+            let entries = session.entries();
+            entries.len() > said && idle(session) && matches!(entries.last(), Some(Entry::Agent(_)))
+        })
+    });
+    let session = ui.session();
+    eprintln!("the daemon's turn: {:?}", kinds(&session, said));
+    assert_eq!(prompts(&session), sent, "no prompt from here started it");
+    let Some(Entry::Agent(reply)) = session.entries().last() else {
+        panic!("the daemon's turn ends in a reply: {:?}", session.entries());
+    };
+    eprintln!("the lead replied: {}", reply.text());
+    eprintln!("the sidebar: {:?}", labels_of(&mut ui, " session"));
+    ui.shot("told");
+}
+
+/// What each of `session`'s entries from `from` on is, to print.
+fn kinds(session: &Session, from: usize) -> Vec<&'static str> {
+    session.entries()[from..]
+        .iter()
+        .map(|entry| match entry {
+            Entry::User(_) => "user",
+            Entry::Agent(_) => "agent",
+            Entry::Thought(_) => "thought",
+            Entry::Tool(_) => "tool",
+            Entry::Notice(_) => "notice",
+            Entry::Surface(_) => "surface",
+            Entry::Wake => "wake",
+        })
         .collect()
 }

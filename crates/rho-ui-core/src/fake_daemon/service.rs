@@ -559,6 +559,9 @@ impl Service for Fake {
             .map_or(&params.cwd, |worktree| &worktree.path);
         let mut session = FakeSession::new(&cwd.to_string_lossy(), None, 0);
         session.saved = false;
+        if let Some(agent) = params.agent {
+            session.agent = agent;
+        }
         let options = session.settings.options();
         state.sessions.insert(id.clone(), session);
         Ok(SessionNewResponse {

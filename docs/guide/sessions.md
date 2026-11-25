@@ -24,6 +24,15 @@ The project and machine filter applies to each session on its own. A starter out
 
 A session whose starter isn't listed, because it was deleted or is a fork, shows on its own. A machine whose rho is older than rho-ui lists the sessions it started unfolded, since its daemon doesn't say which session started which.
 
+## Leads
+
+A lead is a session that runs as rho's `lead` agent: it takes a goal to merged pull requests by starting one session per pull request, answering their questions when its brief settles them, and watching the pull requests. It writes no code itself, and it asks you before it merges unless its brief says it may. It needs a rho that has the `lead` agent.
+
+- **A folder of its own.** A lead works in `~/.rho/leads/<name>/` on its machine (under `$RHO_HOME` if you set one), named from its first message, with `-2`, `-3`… when that name is taken.
+- **The brief is yours too.** The lead keeps what it knows between turns in `brief.md` in that folder: the goal, where it may work, what it may decide without you, its pull requests and its decisions. Edit it at any time; the lead reads it at the start of every turn.
+- **In no project.** A lead's folder belongs to no project, so the project filter doesn't hide it; the machine filter and search still do.
+- **Its sessions fold under it**, as any session's do (see above).
+
 ## Projects
 
 Every folder in a machine's clone folder (`$RHO_HOME/projects` unless you set one in **Settings → Machines**) is a project, found again each time you start a new session. Since the folder puts it on the list, removing it from the list does nothing: move or delete the folder instead. Hidden folders are skipped.

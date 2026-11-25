@@ -32,11 +32,12 @@ use rho_ui_core::{
         TuiJob, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
         SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
-    Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices, Daemon,
-    DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
+    platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
+    Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
     PullRequestId, PullRequestLinkOrigin, PullRequestRead, PullRequestRollup, PullRequestState,
     PullRequestSummary, PullRequestTrouble, ReasoningLevel, RestartCost, RetryReason, RhoInstall,
     RunState, Session, SessionId, SessionOptions, SessionPullRequests, ToolStatus, WorktreeVerdict,
+    LEAD_AGENT,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -44,6 +45,7 @@ use gpui_kit::component::ActiveTheme as _;
 use crate::{
     app::{LaunchConfig, RhoApp},
     forge::{avatar::test::serve_pictures, Check, ForgeCli},
+    leads::Kind,
     machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
     pull_requests::{Serving, Shown, Which},
@@ -283,6 +285,7 @@ impl Harness {
             remote_sockets,
             workspace,
             rho,
+            rho_home,
         } = machines;
         let rho = rho.map(|rho| RhoInstall::Here { rho });
         // Never the user's gh, which would ask GitHub about their account.
@@ -331,6 +334,8 @@ impl Harness {
             }),
             // Not the user's shell, whose files may print or ask things.
             shell: TerminalShell(TEST_SHELL.clone()),
+            // Never the user's rho home, where leads would make folders.
+            rho_home: Some(rho_home.unwrap_or_else(|| PathBuf::from("/nonexistent/rho"))),
         };
         let sidebar = SidebarState {
             shelves,
@@ -767,6 +772,9 @@ struct Machines {
     /// update; with `None`, rho-ui leaves rho alone, as for any daemon
     /// reached at a socket.
     rho: Option<PathBuf>,
+    /// This machine's rho home, where leads keep their folders; one that
+    /// isn't there, so none can be made, when `None`.
+    rho_home: Option<PathBuf>,
 }
 
 /// How [`Harness::send_from_elsewhere`] sends its message.
@@ -1643,7 +1651,7 @@ fn sessions_a_session_started_fold_under_it() {
     ui.act(|window, cx| {
         app.update(cx, |app, cx| {
             let w2 = SessionKey::local("w2");
-            app.open_session(w2, PathBuf::from("/w/a"), None, window, cx);
+            app.open_session(w2, PathBuf::from("/w/a"), None, Kind::Session, window, cx);
         });
     });
     ui.wait_until(
@@ -1653,6 +1661,54 @@ fn sessions_a_session_started_fold_under_it() {
             is_visible(window, "session-local-w2") && on_screen == Some(SessionKey::local("w2"))
         },
     );
+}
+
+/// A lead starts as rho's lead agent in a folder of its own, named from its
+/// first message, made in the rho home's leads, and lists under the Leads
+/// header. A new session from it starts in a project, not in its folder.
+#[test]
+fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
+    let rho_home = tempfile::tempdir().expect("a rho home");
+    let daemon = FakeDaemon::start(Script::default());
+    let machines = Machines {
+        rho_home: Some(rho_home.path().to_path_buf()),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_with("leads", daemon.target(), Some(daemon), machines);
+    ui.wait_until("the sidebar", |window, _, _| is_visible(window, "new-lead"));
+
+    ui.click("new-lead");
+    ui.wait_until("the lead's draft", |_, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).session_key().is_some())
+    });
+    ui.send("Fix the parser!");
+    ui.wait_for_session("the lead", |session| session.id().as_str() == "new-2");
+    let leads = platform::canonicalize(&rho_home.path().join("leads")).expect("the leads root");
+    let folder = leads.join("fix-the-parser");
+    assert_eq!(
+        (ui.fake().agent("new-2"), ui.fake().cwd("new-2")),
+        (Some(LEAD_AGENT.to_owned()), Some(folder.clone()))
+    );
+    assert!(folder.is_dir(), "the lead's folder is made");
+    ui.wait_until("the lead under the header", |window, _, _| {
+        is_visible(window, "leads-header") && is_visible(window, "session-local-new-2")
+    });
+    ui.shot("listed");
+
+    ui.click("new-session");
+    ui.wait_until("a session's draft", |_, _, app| app.draft().is_some());
+    let app = ui.app.clone();
+    ui.act(|_, cx| {
+        let draft = app.read(cx).draft().expect("the draft");
+        let draft = draft.read(cx);
+        assert_eq!(draft.kind(), Kind::Session);
+        assert!(
+            !draft.cwd().path.starts_with(&leads),
+            "a session's draft works outside the leads: {:?}",
+            draft.cwd().path
+        );
+    });
 }
 
 /// Sessions quiet for long start settled. A draft makes no session until

@@ -236,6 +236,7 @@ pub(crate) struct Lookup {
 /// [`crate::local`]); on a remote machine, which is Unix, with a POSIX `sh`
 /// script over its ssh link, whose output it parses. Both give the feature
 /// the same value.
+#[derive(Clone)]
 pub(crate) enum Reader {
     /// From this machine's files.
     Here,
@@ -425,6 +426,15 @@ pub(crate) fn find(output: &[u8], marker: &[u8]) -> Option<usize> {
 pub(crate) fn after<'a>(output: &'a [u8], marker: &[u8]) -> Option<&'a [u8]> {
     let at = find(output, marker)?;
     output.get(at + marker.len()..)
+}
+
+/// The path a script printed last, as a field ended by a NUL, after
+/// whatever a login file printed.
+pub(crate) fn last_path(output: &[u8]) -> Option<PathBuf> {
+    output
+        .split(|&byte| byte == 0)
+        .rfind(|field| !field.is_empty())
+        .map(platform::path_from_bytes)
 }
 
 /// Looks `typed` up with `reader`, doing file I/O on `executor`.

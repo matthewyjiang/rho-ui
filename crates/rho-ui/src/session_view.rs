@@ -89,6 +89,7 @@ use crate::{
     background_log::{BackgroundLog, Recorded},
     composer::{Composer, ComposerMode, ComposerState},
     input_card::{InputCard, InputCardEvent, Queue},
+    leads::Kind,
     machines::{Place, SessionKey},
     pictures::{PictureRead, Pictures},
     plan::PlanList,
@@ -111,7 +112,7 @@ const TICK: Duration = Duration::from_secs(1);
 
 /// What the app needs to hear from a session.
 pub(crate) enum SessionEvent {
-    /// Title or activity changed; see [`SessionView::live`].
+    /// What the sidebar shows of it changed; see [`SessionView::live`].
     LiveChanged,
     /// The saved session changed (a prompt was accepted or a turn ended);
     /// reload the session list.
@@ -272,10 +273,10 @@ pub(crate) struct SessionView {
     turn_began: Option<Instant>,
     /// When the oldest open request arrived.
     waiting_since: Option<Instant>,
-    /// Title and activity as last reported in [`SessionEvent::LiveChanged`];
+    /// What the sidebar was last told in [`SessionEvent::LiveChanged`];
     /// `None` once the view follows the session again, so the app hears of
     /// it when it has caught up, whatever changed.
-    reported: Option<(String, Activity)>,
+    reported: Option<LiveSession>,
     /// A request failed outside a turn, such as a settings change.
     error: Option<String>,
     /// The surfaces the session's `ui` calls showed.
@@ -418,7 +419,7 @@ impl SessionView {
         };
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
-        view.reported = Some((view.title(), view.activity()));
+        view.reported = Some(view.live());
         view
     }
 
@@ -618,6 +619,18 @@ impl SessionView {
             title: self.name().map(SharedString::from),
             placeholder: self.placeholder(),
             activity: self.activity(),
+            kind: self.session.agent().map(Kind::of),
+        }
+    }
+
+    /// A lead's, if it is a lead or a view above it is: a lead's subagent
+    /// or side chat works in the lead's folder, which is in no project. A
+    /// session whose agent isn't known yet counts as a plain one.
+    pub(crate) fn kind(&self, cx: &App) -> Kind {
+        let own = self.session.agent().map_or(Kind::Session, Kind::of);
+        match self.parent() {
+            Some(parent) if own == Kind::Session => parent.read(cx).kind(cx),
+            _ => own,
         }
     }
 
@@ -979,10 +992,10 @@ impl SessionView {
         self.discard_when_idle(cx);
     }
 
-    /// Tells the app when the title or activity the sidebar shows changed,
-    /// and once a view that follows the session again has caught up.
+    /// Tells the app when what the sidebar shows of it changed, and once a
+    /// view that follows the session again has caught up.
     fn report_live(&mut self, cx: &mut Context<'_, Self>) {
-        let live = Some((self.title(), self.activity()));
+        let live = Some(self.live());
         if self.reported != live {
             self.reported = live;
             cx.emit(SessionEvent::LiveChanged);
@@ -1959,14 +1972,17 @@ impl SessionView {
             next = view.read(cx).parent();
             above.push(view);
         }
-        let mut bar = TitleBar::new(self.workspace.read(cx), self.title());
+        let mut bar = TitleBar::new(Some(self.workspace.read(cx)), self.title());
         let this = cx.entity().downgrade();
-        bar = bar.on_project({
-            let this = this.clone();
-            move |_, cx| {
-                let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::NewSession));
-            }
-        });
+        // A lead's folder is no project to start a session in.
+        if self.kind(cx) == Kind::Session {
+            bar = bar.on_project({
+                let this = this.clone();
+                move |_, cx| {
+                    let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::NewSession));
+                }
+            });
+        }
         for view in above.into_iter().rev() {
             let (this, target) = (this.clone(), view.downgrade());
             bar = bar.parent(view.read(cx).title(), move |_, cx| {

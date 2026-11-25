@@ -545,6 +545,7 @@ fn the_session_list_names_the_session_that_started_each() {
                 ("old", None)
             ]
         );
+        assert_eq!(sessions[0].agent(), Some("default"));
 
         // The job list names it too, for a session that saved nothing yet.
         let jobs = daemon.jobs().await.unwrap().active;
