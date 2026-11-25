@@ -132,7 +132,9 @@ impl Link {
         match self {
             #[cfg(not(target_family = "wasm"))]
             Self::Ssh(ssh) => ssh.script(input, deadline).await,
-            Self::Server(server) => server.script(input, deadline).await,
+            // Boxed: this future is some 14 kB, which every script's caller
+            // would otherwise carry in its own.
+            Self::Server(server) => Box::pin(server.script(input, deadline)).await,
         }
     }
 }
