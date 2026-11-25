@@ -193,6 +193,7 @@ gpui_kit::assets::icon_assets!(
         Unlink,
         KeyRound,
         TextQuote,
+        FoldVertical,
         // The A2UI basic catalog's icons, for surfaces (`surface_view.rs`).
         BellOff,
         CalendarDays,

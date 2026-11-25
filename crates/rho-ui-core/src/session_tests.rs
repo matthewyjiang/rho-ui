@@ -78,6 +78,7 @@ fn texts(session: &Session) -> Vec<(&'static str, String)> {
             Entry::Thought(m) => ("thought", m.text().to_owned()),
             Entry::Tool(t) => ("tool", t.title().to_owned()),
             Entry::Notice(n) => ("notice", n.title().to_owned()),
+            Entry::Compaction(_) => ("compaction", String::new()),
             Entry::Surface(shown) => ("surface", shown.surface().to_owned()),
             Entry::Wake => ("wake", String::new()),
         })

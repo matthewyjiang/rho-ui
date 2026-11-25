@@ -29,15 +29,16 @@ use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
         report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script, Started,
-        TuiJob, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
+        TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
         SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
-    Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef, PermissionMode, PromptKey,
-    PullRequestId, PullRequestLinkOrigin, PullRequestRead, PullRequestRollup, PullRequestState,
-    PullRequestSummary, PullRequestTrouble, ReasoningLevel, RestartCost, RetryReason, RhoInstall,
-    RunState, Session, SessionId, SessionOptions, SessionPullRequests, StartedMode,
-    StartedSessionDefaults, ToolStatus, WorktreeVerdict, LEAD_AGENT,
+    Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef,
+    PermissionMode, PromptKey, PullRequestId, PullRequestLinkOrigin, PullRequestRead,
+    PullRequestRollup, PullRequestState, PullRequestSummary, PullRequestTrouble, ReasoningLevel,
+    RestartCost, RetryReason, RhoInstall, RunState, Session, SessionId, SessionOptions,
+    SessionPullRequests, StartedMode, StartedSessionDefaults, ToolStatus, WorktreeVerdict,
+    LEAD_AGENT,
 };
 
 use gpui_kit::component::ActiveTheme as _;
@@ -6812,6 +6813,49 @@ fn the_composer_completes_commands_and_skills() {
     ui.wait_for_session("the next Escape to stop the turn", |session| {
         session.state() != &RunState::NeedsAction
     });
+}
+
+/// A compaction leaves a divider in the transcript saying how far the
+/// context shrank. A `/compact` turn's reply, which says the same again,
+/// stays out.
+#[test]
+fn a_compaction_shows_as_a_divider() {
+    let mut ui = Harness::start("compaction", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("/compact");
+    ui.wait_for_session("the turn's end", |session| {
+        session.state() == &RunState::Idle
+            && session
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Entry::Compaction(_)))
+    });
+    let entries = ui.session().entries().to_vec();
+    let expected = Compaction {
+        before: ContextSize {
+            messages: COMPACTED.previous_messages,
+            tokens: COMPACTED.previous_tokens,
+        },
+        after: ContextSize {
+            messages: COMPACTED.current_messages,
+            tokens: COMPACTED.current_tokens,
+        },
+    };
+    assert!(
+        matches!(
+            entries.as_slice(),
+            [Entry::User(_), Entry::Compaction(shown)] if *shown == expected
+        ),
+        "the prompt and its compaction: {entries:?}"
+    );
+    ui.wait_until("the divider", |window, _, _| {
+        is_visible(window, "compaction-1")
+    });
+    ui.shot("divider");
 }
 
 /// Two machines list their sessions side by side, though their daemons

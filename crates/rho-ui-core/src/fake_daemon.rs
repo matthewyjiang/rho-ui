@@ -53,6 +53,8 @@
 //! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
 //!   in a session. Its two agent nodes are in the job list only: one
 //!   queued second in line, one failed with the error [`WORKFLOW_ERROR`].
+//! - The prompt "/compact" compacts the context from [`COMPACTED`]'s
+//!   before to its after, and answers saying so, as rho does.
 //! - The prompt "flaky" sets a plan of three steps, one done, one under
 //!   way and one to do, then streams half an answer that the provider
 //!   discards, and waits 30 s to retry, rate limited. The turn runs on
@@ -175,11 +177,12 @@ use rho_protocol::{
         TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
-    CommandKind, ContentBlock, Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle,
-    DetachReason, ErrorCode, InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus,
-    ProtocolVersion, Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
-    SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
-    TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
+    CommandKind, CompactionCounts, CompactionId, CompactionStatus, CompactionTrigger, ContentBlock,
+    Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle, DetachReason, ErrorCode,
+    InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus, ProtocolVersion, Published,
+    Publisher, Question, RestartCost, RetryReason, RpcError, Selection, SessionAttachResponse,
+    SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome, VersionMismatch,
+    WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -1414,6 +1417,30 @@ impl FakeSession {
         });
     }
 
+    /// Runs the turn of the prompt "/compact" as rho does: the compaction,
+    /// then a reply that says again what it did.
+    fn compact(&mut self, turn: Turn, echo: SessionEvent) {
+        let id = turn.id.clone();
+        let compaction = CompactionId::new(format!("c-{id}"));
+        self.turn = Some(turn);
+        self.state(JobState::Running);
+        self.publish(echo);
+        self.publish(SessionEvent::Compaction {
+            id: compaction.clone(),
+            status: CompactionStatus::Started {
+                trigger: Some(CompactionTrigger::Command),
+            },
+        });
+        self.publish(SessionEvent::Compaction {
+            id: compaction,
+            status: CompactionStatus::Completed { counts: COMPACTED },
+        });
+        self.answer(
+            &format!("m-{id}"),
+            "context compacted: 263 → 65 messages, 247276 → 54798 tokens",
+        );
+    }
+
     /// Starts the turn of the prompt "flaky": the provider discards what
     /// it streamed, and the turn waits to retry.
     fn flaky(&mut self, turn: Turn, echo: SessionEvent) {
@@ -1632,6 +1659,15 @@ fn user_message(id: &str, text: &str) -> SessionEvent {
 /// How much of a streamed reply one event carries, in bytes: less than a
 /// line of [`report`]'s prose, so its lines arrive unfinished.
 const STREAM_CHUNK: usize = 53;
+
+/// The context before and after the prompt "/compact" compacts it.
+pub const COMPACTED: CompactionCounts = CompactionCounts {
+    previous_messages: 263,
+    current_messages: 65,
+    previous_tokens: 247_276,
+    current_tokens: 54_798,
+    cost_usd_micros: None,
+};
 
 /// The reply to the prompt "report", 6.4 KiB: sections of a heading, a
 /// paragraph, a list, a code block that holds a blank line, and a table.
