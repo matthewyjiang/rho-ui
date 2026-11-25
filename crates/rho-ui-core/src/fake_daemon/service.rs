@@ -25,10 +25,11 @@ use rho_protocol::{
     SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
     SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
     SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
-    SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionNewParams,
-    SessionNewResponse, SessionPromptParams, SessionPromptResponse, SessionPullRequestLinkParams,
-    SessionPullRequestLinkResponse, SessionPullRequestListParams, SessionPullRequestListResponse,
-    SessionPullRequestShowParams, SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
+    SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionMarkParams,
+    SessionMarkResponse, SessionNewParams, SessionNewResponse, SessionPromptParams,
+    SessionPromptResponse, SessionPullRequestLinkParams, SessionPullRequestLinkResponse,
+    SessionPullRequestListParams, SessionPullRequestListResponse, SessionPullRequestShowParams,
+    SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
     SessionPullRequestUnlinkResponse, SessionSteerParams, SessionSteerResponse,
     SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
     SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
@@ -990,12 +991,49 @@ impl Service for Fake {
                 summary(id, session),
                 Some(session.agent.clone()),
                 session.parent.as_deref().map(SessionId::new),
+                session.mark.clone(),
             )
         });
         Ok(SessionListDetailedResponse::new(
             sessions.collect(),
             page.next_cursor,
         ))
+    }
+
+    /// Stamps the mark with the time, as rho does, and refuses a kind it
+    /// does not know and a session that has saved nothing. A daemon from
+    /// before `list_detailed` has no marks.
+    async fn mark_session(
+        &self,
+        params: SessionMarkParams,
+    ) -> Result<SessionMarkResponse, RpcError> {
+        let mut state = self.lock();
+        if state.session_lists == SessionLists::Plain {
+            return Err(RpcError::new(
+                ErrorCode::MethodNotFound,
+                "this rho daemon does not serve rho/session/mark",
+            ));
+        }
+        let mark = match &params.mark {
+            None => None,
+            Some(new) => Some(
+                crate::SessionMark::stamp(new, super::unix_now()).ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::InvalidParams,
+                        "the fake daemon does not know that mark",
+                    )
+                })?,
+            ),
+        };
+        let session = state.session(&params.session)?;
+        if !session.saved {
+            return Err(RpcError::new(
+                ErrorCode::SessionNotFound,
+                format!("session {} has saved nothing yet", params.session),
+            ));
+        }
+        session.remark(mark.clone());
+        Ok(SessionMarkResponse::new(mark))
     }
 
     /// Refuses a blank title or one with a control character, as rho does.

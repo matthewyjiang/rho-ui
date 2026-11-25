@@ -20,12 +20,12 @@ use std::{
 use web_time::Instant;
 
 use gpui_kit::{EntityId, SharedString};
-use rho_ui_core::JobActivity;
+use rho_ui_core::{JobActivity, SessionMark};
 
 use crate::{
     leads::Kind,
     machines::{MachineId, Place, SessionKey},
-    shelf::{Shelf, Shelves},
+    shelf::{self, Shelf},
     unseen::Unseen,
 };
 
@@ -78,6 +78,8 @@ pub(crate) struct SavedSession {
     pub(crate) title: Option<SharedString>,
     /// Last activity in Unix seconds; 0 when unknown.
     pub(crate) updated: i64,
+    /// How the user marked it, as its daemon keeps it.
+    pub(crate) mark: Option<SessionMark>,
     /// Index into [`crate::workspaces::Workspaces`].
     pub(crate) workspace: usize,
     /// The session that started it, as the daemon's list says.
@@ -198,6 +200,9 @@ pub(crate) struct Row {
     /// Last activity in Unix seconds; 0 when unknown.
     pub(crate) updated: i64,
     pub(crate) activity: Activity,
+    /// How the user marked it: as its daemon listed or last said, or as
+    /// the user just did, until the daemon answers.
+    pub(crate) mark: Option<SessionMark>,
     pub(crate) shelf: Shelf,
     /// The daemon lists it as saved. Unsaved rows are sessions made in this run,
     /// and sessions the daemon runs that it doesn't list as saved.
@@ -402,6 +407,7 @@ impl SessionList {
                 cwd: session.cwd,
                 workspace: session.workspace,
                 updated: session.updated,
+                mark: session.mark,
                 shelf: Shelf::Active,
                 saved: true,
                 pinned: None,
@@ -447,6 +453,7 @@ impl SessionList {
                     workspace,
                     updated: now,
                     activity: live.activity,
+                    mark: None,
                     shelf: Shelf::Active,
                     saved: false,
                     pinned: None,
@@ -528,6 +535,7 @@ impl SessionList {
                     workspace: job.workspace,
                     updated: now_unix,
                     activity: Activity::Idle,
+                    mark: None,
                     shelf: Shelf::Active,
                     saved: false,
                     pinned: None,
@@ -610,6 +618,19 @@ impl SessionList {
         }
         if let Some(row) = self.rows.iter_mut().find(|row| row.id == *id) {
             row.title = Some(title);
+        }
+    }
+
+    /// Gives session `id` `mark`, as the user just did, until the daemon's
+    /// list says what it saved. Returns whether its row changed; the list
+    /// needs a rebuild after it.
+    pub(crate) fn set_mark(&mut self, id: &SessionKey, mark: SessionMark) -> bool {
+        match self.rows.iter_mut().find(|row| row.id == *id) {
+            Some(row) if row.mark != Some(mark) => {
+                row.mark = Some(mark);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -706,14 +727,13 @@ impl SessionList {
     /// starter's match; a starter shows for those of its sessions that do.
     pub(crate) fn rebuild<'a>(
         &mut self,
-        shelves: &Shelves,
         now: i64,
         watching: &HashSet<SessionKey>,
         workspace: impl Fn(usize) -> (&'a str, &'a Path),
     ) {
         let families = Families::of(&self.rows);
         self.keep_folds(&families);
-        self.shelve(&families, shelves, now, watching);
+        self.shelve(&families, now, watching);
         let sift = |machine: &MachineId, kind: Kind, title: Option<&str>, at: Option<usize>| {
             let (name, root) = at.map_or(("", Path::new("")), &workspace);
             let matches = |text: &str| contains_ignore_case(text, &self.query);
@@ -838,13 +858,7 @@ impl SessionList {
     /// on its starter's shelf, under its starter's pin: active while any of
     /// it is busy, else placed by its starter's mark and its newest
     /// activity ([`FamilyMarks`]).
-    fn shelve(
-        &mut self,
-        families: &Families,
-        shelves: &Shelves,
-        now: i64,
-        watching: &HashSet<SessionKey>,
-    ) {
+    fn shelve(&mut self, families: &Families, now: i64, watching: &HashSet<SessionKey>) {
         for row in &mut self.rows {
             row.done = self.unseen.contains(&row.id);
             row.watching = watching.contains(&row.id);
@@ -856,11 +870,11 @@ impl SessionList {
             let marks = families.marks(&self.rows, top);
             let row = &mut self.rows[top];
             row.family = Family::Top(marks);
-            row.pinned = shelves.pinned(&row.id);
+            row.pinned = shelf::pinned(row.mark);
             row.shelf = if marks.busy {
                 Shelf::Active
             } else {
-                shelves.shelf(&row.id, marks.updated, now)
+                shelf::shelf(row.mark, marks.updated, now)
             };
             let placed = row.shelf;
             for &ix in families.members(top) {
@@ -1072,6 +1086,7 @@ mod tests {
             cwd: PathBuf::from("/w"),
             title: title.map(SharedString::from),
             updated,
+            mark: None,
             workspace: 0,
             parent: None,
             kind: Kind::Session,
@@ -1128,14 +1143,18 @@ mod tests {
             .collect()
     }
 
-    pub(super) fn rebuild(list: &mut SessionList, shelves: &Shelves, now: i64) {
-        rebuild_watching(list, shelves, now, &[]);
+    pub(super) fn rebuild(list: &mut SessionList, now: i64) {
+        rebuild_watching(list, now, &[]);
     }
 
     /// [`rebuild`], with the agents of `watching` watching a pull request.
-    fn rebuild_watching(list: &mut SessionList, shelves: &Shelves, now: i64, watching: &[&str]) {
+    fn rebuild_watching(list: &mut SessionList, now: i64, watching: &[&str]) {
         let watching = watching.iter().map(|text| id(text)).collect();
-        list.rebuild(shelves, now, &watching, |_| ("atlas", Path::new("/w")));
+        list.rebuild(now, &watching, |_| ("atlas", Path::new("/w")));
+    }
+
+    pub(super) fn mark(list: &mut SessionList, text: &str, mark: SessionMark) {
+        assert!(list.set_mark(&id(text), mark), "{text} is listed");
     }
 
     pub(super) fn job(text: &str, activity: JobActivity, elapsed: Option<u64>) -> JobSession {
@@ -1158,9 +1177,8 @@ mod tests {
         let now = Instant::now();
         let mut list = SessionList::default();
         list.set_saved(&here(), vec![saved("old", Some("older"), 1)]);
-        let shelves = Shelves::default();
         let today = 1 + QUIET_AFTER + 1;
-        rebuild(&mut list, &shelves, today);
+        rebuild(&mut list, today);
         assert_eq!(shown(&list), ["~", "[Settled 1]"]);
 
         list.set_jobs(
@@ -1169,7 +1187,7 @@ mod tests {
             now,
             today,
         );
-        rebuild(&mut list, &shelves, today);
+        rebuild(&mut list, today);
         assert_eq!(shown(&list), ["older"]);
         let began = now
             .checked_sub(Duration::from_secs(90))
@@ -1205,7 +1223,7 @@ mod tests {
         );
 
         list.set_jobs(&here(), Vec::new(), later, today);
-        rebuild(&mut list, &shelves, today);
+        rebuild(&mut list, today);
         assert_eq!(shown(&list), ["older"], "the turn was activity");
     }
 
@@ -1222,7 +1240,7 @@ mod tests {
             now,
             3,
         );
-        rebuild(&mut list, &Shelves::default(), 3);
+        rebuild(&mut list, 3);
         assert_eq!(shown(&list), ["job fresh"]);
         assert_eq!(
             list.row(&id("fresh")).map(|row| row.activity),
@@ -1236,7 +1254,7 @@ mod tests {
         );
 
         list.clear_live(&here());
-        rebuild(&mut list, &Shelves::default(), 3);
+        rebuild(&mut list, 3);
         assert!(shown(&list).is_empty(), "gone with the connection");
     }
 
@@ -1248,7 +1266,7 @@ mod tests {
             vec![saved("old", None, 1), saved("new", Some("newer"), 2)],
         );
         list.set_live(live("fresh", None, Activity::Idle), 0, 3);
-        rebuild(&mut list, &Shelves::default(), 3);
+        rebuild(&mut list, 3);
         assert_eq!(shown(&list), ["New session", "newer", "Untitled"]);
 
         // The agent saves it with its title; the live title (none yet)
@@ -1257,36 +1275,35 @@ mod tests {
             &here(),
             vec![saved("fresh", Some("named"), 3), saved("old", None, 1)],
         );
-        rebuild(&mut list, &Shelves::default(), 3);
+        rebuild(&mut list, 3);
         assert_eq!(shown(&list), ["named", "Untitled"]);
 
         // A live title beats the saved one, and a restart drops the rows
         // the agent never saved.
         list.set_live(live("old", Some("live title"), Activity::Idle), 0, 4);
         list.set_live(live("new", None, Activity::Idle), 0, 4);
-        rebuild(&mut list, &Shelves::default(), 4);
+        rebuild(&mut list, 4);
         assert_eq!(shown(&list), ["New session", "named", "live title"]);
         list.clear_live(&here());
-        rebuild(&mut list, &Shelves::default(), 4);
+        rebuild(&mut list, 4);
         assert_eq!(shown(&list), ["named", "live title"]);
     }
 
     #[test]
     fn busy_sessions_stay_active_and_a_finished_turn_unsettles() {
-        let mut shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(&here(), vec![saved("a", Some("a"), 10)]);
-        shelves.settle(&id("a"), 20);
-        rebuild(&mut list, &shelves, 30);
+        mark(&mut list, "a", SessionMark::Done { at: 20 });
+        rebuild(&mut list, 30);
         assert_eq!(list.count(Shelf::Settled), 1);
 
         let started = Instant::now();
         list.set_live(live("a", None, Activity::Working(started)), 0, 40);
-        rebuild(&mut list, &shelves, 40);
+        rebuild(&mut list, 40);
         assert_eq!(list.count(Shelf::Active), 1, "busy shows as active");
 
         list.set_live(live("a", None, Activity::Idle), 0, 50);
-        rebuild(&mut list, &shelves, 50);
+        rebuild(&mut list, 50);
         assert_eq!(list.count(Shelf::Active), 1, "the turn is new activity");
     }
 
@@ -1294,7 +1311,6 @@ mod tests {
     /// whatever their age; the rest keep newest first.
     #[test]
     fn drafts_then_pinned_sessions_head_the_list() {
-        let mut shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -1304,13 +1320,13 @@ mod tests {
                 saved("old", Some("old"), 1),
             ],
         );
-        shelves.pin(&id("old"), 10);
-        shelves.pin(&id("b"), 20);
-        rebuild(&mut list, &shelves, 30);
+        mark(&mut list, "old", SessionMark::Pinned { at: 10 });
+        mark(&mut list, "b", SessionMark::Pinned { at: 20 });
+        rebuild(&mut list, 30);
         assert_eq!(shown(&list), ["b", "old", "a"]);
 
-        shelves.unpin(&id("b"), 30);
-        rebuild(&mut list, &shelves, 30);
+        mark(&mut list, "b", SessionMark::Kept { at: 30 });
+        rebuild(&mut list, 30);
         assert_eq!(shown(&list), ["old", "a", "b"]);
 
         let draft = DraftRow::new(
@@ -1322,7 +1338,7 @@ mod tests {
         );
         assert!(list.set_drafts(vec![draft.clone()]));
         assert!(!list.set_drafts(vec![draft]), "unchanged");
-        rebuild(&mut list, &shelves, 30);
+        rebuild(&mut list, 30);
         assert_eq!(shown(&list), ["draft half a thought", "old", "a", "b"]);
     }
 
@@ -1336,7 +1352,6 @@ mod tests {
     fn the_active_list_ranks_sessions_as_an_inbox() {
         let now = Instant::now();
         let names = ["working", "idle", "done", "background", "asking", "pinned"];
-        let mut shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -1346,7 +1361,7 @@ mod tests {
                 .map(|(name, updated)| saved(name, Some(name), updated))
                 .collect(),
         );
-        shelves.pin(&id("pinned"), 10);
+        mark(&mut list, "pinned", SessionMark::Pinned { at: 10 });
         for (name, activity) in [
             ("done", Activity::Working(now)),
             ("done", Activity::Idle),
@@ -1357,7 +1372,7 @@ mod tests {
         ] {
             list.set_live(live(name, None, activity), 0, 20);
         }
-        rebuild(&mut list, &shelves, 20);
+        rebuild(&mut list, 20);
         assert_eq!(
             shown(&list),
             ["pinned", "asking", "done", "idle", "working", "background"]
@@ -1365,21 +1380,21 @@ mod tests {
 
         // Its turn over, a session rises to the Done ones, newest first.
         list.set_live(live("working", None, Activity::Idle), 0, 21);
-        rebuild(&mut list, &shelves, 21);
+        rebuild(&mut list, 21);
         assert_eq!(
             shown(&list),
             ["pinned", "asking", "working", "done", "idle", "background"]
         );
 
         // Its agent watches a PR: it will wake by itself, so it isn't Done.
-        rebuild_watching(&mut list, &shelves, 21, &["working"]);
+        rebuild_watching(&mut list, 21, &["working"]);
         assert_eq!(
             shown(&list),
             ["pinned", "asking", "done", "idle", "working", "background"]
         );
         // Settled, nothing keeps its watch current: the row doesn't say.
-        shelves.settle(&id("working"), 21);
-        rebuild_watching(&mut list, &shelves, 21, &["working"]);
+        mark(&mut list, "working", SessionMark::Done { at: 21 });
+        rebuild_watching(&mut list, 21, &["working"]);
         assert!(!list.row(&id("working")).expect("the row").watching);
     }
 
@@ -1390,7 +1405,7 @@ mod tests {
     #[test]
     fn a_finished_turn_is_done_until_seen() {
         let done = |list: &mut SessionList| {
-            rebuild(list, &Shelves::default(), 0);
+            rebuild(list, 0);
             list.row(&id("a")).is_some_and(|row| row.done)
         };
         let db = StateDb::in_memory();
@@ -1456,7 +1471,6 @@ mod tests {
 
     #[test]
     fn shelves_follow_the_active_sessions_and_open_on_click_or_search() {
-        let mut shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -1466,16 +1480,16 @@ mod tests {
                 saved("old", Some("Old work"), 1),
             ],
         );
-        shelves.settle(&id("a"), 5);
-        shelves.snooze(&id("old"), 100);
-        rebuild(&mut list, &shelves, 5);
+        mark(&mut list, "a", SessionMark::Done { at: 5 });
+        mark(&mut list, "old", SessionMark::Snoozed { until: 100 });
+        rebuild(&mut list, 5);
         assert_eq!(
             shown(&list),
             ["Fix boot", "~", "[Snoozed 1]", "[Settled 1]"]
         );
 
         list.toggle(Shelf::Settled);
-        rebuild(&mut list, &shelves, 5);
+        rebuild(&mut list, 5);
         assert_eq!(
             shown(&list),
             [
@@ -1489,23 +1503,23 @@ mod tests {
 
         // A search opens every shelf and counts only matches.
         // Emptied, it folds.
-        shelves.restore(&id("a"), 5);
-        rebuild(&mut list, &shelves, 5);
-        shelves.settle(&id("a"), 5);
-        rebuild(&mut list, &shelves, 5);
+        mark(&mut list, "a", SessionMark::Kept { at: 5 });
+        rebuild(&mut list, 5);
+        mark(&mut list, "a", SessionMark::Done { at: 5 });
+        rebuild(&mut list, 5);
         assert_eq!(
             shown(&list),
             ["Fix boot", "~", "[Snoozed 1]", "[Settled 1]"]
         );
 
         list.set_query("work");
-        rebuild(&mut list, &shelves, 5);
+        rebuild(&mut list, 5);
         assert_eq!(shown(&list), ["[Snoozed 1]", "Old work"]);
         list.set_query("DESIGN");
-        rebuild(&mut list, &shelves, 5);
+        rebuild(&mut list, 5);
         assert_eq!(shown(&list), ["[Settled 1]", "Design the UI"]);
         list.set_query("design ui");
-        rebuild(&mut list, &shelves, 5);
+        rebuild(&mut list, 5);
         assert!(list.is_empty(), "words must appear together");
         // Case beyond ASCII, as every list's search matches.
         for (haystack, needle) in [("Café crème", "CRÈME"), ("ÉTÉ", "été")] {
@@ -1516,7 +1530,7 @@ mod tests {
         }
         assert!(!contains_ignore_case("Café", "cafés"), "past the end");
         list.set_query("atl");
-        rebuild(&mut list, &shelves, 5);
+        rebuild(&mut list, 5);
         assert_eq!(list.items.len(), 5, "the workspace name matches too");
 
         // The rail's busy count ignores the search.
@@ -1524,7 +1538,7 @@ mod tests {
         list.set_live(live("a", None, Activity::Working(now)), 0, 5);
         list.set_live(live("b", None, Activity::Waiting(now)), 0, 5);
         list.set_query("matches nothing");
-        rebuild(&mut list, &shelves, 5);
+        rebuild(&mut list, 5);
         assert!(list.is_empty());
         assert_eq!(
             list.busy(),
@@ -1546,11 +1560,11 @@ mod tests {
             cwd: PathBuf::from("/srv"),
             title: Some(SharedString::from(format!("there {text}"))),
             updated,
+            mark: None,
             workspace: 1,
             parent: None,
             kind: Kind::Session,
         };
-        let shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -1561,24 +1575,24 @@ mod tests {
             0 => ("atlas", Path::new("/w")),
             _ => ("srv", Path::new("/srv")),
         };
-        list.rebuild(&shelves, 4, &HashSet::new(), roots);
+        list.rebuild(4, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["here a", "there a", "here b"]);
 
         // A second answer from one machine replaces only its rows.
         list.set_saved(&there, vec![theirs("a", 5)]);
-        list.rebuild(&shelves, 6, &HashSet::new(), roots);
+        list.rebuild(6, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["there a", "here a", "here b"]);
 
         let mut filter = Filter::default();
         filter.toggle_machine(&there);
         list.set_filter(filter.clone());
-        list.rebuild(&shelves, 6, &HashSet::new(), roots);
+        list.rebuild(6, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["here a", "here b"]);
 
         filter.toggle_machine(&there);
         filter.toggle_project(&Place::new(there.clone(), "/srv"));
         list.set_filter(filter.clone());
-        list.rebuild(&shelves, 6, &HashSet::new(), roots);
+        list.rebuild(6, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["there a"]);
 
         // What the menu no longer offers stops filtering, so nothing stays

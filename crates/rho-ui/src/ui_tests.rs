@@ -28,20 +28,21 @@ use gpui_kit::{
 use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
-        report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script, Started,
-        TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
-        SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
+        report, subagent_result, write_program, FakeDaemon, PullRequestMethods, Script,
+        SessionLists, Started, TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY,
+        REFUSED_KEY, SUBAGENT_AGENT, SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY,
+        WORKFLOW_ERROR,
     },
     platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
     Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef,
-    PermissionMode, PromptKey, PullRequestId, PullRequestLinkOrigin, PullRequestRead,
-    PullRequestRollup, PullRequestState, PullRequestSummary, PullRequestTrouble, ReasoningLevel,
-    RestartCost, RetryReason, RhoInstall, RunState, Session, SessionId, SessionOptions,
-    SessionPullRequests, StartedMode, StartedSessionDefaults, ToolStatus, WorktreeVerdict,
-    LEAD_AGENT,
+    NewSessionMark, PermissionMode, PromptKey, PullRequestId, PullRequestLinkOrigin,
+    PullRequestRead, PullRequestRollup, PullRequestState, PullRequestSummary, PullRequestTrouble,
+    ReasoningLevel, RestartCost, RetryReason, RhoInstall, RunState, Session, SessionId,
+    SessionMark, SessionOptions, SessionPullRequests, StartedMode, StartedSessionDefaults,
+    ToolStatus, WorktreeVerdict, LEAD_AGENT,
 };
 
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 
 use crate::{
     app::{LaunchConfig, RhoApp},
@@ -53,10 +54,8 @@ use crate::{
     rho_install::Offer,
     right_panel::{PanelLayout, Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, SmoothScroll, UiScale},
-    shelf::Shelves,
     sidebar::{SavedFilter, SidebarLayout, SidebarState},
     store::{Key, StateDb},
-    time,
     title_bar::TOP_ROW_REMS,
     turn_times::TurnTimes,
     unseen::Unseen,
@@ -179,14 +178,13 @@ esac
     write_program(path, &script);
 }
 
-/// Shelves that keep `ids`, sessions on this machine, as of now, so they
-/// list as active however long ago the fake daemon dates them.
-fn kept<S: AsRef<str>>(ids: impl IntoIterator<Item = S>) -> Shelves {
-    let mut shelves = Shelves::default();
+/// Marks `daemon`'s sessions `ids` kept as of now, as a restore in another
+/// rho-ui would, so they list as active however long ago the fake daemon
+/// dates them.
+fn keep(daemon: &FakeDaemon, ids: &[&str]) {
     for id in ids {
-        shelves.restore(&SessionKey::local(id.as_ref()), time::now_unix());
+        daemon.set_mark(id, &NewSessionMark::Kept);
     }
-    shelves
 }
 
 /// One app window and its context.
@@ -206,38 +204,31 @@ impl Harness {
     /// Opens the app at 1200x800 against a fake daemon holding `script`.
     /// The fake's saved sessions are kept, so they list as active.
     fn start(name: &'static str, script: Script) -> Self {
-        Self::start_with(name, script, kept(["s1", "old"]))
+        Self::start_with(name, script, &["s1", "old"])
     }
 
     /// Closes the app and opens it again on the same daemon and state
-    /// database, as a restart does, with `shelves` as its settled and
-    /// snoozed state.
-    fn reopen(self, name: &'static str, shelves: Shelves) -> Self {
-        self.reopen_with(name, shelves, Projects::default())
+    /// database, as a restart does. The daemon keeps the sessions' marks.
+    fn reopen(self, name: &'static str) -> Self {
+        self.reopen_with(name, Projects::default())
     }
 
     /// [`Self::reopen`] with `projects` as the user's projects.
-    fn reopen_with(mut self, name: &'static str, shelves: Shelves, projects: Projects) -> Self {
+    fn reopen_with(mut self, name: &'static str, projects: Projects) -> Self {
         let (target, daemon, state) = (self.target.clone(), self.daemon.take(), self.state.clone());
         drop(self);
         let machines = Machines {
-            shelves,
             projects,
             ..Machines::default()
         };
         Self::open_on(name, target, daemon, machines, state)
     }
 
-    /// [`Self::start`] with the given settled and snoozed state.
-    fn start_with(name: &'static str, script: Script, shelves: Shelves) -> Self {
+    /// [`Self::start`] with only the sessions `kept` kept ([`keep`]).
+    fn start_with(name: &'static str, script: Script, kept: &[&str]) -> Self {
         let daemon = FakeDaemon::start(script);
-        Self::open(
-            name,
-            daemon.target(),
-            Some(daemon),
-            shelves,
-            Projects::default(),
-        )
+        keep(&daemon, kept);
+        Self::open(name, daemon.target(), Some(daemon), Projects::default())
     }
 
     /// Opens the app at 1200x800, reaching its daemon as `target` says.
@@ -245,7 +236,6 @@ impl Harness {
         name: &'static str,
         target: DaemonTarget,
         daemon: Option<FakeDaemon>,
-        shelves: Shelves,
         projects: Projects,
     ) -> Self {
         Self::open_with(
@@ -253,7 +243,6 @@ impl Harness {
             target,
             daemon,
             Machines {
-                shelves,
                 projects,
                 ..Machines::default()
             },
@@ -280,7 +269,6 @@ impl Harness {
         state: StateDb,
     ) -> Self {
         let Machines {
-            shelves,
             projects,
             mut settings,
             remote_sockets,
@@ -339,7 +327,6 @@ impl Harness {
             rho_home: Some(rho_home.unwrap_or_else(|| PathBuf::from("/nonexistent/rho"))),
         };
         let sidebar = SidebarState {
-            shelves,
             unseen: Unseen::load(&state),
             layout: SidebarLayout::load(&state),
             filter: SavedFilter::load(&state),
@@ -357,8 +344,8 @@ impl Harness {
                         ..Default::default()
                     },
                     cx,
-                    // In-memory marks, projects and layout: tests never
-                    // touch the user's state database.
+                    // In-memory projects and layout: tests never touch
+                    // the user's state database.
                     |window, cx| cx.new(|cx| RhoApp::new(launch, sidebar, projects, window, cx)),
                 )
             })
@@ -761,7 +748,6 @@ impl Harness {
 /// What [`Harness::open_with`] opens the app with besides its daemon.
 #[derive(Default)]
 struct Machines {
-    shelves: Shelves,
     projects: Projects,
     settings: Settings,
     /// The socket each remote machine reaches, by host.
@@ -909,9 +895,9 @@ fn new_session_runs_a_turn_through_an_approval() {
     });
     ui.shot("usage");
 
-    // Another rho-ui on the daemon, with no marks of its own, lists the
-    // session as active too: the daemon dates a session, whoever started it.
-    let mut ui = ui.reopen("new-session-elsewhere", Shelves::default());
+    // Another rho-ui on the daemon lists the session as active too: the
+    // daemon dates a session, whoever started it.
+    let mut ui = ui.reopen("new-session-elsewhere");
     ui.wait_until("the session active in another rho-ui", |window, _, _| {
         is_visible(window, "session-local-new-1")
     });
@@ -1512,7 +1498,6 @@ fn a_draft_opened_while_connecting_waits_for_the_daemon() {
         "draft-connecting",
         target,
         Some(daemon),
-        Shelves::default(),
         Projects::default(),
     );
     ui.click("new-session");
@@ -1531,7 +1516,7 @@ fn a_draft_opened_while_connecting_waits_for_the_daemon() {
 
 /// Settle and snooze from a row's hover buttons and its context menu, and
 /// bring sessions back from the opened Settled shelf, whose rows show their
-/// details on hover.
+/// details on hover. Each move is saved as the session's mark in the daemon.
 #[test]
 fn settle_and_snooze_move_sessions_between_lists() {
     let mut ui = Harness::start("shelves", Script::default());
@@ -1544,6 +1529,9 @@ fn settle_and_snooze_move_sessions_between_lists() {
     ui.click("settle");
     ui.wait_until("s1 on the settled list", |window, _, _| {
         !is_visible(window, "session-local-s1") && is_visible(window, "toggle-settled")
+    });
+    ui.wait_for_daemon("s1 marked done", |fake| {
+        matches!(fake.mark("s1"), Some(SessionMark::Done { .. }))
     });
     ui.shot("settled-entry");
 
@@ -1569,12 +1557,19 @@ fn settle_and_snooze_move_sessions_between_lists() {
             && is_visible(window, "session-local-old")
             && !is_visible(window, "toggle-settled")
     });
+    // Kept, not cleared: a clear would leave it settled by its age.
+    ui.wait_for_daemon("s1 marked kept", |fake| {
+        matches!(fake.mark("s1"), Some(SessionMark::Kept { .. }))
+    });
 
     ui.act(|window, cx| window.hover("session-local-old", cx));
     ui.click("snooze");
     ui.click("snooze-4h");
     ui.wait_until("old on the snoozed list", |window, _, _| {
         !is_visible(window, "session-local-old") && is_visible(window, "toggle-snoozed")
+    });
+    ui.wait_for_daemon("old marked snoozed", |fake| {
+        matches!(fake.mark("old"), Some(SessionMark::Snoozed { .. }))
     });
 
     // The context menu offers the same moves.
@@ -1602,6 +1597,67 @@ fn settle_and_snooze_move_sessions_between_lists() {
     ui.shot("both-shelves");
 }
 
+/// A mark another rho-ui, or the daemon, gives a session the app follows
+/// moves its row at once, and has the app read the machine's sessions
+/// again, so that a list read before the mark can't put the old one back.
+#[test]
+fn a_mark_set_elsewhere_moves_a_followed_session() {
+    // `open_old_session` waits for a replay of more than 20 entries.
+    let script = Script {
+        replay_turns: 20,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("mark-elsewhere", script);
+    ui.open_old_session();
+    let lists = ui.fake().detailed_lists();
+    ui.fake().set_mark("old", &NewSessionMark::Done);
+    ui.wait_until("old on the settled list", |window, _, _| {
+        !is_visible(window, "session-local-old") && is_visible(window, "toggle-settled")
+    });
+    ui.wait_for_daemon("the sessions listed again", |fake| {
+        fake.detailed_lists() > lists
+    });
+}
+
+/// A daemon from before marks lists its sessions by age alone, and a move
+/// it can't save is undone with an error.
+#[test]
+fn a_daemon_from_before_marks_refuses_a_move() {
+    let script = Script {
+        session_lists: SessionLists::Plain,
+        ..Script::default()
+    };
+    let mut ui = Harness::start_with("marks-unserved", script, &[]);
+    ui.wait_until("the settled entry", |window, _, _| {
+        is_visible(window, "toggle-settled")
+    });
+    ui.click("toggle-settled");
+    ui.wait_until("the settled shelf", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    let notifications = |ui: &mut Harness| {
+        ui.frame();
+        ui.cx
+            .update_window(ui.window, |_, window, cx| window.notifications(cx).len())
+            .expect("window is open")
+    };
+    let before = notifications(&mut ui);
+    ui.act(|window, cx| window.hover("session-local-s1", cx));
+    ui.click("restore");
+    ui.poll(
+        WAIT,
+        "the error",
+        |ui| notifications(ui) > before,
+        Harness::labels_seen,
+    );
+    // Folded, the shelf hides s1 once the daemon's list puts it back.
+    ui.click("toggle-settled");
+    ui.wait_until("s1 settled again", |window, _, _| {
+        !is_visible(window, "session-local-s1") && is_visible(window, "toggle-settled")
+    });
+    assert_eq!(ui.fake().mark("s1"), None);
+}
+
 /// An opened shelf shows its newest 25 sessions, Show more adds the rest,
 /// and folding it goes back to 25.
 #[test]
@@ -1612,7 +1668,7 @@ fn a_long_shelf_shows_25_sessions_at_a_time() {
         ..Script::default()
     };
     // Long quiet: all 32 sessions start settled.
-    let mut ui = Harness::start_with("shelf-pages", script, Shelves::default());
+    let mut ui = Harness::start_with("shelf-pages", script, &[]);
     ui.wait_until("the settled entry", |window, _, _| {
         is_visible(window, "toggle-settled")
     });
@@ -1706,6 +1762,9 @@ fn the_row_menu_renames_pins_and_copies_a_session() {
     ui.wait_until("the pinned session on top", |window, _, _| {
         above(window, "session-local-old", "session-local-s1")
     });
+    ui.wait_for_daemon("old marked pinned", |fake| {
+        matches!(fake.mark("old"), Some(SessionMark::Pinned { .. }))
+    });
     ui.shot("pinned");
 
     ui.act(|window, cx| window.right_click("session-local-s1", cx));
@@ -1715,6 +1774,30 @@ fn the_row_menu_renames_pins_and_copies_a_session() {
         .cx
         .update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
     assert_eq!(copied.as_deref(), Some("s1"));
+}
+
+/// Settling a session that started others saves the mark of each in the
+/// daemon, so another rho-ui shows the whole family settled.
+#[test]
+fn a_move_marks_a_whole_family_in_the_daemon() {
+    let fake = FakeDaemon::start(Script::default());
+    fake.start_session("s1", "w1", "Write the parser", Started::Idle);
+    keep(&fake, &["s1", "old"]);
+    let target = fake.target();
+    let mut ui = Harness::open("family-move", target, Some(fake), Projects::default());
+    ui.wait_until("the starter over its fold", |window, _, _| {
+        is_visible(window, "session-local-s1-fold")
+    });
+    ui.act(|window, cx| window.hover("session-local-s1", cx));
+    ui.click("settle");
+    ui.wait_until("the family on the settled list", |window, _, _| {
+        !is_visible(window, "session-local-s1") && is_visible(window, "toggle-settled")
+    });
+    ui.wait_for_daemon("s1 and w1 marked done", |fake| {
+        ["s1", "w1"]
+            .iter()
+            .all(|id| matches!(fake.mark(id), Some(SessionMark::Done { .. })))
+    });
 }
 
 /// Sessions a session started fold under it, behind a line that counts
@@ -1727,9 +1810,9 @@ fn sessions_a_session_started_fold_under_it() {
     fake.start_session("s1", "w1", "Write the parser", Started::Idle);
     fake.start_session("s1", "w2", "Test the parser", Started::Idle);
     fake.start_session("s1", "w3", "Review the parser", Started::Working);
-    let shelves = kept(["s1", "old"]);
+    keep(&fake, &["s1", "old"]);
     let target = fake.target();
-    let mut ui = Harness::open("started", target, Some(fake), shelves, Projects::default());
+    let mut ui = Harness::open("started", target, Some(fake), Projects::default());
     let started = ["session-local-w1", "session-local-w2", "session-local-w3"];
     ui.wait_until("the fold, closed, under the starter", |window, _, _| {
         is_visible(window, "session-local-s1-fold")
@@ -1825,7 +1908,7 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
 /// its first message, and leaving it drops it. A session can be deleted.
 #[test]
 fn drafts_are_free_quiet_sessions_start_settled_and_sessions_delete() {
-    let mut ui = Harness::start_with("drafts", Script::default(), Shelves::default());
+    let mut ui = Harness::start_with("drafts", Script::default(), &[]);
     ui.wait_until("the settled entry", |window, _, _| {
         is_visible(window, "toggle-settled") && !is_visible(window, "session-local-s1")
     });
@@ -2832,8 +2915,8 @@ fn an_update_installs_then_restarts_the_daemon_on_request() {
         ..Script::default()
     };
     let daemon = FakeDaemon::start(script);
+    keep(&daemon, &["s1", "old"]);
     let machines = Machines {
-        shelves: kept(["s1", "old"]),
         rho: Some(rho),
         ..Machines::default()
     };
@@ -3214,7 +3297,7 @@ fn a_job_started_elsewhere_is_listed_attached_and_steered() {
         tui_job: TuiJob::Running,
         ..Script::default()
     };
-    let mut ui = Harness::start_with("job", script, Shelves::default());
+    let mut ui = Harness::start_with("job", script, &[]);
     ui.wait_until("the running job among settled sessions", |window, _, _| {
         is_visible(window, "session-local-tui-1") && !is_visible(window, "session-local-s1")
     });
@@ -3287,7 +3370,7 @@ fn a_steer_moves_the_running_header_under_it() {
         tui_job: TuiJob::Running,
         ..Script::default()
     };
-    let mut ui = Harness::start_with("steer-turn", script, Shelves::default());
+    let mut ui = Harness::start_with("steer-turn", script, &[]);
     ui.wait_until("the running job", |window, _, _| {
         is_visible(window, "session-local-tui-1")
     });
@@ -3648,12 +3731,12 @@ fn pictures_show_in_place_and_open_in_the_lightbox() {
     )
     .expect("write the picture");
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1", "old"]);
     let mut ui = Harness::open_with(
         "pictures",
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: kept(["s1", "old"]),
             workspace: Some(folder),
             ..Machines::default()
         },
@@ -4271,12 +4354,12 @@ fn advance_until(
 /// daemon then finds PR 12 on. Returns its key.
 fn open_pr_session(name: &'static str, settings: Settings) -> (Harness, SessionKey) {
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1"]);
     let mut ui = Harness::open_with(
         name,
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: kept(["s1"]),
             settings,
             ..Machines::default()
         },
@@ -4419,11 +4502,11 @@ fn a_sidebar_row_marks_its_pr() {
     let pictures = serve_pictures();
     daemon.open_pull_request(&old.id, &pictures);
     daemon.open_pull_request(&settled.id, &pictures);
+    keep(&daemon, &["old"]);
     let mut ui = Harness::open(
         "pull-request-row",
         daemon.target(),
         Some(daemon),
-        kept(["old"]),
         Projects::default(),
     );
     let mark = SharedString::from(format!("session-{old}-pr"));
@@ -4641,16 +4724,7 @@ fn pull_requests_link_by_hand() {
 /// nothing.
 #[test]
 fn a_branch_without_a_pr_shows_the_pr_linked_last() {
-    let daemon = FakeDaemon::start(Script::default());
-    let mut ui = Harness::open_with(
-        "pull-request-no-branch-pr",
-        daemon.target(),
-        Some(daemon),
-        Machines {
-            shelves: kept(["s1"]),
-            ..Machines::default()
-        },
-    );
+    let mut ui = Harness::start_with("pull-request-no-branch-pr", Script::default(), &["s1"]);
     ui.click("new-session");
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     ui.send("background");
@@ -4973,12 +5047,12 @@ fn the_diff_surface_follows_the_sessions_changes() {
     std::fs::write(repo.join("a.txt"), format!("one\n{long}\n")).unwrap();
 
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1"]);
     let mut ui = Harness::open_with(
         "diff",
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: kept(["s1"]),
             workspace: Some(repo.clone()),
             ..Machines::default()
         },
@@ -5021,12 +5095,12 @@ fn the_files_surface_opens_the_sessions_files() {
     std::fs::write(repo.join("README.md"), "# Hi\n").unwrap();
 
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1"]);
     let mut ui = Harness::open_with(
         "files",
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: kept(["s1"]),
             workspace: Some(repo.clone()),
             ..Machines::default()
         },
@@ -5453,7 +5527,7 @@ fn the_right_panel_resizes_from_its_edge() {
         "the panel follows the pointer: {before:?} became {wider:?}"
     );
 
-    let mut ui = ui.reopen("right-panel-resize", kept(["s1"]));
+    let mut ui = ui.reopen("right-panel-resize");
     assert_eq!(
         panel(&mut ui).size.width,
         wider.size.width,
@@ -5511,7 +5585,7 @@ fn the_sidebar_resizes_from_its_edge() {
         "the sidebar follows the pointer: {before:?} became {wider:?}"
     );
 
-    let mut ui = ui.reopen("sidebar-resize", kept(["s1"]));
+    let mut ui = ui.reopen("sidebar-resize");
     ui.wait_until("saved sessions again", |window, _, _| {
         is_visible(window, "session-local-s1")
     });
@@ -5704,7 +5778,7 @@ fn restart_and_open_the_ended_run(mut ui: Harness, parent: &SessionId) {
         session.state() == &RunState::Idle && session.background().is_empty()
     });
 
-    let mut ui = ui.reopen("subagent-restarted", kept(["s1", "old", parent.as_str()]));
+    let mut ui = ui.reopen("subagent-restarted");
     let row: &'static str =
         Box::leak(format!("session-local-{}", parent.as_str()).into_boxed_str());
     ui.wait_until("the parent in the sidebar", |window, _, _| {
@@ -6115,7 +6189,7 @@ fn images_go_with_the_message() {
     ui.act(|window, _| assert_eq!(composer_attachments(window).len(), 1, "its tile is back"));
 
     // Opened afresh, the session replays its messages with their images.
-    let mut ui = ui.reopen("images-replayed", kept(["s1", "old", "new-1"]));
+    let mut ui = ui.reopen("images-replayed");
     ui.wait_until("the session in the sidebar", |window, _, _| {
         is_visible(window, "session-local-new-1")
     });
@@ -6214,7 +6288,7 @@ fn a_message_after_a_waiting_image_waits_too() {
         tui_job: TuiJob::Running,
         ..Script::default()
     };
-    let mut ui = Harness::start_with("image-order", script, Shelves::default());
+    let mut ui = Harness::start_with("image-order", script, &[]);
     ui.wait_until("the running job", |window, _, _| {
         is_visible(window, "session-local-tui-1")
     });
@@ -6255,11 +6329,11 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
     let launch_row: &'static str =
         format!("project-local:{}", std::env::temp_dir().display()).leak();
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1", "old"]);
     let mut ui = Harness::open(
         "project",
         daemon.target(),
         Some(daemon),
-        kept(["s1", "old"]),
         // Added in this order; /w/a has the newer session.
         Projects::of(["/w/b", "/w/a"]),
     );
@@ -6360,11 +6434,11 @@ fn a_typed_worktree_adds_its_project_and_remove_takes_one_off() {
     let main = rho_ui_core::platform::canonicalize(&main).expect("the checkout exists");
     let main_row: &'static str = format!("project-local:{}", main.display()).leak();
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1", "old"]);
     let mut ui = Harness::open(
         "project-add",
         daemon.target(),
         Some(daemon),
-        kept(["s1", "old"]),
         Projects::of(["/w/b", "/w/a"]),
     );
     ui.wait_until("saved sessions in the sidebar", |window, _, _| {
@@ -6578,7 +6652,6 @@ fn a_new_session_can_work_in_a_new_worktree() {
         "worktree",
         daemon.target(),
         Some(daemon),
-        Shelves::default(),
         Projects::of([main.clone(), "/w/a".into()]),
     );
     ui.wait_until("the sidebar", |window, _, _| {
@@ -6661,11 +6734,7 @@ fn a_new_session_can_work_in_a_new_worktree() {
     ui.shot("running");
 
     // After a restart, a new draft in the project starts in a new worktree.
-    let mut ui = ui.reopen_with(
-        "worktree-reopened",
-        Shelves::default(),
-        Projects::of([main.clone()]),
-    );
+    let mut ui = ui.reopen_with("worktree-reopened", Projects::of([main.clone()]));
     ui.wait_until("the sidebar", |window, _, _| {
         is_visible(window, "new-session")
     });
@@ -6892,11 +6961,8 @@ fn machines_list_side_by_side() {
     let mut settings = Settings::default();
     settings.machines = vec![workstation, RemoteMachine::new("gone")];
     let there = MachineId::remote("workstation");
-    let mut shelves = kept(["s1", "old"]);
-    for id in ["s1", "old"] {
-        let there = SessionKey::new(there.clone(), SessionId::from(id));
-        shelves.restore(&there, time::now_unix());
-    }
+    keep(&local, &["s1", "old"]);
+    keep(&remote, &["s1", "old"]);
     let mut projects = Projects::default();
     projects.add(Place::new(there.clone(), "/srv/app"));
     // The same project, named for its folder, on this machine, and one
@@ -6908,7 +6974,6 @@ fn machines_list_side_by_side() {
         local.target(),
         Some(local),
         Machines {
-            shelves,
             projects,
             settings,
             remote_sockets: vec![
@@ -7082,17 +7147,13 @@ fn a_machine_added_in_settings_lists_its_sessions() {
     let DaemonTarget::Socket(remote_socket) = remote.target() else {
         panic!("a fake daemon listens on a socket");
     };
-    let mut shelves = kept(["s1", "old"]);
-    shelves.restore(
-        &SessionKey::new(MachineId::remote("box"), SessionId::from("s1")),
-        time::now_unix(),
-    );
+    keep(&local, &["s1", "old"]);
+    keep(&remote, &["s1"]);
     let mut ui = Harness::open_with(
         "add-machine",
         local.target(),
         Some(local),
         Machines {
-            shelves,
             remote_sockets: vec![("box".to_owned(), remote_socket)],
             ..Machines::default()
         },
@@ -7178,12 +7239,12 @@ fn source_control_shows_this_machines_gh() {
     let mut settings = Settings::default();
     settings.local_cli.set(ForgeCli::Gh, signed_in);
     let daemon = FakeDaemon::start(Script::default());
+    keep(&daemon, &["s1"]);
     let mut ui = Harness::open_with(
         "source-control",
         daemon.target(),
         Some(daemon),
         Machines {
-            shelves: kept(["s1"]),
             settings,
             ..Machines::default()
         },
@@ -7236,13 +7297,8 @@ fn source_control_shows_this_machines_gh() {
 #[test]
 fn rho_settings_write_and_follow_the_daemon() {
     let fake = FakeDaemon::start(Script::default());
-    let mut ui = Harness::open(
-        "rho-settings",
-        fake.target(),
-        None,
-        kept(["s1", "old"]),
-        Projects::default(),
-    );
+    keep(&fake, &["s1", "old"]);
+    let mut ui = Harness::open("rho-settings", fake.target(), None, Projects::default());
     open_settings(&mut ui);
     open_settings_page(&mut ui, "Rho");
     let compact = "setting-general.auto_compact";

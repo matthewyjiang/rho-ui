@@ -4,7 +4,7 @@ Sessions belong to the rho daemon, not to rho-ui. The sidebar lists every saved 
 
 ## Pinned, snoozed and settled
 
-Pinning, snoozing and settling are rho-ui's own; rho has no such state, so rho's terminal UI doesn't see them, and neither does rho-ui on another computer.
+Each machine's rho daemon keeps whether a session is pinned, snoozed or settled, so every rho-ui connected to it, on any computer, shows the same, and a change made in one shows in the others. Another rho-ui shows the change at once when the session is on its screen or working there; otherwise when it next reads the machine's sessions, as it does when it connects and when a session's work starts or ends. rho settles a session itself when the last of the pull requests linked to it merges, whether its agent watched it or not, unless you pinned it, it is still snoozed, or you restored it since the merge. A session with another linked pull request that hasn't merged stays where it is. A rho too old to keep marks shows its sessions by age alone, and can't pin, snooze or settle them.
 
 A session you haven't marked is active for a week after its last activity, whichever client started it, and settled from then on, so the sidebar doesn't fill with old history. That goes by the daemon's record of the session, so every rho-ui shows the same. A session with work under way always shows as active, and one you settled comes back when it has new activity. Restoring or unpinning a session, or a snooze that ends, keeps it active for a week from then.
 

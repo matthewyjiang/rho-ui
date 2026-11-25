@@ -41,8 +41,8 @@ use gpui_kit::{
     StyleRefinement, Styled as _, Subscription, Task, Window,
 };
 use rho_ui_core::{
-    Attached, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs, PendingUpgrade, Prompt,
-    Session, SessionId, VersionFix, VersionMismatch, LEAD_AGENT,
+    Attached, Daemon, DaemonError, DaemonEvent, Detached, Job, Jobs, NewSessionMark,
+    PendingUpgrade, Prompt, Session, SessionId, VersionFix, VersionMismatch, LEAD_AGENT,
 };
 
 mod daemon_control;
@@ -894,6 +894,13 @@ impl RhoApp {
                     self.prs
                         .update(cx, |prs, cx| prs.replaced(&session, set.clone(), cx));
                 }
+                // Its mark changed: the machine's sessions are listed
+                // again, in place of a list read before the change, as
+                // whoever marked this session may have marked the sessions
+                // it started, which nothing here follows.
+                if update.mark_changed().is_some() {
+                    self.refresh_sessions(&session.machine, cx);
+                }
                 if let Some(open) = self.opened(&session) {
                     // One let go hears what came since once followed again.
                     if open.let_go.is_none() {
@@ -965,6 +972,9 @@ impl RhoApp {
             SidebarEvent::Delete { id } => self.delete_session(id.clone(), window, cx),
             SidebarEvent::Rename { id, title } => {
                 self.rename_session(id.clone(), title.clone(), window, cx);
+            }
+            SidebarEvent::Mark { sessions, mark } => {
+                self.mark_sessions(sessions.clone(), mark.clone(), window, cx);
             }
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
             SidebarEvent::ToggleCollapsed => self.toggle_sidebar(window, cx),
@@ -1677,10 +1687,56 @@ impl RhoApp {
         .detach();
     }
 
+    /// Saves `mark` as the mark of each of `sessions`, a session and the
+    /// sessions it started, in their daemon, then lists the machine's
+    /// sessions again: the list holds each mark as the daemon stamped it,
+    /// or, from the first the daemon refused on, the one the session had,
+    /// and the user is told why. A list still being read goes unanswered,
+    /// as it would put back the marks the sidebar shows these sessions
+    /// without. Not connected, the user is told, and the sidebar keeps the
+    /// marks it had.
+    fn mark_sessions(
+        &mut self,
+        sessions: Vec<SessionKey>,
+        mark: NewSessionMark,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(machine) = sessions.first().map(|id| id.machine.clone()) else {
+            return;
+        };
+        // A pin moves it too: to the top of the list, or back off it.
+        let title = "Couldn't move the session";
+        let Some(daemon) = self.daemon(&machine).cloned() else {
+            self.not_connected(&machine, title, window, cx);
+            return;
+        };
+        if let Some(connection) = self.connection_mut(&machine) {
+            connection.sessions_task = Task::ready(());
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let mut result = Ok(());
+            for id in &sessions {
+                result = daemon.mark_session(&id.id, mark.clone()).await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Err(error) = result {
+                    window
+                        .push_notification(Notification::error(error.to_string()).title(title), cx);
+                }
+                this.refresh_sessions(&machine, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Tells the user that what `title` names needs `machine`'s daemon,
     /// which isn't connected: its saved sessions stay listed after the
-    /// connection drops, and their rows still offer to open, rename and
-    /// delete them.
+    /// connection drops, and their rows still offer to open, rename, pin,
+    /// move and delete them.
     fn not_connected(
         &self,
         machine: &MachineId,

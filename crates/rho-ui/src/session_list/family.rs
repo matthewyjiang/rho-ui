@@ -186,15 +186,22 @@ impl SessionList {
         self.reveal = id.cloned();
     }
 
-    /// The sessions of the family `starter` heads, itself first: a move
-    /// marks each, so they stay where the family was put if they lose
-    /// their starter.
+    /// The sessions of the family `starter` heads that a move marks,
+    /// itself first: each one the daemon lists as saved, so they stay
+    /// where the family was put if they lose their starter. The daemon
+    /// keeps no mark for a session it has saved nothing of, such as a
+    /// running subagent's; under its starter that one moves with it
+    /// anyway.
     pub(crate) fn family(&self, starter: &SessionKey) -> Vec<SessionKey> {
         let families = Families::of(&self.rows);
         let top = self.rows.iter().position(|row| row.id == *starter);
         let members = top.map_or(&[][..], |ix| families.members(ix));
+        let saved = members
+            .iter()
+            .map(|&ix| &self.rows[ix])
+            .filter(|row| row.saved);
         std::iter::once(starter.clone())
-            .chain(members.iter().map(|&ix| self.rows[ix].id.clone()))
+            .chain(saved.map(|row| row.id.clone()))
             .collect()
     }
 
@@ -286,17 +293,16 @@ mod tests {
 
     use web_time::Instant;
 
-    use rho_ui_core::JobActivity;
+    use rho_ui_core::{JobActivity, SessionMark};
 
     use super::*;
     use crate::{
         leads::Kind,
         machines::{MachineId, Place},
         session_list::{
-            tests::{here, id, job, rebuild, saved, shown},
+            tests::{here, id, job, mark, rebuild, saved, shown},
             Filter, JobSession, SavedSession,
         },
-        shelf::Shelves,
     };
 
     /// A saved session that session `parent` started.
@@ -305,6 +311,21 @@ mod tests {
             parent: Some(id(parent)),
             ..saved(text, Some(title), updated)
         }
+    }
+
+    /// A move of a family asks the daemon to mark the sessions it has
+    /// saved, not one it only runs, which it would refuse.
+    #[test]
+    fn a_move_marks_the_family_sessions_the_daemon_has_saved() {
+        let mut list = SessionList::default();
+        let sessions = vec![started("w1", "Write", 4, "lead"), saved("lead", None, 3)];
+        list.set_saved(&here(), sessions);
+        let running = JobSession {
+            parent: Some(id("lead")),
+            ..job("w2", JobActivity::Working, None)
+        };
+        list.set_jobs(&here(), vec![running], Instant::now(), 5);
+        assert_eq!(list.family(&id("lead")), [id("lead"), id("w1")]);
     }
 
     #[test]
@@ -350,7 +371,6 @@ mod tests {
     /// screen opens the fold it is under once the list knows its starter.
     #[test]
     fn a_family_lives_on_its_starters_shelf_and_a_busy_member_keeps_it_active() {
-        let mut shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -363,15 +383,15 @@ mod tests {
             ],
         );
         // At rest, the family sits by its newest session, over Solo.
-        rebuild(&mut list, &shelves, 10);
+        rebuild(&mut list, 10);
         assert_eq!(shown(&list), ["Other", "Lead", "› 2 started", "Solo"]);
-        shelves.settle(&id("lead"), 10);
-        shelves.settle(&id("solo"), 10);
-        rebuild(&mut list, &shelves, 10);
+        mark(&mut list, "lead", SessionMark::Done { at: 10 });
+        mark(&mut list, "solo", SessionMark::Done { at: 10 });
+        rebuild(&mut list, 10);
         assert_eq!(shown(&list), ["Other", "~", "[Settled 2]"]);
         list.toggle(Shelf::Settled);
         list.toggle_fold(&id("lead"));
-        rebuild(&mut list, &shelves, 10);
+        rebuild(&mut list, 10);
         // Newer than Solo by its newest session, though Lead itself isn't.
         let settled = ["Lead", "⌄ 2 started", "  Test", "  Write", "Solo"];
         assert_eq!(shown(&list)[3..], settled);
@@ -382,7 +402,7 @@ mod tests {
         };
         let writes = job("w1", JobActivity::Working, None);
         list.set_jobs(&here(), vec![asks, writes], Instant::now(), 11);
-        rebuild(&mut list, &shelves, 11);
+        rebuild(&mut list, 11);
         let asking = [
             "Lead",
             "⌄ 3 started, 1 waiting",
@@ -398,7 +418,7 @@ mod tests {
         let testing = || job("w2", JobActivity::Working, None);
         list.set_jobs(&here(), vec![testing()], Instant::now(), 12);
         list.toggle_fold(&id("lead"));
-        rebuild(&mut list, &shelves, 12);
+        rebuild(&mut list, 12);
         assert_eq!(shown(&list)[..3], ["Lead", "› 2 started, 1 done", "Other"]);
 
         // On screen before the list says who started it, it shows on its
@@ -406,7 +426,7 @@ mod tests {
         list.reveal(Some(&id("w4")));
         let unknown = job("w4", JobActivity::Working, None);
         list.set_jobs(&here(), vec![testing(), unknown], Instant::now(), 13);
-        rebuild(&mut list, &shelves, 13);
+        rebuild(&mut list, 13);
         assert_eq!(
             shown(&list)[..4],
             ["Lead", "› 2 started, 1 done", "Other", "job w4"]
@@ -416,7 +436,7 @@ mod tests {
             ..job("w4", JobActivity::Working, None)
         };
         list.set_jobs(&here(), vec![testing(), known], Instant::now(), 14);
-        rebuild(&mut list, &shelves, 14);
+        rebuild(&mut list, 14);
         let revealed = [
             "Lead",
             "⌄ 3 started, 1 done",
@@ -437,7 +457,6 @@ mod tests {
             kind: Kind::Lead,
             ..saved(text, Some(title), updated)
         };
-        let mut shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -448,8 +467,8 @@ mod tests {
                 lead("past", "Past", 2),
             ],
         );
-        shelves.settle(&id("past"), 10);
-        rebuild(&mut list, &shelves, 10);
+        mark(&mut list, "past", SessionMark::Done { at: 10 });
+        rebuild(&mut list, 10);
         let listed = [
             "[Leads]",
             "Lead",
@@ -466,7 +485,7 @@ mod tests {
         let mut filter = Filter::default();
         filter.toggle_project(&Place::new(here(), "/srv"));
         list.set_filter(filter);
-        rebuild(&mut list, &shelves, 10);
+        rebuild(&mut list, 10);
         assert_eq!(shown(&list), ["[Leads]", "Lead", "~", "[Settled 1]"]);
     }
 
@@ -476,7 +495,6 @@ mod tests {
     /// shows, folded as the user left it.
     #[test]
     fn a_search_that_matches_a_member_shows_its_starter_with_the_fold_open() {
-        let shelves = Shelves::default();
         let mut list = SessionList::default();
         list.set_saved(
             &here(),
@@ -495,7 +513,7 @@ mod tests {
                 0 => ("atlas", Path::new("/w")),
                 _ => ("srv", Path::new("/srv")),
             };
-            list.rebuild(&shelves, 10, &HashSet::new(), roots);
+            list.rebuild(10, &HashSet::new(), roots);
         };
         list.set_query("write");
         relist(&mut list);

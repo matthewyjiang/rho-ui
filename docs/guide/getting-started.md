@@ -126,6 +126,6 @@ Press <kbd>Ctrl</kbd>+<kbd>N</kbd> and pick a project. The folders in `$RHO_HOME
 | File | Holds |
 | --- | --- |
 | `~/.config/rho-ui/settings` | Your settings: theme, scale, fonts, machines |
-| `~/.local/state/rho-ui/state.sqlite3` | What it remembers: projects, pinned, settled and snoozed sessions, turn times, the sidebar's layout and filter |
+| `~/.local/state/rho-ui/state.sqlite3` | What it remembers: projects, turn times, the sidebar's layout and filter. Pinned, settled and snoozed sessions are kept by each machine's rho daemon |
 
 Both follow `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set, on macOS too. Sessions themselves are rho's, kept in rho's home.

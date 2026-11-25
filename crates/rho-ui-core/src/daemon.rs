@@ -66,9 +66,11 @@ use crate::{
 };
 
 mod auth;
+mod marks;
 mod pull_requests;
 mod worktrees;
 
+pub use marks::SessionMark;
 pub use pull_requests::PullRequestError;
 pub use worktrees::ReportedWorktree;
 
@@ -204,7 +206,7 @@ impl SessionId {
     }
 }
 
-/// For IDs read back from storage, such as rho-ui's settled list.
+/// For IDs read back from storage, such as rho-ui's state database.
 impl From<&str> for SessionId {
     fn from(id: &str) -> Self {
         Self(id.into())
@@ -263,8 +265,9 @@ impl DaemonInfo {
 /// by id. Its sessions are leads.
 pub const LEAD_AGENT: &str = "lead";
 
-/// A saved session from `rho/session/list_detailed`, or from
-/// `rho/session/list` on a rho from before it.
+/// A saved session, as [`Daemon::list_sessions`] lists it: from
+/// `rho/session/list_detailed`, or from `rho/session/list` on a rho from
+/// before it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSummary {
     id: SessionId,
@@ -273,10 +276,11 @@ pub struct SessionSummary {
     updated_at: u64,
     agent: Option<String>,
     parent: Option<SessionId>,
+    mark: Option<SessionMark>,
 }
 
 impl SessionSummary {
-    /// A row of `rho/session/list`, which names no agent or parent.
+    /// A row of `rho/session/list`, which names no agent, parent or mark.
     fn from_wire(session: rho_protocol::SessionSummary) -> Self {
         Self {
             id: session.session.into(),
@@ -285,6 +289,7 @@ impl SessionSummary {
             updated_at: session.updated_at,
             agent: None,
             parent: None,
+            mark: None,
         }
     }
 
@@ -293,6 +298,7 @@ impl SessionSummary {
         Self {
             agent: session.agent,
             parent: session.parent.map(SessionId::from),
+            mark: session.mark.as_ref().and_then(SessionMark::from_wire),
             ..Self::from_wire(session.summary)
         }
     }
@@ -331,6 +337,12 @@ impl SessionSummary {
     /// none. `None` from a rho that doesn't say.
     pub fn parent(&self) -> Option<&SessionId> {
         self.parent.as_ref()
+    }
+
+    /// How the user marked the session, as its daemon keeps it; `None`
+    /// while it has no mark, and from a daemon that keeps none.
+    pub fn mark(&self) -> Option<SessionMark> {
+        self.mark
     }
 }
 
@@ -749,10 +761,10 @@ impl Daemon {
     }
 
     /// Saved sessions in every workspace, newest first, each with the agent
-    /// it runs as and the session that started it. A rho from before
-    /// `rho/session/list_detailed` (`MethodNotFound`), as on a machine not
-    /// updated yet, lists them with neither, and isn't asked for it again
-    /// on this connection.
+    /// it runs as, the session that started it and its mark. A rho from
+    /// before `rho/session/list_detailed` (`MethodNotFound`), as on a
+    /// machine not updated yet, lists them with none of those, and isn't
+    /// asked for it again on this connection.
     ///
     /// # Errors
     ///
