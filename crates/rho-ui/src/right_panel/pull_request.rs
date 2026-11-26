@@ -51,9 +51,9 @@ use crate::{
     time,
 };
 
-/// Whether the surface is on screen.
+/// Whether a surface is on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Visibility {
+pub(crate) enum Visibility {
     Shown,
     Hidden,
 }

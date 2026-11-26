@@ -85,7 +85,10 @@ use self::side_chat::{side_question, Discarding};
 use crate::{
     added_dirs::{AddedDirs, DirsAccess},
     auths::Auths,
-    background::{BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler},
+    background::{
+        processes::Processes, BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler,
+        Opens, Output, ProcessOutput, Sources, StopHandler,
+    },
     background_log::{BackgroundLog, Recorded},
     composer::{Composer, ComposerMode, ComposerState},
     input_card::{InputCard, InputCardEvent, Queue},
@@ -96,6 +99,7 @@ use crate::{
     pr_mark::pr_pill,
     projects::Projects,
     pull_requests::PullRequests,
+    right_panel::Visibility,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{model_summary, Availability, SessionSettings, SettingsEvent, Turn},
     sign_in::SignInSlot,
@@ -131,6 +135,9 @@ pub(crate) enum SessionEvent {
     /// Show this session's pull request in the right panel, from the
     /// title bar.
     ShowPullRequest(PullRequestId),
+    /// Show this session's Background surface in the right panel, which
+    /// shows the output of the process a row opened.
+    ShowBackground,
     /// Start a side chat of this session, sending the prompt first if
     /// there is one; see [`SessionView::start_side_chat`].
     SideChat(Option<Prompt>),
@@ -263,6 +270,9 @@ pub(crate) struct SessionView {
     /// The subagent and workflow runs the session started, as the daemon's
     /// job list last said; see [`Self::set_runs`].
     runs: Vec<Run>,
+    /// The session's background processes as the daemon reads them, and
+    /// the output the user follows.
+    processes: Entity<Processes>,
     /// What the background log holds of the session's work.
     recorded: Recorded,
     /// The first prompt was accepted, so the session is saved.
@@ -352,9 +362,12 @@ impl SessionView {
             window,
             cx,
         );
+        let processes = cx.new(|_| Processes::new(daemon.clone(), session.id().clone()));
         let subscriptions =
             vec![
                 cx.subscribe_in(&settings, window, Self::on_settings_event),
+                // The rows say what the daemon read of each process.
+                cx.observe(&processes, |_, _, cx| cx.notify()),
                 // The jump-to-latest button follows the scroll position.
                 cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
                 // A picture a message shows was read.
@@ -398,6 +411,7 @@ impl SessionView {
             attachments: 0,
             stopping: Vec::new(),
             runs: Vec::new(),
+            processes,
             recorded,
             busy_since: None,
             turn_began: None,
@@ -411,23 +425,28 @@ impl SessionView {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             _above: Vec::new(),
-            _tick: cx.spawn(async move |this, cx| loop {
-                cx.background_executor().timer(TICK).await;
-                let tick = this.update(cx, |this, cx| {
-                    if this.busy_since.is_some() {
-                        cx.notify();
-                    }
-                });
-                if tick.is_err() {
-                    break;
-                }
-            }),
+            _tick: Self::tick(cx),
         };
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
         view.sync_kind(window, cx);
         view.reported = Some(view.live());
         view
+    }
+
+    /// Redraws "Working for" every [`TICK`] while a turn runs.
+    fn tick(cx: &Context<'_, Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(TICK).await;
+            let tick = this.update(cx, |this, cx| {
+                if this.busy_since.is_some() {
+                    cx.notify();
+                }
+            });
+            if tick.is_err() {
+                break;
+            }
+        })
     }
 
     /// The session of a subagent that `parent` started, whose observe has
@@ -817,6 +836,8 @@ impl SessionView {
             .update(cx, |settings, _| settings.set_daemon(daemon.clone()));
         self.added_dirs
             .update(cx, |dirs, _| dirs.set_daemon(daemon.clone()));
+        self.processes
+            .update(cx, |processes, _| processes.set_daemon(daemon.clone()));
         self.daemon = daemon;
         Some(Follow {
             cursor: self.session.reattach(),
@@ -967,6 +988,9 @@ impl SessionView {
             cx.notify();
             return;
         }
+        let work = self.session.background();
+        self.processes
+            .update(cx, |processes, cx| processes.sync(work, cx));
         let now = Instant::now();
         let busy = self.is_busy();
         match (busy, self.busy_since, self.turn_began) {
@@ -1951,7 +1975,7 @@ impl SessionView {
     fn render_background(&self, cx: &mut Context<'_, Self>) -> Option<BackgroundList> {
         let list = BackgroundList::new(
             self.session.background(),
-            &self.runs,
+            &self.sources(cx),
             Self::open_handler(cx.entity().downgrade()),
         )?;
         if self.is_subagent() {
@@ -1965,37 +1989,104 @@ impl SessionView {
         }))
     }
 
+    /// What the rows of the session's background work read besides the
+    /// work: a side chat's rows open no output, as its panel shows its
+    /// session's.
+    fn sources<'a>(&'a self, cx: &'a App) -> Sources<'a> {
+        Sources {
+            runs: &self.runs,
+            processes: self.processes.read(cx),
+            output: if self.is_side() {
+                Output::Never
+            } else {
+                Output::Opens
+            },
+        }
+    }
+
     /// The session's background work, running and ended, for the right
-    /// panel's Background surface. A subagent's session can't stop its own.
-    pub(crate) fn background_surface(view: &Entity<Self>, cx: &App) -> BackgroundSurface {
+    /// panel's Background surface, or the output of the process the user
+    /// follows in its place. A subagent's session can't stop its own.
+    pub(crate) fn background_surface(view: &Entity<Self>, cx: &App) -> AnyElement {
         let this = view.read(cx);
+        let stop = (!this.is_subagent()).then(|| {
+            let view = view.downgrade();
+            let on_stop: StopHandler = Rc::new(move |work, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.stop_background(work.clone(), window, cx);
+                });
+            });
+            on_stop
+        });
+        if let Some(followed) = this.processes.read(cx).followed() {
+            let id = BackgroundId::process(followed.log.id().to_owned());
+            let work = this.session.background().iter();
+            let work = work
+                .chain(this.session.ended_background())
+                .find(|work| *work.id() == id);
+            let title =
+                work.map_or_else(SharedString::default, |work| work.title().to_owned().into());
+            // Offered as its row offers it, while the session lists it running.
+            let stoppable = work
+                .is_some_and(|work| work.status() == BackgroundStatus::Running && work.can_stop());
+            let stop = stop.filter(|_| stoppable);
+            let back = view.downgrade();
+            return ProcessOutput::new(
+                this.processes.clone(),
+                title,
+                move |_, cx| {
+                    let _ = back.update(cx, Self::unfollow_output);
+                },
+                stop.map(|on_stop| (this.stopping.contains(&id), on_stop)),
+            )
+            .into_any_element();
+        }
         let surface = BackgroundSurface::new(
             this.session.background(),
             this.session.ended_background(),
-            &this.runs,
+            &this.sources(cx),
             Self::open_handler(view.downgrade()),
         );
-        if this.is_subagent() {
-            return surface;
+        match stop {
+            Some(on_stop) => surface
+                .stoppable(&this.stopping, move |work, window, cx| {
+                    on_stop(work, window, cx);
+                })
+                .into_any_element(),
+            None => surface.into_any_element(),
         }
-        let view = view.downgrade();
-        surface.stoppable(&this.stopping, move |work, window, cx| {
-            let _ = view.update(cx, |this, cx| {
-                this.stop_background(work.clone(), window, cx);
+    }
+
+    /// Opens what a row of the background work opens: a subagent's
+    /// session, or a process's output, in the right panel's Background
+    /// surface.
+    fn open_handler(view: WeakEntity<Self>) -> OpenHandler {
+        Rc::new(move |opens, _, cx| {
+            let _ = view.update(cx, |this, cx| match opens {
+                Opens::Session { session, title } => cx.emit(SessionEvent::OpenSubagent {
+                    session: session.clone(),
+                    title: title.clone(),
+                }),
+                Opens::Output(id) => {
+                    this.processes
+                        .update(cx, |processes, cx| processes.follow(id, cx));
+                    cx.emit(SessionEvent::ShowBackground);
+                }
             });
         })
     }
 
-    /// Opens a subagent's session from its row in the background work.
-    fn open_handler(view: WeakEntity<Self>) -> OpenHandler {
-        Rc::new(move |session, title, _, cx| {
-            let _ = view.update(cx, |_, cx| {
-                cx.emit(SessionEvent::OpenSubagent {
-                    session: session.clone(),
-                    title: title.clone(),
-                });
-            });
-        })
+    /// Notes whether the right panel shows this session's Background
+    /// surface: the output it may show is read only then.
+    pub(crate) fn set_output_shown(&mut self, shown: Visibility, cx: &mut Context<'_, Self>) {
+        self.processes
+            .update(cx, |processes, cx| processes.set_shown(shown, cx));
+    }
+
+    /// Stops following process output: the Background surface shows its
+    /// lists again.
+    pub(crate) fn unfollow_output(&mut self, cx: &mut Context<'_, Self>) {
+        self.processes.update(cx, Processes::unfollow);
     }
 
     /// The session's pull request, marked as its sidebar row marks it. A
@@ -2040,7 +2131,7 @@ impl SessionView {
         }
         let ended = BackgroundHistory::new(
             self.session.ended_background(),
-            &self.runs,
+            &self.sources(cx),
             Self::open_handler(cx.entity().downgrade()),
         );
         bar.trailing(Some(

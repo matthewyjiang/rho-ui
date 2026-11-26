@@ -48,6 +48,10 @@
 //!   [`FakeDaemon::finish_background`], ends it, and the daemon starts a
 //!   turn of its own that tells the model; that turn runs until a steer
 //!   ends it, and drops the work it delivered from the list as it ends.
+//!   `rho/session/processes` lists the session's processes while their
+//!   work is listed, and reads what [`FakeDaemon::write_process`] had one
+//!   write meanwhile, which the session retains whole; [`FakeDaemon::process_reads`]
+//!   counts the reads.
 //! - The prompt "subagent" starts a subagent, [`SUBAGENT_TASK`], and
 //!   answers at once, leaving it running in a session of its own,
 //!   "sub-N", as agent [`SUBAGENT_AGENT`] on [`SUBAGENT_MODEL`], which
@@ -190,10 +194,10 @@ use rho_protocol::{
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, CompactionCounts, CompactionId, CompactionStatus, CompactionTrigger, ContentBlock,
     Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle, DetachReason, ErrorCode,
-    InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus, ProtocolVersion, Published,
-    Publisher, Question, RestartCost, RetryReason, RpcError, Selection, SessionAttachResponse,
-    SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome, VersionMismatch,
-    WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
+    InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus, ProcessStream, ProtocolVersion,
+    Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
+    SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
+    TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -207,6 +211,7 @@ use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId
 mod auth;
 mod config;
 mod listener;
+mod processes;
 mod pull_requests;
 mod service;
 mod started;
@@ -216,6 +221,7 @@ use auth::FakeAuth;
 pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
 use config::FakeConfig;
 use listener::Listener;
+use processes::FakeProcesses;
 use pull_requests::FakePullRequests;
 pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
 use service::Fake;
@@ -845,6 +851,34 @@ impl FakeDaemon {
         }
     }
 
+    /// Has `session`'s oldest running background process write `text` to
+    /// `stream`, as one chunk of its output.
+    ///
+    /// # Panics
+    ///
+    /// If the session runs no background process: the test has a bug.
+    pub fn write_process(&self, session: &UiSessionId, stream: ProcessStream, text: &str) {
+        let mut state = self.service.lock();
+        let session = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        let id = session
+            .background
+            .iter()
+            .find_map(|work| match &work.item {
+                BackgroundItem::Process { id } if work.status.is_running() => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("session runs no background process to write"));
+        session.processes.write(&id, stream, text);
+    }
+
+    /// How many `rho/session/processes` requests the daemon got.
+    pub fn process_reads(&self) -> usize {
+        self.service.lock().process_reads
+    }
+
     /// Starts the workflow [`WORKFLOW_NAME`] in `session`, as the
     /// session's background work, with its two agent nodes in the job
     /// list: one queued second in line, and one failed with
@@ -1251,6 +1285,8 @@ struct FakeSession {
     unloads: u64,
     /// Background work, as the last background event listed it.
     background: Vec<BackgroundWork>,
+    /// What its background processes wrote.
+    processes: FakeProcesses,
     /// Whether a prompt "busy" was already refused.
     refused_busy: bool,
     /// A subagent's session, which only its run writes: observed, never
@@ -1287,6 +1323,7 @@ impl FakeSession {
             live_seq: 0,
             unloads: 0,
             background: Vec::new(),
+            processes: FakeProcesses::default(),
             refused_busy: false,
             subagent: false,
             fork_of: None,
@@ -1594,6 +1631,7 @@ impl FakeSession {
 
     /// Tells clients the session's background work as it is now.
     fn report_background(&mut self) {
+        self.processes.sync(&self.background);
         self.publish(SessionEvent::Background {
             work: self.background.clone(),
         });
@@ -1601,6 +1639,7 @@ impl FakeSession {
 
     /// Starts a background process `sleep 30` with ID `id`.
     fn start_background(&mut self, id: String) {
+        self.processes.start(&id, "sleep 30");
         self.background.push(BackgroundWork {
             item: BackgroundItem::Process { id },
             title: "sleep 30".to_owned(),
@@ -2016,6 +2055,8 @@ struct State {
     /// How many `rho/session/list_detailed` requests it got, each page and
     /// each refusal one.
     detailed_lists: usize,
+    /// How many `rho/session/processes` requests it got.
+    process_reads: usize,
     /// How many of each the daemon has made, for their IDs.
     new_sessions: u64,
     forks: u64,
@@ -2160,6 +2201,7 @@ impl State {
             sessions,
             session_lists: script.session_lists,
             detailed_lists: 0,
+            process_reads: 0,
             new_sessions: 0,
             forks: 0,
             worktrees: 0,

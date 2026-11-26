@@ -67,6 +67,7 @@ use crate::{
 
 mod auth;
 mod marks;
+mod processes;
 mod pull_requests;
 mod worktrees;
 

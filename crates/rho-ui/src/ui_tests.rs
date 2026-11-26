@@ -35,7 +35,7 @@ use rho_ui_core::{
     },
     platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
     Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef,
-    NewSessionMark, PermissionMode, PromptKey, PullRequestId, PullRequestLinkOrigin,
+    NewSessionMark, PermissionMode, ProcessStream, PromptKey, PullRequestId, PullRequestLinkOrigin,
     PullRequestRead, PullRequestRollup, PullRequestState, PullRequestSummary, PullRequestTrouble,
     ReasoningLevel, RestartCost, RetryReason, RhoInstall, RunState, Session, SessionId,
     SessionMark, SessionOptions, SessionPullRequests, StartedMode, StartedSessionDefaults,
@@ -4240,6 +4240,113 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
         );
     });
     ui.shot("exited");
+}
+
+/// Line `ix` of the process output on screen.
+fn process_line(ix: usize) -> ElementId {
+    ElementId::from(("process-line", ix))
+}
+
+/// A background process's row says how long it has run, and opens its
+/// output in the right panel's Background surface, which reads on while
+/// the process runs: what it writes next shows, a line on stderr marked.
+/// Once it ended and its last output is in, nothing is read again; Back
+/// shows the lists, whose ended row opens the output once more.
+#[test]
+fn a_background_process_output_is_followed_until_it_ends() {
+    let mut ui = Harness::start("process-output", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("background");
+    ui.wait_for_session("the turn to end with its process running", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+    let session = SessionId::from("new-1");
+    ui.fake()
+        .write_process(&session, ProcessStream::Stdout, "Compiling rho-ui\nCompil");
+    ui.wait_until("the row's time", |window, _, _| {
+        window
+            .try_find("background-0")
+            .and_then(|row| row.label().map(str::to_owned))
+            .is_some_and(|label| label.starts_with("sleep 30: Running · "))
+    });
+
+    ui.click("background-0");
+    ui.wait_until("the output in the panel", |window, _, _| {
+        is_visible(window, "process-output") && is_visible(window, process_line(1))
+    });
+    assert_eq!(
+        ui.label(process_line(0)).as_deref(),
+        Some("Compiling rho-ui")
+    );
+
+    // What it writes next is read on the output's own poll: the rest of
+    // the line it began, then a line on stderr.
+    ui.fake()
+        .write_process(&session, ProcessStream::Stdout, "ing rho-ui-core\n");
+    ui.fake()
+        .write_process(&session, ProcessStream::Stderr, "warning: unused\n");
+    let lines = |ui: &mut Harness| [1, 2].map(|ix| ui.label(process_line(ix)));
+    ui.poll(
+        WAIT,
+        "the next output",
+        |ui| {
+            ui.cx.advance_clock(Duration::from_millis(500));
+            ui.frame();
+            lines(ui)
+                == [
+                    Some("Compiling rho-ui-core".into()),
+                    Some("warning: unused".into()),
+                ]
+        },
+        |ui| format!("lines 1 and 2 say {:?}", lines(ui)),
+    );
+    ui.shot("following");
+
+    ui.fake().finish_background(&session, 0);
+    ui.poll(
+        WAIT,
+        "the exit",
+        |ui| {
+            ui.cx.advance_clock(Duration::from_secs(1));
+            ui.frame();
+            ui.label("process-output-status")
+                .is_some_and(|status| status.starts_with("Exited 0"))
+        },
+        |ui| format!("it says {:?}", ui.label("process-output-status")),
+    );
+    ui.shot("exited");
+    ui.click("process-output-back");
+    ui.act(|window, _| {
+        assert!(
+            !is_visible(window, "process-output"),
+            "Back shows the lists"
+        );
+        assert!(is_visible(window, "panel-ended-0"));
+    });
+    // Nothing runs and the last output is in: the clock moving on reads
+    // nothing. Following it again reads once, and no more.
+    for _ in 0..10 {
+        ui.cx.advance_clock(Duration::from_secs(1));
+        ui.frame();
+    }
+    let reads = ui.fake().process_reads();
+    ui.click("panel-ended-0");
+    ui.wait_until("the output again", |window, _, _| {
+        is_visible(window, process_line(2))
+    });
+    for _ in 0..10 {
+        ui.cx.advance_clock(Duration::from_secs(1));
+        ui.frame();
+    }
+    assert_eq!(
+        ui.fake().process_reads(),
+        reads + 1,
+        "an ended process's output is read once"
+    );
 }
 
 /// The right panel shows and hides with Ctrl+Alt+B or its toggle, and the
