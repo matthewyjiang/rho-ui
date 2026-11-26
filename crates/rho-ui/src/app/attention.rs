@@ -77,7 +77,9 @@ impl RhoApp {
         let rows = self.sidebar.read(cx).rows();
         let count = rows
             .iter()
-            .filter(|row| row.shelf == Shelf::Active && Call::of(row.status()).is_some())
+            .filter(|row| {
+                row.shelf == Shelf::Active && !row.away() && Call::of(row.status()).is_some()
+            })
             .count();
         let mut calls = self
             .attention
