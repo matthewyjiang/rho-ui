@@ -940,13 +940,10 @@ fn a_ui_calls_surface_is_placed_once_after_the_call() {
     );
 }
 
-/// A message, reply or card knows when it arrived only if it came live:
-/// the daemon's events carry no time, so every replayed entry, the
-/// replay's last one included, has none. A notification card keeps its
-/// tone and the reference its display names it by.
 /// Only what this client saw arrive live has a time: a replay's events
 /// carry none. A replay of the whole conversation over it keeps the times
-/// this client saw, up to the first entry that differs.
+/// this client saw up to the first entry that differs, and that one's if it
+/// is the same message.
 #[test]
 fn only_live_entries_know_when_they_arrived() {
     let user = |id: &str, text: &str| {
@@ -979,10 +976,40 @@ fn only_live_entries_know_when_they_arrived() {
     };
     session.apply(user("u1", "replayed"));
     session.apply(notice());
-    session.apply(user("u2", "live"));
+    session.apply(user("u2", "edited"));
     session.apply(notice());
-    session.apply(user("u3", "edited"));
+    session.apply(user("u3", "live too"));
     assert_eq!(arrived(&session), [false; 5]);
-    session.keep_arrivals(&shown);
-    assert_eq!(arrived(&session), [false, false, true, true, false]);
+    assert_eq!(
+        session.keep_arrivals(&shown),
+        2,
+        "the edited message differs"
+    );
+    assert_eq!(arrived(&session), [false, false, true, false, false]);
+}
+
+/// A notice of several lines, as a provider's diagnostic is, reads its
+/// first line on one row and keeps the rest to open.
+#[test]
+fn a_notice_of_several_lines_keeps_the_rest_as_its_detail() {
+    let mut session = session();
+    session.apply(update(
+        json!({"type": "notice", "text": "provider diagnostic:\nquota exceeded\nretry later"}),
+    ));
+    session.apply(update(json!({"type": "notice", "text": "PR merged\n"})));
+    let notices: Vec<(&str, Option<&str>)> = session
+        .entries()
+        .iter()
+        .map(|entry| match entry {
+            Entry::Notice(notice) => (notice.title(), notice.description()),
+            other => panic!("no {other:?} was sent"),
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [
+            ("provider diagnostic:", Some("quota exceeded\nretry later")),
+            ("PR merged", None),
+        ]
+    );
 }

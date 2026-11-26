@@ -12,8 +12,9 @@
 //!
 //! Each card row is one of the transcript's rows, so only the rows near
 //! the window are drawn: each draws its own stretch of the line, which
-//! meets its neighbors' as the rows touch. Placing a row reads its run's
-//! tones, which costs the run's length, not the transcript's.
+//! meets its neighbors' as the rows touch. The transcript places a run's
+//! rows ([`places`]) once, when the run changes, not each frame: a folded
+//! card is an empty row, so every one in view draws each frame.
 //!
 //! The sizes come from the C1 mockup (`wake-rail.html`) the design was
 //! picked from.
@@ -108,11 +109,10 @@ pub(crate) enum Place {
     Hidden,
 }
 
-/// Where card `at` of a run with these tones goes, while the user has the
+/// Where each card of a run with these tones goes, while the user has the
 /// run's folded cards `shown` or not: on its own row, as the fold row, or
-/// nowhere. The line stops at the last row that shows. It costs the run's
-/// length.
-pub(crate) fn place(tones: &[NoticeTone], shown: Disclosure, at: usize) -> Place {
+/// nowhere. The line stops at the last row that shows.
+pub(crate) fn places(tones: &[NoticeTone], shown: Disclosure) -> Vec<Place> {
     let folds = if shown.is_open() {
         Vec::new()
     } else {
@@ -125,20 +125,24 @@ pub(crate) fn place(tones: &[NoticeTone], shown: Disclosure, at: usize) -> Place
             .is_some_and(|rest| rest.binary_search(&card).is_ok())
     };
     let last_shown = (0..tones.len()).rev().find(|&card| !hidden(card));
-    let ends = Ends {
-        first: at == 0,
-        last: Some(at) == last_shown,
-    };
-    if folds.first() == Some(&at) {
-        Place::Fold {
-            ends,
-            folded: folds,
-        }
-    } else if hidden(at) {
-        Place::Hidden
-    } else {
-        Place::Card(ends)
-    }
+    (0..tones.len())
+        .map(|at| {
+            let ends = Ends {
+                first: at == 0,
+                last: Some(at) == last_shown,
+            };
+            if folds.first() == Some(&at) {
+                Place::Fold {
+                    ends,
+                    folded: folds.clone(),
+                }
+            } else if hidden(at) {
+                Place::Hidden
+            } else {
+                Place::Card(ends)
+            }
+        })
+        .collect()
 }
 
 /// Where a row sits on its stretch of the rail: the line runs up from its
@@ -202,18 +206,29 @@ pub(crate) struct Line<'a> {
 impl<'a> Line<'a> {
     pub(crate) fn of(notice: &'a Notice) -> Self {
         let subject = notice.reference().and_then(Subject::of);
-        let (outcome, name) = match notice.title().split_once(" · ") {
-            Some((outcome, name)) => (outcome, Some(name)),
-            None => (notice.title(), None),
-        };
-        let named_by_chip = |name: &&str| subject.as_ref().is_some_and(|s| s.reference() == *name);
+        let (outcome, name) = outcome_and_name(notice.title(), subject.as_ref());
         Self {
             tone: notice.tone(),
             outcome,
-            name: name.filter(|name| !named_by_chip(name)),
+            name,
             subject,
             arrived: notice.arrived(),
         }
+    }
+}
+
+/// A card's title "Outcome · name" split in two, without a name its chip
+/// shows already.
+fn outcome_and_name<'a>(
+    title: &'a str,
+    subject: Option<&Subject<'_>>,
+) -> (&'a str, Option<&'a str>) {
+    match title.split_once(" · ") {
+        Some((outcome, name)) if subject.is_some_and(|subject| subject.reference() == name) => {
+            (outcome, None)
+        }
+        Some((outcome, name)) => (outcome, Some(name)),
+        None => (title, None),
     }
 }
 
@@ -509,9 +524,7 @@ mod tests {
         use NoticeTone::{Error as Err, Neutral as N};
         let mut tones = vec![N; FOLD_AFTER];
         tones.extend([N, Err, N]);
-        let places: Vec<Place> = (0..tones.len())
-            .map(|at| place(&tones, Disclosure::Folded, at))
-            .collect();
+        let folded = places(&tones, Disclosure::Folded);
         let ends = |first, last| Ends { first, last };
         let mut want = vec![Place::Card(ends(true, false))];
         want.extend((1..FOLD_AFTER).map(|_| Place::Card(ends(false, false))));
@@ -523,10 +536,54 @@ mod tests {
             Place::Card(ends(false, true)),
             Place::Hidden,
         ]);
-        assert_eq!(places, want);
+        assert_eq!(folded, want);
         assert_eq!(
-            place(&tones, Disclosure::Open, tones.len() - 1),
-            Place::Card(ends(false, true))
+            places(&tones, Disclosure::Open).last(),
+            Some(&Place::Card(ends(false, true)))
         );
+    }
+
+    /// A reference shaped as a pull request's makes a chip labelled
+    /// without its owner, and a title's name the chip shows already goes.
+    #[test]
+    fn a_card_reads_its_chip_and_line_off_its_title_and_reference() {
+        let cases = [
+            (
+                "Approved · o/r#12",
+                Some("o/r#12"),
+                Some("r#12"),
+                "Approved",
+                None,
+            ),
+            (
+                "Approved · rho#12",
+                Some("rho#12"),
+                Some("rho#12"),
+                "Approved",
+                None,
+            ),
+            (
+                "Completed · brief",
+                Some("run-7"),
+                None,
+                "Completed",
+                Some("brief"),
+            ),
+            ("Exited · p", Some("#12"), None, "Exited", Some("p")),
+            ("Exited · p", Some("repo#"), None, "Exited", Some("p")),
+            ("PR merged", None, None, "PR merged", None),
+        ];
+        for (title, reference, chip, outcome, name) in cases {
+            let subject = reference.and_then(Subject::of);
+            let label = subject
+                .as_ref()
+                .map(|Subject::PullRequest { label, .. }| *label);
+            assert_eq!(label, chip, "{reference:?}");
+            assert_eq!(
+                outcome_and_name(title, subject.as_ref()),
+                (outcome, name),
+                "{title}"
+            );
+        }
     }
 }

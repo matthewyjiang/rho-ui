@@ -433,13 +433,21 @@ pub struct Notice {
 }
 
 impl Notice {
-    /// A plain notice: one line, routine.
-    fn text(title: String, arrived: Option<DateTime<Utc>>) -> Self {
+    /// A plain notice, routine: its first line is its title, and the rest,
+    /// such as a provider's diagnostic under "provider diagnostic:", its
+    /// detail.
+    fn text(text: &str, arrived: Option<DateTime<Utc>>) -> Self {
+        let (title, description) = match text.split_once('\n') {
+            Some((title, rest)) if !rest.trim().is_empty() => {
+                (title.to_owned(), Some(rest.trim().to_owned()))
+            }
+            _ => (text.trim().to_owned(), None),
+        };
         Self {
             tone: NoticeTone::Neutral,
             title,
             reference: None,
-            description: None,
+            description,
             arrived,
         }
     }
@@ -565,6 +573,16 @@ impl Entry {
             Self::Agent(message) | Self::Thought(message) => message.arrived,
             Self::Notice(notice) => notice.arrived,
             Self::Tool(_) | Self::Compaction(_) | Self::Surface(_) | Self::Wake => None,
+        }
+    }
+
+    /// Whether both are the same message, by the daemon's ID, though it may
+    /// have changed.
+    fn is_same_message(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::User(a), Self::User(b)) => a.id == b.id,
+            (Self::Agent(a), Self::Agent(b)) | (Self::Thought(a), Self::Thought(b)) => a.id == b.id,
+            _ => false,
         }
     }
 
@@ -900,18 +918,23 @@ impl Session {
 
     /// Gives the entries a replay of the whole conversation rebuilt the
     /// times their twins in `shown`, the entries it replaced
-    /// ([`Continuity::Replaced`]), had, up to the first that differs: a
-    /// replay carries no times, but this client saw those arrive. Call it
-    /// once the replay caught up.
-    pub fn keep_arrivals(&mut self, shown: &[Entry]) {
-        for (entry, was) in self.entries.iter_mut().zip(shown) {
+    /// ([`Continuity::Replaced`]), had, and returns the first that differs
+    /// from its twin: a replay carries no times, but this client saw those
+    /// arrive, so only what changed is new. The first that differs keeps
+    /// its time too if it is the same message, such as a reply that went
+    /// on streaming. Call it once the replay caught up.
+    pub fn keep_arrivals(&mut self, shown: &[Entry]) -> usize {
+        for (at, (entry, was)) in self.entries.iter_mut().zip(shown).enumerate() {
             let replayed = entry.arrived();
             entry.set_arrived(was.arrived());
             if entry != was {
-                entry.set_arrived(replayed);
-                break;
+                if !entry.is_same_message(was) {
+                    entry.set_arrived(replayed);
+                }
+                return at;
             }
         }
+        shown.len().min(self.entries.len())
     }
 
     /// Background work an earlier run of the client saw, given before the
@@ -1301,7 +1324,7 @@ impl Session {
                 Some(self.append_message(message.as_str(), &text, Entry::Thought, arrived))
             }
             SessionEvent::ToolCall(update) => Some(self.update_tool(*update)),
-            SessionEvent::Notice { text } => Some(self.push_notice(Notice::text(text, arrived))),
+            SessionEvent::Notice { text } => Some(self.push_notice(Notice::text(&text, arrived))),
             SessionEvent::Card {
                 title,
                 markdown,
@@ -1480,8 +1503,8 @@ impl Session {
                 let timeout = closed
                     .timeout()
                     .filter(|_| resolution == Resolution::TimedOut)?;
-                // A question that needed the user: it reads as one, so it
-                // never folds on the rail.
+                // It asks for the user's look, as the question did. The
+                // answer can run long, so the detail says it whole.
                 return Some(self.push_notice(Notice {
                     tone: NoticeTone::Accent,
                     title: format!(
@@ -1489,7 +1512,11 @@ impl Session {
                         timeout.fallback()
                     ),
                     reference: None,
-                    description: Some(closed.title().to_owned()),
+                    description: Some(format!(
+                        "{}\n\nRho answered: {}",
+                        closed.title(),
+                        timeout.fallback()
+                    )),
                     arrived,
                 }));
             }

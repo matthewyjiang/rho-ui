@@ -910,8 +910,7 @@ impl SessionView {
         match std::mem::replace(&mut self.loading, Loading::Ready) {
             Loading::Ready | Loading::Attaching => {}
             Loading::Replaying(shown) => {
-                self.session.keep_arrivals(&shown);
-                let from = first_change(&shown, self.session.entries());
+                let from = first_change(&shown, self.session.keep_arrivals(&shown));
                 // `from`, not the start that the replay itself reports.
                 self.session.take_removed();
                 self.transcript.truncate(from, self.session.entries(), cx);
@@ -2202,15 +2201,15 @@ impl Render for SessionView {
     }
 }
 
-/// The first entry of `now` whose row differs from the one built for
-/// `shown`'s: where the two part, or the first surface, whose panel a new
-/// store makes again.
-fn first_change(shown: &[Entry], now: &[Entry]) -> usize {
-    shown
+/// The first entry whose row must be built again over what was built for
+/// `shown`: where the replay that replaced it first `differs`
+/// ([`Session::keep_arrivals`]), or the first surface before that, whose
+/// panel a new store makes again.
+fn first_change(shown: &[Entry], differs: usize) -> usize {
+    shown[..differs]
         .iter()
-        .zip(now)
-        .position(|(was, is)| was != is || matches!(is, Entry::Surface(_)))
-        .unwrap_or_else(|| shown.len().min(now.len()))
+        .position(|entry| matches!(entry, Entry::Surface(_)))
+        .unwrap_or(differs)
 }
 
 /// A held message on one line: its text, and what is attached to it, such

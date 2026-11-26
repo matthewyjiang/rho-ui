@@ -60,7 +60,7 @@
 //!   can be observed but not attached to. Every other session runs as the
 //!   default agent, but for a new one that names its own.
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
-//!   whole result as a card, [`subagent_result`], and the parent's daemon
+//!   whole result as a card, `subagent_result`, and the parent's daemon
 //!   turn tells the model, as for a process.
 //! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
 //!   in a session. Its two agent nodes are in the job list only: one
@@ -252,7 +252,7 @@ pub const WORKFLOW_ERROR: &str = "provider refused the request";
 
 /// The whole result the subagent [`SUBAGENT_TASK`] returns, in Markdown:
 /// as long as an explorer's report, with headings, a list and code.
-pub fn subagent_result() -> String {
+fn subagent_result() -> String {
     let parts = (1..=6).map(|n| {
         format!("\n## {n}. Part {n}\n\n- `src/parse.rs:{n}0`\n\n```rust\nfn part_{n}() {{}}\n```\n")
     });

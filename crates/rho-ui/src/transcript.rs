@@ -15,7 +15,13 @@
 //! each of its parts ([`crate::parts`]), so the scroller draws only the
 //! parts near the window.
 
-use std::{cell::RefCell, collections::HashSet, ops::Range, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    ops::Range,
+    rc::Rc,
+    time::Duration,
+};
 
 use web_time::Instant;
 
@@ -248,6 +254,11 @@ pub(crate) struct Transcript {
     /// The runs of cards the user unfolded, by their first card's entry:
     /// one opened stays open.
     unfolded: HashSet<usize>,
+    /// Per card row drawn since its run last changed: its run's first row
+    /// and where the run's cards go ([`rail::places`]). A folded card is
+    /// an empty row, so every one in view draws each frame: placing its
+    /// run each time would cost the run's length per row.
+    placed: RefCell<HashMap<usize, PlacedRun>>,
     /// Per turn: whether its folded working is open.
     worked: Vec<Disclosure>,
     /// Per turn: how long it took, for turns rho-ui watched. The daemon
@@ -279,6 +290,7 @@ impl Transcript {
             steps: Vec::new(),
             details: Vec::new(),
             unfolded: HashSet::new(),
+            placed: RefCell::default(),
             worked: Vec::new(),
             took: Vec::new(),
             running: None,
@@ -379,7 +391,10 @@ impl Transcript {
             }
         }
         // A card that joins a run moves the run's end and may fold some of
-        // it: the run's rows draw anew.
+        // it: the run's rows are placed and draw anew.
+        if synced.added > 0 {
+            self.placed.get_mut().clear();
+        }
         if let Some(before) = (rows - synced.added).checked_sub(1) {
             if synced.added > 0 && self.card_at(before, entries).is_some() {
                 self.remeasure(self.run_of(before, entries), cx);
@@ -429,6 +444,7 @@ impl Transcript {
         self.steps.truncate(rows);
         self.details.truncate(from);
         self.unfolded.retain(|&first| first < from);
+        self.placed.get_mut().clear();
         self.attachments.truncate(from);
         self.markdown.truncate(from);
         self.pictures
@@ -708,6 +724,7 @@ impl Transcript {
                     return;
                 };
                 self.unfolded.insert(entry);
+                self.placed.get_mut().clear();
                 self.run_of(row, entries)
             }
         };
@@ -914,6 +931,35 @@ impl Transcript {
 }
 
 impl Transcript {
+    /// The run of cards at `row`, placed once, then looked up until the
+    /// run changes.
+    fn placed(&self, row: usize, entries: &[Entry]) -> PlacedRun {
+        if let Some(run) = self.placed.borrow().get(&row) {
+            return run.clone();
+        }
+        let run = self.run_of(row, entries);
+        let tones: Vec<_> = run
+            .clone()
+            .filter_map(|row| self.card_at(row, entries))
+            .map(|(_, card)| card.tone())
+            .collect();
+        let first = self.card_at(run.start, entries).map(|(entry, _)| entry);
+        let shown = if first.is_some_and(|first| self.unfolded.contains(&first)) {
+            Disclosure::Open
+        } else {
+            Disclosure::Folded
+        };
+        let placed = PlacedRun {
+            start: run.start,
+            places: rail::places(&tones, shown).into(),
+        };
+        let mut cache = self.placed.borrow_mut();
+        for row in run {
+            cache.insert(row, placed.clone());
+        }
+        placed
+    }
+
     /// Card `ix`, at `row`, on the rail with the rest of its run: its row,
     /// the row that folds it with the run's other routine cards, or nothing
     /// while it is folded. An open card shows its body under its row.
@@ -925,34 +971,30 @@ impl Transcript {
         act: &ActionHandler,
         cx: &App,
     ) -> AnyElement {
-        let run = self.run_of(row, entries);
-        let cards: Vec<(usize, &Notice)> = run
-            .clone()
-            .filter_map(|row| self.card_at(row, entries))
-            .collect();
-        let tones: Vec<_> = cards.iter().map(|(_, card)| card.tone()).collect();
-        // `run_of` spans only card rows, so `cards` has one for each.
-        let first = cards[0].0;
-        let shown = if self.unfolded.contains(&first) {
-            Disclosure::Open
-        } else {
-            Disclosure::Folded
-        };
-        let at = row - run.start;
-        match rail::place(&tones, shown, at) {
+        let PlacedRun { start, places } = self.placed(row, entries);
+        // A run spans only card rows.
+        let card = |at: usize| self.card_at(start + at, entries).map(|(_, card)| card);
+        let first = self.card_at(start, entries).map_or(ix, |(entry, _)| entry);
+        match &places[row - start] {
             // An empty row. When it ends the run, it carries the gap below
             // the run (see `continues_rail`).
             rail::Place::Hidden => div().into_any_element(),
             rail::Place::Fold { ends, folded } => {
-                let folded: Vec<Line<'_>> =
-                    folded.iter().map(|&card| Line::of(cards[card].1)).collect();
+                let folded: Vec<Line<'_>> = folded
+                    .iter()
+                    .filter_map(|&at| card(at))
+                    .map(Line::of)
+                    .collect();
                 let act = Rc::clone(act);
                 let unfold = move |window: &mut Window, cx: &mut App| {
                     act(Action::Unfold { entry: first }, window, cx);
                 };
-                rail::fold_row(ix, &folded, ends, unfold, cx)
+                rail::fold_row(ix, &folded, *ends, unfold, cx)
             }
             rail::Place::Card(ends) => {
+                let Some(notice) = card(row - start) else {
+                    return div().into_any_element();
+                };
                 let body = self.text(ix, 0);
                 let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
                 let detail = body.filter(|_| open).map(|body| {
@@ -968,10 +1010,18 @@ impl Transcript {
                         act(Action::Card { entry: ix }, window, cx);
                     }
                 });
-                rail::card_row(ix, &Line::of(cards[at].1), ends, detail, toggle, cx)
+                rail::card_row(ix, &Line::of(notice), *ends, detail, toggle, cx)
             }
         }
     }
+}
+
+/// A run of cards, placed: its first row, and where each of its cards
+/// goes.
+#[derive(Clone, Debug)]
+struct PlacedRun {
+    start: usize,
+    places: Rc<[rail::Place]>,
 }
 
 /// Whether a row is still being written.
