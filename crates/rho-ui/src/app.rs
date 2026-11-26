@@ -2163,6 +2163,11 @@ impl RhoApp {
                     this.panel
                         .update(cx, |panel, cx| panel.show_background(window, cx));
                 }
+                SessionEvent::ShowContext => {
+                    PanelLayout::show(cx);
+                    this.panel
+                        .update(cx, |panel, cx| panel.show_context(window, cx));
+                }
                 SessionEvent::SideChat(prompt) => {
                     this.start_side_chat(view, prompt.clone(), window, cx);
                 }
@@ -2302,6 +2307,15 @@ impl RhoApp {
     /// UI tests.
     pub(crate) fn brief_text(&self, cx: &App) -> Option<String> {
         self.panel.read(cx).brief_text(cx)
+    }
+    /// Why the right panel's Context surface's latest read found nothing,
+    /// the context's tokens it last found, and how many reads have landed,
+    /// if it is open, for UI tests.
+    pub(crate) fn context_read(
+        &self,
+        cx: &App,
+    ) -> Option<(Option<rho_ui_core::ReportError>, Option<u64>, usize)> {
+        self.panel.read(cx).context_read(cx)
     }
     /// The right panel's tabs, in order, for UI tests.
     pub(crate) fn panel_tabs(&self, cx: &App) -> Vec<crate::right_panel::Surface> {

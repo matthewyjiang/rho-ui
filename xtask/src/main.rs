@@ -391,8 +391,19 @@ fn dev(checkout: &Path, args: &[&str]) -> Result<()> {
 
     let lock_file = root().join("Cargo.lock");
     let lock = fs::read(&lock_file).context("couldn't read Cargo.lock")?;
+    // Patch the source the workspace takes rho-protocol from: the git
+    // repository its line in Cargo.toml names, before a release has the
+    // commit it needs, else crates.io.
+    let manifest =
+        fs::read_to_string(root().join("Cargo.toml")).context("couldn't read Cargo.toml")?;
+    let source = manifest
+        .lines()
+        .find(|line| line.starts_with("rho-protocol"))
+        .and_then(|line| line.split("git = \"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .map_or_else(|| "crates-io".to_owned(), |url| format!("'{url}'"));
     let built = run(cargo(&["build", "-p", "rho-ui", "--config"]).arg(format!(
-        "patch.crates-io.rho-protocol.path='{}'",
+        "patch.{source}.rho-protocol.path='{}'",
         protocol.display()
     )));
     if fs::read(&lock_file).ok().as_ref() != Some(&lock) {

@@ -18,7 +18,10 @@ rust-version = "1.98"
 # as (`SessionEvent::Agent`), and lists the models a model setting may
 # take (`rho/model/list`). 1.5 forks a session (`rho/session/fork`), for
 # side chats.
-rho-protocol = "1.5.0"
+# Until rho-ui 0.3.0, from a rho commit rather than crates.io: it types a
+# session's reports (rho#2040), which no release has yet. The release
+# takes it from crates.io again.
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "51013f45787dcf22050c551018a1ff9a905a5493" }
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 

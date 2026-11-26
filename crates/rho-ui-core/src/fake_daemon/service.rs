@@ -11,8 +11,9 @@ use rho_protocol::{
         JobId, JobKind, JobListResponse, JobLive, JobState, JobSummary, MessageId, Resolution,
         SessionConfigureParams, SessionConfigureResponse, SessionDeleteParams,
         SessionDeleteResponse, SessionId, SessionListParams, SessionListResponse,
-        SessionObserveParams, SessionRenameParams, SessionRenameResponse, SessionSummary,
-        SessionUnsteerParams, SessionUnsteerResponse, SteerId, StreamId,
+        SessionObserveParams, SessionRenameParams, SessionRenameResponse, SessionReportParams,
+        SessionReportResponse, SessionSummary, SessionUnsteerParams, SessionUnsteerResponse,
+        SteerId, StreamId,
     },
     ApprovalAsk, ApprovalSource, Ask, AuthChooseStoreParams, AuthChooseStoreResponse,
     AuthKeyParams, AuthKeyResponse, AuthListParams, AuthListResponse, AuthLoginCancelParams,
@@ -1183,6 +1184,13 @@ impl Service for Fake {
         params: SessionPullRequestUnlinkParams,
     ) -> Result<SessionPullRequestUnlinkResponse, RpcError> {
         self.lock().unlink_pull_request(&params)
+    }
+
+    async fn report_session(
+        &self,
+        params: SessionReportParams,
+    ) -> Result<SessionReportResponse, RpcError> {
+        self.lock().report(&params)
     }
 
     async fn prune_worktrees(
