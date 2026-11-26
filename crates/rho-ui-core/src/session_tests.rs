@@ -561,7 +561,8 @@ fn requests_open_once_and_close_when_any_client_answers() {
 }
 
 /// A question with a timeout keeps it until a client holds it; one the
-/// deadline answered says what rho answered, in case the user meant to.
+/// deadline answered says what rho answered, in case the user meant to,
+/// as a question: it never folds on the rail.
 #[test]
 fn a_timed_out_question_leaves_the_answer_rho_gave() {
     let question = |id: u64| {
@@ -593,7 +594,7 @@ fn a_timed_out_question_leaves_the_answer_rho_gave() {
                 notice.title(),
                 "No answer came in time, so Rho answered “A”"
             );
-            assert_eq!(notice.tone(), NoticeTone::Warning);
+            assert_eq!(notice.tone(), NoticeTone::Accent);
         }
         other => panic!("the transcript holds {other:?}"),
     }

@@ -1480,8 +1480,10 @@ impl Session {
                 let timeout = closed
                     .timeout()
                     .filter(|_| resolution == Resolution::TimedOut)?;
+                // A question that needed the user: it reads as one, so it
+                // never folds on the rail.
                 return Some(self.push_notice(Notice {
-                    tone: NoticeTone::Warning,
+                    tone: NoticeTone::Accent,
                     title: format!(
                         "No answer came in time, so Rho answered “{}”",
                         timeout.fallback()
