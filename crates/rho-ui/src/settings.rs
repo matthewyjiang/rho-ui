@@ -1,10 +1,11 @@
 //! rho-ui's own settings: light or dark, UI scale, fonts, whether scrolling
-//! glides, whether the sidebar warns of a daemon of another build, the
-//! machines it connects to, and the forge CLIs' programs on each. They live in
-//! `settings` in rho-ui's config folder ([`AppDir::Config`]: by default
-//! `~/.config/rho-ui`), one `key = value` per line. In a browser they are
-//! that file on the server's machine, as `rho-ui serve` shares it. The
-//! look applies to GPUI Kit's theme; the app follows the machines.
+//! glides, which sessions send desktop notifications, whether the sidebar
+//! warns of a daemon of another build, the machines it connects to, and the
+//! forge CLIs' programs on each. They live in `settings` in rho-ui's config
+//! folder ([`AppDir::Config`]: by default `~/.config/rho-ui`), one
+//! `key = value` per line. In a browser they are that file on the server's
+//! machine, as `rho-ui serve` shares it. The look applies to GPUI Kit's
+//! theme; the app follows the machines.
 
 #[cfg(not(target_family = "wasm"))]
 use std::io;
@@ -20,6 +21,7 @@ use rho_ui_core::server::{
 };
 
 use crate::{
+    attention::Call,
     forge::{CliPaths, ForgeCli},
     machines::{MachineId, RemoteMachine, LOCAL},
     store,
@@ -178,11 +180,66 @@ impl SmoothScroll {
     }
 }
 
+/// Which sessions send a desktop notification while rho-ui is in the
+/// background ([`crate::attention`]). The window's title counts them all
+/// whatever this says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Notifications {
+    /// A session that needs the user, and one whose turn ended.
+    #[default]
+    All,
+    /// Only a session that needs the user.
+    NeedsYou,
+    Off,
+}
+
+impl Notifications {
+    pub(crate) const CHOICES: [Notifications; 3] = [
+        Notifications::All,
+        Notifications::NeedsYou,
+        Notifications::Off,
+    ];
+
+    /// What the settings file calls it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Notifications::All => "all",
+            Notifications::NeedsYou => "needs_you",
+            Notifications::Off => "off",
+        }
+    }
+
+    /// What settings call it.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Notifications::All => "Needs you and Done",
+            Notifications::NeedsYou => "Needs you only",
+            Notifications::Off => "Off",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::CHOICES
+            .into_iter()
+            .find(|choice| choice.name() == name)
+    }
+
+    /// Whether a session that starts to want `call` sends one.
+    pub(crate) fn sends(self, call: Call) -> bool {
+        match self {
+            Notifications::All => true,
+            Notifications::NeedsYou => call == Call::NeedsYou,
+            Notifications::Off => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Settings {
     pub(crate) appearance: Appearance,
     pub(crate) ui_scale: UiScale,
     pub(crate) smooth_scroll: SmoothScroll,
+    pub(crate) notifications: Notifications,
     pub(crate) ui_font: SharedString,
     pub(crate) code_font: SharedString,
     /// Whether the sidebar warns of a daemon of another build than
@@ -228,6 +285,7 @@ impl Default for Settings {
             appearance: Appearance::default(),
             ui_scale: UiScale::default(),
             smooth_scroll: SmoothScroll::default(),
+            notifications: Notifications::default(),
             ui_font: DEFAULT_UI_FONT.into(),
             code_font: DEFAULT_CODE_FONT.into(),
             warn_other_builds: true,
@@ -354,10 +412,11 @@ impl Settings {
     /// `.<program>`.
     fn to_text(&self) -> String {
         let mut text = format!(
-            "appearance = {}\nui_scale = {}\nsmooth_scroll = {}\nui_font = {}\ncode_font = {}\nwarn_other_builds = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
+            "appearance = {}\nui_scale = {}\nsmooth_scroll = {}\nnotifications = {}\nui_font = {}\ncode_font = {}\nwarn_other_builds = {}\nlocal.label = {}\nlocal.clone_folder = {}\n",
             self.appearance.name(),
             self.ui_scale.percent(),
             self.smooth_scroll.name(),
+            self.notifications.name(),
             self.ui_font,
             self.code_font,
             self.warn_other_builds,
@@ -465,6 +524,11 @@ fn parse(text: &str) -> Settings {
                     settings.smooth_scroll = smooth_scroll;
                 }
             }
+            "notifications" => {
+                if let Some(notifications) = Notifications::from_name(value) {
+                    settings.notifications = notifications;
+                }
+            }
             "ui_font" if !value.is_empty() => settings.ui_font = value.to_owned().into(),
             "code_font" if !value.is_empty() => settings.code_font = value.to_owned().into(),
             "warn_other_builds" => {
@@ -534,6 +598,7 @@ mod tests {
     fn machines_survive_a_save_in_the_order_added() {
         let mut settings = Settings {
             smooth_scroll: SmoothScroll::On,
+            notifications: Notifications::NeedsYou,
             warn_other_builds: false,
             local_label: "laptop".into(),
             local_clone_folder: "~/code".to_owned(),
@@ -553,6 +618,7 @@ mod tests {
         let read = parse(&settings.to_text());
         assert_eq!(read.machines, settings.machines);
         assert_eq!(read.smooth_scroll, SmoothScroll::On);
+        assert_eq!(read.notifications, Notifications::NeedsYou);
         assert!(!read.warn_other_builds);
         assert_eq!(read.local_label, "laptop");
         assert_eq!(read.local_clone_folder, "~/code");

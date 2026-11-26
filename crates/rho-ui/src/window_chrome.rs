@@ -108,13 +108,18 @@ const LIGHT_HEIGHT: Pixels = px(16.);
 /// The gap between the traffic lights and the first control after them.
 const LIGHTS_GAP: Pixels = px(8.);
 
+/// The window's title, which the taskbar and window switchers show;
+/// [`crate::attention::window_title`] counts the sessions that want the
+/// user ahead of it.
+pub(crate) const TITLE: &str = "Rho";
+
 /// The system title bar's replacement for `window_options`: none on
 /// Windows and macOS, where the app draws its own, with the traffic lights
 /// centered in the top row.
 pub(crate) fn titlebar_options(cx: &App) -> TitlebarOptions {
     let chrome = Chrome::get(cx);
     TitlebarOptions {
-        title: Some("Rho".into()),
+        title: Some(TITLE.into()),
         appears_transparent: *chrome != Chrome::System,
         traffic_light_position: (*chrome == Chrome::Mac).then(|| traffic_lights(cx)),
     }

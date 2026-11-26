@@ -45,13 +45,17 @@ use rho_ui_core::{
     PendingUpgrade, Prompt, Session, SessionId, VersionFix, VersionMismatch, LEAD_AGENT,
 };
 
+mod attention;
 mod daemon_control;
 mod opening;
 mod side_chat;
 
+use attention::Attention;
+
 use crate::machines::RemoteMachine;
 use crate::{
     app_update::AppUpdate,
+    attention::Notifier,
     auths::Auths,
     background_log::BackgroundLog,
     cloning,
@@ -120,6 +124,8 @@ pub(crate) struct LaunchConfig {
     /// keep it in a temporary folder. A browser reaches even this machine
     /// through its link, so it has none.
     pub(crate) rho_home: Option<PathBuf>,
+    /// Where notifications go: the desktop's, except in tests.
+    pub(crate) notifier: Notifier,
 }
 
 impl LaunchConfig {
@@ -173,8 +179,9 @@ struct Connection {
     task: Task<()>,
     /// Polls the daemon's jobs while connected; see [`JOB_POLL`].
     jobs_task: Task<()>,
-    /// The jobs as last polled, to tell when they change.
-    jobs: Vec<Job>,
+    /// The jobs as last polled, to tell when they change; `None` until
+    /// the connection's first listing, which always reaches the sidebar.
+    jobs: Option<Vec<Job>>,
     /// The latest `list_sessions`; a newer refresh replaces it.
     sessions_task: Task<()>,
 }
@@ -190,7 +197,7 @@ impl Connection {
             restarted_older: false,
             task: Task::ready(()),
             jobs_task: Task::ready(()),
-            jobs: Vec::new(),
+            jobs: None,
             sessions_task: Task::ready(()),
         }
     }
@@ -276,8 +283,11 @@ pub(crate) struct RhoApp {
     asking: bool,
     /// Smooth wheel scrolling and touchpad flings for the whole window.
     kinetic: Rc<Kinetic>,
+    /// The count in the title, and the notifications of sessions that
+    /// want the user while the window is in the background.
+    attention: Attention,
     focus_handle: FocusHandle,
-    _subscriptions: [Subscription; 8],
+    _subscriptions: [Subscription; 9],
 }
 
 impl RhoApp {
@@ -317,6 +327,10 @@ impl RhoApp {
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
                 this.sidebar_event(event, window, cx);
             });
+        // A session started or stopped wanting the user.
+        let attention_subscription = cx.observe_in(&sidebar, window, |this, _, window, cx| {
+            this.attention_changed(window, cx);
+        });
         let installs_subscription = cx.subscribe_in(
             &installs,
             window,
@@ -334,6 +348,7 @@ impl RhoApp {
             |this, _, action: &DaemonAction, window, cx| this.daemon_action(action, window, cx),
         );
         let shell = launch.shell.clone();
+        let notifier = launch.notifier.clone();
         let panel = cx
             .new(|cx| RightPanel::new(workspaces.clone(), shell, prs.clone(), sidebar.clone(), cx));
         let mut app = Self {
@@ -358,6 +373,7 @@ impl RhoApp {
             pane: Pane::Empty,
             asking: false,
             kinetic: Rc::default(),
+            attention: Attention::new(notifier),
             focus_handle,
             _subscriptions: [
                 sidebar_subscription,
@@ -380,14 +396,18 @@ impl RhoApp {
                 cx.observe_global_in::<Settings>(window, |_, window, cx| {
                     window_chrome::place_traffic_lights(window, cx);
                 }),
-                // Pull requests wait while the window is unfocused.
+                // Pull requests wait while the window is unfocused, and
+                // notifications are sent only then.
                 cx.observe_window_activation(window, |this, window, cx| {
                     let focus = Focus::of(window);
                     this.prs.update(cx, |prs, cx| prs.set_focus(focus, cx));
+                    this.focus_changed(focus, cx);
                 }),
+                attention_subscription,
                 cx.observe_global_in::<PanelLayout>(window, Self::panel_toggled),
             ],
         };
+        Self::answer_notifications(window, cx);
         app.sync_machines(window, cx);
         app
     }
@@ -527,6 +547,7 @@ impl RhoApp {
         self.prs.update(cx, |prs, cx| prs.forget(machine, cx));
         self.installs
             .update(cx, |installs, cx| installs.set_upgrade(machine, None, cx));
+        self.unprime_attention(machine);
         self.next_epoch += 1;
         let epoch = self.next_epoch;
         let Some(target) = self
@@ -544,8 +565,7 @@ impl RhoApp {
         connection.restarting = false;
         connection.stopped = false;
         connection.jobs_task = Task::ready(());
-        // So the first listing on the new connection reaches the sidebar.
-        connection.jobs.clear();
+        connection.jobs = None;
         connection.daemon = None;
         let id = machine.clone();
         connection.task = cx.spawn_in(window, async move |this, cx| {
@@ -629,7 +649,12 @@ impl RhoApp {
                 loop {
                     let changed = match daemon.jobs().await {
                         Ok(jobs) => {
-                            match this.update(cx, |this, cx| this.set_jobs(&machine, &jobs, cx)) {
+                            let set = this.update(cx, |this, cx| {
+                                let changed = this.set_jobs(&machine, &jobs, cx);
+                                this.prime_attention(&machine, cx);
+                                changed
+                            });
+                            match set {
                                 Ok(changed) => changed,
                                 Err(_) => return,
                             }
@@ -698,9 +723,10 @@ impl RhoApp {
         cx: &mut Context<'_, Self>,
     ) {
         let (mut stopped, mut restarted_older) = (false, false);
+        self.unprime_attention(machine);
         if let Some(connection) = self.connection_mut(machine) {
             connection.daemon = None;
-            connection.jobs.clear();
+            connection.jobs = None;
             stopped = connection.stopped;
             restarted_older = std::mem::take(&mut connection.restarted_older);
         }
@@ -772,16 +798,17 @@ impl RhoApp {
         let Some(connection) = self.connection_mut(machine) else {
             return false;
         };
-        let same = connection.jobs.len() == active.len()
-            && connection
-                .jobs
-                .iter()
-                .zip(active)
-                .all(|(was, now)| was.is_same_work(now));
+        let same = connection.jobs.as_ref().is_some_and(|jobs| {
+            jobs.len() == active.len()
+                && jobs
+                    .iter()
+                    .zip(active)
+                    .all(|(was, now)| was.is_same_work(now))
+        });
         if same {
             return false;
         }
-        active.clone_into(&mut connection.jobs);
+        connection.jobs = Some(active.to_vec());
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_jobs(machine, active, cx));
         self.refresh_sessions(machine, cx);
@@ -867,7 +894,7 @@ impl RhoApp {
         }
         self.drop_sessions(|open, _| open.id.machine == *machine, cx);
         if let Some(connection) = self.connection_mut(machine) {
-            connection.jobs.clear();
+            connection.jobs = None;
         }
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.clear_live(machine, cx));

@@ -19,6 +19,7 @@ mod app;
 mod app_menu;
 mod app_update;
 mod attachments;
+mod attention;
 mod auths;
 mod background;
 mod background_log;
@@ -104,6 +105,7 @@ use crate::{
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{
+    attention::Notifier,
     machines::{Reach, RemoteMachine},
     right_panel::TerminalShell,
 };
@@ -196,6 +198,8 @@ gpui_kit::assets::icon_assets!(
         FoldVertical,
         LayoutList,
         NotebookText,
+        // Settings → Notifications.
+        Bell,
         // The A2UI basic catalog's icons, for surfaces (`surface_view.rs`).
         BellOff,
         CalendarDays,
@@ -311,6 +315,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchConfig, St
         remote: Rc::new(RemoteMachine::ssh_reach),
         shell: TerminalShell::from_env(),
         rho_home: rho_ui_core::platform::rho_home(),
+        notifier: Notifier::System,
     })
 }
 
@@ -400,6 +405,11 @@ fn init(cx: &mut App, db: &StateDb) {
     gpui_kit::init(cx);
     themes::install(cx);
     window_chrome::install(cx);
+    // Notifications name the app (on Linux, `notify-rust`'s app name).
+    // Not on Windows, where this sets the AppUserModelID, which would part
+    // the window from a pinned shortcut's taskbar button.
+    #[cfg(not(windows))]
+    cx.set_app_identity("io.github.matthewyjiang.rho-ui", window_chrome::TITLE);
     Settings::default().apply(cx);
     cx.set_global(TurnTimes::load(db));
     cx.set_global(BackgroundLog::new(db));

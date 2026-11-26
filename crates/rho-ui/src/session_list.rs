@@ -980,6 +980,11 @@ impl SessionList {
         self.rows.iter().find(|row| row.id == *id)
     }
 
+    /// Every listed session, whatever the search and the filter show.
+    pub(crate) fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
     /// The rows of the sessions `starter` started itself, not those they
     /// started in turn, in the list's order, whatever the search and the
     /// filter show.

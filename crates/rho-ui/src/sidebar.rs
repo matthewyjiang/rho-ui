@@ -7,8 +7,9 @@
 //! hovering one offers Discard. An active row shows the workspace, the
 //! session's status or age, its title, its branch, and with more than one
 //! machine, the machine's label; hovering it swaps the status for Snooze
-//! and Settle, or Unpin. A turn that finished off screen shows Done until
-//! its session is opened.
+//! and Settle, or Unpin. A turn that finished off screen, or on screen
+//! while the window was in the background, shows Done until its session is
+//! seen.
 //! Right-click a row for its menu, which also renames it in place. A shelf
 //! opens from its header into one-line rows, its newest 25 at first, and
 //! Show more under them adds 25 more at a time. A session another session
@@ -68,7 +69,7 @@ use crate::{
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
     pr_mark::{mark_label, pr_mark},
     projects::Projects,
-    pull_requests::PullRequests,
+    pull_requests::{Focus, PullRequests},
     rho_install::{render_offer, Installs},
     session_list::{
         DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
@@ -352,6 +353,9 @@ pub(crate) struct SidebarView {
     layout: SidebarLayout,
     saved_filter: SavedFilter,
     active: Option<SessionKey>,
+    /// Whether the window has the focus, as its last change said: the
+    /// session on screen counts as seen only while it does.
+    focus: Focus,
     /// The listed draft on screen.
     active_draft: Option<EntityId>,
     hover: Option<Hover>,
@@ -443,6 +447,7 @@ impl SidebarView {
             layout: state.layout,
             saved_filter: state.filter,
             active: None,
+            focus: Focus::Focused,
             active_draft: None,
             hover: None,
             draft_hover: None,
@@ -601,7 +606,10 @@ impl SidebarView {
         if self.active != id {
             self.list.reveal(id.as_ref());
             self.active = id;
-            self.mark_active_seen();
+            // Opening a session is seeing it, focus or not.
+            if let Some(active) = &self.active {
+                self.list.mark_seen(active);
+            }
             // Its PR is listed, whichever shelf it is on.
             self.rebuild(cx);
         }
@@ -621,12 +629,29 @@ impl SidebarView {
         self.list.started_by(starter)
     }
 
-    /// The session on screen has no Done to show: its turn ended in view.
-    /// The list needs a rebuild after it.
+    /// The session on screen has no Done to show while the window has the
+    /// focus: its turn ended in view. While it doesn't, the user may not
+    /// have seen it, so its row says Done until the focus comes back
+    /// ([`Self::set_focus`]). The list needs a rebuild after it.
     fn mark_active_seen(&mut self) {
-        if let Some(active) = &self.active {
+        if let (Some(active), Focus::Focused) = (&self.active, self.focus) {
             self.list.mark_seen(active);
         }
+    }
+
+    /// The window gained the focus or lost it. Back in it, the user sees
+    /// the session on screen.
+    pub(crate) fn set_focus(&mut self, focus: Focus, cx: &mut Context<'_, Self>) {
+        if self.focus != focus {
+            self.focus = focus;
+            self.mark_active_seen();
+            self.rebuild(cx);
+        }
+    }
+
+    /// Every listed session, whatever the search and the filter show.
+    pub(crate) fn rows(&self) -> &[Row] {
+        self.list.rows()
     }
 
     /// How wide the app lays the sidebar out: on macOS, never too narrow
