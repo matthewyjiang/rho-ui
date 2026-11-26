@@ -153,7 +153,7 @@ fn nothing_found(branch: &BranchPullRequest) -> Option<SharedString> {
 }
 
 /// Why what shows of a PR on `machine` may be out of date, as a person
-/// reads it. The daemon reads with the `gh` on its own `PATH`, which
+/// reads it. The daemon reads with a `gh` it finds on its own, which
 /// Settings → Source control doesn't steer, so the fix is on that machine.
 fn trouble_text(trouble: &PullRequestTrouble, machine: &MachineId) -> SharedString {
     let on = on(machine);
