@@ -180,7 +180,7 @@ pub(crate) fn window_title(count: usize) -> String {
 }
 
 /// Shows `count` on the Dock icon, or no badge for 0. Off the main thread,
-/// as in the UI tests, it does nothing: AppKit is the main thread's.
+/// as in the UI tests, it does nothing: `AppKit` is the main thread's.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_dock_badge(count: usize) {
     use objc2::MainThreadMarker;
