@@ -19,8 +19,19 @@
 //! above the box. Up and Down move the highlight, Tab completes, and Enter
 //! completes unless the name is typed out already, or reads as an amount
 //! such as `$20`: then it sends. Escape closes the menu.
+//!
+//! In an open session the same menu offers its MCP servers' resources for
+//! an `@` word, and the values a server suggests for an argument of its
+//! prompt's command ([`mcp`]). Enter takes a resource once something is
+//! typed after the `@`, and a value only once the highlight moved. A
+//! resource is read and attached, and a template, whose placeholders the
+//! user fills in, is written out as text.
 
-use std::{path::PathBuf, rc::Rc};
+mod mcp;
+
+pub(crate) use mcp::McpLink;
+
+use std::{collections::HashSet, path::PathBuf, rc::Rc};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -40,7 +51,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
-    check_attachment_total, Attachment, CommandInfo, CommandKind, Completion, Prompt,
+    check_attachment_total, ArgumentValue, Attachment, CommandInfo, CommandKind, Completion,
+    Mention, Prompt, SessionMcpResource,
 };
 
 use crate::{
@@ -67,14 +79,18 @@ pub(crate) struct ComposerState {
     /// Why the last attachments were refused, one line each, until it is
     /// dismissed, or the next attachment or send.
     refusal: Option<SharedString>,
+    /// MCP resources being read to attach, in the order picked.
+    reads: Vec<mcp::Read>,
     /// The session's slash commands and skills, which the menu offers.
     commands: Vec<CommandInfo>,
-    /// The name being typed at the cursor, as last seen.
-    typing: Option<Completion>,
-    /// The names that complete it, while their menu is open.
+    /// What the session's MCP servers offer, and the requests for it.
+    mcp: mcp::Mcp,
+    /// What is being typed at the cursor, as last seen.
+    typing: Option<Typing>,
+    /// What completes it, while the menu is open.
     menu: Option<Menu>,
-    /// The name Escape closed the menu on; typing on opens it again.
-    dismissed: Option<Completion>,
+    /// What Escape closed the menu on; typing on opens it again.
+    dismissed: Option<Typing>,
     _subscription: Subscription,
     /// The label of the remote machine the message goes to, whose agent
     /// can't read a file that would go by its path here.
@@ -94,16 +110,111 @@ struct Quote {
     text: String,
 }
 
-/// The open menu of names that complete the one at the cursor.
+/// What is being typed at the cursor that the menu can complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Typing {
+    /// A command or skill name.
+    Name(Completion),
+    /// An MCP resource.
+    Mention(Mention),
+    /// The value of an MCP prompt's argument.
+    Value(ArgumentValue),
+}
+
+/// What the open menu offers for what is being typed.
+enum Choices {
+    Names(Completion, Vec<CommandInfo>),
+    Resources(Mention, Vec<SessionMcpResource>),
+    Values(ArgumentValue, Vec<String>),
+}
+
+impl Choices {
+    /// The choices for `typing`; `None` when there are none.
+    fn of(typing: Typing, commands: &[CommandInfo], mcp: &mcp::Mcp) -> Option<Self> {
+        let choices = match typing {
+            Typing::Name(completion) => {
+                let matches = completion.matches(commands).cloned().collect();
+                Self::Names(completion, matches)
+            }
+            Typing::Mention(mention) => {
+                let matches = mention.matches(mcp.resources()).cloned().collect();
+                Self::Resources(mention, matches)
+            }
+            Typing::Value(value) => {
+                // A value typed out already completes nothing, and one a
+                // server suggests twice shows once.
+                let typed = &value.ask().value;
+                let mut seen = HashSet::new();
+                let matches = mcp.values(value.ask());
+                let matches = matches
+                    .filter(|&suggested| suggested != typed && seen.insert(suggested))
+                    .cloned()
+                    .collect();
+                Self::Values(value, matches)
+            }
+        };
+        (choices.len() > 0).then_some(choices)
+    }
+
+    /// Choice `ix`'s element ID, which names it across menus: a resource
+    /// by its server too, as two may offer one URI.
+    fn id(&self, ix: usize) -> String {
+        match self {
+            Self::Names(_, matches) => format!("completion-{}", matches[ix].name()),
+            Self::Resources(_, matches) => {
+                format!("completion-@{}:{}", matches[ix].server, matches[ix].uri)
+            }
+            Self::Values(_, matches) => format!("completion-value-{}", matches[ix]),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Names(_, matches) => matches.len(),
+            Self::Resources(_, matches) => matches.len(),
+            Self::Values(_, matches) => matches.len(),
+        }
+    }
+
+    /// What the menu is, for screen readers.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Names(completion, _) => match completion.kind() {
+                CommandKind::Slash => "Commands",
+                CommandKind::Skill => "Skills",
+            },
+            Self::Resources(..) => "MCP resources",
+            Self::Values(..) => "Suggested values",
+        }
+    }
+}
+
+/// The open menu of what completes the word at the cursor.
 struct Menu {
-    completion: Completion,
-    matches: Vec<CommandInfo>,
+    choices: Choices,
     /// The highlighted match.
     selected: usize,
     /// The user moved the highlight, so Enter takes it whatever is typed.
     picked: bool,
     /// Keeps the highlighted match in view.
     scroll: ScrollHandle,
+}
+
+impl Menu {
+    /// Whether Enter takes the highlighted choice rather than sending: a
+    /// name typed in part that reads as one, a resource once something
+    /// follows the `@`, and a value, which may be what the user means
+    /// already, only once the highlight moved.
+    fn enter_takes(&self) -> bool {
+        match &self.choices {
+            Choices::Names(completion, matches) => {
+                !completion.is_typed_out(&matches[self.selected])
+                    && (self.picked || completion.reads_as_name())
+            }
+            Choices::Resources(mention, _) => self.picked || !mention.typed().is_empty(),
+            Choices::Values(..) => self.picked,
+        }
+    }
 }
 
 /// A key the open menu takes from the text box.
@@ -138,7 +249,9 @@ impl ComposerState {
             quotes: Vec::new(),
             next_id: 0,
             refusal: None,
+            reads: Vec::new(),
             commands: Vec::new(),
+            mcp: mcp::Mcp::default(),
             typing: None,
             menu: None,
             dismissed: None,
@@ -152,15 +265,37 @@ impl ComposerState {
     pub(crate) fn set_commands(&mut self, commands: &[CommandInfo], cx: &mut Context<'_, Self>) {
         if self.commands != commands {
             self.commands = commands.to_vec();
-            self.typing = None;
-            self.update_menu(cx);
+            self.refresh_menu(cx);
         }
     }
 
-    /// Opens, updates or closes the menu for the name at the cursor.
+    /// Builds the menu again for what is typed, as what it offers changed.
+    /// The highlight stays on its choice while the menu still offers it.
+    fn refresh_menu(&mut self, cx: &mut Context<'_, Self>) {
+        let kept = (self.menu.as_ref()).map(|menu| (menu.choices.id(menu.selected), menu.picked));
+        self.typing = None;
+        self.update_menu(cx);
+        let (Some((id, picked)), Some(menu)) = (kept, &mut self.menu) else {
+            return;
+        };
+        if let Some(ix) = (0..menu.choices.len()).find(|&ix| menu.choices.id(ix) == id) {
+            menu.selected = ix;
+            menu.picked = picked;
+            menu.scroll.scroll_to_item(ix);
+        }
+    }
+
+    /// Opens, updates or closes the menu for what is typed at the cursor,
+    /// and asks the session's MCP servers what it needs from them.
     fn update_menu(&mut self, cx: &mut Context<'_, Self>) {
         let input = self.input.read(cx);
-        let typing = Completion::at(&input.value(), input.cursor());
+        let (text, cursor) = (input.value(), input.cursor());
+        let typing = Completion::at(&text, cursor)
+            .map(Typing::Name)
+            .or_else(|| Mention::at(&text, cursor).map(Typing::Mention))
+            .or_else(|| ArgumentValue::at(&text, cursor, self.mcp.prompts()).map(Typing::Value));
+        // Asked on every change: a failed read asks again at the next key.
+        self.ask_mcp(&text, typing.as_ref(), cx);
         if typing == self.typing {
             return;
         }
@@ -170,15 +305,12 @@ impl ComposerState {
         let menu = typing
             .clone()
             .filter(|_| self.dismissed.is_none())
-            .and_then(|completion| {
-                let matches: Vec<_> = completion.matches(&self.commands).cloned().collect();
-                (!matches.is_empty()).then(|| Menu {
-                    completion,
-                    matches,
-                    selected: 0,
-                    picked: false,
-                    scroll: ScrollHandle::new(),
-                })
+            .and_then(|typing| Choices::of(typing, &self.commands, &self.mcp))
+            .map(|choices| Menu {
+                choices,
+                selected: 0,
+                picked: false,
+                scroll: ScrollHandle::new(),
             });
         self.typing = typing;
         if menu.is_some() || self.menu.is_some() {
@@ -194,7 +326,7 @@ impl ComposerState {
         let Some(menu) = &mut self.menu else {
             return false;
         };
-        let last = menu.matches.len() - 1;
+        let last = menu.choices.len() - 1;
         let selected = menu.selected;
         match key {
             MenuKey::Up | MenuKey::Down => {
@@ -209,15 +341,13 @@ impl ComposerState {
                 cx.notify();
             }
             MenuKey::Escape => {
-                self.dismissed = self.menu.take().map(|menu| menu.completion);
+                self.menu = None;
+                self.dismissed = self.typing.clone();
                 cx.notify();
             }
             MenuKey::Tab => self.complete(selected, window, cx),
             MenuKey::Enter => {
-                let completion = &menu.completion;
-                if completion.is_typed_out(&menu.matches[selected])
-                    || !(menu.picked || completion.reads_as_name())
-                {
+                if !menu.enter_takes() {
                     return false;
                 }
                 self.complete(selected, window, cx);
@@ -226,17 +356,30 @@ impl ComposerState {
         true
     }
 
-    /// Completes the name at the cursor to the menu's match `ix`.
+    /// Completes what is typed at the cursor with the menu's match `ix`:
+    /// a name or value written in, a resource read to attach, or a
+    /// template's URI written in to fill in.
     fn complete(&mut self, ix: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
         // `ix` comes from the menu as last drawn; the matches may have
         // changed since.
-        let Some(menu) = self.menu.take() else {
+        let Some(menu) = self.menu.take_if(|menu| ix < menu.choices.len()) else {
             return;
         };
-        let Some(choice) = menu.matches.get(ix) else {
-            return;
+        let text = self.input.read(cx).value();
+        let edit = match menu.choices {
+            Choices::Names(completion, matches) => completion.edit(&text, &matches[ix]),
+            Choices::Values(value, matches) => {
+                self.mcp.forget_values();
+                value.edit(&matches[ix])
+            }
+            Choices::Resources(mention, matches) if matches[ix].templated => {
+                mention.edit(&text, &matches[ix].uri)
+            }
+            Choices::Resources(mention, matches) => {
+                self.read_resource(&matches[ix], cx);
+                mention.remove(&text)
+            }
         };
-        let edit = menu.completion.edit(&self.input.read(cx).value(), choice);
         self.input.update(cx, |input, cx| {
             input.set_selected_range(edit.range, cx);
             input.replace(edit.text, window, cx);
@@ -277,6 +420,7 @@ impl ComposerState {
     /// whitespace.
     pub(crate) fn is_empty(&self, cx: &App) -> bool {
         self.attachments.is_empty()
+            && self.reads.is_empty()
             && self.quotes.is_empty()
             && self.input.read(cx).value().is_empty()
     }
@@ -287,6 +431,18 @@ impl ComposerState {
         !self.attachments.is_empty()
             || !self.quotes.is_empty()
             || !self.input.read(cx).value().trim().is_empty()
+    }
+
+    /// Whether an MCP resource is still being read to attach.
+    #[cfg(test)]
+    pub(crate) fn is_reading(&self) -> bool {
+        !self.reads.is_empty()
+    }
+
+    /// Whether the message can go: there is one, and no MCP resource is
+    /// still being read for it, which would go missing.
+    pub(crate) fn can_send(&self, cx: &App) -> bool {
+        self.reads.is_empty() && !self.prompt(cx).is_empty()
     }
 
     /// The message as it stands: the quotes and the text, trimmed, and the
@@ -459,9 +615,9 @@ impl ComposerState {
     }
 
     /// Adds `attachment` after the others, if one message can carry it with
-    /// them. `why_linked` says why a file goes by its path, for its chip,
-    /// or for the refusal when it can't go that way.
-    fn add(&mut self, attachment: Attachment, why_linked: Option<&str>) -> Result<(), String> {
+    /// them, and gives its card's ID. `why_linked` says why a file goes by
+    /// its path, for its chip, or for the refusal when it can't go that way.
+    fn add(&mut self, attachment: Attachment, why_linked: Option<&str>) -> Result<u64, String> {
         if let (Some(machine), true) = (&self.remote, by_path(&attachment)) {
             let because = why_linked.map_or_default(|why| format!(" ({why})"));
             return Err(format!(
@@ -476,8 +632,9 @@ impl ComposerState {
         if let Some(why) = why_linked {
             item.preview = item.preview.linked_because(why);
         }
+        let id = item.id;
         self.attachments.push(item);
-        Ok(())
+        Ok(id)
     }
 
     /// `attachment` as the composer holds it, under a new ID.
@@ -493,23 +650,26 @@ impl ComposerState {
 
     /// Removes attachment `id`, and the decoded copy GPUI drew an image
     /// from. If the transcript shows the same image, it decodes it again.
+    /// A resource being read stops being read.
     fn remove(&mut self, id: u64, cx: &mut Context<'_, Self>) {
         if let Some(at) = self.attachments.iter().position(|item| item.id == id) {
             self.attachments.remove(at).preview.release(cx);
-            cx.notify();
         }
+        self.reads.retain(|read| read.id != id);
+        cx.notify();
     }
 
-    /// Removes the last attachment, as Backspace in the empty text box
-    /// does. Says whether there was one to remove.
+    /// Removes the last card, as Backspace in the empty text box does: a
+    /// resource being read, which shows last, or else the last
+    /// attachment. Says whether there was one to remove.
     fn remove_last(&mut self, cx: &mut Context<'_, Self>) -> bool {
         if !self.input.read(cx).value().is_empty() {
             return false;
         }
-        let Some(last) = self.attachments.last() else {
+        let last = self.reads.last().map(|read| read.id);
+        let Some(id) = last.or_else(|| self.attachments.last().map(|item| item.id)) else {
             return false;
         };
-        let id = last.id;
         self.remove(id, cx);
         true
     }
@@ -592,22 +752,27 @@ impl Composer {
     /// The attachments as cards of one height, each with its remove
     /// control.
     fn render_attachments(&self, cx: &App) -> Option<AttachmentGroup> {
-        let items = &self.state.read(cx).attachments;
-        if items.is_empty() {
+        let state = self.state.read(cx);
+        if state.attachments.is_empty() && state.reads.is_empty() {
             return None;
         }
-        let cards = items.iter().map(|item| {
-            let (id, state) = (item.id, self.state.clone());
+        let items = state
+            .attachments
+            .iter()
+            .map(|item| (item.id, &item.preview));
+        let reads = state.reads.iter().map(|read| (read.id, &read.preview));
+        let cards = items.chain(reads).map(|(id, preview)| {
+            let state = self.state.clone();
             // Wrapped so UI tests can find it: Kit's Attachment does not
             // register its ID with them.
             div()
                 .id(SharedString::from(format!("composer-attachment-{id}")))
                 .test_support()
-                .aria_label(item.preview.label())
+                .aria_label(preview.label())
                 .child(
                     // Large: a 4 rem square, enough to tell screenshots
                     // apart, with file chips as tall.
-                    item.preview
+                    preview
                         .card()
                         .id(("composer-attachment-card", id))
                         .large()
@@ -746,14 +911,41 @@ impl Composer {
             return None;
         }
         let menu = self.state.read(cx).menu.as_ref()?;
-        let kind = menu.completion.kind();
+        let rows: Vec<Row> = match &menu.choices {
+            Choices::Names(completion, matches) => matches
+                .iter()
+                .map(|command| Row {
+                    name: format!("{}{}", completion.kind().sigil(), command.name()),
+                    hint: command.input_hint().map(str::to_owned),
+                    detail: command.description().to_owned(),
+                })
+                .collect(),
+            Choices::Resources(_, matches) => matches
+                .iter()
+                .map(|resource| Row {
+                    name: resource
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| resource.name.clone()),
+                    hint: resource.templated.then(|| "template".to_owned()),
+                    detail: resource.uri.clone(),
+                })
+                .collect(),
+            Choices::Values(_, matches) => matches
+                .iter()
+                .map(|value| Row {
+                    name: value.clone(),
+                    hint: None,
+                    detail: String::new(),
+                })
+                .collect(),
+        };
         let muted = cx.theme().muted_foreground;
-        let rows = menu.matches.iter().enumerate().map(|(ix, command)| {
-            let name = format!("{}{}", kind.sigil(), command.name());
+        let rows = rows.into_iter().enumerate().map(|(ix, row)| {
             let state = self.state.clone();
-            ListItem::new(SharedString::from(format!("completion-{}", command.name())))
+            ListItem::new(SharedString::from(menu.choices.id(ix)))
                 .selected(ix == menu.selected)
-                .accessibility_label(name.clone())
+                .accessibility_label(row.name.clone())
                 .px_2()
                 .text_sm()
                 .rounded(cx.theme().radius)
@@ -766,27 +958,22 @@ impl Composer {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().flex_shrink_0().child(name))
-                        .children(command.input_hint().map(|hint| {
-                            div()
-                                .flex_shrink_0()
-                                .text_color(muted)
-                                .child(hint.to_owned())
-                        }))
+                        .child(div().flex_shrink_0().child(row.name))
+                        .children(
+                            row.hint
+                                .map(|hint| div().flex_shrink_0().text_color(muted).child(hint)),
+                        )
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .text_color(muted)
-                                .child(command.description().to_owned()),
+                                .child(row.detail),
                         ),
                 )
         });
-        let label = match kind {
-            CommandKind::Slash => "Commands",
-            CommandKind::Skill => "Skills",
-        };
+        let label = menu.choices.label();
         // Deferred, so it paints over the transcript rather than pushing it.
         Some(
             deferred(
@@ -815,6 +1002,14 @@ impl Composer {
     }
 }
 
+/// One row of the completion menu: a name, what to type after it, and a
+/// muted line on it.
+struct Row {
+    name: String,
+    hint: Option<String>,
+    detail: String,
+}
+
 /// Offers the text box's `A` key to the completion menu first, as `key`;
 /// the menu keeps it only while open.
 fn menu_key<A: Action>(
@@ -837,7 +1032,7 @@ impl RenderOnce for Composer {
         let attachments = self.render_attachments(cx);
         let refusal = self.render_refusal(cx);
         let menu = self.render_menu(cx);
-        let empty = self.state.read(cx).prompt(cx).is_empty();
+        let unsendable = !self.state.read(cx).can_send(cx);
         let starting = self.mode == ComposerMode::Starting;
         let text_box = self.render_text_box(cx);
         let attach = self.render_attach();
@@ -856,7 +1051,7 @@ impl RenderOnce for Composer {
                 .icon(IconName::ArrowUp)
                 .rounded(ButtonRounded::Large)
                 .tooltip("Send (Enter)")
-                .disabled(empty)
+                .disabled(unsendable)
                 .loading(starting)
                 .on_click(move |_, window, cx| on_send(window, cx))
         };

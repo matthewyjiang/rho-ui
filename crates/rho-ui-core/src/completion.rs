@@ -1,12 +1,24 @@
-//! Completing a command or skill name as the user types it into a prompt.
+//! Completing what the user types into a prompt: a command or skill name,
+//! an MCP resource to attach, or the value of an MCP prompt's argument.
 //!
 //! A prompt that starts with a single `/` runs the slash command its first
 //! word names; a `$name` word anywhere in it mentions a skill, which the turn
 //! loads first. The session lists both ([`crate::Session::commands`]) and the
 //! daemon reads them in the prompt as typed, so completing a name only edits
-//! the text. The rules are those of rho's terminal UI.
+//! the text ([`Completion`]).
+//!
+//! The session's MCP servers offer resources and prompts
+//! ([`crate::Daemon::mcp_catalog`]). An `@` word names a resource
+//! ([`Mention`]), which goes with the prompt as an attachment rather than as
+//! text. A prompt runs as the slash command `mcp:<server>:<name>`, and the
+//! text after it holds its arguments: the whole of it for a prompt of one
+//! argument, else `name=value` words. A server may suggest values for the
+//! argument being typed ([`ArgumentValue`]). The rules are those of rho's
+//! terminal UI.
 
 use std::ops::Range;
+
+use rho_protocol::{SessionMcpPrompt, SessionMcpResource};
 
 use crate::{CommandInfo, CommandKind};
 
@@ -40,16 +52,7 @@ impl Completion {
     /// what a skill's name can.
     #[must_use]
     pub fn at(text: &str, cursor: usize) -> Option<Self> {
-        if !text.is_char_boundary(cursor) {
-            return None;
-        }
-        let start = text[..cursor]
-            .char_indices()
-            .rfind(|(_, ch)| ch.is_whitespace())
-            .map_or(0, |(at, ch)| at + ch.len_utf8());
-        let end = text[cursor..]
-            .find(char::is_whitespace)
-            .map_or(text.len(), |at| cursor + at);
+        let Range { start, end } = word_at(text, cursor)?;
         let word = &text[start..end];
         let kind = if start == 0 && word.starts_with('/') && !word.starts_with("//") {
             CommandKind::Slash
@@ -125,6 +128,216 @@ impl Completion {
             }
         }
     }
+}
+
+/// The whitespace-delimited word holding byte `cursor` of `text`, in
+/// bytes; `None` when `cursor` is not a character boundary.
+fn word_at(text: &str, cursor: usize) -> Option<Range<usize>> {
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = text[..cursor]
+        .char_indices()
+        .rfind(|(_, ch)| ch.is_whitespace())
+        .map_or(0, |(at, ch)| at + ch.len_utf8());
+    let end = text[cursor..]
+        .find(char::is_whitespace)
+        .map_or(text.len(), |at| cursor + at);
+    Some(start..end)
+}
+
+/// The MCP resource being named at the cursor: a word that starts with `@`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mention {
+    /// The word, `@` included, in bytes.
+    word: Range<usize>,
+    /// What is typed after the `@`, up to the cursor.
+    typed: String,
+}
+
+impl Mention {
+    /// The mention at byte `cursor` of `text`, if the cursor sits after the
+    /// `@` that starts the word holding it.
+    #[must_use]
+    pub fn at(text: &str, cursor: usize) -> Option<Self> {
+        let word = word_at(text, cursor)?;
+        if !text[word.clone()].starts_with('@') || cursor == word.start {
+            return None;
+        }
+        Some(Self {
+            typed: text[word.start + 1..cursor].to_owned(),
+            word,
+        })
+    }
+
+    /// What is typed after the `@`.
+    pub fn typed(&self) -> &str {
+        &self.typed
+    }
+
+    /// Where the mention starts, in bytes: another start is another mention.
+    pub fn start(&self) -> usize {
+        self.word.start
+    }
+
+    /// The `resources` whose URI, name or title holds what is typed,
+    /// ignoring case, in the order the session lists them.
+    pub fn matches<'r>(
+        &self,
+        resources: &'r [SessionMcpResource],
+    ) -> impl Iterator<Item = &'r SessionMcpResource> + 'r {
+        let typed = self.typed.to_lowercase();
+        resources.iter().filter(move |resource| {
+            [
+                Some(&resource.uri),
+                Some(&resource.name),
+                resource.title.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|key| key.to_lowercase().contains(&typed))
+        })
+    }
+
+    /// The edit that takes the mention out, for a resource that goes as an
+    /// attachment: the word, and one space after it if there is one, so
+    /// the words around it stay one space apart.
+    #[must_use]
+    pub fn remove(&self, text: &str) -> Edit {
+        let mut end = self.word.end;
+        if text[end..].starts_with(' ') {
+            end += 1;
+        }
+        Edit {
+            range: self.word.start..end,
+            text: String::new(),
+            cursor: self.word.start,
+        }
+    }
+
+    /// The edit that writes `uri` as the mention, with a space after it
+    /// unless one follows: a resource template, whose placeholders the user
+    /// fills in, goes as text.
+    #[must_use]
+    pub fn edit(&self, text: &str, uri: &str) -> Edit {
+        let mut insert = format!("@{uri}");
+        let cursor = self.word.start + insert.len() + 1;
+        if !text[self.word.end..].starts_with(' ') {
+            insert.push(' ');
+        }
+        Edit {
+            range: self.word.clone(),
+            text: insert,
+            cursor,
+        }
+    }
+}
+
+/// What to ask a server for: values of `argument` of its prompt `prompt`,
+/// given what is typed of it, as `rho/session/mcp/complete` asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArgumentAsk {
+    /// The server's qualified identity.
+    pub server: String,
+    /// The prompt's name.
+    pub prompt: String,
+    /// The argument's name.
+    pub argument: String,
+    /// What is typed of its value; may be empty.
+    pub value: String,
+}
+
+/// The value of an MCP prompt's argument being typed at the cursor, for a
+/// prompt whose server suggests values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArgumentValue {
+    ask: ArgumentAsk,
+    /// The value, in bytes. Completing replaces all of it.
+    value: Range<usize>,
+}
+
+impl ArgumentValue {
+    /// The argument value at byte `cursor` of `text`, a prompt that starts
+    /// with `/mcp:<server>:<name>`, the command of one of `prompts` whose
+    /// server suggests values. A prompt of one argument takes all the
+    /// text after the command, trimmed; any other, the `name=value` word
+    /// holding the cursor, past its `=`, for an argument it declares.
+    #[must_use]
+    pub fn at(text: &str, cursor: usize, prompts: &[SessionMcpPrompt]) -> Option<Self> {
+        let token_end = mcp_command(text)?.len();
+        // Within the command the command's own name is being typed.
+        if cursor <= token_end || !text.is_char_boundary(cursor) {
+            return None;
+        }
+        let (server, name) = prompt_command(&text[..token_end])?;
+        let prompt = prompts.iter().find(|prompt| {
+            prompt.completes_arguments && prompt.server == server && prompt.name == name
+        })?;
+        let (argument, value) = if let [only] = prompt.arguments.as_slice() {
+            let after = &text[token_end..];
+            let start = token_end + (after.len() - after.trim_start().len());
+            (only.name.clone(), start..start + after.trim().len())
+        } else {
+            let word = word_at(text, cursor)?;
+            let equals = word.start + text[word.clone()].find('=')?;
+            // Before the `=`, the argument's name is being typed.
+            if cursor <= equals {
+                return None;
+            }
+            let argument = &text[word.start..equals];
+            prompt
+                .arguments
+                .iter()
+                .find(|declared| declared.name == argument)?;
+            (argument.to_owned(), equals + 1..word.end)
+        };
+        Some(Self {
+            ask: ArgumentAsk {
+                server: prompt.server.clone(),
+                prompt: prompt.name.clone(),
+                argument,
+                value: text[value.clone()].to_owned(),
+            },
+            value,
+        })
+    }
+
+    /// What to ask the server.
+    pub fn ask(&self) -> &ArgumentAsk {
+        &self.ask
+    }
+
+    /// The edit that makes the value `value`, with the cursor after it.
+    #[must_use]
+    pub fn edit(&self, value: &str) -> Edit {
+        Edit {
+            range: self.value.clone(),
+            text: value.to_owned(),
+            cursor: self.value.start + value.len(),
+        }
+    }
+}
+
+/// The MCP prompt command `text` starts with, such as
+/// `/mcp:docs:search`, once something follows it: past the command, its
+/// arguments are being typed.
+#[must_use]
+pub fn mcp_command(text: &str) -> Option<&str> {
+    let token = &text[..text.find(char::is_whitespace)?];
+    prompt_command(token).map(|_| token)
+}
+
+/// The server and prompt names of `/mcp:<server>:<name>`, its prefix in
+/// any case. A server's identity holds no `:`, so the first one after the
+/// prefix splits them.
+fn prompt_command(token: &str) -> Option<(&str, &str)> {
+    const PREFIX: &str = "/mcp:";
+    let rest = token
+        .get(..PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        .and_then(|_| token.get(PREFIX.len()..))?;
+    let (server, name) = rest.split_once(':')?;
+    (!server.is_empty() && !name.is_empty()).then_some((server, name))
 }
 
 /// What a skill's name may hold after its `$`.
@@ -260,6 +473,132 @@ mod tests {
             let completion = at(marked).unwrap_or_else(|| panic!("a word in {marked:?}"));
             assert!(completion.reads_as_name(), "{marked:?}");
         }
+    }
+
+    /// `marked` with `|` as the cursor, after `edit`, cursor marked.
+    fn edited(marked: &str, edit: Edit) -> String {
+        let mut text = marked.replace('|', "");
+        text.replace_range(edit.range, &edit.text);
+        text.insert(edit.cursor, '|');
+        text
+    }
+
+    fn cursor(marked: &str) -> (String, usize) {
+        let cursor = marked.find('|').expect("the text marks the cursor");
+        (marked.replace('|', ""), cursor)
+    }
+
+    fn resource(uri: &str, name: &str) -> SessionMcpResource {
+        SessionMcpResource {
+            server: "docs".to_owned(),
+            uri: uri.to_owned(),
+            name: name.to_owned(),
+            title: None,
+            description: None,
+            mime_type: None,
+            templated: false,
+        }
+    }
+
+    /// An `@` word names a resource by its URI or name; picking one takes
+    /// the word out, or writes a template's URI in its place.
+    #[test]
+    fn a_mention_is_an_at_word() {
+        let resources = [
+            resource("docs://guide/intro", "Intro"),
+            resource("docs://api", "Reference"),
+        ];
+        let cases = [
+            ("@|", Some(vec!["docs://guide/intro", "docs://api"])),
+            ("see @INT|", Some(vec!["docs://guide/intro"])),
+            ("see @ref| now", Some(vec!["docs://api"])),
+            ("line\n@ap|", Some(vec!["docs://api"])),
+            ("@nothing|", Some(vec![])),
+            ("me@ap|", None),
+            ("|@ap", None),
+            ("@ap @x |", None),
+        ];
+        for (marked, want) in cases {
+            let (text, at) = cursor(marked);
+            let got = Mention::at(&text, at).map(|mention| {
+                mention
+                    .matches(&resources)
+                    .map(|resource| resource.uri.as_str())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(got, want, "{marked:?}");
+        }
+
+        let mention = |marked: &str| {
+            let (text, at) = cursor(marked);
+            Mention::at(&text, at).expect("a mention")
+        };
+        for (marked, removed) in [
+            ("@in|", "|"),
+            ("see @in| now", "see |now"),
+            ("see @in|", "see |"),
+        ] {
+            let edit = mention(marked).remove(&marked.replace('|', ""));
+            assert_eq!(edited(marked, edit), removed, "{marked:?}");
+        }
+        let edit = mention("see @us| now").edit("see @us now", "docs://users/{id}");
+        assert_eq!(edited("see @us| now", edit), "see @docs://users/{id} |now");
+    }
+
+    /// The value being typed of a prompt's argument: all the text after
+    /// the command for a prompt of one argument, else the `name=value`
+    /// word, past its `=`; only for a prompt whose server suggests values.
+    #[test]
+    fn an_argument_value_is_found_by_the_prompts_arguments() {
+        let argument = |name: &str| rho_protocol::SessionMcpPromptArgument {
+            name: name.to_owned(),
+            description: None,
+            required: true,
+        };
+        let prompt = |name: &str, arguments: Vec<_>, completes_arguments| SessionMcpPrompt {
+            server: "docs".to_owned(),
+            name: name.to_owned(),
+            title: None,
+            description: None,
+            arguments,
+            completes_arguments,
+        };
+        let prompts = [
+            prompt("search", vec![argument("query")], true),
+            prompt("open", vec![argument("page"), argument("lang")], true),
+            prompt("quiet", vec![argument("query")], false),
+        ];
+        let cases = [
+            ("/mcp:docs:search rust own|", Some(("query", "rust own"))),
+            ("/MCP:docs:search  rust |  ", Some(("query", "rust"))),
+            ("/mcp:docs:search |", Some(("query", ""))),
+            (
+                "/mcp:docs:open page=in|tro lang=en",
+                Some(("page", "intro")),
+            ),
+            ("/mcp:docs:open page=intro lang=|", Some(("lang", ""))),
+            ("/mcp:docs:open pa|ge=intro", None),
+            ("/mcp:docs:open size=|", None),
+            ("/mcp:docs:quiet rust|", None),
+            ("/mcp:docs:sea|rch rust", None),
+            ("/mcp:other:search rust|", None),
+            ("ask /mcp:docs:search rust|", None),
+        ];
+        for (marked, want) in cases {
+            let (text, at) = cursor(marked);
+            let got = ArgumentValue::at(&text, at, &prompts);
+            let got = got
+                .as_ref()
+                .map(|value| (value.ask().argument.as_str(), value.ask().value.as_str()));
+            assert_eq!(got, want, "{marked:?}");
+        }
+
+        let (text, at) = cursor("/mcp:docs:open page=in| lang=en");
+        let value = ArgumentValue::at(&text, at, &prompts).expect("a value");
+        assert_eq!(
+            edited("/mcp:docs:open page=in| lang=en", value.edit("intro")),
+            "/mcp:docs:open page=intro| lang=en"
+        );
     }
 
     #[test]

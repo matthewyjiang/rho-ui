@@ -27,15 +27,16 @@ use rho_protocol::{
     SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
     SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
     SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionMarkParams,
-    SessionMarkResponse, SessionMcpInventory, SessionMcpParams, SessionNewParams,
-    SessionNewResponse, SessionProcessesParams, SessionProcessesResponse, SessionPromptParams,
-    SessionPromptResponse, SessionPullRequestLinkParams, SessionPullRequestLinkResponse,
-    SessionPullRequestListParams, SessionPullRequestListResponse, SessionPullRequestShowParams,
-    SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
-    SessionPullRequestUnlinkResponse, SessionSteerParams, SessionSteerResponse,
-    SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
-    SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
-    WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
+    SessionMarkResponse, SessionMcpCatalog, SessionMcpCatalogParams, SessionMcpCompleteParams,
+    SessionMcpCompleteResponse, SessionMcpInventory, SessionMcpParams, SessionMcpResourceParams,
+    SessionMcpResourceResponse, SessionNewParams, SessionNewResponse, SessionProcessesParams,
+    SessionProcessesResponse, SessionPromptParams, SessionPromptResponse,
+    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
+    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
+    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSteerParams,
+    SessionSteerResponse, SessionSurfaceActionParams, SessionSurfaceActionResponse,
+    SessionWorktree, SettingsService, SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome,
+    UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -1211,6 +1212,30 @@ impl Service for Fake {
 
     async fn session_mcp(&self, params: SessionMcpParams) -> Result<SessionMcpInventory, RpcError> {
         self.lock().mcp_inventory(&params)
+    }
+
+    async fn session_mcp_catalog(
+        &self,
+        params: SessionMcpCatalogParams,
+    ) -> Result<SessionMcpCatalog, RpcError> {
+        self.lock().mcp_catalog(&params)
+    }
+
+    async fn session_mcp_resource(
+        &self,
+        params: SessionMcpResourceParams,
+    ) -> Result<SessionMcpResourceResponse, RpcError> {
+        let mut held = self.lock().mcp.reads_held.subscribe();
+        // Gone with the daemon: the read then answers as if released.
+        let _ = held.wait_for(|held| !held).await;
+        self.lock().mcp_resource(&params)
+    }
+
+    async fn session_mcp_complete(
+        &self,
+        params: SessionMcpCompleteParams,
+    ) -> Result<SessionMcpCompleteResponse, RpcError> {
+        self.lock().mcp_complete(&params)
     }
 
     async fn prune_worktrees(

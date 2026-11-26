@@ -92,7 +92,7 @@ use crate::{
         Opens, OpensOutput, Sources, StopHandler,
     },
     background_log::{BackgroundLog, Recorded},
-    composer::{Composer, ComposerMode, ComposerState},
+    composer::{Composer, ComposerMode, ComposerState, McpLink},
     input_card::{InputCard, InputCardEvent, Queue},
     leads::Kind,
     machines::{Place, SessionKey},
@@ -454,6 +454,9 @@ impl SessionView {
         view.transcript.sync(view.session.entries(), cx);
         view.sync_settings(window, cx);
         view.sync_kind(window, cx);
+        let link = view.mcp_link();
+        view.composer
+            .update(cx, |composer, _| composer.set_mcp(link));
         view.reported = Some(view.live());
         view
     }
@@ -908,6 +911,9 @@ impl SessionView {
         // they are read once it is caught up.
         self.mcp = None;
         self.daemon = daemon;
+        let link = self.mcp_link();
+        self.composer
+            .update(cx, |composer, _| composer.set_mcp(link));
         Some(Follow {
             cursor: self.session.reattach(),
             observe: self.is_subagent(),
@@ -1147,7 +1153,7 @@ impl SessionView {
         {
             return;
         }
-        if self.composer.read(cx).prompt(cx).is_empty() {
+        if !self.composer.read(cx).can_send(cx) {
             return;
         }
         let side = side_question(self.composer.read(cx).prompt(cx).text()).map(str::to_owned);
@@ -1654,6 +1660,15 @@ impl SessionView {
             });
         })
         .detach();
+    }
+
+    /// Where the composer's MCP requests go: the session, through the
+    /// daemon the view has now.
+    fn mcp_link(&self) -> McpLink {
+        McpLink {
+            daemon: self.daemon.clone(),
+            session: self.session.id().clone(),
+        }
     }
 
     /// Shows the session's settings, changeable once the session is open,
@@ -2309,6 +2324,12 @@ impl SessionView {
     #[cfg(test)]
     pub(crate) fn composer_placeholder(&self) -> Kind {
         self.kind
+    }
+
+    /// Whether the composer still reads an MCP resource, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn composer_is_reading(&self, cx: &App) -> bool {
+        self.composer.read(cx).is_reading()
     }
 
     /// The message the composer holds, attachments and all, for UI tests.

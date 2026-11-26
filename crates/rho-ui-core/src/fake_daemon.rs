@@ -153,6 +153,10 @@
 //!   [`MCP_NOTES`]). With [`Script::mcp`] [`McpStartup::Connecting`], the
 //!   first is connecting and the second has timed out until
 //!   [`FakeDaemon::finish_mcp_startup`].
+//!   `rho/session/mcp/catalog`, `.../resource` and `.../complete` answer
+//!   for the docs server's prompts and resources, as `fake_daemon/mcp.rs`
+//!   lists them; the session's commands include its prompt
+//!   `/mcp:docs:search`.
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
 //!   set, if any, and what [`FakeDaemon::set_in_progress`] set.
 //!   `rho/daemon/restart` restarts in place, as rho does: it counts
@@ -239,7 +243,10 @@ pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECK
 use config::FakeConfig;
 use listener::Listener;
 use mcp::FakeMcp;
-pub use mcp::{McpStartup, MCP_DOCS, MCP_GITHUB, MCP_NOTES};
+pub use mcp::{
+    McpStartup, MCP_CHANGELOG, MCP_DOCS, MCP_GITHUB, MCP_INTRO, MCP_INTRO_TEXT, MCP_NOTES,
+    MCP_QUERIES, MCP_SEARCH, MCP_USER,
+};
 use processes::FakeProcesses;
 use pull_requests::FakePullRequests;
 pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
@@ -1295,6 +1302,12 @@ impl Settings {
                     kind: CommandKind::Slash,
                     description: "Compact".to_owned(),
                     input_hint: Some("[instructions]".to_owned()),
+                },
+                SessionCommand {
+                    name: format!("mcp:{MCP_DOCS}:{MCP_SEARCH}"),
+                    kind: CommandKind::Slash,
+                    description: "Search the docs".to_owned(),
+                    input_hint: Some("<query>".to_owned()),
                 },
                 SessionCommand {
                     name: "prompt:review".to_owned(),

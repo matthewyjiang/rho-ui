@@ -185,6 +185,15 @@ impl AttachedFile {
         }
     }
 
+    /// A resource of an MCP server, sent whole as `text` under its `uri`,
+    /// such as `docs://guide/intro`.
+    pub fn resource(uri: String, text: impl Into<Arc<str>>) -> Self {
+        Self {
+            uri,
+            text: Some(text.into()),
+        }
+    }
+
     /// Where it is, such as `file:///home/me/notes.md`.
     pub fn uri(&self) -> &str {
         &self.uri
