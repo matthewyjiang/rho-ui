@@ -1,11 +1,13 @@
-//! The bar across the top of the main pane: the project, then the path to
-//! what the pane shows, each step nested under the one before it, as
-//! `rho-ui / Fix the parser / Read the parser` for a subagent's session
-//! under the session that started it. The project can start a new session
-//! in it, a button beside it opens the repository's web page, and every
-//! step but the last links back to it; controls for what the pane shows sit
-//! at the right, and at the right edge, while the right panel is hidden, the
-//! toggle that shows it.
+//! The bar across the top of the main pane: the session's projects, then
+//! the path to what the pane shows, each step nested under the one before
+//! it, as `rho-ui / Fix the parser / Read the parser` for a subagent's
+//! session under the session that started it. A session in several
+//! projects heads it with their badges stacked and their names together,
+//! as `rho-ui + rho` (see [`crate::project_stack`]). The project can start
+//! a new session in it, a button beside it opens the repository's web
+//! page, and every step but the last links back to it; controls for what
+//! the pane shows sit at the right, and at the right edge, while the right
+//! panel is hidden, the toggle that shows it.
 //!
 //! Kit's `Breadcrumb` separates its items with chevrons and gives UI tests
 //! no way to find them; this bar uses slashes, and tests find each step.
@@ -22,7 +24,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    badge::Badge,
+    project_stack::{self, Naming, ProjectStack},
     repo,
     right_panel::{self, PanelLayout},
     window_chrome::{self, DragArea, MovesWindow as _},
@@ -53,9 +55,9 @@ type Go = Box<dyn Fn(&mut Window, &mut App)>;
 /// steps above the title with [`TitleBar::parent`], outermost first.
 #[derive(IntoElement)]
 pub(crate) struct TitleBar {
-    /// The project's initials and name; `None` while the pane has no
-    /// folder yet, as a lead's draft until its session opens.
-    project: Option<(SharedString, SharedString)>,
+    /// The projects' badges and names; `None` while the pane names none,
+    /// as a lead's before it has any.
+    project: Option<Project>,
     /// The repository's web page, from its origin remote.
     repo_page: Option<String>,
     /// What a click on the project does; without it, the project is text.
@@ -67,15 +69,27 @@ pub(crate) struct TitleBar {
     trailing: Option<AnyElement>,
 }
 
+/// The projects at the head of the bar.
+struct Project {
+    stack: ProjectStack,
+    names: SharedString,
+    /// The first project's name: the one a new session starts in.
+    first: SharedString,
+}
+
 impl TitleBar {
-    /// A bar reading `project / title`, or `title` alone with no
-    /// `workspace`.
-    pub(crate) fn new(workspace: Option<&Workspace>, title: impl Into<SharedString>) -> Self {
+    /// A bar reading `projects / title`, or `title` alone with no
+    /// `projects`. The repository button opens the first project's page.
+    pub(crate) fn new(projects: &[&Workspace], title: impl Into<SharedString>) -> Self {
+        let first = projects.first();
         Self {
-            project: workspace
-                .map(|workspace| (workspace.initials.clone(), workspace.short_name.clone())),
-            repo_page: workspace
-                .and_then(Workspace::origin)
+            project: first.map(|first| Project {
+                stack: ProjectStack::new("title-projects", projects, rems(BADGE_REMS)),
+                names: project_stack::names(projects, Naming::Short),
+                first: first.short_name.clone(),
+            }),
+            repo_page: first
+                .and_then(|first| first.origin())
                 .and_then(repo::web_url),
             on_project: None,
             parents: Vec::new(),
@@ -140,7 +154,7 @@ impl RenderOnce for TitleBar {
         let on_project = self.on_project;
         let project = self
             .project
-            .map(|(initials, name)| project_step(initials, &name, on_project, cx));
+            .map(|project| project_step(project, on_project, cx));
         let has_project = project.is_some();
         let repo_page = self.repo_page.map(|url| {
             Button::new("title-repo")
@@ -206,33 +220,39 @@ impl RenderOnce for TitleBar {
     }
 }
 
-/// The project at the head of the bar: the same text with or without a
-/// click, so the bar reads alike in every pane; with `go`, a link, as the
-/// steps after it are.
-fn project_step(
-    initials: SharedString,
-    name: &SharedString,
-    go: Option<Go>,
-    cx: &App,
-) -> AnyElement {
+/// The projects at the head of the bar: the same text with or without a
+/// click, so the bar reads alike in every pane; with `go`, a link that
+/// starts a session in the first, as the steps after it are.
+fn project_step(project: Project, go: Option<Go>, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let (muted, foreground) = (theme.muted_foreground, theme.foreground);
-    let project = h_flex()
+    let Project {
+        stack,
+        names,
+        first,
+    } = project;
+    let step = h_flex()
         .flex_shrink_0()
         .gap_2()
         .text_color(muted)
-        .child(Badge::new(initials, rems(BADGE_REMS)))
-        .child(name.clone());
+        .child(stack)
+        .child(
+            div()
+                .id("title-project-names")
+                .test_support()
+                .aria_label(names.clone())
+                .child(names),
+        );
     match go {
-        Some(go) => project
+        Some(go) => step
             .id("title-project")
             .test_support()
-            .aria_label(format!("New session in {name}"))
+            .aria_label(format!("New session in {first}"))
             .cursor_pointer()
             .hover(move |style| style.text_color(foreground))
             .on_click(move |_, window, cx| go(window, cx))
             .into_any_element(),
-        None => project.into_any_element(),
+        None => step.into_any_element(),
     }
 }
 

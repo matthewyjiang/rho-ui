@@ -108,7 +108,7 @@ use crate::{
     transcript::{ActionHandler, ItemContent, Transcript},
     usage::UsageRing,
     work::Disclosure,
-    workspaces::WorkspaceRef,
+    workspaces::{Workspace, WorkspaceRef},
     StopTurn,
 };
 
@@ -304,11 +304,22 @@ pub(crate) struct SessionView {
     selected: Option<Selected>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
-    /// For a subagent's session, redraws the title bar as the sessions
-    /// above it are renamed.
-    _above: Vec<Subscription>,
+    /// What the title bar reads besides the session.
+    title_bar: TitleBarSources,
     /// Redraws "Working for" while a turn runs.
     _tick: Task<()>,
+}
+
+/// What a session's title bar reads besides the session.
+#[derive(Default)]
+struct TitleBarSources {
+    /// The user's projects, which say which of a plain session's added
+    /// directories it names; see [`SessionView::with_projects`]. `None`
+    /// for a subagent's view, which names its root session's.
+    projects: Option<Entity<Projects>>,
+    /// What redraws it: for a subagent's view, the sessions above it, as
+    /// they are renamed, and its root's projects; else the projects.
+    _redraws: Vec<Subscription>,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -427,7 +438,7 @@ impl SessionView {
             selected: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
-            _above: Vec::new(),
+            title_bar: TitleBarSources::default(),
             _tick: Self::tick(cx),
         };
         view.transcript.sync(view.session.entries(), cx);
@@ -466,7 +477,8 @@ impl SessionView {
             let parent = parent.read(cx);
             (parent.workspace.clone(), parent.composer.read(cx).remote())
         };
-        // The title bar names every session above this one.
+        // The title bar names every session above this one, and the
+        // projects of the one at the top.
         let mut renamed = Vec::new();
         let mut above = Some(parent.clone());
         while let Some(session) = above {
@@ -475,7 +487,14 @@ impl SessionView {
                     cx.notify();
                 }
             }));
-            above = session.read(cx).parent();
+            let (projects, parent) = {
+                let session = session.read(cx);
+                (session.title_bar.projects.clone(), session.parent())
+            };
+            if let Some(projects) = projects {
+                renamed.push(cx.observe(&projects, |_, _, cx| cx.notify()));
+            }
+            above = parent;
         }
         let view = Self::new(
             daemon,
@@ -488,7 +507,10 @@ impl SessionView {
         );
         Self {
             role: Role::Subagent(parent.downgrade()),
-            _above: renamed,
+            title_bar: TitleBarSources {
+                projects: None,
+                _redraws: renamed,
+            },
             ..view
         }
     }
@@ -528,12 +550,12 @@ impl SessionView {
     /// and offers `projects`, the user's, to add. A subagent's session
     /// never gets this, and a side chat has no title bar.
     pub(crate) fn with_projects(
-        mut self,
+        self,
         projects: &Entity<Projects>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        self.added_dirs = AddedDirs::of_session(
+        let added_dirs = AddedDirs::of_session(
             &self.daemon,
             &self.session,
             &self.workspace,
@@ -542,7 +564,14 @@ impl SessionView {
             window,
             cx,
         );
-        self
+        Self {
+            added_dirs,
+            title_bar: TitleBarSources {
+                projects: Some(projects.clone()),
+                _redraws: vec![cx.observe(projects, |_, _, cx| cx.notify())],
+            },
+            ..self
+        }
     }
 
     /// Offers the sign-in the session's model needs, above the composer,
@@ -666,7 +695,25 @@ impl SessionView {
             placeholder: self.placeholder(),
             activity: self.activity(),
             kind: self.agent_kind(),
+            // Empty until the session's options arrive, which isn't none.
+            added_dirs: self
+                .session
+                .options()
+                .map(|_| self.session.added_dirs().to_vec()),
         }
+    }
+
+    /// The projects the session works in, as its title bar names them: a
+    /// subagent's are those of the session it runs under, whose work it
+    /// does.
+    pub(crate) fn projects<'a>(&self, cx: &'a App) -> Vec<&'a Workspace> {
+        if let Some(parent) = self.parent() {
+            return parent.read(cx).projects(cx);
+        }
+        let projects = self.title_bar.projects.as_ref();
+        let projects = projects.map(|projects| projects.read(cx));
+        let dirs = self.added_dirs.read(cx);
+        dirs.projects(Some(self.workspace.index()), projects, cx)
     }
 
     /// By the agent it runs as, once the session says which: `None` until
@@ -2108,7 +2155,7 @@ impl SessionView {
             next = view.read(cx).parent();
             above.push(view);
         }
-        let mut bar = TitleBar::new(Some(self.workspace.read(cx)), self.title());
+        let mut bar = TitleBar::new(&self.projects(cx), self.title());
         let this = cx.entity().downgrade();
         // A lead's folder is no project to start a session in.
         if self.kind(cx) == Kind::Session {

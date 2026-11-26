@@ -1964,14 +1964,20 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
 /// A project picked in a lead's draft stays in the draft, not on the
 /// draft's own session, which is not the lead's; a pick can be taken out
 /// again. The lead that the first message starts reaches the picks from
-/// its first turn.
+/// its first turn, and its title bar and sidebar row name them, not its
+/// own folder, with their badges stacked.
 #[test]
 fn a_leads_draft_hands_its_projects_to_the_lead() {
     let rho_home = tempfile::tempdir().expect("a rho home");
-    let project = tempfile::tempdir().expect("a project");
+    let projects = tempfile::tempdir().expect("a projects folder");
+    let [rho, rho_ui] = ["rho", "rho-ui"].map(|name| {
+        let dir = projects.path().join(name);
+        std::fs::create_dir(&dir).expect("a project");
+        dir
+    });
     let daemon = FakeDaemon::start(Script::default());
     let machines = Machines {
-        projects: Projects::of([project.path()]),
+        projects: Projects::of([&rho_ui, &rho]),
         rho_home: Some(rho_home.path().to_path_buf()),
         ..Machines::default()
     };
@@ -1990,7 +1996,7 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
     ui.shot("offered");
     ui.click("add-project-0");
     ui.wait_until("the project picked", |window, _, _| {
-        is_visible(window, "added-dir-0") && !is_visible(window, "add-project-0")
+        is_visible(window, "added-dir-0") && !is_visible(window, "add-project-1")
     });
     assert_eq!(ui.fake().added_dirs("new-1"), Some(Vec::new()));
 
@@ -2002,6 +2008,10 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
     ui.wait_until("the project picked again", |window, _, _| {
         is_visible(window, "added-dir-0")
     });
+    ui.click("add-project-0");
+    ui.wait_until("both projects picked", |window, _, _| {
+        is_visible(window, "added-dir-1")
+    });
 
     let app = ui.app.clone();
     ui.act(|window, cx| {
@@ -2010,12 +2020,38 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
         window.focus(&composer, cx);
     });
     ui.send("Fix the parser!");
-    ui.wait_for_session("the lead, reaching the project", |session| {
-        session.id().as_str() == "new-2" && session.added_dirs() == [project.path()]
+    let both = vec![rho, rho_ui];
+    ui.wait_for_session("the lead, reaching the projects", |session| {
+        session.id().as_str() == "new-2" && session.added_dirs() == both
     });
-    assert_eq!(
-        ui.fake().added_dirs("new-2"),
-        Some(vec![project.path().to_path_buf()])
+    assert_eq!(ui.fake().added_dirs("new-2"), Some(both));
+
+    let named = "rho + rho-ui";
+    ui.wait_until("the lead's row names its projects", |window, _, _| {
+        window
+            .try_find("session-local-new-2-project-names")
+            .is_some_and(|names| names.label() == Some(named))
+    });
+    assert_eq!(ui.label("title-project-names").as_deref(), Some(named));
+    ui.wait_until("the lead's turn shows", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.click("toggle-settled");
+    ui.shot("projects");
+    let width = |ui: &mut Harness| {
+        let stack = ui.cx.update_window(ui.window, |_, window, _| {
+            window.find("title-projects").bounds()
+        });
+        stack.expect("window is open")
+    };
+    let stacked = width(&mut ui);
+    ui.act(|window, cx| window.pointer_move(stacked.center(), None, cx));
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.shot("projects-fanned");
+    let fanned = width(&mut ui);
+    assert!(
+        fanned.size.width > stacked.size.width,
+        "hovered, the badges fan apart"
     );
 }
 

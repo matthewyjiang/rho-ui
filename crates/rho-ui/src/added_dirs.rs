@@ -45,8 +45,9 @@ use crate::{
     leads::Kind,
     machines::{MachineId, Place},
     project_picker::{project_row, ROW_REMS},
+    project_stack::session_projects,
     projects::Projects,
-    workspaces::{tilde, WorkspaceRef, Workspaces},
+    workspaces::{tilde, Workspace, WorkspaceRef, Workspaces},
 };
 
 /// Rows the list of projects shows before it scrolls: as many as the
@@ -96,6 +97,8 @@ pub(crate) struct AddedDirs {
     workspaces: Entity<Workspaces>,
     /// As the session last listed them, or as picked in a lead's draft.
     dirs: Vec<PathBuf>,
+    /// Each of `dirs`' index into `workspaces`, which names its project.
+    indices: Vec<usize>,
     /// How they are worded.
     kind: Kind,
     /// `None` in a view that only lists them; see [`DirsAccess`].
@@ -231,11 +234,55 @@ impl AddedDirs {
             machine,
             workspaces,
             dirs,
+            indices: Vec::new(),
             kind,
             form,
         };
+        this.reindex(cx);
         this.refresh_offer(cx);
         this
+    }
+
+    /// The projects the session works in, by [`session_projects`], with
+    /// `own`, the session's workspace, by its index into the workspaces,
+    /// `None` for a lead's draft, which has none yet; `projects` are the
+    /// user's.
+    pub(crate) fn projects<'a>(
+        &self,
+        own: Option<usize>,
+        projects: Option<&Projects>,
+        cx: &'a App,
+    ) -> Vec<&'a Workspace> {
+        let workspaces = self.workspaces.read(cx);
+        session_projects(
+            self.kind,
+            own.map(|ix| workspaces.get(ix)),
+            self.indices.iter().map(|&ix| workspaces.get(ix)),
+            projects,
+        )
+    }
+
+    /// The directories' indices into the workspaces, for whoever names
+    /// their projects elsewhere, as the sidebar's row of a lead's draft.
+    pub(crate) fn indices(&self) -> &[usize] {
+        &self.indices
+    }
+
+    /// Finds each directory's workspace, adding those not in the table, so
+    /// its project can be named.
+    fn reindex(&mut self, cx: &mut Context<'_, Self>) {
+        let (machine, dirs) = (&self.machine, &self.dirs);
+        self.indices = self
+            .workspaces
+            .update(cx, |workspaces, cx| workspaces.index_all(machine, dirs, cx));
+    }
+
+    /// Lists `dirs`, and redraws.
+    fn set_dirs(&mut self, dirs: Vec<PathBuf>, cx: &mut Context<'_, Self>) {
+        self.dirs = dirs;
+        self.reindex(cx);
+        self.refresh_offer(cx);
+        cx.notify();
     }
 
     /// The directories listed: the session's, or those a lead's draft
@@ -255,9 +302,7 @@ impl AddedDirs {
     /// Shows `dirs`, the session's list as the daemon last sent it.
     pub(crate) fn sync(&mut self, dirs: &[PathBuf], cx: &mut Context<'_, Self>) {
         if self.dirs != dirs {
-            self.dirs = dirs.to_vec();
-            self.refresh_offer(cx);
-            cx.notify();
+            self.set_dirs(dirs.to_vec(), cx);
         }
     }
 
@@ -332,18 +377,17 @@ impl AddedDirs {
                 daemon, session, ..
             } => (daemon.clone(), session.clone()),
             Target::Pending => {
-                if let Some(dirs) = with_added(&self.dirs, path) {
-                    self.dirs = dirs;
-                    form.error = None;
-                    if source == Source::Typed {
-                        form.input
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                    }
-                } else {
+                let Some(dirs) = with_added(&self.dirs, path) else {
                     form.error = Some("It's listed already, or in one listed.".into());
+                    cx.notify();
+                    return;
+                };
+                form.error = None;
+                if source == Source::Typed {
+                    form.input
+                        .update(cx, |input, cx| input.set_value("", window, cx));
                 }
-                self.refresh_offer(cx);
-                cx.notify();
+                self.set_dirs(dirs, cx);
                 return;
             }
         };
@@ -377,9 +421,8 @@ impl AddedDirs {
     /// Takes `dir` out of a lead's draft's list, which offers it again if
     /// it is a project.
     fn remove(&mut self, dir: &Path, cx: &mut Context<'_, Self>) {
-        self.dirs.retain(|listed| listed != dir);
-        self.refresh_offer(cx);
-        cx.notify();
+        let dirs = self.dirs.iter().filter(|listed| *listed != dir).cloned();
+        self.set_dirs(dirs.collect(), cx);
     }
 
     /// The popover's list, projects and box, read from `this` as it is now.

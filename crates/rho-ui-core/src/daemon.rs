@@ -275,6 +275,7 @@ pub const LEAD_AGENT: &str = "lead";
 pub struct SessionSummary {
     id: SessionId,
     cwd: PathBuf,
+    added_dirs: Vec<PathBuf>,
     title: Option<String>,
     updated_at: u64,
     agent: Option<String>,
@@ -288,6 +289,7 @@ impl SessionSummary {
         Self {
             id: session.session.into(),
             cwd: session.cwd,
+            added_dirs: session.added_dirs,
             title: session.title.or(session.first_user_message),
             updated_at: session.updated_at,
             agent: None,
@@ -314,6 +316,12 @@ impl SessionSummary {
     /// The workspace the session runs in.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// The directories the session's tools reach besides its workspace,
+    /// as last saved.
+    pub fn added_dirs(&self) -> &[PathBuf] {
+        &self.added_dirs
     }
 
     /// rho's title for the session, or until it has one, its first prompt
