@@ -59,6 +59,13 @@ portable-pty = "0.9"
 # Runs pele, vendored in vendor/pele, for Mermaid diagrams; see src/pele.rs.
 rquickjs = "0.11"
 
+# The Dock icon's badge, which GPUI doesn't offer (src/attention.rs). The
+# versions GPUI's Mac platform builds, so no new crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
+
 # `rho-ui serve` (src/serve.rs): HTTP and its WebSockets for the page, the
 # token, and the runtime it all runs on. `query` reads `/socket?path=`.
 [target.'cfg(unix)'.dependencies]

@@ -2,13 +2,13 @@
 //! dialog over the window. Built from GPUI Kit's `Settings` component: pages
 //! on the left with a search, groups of items on the right. Each change
 //! applies at once and is saved. rho-ui's own settings come first, kept in
-//! its settings file: Appearance, the Machines page in [`machines`], and
-//! the forge CLIs on each machine in [`source_control`]. Then come rho's
-//! own: each machine's sign-ins to providers, in [`providers`], the
-//! worktrees it added for sessions, in [`worktrees`], and a page per
-//! category its daemon describes, saved in that machine's `config.toml`:
-//! see [`rho`]. Last, [`about`] shows the versions of
-//! rho-ui and of Rho on each machine.
+//! its settings file: Appearance, Notifications, the Machines page in
+//! [`machines`], and the forge CLIs on each machine in [`source_control`].
+//! Then come rho's own: each machine's sign-ins to providers, in
+//! [`providers`], the worktrees it added for sessions, in [`worktrees`], and
+//! a page per category its daemon describes, saved in that machine's
+//! `config.toml`: see [`rho`]. Last, [`about`] shows the versions of rho-ui
+//! and of Rho on each machine.
 
 mod about;
 mod machines;
@@ -17,6 +17,7 @@ mod rho;
 mod source_control;
 mod worktrees;
 
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     dialog::DialogEntrance,
@@ -39,7 +40,8 @@ use crate::{
     rho_install::Installs,
     rho_settings::RhoSettings,
     settings::{
-        update, Appearance, Settings, SmoothScroll, UiScale, DEFAULT_CODE_FONT, DEFAULT_UI_FONT,
+        update, Appearance, Notifications, Settings, SmoothScroll, UiScale, DEFAULT_CODE_FONT,
+        DEFAULT_UI_FONT,
     },
     sidebar::SidebarView,
     workspaces::Workspaces,
@@ -540,9 +542,44 @@ impl SettingsView {
     }
 }
 
+/// The Notifications page: which sessions send one while rho-ui is in the
+/// background ([`crate::attention`]).
+fn notifications_page() -> SettingPage {
+    let choices: Vec<(SharedString, SharedString)> = Notifications::CHOICES
+        .into_iter()
+        .map(|choice| (choice.name().into(), choice.label().into()))
+        .collect();
+    SettingPage::new("Notifications")
+        .icon(Lucide::Bell)
+        .resettable(true)
+        .header_style(&page_header())
+        .group(
+            SettingGroup::new().items([SettingItem::new(
+                "Desktop notifications",
+                SettingField::dropdown(
+                    choices,
+                    |cx: &App| cx.global::<Settings>().notifications.name().into(),
+                    |name: SharedString, cx: &mut App| {
+                        if let Some(notifications) = Notifications::from_name(&name) {
+                            update(cx, |settings| settings.notifications = notifications);
+                        }
+                    },
+                )
+                .default_value(Notifications::default().name())
+                .w(rems(CONTROL_REMS))
+                .justify_between(),
+            )
+            .description(
+                "Sent while rho-ui's window doesn't have the focus, when a session \
+                 needs you or its turn ends.",
+            )]),
+        )
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let appearance = self.appearance_page();
+        let notifications = notifications_page();
         let machines = self.machines_page(cx);
         let source_control = self.source_control_page(window, cx);
         let providers = self.providers_page(window, cx);
@@ -566,6 +603,7 @@ impl Render for SettingsView {
                     .sidebar_style(&pages)
                     .with_group_variant(GroupBoxVariant::Fill)
                     .page(appearance)
+                    .page(notifications)
                     .page(machines)
                     .page(source_control)
                     .page(providers)

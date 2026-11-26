@@ -12,7 +12,18 @@ The active list reads as an inbox. Under the pinned sessions, which stay on top 
 
 A session whose agent watches a pull request isn't Done: rho wakes it when the pull request changes, so on the active list it reads **Watching** until the watch ends. Watching doesn't keep a session active, though; you can still snooze or settle one.
 
-A session stays Done until you open it, even across restarts of rho-ui. A turn that finishes while rho-ui is closed doesn't mark its session Done, since rho-ui didn't see it end.
+A session stays Done until you open it, even across restarts of rho-ui. A turn that finishes while rho-ui is closed doesn't mark its session Done, since rho-ui didn't see it end. The session on screen turns Done too if its turn ends while rho-ui's window doesn't have the focus, until you come back to the window.
+
+## Notifications
+
+While rho-ui's window doesn't have the focus, a session that starts to need you (a question or an approval) or whose turn ends sends a desktop notification naming it. Sessions that do so within two seconds of each other share one notification. Clicking it opens the session; the ones that need you come first. Sessions on remote machines notify the same way. Nothing is sent while the window has the focus. **Settings → Notifications** turns them off, or keeps them to sessions that need you.
+
+The window's title counts the sessions that need you or are Done, as `(2) Rho`, so a taskbar or window switcher shows it. On macOS the count also shows on the Dock icon, and the icon bounces once with each notification; on X11 the window is marked urgent until you focus it.
+
+What the platform allows:
+
+- **macOS** shows notifications only for the installed `Rho.app`, not a binary run from a terminal, and asks you to allow them the first time.
+- **Linux** sends them to your desktop's notification server over D-Bus, on Wayland and X11 alike. Whether clicking one also raises the window is up to the compositor: on Wayland, GNOME and KDE may only mark rho-ui as wanting attention, but the session is open when you switch to it.
 
 ## Sessions a session starts
 

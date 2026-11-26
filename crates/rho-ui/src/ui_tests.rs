@@ -22,8 +22,8 @@ use gpui_kit::test::{
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, ClipboardEntry, ClipboardItem,
     ElementId, ElementInputHandler, Entity, ExternalPaths, HeadlessAppContext, ImageFormat,
-    Modifiers, MouseButton, MouseExitEvent, Pixels, PlatformInput, SharedString, Size, Window,
-    WindowBounds, WindowOptions,
+    IntoElement, Modifiers, MouseButton, MouseExitEvent, Pixels, PlatformInput, Render,
+    SharedString, Size, SystemNotification, Window, WindowBounds, WindowOptions,
 };
 use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
@@ -46,6 +46,7 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 
 use crate::{
     app::{LaunchConfig, RhoApp},
+    attention::Notifier,
     forge::{avatar::test::serve_pictures, Check, ForgeCli},
     leads::Kind,
     machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
@@ -198,6 +199,8 @@ struct Harness {
     daemon: Option<FakeDaemon>,
     /// The state database the app saves to, in memory.
     state: StateDb,
+    /// The desktop notifications the app posted, in order.
+    notifications: Rc<RefCell<Vec<SystemNotification>>>,
 }
 
 impl Harness {
@@ -277,6 +280,7 @@ impl Harness {
             rho_home,
         } = machines;
         let rho = rho.map(|rho| RhoInstall::Here { rho });
+        let notifications: Rc<RefCell<Vec<SystemNotification>>> = Rc::default();
         // Never the user's gh, which would ask GitHub about their account.
         if settings.local_cli.get(ForgeCli::Gh).is_empty() {
             settings
@@ -325,6 +329,7 @@ impl Harness {
             shell: TerminalShell(TEST_SHELL.clone()),
             // Never the user's rho home, where leads would make folders.
             rho_home: Some(rho_home.unwrap_or_else(|| PathBuf::from("/nonexistent/rho"))),
+            notifier: Notifier::Kept(Rc::clone(&notifications)),
         };
         let sidebar = SidebarState {
             unseen: Unseen::load(&state),
@@ -358,6 +363,7 @@ impl Harness {
             target,
             daemon,
             state,
+            notifications,
         };
         harness.frame();
         harness
@@ -617,7 +623,12 @@ impl Harness {
     /// terminal UI: over a connection of its own, which it then closes. A
     /// session with a turn under way takes it as a steer.
     fn send_from_elsewhere(&mut self, id: &str, text: &str, how: Send) {
-        let (target, id, text) = (self.target.clone(), SessionId::from(id), text.to_owned());
+        self.send_on(self.target.clone(), id, text, how);
+    }
+
+    /// [`Self::send_from_elsewhere`] to the daemon at `target`.
+    fn send_on(&mut self, target: DaemonTarget, id: &str, text: &str, how: Send) {
+        let (id, text) = (SessionId::from(id), text.to_owned());
         self.cx.update(|cx| {
             cx.spawn(async move |_| {
                 let (daemon, _events) = Daemon::connect(target)
@@ -634,6 +645,31 @@ impl Harness {
             })
             .detach();
         });
+    }
+
+    /// Gives another window the focus, as the user does on leaving rho-ui
+    /// for another app. The app's window must have had it first for GPUI to
+    /// say it lost it.
+    fn blur(&mut self) {
+        self.act(|window, _| window.activate_window());
+        let (elsewhere, _) = self
+            .cx
+            .update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        focus: false,
+                        show: false,
+                        ..Default::default()
+                    },
+                    cx,
+                    |_, cx| cx.new(|_| Elsewhere),
+                )
+            })
+            .expect("open another window");
+        self.cx
+            .update_window(elsewhere, |_, window, _| window.activate_window())
+            .expect("the other window is open");
+        self.frame();
     }
 
     /// The fake daemon the app talks to.
@@ -762,6 +798,15 @@ struct Machines {
     /// This machine's rho home, where leads keep their folders; one that
     /// isn't there, so none can be made, when `None`.
     rho_home: Option<PathBuf>,
+}
+
+/// Another app's window, which [`Harness::blur`] gives the focus.
+struct Elsewhere;
+
+impl Render for Elsewhere {
+    fn render(&mut self, _: &mut Window, _: &mut gpui_kit::Context<'_, Self>) -> impl IntoElement {
+        gpui_kit::Empty
+    }
 }
 
 /// How [`Harness::send_from_elsewhere`] sends its message.
@@ -3607,6 +3652,85 @@ fn a_turn_finished_off_screen_is_done_until_opened() {
     ui.wait_until("the session open and the row seen", |window, _, app| {
         app.active_session().is_some() && !is_visible(window, "session-local-tui-1-done")
     });
+}
+
+/// A turn that ends on a remote machine while rho-ui is in the background
+/// counts in the window's title and, a burst's wait later, sends one
+/// notification naming its session; a click on it brings the window back
+/// and opens the session, which clears the count. With the window focused,
+/// the session on screen asking for an approval sends nothing, though the
+/// title counts it.
+#[test]
+fn a_turn_finished_in_the_background_notifies_and_opens_on_a_click() {
+    let local = FakeDaemon::start(Script::default());
+    let remote = FakeDaemon::start(Script {
+        tui_job: TuiJob::Running,
+        ..Script::default()
+    });
+    let remote_target = remote.target();
+    let DaemonTarget::Socket(remote_socket) = remote.target() else {
+        panic!("a fake daemon listens on a socket");
+    };
+    let mut settings = Settings::default();
+    settings.machines = vec![RemoteMachine::new("box")];
+    let mut ui = Harness::open_with(
+        "notify",
+        local.target(),
+        Some(local),
+        Machines {
+            settings,
+            remote_sockets: vec![("box".to_owned(), remote_socket)],
+            ..Machines::default()
+        },
+    );
+    ui.wait_until("the box's job at work", |window, _, _| {
+        window
+            .try_find("session-box-tui-1-busy")
+            .and_then(|status| status.label().map(|label| label.starts_with("Working")))
+            .unwrap_or(false)
+    });
+    ui.blur();
+    ui.send_on(remote_target.clone(), TUI_SESSION, "wrap up", Send::Steer);
+    ui.wait_for_label("session-box-tui-1-done", "Done");
+    let count = |ui: &mut Harness| ui.cx.update(|cx| ui.app.read(cx).attention_count());
+    assert_eq!(count(&mut ui), 1, "the title counts the Done session");
+    // The burst's wait, on the test's clock.
+    ui.cx.advance_clock(Duration::from_secs(2));
+    let posted = Rc::clone(&ui.notifications);
+    ui.wait_until("one notification", |_, _, _| posted.borrow().len() == 1);
+    let tag = posted.borrow()[0].tag.clone();
+    assert_eq!(
+        tag, "session-box-tui-1",
+        "it opens the session that finished"
+    );
+    ui.shot("background");
+
+    let app = ui.app.clone();
+    ui.act(|window, cx| app.update(cx, |app, cx| app.notification_clicked(&tag, window, cx)));
+    ui.wait_until("the session open and seen", |window, cx, app| {
+        app.active_session()
+            .is_some_and(|view| view.read(cx).key().id.as_str() == TUI_SESSION)
+            && window.is_window_active()
+            && !is_visible(window, "session-box-tui-1-done")
+    });
+    assert_eq!(count(&mut ui), 0, "nothing is left to count");
+
+    // A prompt from elsewhere asks to run `ls`: the session on screen
+    // needs the user, who has the window.
+    ui.send_on(remote_target, TUI_SESSION, "once more", Send::Prompt);
+    ui.wait_until("the approval on screen", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.cx.advance_clock(Duration::from_secs(2));
+    ui.frame();
+    assert_eq!(
+        posted.borrow().len(),
+        1,
+        "nothing more is sent while focused"
+    );
+    assert_eq!(count(&mut ui), 1, "the title counts it all the same");
+    // The box's daemon lasts the test.
+    drop(remote);
 }
 
 /// A project with an origin remote gets a button beside its name in the

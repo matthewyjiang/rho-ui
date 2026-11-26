@@ -20,6 +20,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use crate::{
     app::LaunchConfig,
+    attention::Notifier,
     machines::{Reach, RemoteMachine},
     open_app,
     right_panel::TerminalShell,
@@ -88,6 +89,7 @@ pub(crate) fn main() {
         },
         shell: TerminalShell::from_env(),
         rho_home: None,
+        notifier: Notifier::System,
     };
     gpui_kit::platform::single_threaded_web()
         .with_assets(Assets::new(&origin))
