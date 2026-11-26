@@ -753,7 +753,7 @@ impl RightPanel {
             Surface::Files => Tab::Files(cx.new(|cx| FilesSurface::new(workspaces, place, cx))),
             Surface::PullRequest => {
                 let (prs, session) = (self.prs.clone(), session.clone());
-                let view = cx.new(|cx| PullRequestSurface::new(prs, session, cx));
+                let view = cx.new(|cx| PullRequestSurface::new(prs, workspaces, session, cx));
                 Tab::PullRequest {
                     // Its label, the PR's number, comes once the PR is found.
                     _redraw: cx.observe(&view, |_, _, cx| cx.notify()),

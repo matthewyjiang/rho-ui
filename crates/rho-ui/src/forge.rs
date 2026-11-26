@@ -9,15 +9,16 @@
 //! parser in a module of its own, as [`gh`] has.
 //!
 //! Each machine's rho daemon reads pull requests, with a `gh` it finds on
-//! its own; rho-ui only acts on one, through the CLI here ([`act`]), so the
-//! program Settings name steers that alone.
+//! its own; rho-ui only acts on one, through the CLI here ([`act`]), and
+//! signs in with it to fetch the images in one's text, so the program
+//! Settings name steers those alone.
 //!
-//! People's pictures come from where the forge serves them, without its
-//! CLI; see [`avatar`].
+//! The pictures its pages show come from where the forge serves them,
+//! with `curl`; see [`picture`].
 
-pub(crate) mod avatar;
 mod gh;
 mod gh_actions;
+pub(crate) mod picture;
 
 use std::{
     collections::{BTreeMap, HashMap},

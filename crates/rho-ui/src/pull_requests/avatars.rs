@@ -1,5 +1,5 @@
 //! The pictures of the people who post on PRs, each fetched once from
-//! where the forge serves it ([`forge::avatar`](crate::forge::avatar)) and
+//! where the forge serves it ([`forge::picture`](crate::forge::picture)) and
 //! kept until rho-ui quits: 72 px a side, so about 20 kB each once drawn.
 //!
 //! A picture is known by its address less the query: that holds its size

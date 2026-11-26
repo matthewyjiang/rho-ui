@@ -31,6 +31,7 @@ use crate::{
     folders::Reader,
     forge::{self, AuthState, Check, CliProbe, ForgeCli, Forges, PrAction},
     machines::{MachineId, SessionKey},
+    pictures::{Signing, Site},
     workspaces::Workspaces,
 };
 
@@ -536,6 +537,10 @@ impl PullRequests {
             .as_ref()
             .is_some_and(|shown| shown.session.machine == *machine)
         {
+            // Who comments on it and fetches its images, checked afresh:
+            // the connection dropped what was known.
+            self.forges
+                .update(cx, |forges, cx| forges.ensure_checked(machine, cx));
             self.show_now(cx);
         }
     }
@@ -674,11 +679,15 @@ impl PullRequests {
                 Gh::of(&machine, self.host_of(shown), check),
                 Gh::Unusable(_)
             );
-            if unusable {
-                // A CLI installed or signed in since its check.
-                self.forges
-                    .update(cx, |forges, cx| forges.recheck(&machine, cx));
-            }
+            self.forges.update(cx, |forges, cx| {
+                if unusable {
+                    // A CLI installed or signed in since its check.
+                    forges.recheck(&machine, cx);
+                } else {
+                    // One that couldn't start, its machine not connected.
+                    forges.ensure_checked(&machine, cx);
+                }
+            });
         }
         self.show_fresh(cx);
     }
@@ -888,6 +897,23 @@ impl PullRequests {
             }),
             Gh::Checking => Err("Checking gh…".into()),
             Gh::Unusable(why) => Err(why),
+        }
+    }
+
+    /// The forge whose pictures PR `shown` shows, and how its machine's
+    /// `gh` signs in to it.
+    pub(crate) fn picture_site(&self, shown: &Shown, cx: &App) -> Site {
+        let machine = &shown.session.machine;
+        let host = self.host_of(shown);
+        let check = self.forges.read(cx).check(machine, ForgeCli::Gh);
+        let signing = match Gh::of(machine, host, check) {
+            Gh::Use { program, .. } => Signing::With(program),
+            Gh::Checking => Signing::Checking,
+            Gh::Unusable(_) => Signing::Without,
+        };
+        Site {
+            host: host.to_owned(),
+            signing,
         }
     }
 
@@ -1205,7 +1231,7 @@ impl PullRequests {
         };
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
-            let picture = forge::avatar::fetch(runner, &url, &executor).await;
+            let picture = forge::picture::avatar(runner, &url, &executor).await;
             let picture = picture.inspect_err(|why| report_avatar(&url, why)).ok();
             let _ = this.update(cx, |this, cx| {
                 this.avatars.finish(&url, picture);

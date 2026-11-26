@@ -327,7 +327,25 @@ impl FakeDaemon {
     ///
     /// If the daemon has no session `session`: the test has a bug.
     pub fn open_pull_request(&self, session: &UiSessionId, pictures: &str) {
-        let detail = widgets(pictures);
+        self.open_detail(session, widgets(pictures));
+    }
+
+    /// [`Self::open_pull_request`], with [`images`] at `pictures` at the
+    /// end of its description, and its first comment's icon.
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `session`: the test has a bug.
+    pub fn open_pull_request_with_images(&self, session: &UiSessionId, pictures: &str) {
+        let mut detail = widgets(pictures);
+        detail.body.push_str(&images(pictures));
+        let icon = format!("\n\n<img alt=\"Its icon\" src=\"{pictures}/icon-320x320.png\">");
+        detail.posts[0].body.push_str(&icon);
+        self.open_detail(session, detail);
+    }
+
+    /// Gives `session`'s branch the PR `detail` is of, with `detail`.
+    fn open_detail(&self, session: &UiSessionId, detail: PullRequestDetail) {
         let summary = detail.summary.clone();
         let mut state = self.service.lock();
         state
@@ -399,6 +417,20 @@ impl FakeDaemon {
             .map(|(_, id)| id.clone())
             .collect()
     }
+}
+
+/// The images [`FakeDaemon::open_pull_request_with_images`] adds to
+/// `acme/widgets#12`'s description, at `pictures`: a 1200 x 600
+/// screenshot in Markdown, a 320 px icon in the `<img>` tag GitHub's site
+/// writes for an upload, at half its width, a picture that isn't there,
+/// and one on a host rho-ui doesn't fetch from.
+fn images(pictures: &str) -> String {
+    format!(
+        "\n![The widget]({pictures}/widget-1200x600.png)\n\n\
+         <img width=\"160\" height=\"160\" alt=\"Its icon\" src=\"{pictures}/icon-320x320.png\" />\n\n\
+         ![A missing shot]({pictures}/gone.png)\n\n\
+         ![A tracker](https://tracker.example/pixel.png)\n"
+    )
 }
 
 /// The detail of `acme/widgets#12`, with its people's pictures at
