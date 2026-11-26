@@ -183,17 +183,17 @@ use rho_protocol::{
         BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, IdempotencyKey,
         JobId, JobKind, JobState, JobSummary, MessageId, ModelChoice, ModelOptions, ModelRef,
         PendingUpgrade, PermissionModeOptions, QueuePlace, ReasoningLevel, ReasoningOptions,
-        Replay, Seq, SessionCommand, SessionId, SessionOptions, SessionSurfaceActionParams,
-        SessionWorktree, StartedSessionDefaults, SteerId, StreamId, ToolCallId, ToolCallUpdate,
-        TurnId,
+        Replay, Seq, SessionCommand, SessionId, SessionOptions, SessionPromptParams,
+        SessionSurfaceActionParams, SessionWorktree, StartedSessionDefaults, SteerId, StreamId,
+        ToolCallId, ToolCallUpdate, TurnId,
     },
     serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, CompactionCounts, CompactionId, CompactionStatus, CompactionTrigger, ContentBlock,
     Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle, DetachReason, ErrorCode,
-    InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus, ProtocolVersion, Published,
-    Publisher, Question, RestartCost, RetryReason, RpcError, Selection, SessionAttachResponse,
-    SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome, VersionMismatch,
-    WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
+    InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus, PromptAuthor, ProtocolVersion,
+    Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
+    SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
+    TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -388,6 +388,10 @@ pub enum Started {
     Idle,
     /// Its first turn runs, until a steer ends it.
     Working,
+    /// Its first turn runs the prompt, as a client's would, and waits on
+    /// what that prompt asks: an approval to run `ls`, or for "plan" and
+    /// "questions", a plan approval or questions.
+    Asking(&'static str),
 }
 
 /// Whether the fake daemon runs a turn some other client started.
@@ -687,6 +691,37 @@ impl FakeDaemon {
             session.say(&format!("{id}-m1"), "Started.");
         }
         state.sessions.insert(id.to_owned(), session);
+        if let Started::Asking(prompt) = started {
+            let params = SessionPromptParams {
+                session: SessionId::new(id),
+                content: vec![ContentBlock::Text {
+                    text: prompt.to_owned(),
+                }],
+                timeout_ms: None,
+                environment: ClientEnvironment::default(),
+                grant: None,
+                idempotency_key: None,
+                author: PromptAuthor::Person,
+            };
+            service::start_prompt(&mut state, &params).expect("the fake takes the prompt");
+        }
+    }
+
+    /// The text of session `id`'s latest agent message, as its chunks
+    /// stream it: after an answer, the turn's reply to it, such as
+    /// `you chose allow_once`.
+    pub fn reply(&self, id: &str) -> Option<String> {
+        let state = self.service.lock();
+        let mut reply: Option<(&MessageId, String)> = None;
+        for event in &state.sessions.get(id)?.history {
+            if let SessionEvent::AgentMessageChunk { message, text } = event {
+                match &mut reply {
+                    Some((latest, said)) if *latest == message => said.push_str(text),
+                    _ => reply = Some((message, text.clone())),
+                }
+            }
+        }
+        reply.map(|(_, text)| text)
     }
 
     /// Gives session `id` a saved choice for the sessions it starts that

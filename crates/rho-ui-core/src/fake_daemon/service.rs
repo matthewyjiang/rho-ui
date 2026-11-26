@@ -136,7 +136,7 @@ fn summary(id: &str, session: &FakeSession) -> SessionSummary {
 }
 
 /// Starts the turn of the prompt `params`, as each prompt scripts it.
-fn start_prompt(
+pub(super) fn start_prompt(
     state: &mut State,
     params: &SessionPromptParams,
 ) -> Result<SessionPromptResponse, RpcError> {
@@ -312,7 +312,11 @@ fn reply(answer: &InputAnswer) -> String {
         InputAnswer::AllowOnce => chose("allow_once", &None),
         InputAnswer::AllowForSession => chose("allow_for_session", &None),
         InputAnswer::Deny { reason } => chose("deny", reason),
-        InputAnswer::ApprovePlan { feedback, .. } => chose("approve_plan", feedback),
+        InputAnswer::ApprovePlan { mode, feedback } => {
+            let mode = serde_json::to_value(mode).expect("a mode serializes");
+            let mode = mode.as_str().expect("a mode is a string");
+            chose(&format!("approve_plan {mode}"), feedback)
+        }
         InputAnswer::KeepPlanning { feedback } => chose("keep_planning", feedback),
         InputAnswer::Answers { answers } => {
             let answers = answers

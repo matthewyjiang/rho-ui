@@ -266,7 +266,10 @@ impl SessionList {
             fold,
         }));
         if fold != Fold::Closed {
-            items.extend(drawn.into_iter().map(|ix| Item::row(starter.shelf, ix)));
+            items.extend(drawn.into_iter().map(|ix| match self.asks(ix) {
+                Some(_) if starter.shelf == Shelf::Active => Item::Asking(ix),
+                _ => Item::row(starter.shelf, ix),
+            }));
         }
     }
 }

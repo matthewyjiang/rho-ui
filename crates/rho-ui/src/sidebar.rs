@@ -15,6 +15,9 @@
 //! started is drawn indented under it, behind a line that counts them and
 //! opens on a click, or by itself when one of them comes on screen, or
 //! while the search or the filter shows some of them and not their starter.
+//! One of them that waits on an approval or a plan offers its choices on
+//! its row, answered without opening it; one that asks questions offers
+//! Open.
 //! Hovering a row shows its details in a card. The filter beside the
 //! search hides machines or keeps to chosen projects, and the footer says
 //! which machines aren't connected, with what would fix it (Retry, a
@@ -32,7 +35,7 @@
 //! The data lives in [`SessionList`] and [`Workspaces`], built when it
 //! changes, never per frame.
 
-use std::{ops::Range, path::PathBuf, rc::Rc, time::Duration};
+use std::{collections::HashSet, ops::Range, path::PathBuf, rc::Rc, time::Duration};
 
 use web_time::Instant;
 
@@ -40,7 +43,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     alert::Alert,
-    button::{Button, ButtonVariant, ButtonVariants as _},
+    button::{Button, ButtonVariant, ButtonVariants as _, DropdownButton},
     description_list::DescriptionList,
     empty::{Empty, EmptyDescription, EmptyHeader},
     h_flex,
@@ -48,8 +51,10 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     resizable::{resize_handle, HandleEdge},
-    v_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, InteractiveElementExt as _,
-    Sizable as _, StyledExt, Theme, VirtualListScrollHandle, WindowExt as _,
+    tooltip::Tooltip,
+    v_flex, v_virtual_list, ActiveTheme as _, Disableable as _, Icon, IconName,
+    InteractiveElementExt as _, Sizable as _, StyledExt, Theme, VirtualListScrollHandle,
+    WindowExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -59,7 +64,10 @@ use gpui_kit::{
     Render, ScrollStrategy, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
     Subscription, Task, WeakEntity, Window,
 };
-use rho_ui_core::{Job, NewSessionMark, SessionMark, SessionSummary};
+use rho_ui_core::{
+    Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Job, NewSessionMark, SessionMark,
+    SessionSummary,
+};
 
 use crate::{
     app_update::{self, AppUpdate},
@@ -104,6 +112,14 @@ const ROW_REMS: f32 =
 /// Inside a one-line shelved row's highlight, above and below its title.
 const SHELVED_PAD_REMS: f32 = 0.5;
 
+/// A Kit `xsmall` button's height: the line of choices under a row that
+/// offers its session's request.
+const CHOICES_REMS: f32 = 1.25;
+
+/// An active row that offers its session's request: the row, then the
+/// request's title and the line of choices to answer it with.
+const ASKING_ROW_REMS: f32 = ROW_REMS + LINE_REMS + CHOICES_REMS + 2. * GAP_REMS;
+
 /// A snoozed or settled row's height.
 const SHELVED_ROW_REMS: f32 = TITLE_REMS + 2. * SHELVED_PAD_REMS + 2. * GUTTER_REMS;
 
@@ -141,6 +157,7 @@ use rail::{toggle_button, Layout};
 fn item_rems(item: Item) -> f32 {
     match item {
         Item::Draft(_) | Item::Session(_) => ROW_REMS,
+        Item::Asking(_) => ASKING_ROW_REMS,
         Item::Shelved(_) | Item::More(_) => SHELVED_ROW_REMS,
         Item::Header(_) | Item::Leads | Item::Sessions => HEADER_REMS,
         Item::Fold(_) => FOLD_REMS,
@@ -283,6 +300,14 @@ pub(crate) enum SidebarEvent {
         sessions: Vec<SessionKey>,
         mark: NewSessionMark,
     },
+    /// Send `answer` to request `request` of session `id`, from its row.
+    /// The row holds its choices until the jobs stop listing the request,
+    /// or [`SidebarView::answer_failed`].
+    Answer {
+        id: SessionKey,
+        request: InputId,
+        answer: Answer,
+    },
     OpenSettings,
     /// Collapse the sidebar to its rail, or open it again; see
     /// [`SidebarView::toggle_collapsed`].
@@ -358,6 +383,8 @@ pub(crate) struct SidebarView {
     /// The draft row under the mouse, which offers Discard.
     draft_hover: Option<EntityId>,
     renaming: Option<Renaming>,
+    /// The requests answered from their rows that the jobs still list.
+    answering: HashSet<(SessionKey, InputId)>,
     search: Entity<InputState>,
     scroll: VirtualListScrollHandle,
     /// The list's height in the last frame, which the gap above the
@@ -447,6 +474,7 @@ impl SidebarView {
             hover: None,
             draft_hover: None,
             renaming: None,
+            answering: HashSet::new(),
             search,
             scroll: VirtualListScrollHandle::new(),
             viewport: Pixels::ZERO,
@@ -531,7 +559,7 @@ impl SidebarView {
         jobs: &[Job],
         cx: &mut Context<'_, Self>,
     ) {
-        let jobs = self.workspaces.update(cx, |workspaces, cx| {
+        let sessions: Vec<JobSession> = self.workspaces.update(cx, |workspaces, cx| {
             jobs.iter()
                 .map(|job| JobSession {
                     workspace: workspaces.index(&Place::new(machine.clone(), job.cwd()), cx),
@@ -543,11 +571,19 @@ impl SidebarView {
                     parent: job
                         .parent()
                         .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
+                    asks: job.inputs().first().cloned(),
                 })
                 .collect()
         });
+        let listed = |id: &SessionKey, request: InputId| {
+            jobs.iter().any(|job| {
+                *job.session() == id.id && job.inputs().iter().any(|asked| asked.id() == request)
+            })
+        };
+        self.answering
+            .retain(|(id, request)| id.machine != *machine || listed(id, *request));
         self.list
-            .set_jobs(machine, jobs, Instant::now(), time::now_unix());
+            .set_jobs(machine, sessions, Instant::now(), time::now_unix());
         self.mark_active_seen();
         self.rebuild(cx);
     }
@@ -681,7 +717,7 @@ impl SidebarView {
         // for its sessions included, and the session on screen, for its
         // title bar.
         let drawn = self.list.items().iter().filter_map(|item| match *item {
-            Item::Session(ix) => Some(self.list.row_at(ix).id.clone()),
+            Item::Session(ix) | Item::Asking(ix) => Some(self.list.row_at(ix).id.clone()),
             _ => None,
         });
         let active = self
@@ -985,10 +1021,13 @@ impl SidebarView {
                     let label = machines.tag(&draft.cwd.machine);
                     self.render_draft(draft, workspace, label, cx)
                 }
-                Item::Session(row) => {
-                    let row = self.list.row_at(row);
+                Item::Session(ix) | Item::Asking(ix) => {
+                    let row = self.list.row_at(ix);
                     let workspace = workspaces.get(row.workspace);
-                    self.render_row(row, workspace, label(row), clock, &view, cx)
+                    let asks = matches!(item, Item::Asking(_))
+                        .then(|| self.list.asks(ix))
+                        .flatten();
+                    self.render_row(row, workspace, label(row), asks, clock, &view, cx)
                 }
                 Item::Shelved(row) => {
                     let row = self.list.row_at(row);
@@ -1005,11 +1044,18 @@ impl SidebarView {
             .collect()
     }
 
+    /// An active row: its workspace and status, title, and branch, then,
+    /// with `asks`, the request its session waits on, to answer here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a part of the row the caller already has at hand"
+    )]
     fn render_row(
         &self,
         row: &Row,
         workspace: &Workspace,
         machine: Option<SharedString>,
+        asks: Option<&InputRequest>,
         clock: Clock,
         view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
@@ -1050,8 +1096,188 @@ impl SidebarView {
                 }),
                 machine.map(|label| (format!("{}-machine", row.element_id).into(), label)),
                 theme,
-            ));
-        Self::row_frame(rems(ROW_REMS), row, state, inner, view, cx).into_any_element()
+            ))
+            .when_some(asks, |this, request| {
+                this.child(self.render_request(row, request, cx))
+            });
+        let height = if asks.is_some() {
+            ASKING_ROW_REMS
+        } else {
+            ROW_REMS
+        };
+        Self::row_frame(rems(height), row, state, inner, view, cx).into_any_element()
+    }
+
+    /// The request a row's session waits on: its title, which shows it in
+    /// full on hover, then the choices that answer it
+    /// ([`Self::choice_buttons`]). Questions, and what this app can't
+    /// answer, offer Open instead, which shows the session's card.
+    fn render_request(
+        &self,
+        row: &Row,
+        request: &InputRequest,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let buttons = match request.form() {
+            Form::Choices { choices, .. } => self.choice_buttons(row, request.id(), choices, cx),
+            Form::Questions(_) | Form::Unsupported => {
+                let id = row.id.clone();
+                vec![Button::new(part_id(row, "open"))
+                    .xsmall()
+                    .outline()
+                    .label("Open")
+                    .on_click(cx.listener(move |this, _, _, cx| this.open(&id, cx)))
+                    .into_any_element()]
+            }
+        };
+        let title = SharedString::from(request.title().to_owned());
+        let detail = request
+            .description()
+            .map(|detail| SharedString::from(detail.to_owned()));
+        v_flex()
+            .gap(rems(GAP_REMS))
+            .child(
+                div()
+                    .id(part_id(row, "request"))
+                    .h(rems(LINE_REMS))
+                    .truncate()
+                    .text_xs()
+                    .child(title.clone())
+                    // A long command, or the plan, reads in full here.
+                    .tooltip(move |window, cx| {
+                        let text = match &detail {
+                            Some(detail) => format!("{title}\n\n{detail}"),
+                            None => title.to_string(),
+                        };
+                        Tooltip::new(SharedString::from(text)).build(window, cx)
+                    }),
+            )
+            .child(
+                h_flex()
+                    .h(rems(CHOICES_REMS))
+                    .gap_1()
+                    .overflow_hidden()
+                    // The choices answer the request; they must not also
+                    // open the session.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(buttons),
+            )
+            .into_any_element()
+    }
+
+    /// The buttons that answer request `request` of row `row`'s session
+    /// with one of `choices`: the one Enter would pick in the session's own
+    /// card, with the others that let the turn go on in its menu, and the
+    /// one that turns it down beside it. They hold, disabled, from a click
+    /// until the jobs stop listing the request.
+    fn choice_buttons(
+        &self,
+        row: &Row,
+        request: InputId,
+        choices: &[InputChoice],
+        cx: &Context<'_, Self>,
+    ) -> Vec<AnyElement> {
+        let sending = self.answering.contains(&(row.id.clone(), request));
+        let key = row.id.clone();
+        let answer_with = move |choice: &InputChoice| {
+            // The row has no box for a denial's reason or a plan's
+            // feedback: the session's own card does.
+            let (id, answer) = (key.clone(), choice.answer(""));
+            move |this: &mut Self, cx: &mut Context<'_, Self>| {
+                this.answer(&id, request, answer.clone(), cx);
+            }
+        };
+        let default_ix = choices
+            .iter()
+            .position(|choice| choice.kind() == ChoiceKind::Accept)
+            .unwrap_or(0);
+        let reject = choices
+            .iter()
+            .position(|choice| choice.kind() == ChoiceKind::Reject)
+            .filter(|&ix| ix != default_ix);
+        let others: Vec<InputChoice> = choices
+            .iter()
+            .enumerate()
+            .filter(|&(ix, _)| ix != default_ix && Some(ix) != reject)
+            .map(|(_, choice)| choice.clone())
+            .collect();
+        let mut buttons: Vec<AnyElement> = Vec::new();
+        if let Some(choice) = choices.get(default_ix) {
+            let answer = answer_with(choice);
+            let button = Button::new(part_id(row, choice.id()))
+                .xsmall()
+                .primary()
+                .label(choice.label().to_owned())
+                .disabled(sending)
+                .on_click(cx.listener(move |this, _, _, cx| answer(this, cx)));
+            buttons.push(if others.is_empty() {
+                button.into_any_element()
+            } else {
+                let (view, answer_with) = (cx.weak_entity(), answer_with.clone());
+                DropdownButton::new(part_id(row, "choices"))
+                    .xsmall()
+                    .primary()
+                    .button(button)
+                    .menu_accessibility_label("Other answers")
+                    .disabled(sending)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for choice in &others {
+                            let answer = answer_with(choice);
+                            menu = menu.item(
+                                PopupMenuItem::new(choice.label().to_owned())
+                                    .on_click(on_view(&view, move |this, _, cx| answer(this, cx))),
+                            );
+                        }
+                        menu
+                    })
+                    .into_any_element()
+            });
+        }
+        if let Some(choice) = reject.and_then(|ix| choices.get(ix)) {
+            let answer = answer_with(choice);
+            buttons.push(
+                Button::new(part_id(row, choice.id()))
+                    .xsmall()
+                    .outline()
+                    .label(choice.label().to_owned())
+                    .disabled(sending)
+                    .on_click(cx.listener(move |this, _, _, cx| answer(this, cx)))
+                    .into_any_element(),
+            );
+        }
+        buttons
+    }
+
+    /// Sends `answer` to request `request` of session `id`, once: the
+    /// row's choices hold until the jobs stop listing it.
+    fn answer(
+        &mut self,
+        id: &SessionKey,
+        request: InputId,
+        answer: Answer,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.answering.insert((id.clone(), request)) {
+            cx.emit(SidebarEvent::Answer {
+                id: id.clone(),
+                request,
+                answer,
+            });
+            cx.notify();
+        }
+    }
+
+    /// The answer to request `request` of session `id` didn't reach its
+    /// daemon: its row offers the choices again.
+    pub(crate) fn answer_failed(
+        &mut self,
+        id: &SessionKey,
+        request: InputId,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.answering.remove(&(id.clone(), request)) {
+            cx.notify();
+        }
     }
 
     /// A draft, laid out as an active session: workspace, Draft or on
@@ -2231,6 +2457,12 @@ fn row_menu(
 }
 
 /// A menu item's click handler that runs `f` on the sidebar.
+/// The element ID of part `name` of `row`, such as its `allow-once`
+/// button: the row's own ID, then the part's.
+fn part_id(row: &Row, name: &str) -> SharedString {
+    format!("{}-{name}", row.element_id).into()
+}
+
 fn on_view(
     view: &WeakEntity<SidebarView>,
     f: impl Fn(&mut SidebarView, &mut Window, &mut Context<'_, SidebarView>) + 'static,

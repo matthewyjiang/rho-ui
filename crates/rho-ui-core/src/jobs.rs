@@ -16,6 +16,7 @@ use rho_protocol::{BackgroundItem, JobId, JobKind, JobState, JobSummary};
 use crate::{
     background::{BackgroundId, BackgroundKind},
     daemon::SessionId,
+    input::InputRequest,
 };
 
 /// One listing of the daemon's jobs. Nothing pushes changes to it; list
@@ -59,6 +60,7 @@ pub struct Job {
     activity: JobActivity,
     turn_elapsed: Option<Duration>,
     parent: Option<SessionId>,
+    inputs: Vec<InputRequest>,
 }
 
 impl Job {
@@ -98,6 +100,13 @@ impl Job {
         self.parent.as_ref()
     }
 
+    /// The requests open on the session, oldest first, each answered with
+    /// [`crate::Daemon::answer`] on [`Self::session`], with no need to
+    /// follow it: the turn's own, and its subagents' questions.
+    pub fn inputs(&self) -> &[InputRequest] {
+        &self.inputs
+    }
+
     /// Whether `other` is this job as an earlier or later listing would
     /// show it: everything but [`Self::turn_elapsed`] is the same. Two
     /// listings that differ only in elapsed time changed nothing to show.
@@ -107,6 +116,7 @@ impl Job {
             && self.title == other.title
             && self.activity == other.activity
             && self.parent == other.parent
+            && self.inputs == other.inputs
     }
 
     /// The sessions with work under way among `jobs`, a whole listing.
@@ -156,6 +166,11 @@ impl Job {
             title: live.and_then(|live| live.title.clone()),
             activity,
             parent: starter(job, by_id),
+            inputs: live
+                .map(|live| live.inputs.iter().cloned().map(InputRequest::from_wire))
+                .into_iter()
+                .flatten()
+                .collect(),
         })
     }
 }
@@ -577,6 +592,16 @@ mod tests {
         assert!(earlier.is_same_work(&later));
 
         let waiting = job("session", "waiting_for_input", &live(2_000, &json!([])));
-        assert!(!earlier.is_same_work(&waiting.expect("a waiting job")));
+        let waiting = waiting.expect("a waiting job");
+        assert!(!earlier.is_same_work(&waiting));
+
+        // Another request in place of the one answered, between two
+        // listings, is new work for the list to show and answer.
+        let asks = |id: u64| {
+            let asked = json!([{"id": id, "ask": {"kind": "question",
+                "title": "Which?", "questions": []}}]);
+            job("session", "waiting_for_input", &live(2_000, &asked)).expect("a waiting job")
+        };
+        assert!(!asks(1).is_same_work(&asks(2)));
     }
 }

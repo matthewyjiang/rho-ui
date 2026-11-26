@@ -46,6 +46,7 @@ use rho_ui_core::{
 };
 
 mod daemon_control;
+mod list_answers;
 mod opening;
 mod side_chat;
 
@@ -976,6 +977,13 @@ impl RhoApp {
             }
             SidebarEvent::Mark { sessions, mark } => {
                 self.mark_sessions(sessions.clone(), mark.clone(), window, cx);
+            }
+            SidebarEvent::Answer {
+                id,
+                request,
+                answer,
+            } => {
+                self.answer_from_list(id.clone(), *request, answer.clone(), window, cx);
             }
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
             SidebarEvent::ToggleCollapsed => self.toggle_sidebar(window, cx),

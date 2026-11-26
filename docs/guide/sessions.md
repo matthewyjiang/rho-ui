@@ -22,6 +22,8 @@ A family moves as one. It sits on its starter's shelf, and is active while any s
 
 The project and machine filter applies to each session on its own. A starter outside the filter, or one a search doesn't match, still shows, with its fold held open, when sessions under it do.
 
+No agent may answer the approvals or plan approvals of a session it started: those wait for you. A started session that waits on one shows it on its row, with its choices, so you can answer without opening the session. The row has no box for a denial's reason or a plan's feedback; to give one, or to read a long plan in full, open the session. A started session that asks questions offers Open, into the session, where you answer them.
+
 A session whose starter isn't listed, because it was deleted or is a fork, shows on its own. A machine whose rho is older than rho-ui lists the sessions it started unfolded, since its daemon doesn't say which session started which.
 
 ## Leads

@@ -20,7 +20,7 @@ use std::{
 use web_time::Instant;
 
 use gpui_kit::{EntityId, SharedString};
-use rho_ui_core::{JobActivity, SessionMark};
+use rho_ui_core::{InputRequest, JobActivity, SessionMark};
 
 use crate::{
     leads::Kind,
@@ -121,6 +121,9 @@ pub(crate) struct JobSession {
     pub(crate) workspace: usize,
     /// The session that started it, as the daemon's jobs say.
     pub(crate) parent: Option<SessionKey>,
+    /// The oldest request open on it, which its row offers to answer when
+    /// another session started it.
+    pub(crate) asks: Option<InputRequest>,
 }
 
 /// A new session's draft the user left with a message in its composer,
@@ -176,6 +179,7 @@ struct JobClock {
     id: SessionKey,
     activity: Activity,
     parent: Option<SessionKey>,
+    asks: Option<InputRequest>,
 }
 
 /// The title of a saved session the agent hasn't named.
@@ -296,6 +300,10 @@ pub(crate) enum Item {
     Draft(usize),
     /// An active session, drawn in full. An index into the rows.
     Session(usize),
+    /// An active session another started that waits on a request, drawn
+    /// in full with the request under it, to answer without opening the
+    /// session ([`SessionList::asks`]). An index into the rows.
+    Asking(usize),
     /// A snoozed or settled session, drawn as one line.
     Shelved(usize),
     /// Under a session that started others: how many show, and whether
@@ -516,6 +524,18 @@ impl SessionList {
         }
     }
 
+    /// The request row `ix` offers to answer, as of the last poll of the
+    /// jobs: the oldest open on its session while it waits, if another
+    /// session started it.
+    pub(crate) fn asks(&self, ix: usize) -> Option<&InputRequest> {
+        let row = &self.rows[ix];
+        if row.family != Family::Started || !matches!(row.activity, Activity::Waiting(_)) {
+            return None;
+        }
+        let job = self.jobs.iter().find(|job| job.id == row.id)?;
+        job.asks.as_ref()
+    }
+
     /// The session that started session `id`, as the daemon's jobs say.
     fn job_parent(&self, id: &SessionKey) -> Option<SessionKey> {
         let job = self.jobs.iter().find(|job| job.id == *id)?;
@@ -555,6 +575,7 @@ impl SessionList {
             id: job.id.clone(),
             activity: began(job),
             parent: job.parent.clone(),
+            asks: job.asks.clone(),
         }));
         let is_open = |id: &SessionKey| self.live.iter().any(|live| live.id == *id);
         let has_job = |id: &SessionKey| self.jobs.iter().any(|job| job.id == *id);
@@ -1157,7 +1178,8 @@ mod tests {
     }
 
     /// What the list shows: session titles, indented under the session
-    /// that started them, fold lines as `› 2 started, 1 waiting` (`⌄` when
+    /// that started them, one that offers its request to answer with a
+    /// trailing `?`, fold lines as `› 2 started, 1 waiting` (`⌄` when
     /// open, `•` when held open), shelf headers as `[Settled 2]`, the gap
     /// above them as `~`, and the break under the leads as `-`.
     pub(super) fn shown(list: &SessionList) -> Vec<String> {
@@ -1172,6 +1194,7 @@ mod tests {
                         Family::Started => format!("  {}", row.title()),
                     }
                 }
+                Item::Asking(ix) => format!("  {} ?", list.row_at(ix).title()),
                 Item::Fold(line) => {
                     let chevron = match line.fold {
                         Fold::Open => "⌄",
@@ -1218,6 +1241,7 @@ mod tests {
             turn_elapsed: elapsed.map(Duration::from_secs),
             workspace: 0,
             parent: None,
+            asks: None,
         }
     }
 

@@ -1146,7 +1146,10 @@ fn denials_and_plan_approvals_carry_text_for_the_model() {
     ui.wait_for_session("the approved plan", |session| {
         session.state() == &RunState::Idle
     });
-    assert_eq!(last_reply(&mut ui), "you chose approve_plan: tests first");
+    assert_eq!(
+        last_reply(&mut ui),
+        "you chose approve_plan auto: tests first"
+    );
 }
 
 /// A sent message renders as markdown; dragging across it selects the
@@ -1854,6 +1857,64 @@ fn sessions_a_session_started_fold_under_it() {
             is_visible(window, "session-local-w2") && on_screen == Some(SessionKey::local("w2"))
         },
     );
+}
+
+/// A session another session started that waits on an approval or a plan
+/// offers its choices on its row, which answer it in its daemon without
+/// opening it, the plan's other modes from a menu; one that asks questions
+/// offers Open, which shows its card.
+#[test]
+fn a_started_session_is_answered_from_its_row() {
+    let fake = FakeDaemon::start(Script::default());
+    fake.start_session("s1", "w1", "Write the parser", Started::Asking("ls"));
+    fake.start_session("s1", "w2", "Plan the parser", Started::Asking("plan"));
+    fake.start_session("s1", "w3", "Name the parser", Started::Asking("questions"));
+    keep(&fake, &["s1", "old"]);
+    let target = fake.target();
+    let mut ui = Harness::open("answer-from-list", target, Some(fake), Projects::default());
+    ui.wait_for_label("session-local-s1-fold", "3 sessions · 3 need you");
+    ui.click("session-local-s1-fold");
+    ui.wait_until("each request on its row", |window, _, _| {
+        is_visible(window, "session-local-w1-allow-once")
+            && is_visible(window, "session-local-w2-keep-planning")
+            && is_visible(window, "session-local-w3-open")
+    });
+    ui.shot("asking");
+
+    ui.click("session-local-w1-allow-once");
+    ui.wait_for_daemon("w1 allowed once", |fake| {
+        fake.reply("w1").as_deref() == Some("you chose allow_once")
+    });
+    // The daemon's jobs, polled each second, stop listing the request.
+    advance_until(
+        &mut ui,
+        Duration::from_secs(1),
+        "w1 without its request",
+        |ui| {
+            ui.cx
+                .update_window(ui.window, |_, window, _| {
+                    is_visible(window, "session-local-w1")
+                        && !is_visible(window, "session-local-w1-allow-once")
+                })
+                .expect("window is open")
+        },
+    );
+
+    // Kit's menu trigger beside the plan's first mode.
+    ui.act(|window, cx| window.within("session-local-w2").click("popup", cx));
+    click_menu_item(&mut ui, "Approve in Auto");
+    ui.wait_for_daemon("w2's plan carried out in Auto", |fake| {
+        fake.reply("w2").as_deref() == Some("you chose approve_plan auto")
+    });
+    let app = ui.app.clone();
+    let on_screen = ui.cx.update(|cx| app.read(cx).active_session().is_some());
+    assert!(!on_screen, "answering from the list opens no session");
+
+    ui.click("session-local-w3-open");
+    ui.wait_for_session("w3 open", |session| session.id().as_str() == "w3");
+    ui.wait_until("w3's questions", |window, _, _| {
+        is_visible(window, "questions-next")
+    });
 }
 
 /// Starts a lead, "new-2", from the sidebar with the first message "Fix
