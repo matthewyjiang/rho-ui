@@ -48,10 +48,9 @@ pub(super) struct FakeReports {
     method: ReportMethod,
     /// Sessions whose model can't take some of their conversation.
     native_left_out: BTreeSet<String>,
-    /// Whether answers wait; see [`FakeDaemon::hold_reports`].
+    /// Whether answers wait; see [`FakeDaemon::hold_reports`]. Only an
+    /// answer waiting subscribes, so its receivers count those waiting.
     pub(super) held: watch::Sender<bool>,
-    /// How many answers wait.
-    pub(super) waiting: usize,
 }
 
 impl FakeReports {
@@ -60,7 +59,6 @@ impl FakeReports {
             method,
             native_left_out: BTreeSet::new(),
             held: watch::Sender::new(false),
-            waiting: 0,
         }
     }
 }
@@ -141,7 +139,7 @@ impl FakeDaemon {
 
     /// How many answers [`Self::hold_reports`] holds.
     pub fn held_reports(&self) -> usize {
-        self.service.lock().reports.waiting
+        self.service.lock().reports.held.receiver_count()
     }
 }
 

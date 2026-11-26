@@ -1210,16 +1210,13 @@ impl Service for Fake {
         let (answer, mut held) = {
             let mut state = self.lock();
             let answer = state.report(&params);
-            let held = state.reports.held.subscribe();
-            if !*held.borrow() {
+            if !*state.reports.held.borrow() {
                 return answer;
             }
-            state.reports.waiting += 1;
-            (answer, held)
+            (answer, state.reports.held.subscribe())
         };
-        // Gone with the daemon: the answer then goes as if released.
+        // The sender outlives this call, so this only waits.
         let _ = held.wait_for(|held| !held).await;
-        self.lock().reports.waiting -= 1;
         answer
     }
 
@@ -1232,7 +1229,7 @@ impl Service for Fake {
         params: SessionMcpCatalogParams,
     ) -> Result<SessionMcpCatalog, RpcError> {
         let mut held = self.lock().mcp.catalog_held.subscribe();
-        // Gone with the daemon: the listing then answers as if released.
+        // The sender outlives this call, so this only waits.
         let _ = held.wait_for(|held| !held).await;
         self.lock().mcp_catalog(&params)
     }
@@ -1242,7 +1239,7 @@ impl Service for Fake {
         params: SessionMcpResourceParams,
     ) -> Result<SessionMcpResourceResponse, RpcError> {
         let mut held = self.lock().mcp.reads_held.subscribe();
-        // Gone with the daemon: the read then answers as if released.
+        // The sender outlives this call, so this only waits.
         let _ = held.wait_for(|held| !held).await;
         self.lock().mcp_resource(&params)
     }

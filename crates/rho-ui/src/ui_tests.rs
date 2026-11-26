@@ -6382,8 +6382,8 @@ fn a_shell_that_exits_closes_its_pane() {
 /// turns only: the ring asks again during a turn, which keeps the numbers
 /// shown, and the turn's end reads them again. Coming back to the session
 /// after the app let it go reads it before the session is followed again;
-/// when that read's answer, that it isn't loaded, comes only after the
-/// view caught up, a read after replaces it.
+/// when that read's answer, which may say it isn't loaded, comes only
+/// after the view caught up, a read after replaces it.
 #[test]
 fn the_context_ring_opens_what_fills_the_context() {
     let mut ui = Harness::start("context", Script::default());
@@ -6462,9 +6462,26 @@ fn the_context_ring_opens_what_fills_the_context() {
 
     // The app lets the session go while another shows, so the daemon can
     // unload it. Back on screen, the panel reads before the session is
-    // followed again, and the daemon answers only after the view caught up:
-    // that read may say the session isn't loaded, so the view catching up
-    // reads again, whichever reached the daemon first.
+    // followed again; that read's answer, that the session isn't loaded,
+    // mostly lands before the view caught up, which then reads again.
+    let_go_and_come_back(&mut ui, &key, Answer::Prompt);
+    // When the answer comes only after the view caught up, as from a busy
+    // daemon, the view catching up reads again too.
+    let_go_and_come_back(&mut ui, &key, Answer::Late);
+}
+
+/// When the daemon answers [`let_go_and_come_back`]'s first read.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// As it reads the report.
+    Prompt,
+    /// Once the view has caught up with the session.
+    Late,
+}
+
+/// Shows another session until the app lets `key`'s go, then `key`'s
+/// again, and waits for a fresh read of its context to land.
+fn let_go_and_come_back(ui: &mut Harness, key: &SessionKey, answer: Answer) {
     let read = ui.cx.update(|cx| ui.app.read(cx).context_read(cx));
     let Some((_, _, landed)) = read else {
         panic!("the context read")
@@ -6473,20 +6490,26 @@ fn the_context_ring_opens_what_fills_the_context() {
     ui.wait_for_daemon("the session let go", |fake| {
         fake.followers(key.id.as_str()) == 0
     });
-    ui.fake().hold_reports();
+    if let Answer::Late = answer {
+        ui.fake().hold_reports();
+    }
     let row = SharedString::from(format!("session-{key}"));
     ui.act(|window, cx| window.click(row, cx));
-    ui.wait_for_session("the view caught up", |session| !session.is_replaying());
-    // A read asks for three reports: the one as the session came back, and
-    // the one once the view caught up.
-    ui.wait_for_daemon("a read once the view caught up", |fake| {
-        fake.held_reports() >= 6
+    if let Answer::Late = answer {
+        // Held, the first read is under way when the view catches up,
+        // whichever reached the daemon first. `Reports::read` asks for
+        // three reports at once, so two reads hold six: the one as the
+        // session came back, and the one the view catching up sends, once
+        // its replay has ended.
+        ui.wait_for_daemon("a read once the view caught up", |fake| {
+            fake.held_reports() >= 6
+        });
+        ui.fake().release_reports();
+    }
+    ui.wait_until("the context read once loaded", |window, cx, app| {
+        matches!(app.context_read(cx), Some((None, Some(_), now)) if now > landed)
+            && is_visible(window, "context-figure")
     });
-    ui.fake().release_reports();
-    ui.wait_until(
-        "the context read once loaded",
-        |_, cx, app| matches!(app.context_read(cx), Some((None, Some(_), now)) if now > landed),
-    );
 }
 
 /// Dragging the right panel's edge resizes it, as far as leaves the pane
