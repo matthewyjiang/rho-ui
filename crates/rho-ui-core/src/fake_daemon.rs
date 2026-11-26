@@ -62,6 +62,9 @@
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
 //!   whole result as a card, `subagent_result`, and the parent's daemon
 //!   turn tells the model, as for a process.
+//! - [`FakeDaemon::deliver`] runs a turn of the daemon's own to its end,
+//!   as rho's daemon does to deliver work that finished while the session
+//!   was idle: a card, a read, and a reply.
 //! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
 //!   in a session. Its two agent nodes are in the job list only: one
 //!   queued second in line, one failed with the error [`WORKFLOW_ERROR`].
@@ -92,7 +95,9 @@
 //! - An attach with a cursor of the daemon's stream gets the events after
 //!   it ([`Replay::Tail`]); any other attach gets the whole session
 //!   replayed ([`Replay::Reset`]), which replays the calls with their
-//!   surfaces. Each run of the daemon, from a restart on, has a stream of
+//!   surfaces, and, as rho's saved transcripts hold none, the turn starts
+//!   and ends only of the latest turn on, and none once the session
+//!   reloaded. Each run of the daemon, from a restart on, has a stream of
 //!   its own, as rho's does, and so does each load of a session after
 //!   [`FakeDaemon::unload`].
 //! - A prompt sent again with the idempotency key of the session's latest
@@ -907,6 +912,28 @@ impl FakeDaemon {
         self.service.lock().process_reads
     }
 
+    /// Runs a turn of the daemon's own in `session` to its end, as rho's
+    /// daemon does to deliver work that finished while the session was
+    /// idle: the result's card, a read, and the reply `reply`.
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `session`, or it runs a turn: the test
+    /// has a bug.
+    pub fn deliver(&self, session: &UiSessionId, reply: &str) {
+        let mut state = self.service.lock();
+        let turn = state.next_turn();
+        let session = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        assert!(
+            session.turn.is_none(),
+            "the daemon wakes only an idle session"
+        );
+        session.deliver(turn, reply);
+    }
+
     /// Starts the workflow [`WORKFLOW_NAME`] in `session`, as the
     /// session's background work, with its two agent nodes in the job
     /// list: one queued second in line, and one failed with
@@ -1034,6 +1061,7 @@ impl FakeDaemon {
         let followers = session.publishers.iter().filter(|p| !p.is_gone()).count();
         assert_eq!(followers, 0, "a followed session stays loaded");
         session.unloads += 1;
+        session.reload();
     }
 
     /// Detaches every client of `session` as fallen behind, as rho's
@@ -1299,6 +1327,11 @@ struct FakeSession {
     turn: Option<Turn>,
     /// Every event so far, which an attach replays.
     history: Vec<SessionEvent>,
+    /// How many of `history`'s events the session's saved transcript
+    /// holds: those before the latest turn's end, as rho saves a turn just
+    /// before it says the turn ended, or all of them once it reloaded. A
+    /// reset replays the turn starts and ends after them alone.
+    saved_events: usize,
     publishers: Vec<Publisher>,
     /// How many times clients attached to it.
     attaches: usize,
@@ -1344,6 +1377,7 @@ impl FakeSession {
             state: JobState::Idle,
             turn: None,
             history: Vec::new(),
+            saved_events: 0,
             publishers: Vec::new(),
             attaches: 0,
             prompts: 0,
@@ -1369,6 +1403,7 @@ impl FakeSession {
             self.updated_at,
         );
         fork.history.clone_from(&self.history);
+        fork.saved_events = self.saved_events;
         fork.agent.clone_from(&self.agent);
         fork.settings.model = self.settings.model.clone();
         fork.settings.reasoning = self.settings.reasoning;
@@ -1452,7 +1487,10 @@ impl FakeSession {
     /// lists the work as it is now, without work whose result the model
     /// has. Nor do they hold pull requests, which a client asks for,
     /// marks, which the list reports, or changes to the choice for started
-    /// sessions. Nor does it mark steers, as rho's doesn't.
+    /// sessions. Nor does it mark steers, as rho's doesn't. Nor do they hold
+    /// turn starts or ends, a compaction's start, or provider requests and
+    /// retries: rho replays those only after its last save, which leaves
+    /// the latest turn's end, until a restart or an unload.
     fn transcript(&self) -> Vec<(Seq, SessionEvent)> {
         let agent = SessionEvent::Agent {
             id: self.agent.clone(),
@@ -1461,16 +1499,27 @@ impl FakeSession {
         let history = self
             .history
             .iter()
-            .filter(|event| {
-                !matches!(
-                    event,
+            .enumerate()
+            .filter(|(ix, event)| {
+                let unsaved = *ix >= self.saved_events;
+                match event {
+                    SessionEvent::State { .. }
+                    | SessionEvent::TurnEnded { .. }
+                    | SessionEvent::Compaction {
+                        status: CompactionStatus::Started { .. },
+                        ..
+                    }
+                    | SessionEvent::ProviderRequest
+                    | SessionEvent::ResponseDiscarded
+                    | SessionEvent::ProviderRetry { .. } => unsaved,
                     SessionEvent::Background { .. }
-                        | SessionEvent::PullRequests { .. }
-                        | SessionEvent::StartedSessionDefaults(_)
-                        | SessionEvent::MarkChanged { .. }
-                )
+                    | SessionEvent::PullRequests { .. }
+                    | SessionEvent::StartedSessionDefaults(_)
+                    | SessionEvent::MarkChanged { .. } => false,
+                    _ => true,
+                }
             })
-            .cloned();
+            .map(|(_, event)| event.clone());
         let replay: Vec<SessionEvent> = [agent, started]
             .into_iter()
             .chain(history)
@@ -1488,6 +1537,15 @@ impl FakeSession {
             .enumerate()
             .map(|(ix, event)| (Seq(if ix == last { self.live_seq } else { 0 }), event))
             .collect()
+    }
+
+    /// Loads the session again, as rho's daemon does from its file after a
+    /// restart or an unload: at rest, it has saved every turn, and its
+    /// replay holds no turn starts or ends at all.
+    fn reload(&mut self) {
+        if self.turn.is_none() {
+            self.saved_events = self.history.len();
+        }
     }
 
     /// Saves `mark` in place of the session's own, and tells its followers
@@ -1706,6 +1764,36 @@ impl FakeSession {
         self.say(&format!("m-{id}"), told);
     }
 
+    /// Runs `turn`, one of the daemon's own, to its end: its first boundary
+    /// delivers a worker's result as a card, then the model reads a file
+    /// and answers `reply`.
+    fn deliver(&mut self, turn: Turn, reply: &str) {
+        self.last_prompt = None;
+        let id = turn.id.clone();
+        self.turn = Some(turn);
+        self.state(JobState::Running);
+        self.publish(SessionEvent::Card {
+            title: "Completed · worker".to_owned(),
+            markdown: "The worker finished.".to_owned(),
+            plain: "The worker finished.".to_owned(),
+            tone: CardTone::Success,
+            display: None,
+        });
+        let read = card(
+            ToolStatus::Completed,
+            ToolFamily::FileCommand,
+            ToolHeader::call("read_file", Some("notes.md".to_owned())),
+        );
+        self.tool(
+            &ToolCallId::new(format!("read-{id}")),
+            ("read_file(notes.md)", ToolKind::Read),
+            ToolStatus::Completed,
+            vec![text("The worker's notes.")],
+            read,
+        );
+        self.answer(&format!("m-{id}"), reply);
+    }
+
     /// Ends the running turn with `outcome`. The model had the results of
     /// background work that ended, which leaves the list first.
     fn end_turn(&mut self, outcome: TurnOutcome, state: JobState) {
@@ -1717,6 +1805,7 @@ impl FakeSession {
         if self.background.len() != listed {
             self.report_background();
         }
+        self.saved_events = self.history.len();
         self.publish(SessionEvent::TurnEnded {
             turn: turn.id.clone(),
             outcome,

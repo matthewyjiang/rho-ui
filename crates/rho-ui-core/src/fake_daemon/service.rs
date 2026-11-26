@@ -75,6 +75,7 @@ impl Fake {
             for publisher in session.publishers.drain(..) {
                 publisher.close(DetachReason::Restarting);
             }
+            session.reload();
         }
         drop(state);
         self.restarted.send_modify(|restarts| *restarts += 1);

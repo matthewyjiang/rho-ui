@@ -2639,6 +2639,93 @@ fn finished_work_folds_and_opens_in_levels() {
     ui.shot("diff");
 }
 
+/// Each turn rho began itself, as a lead's are, opens with its wake and
+/// folds only its own working, so every reply shows: live, and once the
+/// conversation replays after a daemon restart, which marks no turn starts.
+#[test]
+fn every_wake_turn_keeps_its_reply_after_a_replay() {
+    let mut ui = Harness::start("wake-replies", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    // A prompt: a read and a reply.
+    ui.send("pictures");
+    let replies = |session: &Session| {
+        session
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Agent(_)))
+            .count()
+    };
+    ui.wait_for_session("the prompt's reply", |session| {
+        session.state() == &RunState::Idle && replies(session) == 1
+    });
+    let id = SessionId::from("new-1");
+    // Two turns of the daemon's own: a card, a read and a reply each.
+    for (reply, n) in [("First result in.", 2), ("Second result in.", 3)] {
+        ui.fake().deliver(&id, reply);
+        ui.wait_for_session("the daemon's reply", |session| {
+            session.state() == &RunState::Idle && replies(session) == n
+        });
+    }
+    // Entries: prompt, read, reply; card, wake, read, reply; card, wake,
+    // read, reply. Each turn's reply shows under its folded working: the
+    // prompt's at the top, the daemon's two at the bottom.
+    let shows_three_turns = |ui: &mut Harness, when: &str| {
+        let session = ui.session();
+        let wakes: Vec<usize> = session
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, entry)| matches!(entry, Entry::Wake).then_some(ix))
+            .collect();
+        assert_eq!(wakes, [4, 8], "{when}: each daemon turn opens with a wake");
+        let shows_turn =
+            |window: &Window, (worked, work, reply): (&'static str, &'static str, &'static str)| {
+                assert!(
+                    is_visible(window, worked),
+                    "{when}: {worked} heads its turn"
+                );
+                assert!(!is_visible(window, work), "{when}: {work} is folded");
+                assert!(is_visible(window, reply), "{when}: {reply} shows");
+            };
+        let app = ui.app.clone();
+        let scroller = ui.cx.update(|cx| {
+            let view = app.read(cx).active_session().expect("a session is open");
+            view.read(cx).transcript().scroller().clone()
+        });
+        ui.cx
+            .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(0, cx)));
+        ui.frame();
+        ui.act(|window, _| shows_turn(window, ("worked-0", "work-1", "reply-2")));
+        ui.cx.update(|cx| {
+            scroller.update(
+                cx,
+                gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end,
+            );
+        });
+        ui.frame();
+        ui.act(|window, _| {
+            shows_turn(window, ("worked-1", "work-5", "reply-6"));
+            shows_turn(window, ("worked-2", "work-9", "reply-10"));
+        });
+        session.entries().to_vec()
+    };
+    ui.shot("live");
+    let live = shows_three_turns(&mut ui, "live");
+
+    ui.fake().restart();
+    ui.wait_for_daemon("new-1 attached after the restart", |fake| {
+        fake.attaches("new-1") == 2
+    });
+    ui.wait_for_session("the replay", |session| !session.is_replaying());
+    ui.shot("replayed");
+    let replayed = shows_three_turns(&mut ui, "replayed");
+    assert_eq!(replayed, live, "the replay shows what live did");
+}
+
 /// A step shows what rho's terminal UI shows for it, once: an edit's line
 /// names the file and what changed, and it opens into the diff alone, not
 /// the receipt the model read; a read's line says how much it read, and the

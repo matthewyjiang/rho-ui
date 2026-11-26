@@ -380,8 +380,8 @@ impl Transcript {
         for turn in known..turns {
             let prompt = self.prompt(turn, entries);
             self.took[turn] = prompt.and_then(|prompt| cx.global::<TurnTimes>().get(prompt.id()));
-            if prompt.is_some_and(UserMessage::is_steer) {
-                self.steered(turn, entries, cx);
+            if prompt.is_some_and(UserMessage::is_steer) || self.is_wake(turn, entries) {
+                self.split(turn, entries, cx);
             }
         }
         // A finished turn that grows, as history replays, folds more rows.
@@ -626,16 +626,19 @@ impl Transcript {
         }
     }
 
-    /// A steer opened `turn` while another ran. The daemon's replay can't
-    /// tell a steer from a prompt, so the steer opens a turn of its own, as
-    /// it will when the session replays: the turn it joined finishes there,
-    /// and the running one is the steer's, timed from now. Two steers the
-    /// model read at once leave the first one's turn at about 0s.
+    /// A steer or a wake opened `turn` while another ran. The daemon's
+    /// replay can't tell a steer from a prompt, nor a result delivered
+    /// after the reply from a turn of the daemon's own, so each opens a
+    /// turn of its own, as it will when the session replays: the turn it
+    /// joined finishes there, and the running one is the new one, timed
+    /// from now. Two steers the model read at once leave the first one's
+    /// turn at about 0s. A wake that opens the running turn itself joins
+    /// none.
     ///
     /// A steer that came while the session was being attached arrives
     /// before [`Self::resume_turn`], so the turn it joined goes untimed and
     /// the steer's counts from the turn's start.
-    fn steered(&mut self, turn: usize, entries: &[Entry], cx: &mut App) {
+    fn split(&mut self, turn: usize, entries: &[Entry], cx: &mut App) {
         let Some(joined) = self.running.filter(|running| running.turn < turn) else {
             return;
         };
@@ -663,14 +666,24 @@ impl Transcript {
 
     /// `turn`'s prompt, or steer.
     fn prompt<'a>(&self, turn: usize, entries: &'a [Entry]) -> Option<&'a UserMessage> {
+        match self.opener(turn, entries)? {
+            Entry::User(prompt) => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// Whether the daemon began `turn` itself.
+    fn is_wake(&self, turn: usize, entries: &[Entry]) -> bool {
+        matches!(self.opener(turn, entries), Some(Entry::Wake))
+    }
+
+    /// The entry that opens `turn`: its prompt, steer, or wake.
+    fn opener<'a>(&self, turn: usize, entries: &'a [Entry]) -> Option<&'a Entry> {
         let row = *self.timeline.turns().get(turn)?;
         let Row::Message(ix) = self.timeline.rows().get(row)? else {
             return None;
         };
-        match entries.get(*ix)? {
-            Entry::User(prompt) => Some(prompt),
-            _ => None,
-        }
+        entries.get(*ix)
     }
 
     /// Does what a click asked for. `action` names rows, entries and turns

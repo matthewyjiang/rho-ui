@@ -697,7 +697,10 @@ fn a_prompts_answer_and_its_turns_events_may_come_in_either_order() {
 /// A turn the daemon begins by itself, to deliver finished background work,
 /// opens with a wake row, so it is a turn of its own. A prompt's turn opens
 /// with its prompt, even after a notice the daemon sent first. A turn under
-/// way when the session was attached opens nothing as it runs on.
+/// way when the session was attached opens nothing as it runs on. A replay,
+/// which marks no turn starts, opens a wake where a card follows the reply,
+/// a `/compact` turn's compaction between them too, but not for a card a
+/// turn's tool calls lead to, nor before a prompt.
 #[test]
 fn a_turn_without_a_prompt_opens_with_a_wake() {
     let ended = |session: &mut Session, id: &str| {
@@ -746,6 +749,56 @@ fn a_turn_without_a_prompt_opens_with_a_wake() {
     );
     let kinds: Vec<&str> = texts(&session).into_iter().map(|(kind, _)| kind).collect();
     assert_eq!(kinds, ["agent", "user", "wake", "agent", "notice", "user"]);
+
+    let card =
+        || json!({"type": "card", "title": "Done", "markdown": "", "plain": "", "tone": "neutral"});
+    let tool = |id: &str| json!({"type": "tool_call", "id": id, "title": "read", "kind": "read"});
+    let say = |id: &str| json!({"type": "agent_message_chunk", "message": id, "text": "ok"});
+    let saved = [
+        json!({"type": "user_message", "message": "u1", "content": [{"type": "text", "text": "go"}]}),
+        tool("t1"),
+        card(),
+        say("m1"),
+        card(),
+        tool("t2"),
+        say("m2"),
+        json!({"type": "compaction", "id": "c1", "status": {"type": "completed", "counts":
+            {"previous_messages": 9, "current_messages": 1, "previous_tokens": 900, "current_tokens": 90}}}),
+        card(),
+        tool("t3"),
+        say("m3"),
+        card(),
+        json!({"type": "user_message", "message": "u2", "content": [{"type": "text", "text": "more"}]}),
+        say("m4"),
+    ];
+    let mut replayed = Session::new(SessionId::from("s2"));
+    replayed.attached(attach_response(JobState::Idle, 14));
+    for event in saved {
+        replayed.apply(update(event));
+    }
+    assert!(!replayed.is_replaying());
+    let kinds: Vec<&str> = texts(&replayed).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            "user",
+            "tool",
+            "notice",
+            "agent",
+            "notice",
+            "wake",
+            "tool",
+            "agent",
+            "compaction",
+            "notice",
+            "wake",
+            "tool",
+            "agent",
+            "notice",
+            "user",
+            "agent"
+        ]
+    );
 }
 
 /// A message refused because a turn was under way is due once a turn ended
