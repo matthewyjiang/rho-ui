@@ -22,7 +22,7 @@ rust-version = "1.98"
 # session's reports (rho#2040) and lists the configured MCP servers and
 # hooks (rho#2045), which no release has yet. The release takes it from
 # crates.io again.
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "dcfd40de83ac8dfcf22754b9fc75247a301e1758" }
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "2fa159719ab0577e0b4fc98da3144c80f65123f1" }
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 
