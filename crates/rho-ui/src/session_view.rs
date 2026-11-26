@@ -301,13 +301,22 @@ pub(crate) struct SessionView {
     selected: Option<Selected>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
-    /// What redraws the title bar besides the session: for a subagent's
-    /// session, the sessions above it, as they are renamed; for one given
-    /// the user's projects ([`Self::with_projects`]), those, which say
-    /// which added directories it names.
-    _title_bar: Vec<Subscription>,
+    /// What the title bar reads besides the session.
+    title_bar: TitleBarSources,
     /// Redraws "Working for" while a turn runs.
     _tick: Task<()>,
+}
+
+/// What a session's title bar reads besides the session.
+#[derive(Default)]
+struct TitleBarSources {
+    /// The user's projects, which say which of a plain session's added
+    /// directories it names; see [`SessionView::with_projects`]. `None`
+    /// for a subagent's view, which names its root session's.
+    projects: Option<Entity<Projects>>,
+    /// What redraws it: for a subagent's view, the sessions above it, as
+    /// they are renamed, and its root's projects; else the projects.
+    _redraws: Vec<Subscription>,
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
@@ -426,7 +435,7 @@ impl SessionView {
             selected: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
-            _title_bar: Vec::new(),
+            title_bar: TitleBarSources::default(),
             _tick: Self::tick(cx),
         };
         view.transcript.sync(view.session.entries(), cx);
@@ -465,7 +474,8 @@ impl SessionView {
             let parent = parent.read(cx);
             (parent.workspace.clone(), parent.composer.read(cx).remote())
         };
-        // The title bar names every session above this one.
+        // The title bar names every session above this one, and the
+        // projects of the one at the top.
         let mut renamed = Vec::new();
         let mut above = Some(parent.clone());
         while let Some(session) = above {
@@ -474,7 +484,14 @@ impl SessionView {
                     cx.notify();
                 }
             }));
-            above = session.read(cx).parent();
+            let (projects, parent) = {
+                let session = session.read(cx);
+                (session.title_bar.projects.clone(), session.parent())
+            };
+            if let Some(projects) = projects {
+                renamed.push(cx.observe(&projects, |_, _, cx| cx.notify()));
+            }
+            above = parent;
         }
         let view = Self::new(
             daemon,
@@ -487,7 +504,10 @@ impl SessionView {
         );
         Self {
             role: Role::Subagent(parent.downgrade()),
-            _title_bar: renamed,
+            title_bar: TitleBarSources {
+                projects: None,
+                _redraws: renamed,
+            },
             ..view
         }
     }
@@ -543,7 +563,10 @@ impl SessionView {
         );
         Self {
             added_dirs,
-            _title_bar: vec![cx.observe(projects, |_, _, cx| cx.notify())],
+            title_bar: TitleBarSources {
+                projects: Some(projects.clone()),
+                _redraws: vec![cx.observe(projects, |_, _, cx| cx.notify())],
+            },
             ..self
         }
     }
@@ -678,8 +701,10 @@ impl SessionView {
         if let Some(parent) = self.parent() {
             return parent.read(cx).projects(cx);
         }
+        let projects = self.title_bar.projects.as_ref();
+        let projects = projects.map(|projects| projects.read(cx));
         let dirs = self.added_dirs.read(cx);
-        dirs.projects(Some(self.workspace.index()), cx)
+        dirs.projects(Some(self.workspace.index()), projects, cx)
     }
 
     /// By the agent it runs as, once the session says which: `None` until

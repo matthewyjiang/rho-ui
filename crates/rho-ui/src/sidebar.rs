@@ -68,7 +68,7 @@ use crate::{
     leads::Kind,
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
     pr_mark::{mark_label, pr_mark},
-    project_stack::{self, session_projects, Naming, ProjectStack},
+    project_stack::{self, session_projects, session_workspaces, Naming, ProjectStack},
     projects::Projects,
     pull_requests::{Focus, PullRequests},
     rho_install::{render_offer, Installs},
@@ -469,19 +469,13 @@ impl SidebarView {
         sessions: Vec<SessionSummary>,
         cx: &mut Context<'_, Self>,
     ) {
-        let list = &self.list;
         let saved = self.workspaces.update(cx, |workspaces, cx| {
             let saved: Vec<SavedSession> = sessions
                 .into_iter()
                 .map(|session| {
                     let id = SessionKey::new(machine.clone(), session.id().clone());
-                    // An open session's own word is the newer.
-                    let dirs = list
-                        .live(&id)
-                        .and_then(|live| live.added_dirs.as_deref())
-                        .unwrap_or(session.added_dirs());
                     SavedSession {
-                        added: index_all(workspaces, machine, dirs, cx),
+                        added: workspaces.index_all(machine, session.added_dirs(), cx),
                         workspace: workspaces
                             .index(&Place::new(machine.clone(), session.cwd()), cx),
                         id,
@@ -574,7 +568,7 @@ impl SidebarView {
         let place = Place::new(live.id.machine.clone(), live.cwd.clone());
         let (workspace, added) = self.workspaces.update(cx, |workspaces, cx| {
             let added = (live.added_dirs.as_deref())
-                .map(|dirs| index_all(workspaces, &place.machine, dirs, cx));
+                .map(|dirs| workspaces.index_all(&place.machine, dirs, cx));
             (workspaces.index(&place, cx), added)
         });
         if self.list.set_live(live, workspace, added, time::now_unix()) {
@@ -711,11 +705,15 @@ impl SidebarView {
         let workspaces = self.workspaces.read(cx);
         let projects = self.projects.read(cx);
         let watching = self.prs.read(cx).watching();
-        self.list.rebuild(time::now_unix(), &watching, |ix| {
-            let workspace = workspaces.get(ix);
-            let users = project_stack::is_users(workspace, projects);
-            (workspace.name.as_ref(), workspace.root_path(), users)
-        });
+        let named = |kind: Kind, own: Option<usize>, added: &[usize]| {
+            let added = added.iter().map(|&ix| workspaces.get(ix));
+            let own = own.map(|ix| workspaces.get(ix));
+            session_workspaces(kind, own, added, Some(projects))
+                .into_iter()
+                .map(|workspace| (workspace.name.as_ref(), workspace.root_path()))
+                .collect()
+        };
+        self.list.rebuild(time::now_unix(), &watching, named);
         // Every session on the active shelf the filter shows has its PRs
         // listed by its daemon, under a closed fold too, as what it watches
         // ranks its family; so has every row drawn there, a starter shown
@@ -725,9 +723,7 @@ impl SidebarView {
             Item::Session(ix) => Some(self.list.row_at(ix).id.clone()),
             _ => None,
         });
-        let active = self
-            .list
-            .on_active_shelf(|ix| workspaces.get(ix).root_path());
+        let active = self.list.on_active_shelf(named);
         let mut listed: Vec<SessionKey> = Vec::new();
         for id in active.into_iter().chain(drawn).chain(self.active.clone()) {
             if !listed.contains(&id) {
@@ -1013,16 +1009,6 @@ impl SidebarView {
         let view = cx.entity().downgrade();
         let cx: &Context<'_, Self> = cx;
         let workspaces = self.workspaces.read(cx);
-        let projects = self.projects.read(cx);
-        let named = |kind: Kind, own: Option<usize>, added: &[usize]| {
-            let added = added.iter().map(|&ix| workspaces.get(ix));
-            session_projects(
-                kind,
-                own.map(|ix| workspaces.get(ix)),
-                added,
-                Some(projects),
-            )
-        };
         let machines = self.machines.read(cx);
         // With one machine, a label says nothing.
         let label = |row: &Row| machines.tag(&row.id.machine);
@@ -1033,29 +1019,17 @@ impl SidebarView {
                 Item::Draft(ix) => {
                     let draft = self.list.draft_at(ix);
                     let workspace = draft.workspace.map(|ix| workspaces.get(ix));
-                    let projects = named(draft.kind, draft.workspace, &draft.added);
+                    let projects = self.projects_of(draft.kind, draft.workspace, &draft.added, cx);
                     let label = machines.tag(&draft.cwd.machine);
                     self.render_draft(draft, workspace, &projects, label, cx)
                 }
                 Item::Session(row) => {
                     let row = self.list.row_at(row);
-                    let workspace = workspaces.get(row.workspace);
-                    let projects = named(row.kind, Some(row.workspace), &row.added);
-                    let place = Where {
-                        workspace,
-                        projects: &projects,
-                    };
-                    self.render_row(row, place, label(row), clock, &view, cx)
+                    self.render_row(row, label(row), clock, &view, cx)
                 }
                 Item::Shelved(row) => {
                     let row = self.list.row_at(row);
-                    let workspace = workspaces.get(row.workspace);
-                    let projects = named(row.kind, Some(row.workspace), &row.added);
-                    let place = Where {
-                        workspace,
-                        projects: &projects,
-                    };
-                    self.render_shelved(row, place, label(row), age_width, clock, cx)
+                    self.render_shelved(row, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
                 Item::Leads => Self::render_kind_header("leads-header", "Leads"),
@@ -1067,20 +1041,32 @@ impl SidebarView {
             .collect()
     }
 
+    /// The projects a session of `kind` works in, with `own` and `added`
+    /// its workspaces' indices; see [`session_projects`].
+    fn projects_of<'a>(
+        &self,
+        kind: Kind,
+        own: Option<usize>,
+        added: &[usize],
+        cx: &'a App,
+    ) -> Vec<&'a Workspace> {
+        let workspaces = self.workspaces.read(cx);
+        let added = added.iter().map(|&ix| workspaces.get(ix));
+        let own = own.map(|ix| workspaces.get(ix));
+        session_projects(kind, own, added, Some(self.projects.read(cx)))
+    }
+
     fn render_row(
         &self,
         row: &Row,
-        place: Where<'_>,
         machine: Option<SharedString>,
         clock: Clock,
         view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let Where {
-            workspace,
-            projects,
-        } = place;
+        let workspace = self.workspaces.read(cx).get(row.workspace);
+        let projects = &self.projects_of(row.kind, Some(row.workspace), &row.added, cx);
         let state = self.row_state(row);
         let right = state
             .hovered
@@ -1281,17 +1267,14 @@ impl SidebarView {
     fn render_shelved(
         &self,
         row: &Row,
-        place: Where<'_>,
         machine: Option<SharedString>,
         age_width: Pixels,
         clock: Clock,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let Where {
-            workspace,
-            projects,
-        } = place;
+        let workspace = self.workspaces.read(cx).get(row.workspace);
+        let projects = &self.projects_of(row.kind, Some(row.workspace), &row.added, cx);
         let state = self.row_state(row);
         let wakes = shelf::wakes(row.mark);
         let offered = ShelfAction::for_row(row);
@@ -1995,19 +1978,6 @@ struct Clock {
     instant: Instant,
 }
 
-/// The index into `workspaces` of each of `dirs`, folders on `machine`,
-/// adding those not in the table.
-fn index_all(
-    workspaces: &mut Workspaces,
-    machine: &MachineId,
-    dirs: &[PathBuf],
-    cx: &mut Context<'_, Workspaces>,
-) -> Vec<usize> {
-    dirs.iter()
-        .map(|dir| workspaces.index(&Place::new(machine.clone(), dir.clone()), cx))
-        .collect()
-}
-
 /// The session's projects' badges and names, those of the row
 /// `element_id`, on a row of `surface`'s color; the caller adds the status
 /// or actions.
@@ -2043,13 +2013,6 @@ fn project_line(
 /// stack rings its badges with.
 fn surface(state: RowState, theme: &Theme) -> Hsla {
     row_bg(state, theme).map_or(theme.sidebar, |bg| theme.sidebar.blend(bg))
-}
-
-/// An item's workspace, for its branch, and the projects it names.
-#[derive(Clone, Copy)]
-struct Where<'a> {
-    workspace: &'a Workspace,
-    projects: &'a [&'a Workspace],
 }
 
 /// A workspace's badge, a line of the sidebar's text tall.
@@ -2556,7 +2519,9 @@ mod tests {
             };
             list.set_live(live, 0, None, 1);
         }
-        list.rebuild(1, &HashSet::new(), |_| ("w", Path::new("/w"), true));
+        list.rebuild(1, &HashSet::new(), |_, _, _: &[usize]| {
+            vec![("w", Path::new("/w"))]
+        });
         for id in ["busy", "lead", "fresh"] {
             let row = list.row(&SessionKey::local(id)).expect("listed");
             assert_eq!(ShelfAction::for_row(row), [], "{id}");

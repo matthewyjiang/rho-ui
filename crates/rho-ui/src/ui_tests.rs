@@ -2026,20 +2026,30 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
     });
     assert_eq!(ui.fake().added_dirs("new-2"), Some(both));
 
-    let named = Some("rho + rho-ui".to_owned());
+    let named = "rho + rho-ui";
     ui.wait_until("the lead's row names its projects", |window, _, _| {
-        is_visible(window, "session-local-new-2-projects")
+        window
+            .try_find("session-local-new-2-project-names")
+            .is_some_and(|names| names.label() == Some(named))
     });
-    assert_eq!(ui.label("title-project-names"), named);
-    assert_eq!(ui.label("session-local-new-2-project-names"), named);
+    assert_eq!(ui.label("title-project-names").as_deref(), Some(named));
     ui.click("toggle-settled");
     ui.shot("projects");
-    ui.act(|window, cx| {
-        let stack = window.find("title-projects").bounds().center();
-        window.pointer_move(stack, None, cx);
-    });
+    let width = |ui: &mut Harness| {
+        let stack = ui.cx.update_window(ui.window, |_, window, _| {
+            window.find("title-projects").bounds()
+        });
+        stack.expect("window is open")
+    };
+    let stacked = width(&mut ui);
+    ui.act(|window, cx| window.pointer_move(stacked.center(), None, cx));
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.shot("projects-fanned");
+    let fanned = width(&mut ui);
+    assert!(
+        fanned.size.width > stacked.size.width,
+        "hovered, the badges fan apart"
+    );
 }
 
 /// A lead's panel starts on Work, beside Brief. Work lists the sessions

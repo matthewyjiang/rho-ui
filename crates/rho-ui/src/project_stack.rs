@@ -3,7 +3,7 @@
 //! ever; several as their badges overlapped in a stack, which fans apart
 //! while hovered, and their names together, as `rho-ui + rho`.
 //!
-//! Which projects a session has ([`session_projects`]) follows its kind: a
+//! Which projects a session has ([`session_workspaces`]) follows its kind: a
 //! lead works in the projects it was given, not in its own folder, which
 //! is named from its first message; a plain session works in its
 //! workspace's project, and in those of its added directories that are
@@ -13,8 +13,9 @@ use gpui_kit::base::{spring, TestSupportExt as _};
 use gpui_kit::component::{tooltip::Tooltip, ActiveTheme as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, App, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
-    Rems, RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window,
+    div, rems, App, Div, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    Pixels, Rems, RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    Window,
 };
 
 use crate::{badge::Badge, leads::Kind, projects::Projects, workspaces::Workspace};
@@ -40,12 +41,14 @@ const RING_REMS: f32 = 0.09;
 /// a shelved row's badge has kept.
 const RECEDED: f32 = 0.4;
 
-/// The projects a session of `kind` works in, first to last, each once:
-/// a lead's `added` directories, as it was given its projects; a plain
-/// session's `own` workspace, then those of its `added` directories in
-/// one of the user's `projects`. A view not given the user's projects
-/// counts none of a plain session's added directories.
-pub(crate) fn session_projects<'a>(
+/// The workspaces whose projects a session of `kind` works in, first to
+/// last: a lead's `added` directories, as it was given its projects; a
+/// plain session's `own` workspace, then those of its `added` directories
+/// in one of the user's `projects`. A view not given the user's projects
+/// counts none of a plain session's added directories. Two checkouts of
+/// one project both stay, so a filter can match either's folder;
+/// [`session_projects`] names each project once.
+pub(crate) fn session_workspaces<'a>(
     kind: Kind,
     own: Option<&'a Workspace>,
     added: impl IntoIterator<Item = &'a Workspace>,
@@ -53,15 +56,30 @@ pub(crate) fn session_projects<'a>(
 ) -> Vec<&'a Workspace> {
     let is_project =
         |workspace: &Workspace| projects.is_some_and(|projects| is_users(workspace, projects));
-    let candidates: Vec<&Workspace> = match kind {
+    match kind {
         Kind::Lead => added.into_iter().collect(),
         Kind::Session => own
             .into_iter()
             .chain(added.into_iter().filter(|workspace| is_project(workspace)))
             .collect(),
-    };
-    let mut named: Vec<&Workspace> = Vec::with_capacity(candidates.len());
-    for workspace in candidates {
+    }
+}
+
+/// The projects a session works in, as [`session_workspaces`] finds
+/// them, each once: what a session is named by.
+pub(crate) fn session_projects<'a>(
+    kind: Kind,
+    own: Option<&'a Workspace>,
+    added: impl IntoIterator<Item = &'a Workspace>,
+    projects: Option<&Projects>,
+) -> Vec<&'a Workspace> {
+    distinct(session_workspaces(kind, own, added, projects))
+}
+
+/// `workspaces`, keeping the first checkout of each project.
+pub(crate) fn distinct(workspaces: Vec<&Workspace>) -> Vec<&Workspace> {
+    let mut named: Vec<&Workspace> = Vec::with_capacity(workspaces.len());
+    for workspace in workspaces {
         // Two checkouts of one project, as a worktree and its repository,
         // are one project.
         if !named
@@ -76,11 +94,15 @@ pub(crate) fn session_projects<'a>(
 
 /// Whether `workspace` is in one of the user's `projects`: their folder,
 /// or a folder or worktree of it.
-pub(crate) fn is_users(workspace: &Workspace, projects: &Projects) -> bool {
+fn is_users(workspace: &Workspace, projects: &Projects) -> bool {
     projects
         .roots()
         .any(|root| *root == workspace.root() || root == workspace.place())
 }
+
+/// The most projects [`names`] names one by one; beyond it, it counts the
+/// rest.
+const NAMED_IN_FULL: usize = 2;
 
 /// How [`names`] names a single project; several are always named
 /// without their owners, to fit.
@@ -92,14 +114,20 @@ pub(crate) enum Naming {
     Full,
 }
 
-/// The projects' names together: one by `naming`, two as `rho-ui + rho`,
-/// more as `rho-ui + 2 more`. Empty with none.
+/// The projects' names together: one by `naming`, up to
+/// [`NAMED_IN_FULL`] as `rho-ui + rho`, more as `rho-ui + 2 more`. Empty
+/// with none.
 pub(crate) fn names(projects: &[&Workspace], naming: Naming) -> SharedString {
     match projects {
         [] => SharedString::default(),
         [one] if naming == Naming::Full => one.name.clone(),
         [one] => one.short_name.clone(),
-        [first, second] => format!("{} + {}", first.short_name, second.short_name).into(),
+        named if named.len() <= NAMED_IN_FULL => named
+            .iter()
+            .map(|workspace| workspace.short_name.as_ref())
+            .collect::<Vec<_>>()
+            .join(" + ")
+            .into(),
         [first, rest @ ..] => format!("{} + {} more", first.short_name, rest.len()).into(),
     }
 }
@@ -121,7 +149,7 @@ fn all_names(projects: &[&Workspace]) -> String {
 pub(crate) struct ProjectStack {
     /// Keys the hover and the spring, so a stack keeps them across frames;
     /// unique in its window.
-    id: SharedString,
+    id: ElementId,
     initials: Vec<SharedString>,
     /// Every project's full name, which the stack is labelled with.
     label: SharedString,
@@ -137,7 +165,7 @@ pub(crate) struct ProjectStack {
 
 impl ProjectStack {
     /// The badges of `projects`, each `side` square; nothing with none.
-    pub(crate) fn new(id: impl Into<SharedString>, projects: &[&Workspace], side: Rems) -> Self {
+    pub(crate) fn new(id: impl Into<ElementId>, projects: &[&Workspace], side: Rems) -> Self {
         Self {
             id: id.into(),
             initials: projects
@@ -146,7 +174,7 @@ impl ProjectStack {
                 .map(|workspace| workspace.initials.clone())
                 .collect(),
             label: all_names(projects).into(),
-            tooltip: projects.len() > 2,
+            tooltip: projects.len() > NAMED_IN_FULL,
             side,
             surface: None,
             receded: false,
@@ -207,10 +235,10 @@ impl RenderOnce for ProjectStack {
         let rem = window.rem_size();
         let side = self.side.to_pixels(rem);
         let ring = rems(RING_REMS).to_pixels(rem);
-        let hovered = window.use_keyed_state(format!("{}-hovered", self.id), cx, |_, _| false);
+        let hovered = window.use_keyed_state((self.id.clone(), "hovered"), cx, |_, _| false);
         let target = if *hovered.read(cx) { 1. } else { 0. };
         let policy = cx.theme().motion_tokens().spring_control;
-        let fanned: f32 = spring(format!("{}-fan", self.id), target, policy, window, cx);
+        let fanned: f32 = spring((self.id.clone(), "fan"), target, policy, window, cx);
         let step = stack_step(side, rems(FANNED_GAP_REMS).to_pixels(rem), fanned);
         let corner = Badge::corner(self.side).to_pixels(rem) + ring;
         let mut left = Pixels::ZERO;

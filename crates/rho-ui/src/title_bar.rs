@@ -3,11 +3,11 @@
 //! it, as `rho-ui / Fix the parser / Read the parser` for a subagent's
 //! session under the session that started it. A session in several
 //! projects heads it with their badges stacked and their names together,
-//! as `rho-ui + rho` (see [`crate::project_stack`]). The project can start a new session
-//! in it, a button beside it opens the repository's web page, and every
-//! step but the last links back to it; controls for what the pane shows sit
-//! at the right, and at the right edge, while the right panel is hidden, the
-//! toggle that shows it.
+//! as `rho-ui + rho` (see [`crate::project_stack`]). The project can start
+//! a new session in it, a button beside it opens the repository's web
+//! page, and every step but the last links back to it; controls for what
+//! the pane shows sit at the right, and at the right edge, while the right
+//! panel is hidden, the toggle that shows it.
 //!
 //! Kit's `Breadcrumb` separates its items with chevrons and gives UI tests
 //! no way to find them; this bar uses slashes, and tests find each step.

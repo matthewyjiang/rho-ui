@@ -317,6 +317,19 @@ impl Workspaces {
         ix
     }
 
+    /// The indices for `dirs`, on `machine`, each as [`Self::index`] finds
+    /// it.
+    pub(crate) fn index_all(
+        &mut self,
+        machine: &MachineId,
+        dirs: &[PathBuf],
+        cx: &mut Context<'_, Self>,
+    ) -> Vec<usize> {
+        dirs.iter()
+            .map(|dir| self.index(&Place::new(machine.clone(), dir.clone()), cx))
+            .collect()
+    }
+
     /// The workspace at `ix`, from [`Self::index`].
     pub(crate) fn get(&self, ix: usize) -> &Workspace {
         &self.list[ix]

@@ -689,9 +689,10 @@ impl Render for DraftView {
             Kind::Session => NEW_SESSION,
             Kind::Lead => NEW_LEAD,
         };
-        // A session's draft names its project; a lead's, those it picked.
+        // A session's draft names its project; a lead's, those it picked,
+        // whether they are the user's projects or not.
         let projects = match self.added_dirs() {
-            Some(dirs) => dirs.read(cx).projects(None, cx),
+            Some(dirs) => dirs.read(cx).projects(None, None, cx),
             None => self
                 .workspace
                 .iter()
