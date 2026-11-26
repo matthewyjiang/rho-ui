@@ -6381,7 +6381,9 @@ fn a_shell_that_exits_closes_its_pane() {
 /// fills it, a source opening to its parts. The daemon reads it between
 /// turns only: the ring asks again during a turn, which keeps the numbers
 /// shown, and the turn's end reads them again. Coming back to the session
-/// after the app let it go reads it once the session is loaded again.
+/// after the app let it go reads it before the session is followed again;
+/// when that read's answer, that it isn't loaded, comes only after the
+/// view caught up, a read after replaces it.
 #[test]
 fn the_context_ring_opens_what_fills_the_context() {
     let mut ui = Harness::start("context", Script::default());
@@ -6459,7 +6461,10 @@ fn the_context_ring_opens_what_fills_the_context() {
     );
 
     // The app lets the session go while another shows, so the daemon can
-    // unload it; back on screen, it is read once it is followed again.
+    // unload it. Back on screen, the panel reads before the session is
+    // followed again, and the daemon answers only after the view caught up:
+    // that read may say the session isn't loaded, so the view catching up
+    // reads again, whichever reached the daemon first.
     let read = ui.cx.update(|cx| ui.app.read(cx).context_read(cx));
     let Some((_, _, landed)) = read else {
         panic!("the context read")
@@ -6468,8 +6473,16 @@ fn the_context_ring_opens_what_fills_the_context() {
     ui.wait_for_daemon("the session let go", |fake| {
         fake.followers(key.id.as_str()) == 0
     });
+    ui.fake().hold_reports();
     let row = SharedString::from(format!("session-{key}"));
     ui.act(|window, cx| window.click(row, cx));
+    ui.wait_for_session("the view caught up", |session| !session.is_replaying());
+    // A read asks for three reports: the one as the session came back, and
+    // the one once the view caught up.
+    ui.wait_for_daemon("a read once the view caught up", |fake| {
+        fake.held_reports() >= 6
+    });
+    ui.fake().release_reports();
     ui.wait_until(
         "the context read once loaded",
         |_, cx, app| matches!(app.context_read(cx), Some((None, Some(_), now)) if now > landed),

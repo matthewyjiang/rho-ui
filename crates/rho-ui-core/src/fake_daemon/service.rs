@@ -1207,7 +1207,20 @@ impl Service for Fake {
         &self,
         params: SessionReportParams,
     ) -> Result<SessionReportResponse, RpcError> {
-        self.lock().report(&params)
+        let (answer, mut held) = {
+            let mut state = self.lock();
+            let answer = state.report(&params);
+            let held = state.reports.held.subscribe();
+            if !*held.borrow() {
+                return answer;
+            }
+            state.reports.waiting += 1;
+            (answer, held)
+        };
+        // Gone with the daemon: the answer then goes as if released.
+        let _ = held.wait_for(|held| !held).await;
+        self.lock().reports.waiting -= 1;
+        answer
     }
 
     async fn session_mcp(&self, params: SessionMcpParams) -> Result<SessionMcpInventory, RpcError> {

@@ -7,6 +7,7 @@
 //! here, one some client follows (`SessionNotLoaded` otherwise).
 //! [`FakeDaemon::leave_out_native_context`] makes a session's model unable
 //! to take some of its conversation, as after a switch of provider.
+//! [`FakeDaemon::hold_reports`] holds its answers, as a busy daemon's.
 
 use std::{collections::BTreeSet, path::PathBuf};
 
@@ -21,6 +22,7 @@ use rho_protocol::methods::{
     SessionReportResponse, SummaryRequestPath, ToolSchemaOrigin, SESSION_REPORT,
 };
 use rho_protocol::{ErrorCode, ModelRef, RpcError};
+use tokio::sync::watch;
 
 use super::{FakeDaemon, FakeSession, State, UiSessionId};
 
@@ -46,6 +48,10 @@ pub(super) struct FakeReports {
     method: ReportMethod,
     /// Sessions whose model can't take some of their conversation.
     native_left_out: BTreeSet<String>,
+    /// Whether answers wait; see [`FakeDaemon::hold_reports`].
+    pub(super) held: watch::Sender<bool>,
+    /// How many answers wait.
+    pub(super) waiting: usize,
 }
 
 impl FakeReports {
@@ -53,6 +59,8 @@ impl FakeReports {
         Self {
             method,
             native_left_out: BTreeSet::new(),
+            held: watch::Sender::new(false),
+            waiting: 0,
         }
     }
 }
@@ -116,6 +124,24 @@ impl FakeDaemon {
             .reports
             .native_left_out
             .insert(session.as_str().to_owned());
+    }
+
+    /// Makes `rho/session/report` read its report as it is asked, but
+    /// answer only once [`Self::release_reports`], as a busy daemon's
+    /// answer comes late: it says what was so when it was asked.
+    pub fn hold_reports(&self) {
+        self.service.lock().reports.held.send_replace(true);
+    }
+
+    /// Sends the answers [`Self::hold_reports`] held, and answers those
+    /// after at once.
+    pub fn release_reports(&self) {
+        self.service.lock().reports.held.send_replace(false);
+    }
+
+    /// How many answers [`Self::hold_reports`] holds.
+    pub fn held_reports(&self) -> usize {
+        self.service.lock().reports.waiting
     }
 }
 
