@@ -560,8 +560,11 @@ pub enum Entry {
     Surface(SurfaceRef),
     /// The daemon began a turn of its own, as it does when the session's
     /// background work finishes or a subagent asks its parent to act, to
-    /// give the model the result. It opens that turn, as a prompt opens one. Only a turn followed live has
-    /// one: the daemon's replay of a conversation does not mark them.
+    /// give the model the result. It opens that turn, as a prompt opens one,
+    /// before the turn's first model output. The turn's start marks it, or,
+    /// since a replay of saved turns marks no turn starts or ends, the
+    /// result's card after the agent's reply does, live or replayed alike:
+    /// rho delivers every result as a card.
     Wake,
 }
 
@@ -723,6 +726,11 @@ pub struct Session {
     /// The turn that last ended, so [`Self::turn_began`] can tell an answer
     /// that arrives after its whole turn.
     ended_turn: Option<TurnId>,
+    /// The next turn, or the one under way, has not opened: since a turn
+    /// began or ended, as the session's state says, or a card came after
+    /// the agent's reply, nothing [`opening`] reads has arrived. Its prompt
+    /// opens it, or else an [`Entry::Wake`] does.
+    unopened: bool,
     /// The directory the session works in, once attached. Diffs name their
     /// files relative to it.
     workspace: Option<PathBuf>,
@@ -741,9 +749,6 @@ pub struct Session {
 /// the turn ends.
 #[derive(Clone, Debug, Default)]
 struct LiveTurn {
-    /// The turn began live and nothing of it that [`opening`] reads has
-    /// arrived yet: its prompt opens it, or else an [`Entry::Wake`] does.
-    unopened: bool,
     /// How many entries there were when the turn's latest provider request
     /// went: what its response streams comes after them.
     attempt: Option<usize>,
@@ -795,6 +800,7 @@ impl Session {
             dropped_steers: Vec::new(),
             early_steers: Vec::new(),
             ended_turn: None,
+            unopened: false,
             workspace: None,
             sync: Sync::Attaching(Vec::new()),
             stream: None,
@@ -847,6 +853,9 @@ impl Session {
             self.title = response.title;
         }
         self.apply_options(response.options);
+        // The attach's state is no turn starting or ending: the replay
+        // after it marks its own, from the conversation's beginning or from
+        // where the session left off.
         self.settle(response.state);
         for request in response.inputs {
             self.open_input(InputRequest::from_wire(request));
@@ -909,6 +918,7 @@ impl Session {
             self.removed = Some(0);
         }
         self.turn = LiveTurn::default();
+        self.unopened = false;
         self.plan.clear();
         self.inputs.clear();
         self.placed_surfaces.clear();
@@ -1331,22 +1341,23 @@ impl Session {
                 plain,
                 tone,
                 display,
-            } => Some(self.push_notice(Notice::card(
-                title,
-                [markdown, plain],
-                tone,
-                display,
-                arrived,
-            ))),
-            SessionEvent::State { state, turn } => {
-                if !state.in_progress() {
-                    // A turn the daemon's restart cut short ends here,
-                    // with no `turn_ended` before it.
-                    if let Some(turn) = &turn {
-                        self.ended_turn = Some(TurnId::from_wire(turn));
-                    }
+            } => {
+                // A result delivered after the agent answered starts model
+                // work of its own: the next turn, or the rest of this one
+                // once the model reads it, which a replay can't tell apart.
+                if self.answered() {
+                    self.unopened = true;
                 }
-                self.settle(state);
+                Some(self.push_notice(Notice::card(
+                    title,
+                    [markdown, plain],
+                    tone,
+                    display,
+                    arrived,
+                )))
+            }
+            SessionEvent::State { state, turn } => {
+                self.change_state(state, turn.as_ref());
                 None
             }
             SessionEvent::TurnEnded { turn, outcome } => {
@@ -1534,14 +1545,26 @@ impl Session {
         None
     }
 
-    /// Opens the turn that began live, if `event` is the first of it that
-    /// [`opening`] reads: with an [`Entry::Wake`], unless it is the prompt.
+    /// Opens the unopened turn, if `event` is the first of it that
+    /// [`opening`] reads: with an [`Entry::Wake`], unless it is a user
+    /// message.
     fn open_turn(&mut self, event: &SessionEvent) {
         if let Some(opening) = opening(event) {
-            if std::mem::take(&mut self.turn.unopened) && opening == Opening::Wake {
+            if std::mem::take(&mut self.unopened) && opening == Opening::Wake {
                 self.entries.push(Entry::Wake);
             }
         }
+    }
+
+    /// Whether the agent's reply is the conversation's latest entry but for
+    /// notices and compactions: the model answered, and nothing of its own
+    /// came since. A replay shows a `/compact` turn as its compaction alone.
+    fn answered(&self) -> bool {
+        let latest = self
+            .entries
+            .iter()
+            .rfind(|entry| !matches!(entry, Entry::Notice(_) | Entry::Compaction(_)));
+        matches!(latest, Some(Entry::Agent(_)))
     }
 
     fn set_background(&mut self, work: Vec<rho_protocol::BackgroundWork>) {
@@ -1589,9 +1612,6 @@ impl Session {
             JobState::Running | JobState::Queued => {
                 if !self.state.is_busy() {
                     self.early_steers.clear();
-                    // A turn of the past, as an attach catches up, opens
-                    // nothing here.
-                    self.turn.unopened = matches!(self.sync, Sync::Live);
                 }
                 self.state = RunState::Running;
             }
@@ -1612,8 +1632,25 @@ impl Session {
         }
     }
 
+    /// Applies the session's new state: a turn began or ended, or waits.
+    fn change_state(&mut self, state: JobState, turn: Option<&rho_protocol::TurnId>) {
+        if !state.in_progress() {
+            // A turn the daemon's restart cut short ends here, with no
+            // `turn_ended` before it.
+            if let Some(turn) = turn {
+                self.ended_turn = Some(TurnId::from_wire(turn));
+            }
+        }
+        let was_busy = self.state.is_busy();
+        self.settle(state);
+        if self.state.is_busy() != was_busy {
+            self.unopened = true;
+        }
+    }
+
     fn end_turn(&mut self, outcome: TurnOutcome) {
         self.turn = LiveTurn::default();
+        self.unopened = true;
         self.state = match outcome {
             TurnOutcome::Answered { stop, .. } => match stop {
                 AnswerStop::Refusal => RunState::Failed("the model refused".to_owned()),
@@ -1805,24 +1842,26 @@ impl Session {
     }
 }
 
-/// What opens a turn that began live.
+/// What opens an unopened turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Opening {
-    /// Its prompt, which the daemon echoes as the turn's user message.
+    /// A user message: its prompt, which the daemon echoes, or a steer,
+    /// which opens a turn of its own as it does in a replay, where steers
+    /// read as prompts.
     Prompt,
-    /// Model output or a steer before any prompt: the daemon began the turn
+    /// Model output before any user message: the daemon began the turn
     /// itself.
     Wake,
 }
 
-/// Whether `event` opens the turn under way, and how. A notice or card does
+/// Whether `event` opens an unopened turn, and how. A notice or card does
 /// not: the daemon may send one before a prompt's echo, as a settings
-/// change does.
+/// change does, and a card that delivers a result comes before the model
+/// output it leads to.
 fn opening(event: &SessionEvent) -> Option<Opening> {
     match event {
-        SessionEvent::UserMessage { steer: None, .. } => Some(Opening::Prompt),
-        SessionEvent::UserMessage { steer: Some(_), .. }
-        | SessionEvent::AgentMessageChunk { .. }
+        SessionEvent::UserMessage { .. } => Some(Opening::Prompt),
+        SessionEvent::AgentMessageChunk { .. }
         | SessionEvent::ThoughtChunk { .. }
         | SessionEvent::ToolCall(_)
         | SessionEvent::Compaction {

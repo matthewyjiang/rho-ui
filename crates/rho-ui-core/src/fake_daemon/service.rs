@@ -18,11 +18,11 @@ use rho_protocol::{
     ApprovalAsk, ApprovalSource, Ask, AuthChooseStoreParams, AuthChooseStoreResponse,
     AuthKeyParams, AuthKeyResponse, AuthListParams, AuthListResponse, AuthLoginCancelParams,
     AuthLoginCancelResponse, AuthLoginParams, AuthLoginResponse, AuthLogoutParams,
-    AuthLogoutResponse, BackgroundStatus, BuildId, ClientInfo, ConfigGetParams, ConfigSchema,
-    ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus, DetachReason,
-    DetailedSessionSummary, ErrorCode, InputAnswer, InputAsker, InputRequest, InputRequestId,
-    InputTimeout, LoginStream, ModelListParams, ModelWatch, Operation, PermissionMode,
-    PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
+    AuthLogoutResponse, BackgroundStatus, BuildId, CardTone, ClientInfo, ConfigGetParams,
+    ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus,
+    DetachReason, DetailedSessionSummary, ErrorCode, InputAnswer, InputAsker, InputRequest,
+    InputRequestId, InputTimeout, LoginStream, ModelListParams, ModelWatch, Operation,
+    PermissionMode, PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
     SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
     SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
     SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
@@ -39,8 +39,8 @@ use rho_protocol::{
 };
 
 use super::{
-    report, shell_card, shell_output, started::StartedChange, surface, FakeSession, SessionLists,
-    Settings, State, Turn, KEY_AUTH, TOOL_IMAGE,
+    report, shell_card, shell_output, started::StartedChange, surface, Card, FakeSession,
+    SessionLists, Settings, State, Turn, KEY_AUTH, TOOL_IMAGE,
 };
 
 #[derive(Debug)]
@@ -76,6 +76,7 @@ impl Fake {
             for publisher in session.publishers.drain(..) {
                 publisher.close(DetachReason::Restarting);
             }
+            session.reload();
         }
         drop(state);
         self.restarted.send_modify(|restarts| *restarts += 1);
@@ -169,8 +170,7 @@ fn start_prompt(
     session.updated_at = date;
     if prompt == "busy" && !session.refused_busy {
         session.refused_busy = true;
-        session.wake(turn, "Nothing new from the background.");
-        session.answer(&format!("m-{turn_id}-done"), "Back to you.");
+        run_own_turn(session, turn);
         return Err(busy());
     }
     if prompt == "subagent" {
@@ -242,6 +242,16 @@ fn start_prompt(
     let (ask, timeout) = other_ask(&prompt).unwrap_or_else(|| (ls_approval(&session.cwd), None));
     session.ask(params, turn, ask, timeout);
     Ok(SessionPromptResponse { turn: turn_id })
+}
+
+/// Runs `turn`, one of the daemon's own begun just before a prompt came,
+/// to its end: it answers at once.
+fn run_own_turn(session: &mut FakeSession, turn: Turn) {
+    let id = turn.id.clone();
+    let told = "Nothing new from the background.";
+    let result = Card::new("Checked · background", told, CardTone::Neutral);
+    session.wake(turn, &result, told);
+    session.answer(&format!("m-{id}-done"), "Back to you.");
 }
 
 fn busy() -> RpcError {
@@ -975,9 +985,14 @@ impl Service for Fake {
         };
         work.status = BackgroundStatus::Cancelled;
         let told = format!("`{}` was stopped.", work.title);
+        let result = Card::new(
+            &format!("Stopped · {}", work.title),
+            &told,
+            CardTone::Neutral,
+        );
         session.report_background();
         if session.turn.is_none() {
-            session.wake(turn, &told);
+            session.wake(turn, &result, &told);
         }
         Ok(SessionBackgroundStopResponse {})
     }

@@ -1097,8 +1097,9 @@ async fn until_detached(events: &mut DaemonEvents, session: &mut Session) -> Det
 
 /// A session the daemon detached as fallen behind attaches again with its
 /// cursor and carries on: the daemon sends only what it missed, which
-/// lands once, after what it showed. Work it saw running, and that ended
-/// meanwhile, is listed as it ended.
+/// lands once, after what it showed, a turn of the daemon's own opening
+/// as it would have live. Work it saw running, and that ended meanwhile,
+/// is listed as it ended.
 #[test]
 fn a_session_that_fell_behind_carries_on_from_its_cursor() {
     let fake = FakeDaemon::start(Script::default());
@@ -1130,8 +1131,13 @@ fn a_session_that_fell_behind_carries_on_from_its_cursor() {
         assert_eq!(&session.entries()[..shown.len()], shown.as_slice());
         assert_eq!(
             session.entries().len(),
-            shown.len() + 2,
-            "the daemon's turn's thought and reply, once"
+            shown.len() + 4,
+            "the daemon's turn's result card, wake, thought and reply, once"
+        );
+        assert_eq!(
+            session.entries()[shown.len() + 1],
+            Entry::Wake,
+            "the missed turn opens as it would have live"
         );
         assert_eq!(last_reply(&session), "`sleep 30` exited with 0.");
         assert_eq!(session.state(), &RunState::Running);

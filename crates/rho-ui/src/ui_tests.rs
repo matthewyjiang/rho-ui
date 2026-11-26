@@ -2643,6 +2643,146 @@ fn finished_work_folds_and_opens_in_levels() {
     ui.shot("diff");
 }
 
+/// A result delivered after the reply, while the daemon's turn still runs,
+/// opens a turn of its own, as it will when the conversation replays: the
+/// turn it ends gets its time then, and the new one runs on.
+#[test]
+fn a_result_after_the_reply_ends_the_turn_it_joined() {
+    let mut ui = Harness::start("late-result", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    let id = SessionId::from("new-1");
+    let says = |session: &Session, text: &str| matches!(session.entries().last(), Some(Entry::Agent(reply)) if reply.text() == text);
+    ui.send("background");
+    ui.wait_for_session("the process to run", |session| {
+        session.state() == &RunState::Idle && !session.background().is_empty()
+    });
+    ui.send("subagent");
+    ui.wait_for_session("the subagent to run", |session| {
+        session.state() == &RunState::Idle && session.background().len() == 2
+    });
+    // The daemon's turn about the exit answers and runs on.
+    ui.fake().finish_background(&id, 0);
+    ui.wait_for_session("the daemon's turn's reply", |session| {
+        session.state() == &RunState::Running && says(session, "`sleep 30` exited with 0.")
+    });
+    assert_eq!(turn_took(&mut ui, 2), None, "the daemon's turn runs");
+
+    ui.fake().finish_subagent(&id);
+    ui.wait_for_session("the reply to the subagent's result", |session| {
+        says(session, "The subagent found the parser.")
+    });
+    let session = ui.session();
+    let wakes = session
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::Wake))
+        .count();
+    assert_eq!(wakes, 2, "the result opens a turn of its own");
+    assert_eq!(session.state(), &RunState::Running);
+    assert!(
+        turn_took(&mut ui, 2).is_some(),
+        "the turn it ended is timed"
+    );
+    assert_eq!(turn_took(&mut ui, 3), None, "the new turn runs");
+    ui.shot("split");
+}
+
+/// Each turn rho began itself, as a lead's are, opens with its wake and
+/// folds only its own working, so every reply shows: live, and once the
+/// conversation replays after a daemon restart, which marks no turn starts.
+#[test]
+fn every_wake_turn_keeps_its_reply_after_a_replay() {
+    let mut ui = Harness::start("wake-replies", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    // A prompt: a read and a reply.
+    ui.send("pictures");
+    let replies = |session: &Session| {
+        session
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Agent(_)))
+            .count()
+    };
+    ui.wait_for_session("the prompt's reply", |session| {
+        session.state() == &RunState::Idle && replies(session) == 1
+    });
+    let id = SessionId::from("new-1");
+    // Two turns of the daemon's own: a card, a read and a reply each.
+    for (reply, n) in [("First result in.", 2), ("Second result in.", 3)] {
+        ui.fake().deliver(&id, reply);
+        ui.wait_for_session("the daemon's reply", |session| {
+            session.state() == &RunState::Idle && replies(session) == n
+        });
+    }
+    // Entries: prompt, read, reply; card, wake, read, reply; card, wake,
+    // read, reply. Each turn's reply shows under its folded working, a
+    // read's step row: the prompt's at the top, the daemon's two at the
+    // bottom. The clock jumps past the folds' springs.
+    let shows_three_turns = |ui: &mut Harness, when: &str| {
+        let session = ui.session();
+        let wakes: Vec<usize> = session
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, entry)| matches!(entry, Entry::Wake).then_some(ix))
+            .collect();
+        assert_eq!(wakes, [4, 8], "{when}: each daemon turn opens with a wake");
+        let shows_turn =
+            |window: &Window, (worked, work, reply): (&'static str, &'static str, &'static str)| {
+                assert!(
+                    is_visible(window, worked),
+                    "{when}: {worked} heads its turn"
+                );
+                assert!(!is_visible(window, work), "{when}: {work} is folded");
+                assert!(is_visible(window, reply), "{when}: {reply} shows");
+            };
+        let app = ui.app.clone();
+        let scroller = ui.cx.update(|cx| {
+            let view = app.read(cx).active_session().expect("a session is open");
+            view.read(cx).transcript().scroller().clone()
+        });
+        ui.cx
+            .update(|cx| scroller.update(cx, |scroller, cx| scroller.scroll_to_item(0, cx)));
+        ui.frame();
+        ui.cx.advance_clock(Duration::from_secs(1));
+        ui.frame();
+        ui.act(|window, _| shows_turn(window, ("worked-0", "step-1", "reply-2")));
+        ui.cx.update(|cx| {
+            scroller.update(
+                cx,
+                gpui_kit::component::message_scroller::MessageScrollerState::scroll_to_end,
+            );
+        });
+        ui.frame();
+        ui.cx.advance_clock(Duration::from_secs(1));
+        ui.frame();
+        ui.act(|window, _| {
+            shows_turn(window, ("worked-1", "step-5", "reply-6"));
+            shows_turn(window, ("worked-2", "step-9", "reply-10"));
+        });
+        session.entries().to_vec()
+    };
+    let live = shows_three_turns(&mut ui, "live");
+    ui.shot("live");
+
+    ui.fake().restart();
+    ui.wait_for_daemon("new-1 attached after the restart", |fake| {
+        fake.attaches("new-1") == 2
+    });
+    ui.wait_for_session("the replay", |session| !session.is_replaying());
+    let replayed = shows_three_turns(&mut ui, "replayed");
+    ui.shot("replayed");
+    assert_eq!(replayed, live, "the replay shows what live did");
+}
+
 /// A step shows what rho's terminal UI shows for it, once: an edit's line
 /// names the file and what changed, and it opens into the diff alone, not
 /// the receipt the model read; a read's line says how much it read, and the
@@ -6558,7 +6698,11 @@ fn cards_between_replies_sit_on_a_rail_that_folds() {
             assert!(!is_visible(window, card(ix)), "card {ix} is folded");
         }
     });
-    let reply = SharedString::from(format!("reply-{}", cards[cards.len() - 1] + 1));
+    // The model answers after the cards as a turn of their own, opened
+    // with its wake row, as the conversation replays.
+    let after = cards[cards.len() - 1] + 1;
+    assert!(matches!(session.entries()[after], Entry::Wake));
+    let reply = SharedString::from(format!("reply-{}", after + 1));
     ui.act(|window, cx| {
         let center = window.find(reply.clone()).bounds().center();
         window.pointer_move(center, None, cx);
