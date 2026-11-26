@@ -45,8 +45,9 @@ use crate::{
     leads::Kind,
     machines::{MachineId, Place},
     project_picker::{project_row, ROW_REMS},
+    project_stack::session_projects,
     projects::Projects,
-    workspaces::{tilde, WorkspaceRef, Workspaces},
+    workspaces::{tilde, Workspace, WorkspaceRef, Workspaces},
 };
 
 /// Rows the list of projects shows before it scrolls: as many as the
@@ -96,6 +97,8 @@ pub(crate) struct AddedDirs {
     workspaces: Entity<Workspaces>,
     /// As the session last listed them, or as picked in a lead's draft.
     dirs: Vec<PathBuf>,
+    /// Each of `dirs`' index into `workspaces`, which names its project.
+    indices: Vec<usize>,
     /// How they are worded.
     kind: Kind,
     /// `None` in a view that only lists them; see [`DirsAccess`].
@@ -231,11 +234,44 @@ impl AddedDirs {
             machine,
             workspaces,
             dirs,
+            indices: Vec::new(),
             kind,
             form,
         };
+        this.reindex(cx);
         this.refresh_offer(cx);
         this
+    }
+
+    /// The projects the session works in, by [`session_projects`], with
+    /// `own`, the session's workspace, by its index into the workspaces;
+    /// `None` for a lead's draft, which has none yet.
+    pub(crate) fn projects<'a>(&self, own: Option<usize>, cx: &'a App) -> Vec<&'a Workspace> {
+        let workspaces = self.workspaces.read(cx);
+        let projects = self.form.as_ref().map(|form| form.projects.read(cx));
+        session_projects(
+            self.kind,
+            own.map(|ix| workspaces.get(ix)),
+            self.indices.iter().map(|&ix| workspaces.get(ix)),
+            projects,
+        )
+    }
+
+    /// The directories' indices into the workspaces, for whoever names
+    /// their projects elsewhere, as the sidebar's row of a lead's draft.
+    pub(crate) fn indices(&self) -> &[usize] {
+        &self.indices
+    }
+
+    /// Finds each directory's workspace, adding those not in the table, so
+    /// its project can be named.
+    fn reindex(&mut self, cx: &mut Context<'_, Self>) {
+        let (machine, dirs) = (&self.machine, &self.dirs);
+        self.indices = self.workspaces.update(cx, |workspaces, cx| {
+            dirs.iter()
+                .map(|dir| workspaces.index(&Place::new(machine.clone(), dir.clone()), cx))
+                .collect()
+        });
     }
 
     /// The directories listed: the session's, or those a lead's draft
@@ -256,6 +292,7 @@ impl AddedDirs {
     pub(crate) fn sync(&mut self, dirs: &[PathBuf], cx: &mut Context<'_, Self>) {
         if self.dirs != dirs {
             self.dirs = dirs.to_vec();
+            self.reindex(cx);
             self.refresh_offer(cx);
             cx.notify();
         }
@@ -342,6 +379,7 @@ impl AddedDirs {
                 } else {
                     form.error = Some("It's listed already, or in one listed.".into());
                 }
+                self.reindex(cx);
                 self.refresh_offer(cx);
                 cx.notify();
                 return;
@@ -378,6 +416,7 @@ impl AddedDirs {
     /// it is a project.
     fn remove(&mut self, dir: &Path, cx: &mut Context<'_, Self>) {
         self.dirs.retain(|listed| listed != dir);
+        self.reindex(cx);
         self.refresh_offer(cx);
         cx.notify();
     }

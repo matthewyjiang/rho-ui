@@ -589,8 +589,8 @@ mod tests {
         );
         let relist = |list: &mut SessionList| {
             let roots = |ix: usize| match ix {
-                0 => ("atlas", Path::new("/w")),
-                _ => ("srv", Path::new("/srv")),
+                0 => ("atlas", Path::new("/w"), true),
+                _ => ("srv", Path::new("/srv"), true),
             };
             list.rebuild(10, &HashSet::new(), roots);
         };

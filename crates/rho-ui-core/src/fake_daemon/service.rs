@@ -127,7 +127,7 @@ fn summary(id: &str, session: &FakeSession) -> SessionSummary {
     SessionSummary {
         session: SessionId::new(id),
         cwd: session.cwd.clone(),
-        added_dirs: Vec::new(),
+        added_dirs: session.settings.added_dirs.clone(),
         title: session.title.clone(),
         first_user_message: None,
         last_user_message: None,

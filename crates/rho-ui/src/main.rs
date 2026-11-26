@@ -43,6 +43,7 @@ mod pictures;
 mod plan;
 mod pr_mark;
 mod project_picker;
+mod project_stack;
 mod projects;
 mod pull_requests;
 mod rail;

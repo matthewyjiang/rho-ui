@@ -1361,6 +1361,7 @@ impl RhoApp {
                     draft.cwd().clone(),
                     draft.title(cx),
                     draft.workspace_index(),
+                    draft.added_indices(cx),
                 )
             })
             .collect();

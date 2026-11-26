@@ -106,6 +106,21 @@ impl Workspace {
     }
 }
 
+/// For tests: a workspace at `path` on this machine, read as a folder of
+/// the project at `root` named `name`.
+#[cfg(test)]
+impl Workspace {
+    pub(crate) fn local(path: &str, name: &str, root: &str) -> Self {
+        let repo = Repo {
+            name: name.to_owned(),
+            origin: None,
+            head: None,
+            root: root.into(),
+        };
+        Self::new(Place::local(path), repo, None)
+    }
+}
+
 /// `cwd` with a leading `home` written as `~`, as a shell shows it.
 pub(crate) fn tilde(cwd: &Path, home: Option<&Path>) -> String {
     match home.map(|home| cwd.strip_prefix(home)) {

@@ -68,6 +68,7 @@ use crate::{
     leads::Kind,
     machines::{self, DaemonAction, MachineId, MachineStatus, Machines, Place, SessionKey},
     pr_mark::{mark_label, pr_mark},
+    project_stack::{self, session_projects, Naming, ProjectStack},
     projects::Projects,
     pull_requests::{Focus, PullRequests},
     rho_install::{render_offer, Installs},
@@ -468,20 +469,31 @@ impl SidebarView {
         sessions: Vec<SessionSummary>,
         cx: &mut Context<'_, Self>,
     ) {
+        let list = &self.list;
         let saved = self.workspaces.update(cx, |workspaces, cx| {
             let saved: Vec<SavedSession> = sessions
                 .into_iter()
-                .map(|session| SavedSession {
-                    workspace: workspaces.index(&Place::new(machine.clone(), session.cwd()), cx),
-                    id: SessionKey::new(machine.clone(), session.id().clone()),
-                    cwd: session.cwd().to_path_buf(),
-                    title: session.title().map(|title| title.to_owned().into()),
-                    updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
-                    parent: session
-                        .parent()
-                        .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
-                    kind: session.agent().map_or(Kind::Session, Kind::of),
-                    mark: session.mark(),
+                .map(|session| {
+                    let id = SessionKey::new(machine.clone(), session.id().clone());
+                    // An open session's own word is the newer.
+                    let dirs = list
+                        .live(&id)
+                        .and_then(|live| live.added_dirs.as_deref())
+                        .unwrap_or(session.added_dirs());
+                    SavedSession {
+                        added: index_all(workspaces, machine, dirs, cx),
+                        workspace: workspaces
+                            .index(&Place::new(machine.clone(), session.cwd()), cx),
+                        id,
+                        cwd: session.cwd().to_path_buf(),
+                        title: session.title().map(|title| title.to_owned().into()),
+                        updated: i64::try_from(session.updated_at()).unwrap_or(i64::MAX),
+                        parent: session
+                            .parent()
+                            .map(|parent| SessionKey::new(machine.clone(), parent.clone())),
+                        kind: session.agent().map_or(Kind::Session, Kind::of),
+                        mark: session.mark(),
+                    }
                 })
                 .collect();
             workspaces.set_history(
@@ -557,13 +569,15 @@ impl SidebarView {
         self.rebuild(cx);
     }
 
-    /// Records an open session's title and activity.
+    /// Records an open session's title, activity and added directories.
     pub(crate) fn set_live(&mut self, live: LiveSession, cx: &mut Context<'_, Self>) {
         let place = Place::new(live.id.machine.clone(), live.cwd.clone());
-        let workspace = self
-            .workspaces
-            .update(cx, |workspaces, cx| workspaces.index(&place, cx));
-        if self.list.set_live(live, workspace, time::now_unix()) {
+        let (workspace, added) = self.workspaces.update(cx, |workspaces, cx| {
+            let added = (live.added_dirs.as_deref())
+                .map(|dirs| index_all(workspaces, &place.machine, dirs, cx));
+            (workspaces.index(&place, cx), added)
+        });
+        if self.list.set_live(live, workspace, added, time::now_unix()) {
             self.mark_active_seen();
             self.rebuild(cx);
         }
@@ -695,10 +709,12 @@ impl SidebarView {
 
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
         let workspaces = self.workspaces.read(cx);
+        let projects = self.projects.read(cx);
         let watching = self.prs.read(cx).watching();
         self.list.rebuild(time::now_unix(), &watching, |ix| {
             let workspace = workspaces.get(ix);
-            (workspace.name.as_ref(), workspace.root_path())
+            let users = project_stack::is_users(workspace, projects);
+            (workspace.name.as_ref(), workspace.root_path(), users)
         });
         // Every session on the active shelf the filter shows has its PRs
         // listed by its daemon, under a closed fold too, as what it watches
@@ -997,6 +1013,16 @@ impl SidebarView {
         let view = cx.entity().downgrade();
         let cx: &Context<'_, Self> = cx;
         let workspaces = self.workspaces.read(cx);
+        let projects = self.projects.read(cx);
+        let named = |kind: Kind, own: Option<usize>, added: &[usize]| {
+            let added = added.iter().map(|&ix| workspaces.get(ix));
+            session_projects(
+                kind,
+                own.map(|ix| workspaces.get(ix)),
+                added,
+                Some(projects),
+            )
+        };
         let machines = self.machines.read(cx);
         // With one machine, a label says nothing.
         let label = |row: &Row| machines.tag(&row.id.machine);
@@ -1007,18 +1033,29 @@ impl SidebarView {
                 Item::Draft(ix) => {
                     let draft = self.list.draft_at(ix);
                     let workspace = draft.workspace.map(|ix| workspaces.get(ix));
+                    let projects = named(draft.kind, draft.workspace, &draft.added);
                     let label = machines.tag(&draft.cwd.machine);
-                    self.render_draft(draft, workspace, label, cx)
+                    self.render_draft(draft, workspace, &projects, label, cx)
                 }
                 Item::Session(row) => {
                     let row = self.list.row_at(row);
                     let workspace = workspaces.get(row.workspace);
-                    self.render_row(row, workspace, label(row), clock, &view, cx)
+                    let projects = named(row.kind, Some(row.workspace), &row.added);
+                    let place = Where {
+                        workspace,
+                        projects: &projects,
+                    };
+                    self.render_row(row, place, label(row), clock, &view, cx)
                 }
                 Item::Shelved(row) => {
                     let row = self.list.row_at(row);
                     let workspace = workspaces.get(row.workspace);
-                    self.render_shelved(row, workspace, label(row), age_width, clock, cx)
+                    let projects = named(row.kind, Some(row.workspace), &row.added);
+                    let place = Where {
+                        workspace,
+                        projects: &projects,
+                    };
+                    self.render_shelved(row, place, label(row), age_width, clock, cx)
                 }
                 Item::Header(which) => self.render_shelf_header(which, cx),
                 Item::Leads => Self::render_kind_header("leads-header", "Leads"),
@@ -1033,13 +1070,17 @@ impl SidebarView {
     fn render_row(
         &self,
         row: &Row,
-        workspace: &Workspace,
+        place: Where<'_>,
         machine: Option<SharedString>,
         clock: Clock,
         view: &WeakEntity<Self>,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let theme = cx.theme();
+        let Where {
+            workspace,
+            projects,
+        } = place;
         let state = self.row_state(row);
         let right = state
             .hovered
@@ -1051,7 +1092,9 @@ impl SidebarView {
             .test_support()
             .gap(rems(GAP_REMS))
             .py(rems(PAD_REMS))
-            .child(workspace_line(Some(workspace), theme).child(right))
+            .child(
+                project_line(&row.element_id, projects, surface(state, theme), theme).child(right),
+            )
             .child(self.rename_box(row, cx).unwrap_or_else(|| {
                 div()
                     .h(rems(TITLE_REMS))
@@ -1086,6 +1129,7 @@ impl SidebarView {
         &self,
         draft: &DraftRow,
         workspace: Option<&Workspace>,
+        projects: &[&Workspace],
         machine: Option<SharedString>,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
@@ -1119,7 +1163,10 @@ impl SidebarView {
             .aria_label(title.clone())
             .gap(rems(GAP_REMS))
             .py(rems(PAD_REMS))
-            .child(workspace_line(workspace, theme).child(right))
+            .child(
+                project_line(&draft.element_id, projects, surface(state, theme), theme)
+                    .child(right),
+            )
             .child(
                 div()
                     .h(rems(TITLE_REMS))
@@ -1234,13 +1281,17 @@ impl SidebarView {
     fn render_shelved(
         &self,
         row: &Row,
-        workspace: &Workspace,
+        place: Where<'_>,
         machine: Option<SharedString>,
         age_width: Pixels,
         clock: Clock,
         cx: &Context<'_, Self>,
     ) -> AnyElement {
         let theme = cx.theme();
+        let Where {
+            workspace,
+            projects,
+        } = place;
         let state = self.row_state(row);
         let wakes = shelf::wakes(row.mark);
         let offered = ShelfAction::for_row(row);
@@ -1280,8 +1331,10 @@ impl SidebarView {
         };
         let card = Card {
             title: row.title(),
-            workspace: workspace.name.clone(),
-            initials: workspace.initials.clone(),
+            projects: projects
+                .iter()
+                .map(|project| (project.initials.clone(), project.name.clone()))
+                .collect(),
             branch: workspace.branch.clone(),
             machine,
             wakes: wakes
@@ -1296,8 +1349,15 @@ impl SidebarView {
             .text_xs()
             // Shelved badges recede until the row is hovered or open.
             .child(
-                badge(card.initials.clone())
-                    .when(!(state.active || state.hovered), |this| this.opacity(0.4)),
+                ProjectStack::new(
+                    format!("{}-projects", row.element_id),
+                    projects,
+                    rems(LINE_REMS),
+                )
+                .on(surface(state, theme))
+                // The row's card lists them all.
+                .untipped()
+                .when(!(state.active || state.hovered), ProjectStack::receded),
             )
             .child(self.rename_box(row, cx).unwrap_or_else(|| {
                 div()
@@ -1935,21 +1995,61 @@ struct Clock {
     instant: Instant,
 }
 
-/// Badge and workspace name; the caller adds the status or actions.
-fn workspace_line(workspace: Option<&Workspace>, theme: &Theme) -> gpui_kit::Div {
+/// The index into `workspaces` of each of `dirs`, folders on `machine`,
+/// adding those not in the table.
+fn index_all(
+    workspaces: &mut Workspaces,
+    machine: &MachineId,
+    dirs: &[PathBuf],
+    cx: &mut Context<'_, Workspaces>,
+) -> Vec<usize> {
+    dirs.iter()
+        .map(|dir| workspaces.index(&Place::new(machine.clone(), dir.clone()), cx))
+        .collect()
+}
+
+/// The session's projects' badges and names, those of the row
+/// `element_id`, on a row of `surface`'s color; the caller adds the status
+/// or actions.
+fn project_line(
+    element_id: &SharedString,
+    projects: &[&Workspace],
+    surface: Hsla,
+    theme: &Theme,
+) -> gpui_kit::Div {
+    let names = project_stack::names(projects, Naming::Full);
     h_flex()
         .h(rems(LINE_REMS))
         .gap_2()
         .text_xs()
-        .children(workspace.map(|workspace| badge(workspace.initials.clone())))
+        .child(
+            ProjectStack::new(format!("{element_id}-projects"), projects, rems(LINE_REMS))
+                .on(surface),
+        )
         .child(
             div()
+                .id(SharedString::from(format!("{element_id}-project-names")))
+                .test_support()
+                .aria_label(names.clone())
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_color(theme.muted_foreground)
-                .children(workspace.map(|workspace| workspace.name.clone())),
+                .child(names),
         )
+}
+
+/// The color under a row's content as `state` lights it: what a project
+/// stack rings its badges with.
+fn surface(state: RowState, theme: &Theme) -> Hsla {
+    row_bg(state, theme).map_or(theme.sidebar, |bg| theme.sidebar.blend(bg))
+}
+
+/// An item's workspace, for its branch, and the projects it names.
+#[derive(Clone, Copy)]
+struct Where<'a> {
+    workspace: &'a Workspace,
+    projects: &'a [&'a Workspace],
 }
 
 /// A workspace's badge, a line of the sidebar's text tall.
@@ -1988,11 +2088,25 @@ struct RowState {
 
 /// Lights a row as `state` says.
 fn lit<E: Styled>(row: E, state: RowState, theme: &Theme) -> E {
+    let row = match row_bg(state, theme) {
+        Some(bg) => row.bg(bg),
+        None => row,
+    };
+    if state.active {
+        row.text_color(theme.sidebar_accent_foreground)
+    } else {
+        row
+    }
+}
+
+/// The background `state` lights a row with, over the sidebar's; `None`
+/// for a row at rest.
+fn row_bg(state: RowState, theme: &Theme) -> Option<Hsla> {
     let accent = theme.sidebar_accent;
     match (state.active, state.hovered) {
-        (true, _) => row.bg(accent).text_color(theme.sidebar_accent_foreground),
-        (false, true) => row.bg(accent.opacity(0.5)),
-        (false, false) => row,
+        (true, _) => Some(accent),
+        (false, true) => Some(accent.opacity(0.5)),
+        (false, false) => None,
     }
 }
 
@@ -2000,8 +2114,8 @@ fn lit<E: Styled>(row: E, state: RowState, theme: &Theme) -> E {
 /// Built with the row, so the card needs nothing from the view.
 struct Card {
     title: SharedString,
-    workspace: SharedString,
-    initials: SharedString,
+    /// Each project's initials and name.
+    projects: Vec<(SharedString, SharedString)>,
     branch: Option<SharedString>,
     machine: Option<SharedString>,
     wakes: Option<String>,
@@ -2020,12 +2134,11 @@ impl Card {
             .bordered(false)
             .columns(1)
             // The icon plus a gap: unbordered lists have no padding.
-            .label_width(rems(LINE_REMS + 0.75))
-            .item(
-                badge(self.initials.clone()).into_any_element(),
-                self.workspace.clone(),
-                1,
-            );
+            .label_width(rems(LINE_REMS + 0.75));
+        // Each project on a line of its own: the card has the room.
+        for (initials, name) in &self.projects {
+            details = details.item(badge(initials.clone()).into_any_element(), name.clone(), 1);
+        }
         if let Some(branch) = &self.branch {
             details = details.item(muted(Lucide::GitBranch), branch.clone(), 1);
         }
@@ -2413,6 +2526,7 @@ mod tests {
             updated: 1,
             mark: None,
             workspace: 0,
+            added: Vec::new(),
             parent: parent.map(SessionKey::local),
             kind: Kind::Session,
         };
@@ -2438,10 +2552,11 @@ mod tests {
                 placeholder: "",
                 activity,
                 kind: Some(Kind::Session),
+                added_dirs: None,
             };
-            list.set_live(live, 0, 1);
+            list.set_live(live, 0, None, 1);
         }
-        list.rebuild(1, &HashSet::new(), |_| ("w", Path::new("/w")));
+        list.rebuild(1, &HashSet::new(), |_| ("w", Path::new("/w"), true));
         for id in ["busy", "lead", "fresh"] {
             let row = list.row(&SessionKey::local(id)).expect("listed");
             assert_eq!(ShelfAction::for_row(row), [], "{id}");

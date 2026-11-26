@@ -35,6 +35,11 @@ impl Badge {
             style: StyleRefinement::default(),
         }
     }
+
+    /// The corner radius of a tile `side` rems square.
+    pub(crate) fn corner(side: Rems) -> Rems {
+        rems(side.0 * RADIUS_SHARE)
+    }
 }
 
 impl Styled for Badge {
@@ -70,7 +75,7 @@ impl RenderOnce for Badge {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .rounded(rems(self.side.0 * RADIUS_SHARE))
+            .rounded(Self::corner(self.side))
             .border_1()
             .border_color(colors.border)
             .bg(colors.background)

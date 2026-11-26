@@ -224,7 +224,10 @@ impl DraftView {
                 subscriptions.push(cx.subscribe_in(picker, window, Self::on_picker_event));
                 Some(WorkspaceRef::new(workspaces, &cwd, cx))
             }
-            DraftKind::Lead { .. } => {
+            DraftKind::Lead { added_dirs } => {
+                // Its picks name its projects, in its title bar and its
+                // sidebar row.
+                subscriptions.push(cx.observe(added_dirs, |_, _, cx| cx.notify()));
                 input.update(cx, |input, cx| {
                     input.set_placeholder(Kind::Lead.placeholder(), window, cx);
                 });
@@ -294,6 +297,14 @@ impl DraftView {
     /// lead's draft until its session opens.
     pub(crate) fn workspace_index(&self) -> Option<usize> {
         self.workspace.as_ref().map(WorkspaceRef::index)
+    }
+
+    /// The directories a lead's draft picked for its lead, by index into
+    /// the workspaces; none for a session's draft.
+    pub(crate) fn added_indices(&self, cx: &App) -> Vec<usize> {
+        self.added_dirs()
+            .map(|dirs| dirs.read(cx).indices().to_vec())
+            .unwrap_or_default()
     }
 
     /// Whether the composer holds a message worth coming back to: more than
@@ -678,10 +689,18 @@ impl Render for DraftView {
             Kind::Session => NEW_SESSION,
             Kind::Lead => NEW_LEAD,
         };
-        let workspace = self.workspace.as_ref().map(|workspace| workspace.read(cx));
+        // A session's draft names its project; a lead's, those it picked.
+        let projects = match self.added_dirs() {
+            Some(dirs) => dirs.read(cx).projects(None, cx),
+            None => self
+                .workspace
+                .iter()
+                .map(|workspace| workspace.read(cx))
+                .collect(),
+        };
         // A lead's projects, at the right, where a session's title bar has
         // its added directories.
-        let title_bar = TitleBar::new(workspace, title).trailing(self.added_dirs().cloned());
+        let title_bar = TitleBar::new(&projects, title).trailing(self.added_dirs().cloned());
         v_flex()
             .id("draft-view")
             .test_support()

@@ -6,9 +6,10 @@
 //! ([`Attention`]), a gap, then each shelf's header and, when it's open,
 //! its newest [`SHELF_PAGE`] sessions, then a Show more that adds as many
 //! again. A session another session started folds under that one
-//! ([`family`]). A [`Filter`] hides machines and keeps to chosen projects,
-//! which no lead is in. Plain data with no GUI code; [`crate::sidebar`]
-//! draws it.
+//! ([`family`]). A [`Filter`] hides machines and keeps to chosen projects:
+//! a session shows for any project it works in (see
+//! [`crate::project_stack`]), and a lead given none shows always. Plain
+//! data with no GUI code; [`crate::sidebar`] draws it.
 
 use std::{
     cmp::Reverse,
@@ -82,6 +83,8 @@ pub(crate) struct SavedSession {
     pub(crate) mark: Option<SessionMark>,
     /// Index into [`crate::workspaces::Workspaces`].
     pub(crate) workspace: usize,
+    /// Its added directories' indices into the workspaces.
+    pub(crate) added: Vec<usize>,
     /// The session that started it, as the daemon's list says.
     pub(crate) parent: Option<SessionKey>,
     /// By the agent the daemon's list says it runs as; a plain session's
@@ -105,6 +108,11 @@ pub(crate) struct LiveSession {
     /// list has it; `None` until the view hears it, which leaves the
     /// saved list's word.
     pub(crate) kind: Option<Kind>,
+    /// The directories its tools reach besides its workspace, as the
+    /// session last said, which name a lead's projects before the saved
+    /// list has them; `None` until the session says, as while it attaches,
+    /// which leaves the saved list's word.
+    pub(crate) added_dirs: Option<Vec<PathBuf>>,
 }
 
 /// A session with work under way in the daemon, whichever client started
@@ -140,6 +148,8 @@ pub(crate) struct DraftRow {
     /// Index into [`crate::workspaces::Workspaces`]; `None` for a lead's
     /// draft until its session opens in the leads root.
     pub(crate) workspace: Option<usize>,
+    /// The projects a lead's draft picked, by index into the workspaces.
+    pub(crate) added: Vec<usize>,
 }
 
 impl DraftRow {
@@ -149,6 +159,7 @@ impl DraftRow {
         cwd: Place,
         title: Option<SharedString>,
         workspace: Option<usize>,
+        added: Vec<usize>,
     ) -> Self {
         Self {
             id,
@@ -157,6 +168,7 @@ impl DraftRow {
             cwd,
             title,
             workspace,
+            added,
         }
     }
 
@@ -197,6 +209,10 @@ pub(crate) struct Row {
     pub(crate) cwd: PathBuf,
     /// Index into [`crate::workspaces::Workspaces`].
     pub(crate) workspace: usize,
+    /// Its added directories' indices into the workspaces: as its open
+    /// view last said, else as the daemon's list did. None for a session
+    /// known only from the daemon's jobs, which don't say.
+    pub(crate) added: Vec<usize>,
     /// Last activity in Unix seconds; 0 when unknown.
     pub(crate) updated: i64,
     pub(crate) activity: Activity,
@@ -360,6 +376,17 @@ pub(crate) struct SessionList {
     reveal: Option<SessionKey>,
 }
 
+/// What the filter and the search read of a row or a draft.
+struct Sifted<'r> {
+    machine: &'r MachineId,
+    kind: Kind,
+    title: Option<&'r str>,
+    /// Its workspace's index; `None` for a lead's draft before it has one.
+    own: Option<usize>,
+    /// Its added directories' indices.
+    added: &'r [usize],
+}
+
 /// Whether a row passes the machine and project filter, and the search, as
 /// of one rebuild.
 #[derive(Clone, Copy)]
@@ -446,6 +473,7 @@ impl SessionList {
                 id: session.id,
                 cwd: session.cwd,
                 workspace: session.workspace,
+                added: session.added,
                 updated: session.updated,
                 mark: session.mark,
                 shelf: Shelf::Active,
@@ -457,9 +485,16 @@ impl SessionList {
     }
 
     /// Records an open session's title and activity; `workspace` is its
-    /// workspace index. A session the saved list doesn't have yet goes on top.
-    /// Returns whether anything changed.
-    pub(crate) fn set_live(&mut self, live: LiveSession, workspace: usize, now: i64) -> bool {
+    /// workspace index, and `added` its added directories', once the
+    /// session says them. A session the saved list doesn't have yet goes
+    /// on top. Returns whether anything changed.
+    pub(crate) fn set_live(
+        &mut self,
+        live: LiveSession,
+        workspace: usize,
+        added: Option<Vec<usize>>,
+        now: i64,
+    ) -> bool {
         match self.live.iter_mut().find(|known| known.id == live.id) {
             Some(known) if *known == live => return false,
             Some(known) => *known = live.clone(),
@@ -469,6 +504,9 @@ impl SessionList {
             let row = &mut self.rows[ix];
             if live.title.is_some() {
                 row.title = live.title;
+            }
+            if let Some(added) = added {
+                row.added = added;
             }
             row.placeholder = live.placeholder;
             row.kind = live.kind.unwrap_or(row.kind);
@@ -491,6 +529,7 @@ impl SessionList {
                     kind: live.kind.unwrap_or(Kind::Session),
                     cwd: live.cwd,
                     workspace,
+                    added: added.unwrap_or_default(),
                     updated: now,
                     activity: live.activity,
                     mark: None,
@@ -503,6 +542,12 @@ impl SessionList {
             );
         }
         true
+    }
+
+    /// What session `id`'s open view last said of it; `None` while it
+    /// isn't open here.
+    pub(crate) fn live(&self, id: &SessionKey) -> Option<&LiveSession> {
+        self.live.iter().find(|live| live.id == *id)
     }
 
     /// What session `id` is doing: as its open view says, else as the
@@ -573,6 +618,7 @@ impl SessionList {
                     placeholder: UNTITLED,
                     cwd: job.cwd,
                     workspace: job.workspace,
+                    added: Vec::new(),
                     updated: now_unix,
                     activity: Activity::Idle,
                     mark: None,
@@ -755,8 +801,10 @@ impl SessionList {
     }
 
     /// Puts every row on its shelf and rebuilds the items and counts.
-    /// `workspace` gives a workspace's name, for the search, and its
-    /// project's folder, for the filter; `watching` holds the sessions
+    /// `workspace` gives a workspace's name, for the search, its project's
+    /// folder, for the filter, and whether that is one of the user's
+    /// projects: a session matches by any project it works in (see
+    /// [`crate::project_stack::session_projects`]); `watching` holds the sessions
     /// whose agent watches a pull request. A busy session is always active.
     /// The active leads come first, then the other active sessions; in
     /// each, pinned sessions first, the latest pinned first, then the rest
@@ -769,29 +817,23 @@ impl SessionList {
         &mut self,
         now: i64,
         watching: &HashSet<SessionKey>,
-        workspace: impl Fn(usize) -> (&'a str, &'a Path),
+        workspace: impl Fn(usize) -> (&'a str, &'a Path, bool),
     ) {
         let families = Families::of(&self.rows);
         self.keep_folds(&families);
         self.shelve(&families, now, watching);
-        let sift = |machine: &MachineId, kind: Kind, title: Option<&str>, at: Option<usize>| {
-            let (name, root) = at.map_or(("", Path::new("")), &workspace);
-            let matches = |text: &str| contains_ignore_case(text, &self.query);
-            Passes {
-                filter: self.filter.shows(machine, root, kind),
-                search: self.query.is_empty() || title.is_some_and(matches) || matches(name),
-            }
-        };
         let passes: Vec<Passes> = self
             .rows
             .iter()
             .map(|row| {
-                sift(
-                    &row.id.machine,
-                    row.kind,
-                    row.title.as_deref(),
-                    Some(row.workspace),
-                )
+                let sifted = Sifted {
+                    machine: &row.id.machine,
+                    kind: row.kind,
+                    title: row.title.as_deref(),
+                    own: Some(row.workspace),
+                    added: &row.added,
+                };
+                self.sift(&sifted, &workspace)
             })
             .collect();
         let mut items = Vec::with_capacity(self.drafts.len() + self.rows.len() + 2);
@@ -800,8 +842,14 @@ impl SessionList {
                 .iter()
                 .enumerate()
                 .filter(|(_, draft)| {
-                    let title = draft.title.as_deref();
-                    sift(&draft.cwd.machine, draft.kind, title, draft.workspace).both()
+                    let sifted = Sifted {
+                        machine: &draft.cwd.machine,
+                        kind: draft.kind,
+                        title: draft.title.as_deref(),
+                        own: draft.workspace,
+                        added: &draft.added,
+                    };
+                    self.sift(&sifted, &workspace).both()
                 })
                 .map(|(ix, _)| Item::Draft(ix)),
         );
@@ -930,6 +978,36 @@ impl SessionList {
         }
     }
 
+    /// Whether `item` passes the filter and the search; `workspace` is
+    /// [`Self::rebuild`]'s. The filter offers only the user's projects, so
+    /// it needs no word on which are; the search reads only the names the
+    /// row shows: a plain session's own workspace's, whether a project or
+    /// not, and of its added directories only the user's projects.
+    fn sift<'a>(
+        &self,
+        item: &Sifted<'_>,
+        workspace: &impl Fn(usize) -> (&'a str, &'a Path, bool),
+    ) -> Passes {
+        let named: Vec<(&str, &Path, bool)> = in_projects(item.kind, item.own, item.added)
+            .map(workspace)
+            .collect();
+        let matches = |text: &str| contains_ignore_case(text, &self.query);
+        let roots = named.iter().map(|&(_, root, _)| root);
+        // A plain session's own workspace comes first.
+        let shown = |ix: usize, project: bool| {
+            item.kind == Kind::Lead || (ix == 0 && item.own.is_some()) || project
+        };
+        Passes {
+            filter: self.filter.shows(item.machine, roots, item.kind),
+            search: self.query.is_empty()
+                || item.title.is_some_and(matches)
+                || named
+                    .iter()
+                    .enumerate()
+                    .any(|(ix, &(name, _, project))| shown(ix, project) && matches(name)),
+        }
+    }
+
     /// The sessions on the active shelf the filter shows, under a closed
     /// fold too: what they watch ranks their family. `root` gives a
     /// workspace's project folder.
@@ -937,10 +1015,8 @@ impl SessionList {
         self.rows
             .iter()
             .filter(|row| {
-                row.shelf == Shelf::Active
-                    && self
-                        .filter
-                        .shows(&row.id.machine, root(row.workspace), row.kind)
+                let roots = in_projects(row.kind, Some(row.workspace), &row.added).map(&root);
+                row.shelf == Shelf::Active && self.filter.shows(&row.id.machine, roots, row.kind)
             })
             .map(|row| row.id.clone())
             .collect()
@@ -1008,6 +1084,21 @@ impl SessionList {
     }
 }
 
+/// The workspaces, by index, whose projects a session of `kind` may work
+/// in, for the search and the filter: a lead's added directories, not its
+/// own folder; a plain session's workspace, then its added directories.
+fn in_projects(
+    kind: Kind,
+    own: Option<usize>,
+    added: &[usize],
+) -> impl Iterator<Item = usize> + '_ {
+    let own = match kind {
+        Kind::Lead => None,
+        Kind::Session => own,
+    };
+    own.into_iter().chain(added.iter().copied())
+}
+
 /// Which sessions the sidebar lists: every machine's but the hidden ones,
 /// and when any projects are chosen, only sessions in those.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1017,16 +1108,31 @@ pub(crate) struct Filter {
 }
 
 impl Filter {
-    /// Whether a session of `kind` on `machine` in the project at `root`
-    /// is listed. A lead is in no project, so only its machine counts.
-    fn shows(&self, machine: &MachineId, root: &Path, kind: Kind) -> bool {
-        !self.hidden.contains(machine)
-            && (kind == Kind::Lead
-                || self.projects.is_empty()
-                || self
-                    .projects
-                    .iter()
-                    .any(|project| project.machine == *machine && project.path == root))
+    /// Whether a session of `kind` on `machine` that works in the
+    /// projects at `roots` is listed: one of them must be chosen, if any
+    /// are. A lead given no project is in none, so only its machine
+    /// counts.
+    fn shows<'a>(
+        &self,
+        machine: &MachineId,
+        roots: impl IntoIterator<Item = &'a Path>,
+        kind: Kind,
+    ) -> bool {
+        if self.hidden.contains(machine) {
+            return false;
+        }
+        if self.projects.is_empty() {
+            return true;
+        }
+        let mut roots = roots.into_iter().peekable();
+        if kind == Kind::Lead && roots.peek().is_none() {
+            return true;
+        }
+        roots.any(|root| {
+            self.projects
+                .iter()
+                .any(|project| project.machine == *machine && project.path == root)
+        })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1145,6 +1251,7 @@ mod tests {
             updated,
             mark: None,
             workspace: 0,
+            added: Vec::new(),
             parent: None,
             kind: Kind::Session,
         }
@@ -1158,6 +1265,7 @@ mod tests {
             placeholder: NEW_SESSION,
             activity,
             kind: Some(Kind::Session),
+            added_dirs: None,
         }
     }
 
@@ -1207,7 +1315,7 @@ mod tests {
     /// [`rebuild`], with the agents of `watching` watching a pull request.
     fn rebuild_watching(list: &mut SessionList, now: i64, watching: &[&str]) {
         let watching = watching.iter().map(|text| id(text)).collect();
-        list.rebuild(now, &watching, |_| ("atlas", Path::new("/w")));
+        list.rebuild(now, &watching, |_| ("atlas", Path::new("/w"), true));
     }
 
     pub(super) fn mark(list: &mut SessionList, text: &str, mark: SessionMark) {
@@ -1304,7 +1412,7 @@ mod tests {
             Some(Activity::Working(now))
         );
 
-        list.set_live(live("fresh", None, Activity::Idle), 0, 3);
+        list.set_live(live("fresh", None, Activity::Idle), 0, None, 3);
         assert_eq!(
             list.row(&id("fresh")).map(|row| row.activity),
             Some(Activity::Idle)
@@ -1322,7 +1430,7 @@ mod tests {
             &here(),
             vec![saved("old", None, 1), saved("new", Some("newer"), 2)],
         );
-        list.set_live(live("fresh", None, Activity::Idle), 0, 3);
+        list.set_live(live("fresh", None, Activity::Idle), 0, None, 3);
         rebuild(&mut list, 3);
         assert_eq!(shown(&list), ["New session", "newer", "Untitled"]);
 
@@ -1337,8 +1445,8 @@ mod tests {
 
         // A live title beats the saved one, and a restart drops the rows
         // the agent never saved.
-        list.set_live(live("old", Some("live title"), Activity::Idle), 0, 4);
-        list.set_live(live("new", None, Activity::Idle), 0, 4);
+        list.set_live(live("old", Some("live title"), Activity::Idle), 0, None, 4);
+        list.set_live(live("new", None, Activity::Idle), 0, None, 4);
         rebuild(&mut list, 4);
         assert_eq!(shown(&list), ["New session", "named", "live title"]);
         list.clear_live(&here());
@@ -1355,11 +1463,11 @@ mod tests {
         assert_eq!(list.count(Shelf::Settled), 1);
 
         let started = Instant::now();
-        list.set_live(live("a", None, Activity::Working(started)), 0, 40);
+        list.set_live(live("a", None, Activity::Working(started)), 0, None, 40);
         rebuild(&mut list, 40);
         assert_eq!(list.count(Shelf::Active), 1, "busy shows as active");
 
-        list.set_live(live("a", None, Activity::Idle), 0, 50);
+        list.set_live(live("a", None, Activity::Idle), 0, None, 50);
         rebuild(&mut list, 50);
         assert_eq!(list.count(Shelf::Active), 1, "the turn is new activity");
     }
@@ -1392,6 +1500,7 @@ mod tests {
             Place::new(here(), "/w"),
             Some("half a thought".into()),
             Some(0),
+            Vec::new(),
         );
         assert!(list.set_drafts(vec![draft.clone()]));
         assert!(!list.set_drafts(vec![draft]), "unchanged");
@@ -1427,7 +1536,7 @@ mod tests {
             ("background", Activity::Background),
             ("pinned", Activity::Working(now)),
         ] {
-            list.set_live(live(name, None, activity), 0, 20);
+            list.set_live(live(name, None, activity), 0, None, 20);
         }
         rebuild(&mut list, 20);
         assert_eq!(
@@ -1436,7 +1545,7 @@ mod tests {
         );
 
         // Its turn over, a session rises to the Done ones, newest first.
-        list.set_live(live("working", None, Activity::Idle), 0, 21);
+        list.set_live(live("working", None, Activity::Idle), 0, None, 21);
         rebuild(&mut list, 21);
         assert_eq!(
             shown(&list),
@@ -1469,17 +1578,17 @@ mod tests {
         let mut list = SessionList::new(Unseen::load(&db));
         list.set_saved(&here(), vec![saved("a", Some("a"), 1)]);
         let now = Instant::now();
-        list.set_live(live("a", None, Activity::Waiting(now)), 0, 2);
-        list.set_live(live("a", None, Activity::Idle), 0, 3);
+        list.set_live(live("a", None, Activity::Waiting(now)), 0, None, 2);
+        list.set_live(live("a", None, Activity::Idle), 0, None, 3);
         assert!(
             !done(&mut list),
             "a request answered no is not a finished turn"
         );
 
-        list.set_live(live("a", None, Activity::Working(now)), 0, 4);
-        list.set_live(live("a", None, Activity::Idle), 0, 5);
+        list.set_live(live("a", None, Activity::Working(now)), 0, None, 4);
+        list.set_live(live("a", None, Activity::Idle), 0, None, 5);
         assert!(done(&mut list));
-        list.set_live(live("a", None, Activity::Working(now)), 0, 6);
+        list.set_live(live("a", None, Activity::Working(now)), 0, None, 6);
         assert!(!done(&mut list), "working again");
 
         // A turn another client ran, seen through the daemon's jobs.
@@ -1493,20 +1602,20 @@ mod tests {
         assert!(list.mark_seen(&id("a")));
         assert!(!done(&mut list));
 
-        list.set_live(live("a", None, Activity::Working(now)), 0, 9);
-        list.set_live(live("a", None, Activity::Background), 0, 10);
+        list.set_live(live("a", None, Activity::Working(now)), 0, None, 9);
+        list.set_live(live("a", None, Activity::Background), 0, None, 10);
         assert_eq!(
             list.row(&id("a")).map(|row| row.activity),
             Some(Activity::Background)
         );
-        list.set_live(live("a", None, Activity::Idle), 0, 11);
+        list.set_live(live("a", None, Activity::Idle), 0, None, 11);
         assert!(done(&mut list), "done once the background work ends");
 
         // A view let go as its turn ends knows more than the last poll,
         // which still had the turn running.
-        list.set_live(live("a", None, Activity::Working(now)), 0, 12);
+        list.set_live(live("a", None, Activity::Working(now)), 0, None, 12);
         list.set_jobs(&here(), vec![job("a", JobActivity::Working, None)], now, 12);
-        list.set_live(live("a", None, Activity::Idle), 0, 13);
+        list.set_live(live("a", None, Activity::Idle), 0, None, 13);
         list.forget_live(&id("a"));
         assert!(done(&mut list), "Done outlives following the session");
         assert_eq!(
@@ -1592,8 +1701,8 @@ mod tests {
 
         // The rail's busy count ignores the search.
         let now = Instant::now();
-        list.set_live(live("a", None, Activity::Working(now)), 0, 5);
-        list.set_live(live("b", None, Activity::Waiting(now)), 0, 5);
+        list.set_live(live("a", None, Activity::Working(now)), 0, None, 5);
+        list.set_live(live("b", None, Activity::Waiting(now)), 0, None, 5);
         list.set_query("matches nothing");
         rebuild(&mut list, 5);
         assert!(list.is_empty());
@@ -1603,6 +1712,69 @@ mod tests {
                 waiting: 1,
                 working: 1
             }
+        );
+    }
+
+    /// Under a project filter, a session shows for any project it works
+    /// in, a lead for those it was given and not its own folder, and the
+    /// search finds it by any of their names, and by no other folder; a
+    /// lead given none shows under any filter.
+    #[test]
+    fn a_session_in_several_projects_shows_for_each() {
+        let in_projects =
+            |text: &str, title: &str, kind: Kind, own: usize, added: Vec<usize>| SavedSession {
+                kind,
+                workspace: own,
+                added,
+                ..saved(text, Some(title), 5)
+            };
+        let mut list = SessionList::default();
+        list.set_saved(
+            &here(),
+            vec![
+                in_projects("plain", "Plain", Kind::Session, 0, vec![1, 3]),
+                in_projects("given", "Given", Kind::Lead, 2, vec![1]),
+                in_projects("bare", "Bare", Kind::Lead, 2, vec![]),
+                in_projects("away", "Away", Kind::Lead, 2, vec![0]),
+            ],
+        );
+        let roots = |ix: usize| match ix {
+            0 => ("atlas", Path::new("/w"), true),
+            1 => ("srv", Path::new("/srv"), true),
+            3 => ("scratch", Path::new("/tmp/scratch"), false),
+            _ => ("fix-it", Path::new("/leads/fix-it"), true),
+        };
+        let mut filter = Filter::default();
+        filter.toggle_project(&Place::new(here(), "/srv"));
+        list.set_filter(filter);
+        list.rebuild(5, &HashSet::new(), roots);
+        let shows = |list: &SessionList| {
+            let mut titles: Vec<String> = shown(list)
+                .into_iter()
+                .filter(|item| !item.starts_with('['))
+                .collect();
+            titles.sort();
+            titles
+        };
+        assert_eq!(shows(&list), ["Bare", "Given", "Plain"]);
+
+        list.set_filter(Filter::default());
+        list.set_query("srv");
+        list.rebuild(5, &HashSet::new(), roots);
+        assert_eq!(shows(&list), ["Given", "Plain"]);
+        list.set_query("scratch");
+        list.rebuild(5, &HashSet::new(), roots);
+        assert_eq!(
+            shows(&list),
+            Vec::<String>::new(),
+            "it names no folder but a project"
+        );
+        list.set_query("fix-it");
+        list.rebuild(5, &HashSet::new(), roots);
+        assert_eq!(
+            shows(&list),
+            Vec::<String>::new(),
+            "a lead's folder is no project"
         );
     }
 
@@ -1619,6 +1791,7 @@ mod tests {
             updated,
             mark: None,
             workspace: 1,
+            added: Vec::new(),
             parent: None,
             kind: Kind::Session,
         };
@@ -1629,8 +1802,8 @@ mod tests {
         );
         list.set_saved(&there, vec![theirs("a", 2)]);
         let roots = |ix: usize| match ix {
-            0 => ("atlas", Path::new("/w")),
-            _ => ("srv", Path::new("/srv")),
+            0 => ("atlas", Path::new("/w"), true),
+            _ => ("srv", Path::new("/srv"), true),
         };
         list.rebuild(4, &HashSet::new(), roots);
         assert_eq!(shown(&list), ["here a", "there a", "here b"]);

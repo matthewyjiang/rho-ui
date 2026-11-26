@@ -41,7 +41,7 @@ A lead is a session that runs as rho's `lead` agent: it takes a goal to merged p
 
 - **A folder of its own.** A lead works in `~/.rho/leads/<name>/` on its machine (under `$RHO_HOME` if you set one), named from its first message, with `-2`, `-3`… when that name is taken.
 - **The brief is yours too.** The lead keeps what it knows between turns in `brief.md` in that folder: the goal, where it may work, what it may decide without you, its pull requests and its decisions. The lead updates it whenever something in it changes, and reads it when it starts and again after rho compacts its context, not every turn. So to change the brief, tell the lead: an edit you make by hand reaches it only at its next reread.
-- **In no project.** A lead's folder belongs to no project, so the project filter doesn't hide it; the machine filter and search still do.
+- **Named by its projects.** A lead's folder is in no project: the title bar and its sidebar row name the projects you picked for it instead, and the project filter shows it when any of them is chosen. A lead with no projects names none, and the project filter never hides it.
 - **Its projects are where it may work.** The projects you pick for a lead are the directories its tools reach, and rho lists them to it. Pick them in its draft: the lead gets them as its first message starts it, so its first turn knows them. After that, add more from the lead's title bar, as any session's directories.
 - **Its sessions fold under it**, as any session's do (see above). The lead reads their results itself, so a session of its that finishes stays off the lead's folded line and doesn't move the lead up the list; one that waits on you still does both.
 - **Work and Brief in its panel.** Brief shows `brief.md` as it was at the end of the lead's last turn, or when you last came back to the lead, and can't be edited there. Work lists the sessions the lead started itself, not the ones those started.
@@ -55,6 +55,10 @@ Add the folders you work in elsewhere yourself. Type a path in the project searc
 A project is a repository rather than one checkout of it. Adding a linked worktree or a subfolder adds the repository it belongs to. With several machines, checkouts of the same repository count as one project, matched by repository name, so a project missing from one machine offers to clone it there.
 
 For a repository with an origin remote on a web host, the button beside the project's name in the title bar opens the repository's page in your browser. rho-ui leaves out any credentials in the remote's URL, and drops an ssh port.
+
+### Sessions in several projects
+
+A session names every project it works in, in its title bar and on its sidebar row, with their badges stacked: a lead the projects you picked for it, and a plain session its own project, then those of its added directories that are among your projects (other directories don't count). The project filter shows such a session when any of its projects is chosen, and the search finds it by any of their names. A subagent's session shows the projects of the session it runs under.
 
 ## Worktrees
 
