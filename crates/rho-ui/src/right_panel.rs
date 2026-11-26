@@ -60,7 +60,7 @@ use self::brief::BriefSurface;
 use self::diff::DiffSurface;
 use self::files::FilesSurface;
 use self::lead_work::WorkSurface;
-use self::pull_request::{PullRequestSurface, Visibility};
+use self::pull_request::PullRequestSurface;
 use self::tabs::{Tab, TabKey, TabSet};
 pub(crate) use self::terminal::{Direction, PaneCommand, TerminalShell};
 use self::terminal::{Emptied, TerminalTab};
@@ -195,6 +195,23 @@ pub(crate) enum TerminalShortcut {
     PreviousTab,
     /// What a pane of the terminal does ([`PaneCommand`]).
     Pane(PaneCommand),
+}
+
+/// Whether a surface is on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    Shown,
+    Hidden,
+}
+
+impl From<bool> for Visibility {
+    fn from(on_screen: bool) -> Self {
+        if on_screen {
+            Self::Shown
+        } else {
+            Self::Hidden
+        }
+    }
 }
 
 /// Whether the panel shows, and how wide, remembered across runs under
@@ -442,24 +459,30 @@ impl RightPanel {
         })
     }
 
-    /// Tells each Pull request surface whether it is on screen: its tab
-    /// shown, for the session on screen, in a panel that shows. Its PR is
-    /// asked for only then.
+    /// Tells each Pull request surface, and each session of a Background
+    /// surface, whether it is on screen: its tab shown, for the session on
+    /// screen, in a panel that shows. A PR, or followed process output, is
+    /// read only then.
     fn sync_shown(&self, cx: &mut Context<'_, Self>) {
-        let shown = PanelLayout::get(cx);
+        let panel = PanelLayout::get(cx);
         for (key, set) in &self.sets {
+            let shown = |active: TabKey| {
+                Visibility::from(
+                    panel && self.on_screen() == Some(key) && set.active == Some(active),
+                )
+            };
+            if let Some(view) = set.view.upgrade() {
+                let background = set
+                    .active
+                    .filter(|active| active.surface == Surface::Background)
+                    .map_or(Visibility::Hidden, shown);
+                view.update(cx, |view, cx| view.set_output_shown(background, cx));
+            }
             for tab in &set.tabs {
-                let Tab::PullRequest { view, .. } = tab else {
-                    continue;
-                };
-                let on_screen =
-                    shown && self.on_screen() == Some(key) && set.active == Some(tab.key());
-                let visibility = if on_screen {
-                    Visibility::Shown
-                } else {
-                    Visibility::Hidden
-                };
-                view.update(cx, |view, cx| view.set_visibility(visibility, cx));
+                if let Tab::PullRequest { view, .. } = tab {
+                    let visibility = shown(tab.key());
+                    view.update(cx, |view, cx| view.set_visibility(visibility, cx));
+                }
             }
         }
     }
@@ -655,6 +678,15 @@ impl RightPanel {
         self.show(key, cx);
     }
 
+    /// Shows the Background surface of the session on screen, opening its
+    /// tab if it wasn't, as a background process's row asks to show the
+    /// process's output there.
+    pub(crate) fn show_background(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        if let Some(key) = self.tab_for(Surface::Background, window, cx) {
+            self.show(key, cx);
+        }
+    }
+
     /// A new tab `key` of `session`, which works in `place`.
     fn new_tab(
         &self,
@@ -779,6 +811,8 @@ impl RightPanel {
             set.remove(|key| keys.contains(&key));
         }
         self.forget_closed_hover();
+        // Another tab may show in a closed one's place.
+        self.sync_shown(cx);
         cx.notify();
     }
 
@@ -792,13 +826,20 @@ impl RightPanel {
     }
 
     /// Closes `session`'s tab `key`. A side chat's view is discarded, which
-    /// deletes the fork.
+    /// deletes the fork; the Background surface lets go of the process
+    /// output it showed, so it opens on its lists again.
     fn close(&mut self, session: &SessionKey, key: TabKey, cx: &mut Context<'_, Self>) {
         let Some(set) = self.sets.get_mut(session) else {
             return;
         };
-        if let Some(Tab::SideChat { view, .. }) = set.tab(key) {
-            view.clone().update(cx, SessionView::discard);
+        match set.tab(key) {
+            Some(Tab::SideChat { view, .. }) => view.clone().update(cx, SessionView::discard),
+            Some(Tab::Background) => {
+                if let Some(view) = set.view.upgrade() {
+                    view.update(cx, SessionView::unfollow_output);
+                }
+            }
+            _ => {}
         }
         set.remove(|removed| removed == key);
         self.forget_closed_hover();

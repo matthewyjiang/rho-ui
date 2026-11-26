@@ -2158,6 +2158,11 @@ impl RhoApp {
                         panel.show_pull_request(id, window, cx);
                     });
                 }
+                SessionEvent::ShowBackground => {
+                    PanelLayout::show(cx);
+                    this.panel
+                        .update(cx, |panel, cx| panel.show_background(window, cx));
+                }
                 SessionEvent::SideChat(prompt) => {
                     this.start_side_chat(view, prompt.clone(), window, cx);
                 }

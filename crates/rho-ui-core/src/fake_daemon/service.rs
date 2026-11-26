@@ -26,14 +26,14 @@ use rho_protocol::{
     SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
     SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
     SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionMarkParams,
-    SessionMarkResponse, SessionNewParams, SessionNewResponse, SessionPromptParams,
-    SessionPromptResponse, SessionPullRequestLinkParams, SessionPullRequestLinkResponse,
-    SessionPullRequestListParams, SessionPullRequestListResponse, SessionPullRequestShowParams,
-    SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
-    SessionPullRequestUnlinkResponse, SessionSteerParams, SessionSteerResponse,
-    SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
-    SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
-    WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
+    SessionMarkResponse, SessionNewParams, SessionNewResponse, SessionProcessesParams,
+    SessionProcessesResponse, SessionPromptParams, SessionPromptResponse,
+    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
+    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
+    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSteerParams,
+    SessionSteerResponse, SessionSurfaceActionParams, SessionSurfaceActionResponse,
+    SessionWorktree, SettingsService, SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome,
+    UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -961,6 +961,16 @@ impl Service for Fake {
             session.wake(turn, &told);
         }
         Ok(SessionBackgroundStopResponse {})
+    }
+
+    async fn session_processes(
+        &self,
+        params: SessionProcessesParams,
+    ) -> Result<SessionProcessesResponse, RpcError> {
+        let mut state = self.lock();
+        state.process_reads += 1;
+        let session = state.session(&params.session)?;
+        Ok(session.processes.read(&session.background, &params))
     }
 
     async fn list_sessions(

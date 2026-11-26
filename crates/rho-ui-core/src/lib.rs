@@ -15,6 +15,7 @@ mod jobs;
 mod link;
 mod options;
 pub mod platform;
+mod process_log;
 mod prompt;
 #[cfg(not(target_family = "wasm"))]
 pub mod release;
@@ -49,6 +50,7 @@ pub use options::{
     PermissionMode, ReasoningLevel, SessionOptions, StartedMode, StartedSessionChange,
     StartedSessionDefaults,
 };
+pub use process_log::{LogChange, OutputLine, ProcessLog};
 pub use prompt::{
     check_attachment_total, mebibytes, AttachedFile, Attachment, AttachmentsTooLarge, Image,
     ImageFormat, Prompt, MAX_ATTACHED_TEXT_CHARS, MAX_PROMPT_ATTACHMENT_BYTES,
@@ -75,6 +77,12 @@ pub use rho_protocol::{
     PullRequestState, PullRequestSummary, PullRequestTarget, PullRequestThread,
     PullRequestThreadState, PullRequestTrouble, PullRequestVerdict, SessionPullRequestLinkResponse,
     SessionPullRequestShowResponse, SessionPullRequests,
+};
+/// A session's background processes and their output, as
+/// [`Daemon::processes`] reads them, as rho-protocol has them.
+pub use rho_protocol::{
+    ProcessChunk, ProcessOutput, ProcessOutputParams, ProcessState, ProcessStream, SessionProcess,
+    SessionProcessesResponse,
 };
 /// What [`Daemon::check_worktrees`] and [`Daemon::prune_worktrees`] report
 /// of each session worktree, as rho-protocol has it.
