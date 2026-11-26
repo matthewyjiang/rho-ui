@@ -3,9 +3,9 @@
 //! (`rho/session/report`).
 //!
 //! [`super::RightPanel`] asks it to read the reports when its tab opens,
-//! when the session's turn ends or it comes back on screen, once the
-//! session is loaded again after a read found it unloaded, and when the
-//! composer's context ring is clicked. The daemon reads reports between
+//! when the session's turn ends or it comes back on screen, when the
+//! session view's live state changes while a read may predate the
+//! session's load, and when the composer's context ring is clicked. The daemon reads reports between
 //! turns only, so a read during a turn keeps the numbers shown.
 //!
 //! It doesn't read the hooks report: rho reloads the session's hooks to
@@ -173,6 +173,8 @@ pub(super) struct ContextSurface {
     open: Vec<Source>,
     /// The read under way; a newer one replaces it.
     load: Task<()>,
+    /// Whether that read hasn't landed yet.
+    reading: bool,
     /// Reads landed, for UI tests.
     #[cfg(test)]
     landed: usize,
@@ -185,6 +187,7 @@ impl ContextSurface {
             failed: None,
             open: Vec::new(),
             load: Task::ready(()),
+            reading: false,
             #[cfg(test)]
             landed: 0,
         }
@@ -199,6 +202,7 @@ impl ContextSurface {
         cx: &mut Context<'_, Self>,
     ) {
         self.failed = None;
+        self.reading = true;
         cx.notify();
         self.load = cx.spawn(async move |this, cx| {
             let read = Reports::read(daemon, session).await;
@@ -206,13 +210,16 @@ impl ContextSurface {
         });
     }
 
-    /// Whether the latest read found the session unloaded, so a read once
-    /// it is loaded again should replace it.
-    pub(super) fn waits_for_load(&self) -> bool {
-        self.failed == Some(ReportError::NotLoaded)
+    /// Whether the latest read may have gone out before the daemon loaded
+    /// the session: it found it unloaded, or it hasn't landed, so its
+    /// answer may yet say so. A read once the session is loaded should
+    /// replace it.
+    pub(super) fn may_predate_load(&self) -> bool {
+        self.reading || self.failed == Some(ReportError::NotLoaded)
     }
 
     fn landed(&mut self, read: Result<Reports, ReportError>, cx: &mut Context<'_, Self>) {
+        self.reading = false;
         match read {
             Ok(reports) => self.reports = Some(reports),
             Err(error) => self.failed = Some(error),
