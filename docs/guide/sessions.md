@@ -32,7 +32,7 @@ A lead is a session that runs as rho's `lead` agent: it takes a goal to merged p
 - **The brief is yours too.** The lead keeps what it knows between turns in `brief.md` in that folder: the goal, where it may work, what it may decide without you, its pull requests and its decisions. The lead updates it whenever something in it changes, and reads it when it starts and again after rho compacts its context, not every turn. So to change the brief, tell the lead: an edit you make by hand reaches it only at its next reread.
 - **In no project.** A lead's folder belongs to no project, so the project filter doesn't hide it; the machine filter and search still do.
 - **Its projects are where it may work.** The projects you pick for a lead are the directories its tools reach, and rho lists them to it. Pick them in its draft: the lead gets them as its first message starts it, so its first turn knows them. After that, add more from the lead's title bar, as any session's directories.
-- **Its sessions fold under it**, as any session's do (see above).
+- **Its sessions fold under it**, as any session's do (see above). The lead reads their results itself, so a session of its that finishes stays off the lead's folded line and doesn't move the lead up the list; one that waits on you still does both.
 - **Work and Brief in its panel.** Brief shows `brief.md` as it was at the end of the lead's last turn, or when you last came back to the lead, and can't be edited there. Work lists the sessions the lead started itself, not the ones those started.
 
 ## Projects

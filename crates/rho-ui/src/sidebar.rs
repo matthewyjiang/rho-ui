@@ -1376,8 +1376,8 @@ impl SidebarView {
 
     /// "⌄ 3 sessions · 1 needs you": the line under a session that started
     /// others, indented as they are, with the most pressing thing of its
-    /// family: how many of them wait for the user, else are Done, else
-    /// work. A click opens or closes the fold, unless the search or the
+    /// family: how many of them wait for the user, else are Done (never
+    /// under a lead, which reads them itself), else work. A click opens or closes the fold, unless the search or the
     /// filter holds it open, which leaves out the chevron. Kit's
     /// `Collapsible` owns its content, which here is separate rows of the
     /// virtual list, so the line is laid out by hand, as a shelf header is.
