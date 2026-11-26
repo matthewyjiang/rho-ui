@@ -94,6 +94,7 @@ use crate::{
     input_card::{InputCard, InputCardEvent, Queue},
     leads::Kind,
     machines::{Place, SessionKey},
+    mcp_status::McpStatus,
     pictures::{PictureRead, Pictures},
     plan::PlanList,
     pr_mark::pr_pill,
@@ -306,6 +307,9 @@ pub(crate) struct SessionView {
     _subscriptions: Vec<Subscription>,
     /// What the title bar reads besides the session.
     title_bar: TitleBarSources,
+    /// The session's MCP servers, once it is loaded, for the mark in the
+    /// composer's footer; a subagent's session, with no composer, has none.
+    mcp: Option<Entity<McpStatus>>,
     /// Redraws "Working for" while a turn runs.
     _tick: Task<()>,
 }
@@ -439,6 +443,7 @@ impl SessionView {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             title_bar: TitleBarSources::default(),
+            mcp: None,
             _tick: Self::tick(cx),
         };
         view.transcript.sync(view.session.entries(), cx);
@@ -894,6 +899,9 @@ impl SessionView {
             .update(cx, |dirs, _| dirs.set_daemon(daemon.clone()));
         self.processes
             .update(cx, |processes, _| processes.set_daemon(daemon.clone()));
+        // The daemon loads the session again, starting its servers anew:
+        // they are read once it is caught up.
+        self.mcp = None;
         self.daemon = daemon;
         Some(Follow {
             cursor: self.session.reattach(),
@@ -963,6 +971,17 @@ impl SessionView {
     /// first entry that changed, so where the transcript was scrolled to,
     /// and what was unfolded, stay above it.
     fn caught_up(&mut self, cx: &mut Context<'_, Self>) {
+        // The daemon has the session loaded now, so it can say how its MCP
+        // servers are doing.
+        if self.mcp.is_none() && !self.is_subagent() {
+            let (daemon, id) = (self.daemon.clone(), self.session.id().clone());
+            let mcp = cx.new(|cx| {
+                let mut mcp = McpStatus::new(daemon, id);
+                mcp.reload(cx);
+                mcp
+            });
+            self.mcp = Some(mcp);
+        }
         match std::mem::replace(&mut self.loading, Loading::Ready) {
             Loading::Ready | Loading::Attaching => {}
             Loading::Replaying(shown) => {
@@ -1064,6 +1083,10 @@ impl SessionView {
             (false, Some(_), _) => {
                 self.busy_since = None;
                 self.transcript.end_turn(self.session.entries(), cx);
+                // A turn can start a server, or see one fail.
+                if let Some(mcp) = &self.mcp {
+                    mcp.update(cx, McpStatus::reload);
+                }
                 // A sign-out elsewhere fails the next turn: read whether
                 // the model's profile is still signed in.
                 if matches!(self.session.state(), RunState::Failed(_)) {
@@ -1960,6 +1983,7 @@ impl SessionView {
                 )
                 .leading(SessionSettings::render_mode(&self.settings, cx))
                 .trailing(SessionSettings::render_panel_button(&self.settings, cx))
+                .status(self.mcp.clone())
                 .usage(self.usage_ring(cx)),
             )
             .into_any_element()

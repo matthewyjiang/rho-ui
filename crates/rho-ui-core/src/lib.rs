@@ -91,6 +91,9 @@ pub use rho_protocol::{
     ProcessChunk, ProcessOutput, ProcessOutputParams, ProcessState, ProcessStream, SessionProcess,
     SessionProcessesResponse,
 };
+/// A session's MCP servers, as [`Daemon::mcp_servers`] reports them, as
+/// rho-protocol has them.
+pub use rho_protocol::{SessionMcpInventory, SessionMcpServer, SessionMcpStatus};
 /// What [`Daemon::check_worktrees`] and [`Daemon::prune_worktrees`] report
 /// of each session worktree, as rho-protocol has it.
 pub use rho_protocol::{SessionWorktree, WorktreeVerdict};

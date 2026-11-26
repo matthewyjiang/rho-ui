@@ -64,6 +64,7 @@ use crate::{
 };
 
 mod live;
+mod mcp;
 mod surfaces;
 
 /// Points the Vulkan loader at lavapipe before `main`, while the process has

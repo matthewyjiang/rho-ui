@@ -542,6 +542,8 @@ pub(crate) struct Composer {
     leading: Option<AnyElement>,
     /// Session settings just before Send.
     trailing: Option<AnyElement>,
+    /// Marks of what needs the user's eye, before the context ring.
+    status: Option<AnyElement>,
     /// Context use and cost, before the trailing settings.
     usage: Option<UsageRing>,
     on_send: Handler,
@@ -560,6 +562,7 @@ impl Composer {
             mode,
             leading: None,
             trailing: None,
+            status: None,
             usage: None,
             on_send: Rc::new(on_send),
             on_stop: Rc::new(on_stop),
@@ -573,6 +576,11 @@ impl Composer {
 
     pub(crate) fn trailing(mut self, controls: Option<impl IntoElement>) -> Self {
         self.trailing = controls.map(IntoElement::into_any_element);
+        self
+    }
+
+    pub(crate) fn status(mut self, status: Option<impl IntoElement>) -> Self {
+        self.status = status.map(IntoElement::into_any_element);
         self
     }
 
@@ -898,6 +906,7 @@ impl RenderOnce for Composer {
                             .overflow_hidden()
                             .children(self.leading),
                     )
+                    .children(self.status)
                     .children(self.usage)
                     .children(self.trailing)
                     .child(action),

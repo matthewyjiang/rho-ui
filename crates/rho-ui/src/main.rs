@@ -37,6 +37,7 @@ mod leads;
 mod lightbox;
 mod local;
 mod machines;
+mod mcp_status;
 mod parts;
 mod pele;
 mod pictures;
@@ -152,6 +153,7 @@ gpui_kit::assets::icon_assets!(
         Clock,
         SquareTerminal,
         ListChecks,
+        Plug,
         Workflow,
         Bot,
         Cog,

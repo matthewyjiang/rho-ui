@@ -141,6 +141,11 @@
 //!   at once and which waits for [`FakeDaemon::approve_login`]. The key
 //!   [`REFUSED_KEY`] is refused, and [`UNCHECKED_KEY`] saved unchecked. Credentials go to a file store the
 //!   config chose.
+//! - `rho/session/mcp` reports three MCP servers for every session: two
+//!   connected and one disabled ([`MCP_DOCS`], [`MCP_GITHUB`],
+//!   [`MCP_NOTES`]). With [`Script::mcp`] [`McpStartup::Connecting`], the
+//!   first is connecting and the second has timed out until
+//!   [`FakeDaemon::finish_mcp_startup`].
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
 //!   set, if any, and what [`FakeDaemon::set_in_progress`] set.
 //!   `rho/daemon/restart` restarts in place, as rho does: it counts
@@ -214,6 +219,7 @@ use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId
 mod auth;
 mod config;
 mod listener;
+mod mcp;
 mod processes;
 mod pull_requests;
 mod reports;
@@ -225,6 +231,8 @@ use auth::FakeAuth;
 pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
 use config::FakeConfig;
 use listener::Listener;
+use mcp::FakeMcp;
+pub use mcp::{McpStartup, MCP_DOCS, MCP_GITHUB, MCP_NOTES};
 use processes::FakeProcesses;
 use pull_requests::FakePullRequests;
 pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
@@ -379,6 +387,8 @@ pub struct Script {
     pub pull_requests: PullRequestMethods,
     /// Whether the daemon serves session reports, or is from before them.
     pub reports: ReportMethod,
+    /// Whether the sessions' MCP servers are still starting.
+    pub mcp: McpStartup,
 }
 
 /// Whether the fake daemon serves `rho/session/list_detailed`, and with it
@@ -2186,6 +2196,7 @@ struct State {
     auth: FakeAuth,
     pull_requests: FakePullRequests,
     reports: FakeReports,
+    mcp: FakeMcp,
     /// Restart as the next prompt arrives; see
     /// [`FakeDaemon::restart_at_next_prompt`].
     restart_at_prompt: bool,
@@ -2313,6 +2324,7 @@ impl State {
             auth: FakeAuth::new(&script),
             pull_requests: FakePullRequests::new(script.pull_requests),
             reports: FakeReports::new(script.reports),
+            mcp: FakeMcp::new(&script),
             restart_at_prompt: false,
         };
         if script.tui_job == TuiJob::Running {

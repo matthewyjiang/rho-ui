@@ -27,14 +27,15 @@ use rho_protocol::{
     SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
     SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
     SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionMarkParams,
-    SessionMarkResponse, SessionNewParams, SessionNewResponse, SessionProcessesParams,
-    SessionProcessesResponse, SessionPromptParams, SessionPromptResponse,
-    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
-    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
-    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSteerParams,
-    SessionSteerResponse, SessionSurfaceActionParams, SessionSurfaceActionResponse,
-    SessionWorktree, SettingsService, SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome,
-    UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
+    SessionMarkResponse, SessionMcpInventory, SessionMcpParams, SessionNewParams,
+    SessionNewResponse, SessionProcessesParams, SessionProcessesResponse, SessionPromptParams,
+    SessionPromptResponse, SessionPullRequestLinkParams, SessionPullRequestLinkResponse,
+    SessionPullRequestListParams, SessionPullRequestListResponse, SessionPullRequestShowParams,
+    SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
+    SessionPullRequestUnlinkResponse, SessionSteerParams, SessionSteerResponse,
+    SessionSurfaceActionParams, SessionSurfaceActionResponse, SessionWorktree, SettingsService,
+    SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams,
+    WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -1191,6 +1192,10 @@ impl Service for Fake {
         params: SessionReportParams,
     ) -> Result<SessionReportResponse, RpcError> {
         self.lock().report(&params)
+    }
+
+    async fn session_mcp(&self, params: SessionMcpParams) -> Result<SessionMcpInventory, RpcError> {
+        self.lock().mcp_inventory(&params)
     }
 
     async fn prune_worktrees(
