@@ -45,18 +45,12 @@ use self::{
     header::{identity, toolbar, web_url},
     link::{link_button, LinkForm, Unlinking},
 };
+use super::Visibility;
 use crate::{
     machines::SessionKey,
     pull_requests::{every_post, PullRequests, Seen, Shown, Which},
     time,
 };
-
-/// Whether a surface is on screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Visibility {
-    Shown,
-    Hidden,
-}
 
 /// The Pull request surface of [`super::RightPanel`]: one PR of the
 /// session its tab belongs to.

@@ -11,20 +11,22 @@
 //! - every [`OUTPUT_POLL`] while the followed process's output is on screen
 //!   and the process runs, and until its last output is read.
 //!
-//! A read that fails is not tried again until the list changes, another
-//! process is followed, or the session's machine connects again: a daemon
-//! from before process reads refuses every one.
+//! A read that fails is not tried again until the list changes, a process
+//! is followed, or the session's next background list after its machine
+//! connected again, so a daemon that keeps failing isn't asked every
+//! second.
 
 use std::{collections::HashMap, time::Duration};
 
-use crate::right_panel::Visibility;
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::{AppContext as _, Context, Entity, SharedString, Task};
 use rho_ui_core::{
-    BackgroundKind, BackgroundStatus, BackgroundWork, Daemon, DaemonError, ProcessLog,
-    ProcessOutput, ProcessOutputParams, ProcessState, SessionId, SessionProcess,
-    SessionProcessesResponse,
+    BackgroundKind, BackgroundStatus, BackgroundWork, Daemon, DaemonError, LogChange, ProcessLog,
+    ProcessOutput, ProcessOutputParams, SessionId, SessionProcess, SessionProcessesResponse,
 };
+
+use super::is_live;
+use crate::right_panel::Visibility;
 
 /// How often the rows are read while a process runs: the daemon counts a
 /// process's time in whole seconds, as the rows show it, so reading more
@@ -41,8 +43,25 @@ const OUTPUT_POLL: Duration = Duration::from_millis(500);
 pub(crate) struct Followed {
     pub(crate) log: ProcessLog,
     pub(crate) scroller: Entity<MessageScrollerState>,
-    /// The session no longer knows the process: no more output comes.
-    pub(crate) gone: bool,
+    /// Why no more output comes, once none will.
+    done: Option<Done>,
+}
+
+/// Why a followed process's output is all read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Done {
+    /// An output read found it ended: that read held its last output.
+    Ended,
+    /// The session no longer knows the process.
+    Gone,
+}
+
+impl Followed {
+    /// Why no more output comes, once none will; `None` while the process
+    /// may still write.
+    pub(crate) fn done(&self) -> Option<Done> {
+        self.done
+    }
 }
 
 /// One session's processes, as its daemon last read them. Its
@@ -51,21 +70,25 @@ pub(crate) struct Followed {
 pub(crate) struct Processes {
     daemon: Daemon,
     session: SessionId,
-    /// Each process the daemon listed, by ID, as it last said: kept after
-    /// it leaves the list, so an ended row still says how long it ran.
+    /// Each process the daemon listed, by ID, as it last said. Kept after
+    /// it leaves the list, so an ended row still says how long it ran; it
+    /// holds no more than the processes the session ran.
     known: HashMap<String, SessionProcess>,
     /// The session's processes and their status, as its background list
     /// last had them.
     listed: Vec<(String, BackgroundStatus)>,
-    /// The list changed since the last answer: one more read is owed.
-    owed: bool,
+    /// How many times `listed` changed, and how many of those changes the
+    /// newest answered read was sent after: a read is owed while they
+    /// differ. An answer to a read sent before a change doesn't pay it.
+    changes: u64,
+    seen: u64,
     followed: Option<Followed>,
     /// Whether the followed output is on screen, as the right panel says.
     shown: Visibility,
     /// Why the last read failed; reads wait until something changes.
     error: Option<SharedString>,
-    /// The loop reading on while anything is wanted, which ends itself
-    /// when nothing is.
+    /// The loop reading on while anything is wanted. It ends itself when
+    /// nothing is, setting `polling` back; the task stays until replaced.
     poll: Option<Task<()>>,
     polling: bool,
 }
@@ -77,7 +100,8 @@ impl Processes {
             session,
             known: HashMap::new(),
             listed: Vec::new(),
-            owed: false,
+            changes: 0,
+            seen: 0,
             followed: None,
             shown: Visibility::Hidden,
             error: None,
@@ -110,7 +134,7 @@ impl Processes {
             .collect();
         if listed != self.listed {
             self.listed = listed;
-            self.owed = true;
+            self.changes += 1;
             self.error = None;
         }
         self.kick(cx);
@@ -132,18 +156,19 @@ impl Processes {
     }
 
     /// Follows process `id`'s output, from the start of what the session
-    /// retains, in place of any other.
+    /// retains, in place of any other. Following the one followed again
+    /// reads it afresh if its last read failed or the session forgot it.
     pub(crate) fn follow(&mut self, id: &str, cx: &mut Context<'_, Self>) {
-        if self
+        let reading = self
             .followed()
-            .is_some_and(|followed| followed.log.id() == id)
-        {
+            .is_some_and(|followed| followed.log.id() == id && followed.done != Some(Done::Gone));
+        if reading && self.error.is_none() {
             return;
         }
         self.followed = Some(Followed {
             log: ProcessLog::new(id.to_owned()),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
-            gone: false,
+            done: None,
         });
         self.error = None;
         self.restart(cx);
@@ -171,17 +196,10 @@ impl Processes {
     /// The output to read with the next read: the followed process's,
     /// while it is on screen and has more to come.
     fn output_wanted(&self) -> Option<ProcessOutputParams> {
-        let followed = self
-            .followed
+        self.followed
             .as_ref()
-            .filter(|followed| self.shown == Visibility::Shown && !followed.gone)?;
-        let ended = followed
-            .log
-            .process()
-            .is_some_and(|process| !is_live(process.state));
-        // Once it ended, one read takes what it wrote last; after that
-        // nothing more comes.
-        (!ended || self.owed).then(|| followed.log.request())
+            .filter(|followed| self.shown == Visibility::Shown && followed.done.is_none())
+            .map(|followed| followed.log.request())
     }
 
     /// Whether a read would tell anything new.
@@ -190,7 +208,8 @@ impl Processes {
             .listed
             .iter()
             .any(|(_, status)| *status == BackgroundStatus::Running);
-        self.error.is_none() && (self.owed || running || self.output_wanted().is_some())
+        let owed = self.seen < self.changes;
+        self.error.is_none() && (owed || running || self.output_wanted().is_some())
     }
 
     /// Starts reading if anything is wanted and no read loop runs.
@@ -201,11 +220,14 @@ impl Processes {
         self.polling = true;
         self.poll = Some(cx.spawn(async move |this, cx| loop {
             let read = this.update(cx, |this, _| this.next_read());
-            let Ok(Some((daemon, session, output))) = read else {
+            let Ok(Some(read)) = read else {
                 break;
             };
-            let answer = daemon.processes(&session, output.clone()).await;
-            let cadence = this.update(cx, |this, cx| this.answered(output, answer, cx));
+            let answer = read
+                .daemon
+                .processes(&read.session, read.output.clone())
+                .await;
+            let cadence = this.update(cx, |this, cx| this.answered(read, answer, cx));
             let Ok(cadence) = cadence else {
                 break;
             };
@@ -214,67 +236,63 @@ impl Processes {
     }
 
     /// Reads at once, in place of a read loop that may be waiting. A read
-    /// the loop had under way may have been the one owed, which is owed
-    /// again.
+    /// it had under way is dropped unanswered, so what it owed stays owed.
     fn restart(&mut self, cx: &mut Context<'_, Self>) {
-        self.owed |= self.polling;
         self.poll = None;
         self.polling = false;
         self.kick(cx);
     }
 
     /// What the next read asks, or `None`, ending the loop, when nothing is
-    /// wanted. The read is the one owed, if one is: an answer to a read
-    /// sent before the list changed would say what was before.
-    fn next_read(&mut self) -> Option<(Daemon, SessionId, Option<ProcessOutputParams>)> {
+    /// wanted.
+    fn next_read(&mut self) -> Option<Read> {
         if !self.wanted() {
             self.polling = false;
             return None;
         }
-        let output = self.output_wanted();
-        self.owed = false;
-        Some((self.daemon.clone(), self.session.clone(), output))
+        Some(Read {
+            daemon: self.daemon.clone(),
+            session: self.session.clone(),
+            output: self.output_wanted(),
+            changes: self.changes,
+        })
     }
 
-    /// Takes the answer to a read that asked for `asked`, and returns how
-    /// long to wait before the next.
+    /// Takes the answer to `read`, and returns how long to wait before the
+    /// next. Redraws only if it changed something.
     fn answered(
         &mut self,
-        asked: Option<ProcessOutputParams>,
+        read: Read,
         answer: Result<SessionProcessesResponse, DaemonError>,
         cx: &mut Context<'_, Self>,
     ) -> Duration {
+        self.seen = self.seen.max(read.changes);
         let mut changed = false;
         match answer {
             Ok(answer) => {
-                for process in answer.processes {
-                    changed |= self.known.get(&process.id) != Some(&process);
-                    self.known.insert(process.id.clone(), process);
-                }
+                changed |= self.learn(answer.processes);
                 // An answer for a process followed before this one changes
                 // nothing.
                 let followed = self.followed.as_mut().filter(|followed| {
-                    asked.is_some_and(|asked| asked.process == followed.log.id())
+                    read.output
+                        .is_some_and(|asked| asked.process == followed.log.id())
                 });
                 if let Some(followed) = followed {
-                    changed = true;
-                    match answer.output {
-                        Some(output) => {
-                            self.known
-                                .insert(output.process.id.clone(), output.process.clone());
-                            show(followed, output, cx);
-                        }
-                        None => followed.gone = true,
+                    if let Some(output) = answer.output {
+                        let process = output.process.clone();
+                        changed |= show(followed, output, cx);
+                        changed |= self.learn([process]);
+                    } else {
+                        followed.done = Some(Done::Gone);
+                        changed = true;
                     }
                 }
             }
             Err(error) => {
-                changed = true;
                 self.error = Some(error.to_string().into());
+                changed = true;
             }
         }
-        // Each redraw reaches the session's view and the panel: only
-        // what changed is drawn again.
         if changed {
             cx.notify();
         }
@@ -284,15 +302,48 @@ impl Processes {
             LIST_POLL
         }
     }
+
+    /// Keeps what the daemon said of `processes`; returns whether it said
+    /// anything new.
+    fn learn(&mut self, processes: impl IntoIterator<Item = SessionProcess>) -> bool {
+        let mut changed = false;
+        for process in processes {
+            changed |= self.known.get(&process.id) != Some(&process);
+            self.known.insert(process.id.clone(), process);
+        }
+        changed
+    }
+}
+
+/// One read as it was sent.
+struct Read {
+    daemon: Daemon,
+    session: SessionId,
+    /// The output it asked for too, if any.
+    output: Option<ProcessOutputParams>,
+    /// How many times the list had changed when it was sent.
+    changes: u64,
 }
 
 /// Adds `output` to what `followed` holds, and has its list show the lines
-/// that changed.
-fn show(followed: &mut Followed, output: ProcessOutput, cx: &mut Context<'_, Processes>) {
+/// that changed. Returns whether anything did.
+fn show(followed: &mut Followed, output: ProcessOutput, cx: &mut Context<'_, Processes>) -> bool {
+    let was = followed.done;
+    if !is_live(output.process.state) {
+        // The daemon marks a process ended only once its output is all
+        // read, so this answer holds the last of it.
+        followed.done = Some(Done::Ended);
+    }
     let change = followed.log.apply(output);
+    if change == LogChange::default() {
+        return followed.done != was;
+    }
     followed.scroller.update(cx, |scroller, cx| {
         if change.dropped > 0 {
             scroller.splice(0..change.dropped, 0, cx);
+        }
+        if change.trimmed {
+            scroller.remeasure_items(0..1, cx);
         }
         if let Some(ix) = change.changed {
             scroller.remeasure_items(ix..ix + 1, cx);
@@ -301,9 +352,5 @@ fn show(followed: &mut Followed, output: ProcessOutput, cx: &mut Context<'_, Pro
             scroller.append(change.added, cx);
         }
     });
-}
-
-/// Whether a process in `state` may still write.
-pub(crate) fn is_live(state: ProcessState) -> bool {
-    matches!(state, ProcessState::Starting | ProcessState::Running)
+    true
 }

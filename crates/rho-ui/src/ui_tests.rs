@@ -4247,11 +4247,11 @@ fn process_line(ix: usize) -> ElementId {
     ElementId::from(("process-line", ix))
 }
 
-/// A background process's row says how long it has run, and opens its
-/// output in the right panel's Background surface, which reads on while
-/// the process runs: what it writes next shows, a line on stderr marked.
-/// Once it ended and its last output is in, nothing is read again; Back
-/// shows the lists, whose ended row opens the output once more.
+/// A background process's row says how long it has run and been quiet,
+/// and opens its output in the right panel's Background surface, which
+/// reads on while the process runs: what it writes next shows, a line on
+/// stderr marked. Once it ended and its last output is in, nothing is read
+/// again; Back shows the lists, whose ended row opens the output once more.
 #[test]
 fn a_background_process_output_is_followed_until_it_ends() {
     let mut ui = Harness::start("process-output", Script::default());
@@ -4267,12 +4267,27 @@ fn a_background_process_output_is_followed_until_it_ends() {
     let session = SessionId::from("new-1");
     ui.fake()
         .write_process(&session, ProcessStream::Stdout, "Compiling rho-ui\nCompil");
-    ui.wait_until("the row's time", |window, _, _| {
-        window
-            .try_find("background-0")
-            .and_then(|row| row.label().map(str::to_owned))
-            .is_some_and(|label| label.starts_with("sleep 30: Running · "))
-    });
+    // It ran a while, and has been quiet long enough for its row to say.
+    ui.fake().age_process(
+        &session,
+        Duration::from_secs(4 * 60 + 12),
+        Duration::from_secs(90),
+    );
+    ui.poll(
+        WAIT,
+        "the row's time",
+        |ui| {
+            ui.cx.advance_clock(Duration::from_secs(1));
+            ui.frame();
+            ui.label("background-0")
+                .is_some_and(|label| label.starts_with("sleep 30: Running · 4m 1"))
+                && ui
+                    .label("background-0")
+                    .is_some_and(|label| label.contains("· quiet 1m 3"))
+        },
+        |ui| format!("the row says {:?}", ui.label("background-0")),
+    );
+    ui.shot("rows");
 
     ui.click("background-0");
     ui.wait_until("the output in the panel", |window, _, _| {

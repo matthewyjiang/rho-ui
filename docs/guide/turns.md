@@ -14,7 +14,7 @@ Processes, workflow runs and subagents a turn starts can outlive the turn. When 
 
 A subagent's session opens read-only: only the subagent writes to it, and its questions come to the session that started it.
 
-A process's output opens in the panel's Background tab. It needs rho 3.5 or newer; an older rho refuses.
+A process's output opens in the panel's Background tab.
 
 - **It's read, not pushed.** rho-ui asks the daemon for new output every half second while the output is on screen, and for each process's time every second while one runs. It stops asking once nothing runs.
 - **rho keeps only so much of it.** Past its output budget, the oldest output goes first, so a long-running process's output may start partway through.

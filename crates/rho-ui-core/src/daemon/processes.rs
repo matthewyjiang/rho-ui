@@ -6,7 +6,7 @@
 //! nothing the session's model sees.
 
 use rho_protocol::{
-    methods, ErrorCode, ProcessOutputParams, SessionProcessesParams, SessionProcessesResponse,
+    methods, ProcessOutputParams, SessionProcessesParams, SessionProcessesResponse,
 };
 
 use super::{Daemon, DaemonError, SessionId};
@@ -19,8 +19,7 @@ impl Daemon {
     ///
     /// # Errors
     ///
-    /// Fails if the daemon is from before process reads, the session is not
-    /// loaded, or the connection is gone.
+    /// Fails if the session is not loaded or the connection is gone.
     pub async fn processes(
         &self,
         id: &SessionId,
@@ -30,18 +29,9 @@ impl Daemon {
             session: id.to_wire(),
             output,
         };
-        match self
+        Ok(self
             .client
             .request::<methods::SessionProcesses>(&params)
-            .await
-        {
-            Ok(response) => Ok(response),
-            Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => {
-                Err(DaemonError::Refused(
-                    "this machine's rho is from before reading background processes".to_owned(),
-                ))
-            }
-            Err(error) => Err(error.into()),
-        }
+            .await?)
     }
 }

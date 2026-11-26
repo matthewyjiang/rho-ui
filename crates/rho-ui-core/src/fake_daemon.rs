@@ -858,6 +858,28 @@ impl FakeDaemon {
     ///
     /// If the session runs no background process: the test has a bug.
     pub fn write_process(&self, session: &UiSessionId, stream: ProcessStream, text: &str) {
+        self.with_running_process(session, |processes, id| {
+            processes.write(id, stream, text);
+        });
+    }
+
+    /// Has `session`'s oldest running background process have run for
+    /// `ran` so far, and last written `quiet` ago.
+    ///
+    /// # Panics
+    ///
+    /// If the session runs no background process: the test has a bug.
+    pub fn age_process(&self, session: &UiSessionId, ran: Duration, quiet: Duration) {
+        self.with_running_process(session, |processes, id| processes.age(id, ran, quiet));
+    }
+
+    /// Runs `act` on `session`'s processes with the ID of its oldest
+    /// running one.
+    fn with_running_process(
+        &self,
+        session: &UiSessionId,
+        act: impl FnOnce(&mut FakeProcesses, &str),
+    ) {
         let mut state = self.service.lock();
         let session = state
             .sessions
@@ -870,8 +892,8 @@ impl FakeDaemon {
                 BackgroundItem::Process { id } if work.status.is_running() => Some(id.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("session runs no background process to write"));
-        session.processes.write(&id, stream, text);
+            .unwrap_or_else(|| panic!("session runs no background process"));
+        act(&mut session.processes, &id);
     }
 
     /// How many `rho/session/processes` requests the daemon got.

@@ -87,7 +87,7 @@ use crate::{
     auths::Auths,
     background::{
         processes::Processes, BackgroundHistory, BackgroundList, BackgroundSurface, OpenHandler,
-        Opens, Output, ProcessOutput, Sources, StopHandler,
+        Opens, OpensOutput, Sources, StopHandler,
     },
     background_log::{BackgroundLog, Recorded},
     composer::{Composer, ComposerMode, ComposerState},
@@ -1981,12 +1981,7 @@ impl SessionView {
         if self.is_subagent() {
             return Some(list);
         }
-        let view = cx.entity().downgrade();
-        Some(list.stoppable(&self.stopping, move |work, window, cx| {
-            let _ = view.update(cx, |this, cx| {
-                this.stop_background(work.clone(), window, cx);
-            });
-        }))
+        Some(list.stoppable(&self.stopping, Self::stop_handler(cx.entity().downgrade())))
     }
 
     /// What the rows of the session's background work read besides the
@@ -1997,64 +1992,42 @@ impl SessionView {
             runs: &self.runs,
             processes: self.processes.read(cx),
             output: if self.is_side() {
-                Output::Never
+                OpensOutput::No
             } else {
-                Output::Opens
+                OpensOutput::Yes
             },
         }
     }
 
     /// The session's background work, running and ended, for the right
-    /// panel's Background surface, or the output of the process the user
-    /// follows in its place. A subagent's session can't stop its own.
-    pub(crate) fn background_surface(view: &Entity<Self>, cx: &App) -> AnyElement {
+    /// panel's Background surface, which may show a process's output in
+    /// its place. A subagent's session can't stop its own.
+    pub(crate) fn background_surface(view: &Entity<Self>, cx: &App) -> BackgroundSurface {
         let this = view.read(cx);
-        let stop = (!this.is_subagent()).then(|| {
-            let view = view.downgrade();
-            let on_stop: StopHandler = Rc::new(move |work, window, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    this.stop_background(work.clone(), window, cx);
-                });
-            });
-            on_stop
-        });
-        if let Some(followed) = this.processes.read(cx).followed() {
-            let id = BackgroundId::process(followed.log.id().to_owned());
-            let work = this.session.background().iter();
-            let work = work
-                .chain(this.session.ended_background())
-                .find(|work| *work.id() == id);
-            let title =
-                work.map_or_else(SharedString::default, |work| work.title().to_owned().into());
-            // Offered as its row offers it, while the session lists it running.
-            let stoppable = work
-                .is_some_and(|work| work.status() == BackgroundStatus::Running && work.can_stop());
-            let stop = stop.filter(|_| stoppable);
-            let back = view.downgrade();
-            return ProcessOutput::new(
-                this.processes.clone(),
-                title,
-                move |_, cx| {
-                    let _ = back.update(cx, Self::unfollow_output);
-                },
-                stop.map(|on_stop| (this.stopping.contains(&id), on_stop)),
-            )
-            .into_any_element();
-        }
+        let back = view.downgrade();
         let surface = BackgroundSurface::new(
             this.session.background(),
             this.session.ended_background(),
             &this.sources(cx),
+            &this.processes,
             Self::open_handler(view.downgrade()),
+            Rc::new(move |_, cx| {
+                let _ = back.update(cx, Self::unfollow_output);
+            }),
         );
-        match stop {
-            Some(on_stop) => surface
-                .stoppable(&this.stopping, move |work, window, cx| {
-                    on_stop(work, window, cx);
-                })
-                .into_any_element(),
-            None => surface.into_any_element(),
+        if this.is_subagent() {
+            return surface;
         }
+        surface.stoppable(&this.stopping, Self::stop_handler(view.downgrade()))
+    }
+
+    /// Stops a piece of the background work, from its row.
+    fn stop_handler(view: WeakEntity<Self>) -> StopHandler {
+        Rc::new(move |work, window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.stop_background(work.clone(), window, cx);
+            });
+        })
     }
 
     /// Opens what a row of the background work opens: a subagent's

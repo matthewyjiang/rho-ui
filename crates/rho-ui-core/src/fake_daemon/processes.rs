@@ -4,7 +4,10 @@
 //! process is listed, and its output read, while its work is listed: as
 //! rho forgets a process once the model was given its result.
 
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use rho_protocol::{
     methods::{BackgroundItem, BackgroundStatus, BackgroundWork},
@@ -62,6 +65,24 @@ impl FakeProcesses {
             text: text.to_owned(),
         });
         record.last_output = Some(Instant::now());
+    }
+
+    /// Has process `id` run for `ran` so far, and last written `quiet`
+    /// ago.
+    ///
+    /// # Panics
+    ///
+    /// If there is no process `id`, or this machine has been up for less
+    /// than `ran`: the test has a bug.
+    pub(super) fn age(&mut self, id: &str, ran: Duration, quiet: Duration) {
+        let record = self
+            .0
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("the fake daemon has no process {id}"));
+        let now = Instant::now();
+        let ago = |by: Duration| now.checked_sub(by).expect("the clock goes back that far");
+        record.started = ago(ran);
+        record.last_output = Some(ago(quiet));
     }
 
     /// Takes each process's state from its work in `work`, the session's

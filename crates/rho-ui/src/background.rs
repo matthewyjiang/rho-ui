@@ -21,7 +21,7 @@
 mod output;
 pub(crate) mod processes;
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{ObservedElement, TestSupportExt as _};
@@ -34,7 +34,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, Anchor, AnyElement, App, Div, Hsla, InteractiveElement as _, IntoElement,
+    div, rems, Anchor, AnyElement, App, Div, Entity, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _,
     Styled as _, Window,
 };
@@ -43,9 +43,16 @@ use rho_ui_core::{
     SessionId, SessionProcess,
 };
 
-use self::output::timing;
-pub(crate) use self::output::ProcessOutput;
+pub(crate) use self::output::BackHandler;
+use self::output::OutputView;
 use self::processes::Processes;
+use crate::time;
+
+/// How long a running process must have written nothing before its status
+/// says how long it has been quiet: as rho's terminal UI does
+/// (`QUIET_LABEL_AFTER` in rho's `tui/process_panel.rs`), since a pause of
+/// seconds is ordinary.
+const QUIET_AFTER_SECONDS: u64 = 60;
 
 /// Asks the daemon to stop one piece of work.
 pub(crate) type StopHandler = Rc<dyn Fn(&BackgroundId, &mut Window, &mut App)>;
@@ -82,24 +89,18 @@ struct Row {
 }
 
 impl Row {
-    /// `work` as its session lists it, with what the job list says of it,
-    /// `run`, if it is a run, and what the daemon read of it, `process`, if
-    /// it is a process. A process's row opens its output where `output`
+    /// `listed` work, its process's row opening its output where `output`
     /// says it can.
-    fn new(
-        work: &BackgroundWork,
-        run: Option<&Run>,
-        process: Option<&SessionProcess>,
-        output: Output,
-        stop: Stop,
-    ) -> Self {
+    fn new(listed: &Listed, output: OpensOutput, stop: Stop) -> Self {
+        let Listed { work, run, process } = listed;
+        let (run, process) = (run.as_ref(), process.as_ref());
         let title: SharedString = work.title().to_owned().into();
         let opens = match (work.session(), work.id().key()) {
             (Some(session), _) => Some(Opens::Session {
                 session,
                 title: title.clone(),
             }),
-            (None, Some((BackgroundKind::Process, id))) if output == Output::Opens => {
+            (None, Some((BackgroundKind::Process, id))) if output == OpensOutput::Yes => {
                 Some(Opens::Output(id.to_owned()))
             }
             _ => None,
@@ -274,9 +275,9 @@ enum Nest {
 /// Whether a process's row opens its output: not where the output can't
 /// show, as in a side chat, whose panel shows its session's surfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Output {
-    Opens,
-    Never,
+pub(crate) enum OpensOutput {
+    Yes,
+    No,
 }
 
 /// Whether a row offers to stop its work.
@@ -298,32 +299,41 @@ pub(crate) struct Sources<'a> {
     /// The session's processes, as the daemon last read them.
     pub(crate) processes: &'a Processes,
     /// Whether a process's row opens its output.
-    pub(crate) output: Output,
+    pub(crate) output: OpensOutput,
 }
 
 impl Sources<'_> {
-    /// The row of `work`, with what the job list and the daemon's read of
-    /// its processes say of it.
-    fn row(&self, work: &BackgroundWork, stop: Stop) -> Row {
-        Row::new(
-            work,
-            run_of(self.runs, work),
-            process_of(self.processes, work),
-            self.output,
-            stop,
-        )
+    /// `work`, with what the job list and the daemon's read of its
+    /// processes say of it.
+    fn listed(&self, work: &BackgroundWork) -> Listed {
+        let process = match work.id().key() {
+            Some((BackgroundKind::Process, id)) => self.processes.process(id).cloned(),
+            _ => None,
+        };
+        Listed {
+            work: work.clone(),
+            run: self.runs.iter().find(|run| run.id() == work.id()).cloned(),
+            process,
+        }
     }
+}
+
+/// One piece of work as its session lists it, with what the job list says
+/// of it if it is a run, and the daemon's read of it if it is a process.
+struct Listed {
+    work: BackgroundWork,
+    run: Option<Run>,
+    process: Option<SessionProcess>,
 }
 
 /// The session's running background work, oldest first within each kind,
 /// as the daemon lists it.
 #[derive(IntoElement)]
 pub(crate) struct BackgroundList {
-    /// Each piece of work, with what the job list says of it if it is a
-    /// run, and the daemon's read of it if it is a process.
-    running: Vec<(BackgroundWork, Option<Run>, Option<SessionProcess>)>,
+    /// The running work.
+    running: Vec<Listed>,
     /// Whether a process's row opens its output.
-    output: Output,
+    output: OpensOutput,
     /// The work the user asked to stop, and how to ask; `None` where
     /// nothing can be stopped from here.
     stop: Option<(Vec<BackgroundId>, StopHandler)>,
@@ -345,14 +355,7 @@ impl BackgroundList {
         let running: Vec<_> = work
             .iter()
             .filter(|work| work.status() == BackgroundStatus::Running)
-            .map(|work| {
-                let run = run_of(sources.runs, work).cloned();
-                (
-                    work.clone(),
-                    run,
-                    process_of(sources.processes, work).cloned(),
-                )
-            })
+            .map(|work| sources.listed(work))
             .collect();
         (!running.is_empty()).then_some(Self {
             running,
@@ -375,12 +378,8 @@ impl BackgroundList {
 
     /// Offers to stop each piece of work that can be, with `on_stop`.
     /// `stopping` holds the work the user asked to stop.
-    pub(crate) fn stoppable(
-        mut self,
-        stopping: &[BackgroundId],
-        on_stop: impl Fn(&BackgroundId, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.stop = Some((stopping.to_vec(), Rc::new(on_stop)));
+    pub(crate) fn stoppable(mut self, stopping: &[BackgroundId], on_stop: StopHandler) -> Self {
+        self.stop = Some((stopping.to_vec(), on_stop));
         self
     }
 }
@@ -389,7 +388,8 @@ impl RenderOnce for BackgroundList {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let (stop, on_open, ids) = (self.stop, self.on_open, self.ids);
         let mut rows = Vec::new();
-        for (ix, (work, run, process)) in self.running.iter().enumerate() {
+        for (ix, listed) in self.running.iter().enumerate() {
+            let work = &listed.work;
             let offer = stop.as_ref().filter(|_| work.can_stop());
             let state = match offer {
                 None => Stop::Never,
@@ -398,25 +398,13 @@ impl RenderOnce for BackgroundList {
             };
             let trailing = match offer {
                 Some((_, on_stop)) => {
-                    let (on_stop, id) = (Rc::clone(on_stop), work.id().clone());
-                    Button::new(SharedString::from(format!("{ids}-stop-{ix}")))
-                        .ghost()
-                        .xsmall()
-                        .icon(Lucide::Square)
-                        .tooltip("Stop")
-                        .disabled(state == Stop::Asked)
-                        .on_click(move |_, window, cx| {
-                            // The row under it opens what it shows.
-                            cx.stop_propagation();
-                            on_stop(&id, window, cx);
-                        })
-                        .into_any_element()
+                    stop_button(format!("{ids}-stop-{ix}"), work, state, on_stop).into_any_element()
                 }
                 // Keeps the status in the lane of the rows that can stop:
                 // the size of an xsmall icon button.
                 None => div().flex_shrink_0().size_5().into_any_element(),
             };
-            let row = Row::new(work, run.as_ref(), process.as_ref(), self.output, state);
+            let row = Row::new(listed, self.output, state);
             rows.extend(row.render_tree(
                 &format!("{ids}-{ix}"),
                 0,
@@ -466,21 +454,30 @@ fn ended_rows(ended: &[BackgroundWork], sources: &Sources<'_>) -> Rc<[Row]> {
     ended
         .iter()
         .rev()
-        .map(|work| sources.row(work, Stop::Never))
+        .map(|work| Row::new(&sources.listed(work), sources.output, Stop::Never))
         .collect()
 }
 
-/// What the job list says of `work`, if it is one of `runs`.
-fn run_of<'a>(runs: &'a [Run], work: &BackgroundWork) -> Option<&'a Run> {
-    runs.iter().find(|run| run.id() == work.id())
-}
-
-/// What the daemon last read of `work`, if it is a process it read.
-fn process_of<'a>(processes: &'a Processes, work: &BackgroundWork) -> Option<&'a SessionProcess> {
-    match work.id().key() {
-        Some((BackgroundKind::Process, id)) => processes.process(id),
-        _ => None,
-    }
+/// The button that stops `work`, named `id`, disabled once the stop was
+/// asked for. It keeps its click from the row under it, which opens what
+/// the row shows.
+fn stop_button(
+    id: impl Into<SharedString>,
+    work: &BackgroundWork,
+    state: Stop,
+    on_stop: &StopHandler,
+) -> Button {
+    let (on_stop, work) = (Rc::clone(on_stop), work.id().clone());
+    Button::new(id.into())
+        .ghost()
+        .xsmall()
+        .icon(Lucide::Square)
+        .tooltip("Stop")
+        .disabled(state == Stop::Asked)
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            on_stop(&work, window, cx);
+        })
 }
 
 impl RenderOnce for BackgroundHistory {
@@ -524,47 +521,82 @@ impl RenderOnce for BackgroundHistory {
 
 /// The session's background work as a surface of the right panel: what
 /// runs, each with a button to stop it once [`Self::stoppable`], then what
-/// ended, newest first, with how it ended. A process's output shows in its
-/// place ([`ProcessOutput`]).
+/// ended, newest first, with how it ended; or, in their place, the output
+/// of the process the user follows, as Files shows an open file in place
+/// of its tree.
 #[derive(IntoElement)]
-pub(crate) struct BackgroundSurface {
-    running: Option<BackgroundList>,
-    ended: Rc<[Row]>,
-    on_open: OpenHandler,
+pub(crate) struct BackgroundSurface(Shows);
+
+/// What the Background surface shows.
+enum Shows {
+    Lists {
+        running: Option<BackgroundList>,
+        ended: Rc<[Row]>,
+        on_open: OpenHandler,
+    },
+    /// Boxed: it holds the followed work whole.
+    Output(Box<OutputView>),
 }
 
 impl BackgroundSurface {
     /// `work` is the daemon's list, of which the running work shows, and
     /// `ended` the work seen to end, oldest first, each with what
     /// `sources` say of it. Each row opens what it opens with `on_open`.
+    /// While `processes` follows a process's output, the surface shows it,
+    /// with Back, which `on_back` takes.
     pub(crate) fn new(
         work: &[BackgroundWork],
         ended: &[BackgroundWork],
         sources: &Sources<'_>,
+        processes: &Entity<Processes>,
         on_open: OpenHandler,
+        on_back: BackHandler,
     ) -> Self {
-        Self {
+        let followed = sources.processes.followed().and_then(|followed| {
+            let id = BackgroundId::process(followed.log.id().to_owned());
+            work.iter().chain(ended).find(|work| *work.id() == id)
+        });
+        if let Some(work) = followed {
+            let listed = sources.listed(work);
+            let view = OutputView::new(processes.clone(), listed, on_back);
+            return Self(Shows::Output(Box::new(view)));
+        }
+        Self(Shows::Lists {
             running: BackgroundList::new(work, sources, Rc::clone(&on_open))
                 .map(|list| list.nested("panel-background")),
             ended: ended_rows(ended, sources),
             on_open,
-        }
+        })
     }
 
     /// Offers to stop the running work; see [`BackgroundList::stoppable`].
-    pub(crate) fn stoppable(
-        mut self,
-        stopping: &[BackgroundId],
-        on_stop: impl Fn(&BackgroundId, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.running = self.running.map(|list| list.stoppable(stopping, on_stop));
-        self
+    pub(crate) fn stoppable(self, stopping: &[BackgroundId], on_stop: StopHandler) -> Self {
+        Self(match self.0 {
+            Shows::Lists {
+                running,
+                ended,
+                on_open,
+            } => Shows::Lists {
+                running: running.map(|list| list.stoppable(stopping, on_stop)),
+                ended,
+                on_open,
+            },
+            Shows::Output(view) => Shows::Output(Box::new(view.stoppable(stopping, on_stop))),
+        })
     }
 }
 
 impl RenderOnce for BackgroundSurface {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        if self.running.is_none() && self.ended.is_empty() {
+        let (running, ended, on_open) = match self.0 {
+            Shows::Lists {
+                running,
+                ended,
+                on_open,
+            } => (running, ended, on_open),
+            Shows::Output(view) => return (*view).into_any_element(),
+        };
+        if running.is_none() && ended.is_empty() {
             return Empty::new()
                 .h_full()
                 .header(EmptyHeader::new().description(
@@ -581,14 +613,13 @@ impl RenderOnce for BackgroundSurface {
                 .text_color(muted)
                 .child(text)
         };
-        let (ended, on_open) = (self.ended, self.on_open);
         v_flex()
             .id("panel-background-surface")
             .size_full()
             .overflow_y_scroll()
             .py_3()
             .gap_4()
-            .when_some(self.running, |this, running| {
+            .when_some(running, |this, running| {
                 this.child(v_flex().gap_2().child(heading("Running")).child(running))
             })
             .when(!ended.is_empty(), |this| {
@@ -631,6 +662,31 @@ fn status_label(work: &BackgroundWork, process: Option<&SessionProcess>, stop: S
         (BackgroundStatus::Cancelled, _) => "Stopped".to_owned(),
         (BackgroundStatus::Ended, _) => "Ended".to_owned(),
     }
+}
+
+/// How long `process` has run, and while it runs and has been quiet a
+/// while, for how long: "1m 20s", "4m 2s · quiet 3m 10s". `None` for one
+/// that never started.
+fn timing(process: &SessionProcess) -> Option<String> {
+    if process.state == ProcessState::FailedToStart {
+        return None;
+    }
+    let elapsed = time::running(Duration::from_secs(process.elapsed_seconds));
+    let quiet = process
+        .quiet_seconds
+        .filter(|&quiet| is_live(process.state) && quiet >= QUIET_AFTER_SECONDS);
+    Some(match quiet {
+        Some(quiet) => format!(
+            "{elapsed} · quiet {}",
+            time::running(Duration::from_secs(quiet))
+        ),
+        None => elapsed,
+    })
+}
+
+/// Whether a process in `state` may still write.
+fn is_live(state: ProcessState) -> bool {
+    matches!(state, ProcessState::Starting | ProcessState::Running)
 }
 
 /// How a run is doing, in words, from the job list.

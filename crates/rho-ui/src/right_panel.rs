@@ -61,7 +61,6 @@ use self::diff::DiffSurface;
 use self::files::FilesSurface;
 use self::lead_work::WorkSurface;
 use self::pull_request::PullRequestSurface;
-pub(crate) use self::pull_request::Visibility;
 use self::tabs::{Tab, TabKey, TabSet};
 pub(crate) use self::terminal::{Direction, PaneCommand, TerminalShell};
 use self::terminal::{Emptied, TerminalTab};
@@ -196,6 +195,23 @@ pub(crate) enum TerminalShortcut {
     PreviousTab,
     /// What a pane of the terminal does ([`PaneCommand`]).
     Pane(PaneCommand),
+}
+
+/// Whether a surface is on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    Shown,
+    Hidden,
+}
+
+impl From<bool> for Visibility {
+    fn from(on_screen: bool) -> Self {
+        if on_screen {
+            Self::Shown
+        } else {
+            Self::Hidden
+        }
+    }
 }
 
 /// Whether the panel shows, and how wide, remembered across runs under
@@ -449,16 +465,11 @@ impl RightPanel {
     /// read only then.
     fn sync_shown(&self, cx: &mut Context<'_, Self>) {
         let panel = PanelLayout::get(cx);
-        let visibility = |on_screen: bool| {
-            if on_screen {
-                Visibility::Shown
-            } else {
-                Visibility::Hidden
-            }
-        };
         for (key, set) in &self.sets {
             let shown = |active: TabKey| {
-                visibility(panel && self.on_screen() == Some(key) && set.active == Some(active))
+                Visibility::from(
+                    panel && self.on_screen() == Some(key) && set.active == Some(active),
+                )
             };
             if let Some(view) = set.view.upgrade() {
                 let background = set
