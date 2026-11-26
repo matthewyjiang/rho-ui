@@ -1,20 +1,24 @@
 //! The timeline rail: the cards rho sends between two replies, such as a
 //! background process that ended, a session that finished or asks, or a
-//! watched pull request that changed, each one line on a thin rail in the
-//! transcript's left gutter. The rail stops at each reply: a run of cards
-//! is one stretch of it.
+//! watched pull request that changed, on a thin rail in the transcript's
+//! left gutter. A card takes one row for each event it tells of (two on
+//! one pull request take two), or one for its title from a rho that
+//! doesn't say. The rail stops at each reply: a run of cards is one stretch
+//! of it.
 //!
-//! A row's dot says how the card reads: a ring for routine news, filled
-//! when someone must look (an error, or an accent such as a question), so
-//! the urgency doesn't rest on color alone. Clicking a row opens its body
-//! under it. Past [`FOLD_AFTER`] cards in one run, the routine ones fold
-//! behind one row (see [`place`]).
+//! A row's dot says what the card asks of the reader ([`Urgency`]): a ring
+//! for news, filled when someone must act (a question, a failure), so the
+//! urgency doesn't rest on color alone. Clicking a row opens the card's
+//! body under it; its pull request's chip shows the pull request, and a
+//! session it is about opens from the row. Past [`FOLD_AFTER`] cards in one
+//! run, those that don't need the reader fold behind one row (see
+//! [`places`]).
 //!
-//! Each card row is one of the transcript's rows, so only the rows near
-//! the window are drawn: each draws its own stretch of the line, which
-//! meets its neighbors' as the rows touch. The transcript places a run's
-//! rows ([`places`]) once, when the run changes, not each frame: a folded
-//! card is an empty row, so every one in view draws each frame.
+//! Each card is one of the transcript's rows, so only the rows near the
+//! window are drawn: each draws its own stretch of the line, which meets
+//! its neighbors' as the rows touch. The transcript places a run's cards
+//! ([`places`]) once, when the run changes, not each frame: a folded card
+//! is an empty row, so every one in view draws each frame.
 //!
 //! The sizes come from the C1 mockup (`wake-rail.html`) the design was
 //! picked from.
@@ -22,22 +26,33 @@
 //! The rail and its dots are layout, drawn with GPUI's divs: GPUI Kit has
 //! no timeline element.
 
+use std::rc::Rc;
+
 use chrono::{DateTime, Utc};
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{h_flex, tag::Tag, v_flex, ActiveTheme as _, Icon, Sizable as _};
+use gpui_kit::base::{ObservedElement, TestSupportExt as _};
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    tag::Tag,
+    tooltip::Tooltip,
+    v_flex, ActiveTheme as _, Icon, Sizable as _,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, AnyElement, App, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled, Window,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window,
 };
-use rho_ui_core::{Notice, NoticeTone};
+use rho_ui_core::{
+    Notice, NoticeTone, NotificationItem, NotificationOutcome, NotificationSubject, PullRequestId,
+    SessionId, Urgency,
+};
 
 use crate::{time, transcript::find::Marks, work::Disclosure};
 
-/// How many cards of a run always show before its routine ones fold. It
-/// comes from the C1 mockup the design was picked from, not from measuring
-/// real sessions: tune it once leads' runs of cards are seen in use.
+/// How many cards of a run always show before the rest may fold. It comes
+/// from the C1 mockup the design was picked from, not from measuring real
+/// sessions: tune it once leads' runs of cards are seen in use.
 pub(crate) const FOLD_AFTER: usize = 4;
 
 /// The fewest cards a fold hides: a fold row in place of one card would
@@ -57,7 +72,7 @@ const ROW_PAD: f32 = 6.;
 /// A dot's diameter, and its ring's width.
 const DOT: f32 = 9.;
 const DOT_RING: f32 = 2.;
-/// A fold row's small dots, one for each folded card up to
+/// A fold row's small dots, one for each folded row up to
 /// [`STACKED_DOTS`], each overlapping the next by [`STACKED_OVERLAP`]: the
 /// mockup's stack, which reads as "several" without counting them.
 const STACKED_DOT: f32 = 7.;
@@ -68,27 +83,24 @@ const STACKED_DOTS: usize = 4;
 /// rest as "other": three keep the line short in the mockup's measure.
 const TALLY_KINDS: usize = 3;
 
-/// The group a card row's hover shows its chevron through.
-const ROW_GROUP: &str = "rail-row";
+/// The group a card's hover shows its chevron and its links through.
+const CARD_GROUP: &str = "rail-card";
 
-/// Whether a card of `tone` may fold: routine news may, an error or a
-/// question never does.
-fn is_routine(tone: NoticeTone) -> bool {
-    match tone {
-        NoticeTone::Neutral | NoticeTone::Success | NoticeTone::Warning => true,
-        NoticeTone::Error | NoticeTone::Accent => false,
-    }
+/// Whether a card that asks `urgency` may fold: only one that needs the
+/// reader never does.
+fn may_fold(urgency: Urgency) -> bool {
+    urgency != Urgency::NeedsYou
 }
 
-/// The places in a run of cards, with these tones, that fold behind one
-/// row: the routine ones after the first [`FOLD_AFTER`], once there are at
-/// least [`FOLD_AT_LEAST`] of them. None fold otherwise.
-fn folded(tones: &[NoticeTone]) -> Vec<usize> {
-    let folds: Vec<usize> = tones
+/// The places in a run of cards, asking these urgencies, that fold behind
+/// one row: those that may fold after the first [`FOLD_AFTER`], once there
+/// are at least [`FOLD_AT_LEAST`] of them. None fold otherwise.
+fn folded(urgencies: &[Urgency]) -> Vec<usize> {
+    let folds: Vec<usize> = urgencies
         .iter()
         .enumerate()
         .skip(FOLD_AFTER)
-        .filter(|(_, tone)| is_routine(**tone))
+        .filter(|(_, urgency)| may_fold(**urgency))
         .map(|(at, _)| at)
         .collect();
     if folds.len() < FOLD_AT_LEAST {
@@ -100,7 +112,7 @@ fn folded(tones: &[NoticeTone]) -> Vec<usize> {
 /// What a card of a run draws.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Place {
-    /// Its own row.
+    /// Its own rows.
     Card(Ends),
     /// The fold row, in place of the first card it folds: the places in the
     /// run of the cards it folds, this one first.
@@ -109,14 +121,14 @@ pub(crate) enum Place {
     Hidden,
 }
 
-/// Where each card of a run with these tones goes, while the user has the
-/// run's folded cards `shown` or not: on its own row, as the fold row, or
-/// nowhere. The line stops at the last row that shows.
-pub(crate) fn places(tones: &[NoticeTone], shown: Disclosure) -> Vec<Place> {
+/// Where each card of a run asking these urgencies goes, while the user
+/// has the run's folded cards `shown` or not: on its own rows, as the fold
+/// row, or nowhere. The line stops at the last card that shows.
+pub(crate) fn places(urgencies: &[Urgency], shown: Disclosure) -> Vec<Place> {
     let folds = if shown.is_open() {
         Vec::new()
     } else {
-        folded(tones)
+        folded(urgencies)
     };
     // The fold row shows in the first folded card's place; the rest hide.
     let hidden = |card: usize| {
@@ -124,8 +136,8 @@ pub(crate) fn places(tones: &[NoticeTone], shown: Disclosure) -> Vec<Place> {
             .get(1..)
             .is_some_and(|rest| rest.binary_search(&card).is_ok())
     };
-    let last_shown = (0..tones.len()).rev().find(|&card| !hidden(card));
-    (0..tones.len())
+    let last_shown = (0..urgencies.len()).rev().find(|&card| !hidden(card));
+    (0..urgencies.len())
         .map(|at| {
             let ends = Ends {
                 first: at == 0,
@@ -145,232 +157,368 @@ pub(crate) fn places(tones: &[NoticeTone], shown: Disclosure) -> Vec<Place> {
         .collect()
 }
 
-/// Where a row sits on its stretch of the rail: the line runs up from its
-/// dot unless it is the first row, and down unless it is the last shown.
+/// Where a card sits on its stretch of the rail: the line runs up from its
+/// first dot unless it is the first card, and down from its last unless it
+/// is the last shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ends {
     pub(crate) first: bool,
     pub(crate) last: bool,
 }
 
-/// What a card is about, shown as a chip before its line.
-///
-/// rho's card names it only by its `reference`, a label with no kind, so
-/// this reads a pull request off its shape (`owner/repo#12`). Once rho
-/// sends the subject as data, this is where it lands, and the chip can
-/// open it.
+/// What clicking a card's subject opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Subject<'a> {
-    /// A pull request, by its full reference and the label shown.
-    PullRequest { reference: &'a str, label: &'a str },
+pub(crate) enum Link {
+    /// A pull request, in the session's Pull request surface.
+    PullRequest(PullRequestId),
+    /// Another session, such as one this one started.
+    Session(SessionId),
+    /// A subagent's session, with the line that names it, its title until
+    /// the session says.
+    Subagent {
+        session: SessionId,
+        title: SharedString,
+    },
 }
 
-impl<'a> Subject<'a> {
-    fn of(reference: &'a str) -> Option<Self> {
-        let (repo, number) = reference.rsplit_once('#')?;
-        let is_number = !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit());
-        if repo.is_empty() || !is_number {
-            return None;
-        }
-        // `rho#12`: the owner is rarely what tells two apart.
-        let label = reference
-            .rsplit_once('/')
-            .map_or(reference, |(_, label)| label);
-        Some(Self::PullRequest { reference, label })
-    }
+/// Opens a [`Link`]; the session view carries it out.
+pub(crate) type OpenHandler = Rc<dyn Fn(&Link, &mut Window, &mut App)>;
 
-    fn reference(&self) -> &'a str {
-        match self {
-            Self::PullRequest { reference, .. } => reference,
-        }
-    }
+/// Opens or closes a card's body.
+pub(crate) type ToggleHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
-    /// What its chip says.
-    pub(crate) fn label(&self) -> &'a str {
-        match self {
-            Self::PullRequest { label, .. } => label,
-        }
-    }
-}
-
-/// One row of the rail: what a card says, in a line. A card makes one row
-/// today; once rho sends a card's events as items (two comments on one
-/// pull request), each makes a row of its own from the same parts.
-///
-/// rho titles its notification cards "Outcome · name", which [`Line::of`]
-/// splits: a stand-in, as [`Subject`] is, until rho sends the two apart.
+/// One row of a card: one event it tells of, or its title from a rho that
+/// doesn't say.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Line<'a> {
-    pub(crate) tone: NoticeTone,
-    pub(crate) subject: Option<Subject<'a>>,
-    /// What happened: rho titles a card "Outcome · name".
-    pub(crate) outcome: &'a str,
-    /// Who or what it happened to, unless the chip names it already.
-    pub(crate) name: Option<&'a str>,
-    pub(crate) arrived: Option<DateTime<Utc>>,
+    /// The event in words.
+    pub(crate) text: &'a str,
+    /// What happened, for a fold row's tally.
+    outcome: Option<NotificationOutcome>,
+    /// The pull request it is about, as its chip names it: `rho-ui#12`.
+    pub(crate) chip: Option<String>,
+    /// What clicking its subject opens.
+    link: Option<Link>,
 }
 
 impl<'a> Line<'a> {
-    pub(crate) fn of(notice: &'a Notice) -> Self {
-        let subject = notice.reference().and_then(Subject::of);
-        let (outcome, name) = outcome_and_name(notice.title(), subject.as_ref());
+    fn of(item: &'a NotificationItem) -> Self {
+        let (chip, link) = match &item.subject {
+            // The owner is rarely what tells two apart.
+            NotificationSubject::PullRequest { id, .. } => (
+                Some(format!("{}#{}", id.name, id.number)),
+                Some(Link::PullRequest(id.clone())),
+            ),
+            NotificationSubject::Session { id } => (None, Some(Link::Session(id.clone().into()))),
+            NotificationSubject::Subagent {
+                session: Some(session),
+                ..
+            } => (
+                None,
+                Some(Link::Subagent {
+                    session: session.clone().into(),
+                    title: SharedString::from(item.text.clone()),
+                }),
+            ),
+            // A process, a workflow, a subagent with no session, or a kind
+            // a newer rho adds: nothing here opens it.
+            _ => (None, None),
+        };
         Self {
+            text: &item.text,
+            outcome: Some(item.outcome),
+            chip,
+            link,
+        }
+    }
+}
+
+/// A card as the rail draws it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Card<'a> {
+    /// What its elements' IDs start with: `card-` and its notification's
+    /// id, which stays put however often rho sends it, or its entry's
+    /// index from a rho that sends none ([`card_key`]).
+    pub(crate) key: SharedString,
+    urgency: Urgency,
+    tone: NoticeTone,
+    arrived: Option<DateTime<Utc>>,
+    pub(crate) lines: Vec<Line<'a>>,
+}
+
+impl<'a> Card<'a> {
+    /// Entry `ix`'s card.
+    pub(crate) fn of(ix: usize, notice: &'a Notice) -> Self {
+        let mut lines: Vec<Line<'a>> = notice.items().iter().map(Line::of).collect();
+        if lines.is_empty() {
+            lines.push(Line {
+                text: notice.title(),
+                outcome: None,
+                chip: None,
+                link: None,
+            });
+        }
+        Self {
+            key: card_key(ix, notice),
+            urgency: notice.urgency(),
             tone: notice.tone(),
-            outcome,
-            name,
-            subject,
             arrived: notice.arrived(),
+            lines,
         }
     }
 }
 
-/// A card's title "Outcome · name" split in two, without a name its chip
-/// shows already.
-fn outcome_and_name<'a>(
-    title: &'a str,
-    subject: Option<&Subject<'_>>,
-) -> (&'a str, Option<&'a str>) {
-    match title.split_once(" · ") {
-        Some((outcome, name)) if subject.is_some_and(|subject| subject.reference() == name) => {
-            (outcome, None)
-        }
-        Some((outcome, name)) => (outcome, Some(name)),
-        None => (title, None),
+/// What entry `ix`'s card's elements' IDs start with; see [`Card::key`].
+pub(crate) fn card_key(ix: usize, notice: &Notice) -> SharedString {
+    match notice.id() {
+        Some(id) => SharedString::from(format!("card-{id}")),
+        None => SharedString::from(format!("card-{ix}")),
     }
 }
 
-/// What find marks in a card's line: in its chip, its outcome and its
-/// name.
+/// What find marks in a card's row: in its chip, and in its line.
 #[derive(Default)]
 pub(crate) struct LineMarks {
-    pub(crate) subject: Marks,
-    pub(crate) outcome: Marks,
-    pub(crate) name: Marks,
+    pub(crate) chip: Marks,
+    pub(crate) text: Marks,
 }
 
-/// A card's row: entry `ix`'s line, with what find `marks` in it, and
-/// under it, while `detail` is `Some`, its body. `on_click` opens or closes
+/// A card's rows, with what find marks in each line, and under the last,
+/// while `detail` is `Some`, the card's body. `on_toggle` opens or closes
 /// the body; a card with no body has none.
-pub(crate) fn card_row(
-    ix: usize,
+pub(crate) struct CardRows<'a> {
+    pub(crate) card: &'a Card<'a>,
+    /// One per line of the card.
+    pub(crate) marks: Vec<LineMarks>,
+    pub(crate) ends: Ends,
+    pub(crate) detail: Option<AnyElement>,
+    pub(crate) on_toggle: Option<ToggleHandler>,
+    pub(crate) on_open: OpenHandler,
+}
+
+/// A card's body, as its rows show it: one opens or closes it on a click,
+/// and the first's chevron says which it is.
+enum Body {
+    /// The card has none.
+    None,
+    Shut(ToggleHandler),
+    Open(ToggleHandler),
+}
+
+impl Body {
+    fn on_toggle(&self) -> Option<ToggleHandler> {
+        match self {
+            Self::None => None,
+            Self::Shut(on_toggle) | Self::Open(on_toggle) => Some(Rc::clone(on_toggle)),
+        }
+    }
+}
+
+impl CardRows<'_> {
+    pub(crate) fn render(self, cx: &App) -> AnyElement {
+        let Self {
+            card,
+            marks,
+            ends,
+            mut detail,
+            on_toggle,
+            on_open,
+        } = self;
+        let body = match on_toggle {
+            None => Body::None,
+            Some(on_toggle) if detail.is_some() => Body::Open(on_toggle),
+            Some(on_toggle) => Body::Shut(on_toggle),
+        };
+        let count = card.lines.len();
+        let mut marks = marks.into_iter();
+        let mut rows = Vec::with_capacity(count);
+        for (n, line) in card.lines.iter().enumerate() {
+            let first = n == 0;
+            let last = n + 1 == count;
+            let row = line_row(
+                card,
+                n,
+                line,
+                marks.next().unwrap_or_default(),
+                &body,
+                &on_open,
+                cx,
+            );
+            let line_ends = Ends {
+                first: ends.first && first,
+                last: ends.last && last,
+            };
+            let content = v_flex().flex_1().min_w_0().child(row).children(
+                if last { detail.take() } else { None }.map(|detail| {
+                    v_flex()
+                        .id(SharedString::from(format!("{}-detail", card.key)))
+                        .test_support()
+                        .mt(px(2.))
+                        .mb(px(6.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .border_l_2()
+                        .border_color(cx.theme().border)
+                        .rounded_r(cx.theme().radius)
+                        .bg(cx.theme().muted.opacity(0.3))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(detail)
+                }),
+            );
+            rows.push(on_rail(Dot::of(card.urgency, card.tone, cx), line_ends, cx).child(content));
+        }
+        v_flex()
+            .id(card.key.clone())
+            .test_support()
+            .group(CARD_GROUP)
+            .w_full()
+            .children(rows)
+            .into_any_element()
+    }
+}
+
+/// Line `n` of `card`: its chip, its words, and on the first, the card's
+/// time. Clicking it opens or closes the card's body.
+fn line_row(
+    card: &Card<'_>,
+    n: usize,
     line: &Line<'_>,
     marks: LineMarks,
-    ends: Ends,
-    detail: Option<AnyElement>,
-    on_click: Option<impl Fn(&mut Window, &mut App) + 'static>,
+    body: &Body,
+    on_open: &OpenHandler,
     cx: &App,
-) -> AnyElement {
+) -> ObservedElement<Stateful<Div>> {
     let theme = cx.theme();
-    let open = detail.is_some();
-    // A failure or a question reads in the body text's color; routine news
-    // is muted.
-    let text = if is_routine(line.tone) {
-        theme.muted_foreground
-    } else {
+    let key = &card.key;
+    // A failure or a question reads in the body text's color; the rest is
+    // muted.
+    let text = if card.urgency == Urgency::NeedsYou {
         theme.foreground
+    } else {
+        theme.muted_foreground
     };
-    let chevron = on_click.is_some().then(|| {
-        Icon::new(if open {
-            Lucide::ChevronDown
-        } else {
-            Lucide::ChevronRight
-        })
-        .xsmall()
-        .flex_none()
-        .text_color(faint(cx))
-    });
     // Shown on hover, so a quiet row is a dot and a line.
-    let chevron = chevron.map(|icon| {
-        div().flex_none().child(icon).when(!open, |chevron| {
-            chevron
-                .opacity(0.)
-                .group_hover(ROW_GROUP, |style| style.opacity(1.))
-        })
-    });
+    let on_hover = |element: Div| {
+        element
+            .opacity(0.)
+            .group_hover(CARD_GROUP, |style| style.opacity(1.))
+    };
+    let chevron = match body {
+        _ if n > 0 => None,
+        Body::None => None,
+        Body::Shut(_) => Some(on_hover(chevron(Lucide::ChevronRight, cx))),
+        Body::Open(_) => Some(chevron(Lucide::ChevronDown, cx)),
+    };
     let LineMarks {
-        subject: subject_marks,
-        outcome,
-        name: name_marks,
+        chip: chip_marks,
+        text: text_marks,
     } = marks;
-    let chip = line.subject.as_ref().map(|subject| {
-        Tag::secondary()
+    let chip = line.chip.as_ref().map(|label| {
+        let tag = Tag::secondary()
             .small()
             .flex_none()
             .font_family(theme.mono_font_family.clone())
-            .child(subject_marks.text(subject.label().to_owned(), cx))
+            .child(chip_marks.text(label.clone(), cx));
+        // Kit's Tag takes no clicks.
+        let chip = div()
+            .id(SharedString::from(format!("{key}-chip-{n}")))
+            .test_support()
+            .flex_none()
+            .child(tag);
+        match line.link.clone() {
+            Some(target) => {
+                let on_open = Rc::clone(on_open);
+                chip.cursor_pointer().on_click(move |_, window, cx| {
+                    // The row's own click would open the body.
+                    cx.stop_propagation();
+                    on_open(&target, window, cx);
+                })
+            }
+            None => chip,
+        }
     });
-    let row = row_frame(cx)
-        .group(ROW_GROUP)
-        .id(SharedString::from(format!("card-{ix}")))
+    // A session opens from a button: it has no chip to click.
+    let open_session = match &line.link {
+        Some(target @ (Link::Session(_) | Link::Subagent { .. })) => {
+            let (target, on_open) = (target.clone(), Rc::clone(on_open));
+            let button = Button::new(SharedString::from(format!("{key}-open-{n}")))
+                .ghost()
+                .xsmall()
+                .label("Open session")
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_open(&target, window, cx);
+                });
+            Some(on_hover(div().flex_none().child(button)))
+        }
+        _ => None,
+    };
+    let label = match &line.chip {
+        Some(chip) => format!("{chip} · {}", line.text),
+        None => line.text.to_owned(),
+    };
+    row_frame(cx)
+        .id(SharedString::from(format!("{key}-line-{n}")))
         .test_support()
-        .aria_label(SharedString::from(match line.name {
-            Some(name) => format!("{} · {name}", line.outcome),
-            None => line.outcome.to_owned(),
-        }))
+        .aria_label(SharedString::from(label))
         .text_color(text)
         .children(chip)
         .child(
             div()
                 .min_w_0()
-                .when(line.name.is_some(), Styled::flex_none)
                 .truncate()
-                .child(outcome.text(line.outcome.to_owned(), cx)),
+                .child(text_marks.text(line.text.to_owned(), cx)),
         )
-        .children(line.name.map(|name| {
-            // Names read in the body text's color.
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(theme.foreground)
-                .child(name_marks.text(name.to_owned(), cx))
-        }))
+        .children(open_session)
         .children(chevron)
-        .child(clock(line.arrived, cx))
-        .when_some(on_click, |row, on_click| {
+        .when(n == 0, |row| {
+            row.child(clock(format!("{key}-time"), card.arrived, cx))
+        })
+        .when_some(body.on_toggle(), |row, on_toggle| {
             row.cursor_pointer()
                 .hover(|style| style.bg(hovered(cx)))
-                .on_click(move |_, window, cx| on_click(window, cx))
-        });
-    let detail = detail.map(|detail| {
-        v_flex()
-            .id(SharedString::from(format!("card-{ix}-detail")))
-            .test_support()
-            .mt(px(2.))
-            .mb(px(6.))
-            .px(px(10.))
-            .py(px(6.))
-            .border_l_2()
-            .border_color(theme.border)
-            .rounded_r(theme.radius)
-            .bg(theme.muted.opacity(0.3))
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(detail)
-    });
-    on_rail(Dot::of(line.tone, cx), ends, cx)
-        .child(v_flex().flex_1().min_w_0().child(row).children(detail))
-        .into_any_element()
+                .on_click(move |_, window, cx| on_toggle(window, cx))
+        })
 }
 
-/// The row that folds a run's routine cards, `folded`, in place of the
-/// first, entry `ix`: how many, a tally of what they say, and when the last
-/// came. Clicking it unfolds them.
+/// A card's chevron, `icon`, faint.
+fn chevron(icon: Lucide, cx: &App) -> Div {
+    let icon = Icon::new(icon).xsmall().flex_none().text_color(faint(cx));
+    div().flex_none().child(icon)
+}
+
+/// The row that folds a run's cards, `folded`, in place of the first,
+/// whose key it takes: how many rows, a tally of what they say, and when
+/// the last came. Clicking it unfolds them.
 pub(crate) fn fold_row(
-    ix: usize,
-    folded: &[Line<'_>],
+    folded: &[Card<'_>],
     ends: Ends,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
-    let stack = h_flex()
-        .flex_none()
-        .children(folded.iter().take(STACKED_DOTS).map(|line| {
-            dot(Dot::of(line.tone, cx), STACKED_DOT, STACKED_RING, cx).mr(px(-STACKED_OVERLAP))
-        }));
-    let label = format!("+{} more · {}", folded.len(), tally(folded));
-    let last = folded.iter().filter_map(|line| line.arrived).max();
+    let key = folded
+        .first()
+        .map_or_else(SharedString::default, |card| card.key.clone());
+    let dots = folded.iter().flat_map(|card| {
+        card.lines
+            .iter()
+            .map(move |_| Dot::of(card.urgency, card.tone, cx))
+    });
+    let stack = h_flex().flex_none().children(
+        dots.take(STACKED_DOTS)
+            .map(|kind| dot(kind, STACKED_DOT, STACKED_RING, cx).mr(px(-STACKED_OVERLAP))),
+    );
+    let lines: Vec<&Line<'_>> = folded.iter().flat_map(|card| &card.lines).collect();
+    let tally = tally(&lines);
+    let label = if tally.is_empty() {
+        format!("+{} more", lines.len())
+    } else {
+        format!("+{} more · {tally}", lines.len())
+    };
+    let last = folded.iter().filter_map(|card| card.arrived).max();
     let row = row_frame(cx)
-        .id(SharedString::from(format!("rail-fold-{ix}")))
+        .id(SharedString::from(format!("rail-fold-{key}")))
         .test_support()
         .aria_label(SharedString::from(label.clone()))
         .text_color(faint(cx))
@@ -379,19 +527,21 @@ pub(crate) fn fold_row(
         .on_click(move |_, window, cx| on_click(window, cx))
         .child(stack)
         .child(div().min_w_0().truncate().child(label))
-        .child(clock(last, cx));
+        .child(clock(format!("rail-fold-{key}-time"), last, cx));
     on_rail(Dot::Folded, ends, cx)
         .child(div().flex_1().min_w_0().child(row))
         .into_any_element()
 }
 
-/// What folded cards say, counted by outcome in the order they came:
+/// What folded rows say, counted by outcome in the order they came:
 /// "2 completed, 1 new comments". Past [`TALLY_KINDS`] kinds the rest
-/// count as other.
-fn tally(folded: &[Line<'_>]) -> String {
+/// count as other; rows that don't say what happened aren't counted.
+fn tally(folded: &[&Line<'_>]) -> String {
     let mut kinds: Vec<(String, usize)> = Vec::new();
-    for line in folded {
-        let outcome = line.outcome.to_lowercase();
+    for outcome in folded
+        .iter()
+        .filter_map(|line| line.outcome.and_then(outcome_words))
+    {
         match kinds.iter_mut().find(|(kind, _)| *kind == outcome) {
             Some((_, count)) => *count += 1,
             None => kinds.push((outcome, 1)),
@@ -407,6 +557,14 @@ fn tally(folded: &[Line<'_>]) -> String {
         parts.push(format!("{other} other"));
     }
     parts.join(", ")
+}
+
+/// `outcome` in words, "checks failed", as rho names it on the wire,
+/// `checks_failed`; none for one this client doesn't know.
+fn outcome_words(outcome: NotificationOutcome) -> Option<String> {
+    let name = serde_json::to_value(outcome).ok()?;
+    let name = name.as_str().filter(|name| *name != "unknown")?;
+    Some(name.replace('_', " "))
 }
 
 /// A row's line, card or fold, without its content: one line of small
@@ -427,16 +585,27 @@ fn hovered(cx: &App) -> Hsla {
     cx.theme().muted.opacity(0.5)
 }
 
-/// A time as the rail and the messages show it, small and faint; nothing
-/// for an entry with no time.
-pub(crate) fn clock(at: Option<DateTime<Utc>>, cx: &App) -> Div {
+/// A time as the rail and the messages show it, small and faint, which
+/// says it in full on hover; nothing for an entry with no time. `id` is
+/// the element's, which its tooltip needs.
+pub(crate) fn clock(
+    id: impl Into<SharedString>,
+    at: Option<DateTime<Utc>>,
+    cx: &App,
+) -> ObservedElement<Stateful<Div>> {
     div()
+        .id(id.into())
+        .test_support()
         .flex_none()
         .ml_auto()
         .pl_2()
         .text_xs()
         .text_color(faint(cx))
         .children(at.map(time::clock))
+        .when_some(at, |clock, at| {
+            let stamp = SharedString::from(time::stamp(at));
+            clock.tooltip(move |window, cx| Tooltip::new(stamp.clone()).build(window, cx))
+        })
 }
 
 /// The faint color of the rail's times and quiet marks: the muted text
@@ -448,24 +617,33 @@ fn faint(cx: &App) -> Hsla {
 /// A dot on the rail.
 #[derive(Clone, Copy, Debug)]
 enum Dot {
-    /// Routine: a ring.
+    /// News: a ring.
     Ring(Hsla),
-    /// Someone must look: filled.
+    /// Someone must act: filled.
     Filled(Hsla),
     /// A fold row's: a dashed ring.
     Folded,
 }
 
 impl Dot {
-    fn of(tone: NoticeTone, cx: &App) -> Self {
+    /// A card's dot: filled when it needs the reader, red for a failure
+    /// and the accent for the rest, such as a question, whatever its tone;
+    /// a ring in its tone's color when it is worth a look; a faint ring
+    /// for routine news.
+    fn of(urgency: Urgency, tone: NoticeTone, cx: &App) -> Self {
         let theme = cx.theme();
-        match tone {
-            NoticeTone::Neutral => Self::Ring(faint(cx)),
-            NoticeTone::Success => Self::Ring(theme.success),
-            NoticeTone::Warning => Self::Ring(theme.warning),
-            NoticeTone::Error => Self::Filled(theme.danger),
-            // Kit's `info` is cyan; the design's accent is blue.
-            NoticeTone::Accent => Self::Filled(theme.blue),
+        // Kit's `info` is cyan; the design's accent is blue.
+        let accent = theme.blue;
+        match (urgency, tone) {
+            (Urgency::NeedsYou, NoticeTone::Error) => Self::Filled(theme.danger),
+            (Urgency::NeedsYou, _) => Self::Filled(accent),
+            (Urgency::Notable, NoticeTone::Success) => Self::Ring(theme.success),
+            (Urgency::Notable, NoticeTone::Warning) => Self::Ring(theme.warning),
+            (Urgency::Notable, NoticeTone::Error) => Self::Ring(theme.danger),
+            (Urgency::Notable, NoticeTone::Accent) => Self::Ring(accent),
+            (Urgency::Notable, NoticeTone::Neutral) | (Urgency::Routine, _) => {
+                Self::Ring(faint(cx))
+            }
         }
     }
 }
@@ -516,36 +694,36 @@ mod tests {
     use super::*;
 
     /// The rule a run folds by: the first [`FOLD_AFTER`] always show, then
-    /// routine cards fold, but only two or more at once, and an error or a
-    /// question never.
+    /// cards fold, but only two or more at once, and one that needs the
+    /// reader never.
     #[test]
-    fn a_run_folds_its_routine_cards_past_the_first_few() {
-        use NoticeTone::{Accent as Ask, Error as Err, Neutral as N, Success as Ok};
-        let first = [N; FOLD_AFTER];
-        let run = |rest: &[NoticeTone]| [&first[..], rest].concat();
-        let cases: [(Vec<NoticeTone>, Vec<usize>); 4] = [
+    fn a_run_folds_its_cards_past_the_first_few() {
+        use Urgency::{NeedsYou as Act, Notable as Look, Routine as R};
+        let first = [R; FOLD_AFTER];
+        let run = |rest: &[Urgency]| [&first[..], rest].concat();
+        let cases: [(Vec<Urgency>, Vec<usize>); 4] = [
             (run(&[]), vec![]),
-            (run(&[Ok]), vec![]),
-            (run(&[Ok, Ok]), vec![FOLD_AFTER, FOLD_AFTER + 1]),
+            (run(&[Look]), vec![]),
+            (run(&[Look, R]), vec![FOLD_AFTER, FOLD_AFTER + 1]),
             (
-                run(&[Err, Ok, Ask, N]),
+                run(&[Act, Look, Act, R]),
                 vec![FOLD_AFTER + 1, FOLD_AFTER + 3],
             ),
         ];
-        for (tones, want) in cases {
-            assert_eq!(folded(&tones), want, "tones {tones:?}");
+        for (urgencies, want) in cases {
+            assert_eq!(folded(&urgencies), want, "urgencies {urgencies:?}");
         }
     }
 
     /// The fold row takes the first folded card's place, the rest hide,
-    /// and the line stops at the last row that shows, wherever that is;
+    /// and the line stops at the last card that shows, wherever that is;
     /// unfolded, every card shows.
     #[test]
-    fn the_line_stops_at_the_last_row_shown() {
-        use NoticeTone::{Error as Err, Neutral as N};
-        let mut tones = vec![N; FOLD_AFTER];
-        tones.extend([N, Err, N]);
-        let folded = places(&tones, Disclosure::Folded);
+    fn the_line_stops_at_the_last_card_shown() {
+        use Urgency::{NeedsYou as Act, Routine as R};
+        let mut urgencies = vec![R; FOLD_AFTER];
+        urgencies.extend([R, Act, R]);
+        let folded = places(&urgencies, Disclosure::Folded);
         let ends = |first, last| Ends { first, last };
         let mut want = vec![Place::Card(ends(true, false))];
         want.extend((1..FOLD_AFTER).map(|_| Place::Card(ends(false, false))));
@@ -559,51 +737,67 @@ mod tests {
         ]);
         assert_eq!(folded, want);
         assert_eq!(
-            places(&tones, Disclosure::Open).last(),
+            places(&urgencies, Disclosure::Open).last(),
             Some(&Place::Card(ends(false, true)))
         );
     }
 
-    /// A reference shaped as a pull request's makes a chip labelled
-    /// without its owner, and a title's name the chip shows already goes.
+    /// An item's subject makes its chip and what it opens: a pull request
+    /// both, a session or a subagent's session a link, and anything with
+    /// no session to open neither.
     #[test]
-    fn a_card_reads_its_chip_and_line_off_its_title_and_reference() {
+    fn an_item_reads_its_chip_and_link_off_its_subject() {
+        let pr = PullRequestId::new("github.com", "o", "rho", 12);
+        let session = || rho_ui_core::SessionId::from("s-2");
         let cases = [
             (
-                "Approved · o/r#12",
-                Some("o/r#12"),
-                Some("r#12"),
-                "Approved",
+                NotificationSubject::PullRequest {
+                    id: pr.clone(),
+                    url: String::new(),
+                },
+                Some("rho#12"),
+                Some(Link::PullRequest(pr)),
+            ),
+            (
+                serde_json::from_value(serde_json::json!({"kind": "session", "id": "s-2"}))
+                    .expect("a session subject"),
+                None,
+                Some(Link::Session(session())),
+            ),
+            (
+                serde_json::from_value(
+                    serde_json::json!({"kind": "subagent", "run": "r", "session": "s-2"}),
+                )
+                .expect("a subagent subject"),
+                None,
+                Some(Link::Subagent {
+                    session: session(),
+                    title: "done".into(),
+                }),
+            ),
+            (
+                serde_json::from_value(serde_json::json!({"kind": "subagent", "run": "r"}))
+                    .expect("a subagent subject"),
+                None,
                 None,
             ),
             (
-                "Approved · rho#12",
-                Some("rho#12"),
-                Some("rho#12"),
-                "Approved",
+                serde_json::from_value(serde_json::json!({"kind": "process", "id": "p-1"}))
+                    .expect("a process subject"),
+                None,
                 None,
             ),
-            (
-                "Completed · brief",
-                Some("run-7"),
-                None,
-                "Completed",
-                Some("brief"),
-            ),
-            ("Exited · p", Some("#12"), None, "Exited", Some("p")),
-            ("Exited · p", Some("repo#"), None, "Exited", Some("p")),
-            ("PR merged", None, None, "PR merged", None),
         ];
-        for (title, reference, chip, outcome, name) in cases {
-            let subject = reference.and_then(Subject::of);
-            let label = subject
-                .as_ref()
-                .map(|Subject::PullRequest { label, .. }| *label);
-            assert_eq!(label, chip, "{reference:?}");
+        for (subject, chip, link) in cases {
+            let item = serde_json::from_value::<NotificationItem>(serde_json::json!({
+                "outcome": "completed", "subject": subject, "text": "done"
+            }))
+            .expect("an item");
+            let line = Line::of(&item);
             assert_eq!(
-                outcome_and_name(title, subject.as_ref()),
-                (outcome, name),
-                "{title}"
+                (line.chip.as_deref(), line.link),
+                (chip, link),
+                "{subject:?}"
             );
         }
     }

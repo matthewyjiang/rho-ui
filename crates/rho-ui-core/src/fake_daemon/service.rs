@@ -205,17 +205,16 @@ fn start_prompt(
         session.answer(&format!("m-{turn_id}"), FIGURES);
         return Ok(SessionPromptResponse { turn: turn_id });
     }
-    if prompt == "cards" {
+    if prompt == "cards" || prompt == "older cards" {
         session.turn = Some(turn);
         session.state(JobState::Running);
         session.publish(echo(&turn_id, params));
-        session.say(
-            &format!("m-{turn_id}-a"),
-            "Six workers running. Watching their PRs.",
-        );
-        for card in super::CARDS {
-            session.publish(super::notification(card));
-        }
+        let sender = if prompt == "cards" {
+            super::cards::Sender::Typed
+        } else {
+            super::cards::Sender::Older
+        };
+        session.say_cards(&format!("m-{turn_id}"), sender);
         session.answer(
             &format!("m-{turn_id}"),
             "One test fails; the rest is good news.",

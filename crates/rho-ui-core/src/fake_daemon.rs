@@ -42,7 +42,11 @@
 //! - The prompt "plan" asks to carry out a plan, and answers "you chose"
 //!   and the answer, with its feedback after a colon.
 //! - The prompt "cards" says it looks, then sends [`CARDS`], then answers:
-//!   a run of cards between two replies.
+//!   a run of cards between two replies. "older cards" sends them as a
+//!   rho from before typed notifications does: untimed, with nothing
+//!   beside them.
+//! - Every other event goes out with the time it happened,
+//!   [`event_time`], which a reset replays to the second, as rho does.
 //! - The prompt "report" answers with [`report`], a long reply that
 //!   streams in over several events.
 //! - The prompt "background" starts a background process, `sleep 30`, and
@@ -202,9 +206,8 @@ use std::{
 
 use rho_protocol::{
     display::{
-        CodeWindow, DiffRow, DiffRowKind, NotificationCard, NotificationDelivery,
-        NotificationPreview, NotificationTone, NotificationVisibility, ToolBody, ToolCard,
-        ToolCardStatus, ToolFact, ToolFamily, ToolHeader,
+        CodeWindow, DiffRow, DiffRowKind, NotificationInfo, ToolBody, ToolCard, ToolCardStatus,
+        ToolFact, ToolFamily, ToolHeader,
     },
     methods::{
         BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, IdempotencyKey,
@@ -214,13 +217,13 @@ use rho_protocol::{
         SessionWorktree, StartedSessionDefaults, SteerId, StreamId, ToolCallId, ToolCallUpdate,
         TurnId,
     },
-    serve_connection, subscription, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
+    serve_connection, subscription_of, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, CompactionCounts, CompactionId, CompactionStatus, CompactionTrigger, ContentBlock,
     Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle, DetachReason, ErrorCode,
     InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus, ProcessStream, ProtocolVersion,
     Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
-    SessionAttachResponse, SessionEvent, Subscription, ToolContent, ToolKind, ToolStatus,
-    TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
+    SessionAttachResponse, SessionEvent, StreamEvent, Subscription, ToolContent, ToolKind,
+    ToolStatus, TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -232,6 +235,7 @@ use tokio::{
 use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId, SessionMark};
 
 mod auth;
+mod cards;
 mod config;
 mod configured;
 mod listener;
@@ -245,6 +249,7 @@ pub mod surface;
 
 use auth::FakeAuth;
 pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
+pub use cards::{FakeCard, FakeSubject, CARDS};
 use config::FakeConfig;
 use configured::FakeConfigured;
 pub use configured::{ConfiguredList, ConfiguredMethods, ConfiguredRead, INVALID_HOOKS_WORKSPACE};
@@ -413,6 +418,9 @@ pub struct Script {
     /// Whether the daemon lists its configured MCP servers and hooks, or
     /// is from before that.
     pub configured: ConfiguredMethods,
+    /// Whether "old"'s replay ends with [`CARDS`] and a reply, as rho saved
+    /// them.
+    pub old_cards: bool,
 }
 
 /// Whether the fake daemon serves `rho/session/list_detailed`, and with it
@@ -1098,6 +1106,23 @@ impl FakeDaemon {
         session.reload();
     }
 
+    /// When `session`'s notification card `card`, one of [`CARDS`], went
+    /// out live, in Unix milliseconds: a reset replays it to the second.
+    pub fn card_time(&self, session: &UiSessionId, card: &str) -> Option<u64> {
+        let state = self.service.lock();
+        let sent = state
+            .sessions
+            .get(session.as_str())?
+            .history
+            .iter()
+            .find(|sent| {
+                sent.notification
+                    .as_ref()
+                    .is_some_and(|info| info.id.as_str() == card)
+            })?;
+        sent.at
+    }
+
     /// Detaches every client of `session` as fallen behind, as rho's
     /// daemon does to one that left too many events unread. Attaching
     /// again replays the session.
@@ -1197,6 +1222,30 @@ impl Card {
 /// the fake then panics, naming the number, since no test expects the
 /// detach.
 const BACKLOG: usize = 4096;
+
+/// When a session's first event happened, as the fake says: 09:00 UTC on
+/// 1 January 2026. A test knows when each event happened
+/// ([`event_time`]).
+pub const CLOCK_START_MS: u64 = 1_767_258_000_000;
+
+/// How long after a session's event its next happened: not whole seconds,
+/// so the time a reset replays, which keeps the seconds alone, isn't the
+/// time the event went out live with.
+pub const EVENT_EVERY_MS: u64 = 1_500;
+
+/// When a session's event `seq` happened, in Unix milliseconds, as it
+/// went out live and as a tail replays it.
+pub fn event_time(seq: u64) -> u64 {
+    CLOCK_START_MS + seq * EVENT_EVERY_MS
+}
+
+/// What an event goes out with beside it.
+enum Stamp {
+    /// Its time, and for a notification card, what the card is about.
+    Timed(Option<Box<NotificationInfo>>),
+    /// Nothing, as from a rho from before event times.
+    Untimed,
+}
 
 const MODELS: [(&str, &str); 3] = [("small", "Small"), ("large", "Large"), ("huge", "Huge")];
 
@@ -1394,8 +1443,9 @@ struct FakeSession {
     held_started: Vec<HeldChange>,
     state: JobState,
     turn: Option<Turn>,
-    /// Every event so far, which an attach replays.
-    history: Vec<SessionEvent>,
+    /// Every event so far, as it was published, which an attach replays:
+    /// the `n`th has seq `n`.
+    history: Vec<StreamEvent>,
     /// How many of `history`'s events the session's saved transcript
     /// holds: those before the latest turn's end, as rho saves a turn just
     /// before it says the turn ended, or all of them once it reloaded. A
@@ -1530,23 +1580,20 @@ impl FakeSession {
             options: self.settings.options(),
             background: self.background.clone(),
         };
-        let (publisher, subscription) = subscription(BACKLOG, replayed);
+        let (publisher, subscription) = subscription_of(BACKLOG, replayed);
         (response, publisher, subscription)
     }
 
     /// The events after seq `after`, as they were published: the `n`th
     /// event published has seq `n`.
-    fn tail(&self, after: u64) -> Vec<(Seq, SessionEvent)> {
+    fn tail(&self, after: u64) -> Vec<StreamEvent> {
         debug_assert_eq!(
             u64::try_from(self.history.len()).ok(),
             Some(self.live_seq),
             "every event published is in the history, in order"
         );
         let skip = usize::try_from(after).expect("a seq the fake published fits in usize");
-        (after + 1..)
-            .map(Seq)
-            .zip(self.history[skip..].iter().cloned())
-            .collect()
+        self.history[skip..].to_vec()
     }
 
     /// The whole session, as a reset replays it, after the agent it runs
@@ -1560,8 +1607,10 @@ impl FakeSession {
     /// sessions. Nor does it mark steers, as rho's doesn't. Nor do they hold
     /// turn starts or ends, a compaction's start, or provider requests and
     /// retries: rho replays those only after its last save, which leaves
-    /// the latest turn's end, until a restart or an unload.
-    fn transcript(&self) -> Vec<(Seq, SessionEvent)> {
+    /// the latest turn's end, until a restart or an unload. A saved event
+    /// keeps its time to the second, as rho's file does, and the agent and
+    /// the choice have none.
+    fn transcript(&self) -> Vec<StreamEvent> {
         let agent = SessionEvent::Agent {
             id: self.agent.clone(),
         };
@@ -1570,9 +1619,9 @@ impl FakeSession {
             .history
             .iter()
             .enumerate()
-            .filter(|(ix, event)| {
+            .filter(|(ix, sent)| {
                 let unsaved = *ix >= self.saved_events;
-                match event {
+                match &sent.event {
                     SessionEvent::State { .. }
                     | SessionEvent::TurnEnded { .. }
                     | SessionEvent::Compaction {
@@ -1589,23 +1638,30 @@ impl FakeSession {
                     _ => true,
                 }
             })
-            .map(|(_, event)| event.clone());
-        let replay: Vec<SessionEvent> = [agent, started]
-            .into_iter()
-            .chain(history)
-            .map(|mut event| {
-                if let SessionEvent::UserMessage { steer, .. } = &mut event {
+            .map(|(ix, sent)| {
+                let mut sent = sent.clone();
+                if ix < self.saved_events {
+                    sent.at = sent.at.map(|at| at / 1000 * 1000);
+                }
+                if let SessionEvent::UserMessage { steer, .. } = &mut sent.event {
                     *steer = None;
                 }
-                event
-            })
+                sent
+            });
+        let replay: Vec<StreamEvent> = [agent, started]
+            .into_iter()
+            .map(|event| StreamEvent::new(Seq(0), event))
+            .chain(history)
             .collect();
         // As the daemon numbers a reset's replay: 0 for all but the last.
         let last = replay.len().saturating_sub(1);
         replay
             .into_iter()
             .enumerate()
-            .map(|(ix, event)| (Seq(if ix == last { self.live_seq } else { 0 }), event))
+            .map(|(ix, mut sent)| {
+                sent.seq = Seq(if ix == last { self.live_seq } else { 0 });
+                sent
+            })
             .collect()
     }
 
@@ -1627,15 +1683,34 @@ impl FakeSession {
         }
     }
 
-    /// Records `event` and sends it to every attached client.
+    /// Records `event` and sends it to every attached client, with the
+    /// time it happened ([`event_time`]).
     fn publish(&mut self, event: SessionEvent) {
+        self.publish_as(event, Stamp::Timed(None));
+    }
+
+    /// Records notification card `card` and sends it to every attached
+    /// client, as `sender` does.
+    fn notify(&mut self, card: &FakeCard, sender: cards::Sender) {
+        let stamp = match sender {
+            cards::Sender::Typed => Stamp::Timed(Some(card.info())),
+            cards::Sender::Older => Stamp::Untimed,
+        };
+        self.publish_as(card.event(), stamp);
+    }
+
+    fn publish_as(&mut self, event: SessionEvent, stamp: Stamp) {
         if let SessionEvent::State { state, .. } = &event {
             self.state = *state;
         }
         self.live_seq += 1;
-        let seq = Seq(self.live_seq);
+        let mut sent = StreamEvent::new(Seq(self.live_seq), event);
+        if let Stamp::Timed(notification) = stamp {
+            sent.at = Some(event_time(self.live_seq));
+            sent.notification = notification;
+        }
         self.publishers.retain(|publisher| {
-            match publisher.try_publish(seq, event.clone()) {
+            match publisher.try_publish_event(sent.clone()) {
                 Ok(()) => true,
                 // The client detached or left.
                 Err(Published::Gone) => false,
@@ -1645,7 +1720,7 @@ impl FakeSession {
                 ),
             }
         });
-        self.history.push(event);
+        self.history.push(sent);
     }
 
     fn state(&mut self, state: JobState) {
@@ -2213,95 +2288,6 @@ fn grep_lines(n: usize) -> Vec<String> {
     lines
 }
 
-/// The cards the prompt "cards" sends between its two replies, as a lead
-/// gets them from its workers, processes and pull requests: `(title,
-/// tone, reference, body)`. A failure, three routine cards, then the
-/// comments, which ask for a look, then three more routine cards: with the
-/// rail's first four always showing, the last three fold, and the comments
-/// show though they come after the fourth.
-pub const CARDS: [(&str, CardTone, &str, &str); 8] = [
-    (
-        "Failed (exit 101) · cargo test -j 6 -p rho-ui",
-        CardTone::Error,
-        "p-3",
-        "test ui_tests::transcript_keeps_scroll_on_resize ... FAILED",
-    ),
-    (
-        "Checks passed · matthewyjiang/rho-ui#99",
-        CardTone::Success,
-        "matthewyjiang/rho-ui#99",
-        "- All 9 checks passed.",
-    ),
-    (
-        "Approved · matthewyjiang/rho-ui#100",
-        CardTone::Success,
-        "matthewyjiang/rho-ui#100",
-        "",
-    ),
-    (
-        "Approved · matthewyjiang/rho-ui#102",
-        CardTone::Success,
-        "matthewyjiang/rho-ui#102",
-        "",
-    ),
-    (
-        "New comments · matthewyjiang/rho-ui#101",
-        CardTone::Accent,
-        "matthewyjiang/rho-ui#101",
-        "- 1 new comment:\n  - coderabbitai: \"Split the status view out of #10?\"",
-    ),
-    (
-        "Completed · brief rereads",
-        CardTone::Success,
-        "run-7",
-        "Fixed and pushed to `feat/lead-brief-after-compaction`.",
-    ),
-    (
-        "New commits · matthewyjiang/rho#2040",
-        CardTone::Neutral,
-        "matthewyjiang/rho#2040",
-        "",
-    ),
-    (
-        "Changes requested · matthewyjiang/rho#2040",
-        CardTone::Warning,
-        "matthewyjiang/rho#2040",
-        "- coderabbitai: \"Reread the brief before any write to it.\"",
-    ),
-];
-
-/// Card `(title, tone, reference, body)` as rho's daemon sends a
-/// notification: the bodies, and the card rho's terminal UI draws.
-fn notification((title, tone, reference, body): (&str, CardTone, &str, &str)) -> SessionEvent {
-    let display_tone = match tone {
-        CardTone::Accent => NotificationTone::Accent,
-        CardTone::Success => NotificationTone::Success,
-        CardTone::Warning => NotificationTone::Warning,
-        CardTone::Error => NotificationTone::Error,
-        _ => NotificationTone::Neutral,
-    };
-    SessionEvent::Card {
-        title: title.to_owned(),
-        markdown: body.to_owned(),
-        plain: body.to_owned(),
-        tone,
-        display: Some(Box::new(NotificationCard {
-            title: title.to_owned(),
-            sender: "github".to_owned(),
-            recipient: "session".to_owned(),
-            delivery: NotificationDelivery::Received,
-            tone: display_tone,
-            preview: NotificationPreview::Truncated,
-            visibility: NotificationVisibility::Conversation,
-            reference: Some(reference.to_owned()),
-            subtitle: None,
-            body: body.to_owned(),
-            output: None,
-            details: Vec::new(),
-        })),
-    }
-}
-
 #[derive(Debug)]
 struct State {
     sessions: BTreeMap<String, FakeSession>,
@@ -2442,6 +2428,12 @@ impl State {
                 .collect();
             old.say("long", &sentences.join(" "));
         }
+        if script.old_cards {
+            old.say_cards("old-cards", cards::Sender::Typed);
+            old.say("old-cards", "One test fails; the rest is good news.");
+        }
+        // As rho loads it from its file: all of it saved.
+        old.reload();
         sessions.insert("old".to_owned(), old);
         let mut updated = 1_767_225_600;
         for n in 0..script.past_sessions {

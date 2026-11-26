@@ -18,6 +18,8 @@ fn update(value: serde_json::Value) -> SessionUpdate {
     SessionUpdate {
         seq: Seq(0),
         event: serde_json::from_value(value).expect("a valid session event"),
+        at: None,
+        notification: None,
     }
 }
 
@@ -1033,10 +1035,10 @@ fn a_ui_calls_surface_is_placed_once_after_the_call() {
     );
 }
 
-/// Only what this client saw arrive live has a time: a replay's events
-/// carry none. A replay of the whole conversation over it keeps the times
-/// this client saw up to the first entry that differs, and that one's if it
-/// is the same message.
+/// From a daemon that sends no times, only what this client saw arrive
+/// live has a time. A replay of the whole conversation over it keeps the
+/// times this client saw up to the first entry that differs, and that
+/// one's if it is the same message.
 #[test]
 fn only_live_entries_know_when_they_arrived() {
     let user = |id: &str, text: &str| {
@@ -1079,6 +1081,39 @@ fn only_live_entries_know_when_they_arrived() {
         "the edited message differs"
     );
     assert_eq!(arrived(&session), [false, false, true, false, false]);
+}
+
+/// A notification card the daemon sends again, by its id, as a reattach
+/// may, changes in place instead of adding a second row, and keeps the
+/// time it first happened.
+#[test]
+fn a_card_sent_again_stays_one_row() {
+    let card = |at: u64, text: &str| SessionUpdate {
+        at: Some(at),
+        notification: Some(
+            serde_json::from_value(json!({"id": "n-1", "urgency": "needs_you",
+                "subject": {"kind": "process", "id": "p-1"},
+                "items": [{"outcome": "failed", "subject": {"kind": "process", "id": "p-1"},
+                    "text": text}]}))
+            .expect("a valid notification"),
+        ),
+        ..update(
+            json!({"type": "card", "title": text, "markdown": "", "plain": "",
+            "tone": "error"}),
+        )
+    };
+    let mut session = session();
+    session.apply(card(1_000, "Failed · build"));
+    session.apply(card(2_000, "Failed (exit 2) · build"));
+    let [Entry::Notice(notice)] = session.entries() else {
+        panic!("one card: {:?}", session.entries());
+    };
+    assert_eq!(notice.items()[0].text, "Failed (exit 2) · build");
+    assert_eq!(
+        notice.arrived().map(|at| at.timestamp_millis()),
+        Some(1_000)
+    );
+    assert_eq!(notice.urgency(), Urgency::NeedsYou);
 }
 
 /// A notice of several lines, as a provider's diagnostic is, reads its

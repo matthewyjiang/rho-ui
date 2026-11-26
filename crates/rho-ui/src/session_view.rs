@@ -102,13 +102,14 @@ use crate::{
     pr_mark::pr_pill,
     projects::Projects,
     pull_requests::PullRequests,
+    rail,
     right_panel::Visibility,
     session_list::{Activity, LiveSession, NEW_SESSION, UNTITLED},
     session_settings::{model_summary, Availability, SessionSettings, SettingsEvent, Turn},
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
-    transcript::{find::Direction, ActionHandler, ItemContent, Transcript},
+    transcript::{find::Direction, Action, ActionHandler, ItemContent, Transcript},
     usage::UsageRing,
     work::Disclosure,
     workspaces::{Workspace, WorkspaceRef},
@@ -131,6 +132,9 @@ pub(crate) enum SessionEvent {
         /// The subagent's task, its title until its session says.
         title: SharedString,
     },
+    /// Open another session on this one's machine, such as one this one
+    /// started, from a card about it.
+    OpenSession(SessionId),
     /// Show a session above this one, from the title bar.
     Show(WeakEntity<SessionView>),
     /// Start a new session in this one's project, from the title bar.
@@ -1825,8 +1829,12 @@ impl SessionView {
             let view = view.clone();
             Rc::new(move |action, _, cx| {
                 let _ = view.update(cx, |this, cx| {
+                    if let Action::Open(link) = action {
+                        Self::open_link(link, cx);
+                        return;
+                    }
                     this.transcript.act(
-                        action,
+                        &action,
                         this.loading.drawn(&this.session).unwrap_or_default(),
                         cx,
                     );
@@ -2142,6 +2150,18 @@ impl SessionView {
                 this.stop_background(work.clone(), window, cx);
             });
         })
+    }
+
+    /// Opens what a card on the rail is about: a pull request in the right
+    /// panel, or a session.
+    fn open_link(link: rail::Link, cx: &mut Context<'_, Self>) {
+        cx.emit(match link {
+            rail::Link::PullRequest(id) => SessionEvent::ShowPullRequest(id),
+            rail::Link::Session(id) => SessionEvent::OpenSession(id),
+            rail::Link::Subagent { session, title } => {
+                SessionEvent::OpenSubagent { session, title }
+            }
+        });
     }
 
     /// Opens what a row of the background work opens: a subagent's

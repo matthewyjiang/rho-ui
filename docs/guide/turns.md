@@ -34,7 +34,11 @@ A session whose model isn't signed in still opens, with a card above the compose
 
 ## Times
 
-Hovering a message shows when it arrived, and each card rho sends between replies shows its time. rho doesn't record when things happened, so only what rho-ui saw arrive while it followed the session has a time: a conversation opened again later, or what came while rho-ui was disconnected, shows none.
+Hovering a message shows when it arrived, and each card rho sends between replies shows its time; hovering that time shows the full date. rho records when each card happened, so a conversation opened again later, or what came while rho-ui was disconnected, shows the times they happened, to the second. An older rho records none: there, only what rho-ui saw arrive while it followed the session has a time.
+
+## Cards between replies
+
+Past the first four in a row, the cards that don't need you, such as routine pull request news, fold behind one row that says what they hold. A failure or a question waiting on you never folds. rho says which is which; an older rho doesn't, and rho-ui goes by each card's color instead, so a peer's question can fold there.
 
 ## Forms
 

@@ -2182,6 +2182,12 @@ impl RhoApp {
                 SessionEvent::OpenSubagent { session, title } => {
                     this.open_subagent(view, session.clone(), title.clone(), window, cx);
                 }
+                // As its row in the sidebar opens it, if the sidebar lists
+                // it.
+                SessionEvent::OpenSession(id) => {
+                    let id = SessionKey::new(view.read(cx).key().machine, id.clone());
+                    this.sidebar.update(cx, |sidebar, cx| sidebar.open(&id, cx));
+                }
                 SessionEvent::Show(target) => {
                     // A side chat shows in the panel, beside its session.
                     let target = target.upgrade().map(|target| {
