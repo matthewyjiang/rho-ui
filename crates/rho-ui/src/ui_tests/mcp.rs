@@ -227,21 +227,38 @@ fn the_composer_attaches_mcp_resources() {
     assert_eq!((page.uri(), page.text()), (MCP_INTRO, Some(MCP_INTRO_TEXT)));
 }
 
-/// A catalog read that fails asks again at the next key, and not before:
-/// a session still loading, or a server that times out, gets one request a
-/// key, not a stream of them.
+/// A catalog read that fails asks again for the keys typed while it was
+/// asked, and after that only at the next key: a session still loading, or
+/// a server that times out, gets one request a key, not a stream of them,
+/// and no key is lost to one in flight.
 #[test]
 fn a_failed_catalog_read_asks_again_at_the_next_key() {
     let mut ui = Harness::start("mcp-catalog-fails", Script::default());
     open_session(&mut ui);
     ui.fake().fail_mcp_catalog();
+    ui.fake().hold_mcp_catalog();
 
-    for (typed, reads) in [("@a", 1), ("b", 2)] {
-        ui.type_in(typed);
-        ui.wait_for_daemon("the catalog asked", |fake| {
-            fake.mcp_catalog_reads() >= reads
-        });
-        ui.frame();
-        assert_eq!(ui.fake().mcp_catalog_reads(), reads, "after {typed:?}");
-    }
+    // `b` comes while `@a`'s read is held: the same mention, so it asks
+    // nothing until that one fails.
+    ui.type_in("@a");
+    ui.type_in("b");
+    ui.fake().release_mcp_catalog();
+    settle_catalog(&mut ui, 2, "for the key typed while it was asked");
+
+    ui.type_in("c");
+    settle_catalog(&mut ui, 3, "at the next key");
+}
+
+/// Waits until the composer has had `reads` catalog answers and asks no
+/// more, then checks a frame later that it has asked no more.
+fn settle_catalog(ui: &mut Harness, reads: usize, why: &str) {
+    ui.wait_for_daemon("the catalog asked", |fake| {
+        fake.mcp_catalog_reads() >= reads
+    });
+    ui.wait_until("the answer landed", |_, cx, app| {
+        app.active_session()
+            .is_some_and(|view| !view.read(cx).composer_is_asking_catalog(cx))
+    });
+    ui.frame();
+    assert_eq!(ui.fake().mcp_catalog_reads(), reads, "asked {why}");
 }

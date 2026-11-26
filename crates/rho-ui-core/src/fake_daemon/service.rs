@@ -1218,6 +1218,9 @@ impl Service for Fake {
         &self,
         params: SessionMcpCatalogParams,
     ) -> Result<SessionMcpCatalog, RpcError> {
+        let mut held = self.lock().mcp.catalog_held.subscribe();
+        // Gone with the daemon: the listing then answers as if released.
+        let _ = held.wait_for(|held| !held).await;
         self.lock().mcp_catalog(&params)
     }
 

@@ -439,6 +439,12 @@ impl ComposerState {
         !self.reads.is_empty()
     }
 
+    /// Whether the session's MCP catalog is being asked for.
+    #[cfg(test)]
+    pub(crate) fn is_asking_catalog(&self) -> bool {
+        self.mcp.is_asking_catalog()
+    }
+
     /// Whether the message can go: there is one, and no MCP resource is
     /// still being read for it, which would go missing.
     pub(crate) fn can_send(&self, cx: &App) -> bool {

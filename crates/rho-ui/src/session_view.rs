@@ -2326,6 +2326,12 @@ impl SessionView {
         self.kind
     }
 
+    /// Whether the composer is asking for the MCP catalog, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn composer_is_asking_catalog(&self, cx: &App) -> bool {
+        self.composer.read(cx).is_asking_catalog()
+    }
+
     /// Whether the composer still reads an MCP resource, for UI tests.
     #[cfg(test)]
     pub(crate) fn composer_is_reading(&self, cx: &App) -> bool {

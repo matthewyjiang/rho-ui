@@ -75,6 +75,12 @@ impl Mcp {
             .map_or(&[], |catalog| catalog.prompts.as_slice())
     }
 
+    /// Whether the catalog is being asked for.
+    #[cfg(test)]
+    pub(super) fn is_asking_catalog(&self) -> bool {
+        self.catalog_task.is_some()
+    }
+
     /// The resources the servers offered when last asked.
     pub(super) fn resources(&self) -> &[SessionMcpResource] {
         self.catalog
@@ -141,6 +147,7 @@ impl ComposerState {
         let asked = std::mem::replace(&mut self.mcp.catalog_for, catalog_for.clone());
         if catalog_for.is_some() && catalog_for != asked && !self.mcp.no_catalog {
             let link = link.clone();
+            let asked_text = text.to_owned();
             self.mcp.catalog_task = Some(cx.spawn(async move |this, cx| {
                 let catalog = link.daemon.mcp_catalog(&link.session).await;
                 let _ = this.update(cx, |this, cx| {
@@ -151,9 +158,16 @@ impl ComposerState {
                             this.refresh_menu(cx);
                         }
                         Ok(None) => this.mcp.no_catalog = true,
-                        // Still loading, say: the next key asks again, and
-                        // what was offered before stays, so nothing redraws.
-                        Err(_) => this.mcp.catalog_for = None,
+                        // Still loading, say: what was offered before stays,
+                        // and the next key asks again. Keys typed while
+                        // this was asked asked nothing, so the newest text
+                        // asks now, once.
+                        Err(_) => {
+                            this.mcp.catalog_for = None;
+                            if this.input.read(cx).value() != asked_text {
+                                this.update_menu(cx);
+                            }
+                        }
                     }
                 });
             }));

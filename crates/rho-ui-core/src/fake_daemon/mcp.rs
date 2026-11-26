@@ -63,6 +63,8 @@ pub(super) struct FakeMcp {
     startup: McpStartup,
     /// Whether resource reads wait; see [`FakeDaemon::hold_mcp_reads`].
     pub(super) reads_held: watch::Sender<bool>,
+    /// Whether the catalog waits; see [`FakeDaemon::hold_mcp_catalog`].
+    pub(super) catalog_held: watch::Sender<bool>,
     /// Whether the catalog fails; see [`FakeDaemon::fail_mcp_catalog`].
     catalog_fails: bool,
     /// How many times the catalog was asked for.
@@ -74,6 +76,7 @@ impl FakeMcp {
         Self {
             startup: script.mcp,
             reads_held: watch::Sender::new(false),
+            catalog_held: watch::Sender::new(false),
             catalog_fails: false,
             catalog_reads: 0,
         }
@@ -249,7 +252,19 @@ impl FakeDaemon {
         self.service.lock().mcp.catalog_fails = true;
     }
 
-    /// How many times `rho/session/mcp/catalog` was asked.
+    /// Makes `rho/session/mcp/catalog` wait until
+    /// [`Self::release_mcp_catalog`], as a slow server's listing does.
+    pub fn hold_mcp_catalog(&self) {
+        self.service.lock().mcp.catalog_held.send_replace(true);
+    }
+
+    /// Answers the listings [`Self::hold_mcp_catalog`] held, and those
+    /// after.
+    pub fn release_mcp_catalog(&self) {
+        self.service.lock().mcp.catalog_held.send_replace(false);
+    }
+
+    /// How many times `rho/session/mcp/catalog` was answered.
     pub fn mcp_catalog_reads(&self) -> usize {
         self.service.lock().mcp.catalog_reads
     }
