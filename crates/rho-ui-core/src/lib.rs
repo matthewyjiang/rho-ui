@@ -85,6 +85,14 @@ pub use rho_protocol::{
     PullRequestThreadState, PullRequestTrouble, PullRequestVerdict, SessionPullRequestLinkResponse,
     SessionPullRequestShowResponse, SessionPullRequests,
 };
+/// What the daemon's configuration sets up, as
+/// [`Daemon::configured_mcp_servers`] and [`Daemon::configured_hooks`] list
+/// it, as rho-protocol has it.
+pub use rho_protocol::{
+    ConfiguredMcpServer, HookContract, HookEvent, HookStatus, HookTools, HookWarning, HooksFile,
+    HooksFileScope, HooksFileStatus, HooksListResponse, McpListResponse, McpServerSource,
+    McpTransport,
+};
 /// A session's background processes and their output, as
 /// [`Daemon::processes`] reads them, as rho-protocol has them.
 pub use rho_protocol::{

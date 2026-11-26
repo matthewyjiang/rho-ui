@@ -60,6 +60,7 @@ use crate::{
     auths::Auths,
     background_log::BackgroundLog,
     cloning,
+    configured::Configured,
     draft::{DraftEvent, DraftSettings, DraftView},
     forge::Forges,
     kinetic::Kinetic,
@@ -248,6 +249,9 @@ pub(crate) struct RhoApp {
     auths: Entity<Auths>,
     /// The session worktrees of each connected machine, for Settings.
     worktrees: Entity<Worktrees>,
+    /// The MCP servers and hooks each connected machine's rho
+    /// configures, for Settings.
+    configured: Entity<Configured>,
     /// Each machine's rho, apart from its daemon: installing and updating.
     installs: Entity<Installs>,
     /// rho-ui's own updates.
@@ -359,6 +363,7 @@ impl RhoApp {
             rho_settings: cx.new(|_| RhoSettings::default()),
             auths: cx.new(|_| Auths::default()),
             worktrees: cx.new(|_| Worktrees::default()),
+            configured: cx.new(|_| Configured::default()),
             installs,
             app_update,
             forges,
@@ -448,6 +453,8 @@ impl RhoApp {
                 .update(cx, |auths, cx| auths.forget(&gone.machine, cx));
             self.worktrees
                 .update(cx, |worktrees, cx| worktrees.forget(&gone.machine, cx));
+            self.configured
+                .update(cx, |configured, cx| configured.forget(&gone.machine, cx));
             self.prs.update(cx, |prs, cx| prs.forget(&gone.machine, cx));
             self.forges
                 .update(cx, |forges, cx| forges.forget(&gone.machine, cx));
@@ -545,6 +552,8 @@ impl RhoApp {
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.forget(machine, cx));
+        self.configured
+            .update(cx, |configured, cx| configured.forget(machine, cx));
         self.prs.update(cx, |prs, cx| prs.forget(machine, cx));
         self.installs
             .update(cx, |installs, cx| installs.set_upgrade(machine, None, cx));
@@ -637,6 +646,9 @@ impl RhoApp {
             .update(cx, |auths, cx| auths.connected(machine, daemon.clone(), cx));
         self.worktrees.update(cx, |worktrees, cx| {
             worktrees.connected(machine, daemon.clone(), cx);
+        });
+        self.configured.update(cx, |configured, cx| {
+            configured.connected(machine, daemon.clone(), cx);
         });
         self.prs
             .update(cx, |prs, cx| prs.connected(machine, daemon.clone(), cx));
@@ -740,6 +752,8 @@ impl RhoApp {
         self.auths.update(cx, |auths, cx| auths.forget(machine, cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.forget(machine, cx));
+        self.configured
+            .update(cx, |configured, cx| configured.forget(machine, cx));
         self.prs.update(cx, |prs, cx| prs.forget(machine, cx));
         self.workspaces
             .update(cx, |workspaces, _| workspaces.disconnected(machine));
@@ -1020,6 +1034,9 @@ impl RhoApp {
             rho_settings: self.rho_settings.clone(),
             auths: self.auths.clone(),
             worktrees: self.worktrees.clone(),
+            configured: self.configured.clone(),
+            project: self.shown_project(cx),
+            projects: self.projects.clone(),
             sidebar: self.sidebar.clone(),
             workspaces: self.workspaces.clone(),
             forges: self.forges.clone(),
@@ -1027,6 +1044,20 @@ impl RhoApp {
             app_update: self.app_update.clone(),
         };
         settings_view::open(app, window, cx);
+    }
+
+    /// The project of the session or draft on screen, which Settings → MCP
+    /// & hooks shows first.
+    fn shown_project(&self, cx: &App) -> Option<Place> {
+        match &self.pane {
+            Pane::Session(view) => view
+                .read(cx)
+                .projects(cx)
+                .first()
+                .map(|project| project.root()),
+            Pane::Draft(draft) => Some(draft.read(cx).cwd().clone()),
+            Pane::Empty => None,
+        }
     }
 
     /// Notes that `machine`'s daemon may restart in place, so its

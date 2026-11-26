@@ -5,12 +5,14 @@
 //! its settings file: Appearance, Notifications, the Machines page in
 //! [`machines`], and the forge CLIs on each machine in [`source_control`].
 //! Then come rho's own: each machine's sign-ins to providers, in
-//! [`providers`], the worktrees it added for sessions, in [`worktrees`], and
-//! a page per category its daemon describes, saved in that machine's
-//! `config.toml`: see [`rho`]. Last, [`about`] shows the versions of rho-ui
-//! and of Rho on each machine.
+//! [`providers`], the worktrees it added for sessions, in [`worktrees`], a
+//! page per category its daemon describes, saved in that machine's
+//! `config.toml`: see [`rho`], and the MCP servers and hooks its
+//! configuration sets up, read-only, in [`configured`]. Last, [`about`]
+//! shows the versions of rho-ui and of Rho on each machine.
 
 mod about;
+mod configured;
 mod machines;
 mod providers;
 mod rho;
@@ -35,8 +37,10 @@ use gpui_kit::{
 use crate::{
     app_update::AppUpdate,
     auths::Auths,
+    configured::Configured,
     forge::Forges,
-    machines::{MachineId, MachineStatus, Machines},
+    machines::{MachineId, MachineStatus, Machines, Place},
+    projects::Projects,
     rho_install::Installs,
     rho_settings::RhoSettings,
     settings::{
@@ -47,6 +51,7 @@ use crate::{
     workspaces::Workspaces,
     worktrees::Worktrees,
 };
+use configured::ConfiguredFields;
 use machines::MachineFields;
 use providers::ProvidersFields;
 use rho::RhoFields;
@@ -114,6 +119,13 @@ pub(crate) struct AppState {
     pub(crate) auths: Entity<Auths>,
     /// The worktrees each machine's rho added for sessions.
     pub(crate) worktrees: Entity<Worktrees>,
+    /// The MCP servers and hooks each machine's rho configures.
+    pub(crate) configured: Entity<Configured>,
+    /// The project of the session or draft on screen, whose MCP servers
+    /// and hooks show first.
+    pub(crate) project: Option<Place>,
+    /// The user's projects, to read MCP servers and hooks for.
+    pub(crate) projects: Entity<Projects>,
     /// The listed sessions, whose titles name their worktrees.
     pub(crate) sidebar: Entity<SidebarView>,
     /// Each machine's home folder, which paths show as `~`.
@@ -201,6 +213,7 @@ struct SettingsView {
     source_control: SourceControlFields,
     providers: ProvidersFields,
     worktrees: WorktreesFields,
+    configured: ConfiguredFields,
     /// Each machine's rho, for About.
     installs: Entity<Installs>,
     /// rho-ui's own updates, for About.
@@ -215,6 +228,9 @@ impl SettingsView {
             rho_settings,
             auths,
             worktrees,
+            configured,
+            project,
+            projects,
             sidebar,
             workspaces,
             forges,
@@ -238,6 +254,14 @@ impl SettingsView {
             ui_font,
             code_font,
             machines: MachineFields::new(window, cx),
+            configured: ConfiguredFields::new(
+                &machines,
+                configured,
+                project,
+                projects,
+                workspaces.clone(),
+                cx,
+            ),
             source_control: SourceControlFields::new(&machines, workspaces, forges, cx),
             providers: ProvidersFields::new(&machines, auths, cx),
             worktrees: WorktreesFields::new(&machines, worktrees, sidebar, cx),
@@ -336,7 +360,12 @@ struct PickedMachine(MachineId);
 impl PickedMachine {
     /// This machine, until the user picks another.
     fn new() -> Self {
-        Self(MachineId::local())
+        Self::of(MachineId::local())
+    }
+
+    /// `machine`, until the user picks another.
+    fn of(machine: MachineId) -> Self {
+        Self(machine)
     }
 
     fn shown(&self, machines: &Machines) -> MachineId {
@@ -585,6 +614,7 @@ impl Render for SettingsView {
         let providers = self.providers_page(window, cx);
         let worktrees = self.worktrees_page(cx);
         let rho = self.rho_page(window, cx);
+        let configured = self.configured_page(cx);
         let about = about::about_page(&self.machine_list, &self.installs, &self.app_update, cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
@@ -609,6 +639,7 @@ impl Render for SettingsView {
                     .page(providers)
                     .page(worktrees)
                     .page(rho)
+                    .page(configured)
                     .page(about),
             )
     }

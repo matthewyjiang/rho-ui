@@ -20,9 +20,10 @@ use rho_protocol::{
     AuthLoginCancelResponse, AuthLoginParams, AuthLoginResponse, AuthLogoutParams,
     AuthLogoutResponse, BackgroundStatus, BuildId, CardTone, ClientInfo, ConfigGetParams,
     ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus,
-    DetachReason, DetailedSessionSummary, ErrorCode, InputAnswer, InputAsker, InputRequest,
-    InputRequestId, InputTimeout, LoginStream, ModelListParams, ModelWatch, Operation,
-    PermissionMode, PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
+    DetachReason, DetailedSessionSummary, ErrorCode, HooksListParams, HooksListResponse,
+    InputAnswer, InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream,
+    McpListParams, McpListResponse, ModelListParams, ModelWatch, Operation, PermissionMode,
+    PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
     SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
     SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
     SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
@@ -1333,5 +1334,13 @@ impl SettingsService for Fake {
 
     async fn list_models(&self, _: ModelListParams) -> Result<ModelWatch, RpcError> {
         Ok(ModelWatch::new(self.lock().models.subscribe()))
+    }
+
+    async fn list_mcp_servers(&self, params: McpListParams) -> Result<McpListResponse, RpcError> {
+        self.lock().configured_mcp(&params)
+    }
+
+    async fn list_hooks(&self, params: HooksListParams) -> Result<HooksListResponse, RpcError> {
+        self.lock().configured_hooks(&params)
     }
 }
