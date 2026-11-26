@@ -7311,6 +7311,7 @@ dependencies = [
  "ratex-parser",
  "ratex-svg",
  "ratex-types",
+ "regex",
  "resvg 0.46.0",
  "rho-ui-core",
  "rquickjs",

@@ -33,7 +33,7 @@ use gpui_kit::{
 };
 use rho_ui_core::{Notice, NoticeTone};
 
-use crate::{time, work::Disclosure};
+use crate::{time, transcript::find::Marks, work::Disclosure};
 
 /// How many cards of a run always show before its routine ones fold. It
 /// comes from the C1 mockup the design was picked from, not from measuring
@@ -184,6 +184,13 @@ impl<'a> Subject<'a> {
             Self::PullRequest { reference, .. } => reference,
         }
     }
+
+    /// What its chip says.
+    pub(crate) fn label(&self) -> &'a str {
+        match self {
+            Self::PullRequest { label, .. } => label,
+        }
+    }
 }
 
 /// One row of the rail: what a card says, in a line. A card makes one row
@@ -232,12 +239,22 @@ fn outcome_and_name<'a>(
     }
 }
 
-/// A card's row: entry `ix`'s line, and under it, while `detail` is
-/// `Some`, its body. `on_click` opens or closes the body; a card with no
-/// body has none.
+/// What find marks in a card's line: in its chip, its outcome and its
+/// name.
+#[derive(Default)]
+pub(crate) struct LineMarks {
+    pub(crate) subject: Marks,
+    pub(crate) outcome: Marks,
+    pub(crate) name: Marks,
+}
+
+/// A card's row: entry `ix`'s line, with what find `marks` in it, and
+/// under it, while `detail` is `Some`, its body. `on_click` opens or closes
+/// the body; a card with no body has none.
 pub(crate) fn card_row(
     ix: usize,
     line: &Line<'_>,
+    marks: LineMarks,
     ends: Ends,
     detail: Option<AnyElement>,
     on_click: Option<impl Fn(&mut Window, &mut App) + 'static>,
@@ -270,13 +287,17 @@ pub(crate) fn card_row(
                 .group_hover(ROW_GROUP, |style| style.opacity(1.))
         })
     });
+    let LineMarks {
+        subject: subject_marks,
+        outcome,
+        name: name_marks,
+    } = marks;
     let chip = line.subject.as_ref().map(|subject| {
-        let Subject::PullRequest { label, .. } = subject;
         Tag::secondary()
             .small()
             .flex_none()
             .font_family(theme.mono_font_family.clone())
-            .child(SharedString::from(label.to_string()))
+            .child(subject_marks.text(subject.label().to_owned(), cx))
     });
     let row = row_frame(cx)
         .group(ROW_GROUP)
@@ -293,7 +314,7 @@ pub(crate) fn card_row(
                 .min_w_0()
                 .when(line.name.is_some(), Styled::flex_none)
                 .truncate()
-                .child(line.outcome.to_owned()),
+                .child(outcome.text(line.outcome.to_owned(), cx)),
         )
         .children(line.name.map(|name| {
             // Names read in the body text's color.
@@ -301,7 +322,7 @@ pub(crate) fn card_row(
                 .min_w_0()
                 .truncate()
                 .text_color(theme.foreground)
-                .child(name.to_owned())
+                .child(name_marks.text(name.to_owned(), cx))
         }))
         .children(chevron)
         .child(clock(line.arrived, cx))

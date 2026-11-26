@@ -15,6 +15,8 @@
 //! each of its parts ([`crate::parts`]), so the scroller draws only the
 //! parts near the window.
 
+pub(crate) mod find;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -45,7 +47,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window,
 };
 use rho_ui_core::{
-    surface::SurfaceRef, Compaction, Delay, Entry, Notice, Row, Timeline, ToolContent, UserMessage,
+    surface::SurfaceRef, Compaction, Delay, Entry, Notice, Row, Step, Timeline, ToolContent,
+    UserMessage,
 };
 
 use crate::{
@@ -59,8 +62,9 @@ use crate::{
     surface_view::Surfaces,
     turn_times::TurnTimes,
     usage,
-    work::{self, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
+    work::{self, BodyView, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
+use find::{Field, Find};
 
 /// [`figures::extensions`] and the plugin for images by path, for a
 /// `TextView` showing message `entry` of a session whose images `pictures`
@@ -270,6 +274,10 @@ pub(crate) struct Transcript {
     delay: Option<Delay>,
     /// Diff viewers, made when a step with patches first opens.
     diffs: Vec<DiffView>,
+    /// Text views of steps' Markdown details, made when they first open.
+    bodies: Vec<BodyView>,
+    /// What the find bar found.
+    find: Find,
     /// Per entry: a user message's attachments, or a tool's images, ready
     /// to draw.
     attachments: Vec<Vec<Preview>>,
@@ -296,6 +304,8 @@ impl Transcript {
             running: None,
             delay: None,
             diffs: Vec::new(),
+            bodies: Vec::new(),
+            find: Find::default(),
             attachments: Vec::new(),
             markdown: Vec::new(),
         }
@@ -326,6 +336,23 @@ impl Transcript {
     /// Whether row `row` is a compaction's. It stays out of its turn's
     /// folded working: the model sees what came before it only as a
     /// summary, which matters after the turn too.
+    /// Whether `row` of `turn` folds behind the turn's "Worked for" line
+    /// once the turn ends.
+    fn folds_in_working(&self, turn: usize, row: usize, entries: &[Entry]) -> bool {
+        let working = self.timeline.working(turn);
+        working.is_some_and(|rows| rows.contains(&row)) && !self.is_compaction_row(row, entries)
+    }
+
+    /// Unfolds the run of cards whose first is entry `first`; whether it
+    /// was folded.
+    fn unfold_run(&mut self, first: usize) -> bool {
+        let folded = self.unfolded.insert(first);
+        if folded {
+            self.placed.get_mut().clear();
+        }
+        folded
+    }
+
     fn is_compaction_row(&self, row: usize, entries: &[Entry]) -> bool {
         matches!(
             self.timeline.rows().get(row),
@@ -358,7 +385,8 @@ impl Transcript {
         if let Some(row) = synced.grew {
             self.remeasure(row..row + 1, cx);
         }
-        for (ix, entry) in entries.iter().enumerate().skip(self.markdown.len()) {
+        let seen_entries = self.markdown.len();
+        for (ix, entry) in entries.iter().enumerate().skip(seen_entries) {
             let markdown = self.markdown(ix, entry, cx);
             self.markdown.push(markdown);
         }
@@ -404,6 +432,7 @@ impl Transcript {
                 self.remeasure(self.run_of(before, entries), cx);
             }
         }
+        self.find_again(seen_entries..entries.len(), entries, cx);
     }
 
     /// The card row `row` shows, if it shows one, with its entry.
@@ -454,6 +483,8 @@ impl Transcript {
         self.pictures
             .update(cx, |pictures, _| pictures.forget_from(from));
         self.diffs.retain(|diff| diff.entry < from);
+        self.bodies.retain(|body| body.entry < from);
+        self.find_truncate(from);
         self.worked.truncate(turns);
         self.took.truncate(turns);
         let gone = self.items.borrow_mut().truncate(rows);
@@ -485,17 +516,51 @@ impl Transcript {
             self.set_markdown(ix, entry, cx);
         }
         if let Some(Entry::Tool(tool)) = entries.get(ix) {
-            match self.diffs.iter_mut().find(|diff| diff.entry == ix) {
-                Some(diff) => diff.update(tool, cx),
-                // Open before its patch came: the viewer is made now.
-                None if self.details.get(ix).is_some_and(|open| open.is_open()) => {
-                    self.diffs.extend(DiffView::new(ix, tool, cx));
-                }
-                None => {}
+            if let Some(diff) = self.diffs.iter_mut().find(|diff| diff.entry == ix) {
+                diff.update(tool, cx);
             }
         }
+        if let Some(step) = entries.get(ix).and_then(Entry::as_step) {
+            if let Some(body) = self.bodies.iter_mut().find(|body| body.entry == ix) {
+                body.update(step, cx);
+            }
+        }
+        // Open before its patch or body came: their views are made now.
+        if self.details.get(ix).is_some_and(|open| open.is_open()) {
+            self.open_views(ix, entries, cx);
+        }
+        self.find_again(ix..ix + 1, entries, cx);
         if let Some(row) = self.timeline.row_of(ix) {
             self.remeasure(row..row + 1, cx);
+        }
+    }
+
+    /// Makes step `ix`'s diff viewer and the text view of its Markdown
+    /// details, those it has and lacks, as its details open.
+    fn open_views(&mut self, ix: usize, entries: &[Entry], cx: &mut App) {
+        let (Some(step), Some(row)) = (
+            entries.get(ix).and_then(Entry::as_step),
+            self.timeline.row_of(ix),
+        ) else {
+            return;
+        };
+        if let Step::Tool(tool) = step {
+            if !self.diffs.iter().any(|diff| diff.entry == ix) {
+                self.diffs.extend(DiffView::new(ix, tool, cx));
+            }
+        }
+        if self.bodies.iter().any(|body| body.entry == ix) {
+            return;
+        }
+        let scroller = self.scroller.clone();
+        let items = Rc::clone(&self.items);
+        let relayout = move |cx: &mut App| {
+            let items = items.borrow().of(row..row + 1);
+            scroller.update(cx, |scroller, cx| scroller.remeasure_items(items, cx));
+        };
+        if let Some(body) = BodyView::new(ix, step, relayout, cx) {
+            self.bodies.push(body);
+            self.find_again(ix..ix + 1, entries, cx);
         }
     }
 
@@ -707,11 +772,7 @@ impl Transcript {
                     return;
                 };
                 details.toggle();
-                if let Some(Entry::Tool(tool)) = entries.get(ix) {
-                    if !self.diffs.iter().any(|diff| diff.entry == ix) {
-                        self.diffs.extend(DiffView::new(ix, tool, cx));
-                    }
-                }
+                self.open_views(ix, entries, cx);
                 row..row + 1
             }
             Action::Worked { turn } => {
@@ -735,8 +796,7 @@ impl Transcript {
                 let Some(row) = self.timeline.row_of(entry) else {
                     return;
                 };
-                self.unfolded.insert(entry);
-                self.placed.get_mut().clear();
+                self.unfold_run(entry);
                 self.run_of(row, entries)
             }
         };
@@ -800,10 +860,7 @@ impl Transcript {
                 .child(self.render_content(place, entries, act, cx))
                 .into_any_element();
         };
-        let working = self.timeline.working(turn);
-        if working.as_ref().is_some_and(|rows| rows.contains(&row))
-            && !self.is_compaction_row(row, entries)
-        {
+        if self.folds_in_working(turn, row, entries) {
             let shows = if self.is_finished(turn) {
                 self.worked[turn]
             } else {
@@ -932,6 +989,8 @@ impl Transcript {
                         details: &self.details[run.clone()],
                         images: &self.attachments[run.clone()],
                         diffs: &self.diffs,
+                        bodies: &self.bodies,
+                        find: &self.find,
                         phase,
                         on_fold,
                     },
@@ -1022,7 +1081,12 @@ impl Transcript {
                         act(Action::Card { entry: ix }, window, cx);
                     }
                 });
-                rail::card_row(ix, &Line::of(notice), *ends, detail, toggle, cx)
+                let marks = rail::LineMarks {
+                    subject: self.find.marks(ix, Field::Subject),
+                    outcome: self.find.marks(ix, Field::Title),
+                    name: self.find.marks(ix, Field::Name),
+                };
+                rail::card_row(ix, &Line::of(notice), marks, *ends, detail, toggle, cx)
             }
         }
     }

@@ -122,6 +122,8 @@ gpui_kit::actions!(
         NewSessionIn,
         /// Stop the running turn in the focused session.
         StopTurn,
+        /// Find text in the focused session's transcript.
+        FindInTranscript,
         /// Open settings.
         OpenSettings,
         /// Collapse the sidebar to its rail, or open it again.
@@ -430,13 +432,14 @@ fn init(cx: &mut App, db: &StateDb) {
         shortcut("secondary-b", ToggleSidebar, Some("RhoApp"), cx),
         shortcut("secondary-alt-b", ToggleRightPanel, Some("RhoApp"), cx),
         shortcut("secondary-q", Quit, None, cx),
+        shortcut("secondary-f", FindInTranscript, Some("RhoApp"), cx),
     ]);
     cx.bind_keys([
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
         // The terminal takes these keys for the program in it: Tab moves the
         // keyboard elsewhere, and off macOS, where the app's shortcuts take
-        // Ctrl, those are the shell's (Ctrl+B and Ctrl+N move the cursor in
-        // readline). On macOS they take Cmd, which a terminal leaves to the
+        // Ctrl, those are the shell's (Ctrl+B, Ctrl+F and Ctrl+N move the
+        // cursor in readline). On macOS they take Cmd, which a terminal leaves to the
         // app.
         KeyBinding::new("tab", NoAction, Some("Terminal")),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
@@ -444,6 +447,8 @@ fn init(cx: &mut App, db: &StateDb) {
         KeyBinding::new("ctrl-b", NoAction, Some("Terminal")),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-n", NoAction, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-f", NoAction, Some("Terminal")),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-n", NoAction, Some("Terminal")),
         // The terminal's clipboard keys, as Ghostty's: Cmd+C and Cmd+V on
