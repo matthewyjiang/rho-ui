@@ -575,8 +575,8 @@ impl Transcript {
         };
         if let Entry::Notice(notice) = shown {
             for (n, line) in Card::of(entry, notice).lines.iter().enumerate() {
-                if let Some(chip) = &line.chip {
-                    found(Field::Card(n, CardPart::Chip), chip);
+                if let Some(chip) = line.chip() {
+                    found(Field::Card(n, CardPart::Chip), &chip);
                 }
                 found(Field::Card(n, CardPart::Text), line.text);
             }

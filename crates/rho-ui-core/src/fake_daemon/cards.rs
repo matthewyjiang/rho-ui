@@ -40,7 +40,7 @@ impl FakeSubject {
     /// # Panics
     ///
     /// If a pull request's repo isn't `owner/name`: [`CARDS`] has a bug.
-    pub fn wire(self) -> NotificationSubject {
+    fn wire(self) -> NotificationSubject {
         match self {
             Self::PullRequest { repo, number } => {
                 let (owner, name) = repo.split_once('/').expect("a repo is owner/name");

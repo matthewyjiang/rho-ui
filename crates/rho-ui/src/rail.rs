@@ -169,8 +169,9 @@ pub(crate) struct Ends {
 /// What clicking a card's subject opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Link {
-    /// A pull request, in the session's Pull request surface.
-    PullRequest(PullRequestId),
+    /// A pull request, in the session's Pull request surface, or at `url`
+    /// once the session no longer links it.
+    PullRequest { id: PullRequestId, url: String },
     /// Another session, such as one this one started.
     Session(SessionId),
     /// A subagent's session, with the line that names it, its title until
@@ -195,40 +196,42 @@ pub(crate) struct Line<'a> {
     pub(crate) text: &'a str,
     /// What happened, for a fold row's tally.
     outcome: Option<NotificationOutcome>,
-    /// The pull request it is about, as its chip names it: `rho-ui#12`.
-    pub(crate) chip: Option<String>,
     /// What clicking its subject opens.
     link: Option<Link>,
 }
 
 impl<'a> Line<'a> {
     fn of(item: &'a NotificationItem) -> Self {
-        let (chip, link) = match &item.subject {
-            // The owner is rarely what tells two apart.
-            NotificationSubject::PullRequest { id, .. } => (
-                Some(format!("{}#{}", id.name, id.number)),
-                Some(Link::PullRequest(id.clone())),
-            ),
-            NotificationSubject::Session { id } => (None, Some(Link::Session(id.clone().into()))),
+        let link = match &item.subject {
+            NotificationSubject::PullRequest { id, url } => Some(Link::PullRequest {
+                id: id.clone(),
+                url: url.clone(),
+            }),
+            NotificationSubject::Session { id } => Some(Link::Session(id.clone().into())),
             NotificationSubject::Subagent {
                 session: Some(session),
                 ..
-            } => (
-                None,
-                Some(Link::Subagent {
-                    session: session.clone().into(),
-                    title: SharedString::from(item.text.clone()),
-                }),
-            ),
+            } => Some(Link::Subagent {
+                session: session.clone().into(),
+                title: SharedString::from(item.text.clone()),
+            }),
             // A process, a workflow, a subagent with no session, or a kind
             // a newer rho adds: nothing here opens it.
-            _ => (None, None),
+            _ => None,
         };
         Self {
             text: &item.text,
             outcome: Some(item.outcome),
-            chip,
             link,
+        }
+    }
+
+    /// The pull request it is about, as its chip names it: `rho-ui#12`.
+    /// The owner is rarely what tells two apart.
+    pub(crate) fn chip(&self) -> Option<String> {
+        match &self.link {
+            Some(Link::PullRequest { id, .. }) => Some(format!("{}#{}", id.name, id.number)),
+            _ => None,
         }
     }
 }
@@ -254,7 +257,6 @@ impl<'a> Card<'a> {
             lines.push(Line {
                 text: notice.title(),
                 outcome: None,
-                chip: None,
                 link: None,
             });
         }
@@ -269,7 +271,7 @@ impl<'a> Card<'a> {
 }
 
 /// What entry `ix`'s card's elements' IDs start with; see [`Card::key`].
-pub(crate) fn card_key(ix: usize, notice: &Notice) -> SharedString {
+fn card_key(ix: usize, notice: &Notice) -> SharedString {
     match notice.id() {
         Some(id) => SharedString::from(format!("card-{id}")),
         None => SharedString::from(format!("card-{ix}")),
@@ -284,28 +286,34 @@ pub(crate) struct LineMarks {
 }
 
 /// A card's rows, with what find marks in each line, and under the last,
-/// while `detail` is `Some`, the card's body. `on_toggle` opens or closes
-/// the body; a card with no body has none.
+/// while its body is open, the body.
 pub(crate) struct CardRows<'a> {
     pub(crate) card: &'a Card<'a>,
     /// One per line of the card.
     pub(crate) marks: Vec<LineMarks>,
     pub(crate) ends: Ends,
-    pub(crate) detail: Option<AnyElement>,
-    pub(crate) on_toggle: Option<ToggleHandler>,
+    pub(crate) body: Body,
     pub(crate) on_open: OpenHandler,
 }
 
-/// A card's body, as its rows show it: one opens or closes it on a click,
-/// and the first's chevron says which it is.
-enum Body {
+/// A card's body, which a click on any of its rows opens or closes.
+pub(crate) enum Body {
     /// The card has none.
+    None,
+    Shut(ToggleHandler),
+    /// Open, drawn as the element.
+    Open(ToggleHandler, AnyElement),
+}
+
+/// Whether a card's body is open, for its rows: the first's chevron says
+/// which, and a click on any toggles it.
+enum Toggle {
     None,
     Shut(ToggleHandler),
     Open(ToggleHandler),
 }
 
-impl Body {
+impl Toggle {
     fn on_toggle(&self) -> Option<ToggleHandler> {
         match self {
             Self::None => None,
@@ -320,14 +328,13 @@ impl CardRows<'_> {
             card,
             marks,
             ends,
-            mut detail,
-            on_toggle,
+            body,
             on_open,
         } = self;
-        let body = match on_toggle {
-            None => Body::None,
-            Some(on_toggle) if detail.is_some() => Body::Open(on_toggle),
-            Some(on_toggle) => Body::Shut(on_toggle),
+        let (toggle, mut detail) = match body {
+            Body::None => (Toggle::None, None),
+            Body::Shut(on_toggle) => (Toggle::Shut(on_toggle), None),
+            Body::Open(on_toggle, detail) => (Toggle::Open(on_toggle), Some(detail)),
         };
         let count = card.lines.len();
         let mut marks = marks.into_iter();
@@ -340,7 +347,7 @@ impl CardRows<'_> {
                 n,
                 line,
                 marks.next().unwrap_or_default(),
-                &body,
+                &toggle,
                 &on_open,
                 cx,
             );
@@ -385,7 +392,7 @@ fn line_row(
     n: usize,
     line: &Line<'_>,
     marks: LineMarks,
-    body: &Body,
+    toggle: &Toggle,
     on_open: &OpenHandler,
     cx: &App,
 ) -> ObservedElement<Stateful<Div>> {
@@ -404,17 +411,18 @@ fn line_row(
             .opacity(0.)
             .group_hover(CARD_GROUP, |style| style.opacity(1.))
     };
-    let chevron = match body {
+    let chevron = match toggle {
         _ if n > 0 => None,
-        Body::None => None,
-        Body::Shut(_) => Some(on_hover(chevron(Lucide::ChevronRight, cx))),
-        Body::Open(_) => Some(chevron(Lucide::ChevronDown, cx)),
+        Toggle::None => None,
+        Toggle::Shut(_) => Some(on_hover(chevron(Lucide::ChevronRight, cx))),
+        Toggle::Open(_) => Some(chevron(Lucide::ChevronDown, cx)),
     };
     let LineMarks {
         chip: chip_marks,
         text: text_marks,
     } = marks;
-    let chip = line.chip.as_ref().map(|label| {
+    let chip_label = line.chip();
+    let chip = chip_label.as_ref().map(|label| {
         let tag = Tag::secondary()
             .small()
             .flex_none()
@@ -454,7 +462,7 @@ fn line_row(
         }
         _ => None,
     };
-    let label = match &line.chip {
+    let label = match &chip_label {
         Some(chip) => format!("{chip} · {}", line.text),
         None => line.text.to_owned(),
     };
@@ -475,7 +483,7 @@ fn line_row(
         .when(n == 0, |row| {
             row.child(clock(format!("{key}-time"), card.arrived, cx))
         })
-        .when_some(body.on_toggle(), |row, on_toggle| {
+        .when_some(toggle.on_toggle(), |row, on_toggle| {
             row.cursor_pointer()
                 .hover(|style| style.bg(hovered(cx)))
                 .on_click(move |_, window, cx| on_toggle(window, cx))
@@ -534,10 +542,10 @@ pub(crate) fn fold_row(
 }
 
 /// What folded rows say, counted by outcome in the order they came:
-/// "2 completed, 1 new comments". Past [`TALLY_KINDS`] kinds the rest
+/// "2 completed, 1 with new comments". Past [`TALLY_KINDS`] kinds the rest
 /// count as other; rows that don't say what happened aren't counted.
 fn tally(folded: &[&Line<'_>]) -> String {
-    let mut kinds: Vec<(String, usize)> = Vec::new();
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
     for outcome in folded
         .iter()
         .filter_map(|line| line.outcome.and_then(outcome_words))
@@ -559,12 +567,39 @@ fn tally(folded: &[&Line<'_>]) -> String {
     parts.join(", ")
 }
 
-/// `outcome` in words, "checks failed", as rho names it on the wire,
-/// `checks_failed`; none for one this client doesn't know.
-fn outcome_words(outcome: NotificationOutcome) -> Option<String> {
-    let name = serde_json::to_value(outcome).ok()?;
-    let name = name.as_str().filter(|name| *name != "unknown")?;
-    Some(name.replace('_', " "))
+/// `outcome` in words that read after a count of rows, "2 failed"; none
+/// for one this client doesn't know.
+fn outcome_words(outcome: NotificationOutcome) -> Option<&'static str> {
+    use NotificationOutcome as O;
+    Some(match outcome {
+        O::Update => "updated",
+        O::Question => "asking",
+        O::ActionRequested => "asking you to act",
+        O::Running => "running",
+        O::Completed => "completed",
+        O::Failed => "failed",
+        O::FailedToStart => "failed to start",
+        O::Exited => "exited",
+        O::Stopped => "stopped",
+        O::Cancelled => "cancelled",
+        O::TimedOut => "timed out",
+        O::Interrupted => "interrupted",
+        O::CutOff => "cut off",
+        O::Refused => "refused",
+        O::OutOfSteps => "out of steps",
+        O::NewCommits => "with new commits",
+        O::ChecksFailed => "with failing checks",
+        O::ChecksPassed => "with passing checks",
+        O::ChecksFinished => "with checks finished",
+        O::NewComments => "with new comments",
+        O::MergeConflict => "in conflict",
+        O::Merged => "merged",
+        O::Closed => "closed",
+        O::WatchStopped => "no longer watched",
+        O::Unreadable => "unreadable",
+        // A value a newer rho adds.
+        _ => return None,
+    })
 }
 
 /// A row's line, card or fold, without its content: one line of small
@@ -586,8 +621,8 @@ fn hovered(cx: &App) -> Hsla {
 }
 
 /// A time as the rail and the messages show it, small and faint, which
-/// says it in full on hover; nothing for an entry with no time. `id` is
-/// the element's, which its tooltip needs.
+/// says it in full on hover, and to a screen reader; nothing for an entry
+/// with no time. `id` is the element's, which its tooltip needs.
 pub(crate) fn clock(
     id: impl Into<SharedString>,
     at: Option<DateTime<Utc>>,
@@ -604,7 +639,9 @@ pub(crate) fn clock(
         .children(at.map(time::clock))
         .when_some(at, |clock, at| {
             let stamp = SharedString::from(time::stamp(at));
-            clock.tooltip(move |window, cx| Tooltip::new(stamp.clone()).build(window, cx))
+            clock
+                .aria_label(stamp.clone())
+                .tooltip(move |window, cx| Tooltip::new(stamp.clone()).build(window, cx))
         })
 }
 
@@ -753,10 +790,13 @@ mod tests {
             (
                 NotificationSubject::PullRequest {
                     id: pr.clone(),
-                    url: String::new(),
+                    url: "https://github.com/o/rho/pull/12".to_owned(),
                 },
                 Some("rho#12"),
-                Some(Link::PullRequest(pr)),
+                Some(Link::PullRequest {
+                    id: pr,
+                    url: "https://github.com/o/rho/pull/12".to_owned(),
+                }),
             ),
             (
                 serde_json::from_value(serde_json::json!({"kind": "session", "id": "s-2"}))
@@ -795,7 +835,7 @@ mod tests {
             .expect("an item");
             let line = Line::of(&item);
             assert_eq!(
-                (line.chip.as_deref(), line.link),
+                (line.chip().as_deref(), line.link),
                 (chip, link),
                 "{subject:?}"
             );

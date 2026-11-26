@@ -51,9 +51,9 @@ pub struct SessionUpdate {
     /// Its place in the session's stream; see [`Session::reattach`].
     pub(crate) seq: Seq,
     pub(crate) event: SessionEvent,
-    /// When it happened, in Unix milliseconds, when the daemon says: live,
-    /// and for a saved event a replay repeats, to the second.
-    pub(crate) at: Option<u64>,
+    /// When it happened, when the daemon says: live, and for a saved event
+    /// a replay repeats, to the second.
+    pub(crate) at: Option<DateTime<Utc>>,
     /// What the event, a notification card, is about, typed.
     pub(crate) notification: Option<Box<NotificationInfo>>,
 }
@@ -71,7 +71,8 @@ impl SessionUpdate {
         let update = Self {
             seq: params.seq,
             event: params.event,
-            at,
+            // Unix milliseconds.
+            at: at.and_then(|at| DateTime::from_timestamp_millis(i64::try_from(at).ok()?)),
             notification,
         };
         (params.session.into(), update)
@@ -446,7 +447,7 @@ impl NoticeTone {
 }
 
 /// What a [`Notice`] asks of the reader, least first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Urgency {
     /// Progress, or work stopped on purpose: safe to fold away.
     Routine,
@@ -1011,18 +1012,23 @@ impl Session {
     /// Gives the entries a replay of the whole conversation rebuilt the
     /// times their twins in `shown`, the entries it replaced
     /// ([`Continuity::Replaced`]), had, and returns the first that differs
-    /// from its twin: an older daemon replays no times, but this client
-    /// saw those arrive, so only what changed is new. The first that differs keeps
-    /// its time too if it is the same message, such as a reply that went
-    /// on streaming. Call it once the replay caught up.
+    /// from its twin, times aside: so only what changed is new. A twin
+    /// that has no time, as from an older daemon, which sends none, leaves
+    /// the replay's; one that has, which this client may have seen arrive
+    /// to the millisecond, is kept. The first that differs keeps its twin's
+    /// time too if it is the same message, such as a reply that went on
+    /// streaming. Call it once the replay caught up.
     pub fn keep_arrivals(&mut self, shown: &[Entry]) -> usize {
         for (at, (entry, was)) in self.entries.iter_mut().zip(shown).enumerate() {
             let replayed = entry.arrived();
             entry.set_arrived(was.arrived());
-            if entry != was {
-                if !entry.is_same_message(was) {
-                    entry.set_arrived(replayed);
-                }
+            let same = entry == was;
+            if same || entry.is_same_message(was) {
+                entry.set_arrived(was.arrived().or(replayed));
+            } else {
+                entry.set_arrived(replayed);
+            }
+            if !same {
                 return at;
             }
         }
@@ -1344,9 +1350,7 @@ impl Session {
         // leaves now, if it came live, and none for one from a replay, or
         // from the events a reattach caught up on: now would be when the
         // conversation was read again, not when it happened.
-        let arrived = at
-            .and_then(|at| DateTime::from_timestamp_millis(i64::try_from(at).ok()?))
-            .or_else(|| matches!(self.sync, Sync::Live).then(now));
+        let arrived = at.or_else(|| matches!(self.sync, Sync::Live).then(now));
         let mut caught_up = false;
         if let Sync::Replaying(left) = &mut self.sync {
             *left -= 1;
@@ -1435,10 +1439,11 @@ impl Session {
                 ..
             } => {
                 let card = Notice::card(title, [markdown, plain], tone, notification, arrived);
-                let card = match self.put_again(card) {
-                    Ok(at) => return Some(at),
-                    Err(card) => card,
-                };
+                // rho gives a card the same id wherever it sends it again,
+                // as a catch-up after a reattach may.
+                if self.has_card(&card) {
+                    return None;
+                }
                 // A result delivered after the agent answered starts model
                 // work of its own: the next turn, or the rest of this one
                 // once the model reads it, which a replay can't tell apart.
@@ -1770,24 +1775,14 @@ impl Session {
         self.entries.len() - 1
     }
 
-    /// Puts notification card `card` in place of the one with its id, as
-    /// a reattach may send it again, and returns its index; it keeps the
-    /// time it first arrived. Gives `card` back if the session has none
-    /// with its id.
-    fn put_again(&mut self, mut card: Notice) -> Result<usize, Notice> {
-        let found = card.id().and_then(|id| {
+    /// Whether the session has notification card `card` already, by its
+    /// id; one without an id never matches.
+    fn has_card(&self, card: &Notice) -> bool {
+        card.id().is_some_and(|id| {
             self.entries
                 .iter()
-                .rposition(|entry| matches!(entry, Entry::Notice(was) if was.id() == Some(id)))
-        });
-        let Some(at) = found else {
-            return Err(card);
-        };
-        if let Entry::Notice(was) = &self.entries[at] {
-            card.arrived = was.arrived.or(card.arrived);
-        }
-        self.entries[at] = Entry::Notice(card);
-        Ok(at)
+                .any(|entry| matches!(entry, Entry::Notice(was) if was.id() == Some(id)))
+        })
     }
 
     /// Puts `message` in place of the user message with its ID, or after

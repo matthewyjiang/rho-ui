@@ -11,7 +11,7 @@ use rho_ui_core::{
 };
 
 use super::{is_visible, Harness};
-use crate::{rail, right_panel::PanelLayout};
+use crate::{rail, right_panel::PanelLayout, time};
 
 /// The cards in `session`, with their entries.
 fn cards(session: &Session) -> Vec<(usize, Notice)> {
@@ -27,11 +27,6 @@ fn cards(session: &Session) -> Vec<(usize, Notice)> {
 /// Row `n` of the card whose elements' IDs start with `key`.
 fn line(key: &str, n: usize) -> SharedString {
     SharedString::from(format!("{key}-line-{n}"))
-}
-
-/// `id`, kept for the app's lifetime, as [`Harness::click`] takes it.
-fn leak(id: String) -> &'static str {
-    Box::leak(id.into_boxed_str())
 }
 
 /// A conversation opened again shows its cards as rho saved them: each at
@@ -108,9 +103,11 @@ fn replayed_cards_keep_their_times_and_fold_by_urgency() {
                 card.id
             );
         }
-        // Its time says it in full on hover.
-        let time = window.find("card-n-test-time").bounds().center();
-        window.pointer_move(time, None, cx);
+        // Its time says it in full, to the second rho saved, on hover.
+        let time = window.find("card-n-test-time");
+        let failed = cards[0].1.arrived().expect("a replayed time");
+        assert_eq!(time.label(), Some(time::stamp(failed).as_str()));
+        window.pointer_move(time.bounds().center(), None, cx);
     });
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.frame();
@@ -191,7 +188,7 @@ fn an_older_rhos_cards_sit_on_the_rail_by_their_tone() {
     assert!(matches!(session.entries()[after], Entry::Wake));
     ui.shot("folded");
 
-    ui.click(leak(fold.to_string()));
+    ui.click(fold.to_string().leak());
     ui.wait_until("every card, unfolded", |window, _, _| {
         cards
             .iter()
@@ -199,7 +196,7 @@ fn an_older_rhos_cards_sit_on_the_rail_by_their_tone() {
             && !is_visible(window, fold.clone())
     });
     let failed = cards[0].0;
-    ui.click(leak(line(&key(failed), 0).to_string()));
+    ui.click(line(&key(failed), 0).to_string().leak());
     ui.wait_until("the failure's body", |window, _, _| {
         is_visible(
             window,

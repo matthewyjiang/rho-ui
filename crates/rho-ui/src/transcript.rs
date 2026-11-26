@@ -199,7 +199,7 @@ fn code_actions(block: &CodeBlock, window: &mut Window, cx: &mut App) -> impl In
 }
 
 /// What a click in the transcript asks for.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     /// Open or fold part of work row `row`.
     Fold { row: usize, fold: Fold },
@@ -209,13 +209,18 @@ pub(crate) enum Action {
     Card { entry: usize },
     /// Unfold the folded cards of the run that card `entry` opens.
     Unfold { entry: usize },
-    /// Open what a card is about. The session view carries it out: it
-    /// changes nothing here.
-    Open(rail::Link),
 }
 
 /// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
+
+/// What a click in the transcript calls: `act` for what changes the
+/// transcript, and `open` for what a card on the rail is about, which the
+/// session view opens.
+pub(crate) struct Handlers {
+    pub(crate) act: ActionHandler,
+    pub(crate) open: rail::OpenHandler,
+}
 
 /// Builds the content of the scroller's item at a [`Place`]:
 /// [`Transcript::render_content`], reached through the session view, because
@@ -755,8 +760,8 @@ impl Transcript {
 
     /// Does what a click asked for. `action` names rows, entries and turns
     /// as last drawn; one the transcript has lost since is ignored.
-    pub(crate) fn act(&mut self, action: &Action, entries: &[Entry], cx: &mut App) {
-        let rows = match *action {
+    pub(crate) fn act(&mut self, action: Action, entries: &[Entry], cx: &mut App) {
+        let rows = match action {
             Action::Fold {
                 row,
                 fold: Fold::Steps,
@@ -795,7 +800,6 @@ impl Transcript {
                 };
                 row..row + 1
             }
-            Action::Open(_) => return,
             Action::Unfold { entry } => {
                 let Some(row) = self.timeline.row_of(entry) else {
                     return;
@@ -835,7 +839,7 @@ impl Transcript {
         item: usize,
         entries: &[Entry],
         surfaces: &Surfaces,
-        act: &ActionHandler,
+        handlers: &Handlers,
         content: &ItemContent,
         cx: &App,
     ) -> AnyElement {
@@ -861,7 +865,7 @@ impl Transcript {
         let Some(turn) = self.timeline.turn_of(row) else {
             return measure
                 .when(gap_below, Styled::pb_3)
-                .child(self.render_content(place, entries, act, cx))
+                .child(self.render_content(place, entries, handlers, cx))
                 .into_any_element();
         };
         if self.folds_in_working(turn, row, entries) {
@@ -889,9 +893,9 @@ impl Transcript {
         let opens_turn = self.timeline.turns().get(turn) == Some(&row);
         measure
             .when(gap_below, Styled::pb_3)
-            .child(self.render_content(place, entries, act, cx))
+            .child(self.render_content(place, entries, handlers, cx))
             .when(opens_turn, |this| {
-                this.child(self.render_header(turn, act, cx))
+                this.child(self.render_header(turn, &handlers.act, cx))
             })
             .into_any_element()
     }
@@ -946,9 +950,10 @@ impl Transcript {
         &self,
         place: Place,
         entries: &[Entry],
-        act: &ActionHandler,
+        handlers: &Handlers,
         cx: &App,
     ) -> AnyElement {
+        let act = &handlers.act;
         let Place {
             row,
             part,
@@ -966,7 +971,7 @@ impl Transcript {
         };
         match drawn {
             Row::Message(entry) => match &entries[*entry] {
-                Entry::Notice(_) => self.render_card(row, *entry, entries, act, cx),
+                Entry::Notice(_) => self.render_card(row, *entry, entries, handlers, cx),
                 message => {
                     let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
                     let shown = Shown {
@@ -1036,14 +1041,14 @@ impl Transcript {
     }
 
     /// Card `ix`, at `row`, on the rail with the rest of its run: its row,
-    /// the row that folds it with the run's other routine cards, or nothing
+    /// the row that folds it with the run's other cards that may fold, or nothing
     /// while it is folded. An open card shows its body under its row.
     fn render_card(
         &self,
         row: usize,
         ix: usize,
         entries: &[Entry],
-        act: &ActionHandler,
+        Handlers { act, open }: &Handlers,
         cx: &App,
     ) -> AnyElement {
         let PlacedRun { start, places } = self.placed(row, entries);
@@ -1071,26 +1076,25 @@ impl Transcript {
                     return div().into_any_element();
                 };
                 let card = Card::of(ix, notice);
-                let body = self.text(ix, 0);
-                let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
-                let detail = body.filter(|_| open).map(|body| {
-                    TextView::new(body)
-                        .style(message_style(xsmall_text(cx)))
-                        .code_block_actions(code_actions)
-                        .selectable(true)
-                        .into_any_element()
-                });
-                let on_toggle = body.map(|_| {
-                    let act = Rc::clone(act);
-                    let on_toggle: rail::ToggleHandler =
-                        Rc::new(move |window: &mut Window, cx: &mut App| {
+                let shows = self.details.get(ix).is_some_and(|shows| shows.is_open());
+                let body = match self.text(ix, 0) {
+                    None => rail::Body::None,
+                    Some(text) => {
+                        let act = Rc::clone(act);
+                        let on_toggle: rail::ToggleHandler = Rc::new(move |window, cx| {
                             act(Action::Card { entry: ix }, window, cx);
                         });
-                    on_toggle
-                });
-                let on_open: rail::OpenHandler = {
-                    let act = Rc::clone(act);
-                    Rc::new(move |link, window, cx| act(Action::Open(link.clone()), window, cx))
+                        if shows {
+                            let detail = TextView::new(text)
+                                .style(message_style(xsmall_text(cx)))
+                                .code_block_actions(code_actions)
+                                .selectable(true)
+                                .into_any_element();
+                            rail::Body::Open(on_toggle, detail)
+                        } else {
+                            rail::Body::Shut(on_toggle)
+                        }
+                    }
                 };
                 let marks = (0..card.lines.len())
                     .map(|n| rail::LineMarks {
@@ -1102,9 +1106,8 @@ impl Transcript {
                     card: &card,
                     marks,
                     ends: *ends,
-                    detail,
-                    on_toggle,
-                    on_open,
+                    body,
+                    on_open: Rc::clone(open),
                 }
                 .render(cx)
             }

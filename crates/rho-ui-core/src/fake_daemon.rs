@@ -1226,16 +1226,16 @@ const BACKLOG: usize = 4096;
 /// When a session's first event happened, as the fake says: 09:00 UTC on
 /// 1 January 2026. A test knows when each event happened
 /// ([`event_time`]).
-pub const CLOCK_START_MS: u64 = 1_767_258_000_000;
+const CLOCK_START_MS: u64 = 1_767_258_000_000;
 
 /// How long after a session's event its next happened: not whole seconds,
 /// so the time a reset replays, which keeps the seconds alone, isn't the
 /// time the event went out live with.
-pub const EVENT_EVERY_MS: u64 = 1_500;
+const EVENT_EVERY_MS: u64 = 1_500;
 
 /// When a session's event `seq` happened, in Unix milliseconds, as it
 /// went out live and as a tail replays it.
-pub fn event_time(seq: u64) -> u64 {
+fn event_time(seq: u64) -> u64 {
     CLOCK_START_MS + seq * EVENT_EVERY_MS
 }
 

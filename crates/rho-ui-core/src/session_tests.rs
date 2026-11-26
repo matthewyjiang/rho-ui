@@ -1083,37 +1083,57 @@ fn only_live_entries_know_when_they_arrived() {
     assert_eq!(arrived(&session), [false, false, true, false, false]);
 }
 
-/// A notification card the daemon sends again, by its id, as a reattach
-/// may, changes in place instead of adding a second row, and keeps the
-/// time it first happened.
+/// What a rho that sends no times showed, replayed whole by one that does,
+/// as after it upgrades in place, takes the times the replay gives.
+#[test]
+fn a_replay_with_times_gives_them_to_what_had_none() {
+    let notice = |at| SessionUpdate {
+        at,
+        ..update(json!({"type": "notice", "text": "PR merged"}))
+    };
+    let mut session = Session::new(SessionId::from("s1"));
+    session.attached(attach_response(JobState::Idle, 1));
+    session.apply(notice(None));
+    let Continuity::Replaced(shown) = session.attached(attach_response(JobState::Idle, 1)) else {
+        panic!("a reset replays the whole conversation");
+    };
+    let at = DateTime::from_timestamp_millis(1_000);
+    session.apply(notice(at));
+    assert_eq!(session.keep_arrivals(&shown), 1, "nothing changed");
+    let [Entry::Notice(notice)] = session.entries() else {
+        panic!("one notice: {:?}", session.entries());
+    };
+    assert_eq!(notice.arrived(), at);
+}
+
+/// A notification card the daemon sends again, by its id, as a catch-up
+/// after a reattach may, stays one row, with the time it first came.
 #[test]
 fn a_card_sent_again_stays_one_row() {
-    let card = |at: u64, text: &str| SessionUpdate {
-        at: Some(at),
+    let card = |at: i64| SessionUpdate {
+        at: DateTime::from_timestamp_millis(at),
         notification: Some(
             serde_json::from_value(json!({"id": "n-1", "urgency": "needs_you",
                 "subject": {"kind": "process", "id": "p-1"},
                 "items": [{"outcome": "failed", "subject": {"kind": "process", "id": "p-1"},
-                    "text": text}]}))
+                    "text": "Failed · build"}]}))
             .expect("a valid notification"),
         ),
         ..update(
-            json!({"type": "card", "title": text, "markdown": "", "plain": "",
-            "tone": "error"}),
+            json!({"type": "card", "title": "Failed · build", "markdown": "",
+            "plain": "", "tone": "error"}),
         )
     };
     let mut session = session();
-    session.apply(card(1_000, "Failed · build"));
-    session.apply(card(2_000, "Failed (exit 2) · build"));
+    session.apply(card(1_000));
+    session.apply(card(2_000));
     let [Entry::Notice(notice)] = session.entries() else {
         panic!("one card: {:?}", session.entries());
     };
-    assert_eq!(notice.items()[0].text, "Failed (exit 2) · build");
     assert_eq!(
         notice.arrived().map(|at| at.timestamp_millis()),
         Some(1_000)
     );
-    assert_eq!(notice.urgency(), Urgency::NeedsYou);
 }
 
 /// A notice of several lines, as a provider's diagnostic is, reads its

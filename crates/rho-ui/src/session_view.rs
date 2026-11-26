@@ -109,7 +109,7 @@ use crate::{
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
-    transcript::{find::Direction, Action, ActionHandler, ItemContent, Transcript},
+    transcript::{find::Direction, ActionHandler, Handlers, ItemContent, Transcript},
     usage::UsageRing,
     work::Disclosure,
     workspaces::{Workspace, WorkspaceRef},
@@ -134,7 +134,7 @@ pub(crate) enum SessionEvent {
     },
     /// Open another session on this one's machine, such as one this one
     /// started, from a card about it.
-    OpenSession(SessionId),
+    GoToSession(SessionId),
     /// Show a session above this one, from the title bar.
     Show(WeakEntity<SessionView>),
     /// Start a new session in this one's project, from the title bar.
@@ -1825,33 +1825,17 @@ impl SessionView {
         }
 
         let view = cx.entity().downgrade();
-        let act: ActionHandler = {
-            let view = view.clone();
-            Rc::new(move |action, _, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    if let Action::Open(link) = action {
-                        Self::open_link(link, cx);
-                        return;
-                    }
-                    this.transcript.act(
-                        &action,
-                        this.loading.drawn(&this.session).unwrap_or_default(),
-                        cx,
-                    );
-                    cx.notify();
-                });
-            })
-        };
+        let handlers = Rc::new(Self::transcript_handlers(&view));
         let content: ItemContent = {
             let view = view.clone();
-            let act = Rc::clone(&act);
+            let handlers = Rc::clone(&handlers);
             Rc::new(move |place, _, cx| match view.upgrade() {
                 Some(view) => {
                     let this = view.read(cx);
                     this.transcript.render_content(
                         place,
                         this.loading.drawn(&this.session).unwrap_or_default(),
-                        &act,
+                        &handlers,
                         cx,
                     )
                 }
@@ -1885,7 +1869,7 @@ impl SessionView {
                                 ix,
                                 this.loading.drawn(&this.session).unwrap_or_default(),
                                 &this.surfaces,
-                                &act,
+                                &handlers,
                                 &content,
                                 cx,
                             )
@@ -2152,16 +2136,52 @@ impl SessionView {
         })
     }
 
-    /// Opens what a card on the rail is about: a pull request in the right
-    /// panel, or a session.
-    fn open_link(link: rail::Link, cx: &mut Context<'_, Self>) {
-        cx.emit(match link {
-            rail::Link::PullRequest(id) => SessionEvent::ShowPullRequest(id),
-            rail::Link::Session(id) => SessionEvent::OpenSession(id),
+    /// What a click in the transcript of `view` calls.
+    fn transcript_handlers(view: &WeakEntity<Self>) -> Handlers {
+        let act: ActionHandler = {
+            let view = view.clone();
+            Rc::new(move |action, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.transcript.act(
+                        action,
+                        this.loading.drawn(&this.session).unwrap_or_default(),
+                        cx,
+                    );
+                    cx.notify();
+                });
+            })
+        };
+        let view = view.clone();
+        let open: rail::OpenHandler = Rc::new(move |link, _, cx| {
+            let _ = view.update(cx, |this, cx| this.open_link(link.clone(), cx));
+        });
+        Handlers { act, open }
+    }
+
+    /// Opens what a card on the rail is about: a session, or a pull request
+    /// in the right panel while the session links it, else in the browser,
+    /// since the panel shows only the session's.
+    fn open_link(&self, link: rail::Link, cx: &mut Context<'_, Self>) {
+        let event = match link {
+            rail::Link::PullRequest { id, url } => {
+                let key = self.key();
+                let set = self.prs.as_ref().and_then(|(prs, _)| prs.read(cx).of(&key));
+                let linked = set.is_some_and(|set| {
+                    set.link(&id).is_some()
+                        || set.branch_pull_request().is_some_and(|pr| pr.id == id)
+                });
+                if !linked {
+                    cx.open_url(&url);
+                    return;
+                }
+                SessionEvent::ShowPullRequest(id)
+            }
+            rail::Link::Session(id) => SessionEvent::GoToSession(id),
             rail::Link::Subagent { session, title } => {
                 SessionEvent::OpenSubagent { session, title }
             }
-        });
+        };
+        cx.emit(event);
     }
 
     /// Opens what a row of the background work opens: a subagent's

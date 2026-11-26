@@ -34,7 +34,7 @@ A session whose model isn't signed in still opens, with a card above the compose
 
 ## Times
 
-Hovering a message shows when it arrived, and each card rho sends between replies shows its time; hovering that time shows the full date. rho records when each card happened, so a conversation opened again later, or what came while rho-ui was disconnected, shows the times they happened, to the second. An older rho records none: there, only what rho-ui saw arrive while it followed the session has a time.
+Hovering a message shows when it arrived, and each card rho sends between replies shows its time; hovering that time shows the full date. rho records when everything happened, so a conversation opened again later, or what came while rho-ui was disconnected, shows the times they happened, to the second. An older rho records none: there, only what rho-ui saw arrive while it followed the session has a time.
 
 ## Cards between replies
 
