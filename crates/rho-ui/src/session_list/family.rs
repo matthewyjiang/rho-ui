@@ -3,11 +3,16 @@
 //! the parents that the list holds. [`Families`] works out which row each
 //! folds under and what each family comes to ([`FamilyMarks`]), which
 //! shelves, ranks and dates it, and [`SessionList::push_family`] lays one
-//! out under its starter.
+//! out under its starter. An active family's fold leaves out the sessions
+//! of it that are settled or snoozed on their own ([`Row::away`]).
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{leads::Kind, machines::SessionKey, shelf::Shelf};
+use crate::{
+    leads::Kind,
+    machines::SessionKey,
+    shelf::{self, Shelf},
+};
 
 use super::{Activity, Attention, Item, Passes, Row, SessionList};
 
@@ -33,6 +38,9 @@ pub(crate) struct FamilyMarks {
     pub(super) attention: Attention,
     /// Any session of it is busy, which keeps it active.
     pub(crate) busy: bool,
+    /// Where it is when none of it is busy: by its starter's mark and its
+    /// newest activity.
+    pub(super) rest: Shelf,
 }
 
 /// The most pressing thing of the sessions under a fold: how many wait for
@@ -102,6 +110,26 @@ impl Row {
         }
     }
 
+    /// The shelf it would be on by itself as of `now`, as a session under a
+    /// family whose shelf at rest is `rest`, when that is Settled or Snoozed
+    /// and not `rest`: settled or snoozed apart from its family, as rho
+    /// settles a session once its last linked pull request merges. One
+    /// settled with a settled family, or snoozed with a snoozed one, isn't.
+    pub(super) fn apart_from(&self, rest: Shelf, now: i64) -> Option<Shelf> {
+        if !self.activity.is_idle() {
+            return None;
+        }
+        Some(shelf::shelf(self.mark, self.updated, now))
+            .filter(|&own| own != Shelf::Active && own != rest)
+    }
+
+    /// Whether it is settled or snoozed apart from its family ([`Row::apart`])
+    /// while the family shows on the active list: its starter's fold leaves
+    /// it out, but for a search, and nothing counts it as wanting the user.
+    pub(crate) fn away(&self) -> bool {
+        self.shelf == Shelf::Active && self.apart.is_some()
+    }
+
     /// What it presses on the family it folds in, under a starter of kind
     /// `starter`: its own, but a lead reads its sessions' results itself,
     /// so one of those that is Done rests there. Its own row still says
@@ -150,35 +178,30 @@ impl Families {
         self.members.get(&ix).map_or(&[][..], Vec::as_slice)
     }
 
-    /// The marks of top row `top`'s family, from what its rows do, are
-    /// Done and watch as they stand, each session under it by what it
-    /// presses on the family ([`Row::attention_under`]).
-    pub(super) fn marks(&self, rows: &[Row], top: usize) -> FamilyMarks {
+    /// The marks of top row `top`'s family as of `now`, from what its rows
+    /// do, are Done and watch as they stand, each session under it by what
+    /// it presses on the family ([`Row::attention_under`]). One settled or
+    /// snoozed apart from it ([`Row::apart`]) presses on nothing: on the
+    /// active shelf, where alone the family ranks, it is away.
+    pub(super) fn marks(&self, rows: &[Row], top: usize, now: i64) -> FamilyMarks {
         let starter = &rows[top];
-        let mut marks = FamilyMarks {
-            updated: starter.updated,
-            attention: starter.attention(),
-            busy: !starter.activity.is_idle(),
-        };
-        for row in self.members(top).iter().map(|&ix| &rows[ix]) {
-            marks.updated = marks.updated.max(row.updated);
-            marks.attention = marks.attention.min(row.attention_under(starter.kind));
-            marks.busy |= !row.activity.is_idle();
+        let members = || self.members(top).iter().map(|&ix| &rows[ix]);
+        let updated = members()
+            .map(|row| row.updated)
+            .fold(starter.updated, i64::max);
+        let rest = shelf::shelf(starter.mark, updated, now);
+        let attention = members()
+            .filter(|row| row.apart_from(rest, now).is_none())
+            .map(|row| row.attention_under(starter.kind))
+            .fold(starter.attention(), Ord::min);
+        FamilyMarks {
+            updated,
+            attention,
+            busy: std::iter::once(starter)
+                .chain(members())
+                .any(|row| !row.activity.is_idle()),
+            rest,
         }
-        marks
-    }
-
-    /// The rows under top row `top` that show, by `passes`: those the
-    /// filter shows that match the search, or whose starter does.
-    pub(super) fn drawn<'a>(
-        &'a self,
-        top: usize,
-        passes: &'a [Passes],
-    ) -> impl Iterator<Item = usize> + 'a {
-        self.members(top)
-            .iter()
-            .copied()
-            .filter(move |&ix| passes[ix].filter && (passes[ix].search || passes[top].search))
     }
 }
 
@@ -204,7 +227,8 @@ impl SessionList {
     /// where the family was put if they lose their starter. The daemon
     /// keeps no mark for a session it has saved nothing of, such as a
     /// running subagent's; under its starter that one moves with it
-    /// anyway.
+    /// anyway. One settled or snoozed apart from the family
+    /// ([`Row::away`]) keeps its own mark.
     pub(crate) fn family(&self, starter: &SessionKey) -> Vec<SessionKey> {
         let families = Families::of(&self.rows);
         let top = self.rows.iter().position(|row| row.id == *starter);
@@ -212,7 +236,7 @@ impl SessionList {
         let saved = members
             .iter()
             .map(|&ix| &self.rows[ix])
-            .filter(|row| row.saved);
+            .filter(|row| row.saved && row.apart.is_none());
         std::iter::once(starter.clone())
             .chain(saved.map(|row| row.id.clone()))
             .collect()
@@ -235,9 +259,27 @@ impl SessionList {
         }
     }
 
+    /// The rows under top row `top` that show, by `passes`: those the
+    /// filter shows that match the search, or whose starter does. One away
+    /// from the fold ([`Row::away`]) shows only for a search, which opens
+    /// every shelf.
+    pub(super) fn drawn<'a>(
+        &'a self,
+        families: &'a Families,
+        top: usize,
+        passes: &'a [Passes],
+    ) -> impl Iterator<Item = usize> + 'a {
+        let searching = !self.query.is_empty();
+        families.members(top).iter().copied().filter(move |&ix| {
+            passes[ix].filter
+                && (passes[ix].search || passes[top].search)
+                && (searching || !self.rows[ix].away())
+        })
+    }
+
     /// Pushes the fold line under top row `top` when any of the sessions
-    /// under it show (see [`Families::drawn`]), then, while it's open,
-    /// those, laid out on its shelf.
+    /// under it show (see [`Self::drawn`]), then, while it's open, those,
+    /// laid out on its shelf.
     pub(super) fn push_family(
         &self,
         items: &mut Vec<Item>,
@@ -245,7 +287,7 @@ impl SessionList {
         top: usize,
         passes: &[Passes],
     ) {
-        let mut drawn: Vec<usize> = families.drawn(top, passes).collect();
+        let mut drawn: Vec<usize> = self.drawn(families, top, passes).collect();
         if drawn.is_empty() {
             return;
         }
@@ -326,17 +368,36 @@ mod tests {
     }
 
     /// A move of a family asks the daemon to mark the sessions it has
-    /// saved, not one it only runs, which it would refuse.
+    /// saved, not one it only runs, which it would refuse, nor one settled
+    /// on its own while the family is elsewhere, which a snooze's end or a
+    /// restore would bring back.
     #[test]
     fn a_move_marks_the_family_sessions_the_daemon_has_saved() {
         let mut list = SessionList::default();
-        let sessions = vec![started("w1", "Write", 4, "lead"), saved("lead", None, 3)];
+        let merged = SavedSession {
+            mark: Some(SessionMark::Done { at: 2 }),
+            ..started("w0", "Merge", 2, "lead")
+        };
+        let sessions = vec![
+            started("w1", "Write", 4, "lead"),
+            saved("lead", None, 3),
+            merged,
+        ];
         list.set_saved(&here(), sessions);
         let running = JobSession {
             parent: Some(id("lead")),
             ..job("w2", JobActivity::Working, None)
         };
         list.set_jobs(&here(), vec![running], Instant::now(), 5);
+        rebuild(&mut list, 5);
+        assert_eq!(list.family(&id("lead")), [id("lead"), id("w1")]);
+
+        // Snoozed as it was moved, the family's Restore leaves Merge out.
+        list.set_jobs(&here(), Vec::new(), Instant::now(), 6);
+        for snoozed in ["lead", "w1"] {
+            mark(&mut list, snoozed, SessionMark::Snoozed { until: 100 });
+        }
+        rebuild(&mut list, 6);
         assert_eq!(list.family(&id("lead")), [id("lead"), id("w1")]);
     }
 
@@ -483,6 +544,101 @@ mod tests {
             "  Test",
         ];
         assert_eq!(shown(&list)[..5], revealed);
+    }
+
+    /// On the active shelf, a session that is settled or snoozed on its own,
+    /// as rho settles one when its last linked pull request merges, leaves
+    /// its family's fold: the fold neither draws nor counts it, its line
+    /// says nothing of it, it doesn't rank the family, and it isn't on the
+    /// active list that the title's count reads. A search finds it; the end
+    /// of its snooze or new activity brings it back, by its shelf's rule; a
+    /// family off the active shelf shows all of it, and so does one snoozed
+    /// together that a busy session wakes.
+    #[test]
+    fn a_session_settled_on_its_own_leaves_its_active_familys_fold() {
+        let mut list = SessionList::default();
+        let snoozed = SavedSession {
+            mark: Some(SessionMark::Snoozed { until: 200 }),
+            ..started("w3", "Review", 25, "lead")
+        };
+        list.set_saved(
+            &here(),
+            vec![
+                saved("other", Some("Other"), 80),
+                snoozed,
+                started("w2", "Test", 20, "lead"),
+                started("w1", "Write", 10, "lead"),
+                saved("lead", Some("Lead"), 5),
+            ],
+        );
+        // Test's turn ends off screen, then its pull request merges.
+        let testing = || job("w2", JobActivity::Working, None);
+        list.set_jobs(&here(), vec![testing()], Instant::now(), 60);
+        list.set_jobs(&here(), Vec::new(), Instant::now(), 60);
+        mark(&mut list, "w2", SessionMark::Done { at: 70 });
+        list.toggle_fold(&id("lead"));
+        rebuild(&mut list, 100);
+        // Test's Done would rank Lead over Other.
+        assert_eq!(shown(&list), ["Other", "Lead", "⌄ 1 started", "  Write"]);
+        let active: Vec<&str> = list
+            .rows()
+            .iter()
+            .filter(|row| row.shelf == Shelf::Active && !row.away())
+            .map(|row| row.id.id.as_str())
+            .collect();
+        assert_eq!(active, ["other", "w1", "lead"]);
+
+        list.set_query("test");
+        rebuild(&mut list, 100);
+        assert_eq!(shown(&list), ["Lead", "• 1 started, 1 done", "  Test"]);
+        list.set_query("");
+        rebuild(&mut list, 200);
+        let woke = ["Other", "Lead", "⌄ 2 started", "  Review", "  Write"];
+        assert_eq!(shown(&list), woke);
+
+        list.set_jobs(&here(), vec![testing()], Instant::now(), 210);
+        list.set_jobs(&here(), Vec::new(), Instant::now(), 211);
+        rebuild(&mut list, 211);
+        let back = [
+            "Lead",
+            "⌄ 3 started, 1 done",
+            "  Test",
+            "  Review",
+            "  Write",
+            "Other",
+        ];
+        assert_eq!(shown(&list), back);
+
+        // Test merges again, and Lead settles.
+        mark(&mut list, "w2", SessionMark::Done { at: 300 });
+        mark(&mut list, "lead", SessionMark::Done { at: 300 });
+        list.toggle(Shelf::Settled);
+        rebuild(&mut list, 300);
+        let settled = [
+            "[Settled 1]",
+            "Lead",
+            "⌄ 3 started, 1 done",
+            "  Review",
+            "  Test",
+            "  Write",
+        ];
+        assert_eq!(shown(&list)[2..], settled);
+
+        // Snoozed together, then woken by Write's turn.
+        for snoozed in ["lead", "w1", "w2", "w3"] {
+            mark(&mut list, snoozed, SessionMark::Snoozed { until: 1000 });
+        }
+        let writes = job("w1", JobActivity::Working, None);
+        list.set_jobs(&here(), vec![writes], Instant::now(), 310);
+        rebuild(&mut list, 310);
+        let woken = [
+            "Lead",
+            "⌄ 3 started, 1 done",
+            "  Test",
+            "  Review",
+            "  Write",
+        ];
+        assert_eq!(shown(&list)[..5], woken);
     }
 
     /// Active leads list first, under their header, each over the sessions

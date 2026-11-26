@@ -241,6 +241,12 @@ pub(crate) struct Row {
     /// Whether it folds under the session that started it. As of the last
     /// rebuild.
     pub(crate) family: Family,
+    /// Under a starter, the shelf it would be on by itself when that is
+    /// Settled or Snoozed and not where its family is at rest, as rho
+    /// settles a session once its last linked pull request merges: a move
+    /// of the family leaves its mark alone, and on the active shelf it is
+    /// [away](Row::away). As of the last rebuild.
+    apart: Option<Shelf>,
     /// A lead, as the saved list or its open view says; one known only
     /// from the daemon's jobs, which name no agent, is taken for a plain
     /// session until either does.
@@ -485,6 +491,7 @@ impl SessionList {
                 watching: false,
                 parent: session.parent.or_else(|| self.job_parent(&session.id)),
                 family: Family::Top(FamilyMarks::default()),
+                apart: None,
                 id: session.id,
                 cwd: session.cwd,
                 workspace: session.workspace,
@@ -545,6 +552,7 @@ impl SessionList {
                     element_id: format!("session-{}", live.id).into(),
                     parent: self.job_parent(&live.id),
                     family: Family::Top(FamilyMarks::default()),
+                    apart: None,
                     id: live.id,
                     title: live.title,
                     placeholder: live.placeholder,
@@ -645,6 +653,7 @@ impl SessionList {
                     watching: false,
                     parent: job.parent,
                     family: Family::Top(FamilyMarks::default()),
+                    apart: None,
                     kind: Kind::Session,
                 },
             );
@@ -869,8 +878,11 @@ impl SessionList {
                 .map(|(ix, _)| Item::Draft(ix)),
         );
         // A family shows when its starter passes the filter and the search,
-        // or when any session under it shows.
-        let visible = |ix: usize| passes[ix].both() || families.drawn(ix, &passes).next().is_some();
+        // or when any session under it shows. Worked out up front, as the
+        // loop below folds emptied shelves.
+        let visible: Vec<bool> = (0..self.rows.len())
+            .map(|ix| passes[ix].both() || self.drawn(&families, ix, &passes).next().is_some())
+            .collect();
         let mut counts = [0; 3];
         for shelf in [Shelf::Active, Shelf::Snoozed, Shelf::Settled] {
             let mut shown: Vec<(usize, FamilyMarks)> = self
@@ -878,7 +890,7 @@ impl SessionList {
                 .iter()
                 .enumerate()
                 .filter_map(|(ix, row)| match row.family {
-                    Family::Top(marks) if row.shelf == shelf && visible(ix) => Some((ix, marks)),
+                    Family::Top(marks) if row.shelf == shelf && visible[ix] => Some((ix, marks)),
                     Family::Top(_) | Family::Started => None,
                 })
                 .collect();
@@ -960,24 +972,26 @@ impl SessionList {
     /// whether its agent watches a pull request (`watching`). A family sits
     /// on its starter's shelf, under its starter's pin: active while any of
     /// it is busy, else placed by its starter's mark and its newest
-    /// activity ([`FamilyMarks`]).
+    /// activity ([`FamilyMarks`]). A session in it may be settled or
+    /// snoozed apart from it ([`Row::apart`]).
     fn shelve(&mut self, families: &Families, now: i64, watching: &HashSet<SessionKey>) {
         for row in &mut self.rows {
             row.done = self.unseen.contains(&row.id);
             row.watching = watching.contains(&row.id);
+            row.apart = None;
         }
         for top in 0..self.rows.len() {
             if families.starter(top).is_some() {
                 continue;
             }
-            let marks = families.marks(&self.rows, top);
+            let marks = families.marks(&self.rows, top, now);
             let row = &mut self.rows[top];
             row.family = Family::Top(marks);
             row.pinned = shelf::pinned(row.mark);
             row.shelf = if marks.busy {
                 Shelf::Active
             } else {
-                shelf::shelf(row.mark, marks.updated, now)
+                marks.rest
             };
             let placed = row.shelf;
             for &ix in families.members(top) {
@@ -985,6 +999,7 @@ impl SessionList {
                 member.family = Family::Started;
                 member.pinned = None;
                 member.shelf = placed;
+                member.apart = member.apart_from(marks.rest, now);
             }
         }
         // Nothing keeps what a shelved session watches current.
