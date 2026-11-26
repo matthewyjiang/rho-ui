@@ -2033,6 +2033,9 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
             .is_some_and(|names| names.label() == Some(named))
     });
     assert_eq!(ui.label("title-project-names").as_deref(), Some(named));
+    ui.wait_until("the lead's turn shows", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
     ui.click("toggle-settled");
     ui.shot("projects");
     let width = |ui: &mut Harness| {
