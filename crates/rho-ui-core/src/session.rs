@@ -23,8 +23,10 @@ use std::{
     time::Duration,
 };
 
-use web_time::Instant;
+use chrono::{DateTime, Utc};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
+use rho_protocol::display::NotificationCard;
 use rho_protocol::{
     AnswerStop, CardTone, CompactionStatus, CompactionTrigger, JobState, Replay, Resolution, Seq,
     SessionAttachResponse, SessionEvent, SessionOptions as WireOptions, SessionPullRequests,
@@ -323,6 +325,7 @@ pub struct UserMessage {
     id: String,
     prompt: Prompt,
     steer: bool,
+    arrived: Option<DateTime<Utc>>,
 }
 
 impl UserMessage {
@@ -347,6 +350,12 @@ impl UserMessage {
     pub fn is_steer(&self) -> bool {
         self.steer
     }
+
+    /// When it arrived, if this client saw it come live: the daemon's
+    /// events carry no time, so a replayed one has none.
+    pub fn arrived(&self) -> Option<DateTime<Utc>> {
+        self.arrived
+    }
 }
 
 /// Text from the agent, as Markdown.
@@ -354,6 +363,7 @@ impl UserMessage {
 pub struct Message {
     id: String,
     text: String,
+    arrived: Option<DateTime<Utc>>,
 }
 
 impl Message {
@@ -366,46 +376,116 @@ impl Message {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// When its first text arrived, if this client saw it come live: the
+    /// daemon's events carry no time, so a replayed one has none.
+    pub fn arrived(&self) -> Option<DateTime<Utc>> {
+        self.arrived
+    }
 }
 
-/// How loud a [`Notice`] is.
+/// Now, from `web-time`'s clock, which works in a browser too.
+fn now() -> DateTime<Utc> {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    DateTime::from_timestamp_millis(i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+/// How a [`Notice`] reads, as rho's card tone says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoticeLevel {
-    /// For information.
-    Info,
+pub enum NoticeTone {
+    /// Routine news.
+    Neutral,
+    /// Something went well: work finished, checks passed.
+    Success,
     /// Something may need attention.
     Warning,
     /// Something failed.
     Error,
+    /// Something to look at, as a question is.
+    Accent,
 }
 
-/// A message from rho that is not part of the conversation.
+impl NoticeTone {
+    fn from_wire(tone: CardTone) -> Self {
+        match tone {
+            CardTone::Success => Self::Success,
+            CardTone::Warning => Self::Warning,
+            CardTone::Error => Self::Error,
+            CardTone::Accent => Self::Accent,
+            // Neutral, and a tone a newer daemon adds.
+            _ => Self::Neutral,
+        }
+    }
+}
+
+/// A message from rho that is not part of the conversation: a card, such
+/// as a background result, or a notice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
-    level: NoticeLevel,
+    tone: NoticeTone,
     title: String,
+    reference: Option<String>,
     description: Option<String>,
+    arrived: Option<DateTime<Utc>>,
 }
 
 impl Notice {
-    /// The notice a card shows, titled `title`. Its detail is the first of
-    /// `bodies` that isn't empty: the card's Markdown body, then its plain
-    /// one.
-    fn card(title: String, tone: CardTone, bodies: [String; 2]) -> Self {
+    /// A plain notice, routine: its first line is its title, and the rest,
+    /// such as a provider's diagnostic under "provider diagnostic:", its
+    /// detail.
+    fn text(text: &str, arrived: Option<DateTime<Utc>>) -> Self {
+        let (title, description) = match text.split_once('\n') {
+            Some((title, rest)) if !rest.trim().is_empty() => {
+                (title.to_owned(), Some(rest.trim().to_owned()))
+            }
+            _ => (text.trim().to_owned(), None),
+        };
         Self {
-            level: match tone {
-                CardTone::Warning => NoticeLevel::Warning,
-                CardTone::Error => NoticeLevel::Error,
-                _ => NoticeLevel::Info,
-            },
+            tone: NoticeTone::Neutral,
             title,
-            description: bodies.into_iter().find(|body| !body.is_empty()),
+            reference: None,
+            description,
+            arrived,
         }
     }
 
-    /// How loud it is.
-    pub fn level(&self) -> NoticeLevel {
-        self.level
+    /// A card. Its detail is the first of its bodies that isn't empty,
+    /// Markdown then plain, and its reference is what a notification names
+    /// its subject by.
+    fn card(
+        title: String,
+        [markdown, plain]: [String; 2],
+        tone: CardTone,
+        display: Option<Box<NotificationCard>>,
+        arrived: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            tone: NoticeTone::from_wire(tone),
+            title,
+            reference: display.and_then(|card| card.reference),
+            description: [markdown, plain].into_iter().find(|body| !body.is_empty()),
+            arrived,
+        }
+    }
+
+    /// How it reads.
+    pub fn tone(&self) -> NoticeTone {
+        self.tone
+    }
+
+    /// What a notification card names its subject by, such as a pull
+    /// request's `owner/repo#12`, a session's ID or a process's.
+    pub fn reference(&self) -> Option<&str> {
+        self.reference.as_deref()
+    }
+
+    /// When it arrived, if this client saw it come live: the daemon's
+    /// events carry no time, so a replayed one has none.
+    pub fn arrived(&self) -> Option<DateTime<Utc>> {
+        self.arrived
     }
 
     /// One line.
@@ -483,6 +563,37 @@ pub enum Entry {
     /// give the model the result. It opens that turn, as a prompt opens one. Only a turn followed live has
     /// one: the daemon's replay of a conversation does not mark them.
     Wake,
+}
+
+impl Entry {
+    /// When a message or notice arrived, if this client saw it come live.
+    fn arrived(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::User(message) => message.arrived,
+            Self::Agent(message) | Self::Thought(message) => message.arrived,
+            Self::Notice(notice) => notice.arrived,
+            Self::Tool(_) | Self::Compaction(_) | Self::Surface(_) | Self::Wake => None,
+        }
+    }
+
+    /// Whether both are the same message, by the daemon's ID, though it may
+    /// have changed.
+    fn is_same_message(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::User(a), Self::User(b)) => a.id == b.id,
+            (Self::Agent(a), Self::Agent(b)) | (Self::Thought(a), Self::Thought(b)) => a.id == b.id,
+            _ => false,
+        }
+    }
+
+    fn set_arrived(&mut self, at: Option<DateTime<Utc>>) {
+        match self {
+            Self::User(message) => message.arrived = at,
+            Self::Agent(message) | Self::Thought(message) => message.arrived = at,
+            Self::Notice(notice) => notice.arrived = at,
+            Self::Tool(_) | Self::Compaction(_) | Self::Surface(_) | Self::Wake => {}
+        }
+    }
 }
 
 /// Progress on one [`PlanItem`].
@@ -805,6 +916,27 @@ impl Session {
         shown
     }
 
+    /// Gives the entries a replay of the whole conversation rebuilt the
+    /// times their twins in `shown`, the entries it replaced
+    /// ([`Continuity::Replaced`]), had, and returns the first that differs
+    /// from its twin: a replay carries no times, but this client saw those
+    /// arrive, so only what changed is new. The first that differs keeps
+    /// its time too if it is the same message, such as a reply that went
+    /// on streaming. Call it once the replay caught up.
+    pub fn keep_arrivals(&mut self, shown: &[Entry]) -> usize {
+        for (at, (entry, was)) in self.entries.iter_mut().zip(shown).enumerate() {
+            let replayed = entry.arrived();
+            entry.set_arrived(was.arrived());
+            if entry != was {
+                if !entry.is_same_message(was) {
+                    entry.set_arrived(replayed);
+                }
+                return at;
+            }
+        }
+        shown.len().min(self.entries.len())
+    }
+
     /// Background work an earlier run of the client saw, given before the
     /// attach: what had ended, in the order it ended, as
     /// [`Self::ended_background`] listed it, and what still ran. What ended
@@ -1109,6 +1241,12 @@ impl Session {
 
     fn apply_event(&mut self, SessionUpdate { seq, event }: SessionUpdate) -> Option<usize> {
         self.seq = self.seq.max(seq);
+        // When the entry it makes arrived, for the transcript to show: now,
+        // if it came live. rho-protocol's events carry no time, so one from
+        // a replay, or from the events a reattach caught up on, has none:
+        // now would be when the conversation was read again, not when it
+        // happened.
+        let arrived = matches!(self.sync, Sync::Live).then(now);
         let mut caught_up = false;
         if let Sync::Replaying(left) = &mut self.sync {
             *left -= 1;
@@ -1117,7 +1255,7 @@ impl Session {
                 caught_up = true;
             }
         }
-        let changed = self.apply_change(event);
+        let changed = self.apply_change(event, arrived);
         if caught_up {
             self.settle_remembered();
         }
@@ -1147,8 +1285,12 @@ impl Session {
     }
 
     /// [`Self::apply_event`] once the attachment's place in the replay is
-    /// counted.
-    fn apply_change(&mut self, event: SessionEvent) -> Option<usize> {
+    /// counted, and whether the event came live.
+    fn apply_change(
+        &mut self,
+        event: SessionEvent,
+        arrived: Option<DateTime<Utc>>,
+    ) -> Option<usize> {
         self.open_turn(&event);
         // A retry says what the turn does until its next event.
         if matches!(self.turn.delay, Some(Delay::Retrying { .. })) {
@@ -1171,28 +1313,31 @@ impl Session {
                     id: message.as_str().to_owned(),
                     prompt: Prompt::from_wire(&content),
                     steer: is_steer,
+                    arrived,
                 }))
             }
             SessionEvent::AgentMessageChunk { .. } if self.turn.compacts => None,
             SessionEvent::AgentMessageChunk { message, text } => {
-                Some(self.append_message(message.as_str(), &text, Entry::Agent))
+                Some(self.append_message(message.as_str(), &text, Entry::Agent, arrived))
             }
             SessionEvent::ThoughtChunk { message, text } => {
-                Some(self.append_message(message.as_str(), &text, Entry::Thought))
+                Some(self.append_message(message.as_str(), &text, Entry::Thought, arrived))
             }
             SessionEvent::ToolCall(update) => Some(self.update_tool(*update)),
-            SessionEvent::Notice { text } => Some(self.push_notice(Notice {
-                level: NoticeLevel::Info,
-                title: text,
-                description: None,
-            })),
+            SessionEvent::Notice { text } => Some(self.push_notice(Notice::text(&text, arrived))),
             SessionEvent::Card {
                 title,
                 markdown,
                 plain,
                 tone,
-                ..
-            } => Some(self.push_notice(Notice::card(title, tone, [markdown, plain]))),
+                display,
+            } => Some(self.push_notice(Notice::card(
+                title,
+                [markdown, plain],
+                tone,
+                display,
+                arrived,
+            ))),
             SessionEvent::State { state, turn } => {
                 if !state.in_progress() {
                     // A turn the daemon's restart cut short ends here,
@@ -1231,7 +1376,7 @@ impl Session {
             }
             event @ (SessionEvent::InputRequested { .. }
             | SessionEvent::InputResolved { .. }
-            | SessionEvent::InputHeld { .. }) => self.track_input(event),
+            | SessionEvent::InputHeld { .. }) => self.track_input(event, arrived),
             SessionEvent::Background { work } => {
                 self.set_background(work);
                 None
@@ -1344,7 +1489,11 @@ impl Session {
     /// which drops its timeout. A request nobody answered by its deadline
     /// leaves a notice of the answer rho gave, the entry this returns: the
     /// user may have been about to answer it.
-    fn track_input(&mut self, event: SessionEvent) -> Option<usize> {
+    fn track_input(
+        &mut self,
+        event: SessionEvent,
+        arrived: Option<DateTime<Utc>>,
+    ) -> Option<usize> {
         match event {
             SessionEvent::InputRequested { request } => {
                 self.open_input(InputRequest::from_wire(*request));
@@ -1354,13 +1503,21 @@ impl Session {
                 let timeout = closed
                     .timeout()
                     .filter(|_| resolution == Resolution::TimedOut)?;
+                // It asks for the user's look, as the question did. The
+                // answer can run long, so the detail says it whole.
                 return Some(self.push_notice(Notice {
-                    level: NoticeLevel::Warning,
+                    tone: NoticeTone::Accent,
                     title: format!(
                         "No answer came in time, so Rho answered “{}”",
                         timeout.fallback()
                     ),
-                    description: Some(closed.title().to_owned()),
+                    reference: None,
+                    description: Some(format!(
+                        "{}\n\nRho answered: {}",
+                        closed.title(),
+                        timeout.fallback()
+                    )),
+                    arrived,
                 }));
             }
             SessionEvent::InputHeld { id } => {
@@ -1486,13 +1643,16 @@ impl Session {
 
     /// Puts `message` in place of the user message with its ID, or after
     /// the rest if it is new, and returns its index: a user message always
-    /// comes whole.
-    fn put_user(&mut self, message: UserMessage) -> usize {
+    /// comes whole. One put again keeps the time it first arrived.
+    fn put_user(&mut self, mut message: UserMessage) -> usize {
         let found = self
             .entries
             .iter()
             .rposition(|entry| matches!(entry, Entry::User(user) if user.id == message.id));
         if let Some(at) = found {
+            if let Entry::User(was) = &self.entries[at] {
+                message.arrived = was.arrived.or(message.arrived);
+            }
             self.entries[at] = Entry::User(message);
             at
         } else {
@@ -1502,9 +1662,14 @@ impl Session {
     }
 
     /// The agent message `id` and its index, appending `make(empty)` if it
-    /// is new. Searches from the end: updates almost always touch the
-    /// newest rows.
-    fn message_mut(&mut self, id: &str, make: fn(Message) -> Entry) -> (usize, &mut Message) {
+    /// is new, as arrived at `arrived`. Searches from the end: updates
+    /// almost always touch the newest rows.
+    fn message_mut(
+        &mut self,
+        id: &str,
+        make: fn(Message) -> Entry,
+        arrived: Option<DateTime<Utc>>,
+    ) -> (usize, &mut Message) {
         let found = self.entries.iter().rposition(|entry| {
             matches!(entry, Entry::Agent(message) | Entry::Thought(message) if message.id == id)
         });
@@ -1512,6 +1677,7 @@ impl Session {
             self.entries.push(make(Message {
                 id: id.to_owned(),
                 text: String::new(),
+                arrived,
             }));
             self.entries.len() - 1
         });
@@ -1521,8 +1687,14 @@ impl Session {
         }
     }
 
-    fn append_message(&mut self, id: &str, text: &str, make: fn(Message) -> Entry) -> usize {
-        let (at, message) = self.message_mut(id, make);
+    fn append_message(
+        &mut self,
+        id: &str,
+        text: &str,
+        make: fn(Message) -> Entry,
+        arrived: Option<DateTime<Utc>>,
+    ) -> usize {
+        let (at, message) = self.message_mut(id, make, arrived);
         message.text.push_str(text);
         at
     }

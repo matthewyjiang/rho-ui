@@ -27,6 +27,9 @@ futures = "0.3"
 # wasm itself (sqlite-wasm-rs), and rho-ui keeps a copy in memory of the
 # server's, which `serialize` moves between them.
 rusqlite = { version = "0.41", features = ["bundled", "serialize"] }
+# Shows when messages and cards arrived, in local time; `wasmbind` reads the
+# browser's time zone.
+chrono = { version = "0.4", default-features = false, features = ["clock", "wasmbind"] }
 # `Instant` and `SystemTime` that work in a browser too, where std's panic,
 # as GPUI's executor's are; std's own elsewhere.
 web-time = "1"

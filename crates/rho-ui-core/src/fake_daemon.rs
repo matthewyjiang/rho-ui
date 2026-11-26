@@ -41,6 +41,8 @@
 //!   the session's folder.
 //! - The prompt "plan" asks to carry out a plan, and answers "you chose"
 //!   and the answer, with its feedback after a colon.
+//! - The prompt "cards" says it looks, then sends [`CARDS`], then answers:
+//!   a run of cards between two replies.
 //! - The prompt "report" answers with [`report`], a long reply that
 //!   streams in over several events.
 //! - The prompt "background" starts a background process, `sleep 30`, and
@@ -58,7 +60,7 @@
 //!   can be observed but not attached to. Every other session runs as the
 //!   default agent, but for a new one that names its own.
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
-//!   whole result as a card, [`subagent_result`], and the parent's daemon
+//!   whole result as a card, `subagent_result`, and the parent's daemon
 //!   turn tells the model, as for a process.
 //! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
 //!   in a session. Its two agent nodes are in the job list only: one
@@ -180,8 +182,9 @@ use std::{
 
 use rho_protocol::{
     display::{
-        CodeWindow, DiffRow, DiffRowKind, ToolBody, ToolCard, ToolCardStatus, ToolFact, ToolFamily,
-        ToolHeader,
+        CodeWindow, DiffRow, DiffRowKind, NotificationCard, NotificationDelivery,
+        NotificationPreview, NotificationTone, NotificationVisibility, ToolBody, ToolCard,
+        ToolCardStatus, ToolFact, ToolFamily, ToolHeader,
     },
     methods::{
         BackgroundItem, BackgroundStatus, BackgroundWork, Budget, FastModeOptions, IdempotencyKey,
@@ -249,7 +252,7 @@ pub const WORKFLOW_ERROR: &str = "provider refused the request";
 
 /// The whole result the subagent [`SUBAGENT_TASK`] returns, in Markdown:
 /// as long as an explorer's report, with headings, a list and code.
-pub fn subagent_result() -> String {
+fn subagent_result() -> String {
     let parts = (1..=6).map(|n| {
         format!("\n## {n}. Part {n}\n\n- `src/parse.rs:{n}0`\n\n```rust\nfn part_{n}() {{}}\n```\n")
     });
@@ -357,8 +360,6 @@ pub struct Script {
     pub replay_turns: usize,
     /// Whether [`TUI_SESSION`] exists, with a turn under way.
     pub tui_job: TuiJob,
-    /// Whether "old"'s replay ends with an info card and a warning card.
-    pub cards: bool,
     /// Whether "old"'s replay ends with a reply of one paragraph over
     /// 4 KiB, which GPUI Kit parses off the UI thread.
     pub long_reply: bool,
@@ -2044,28 +2045,92 @@ fn grep_lines(n: usize) -> Vec<String> {
     lines
 }
 
-/// An info card and a warning card, as background work and failing hooks
-/// send them.
-fn cards(session: &mut FakeSession) {
-    for (title, plain, tone) in [
-        (
-            "Completed · cargo test",
-            "ran 2m 04s\n142 passed",
-            CardTone::Neutral,
-        ),
-        (
-            "Hook failed · pre-commit",
-            "exit status 1",
-            CardTone::Warning,
-        ),
-    ] {
-        session.publish(SessionEvent::Card {
+/// The cards the prompt "cards" sends between its two replies, as a lead
+/// gets them from its workers, processes and pull requests: `(title,
+/// tone, reference, body)`. A failure, three routine cards, then the
+/// comments, which ask for a look, then three more routine cards: with the
+/// rail's first four always showing, the last three fold, and the comments
+/// show though they come after the fourth.
+pub const CARDS: [(&str, CardTone, &str, &str); 8] = [
+    (
+        "Failed (exit 101) · cargo test -j 6 -p rho-ui",
+        CardTone::Error,
+        "p-3",
+        "test ui_tests::transcript_keeps_scroll_on_resize ... FAILED",
+    ),
+    (
+        "Checks passed · matthewyjiang/rho-ui#99",
+        CardTone::Success,
+        "matthewyjiang/rho-ui#99",
+        "- All 9 checks passed.",
+    ),
+    (
+        "Approved · matthewyjiang/rho-ui#100",
+        CardTone::Success,
+        "matthewyjiang/rho-ui#100",
+        "",
+    ),
+    (
+        "Approved · matthewyjiang/rho-ui#102",
+        CardTone::Success,
+        "matthewyjiang/rho-ui#102",
+        "",
+    ),
+    (
+        "New comments · matthewyjiang/rho-ui#101",
+        CardTone::Accent,
+        "matthewyjiang/rho-ui#101",
+        "- 1 new comment:\n  - coderabbitai: \"Split the status view out of #10?\"",
+    ),
+    (
+        "Completed · brief rereads",
+        CardTone::Success,
+        "run-7",
+        "Fixed and pushed to `feat/lead-brief-after-compaction`.",
+    ),
+    (
+        "New commits · matthewyjiang/rho#2040",
+        CardTone::Neutral,
+        "matthewyjiang/rho#2040",
+        "",
+    ),
+    (
+        "Changes requested · matthewyjiang/rho#2040",
+        CardTone::Warning,
+        "matthewyjiang/rho#2040",
+        "- coderabbitai: \"Reread the brief before any write to it.\"",
+    ),
+];
+
+/// Card `(title, tone, reference, body)` as rho's daemon sends a
+/// notification: the bodies, and the card rho's terminal UI draws.
+fn notification((title, tone, reference, body): (&str, CardTone, &str, &str)) -> SessionEvent {
+    let display_tone = match tone {
+        CardTone::Accent => NotificationTone::Accent,
+        CardTone::Success => NotificationTone::Success,
+        CardTone::Warning => NotificationTone::Warning,
+        CardTone::Error => NotificationTone::Error,
+        _ => NotificationTone::Neutral,
+    };
+    SessionEvent::Card {
+        title: title.to_owned(),
+        markdown: body.to_owned(),
+        plain: body.to_owned(),
+        tone,
+        display: Some(Box::new(NotificationCard {
             title: title.to_owned(),
-            markdown: plain.to_owned(),
-            plain: plain.to_owned(),
-            tone,
-            display: None,
-        });
+            sender: "github".to_owned(),
+            recipient: "session".to_owned(),
+            delivery: NotificationDelivery::Received,
+            tone: display_tone,
+            preview: NotificationPreview::Truncated,
+            visibility: NotificationVisibility::Conversation,
+            reference: Some(reference.to_owned()),
+            subtitle: None,
+            body: body.to_owned(),
+            output: None,
+            details: Vec::new(),
+        })),
     }
 }
 
@@ -2198,9 +2263,6 @@ impl State {
         );
         let mut old = FakeSession::new("/w/b", None, 1_767_225_600);
         replay(&mut old, script.replay_turns);
-        if script.cards {
-            cards(&mut old);
-        }
         if script.long_reply {
             // One paragraph: rho-ui draws a reply of several blocks in
             // parts, each parsed as a text of its own.

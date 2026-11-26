@@ -31,6 +31,10 @@ A session whose model isn't signed in still opens, with a card above the compose
 - **Long replies** are drawn in parts of about 2,000 characters, so <kbd>Ctrl</kbd>+<kbd>A</kbd> selects the part you clicked in, not the whole reply.
 - **Add to prompt** appears when you select text in the transcript. It quotes the selection in your next message.
 
+## Times
+
+Hovering a message shows when it arrived, and each card rho sends between replies shows its time. rho doesn't record when things happened, so only what rho-ui saw arrive while it followed the session has a time: a conversation opened again later, or what came while rho-ui was disconnected, shows none.
+
 ## Forms
 
 rho's `ui` tool can show you a form or a small panel in the transcript. A button sends what you entered back to the agent, which reads it at its next step. rho-ui draws images in a form only from `data:` URLs; other links open in your browser.

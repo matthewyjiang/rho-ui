@@ -45,6 +45,7 @@ mod pr_mark;
 mod project_picker;
 mod projects;
 mod pull_requests;
+mod rail;
 mod repo;
 mod rho_install;
 mod rho_settings;

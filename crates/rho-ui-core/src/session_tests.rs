@@ -561,7 +561,8 @@ fn requests_open_once_and_close_when_any_client_answers() {
 }
 
 /// A question with a timeout keeps it until a client holds it; one the
-/// deadline answered says what rho answered, in case the user meant to.
+/// deadline answered says what rho answered, in case the user meant to,
+/// as a question: it never folds on the rail.
 #[test]
 fn a_timed_out_question_leaves_the_answer_rho_gave() {
     let question = |id: u64| {
@@ -593,7 +594,7 @@ fn a_timed_out_question_leaves_the_answer_rho_gave() {
                 notice.title(),
                 "No answer came in time, so Rho answered “A”"
             );
-            assert_eq!(notice.level(), NoticeLevel::Warning);
+            assert_eq!(notice.tone(), NoticeTone::Accent);
         }
         other => panic!("the transcript holds {other:?}"),
     }
@@ -935,6 +936,80 @@ fn a_ui_calls_surface_is_placed_once_after_the_call() {
             Row::Message(1),
             Row::Work(2..4),
             Row::Message(4),
+        ]
+    );
+}
+
+/// Only what this client saw arrive live has a time: a replay's events
+/// carry none. A replay of the whole conversation over it keeps the times
+/// this client saw up to the first entry that differs, and that one's if it
+/// is the same message.
+#[test]
+fn only_live_entries_know_when_they_arrived() {
+    let user = |id: &str, text: &str| {
+        update(json!({"type": "user_message", "message": id,
+            "content": [{"type": "text", "text": text}]}))
+    };
+    let notice = || update(json!({"type": "notice", "text": "PR merged"}));
+    let arrived = |session: &Session| -> Vec<bool> {
+        session
+            .entries()
+            .iter()
+            .map(|entry| match entry {
+                Entry::User(message) => message.arrived().is_some(),
+                Entry::Notice(notice) => notice.arrived().is_some(),
+                other => panic!("no {other:?} was sent"),
+            })
+            .collect()
+    };
+    let mut session = Session::new(SessionId::from("s1"));
+    session.attached(attach_response(JobState::Idle, 2));
+    session.apply(user("u1", "replayed"));
+    session.apply(notice());
+    session.apply(user("u2", "live"));
+    session.apply(notice());
+    session.apply(user("u3", "live too"));
+    assert_eq!(arrived(&session), [false, false, true, true, true]);
+
+    let Continuity::Replaced(shown) = session.attached(attach_response(JobState::Idle, 5)) else {
+        panic!("a reset replays the whole conversation");
+    };
+    session.apply(user("u1", "replayed"));
+    session.apply(notice());
+    session.apply(user("u2", "edited"));
+    session.apply(notice());
+    session.apply(user("u3", "live too"));
+    assert_eq!(arrived(&session), [false; 5]);
+    assert_eq!(
+        session.keep_arrivals(&shown),
+        2,
+        "the edited message differs"
+    );
+    assert_eq!(arrived(&session), [false, false, true, false, false]);
+}
+
+/// A notice of several lines, as a provider's diagnostic is, reads its
+/// first line on one row and keeps the rest to open.
+#[test]
+fn a_notice_of_several_lines_keeps_the_rest_as_its_detail() {
+    let mut session = session();
+    session.apply(update(
+        json!({"type": "notice", "text": "provider diagnostic:\nquota exceeded\nretry later"}),
+    ));
+    session.apply(update(json!({"type": "notice", "text": "PR merged\n"})));
+    let notices: Vec<(&str, Option<&str>)> = session
+        .entries()
+        .iter()
+        .map(|entry| match entry {
+            Entry::Notice(notice) => (notice.title(), notice.description()),
+            other => panic!("no {other:?} was sent"),
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [
+            ("provider diagnostic:", Some("quota exceeded\nretry later")),
+            ("PR merged", None),
         ]
     );
 }
