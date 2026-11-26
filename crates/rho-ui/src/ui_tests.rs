@@ -1902,6 +1902,7 @@ fn a_started_session_is_answered_from_its_row() {
 
     // Kit's menu trigger beside the plan's first mode.
     ui.act(|window, cx| window.within("session-local-w2").click("popup", cx));
+    ui.shot("plan-menu");
     click_menu_item(&mut ui, "Approve in Auto");
     ui.wait_for_daemon("w2's plan carried out in Auto", |fake| {
         fake.reply("w2").as_deref() == Some("you chose approve_plan auto")
