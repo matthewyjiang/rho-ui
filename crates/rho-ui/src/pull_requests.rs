@@ -381,7 +381,8 @@ struct MachinePrs {
     connection: u64,
     daemon: Daemon,
     serving: Serving,
-    /// Each session's set, replaced whole by every answer and event, never
+    /// Each session's set, replaced whole by every event and by each answer
+    /// no event of its session came after ([`Self::answered`]), never
     /// merged.
     sessions: HashMap<SessionId, SessionPullRequests>,
     /// Each pull request's detail, from the last `show` that carried one:
@@ -393,6 +394,18 @@ struct MachinePrs {
     failed: Option<SharedString>,
     /// Reissues `list` for this machine's listed sessions.
     list: Cadence<()>,
+    /// Events taken from this connection, and the count at each session's
+    /// last: see [`Self::answered`].
+    events: u64,
+    last_event: HashMap<SessionId, u64>,
+}
+
+/// When a request went to a machine: on which of its connections, and
+/// after how many of that connection's events.
+#[derive(Clone, Copy)]
+struct Asked {
+    connection: u64,
+    events: u64,
 }
 
 impl MachinePrs {
@@ -403,6 +416,42 @@ impl MachinePrs {
         }
         self.sessions.insert(session.clone(), set);
         true
+    }
+
+    /// A request sent now.
+    fn asked(&self) -> Asked {
+        Asked {
+            connection: self.connection,
+            events: self.events,
+        }
+    }
+
+    /// Stores `set`, from an event. Whether it changed.
+    fn evented(&mut self, session: &SessionId, set: SessionPullRequests) -> bool {
+        self.events += 1;
+        self.last_event.insert(session.clone(), self.events);
+        self.store(session, set)
+    }
+
+    /// Stores `set`, from the answer to a request sent when `asked`, unless
+    /// an event for `session` came since. Neither says which is newer, and
+    /// the event may be: the daemon read the answer's set before it
+    /// answered, and a change in between still arrives first, so the late
+    /// answer would undo it. Skipping loses nothing as long as an event
+    /// carries every change the answer could: rho sends each change of a
+    /// followed session's set to its feed, and what a request read before
+    /// it answers, and sends a session's events before an answer that
+    /// names it (`show`, `link`, `unlink`). A session no one follows has no
+    /// events, so its answers always store. Whether it changed.
+    fn answered(&mut self, session: &SessionId, set: SessionPullRequests, asked: Asked) -> bool {
+        if self
+            .last_event
+            .get(session)
+            .is_some_and(|&at| at > asked.events)
+        {
+            return false;
+        }
+        self.store(session, set)
     }
 
     /// Takes `answer` to a request to `machine`'s daemon. An answer means
@@ -528,6 +577,8 @@ impl PullRequests {
                 details: HashMap::new(),
                 failed: None,
                 list: Cadence::new(),
+                events: 0,
+                last_event: HashMap::new(),
             },
         );
         cx.notify();
@@ -581,7 +632,7 @@ impl PullRequests {
         if entry.serving == Serving::Asking {
             entry.serving = Serving::Served;
         }
-        if !entry.store(&session.id, set) {
+        if !entry.evented(&session.id, set) {
             return;
         }
         cx.notify();
@@ -696,6 +747,13 @@ impl PullRequests {
     /// machine isn't connected.
     pub(crate) fn serving(&self, machine: &MachineId) -> Option<Serving> {
         self.machines.get(machine).map(|entry| entry.serving)
+    }
+
+    /// Whether a show is on its way, or waits for the one on its way: a
+    /// test that counts the daemon's shows waits for none before it counts.
+    #[cfg(test)]
+    pub(crate) fn is_showing(&self) -> bool {
+        self.show.is_running()
     }
 
     /// `session`'s set, once its daemon answered with one.
@@ -813,16 +871,15 @@ impl PullRequests {
             Ok(entry) => entry,
             Err(why) => return Task::ready(Err(why)),
         };
-        let (daemon, connection, session) =
-            (entry.daemon.clone(), entry.connection, session.clone());
+        let (daemon, asked, session) = (entry.daemon.clone(), entry.asked(), session.clone());
         cx.spawn(async move |this, cx| {
             let answer = daemon.link_pull_request(&session.id, &text).await;
             this.update(cx, |this, cx| {
-                let Some(entry) = this.current(&session.machine, connection) else {
+                let Some(entry) = this.current(&session.machine, asked) else {
                     return Err(not_connected(&session.machine));
                 };
                 let linked = entry.take(&session.machine, answer).map(|response| {
-                    entry.store(&session.id, response.pull_requests);
+                    entry.answered(&session.id, response.pull_requests, asked);
                     response.pull_request
                 });
                 cx.notify();
@@ -855,16 +912,15 @@ impl PullRequests {
             // Unlinked already.
             return Task::ready(Ok(()));
         };
-        let (daemon, connection, session) =
-            (entry.daemon.clone(), entry.connection, session.clone());
+        let (daemon, asked, session) = (entry.daemon.clone(), entry.asked(), session.clone());
         cx.spawn(async move |this, cx| {
             let answer = daemon.unlink_pull_request(&session.id, &text).await;
             this.update(cx, |this, cx| {
-                let Some(entry) = this.current(&session.machine, connection) else {
+                let Some(entry) = this.current(&session.machine, asked) else {
                     return Err(not_connected(&session.machine));
                 };
                 let unlinked = entry.take(&session.machine, answer).map(|set| {
-                    entry.store(&session.id, set);
+                    entry.answered(&session.id, set, asked);
                 });
                 cx.notify();
                 unlinked
@@ -963,12 +1019,12 @@ impl PullRequests {
         Ok(entry)
     }
 
-    /// `machine`'s state, while it is still on `connection`: an answer sent
-    /// on an earlier one is dropped.
-    fn current(&mut self, machine: &MachineId, connection: u64) -> Option<&mut MachinePrs> {
+    /// `machine`'s state, while it is still on the connection a request
+    /// was `asked` on: an answer sent on an earlier one is dropped.
+    fn current(&mut self, machine: &MachineId, asked: Asked) -> Option<&mut MachinePrs> {
         self.machines
             .get_mut(machine)
-            .filter(|entry| entry.connection == connection)
+            .filter(|entry| entry.connection == asked.connection)
     }
 
     /// Shows what is on screen again now if it is of `session`, whose set
@@ -1032,7 +1088,7 @@ impl PullRequests {
                 },
             },
         };
-        let (daemon, connection) = (entry.daemon.clone(), entry.connection);
+        let (daemon, asked) = (entry.daemon.clone(), entry.asked());
         let read = std::mem::take(&mut self.next);
         self.show
             .start(shown.clone(), cx.background_executor().now());
@@ -1041,7 +1097,7 @@ impl PullRequests {
                 .show_pull_request(&shown.session.id, target, read)
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.showed(&shown, connection, answer, cx);
+                this.showed(&shown, asked, answer, cx);
                 if this.show.finish() {
                     this.show_now(cx);
                 } else {
@@ -1051,18 +1107,18 @@ impl PullRequests {
         });
     }
 
-    /// Takes the answer to a `show` of `shown` sent on `connection`. A
+    /// Takes the answer to a `show` of `shown` sent when `asked`. A
     /// refusal stays with what it showed, and what was shown before stays,
     /// with why it may be out of date.
     fn showed(
         &mut self,
         shown: &Shown,
-        connection: u64,
+        asked: Asked,
         answer: Result<SessionPullRequestShowResponse, PullRequestError>,
         cx: &mut Context<'_, Self>,
     ) {
         let machine = &shown.session.machine;
-        let Some(entry) = self.current(machine, connection) else {
+        let Some(entry) = self.current(machine, asked) else {
             return;
         };
         let before = entry.health();
@@ -1070,7 +1126,7 @@ impl PullRequests {
         let mut read = None;
         let refused = match entry.take(machine, answer) {
             Ok(response) => {
-                stored = entry.store(&shown.session.id, response.pull_requests);
+                stored = entry.answered(&shown.session.id, response.pull_requests, asked);
                 if let Some(detail) = response.detail {
                     let id = detail.summary.id.clone();
                     if entry.details.get(&id) != Some(&*detail) {
@@ -1163,51 +1219,49 @@ impl PullRequests {
         {
             return;
         }
-        let (daemon, connection) = (entry.daemon.clone(), entry.connection);
+        let (daemon, asked) = (entry.daemon.clone(), entry.asked());
         entry.list.start((), cx.background_executor().now());
         let machine = machine.clone();
         entry.list.task = cx.spawn(async move |this, cx| {
             let answer = daemon.list_pull_requests(&sessions).await;
             let _ = this.update(cx, |this, cx| {
-                this.list_answered(&machine, connection, answer, cx);
+                this.list_answered(&machine, asked, answer, cx);
             });
         });
     }
 
-    /// Takes the answer to a `list` sent to `machine` on `connection`, and
+    /// Takes the answer to a `list` sent to `machine` when `asked`, and
     /// schedules the next.
     fn list_answered(
         &mut self,
         machine: &MachineId,
-        connection: u64,
+        asked: Asked,
         answer: Result<Vec<(SessionId, SessionPullRequests)>, PullRequestError>,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(entry) = self.current(machine, connection) else {
+        let Some(entry) = self.current(machine, asked) else {
             return;
         };
         let before = entry.health();
         // What the daemon refused of the list alone has no one to tell: the
         // next list asks again.
         let sets = entry.take(machine, answer).unwrap_or_default();
-        let mut stored = false;
+        let mut stored = Vec::new();
         for (session, set) in sets {
-            stored |= entry.store(&session, set);
+            if entry.answered(&session, set, asked) {
+                stored.push(session);
+            }
         }
-        let changed = stored || entry.health() != before;
+        let changed = !stored.is_empty() || entry.health() != before;
         let again = entry.list.finish();
         // Every notify redraws the sidebar and syncs the panel's tabs: only
         // when something changed.
         if changed {
             cx.notify();
         }
-        let shown = self
-            .shown
-            .as_ref()
-            .map(|shown| shown.session.clone())
-            .filter(|session| session.machine == *machine);
-        if let Some(session) = shown.filter(|_| stored) {
-            self.show_if_moved(&session, cx);
+        // As for an event: only the shown session's own set can move its PR.
+        for session in stored {
+            self.show_if_moved(&SessionKey::new(machine.clone(), session), cx);
         }
         if again {
             self.list_now(machine, cx);

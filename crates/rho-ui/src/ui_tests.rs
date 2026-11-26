@@ -3602,6 +3602,11 @@ fn a_left_session_is_let_go_and_shown_again_at_once() {
     ui.type_in("half a thought");
 
     ui.click("session-local-s1");
+    // Until s1's attach answers and its replay catches up, Enter sends
+    // nothing.
+    ui.wait_for_session("s1 caught up", |session| {
+        session.id().as_str() == "s1" && !session.is_replaying()
+    });
     ui.wait_for_daemon("old let go", |fake| fake.followers("old") == 0);
     ui.act(|window, _| {
         assert!(is_visible(window, "session-local-old"), "old's row stays");
@@ -4784,20 +4789,25 @@ fn a_side_chat_forks_the_session_into_the_right_panel() {
     });
     assert_eq!(ui.composer_text(), "", "the question left the composer");
     // The question went once the forked conversation was all there, so
-    // its turn is the one running, not the turn it forked.
-    ui.act(|window, _| {
-        let forked = window
-            .within("right-panel")
-            .find("worked-0")
-            .label()
-            .map(str::to_owned);
-        assert!(
-            forked
-                .as_deref()
-                .is_some_and(|label| label.starts_with("Worked for ")),
-            "the forked turn's header: {forked:?}"
-        );
-    });
+    // its turn is the one running, not the turn it forked: the forked
+    // turn's header, once drawn, says how long it worked.
+    let forked = |ui: &mut Harness| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                let header = window.within("right-panel").try_find("worked-0")?;
+                header.label().map(str::to_owned)
+            })
+            .expect("window is open")
+    };
+    ui.poll(
+        WAIT,
+        "the forked turn's header",
+        |ui| {
+            ui.frame();
+            forked(ui).is_some_and(|label| label.starts_with("Worked for "))
+        },
+        |ui| format!("it says {:?}", forked(ui)),
+    );
     ui.shot("approval");
     ui.act(|window, cx| {
         window
@@ -5620,6 +5630,11 @@ fn a_branch_without_a_pr_shows_the_pr_linked_last() {
     // With the panel hidden, the title bar marks the PR linked last. A
     // minute on, the daemon's read of the tab's PR is due again.
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
+    // The picked PR showed from the set at once; its show, or one before
+    // it, may still be on its way to the daemon, which counts it on arrival.
+    ui.wait_until("the shows answered", |_, cx, app| {
+        !app.pull_requests().read(cx).is_showing()
+    });
     ui.cx.advance_clock(Duration::from_secs(60));
     ui.frame();
     let asked = ui.fake().pull_requests_shown(&key.id).len();
