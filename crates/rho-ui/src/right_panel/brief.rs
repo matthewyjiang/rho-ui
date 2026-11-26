@@ -1,5 +1,5 @@
-//! The Brief surface: a lead's `brief.md`, which it keeps in its folder and
-//! reads at the start of every turn, drawn as Markdown, read-only. It reads
+//! The Brief surface: a lead's `brief.md`, which it keeps current in its
+//! folder and rereads after compaction, drawn as Markdown, read-only. It reads
 //! the file on the lead's machine when its tab opens, and again when the
 //! lead's turn ends or it comes back on screen ([`super::RightPanel`] says
 //! when), showing what it read until the next read lands, and through one
@@ -32,7 +32,7 @@ const BRIEF_LIMIT: usize = 64 << 10;
 
 /// The line over the brief: how the lead uses it, and how to change it.
 const CAPTION: &str =
-    "The lead reads this at the start of every turn. To change it, tell the lead.";
+    "The lead keeps this current and rereads it after compaction. To change it, tell the lead.";
 
 /// What the surface shows.
 enum Shown {

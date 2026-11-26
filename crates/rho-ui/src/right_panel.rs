@@ -110,7 +110,7 @@ pub(crate) enum Surface {
     SideChat,
     /// A lead's work: the sessions it started and the PRs linked to it.
     Work,
-    /// A lead's `brief.md`, which it reads at the start of every turn.
+    /// A lead's `brief.md`, which it keeps current and rereads after compaction.
     Brief,
 }
 
