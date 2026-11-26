@@ -32,12 +32,12 @@ mod tool_card;
 
 pub use agent_settings::{AgentSettings, AgentSettingsChanged};
 pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundWork};
-pub use completion::{Completion, Edit};
+pub use completion::{mcp_command, ArgumentAsk, ArgumentValue, Completion, Edit, Mention};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
     Detached, PendingUpgrade, PromptKey, PullRequestError, Report, ReportError, ReportedWorktree,
-    RestartCost, SessionId, SessionMark, SessionSummary, SurfaceActionError, Unsteered, VersionFix,
-    VersionMismatch, LEAD_AGENT,
+    ResourceAttachment, RestartCost, SessionId, SessionMark, SessionSummary, SurfaceActionError,
+    Unsteered, VersionFix, VersionMismatch, LEAD_AGENT, MAX_RESOURCE_TEXT_BYTES,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -91,9 +91,13 @@ pub use rho_protocol::{
     ProcessChunk, ProcessOutput, ProcessOutputParams, ProcessState, ProcessStream, SessionProcess,
     SessionProcessesResponse,
 };
-/// A session's MCP servers, as [`Daemon::mcp_servers`] reports them, as
-/// rho-protocol has them.
-pub use rho_protocol::{SessionMcpInventory, SessionMcpServer, SessionMcpStatus};
+/// A session's MCP servers, as [`Daemon::mcp_servers`] reports them, and
+/// what they offer, as [`Daemon::mcp_catalog`] lists it, as rho-protocol
+/// has them.
+pub use rho_protocol::{
+    SessionMcpCatalog, SessionMcpInventory, SessionMcpPrompt, SessionMcpResource, SessionMcpServer,
+    SessionMcpStatus,
+};
 /// What [`Daemon::check_worktrees`] and [`Daemon::prune_worktrees`] report
 /// of each session worktree, as rho-protocol has it.
 pub use rho_protocol::{SessionWorktree, WorktreeVerdict};

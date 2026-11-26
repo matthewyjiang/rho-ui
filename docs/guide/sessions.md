@@ -74,6 +74,8 @@ Type `/` at the start of a message or `$` anywhere to complete the session's com
 
 To run a new session as one of the workspace's agents, start its first message with `/agent:<name>` and the task.
 
+An MCP prompt runs as `/mcp:<server>:<name>`, followed by its arguments: everything after the command for a prompt of one argument, else `name=value` words. When its server suggests values for an argument, the menu offers them as you type it. <kbd>Tab</kbd> takes a suggestion, and <kbd>Enter</kbd> takes one only once you've moved the highlight, so a value you typed yourself sends as it is.
+
 ## Attachments
 
 What the model gets depends on the file:
@@ -83,6 +85,8 @@ What the model gets depends on the file:
 | PNG, JPEG, GIF or WebP image | An image the model sees |
 | Text file up to 200,000 characters | Its whole text |
 | Anything else: a PDF, a binary, a longer text file | Its path, for the agent to read with its own tools |
+
+Type `@` to attach a resource one of the session's MCP servers offers, such as a document or a database row. The menu matches what you type against each resource's URI and name. rho-ui reads the resource when you pick it, and the message can't be sent until the read is done. The model gets the resource's text under its URI, or a lone image as an image. Text beyond 200 KiB is cut off and says so, and binary parts are described rather than sent. A resource template, such as `docs://users/{id}`, is written into the message as text for you to fill in. Resources are offered only in an open session, not in a draft.
 
 One message carries at most 16 MiB of attachments, as the daemon reads a message as one line of up to 16 MiB. A message with attachments can't steer a running turn, so it waits and goes as the next prompt. A session on a remote machine can't take files that would go by path, since the path is on this machine.
 

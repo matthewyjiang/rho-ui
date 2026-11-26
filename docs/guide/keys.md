@@ -21,6 +21,7 @@ On macOS, <kbd>Cmd</kbd> takes the place of <kbd>Ctrl</kbd> in these, and the me
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> or <kbd>Alt</kbd>+<kbd>Enter</kbd> | New line |
 | <kbd>Ctrl</kbd>+<kbd>V</kbd>, or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> on any platform | Paste text, an image, or a copied file |
 | <kbd>/</kbd> at the start, or <kbd>$</kbd> anywhere | Complete a slash command or a skill |
+| <kbd>@</kbd> | Attach an MCP resource |
 | <kbd>Up</kbd>, <kbd>Down</kbd>, <kbd>Tab</kbd> | Move through and complete the menu |
 | <kbd>Escape</kbd> | Close the menu (it doesn't stop the turn) |
 | <kbd>Backspace</kbd> in an empty box | Remove the last attachment |

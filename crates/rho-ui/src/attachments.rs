@@ -94,6 +94,15 @@ impl Preview {
         self
     }
 
+    /// Says it holds only the first `bytes` of the text it stood for, as a
+    /// resource cut to fit does.
+    pub(crate) fn cut(mut self, bytes: usize) -> Self {
+        if let Self::File { detail, .. } = &mut self {
+            *detail = format!("{detail}, cut to {} KiB", bytes >> 10).into();
+        }
+        self
+    }
+
     /// What it is, for screen readers, such as "PNG image, 1920 × 1080".
     pub(crate) fn label(&self) -> SharedString {
         match self {

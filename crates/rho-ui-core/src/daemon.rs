@@ -74,6 +74,7 @@ mod reports;
 mod worktrees;
 
 pub use marks::SessionMark;
+pub use mcp::{ResourceAttachment, MAX_RESOURCE_TEXT_BYTES};
 pub use pull_requests::PullRequestError;
 pub use reports::{Report, ReportError};
 pub use worktrees::ReportedWorktree;
