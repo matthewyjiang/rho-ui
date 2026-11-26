@@ -5,8 +5,8 @@
 use gpui_kit::{App, Entity, ScrollHandle, SharedString, Subscription, WeakEntity};
 
 use super::{
-    brief::BriefSurface, diff::DiffSurface, files::FilesSurface, lead_work::WorkSurface,
-    pull_request::PullRequestSurface, terminal::TerminalTab, Surface,
+    brief::BriefSurface, context::ContextSurface, diff::DiffSurface, files::FilesSurface,
+    lead_work::WorkSurface, pull_request::PullRequestSurface, terminal::TerminalTab, Surface,
 };
 use crate::{leads::Kind, machines::Place, session_view::SessionView};
 
@@ -40,6 +40,8 @@ pub(super) enum Tab {
     Work(Entity<WorkSurface>),
     /// A lead's `brief.md`.
     Brief(Entity<BriefSurface>),
+    /// How full the session's context window is, and what fills it.
+    Context(Entity<ContextSurface>),
     /// The session's PRs, one at a time, with the subscription that
     /// redraws the panel as its label changes.
     PullRequest {
@@ -70,6 +72,7 @@ impl Tab {
             Tab::Files(_) => (Surface::Files, 1),
             Tab::Work(_) => (Surface::Work, 1),
             Tab::Brief(_) => (Surface::Brief, 1),
+            Tab::Context(_) => (Surface::Context, 1),
             Tab::PullRequest { .. } => (Surface::PullRequest, 1),
             Tab::Terminal { number, .. } => (Surface::Terminal, *number),
             Tab::SideChat { number, .. } => (Surface::SideChat, *number),
@@ -91,9 +94,12 @@ impl Tab {
             Tab::SideChat { number, .. } => {
                 format!("{} {number}", Surface::SideChat.label()).into()
             }
-            Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::Work(_) | Tab::Brief(_) => {
-                self.key().surface.label().into()
-            }
+            Tab::Background
+            | Tab::Diff(_)
+            | Tab::Files(_)
+            | Tab::Work(_)
+            | Tab::Brief(_)
+            | Tab::Context(_) => self.key().surface.label().into(),
         }
     }
 }
@@ -205,7 +211,8 @@ impl TabSet {
             | Surface::Diff
             | Surface::Files
             | Surface::Work
-            | Surface::Brief => 1,
+            | Surface::Brief
+            | Surface::Context => 1,
         };
         TabKey { surface, number }
     }

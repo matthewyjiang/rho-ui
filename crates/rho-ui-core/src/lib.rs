@@ -35,8 +35,8 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{Completion, Edit};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
-    Detached, PendingUpgrade, PromptKey, PullRequestError, ReportedWorktree, RestartCost,
-    SessionId, SessionMark, SessionSummary, SurfaceActionError, Unsteered, VersionFix,
+    Detached, PendingUpgrade, PromptKey, PullRequestError, Report, ReportError, ReportedWorktree,
+    RestartCost, SessionId, SessionMark, SessionSummary, SurfaceActionError, Unsteered, VersionFix,
     VersionMismatch, LEAD_AGENT,
 };
 pub use input::{
@@ -59,6 +59,13 @@ pub use remote_shell::{
     RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput,
 };
 pub use rho_install::{RhoCheck, RhoInstall, Update};
+/// A session's reports, which [`Daemon::session_report`] reads, as
+/// rho-protocol has them.
+pub use rho_protocol::methods::{
+    ContextBasis, ContextMessageKind, ContextMessagePart, ContextPromptPart, ContextToolResultPart,
+    ContextToolSchemaPart, PromptSourceKind, SessionCompactionReport, SessionContextReport,
+    SessionHooksReport, SessionProviderContextReport, ToolSchemaOrigin,
+};
 /// The mark [`Daemon::mark_session`] sets, as rho-protocol has it.
 pub use rho_protocol::NewSessionMark;
 /// The auth profiles, logins and credential store [`Daemon`]'s sign-in

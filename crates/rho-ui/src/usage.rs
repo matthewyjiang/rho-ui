@@ -1,11 +1,19 @@
 //! Context use and cost in the composer's footer: a ring that fills as the
 //! context window does, and on hover a card with the tokens in use and what
 //! the session has cost. When the daemon knows no window size there is no
-//! ring to fill, so the cost shows as text instead.
+//! ring to fill, so the cost shows as text instead. A click on either opens
+//! the session's context in the right panel, if the view gives it
+//! somewhere to open it.
+
+use std::rc::Rc;
 
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
-    h_flex, hover_card::HoverCard, progress::ProgressCircle, v_flex, ActiveTheme as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    hover_card::HoverCard,
+    progress::ProgressCircle,
+    v_flex, ActiveTheme as _, Sizable as _,
 };
 use gpui_kit::{
     div, Anchor, AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -13,15 +21,28 @@ use gpui_kit::{
 };
 use rho_ui_core::Usage;
 
+/// What a click on the ring does.
+type OnClick = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// The daemon's last usage report, drawn for the footer.
 #[derive(IntoElement)]
 pub(crate) struct UsageRing {
     usage: Usage,
+    on_click: Option<OnClick>,
 }
 
 impl UsageRing {
     pub(crate) fn new(usage: Usage) -> Self {
-        Self { usage }
+        Self {
+            usage,
+            on_click: None,
+        }
+    }
+
+    /// Runs `handler` on a click, as to open the session's context.
+    pub(crate) fn on_click(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_click = Some(Rc::new(handler));
+        self
     }
 
     /// The share of the context window in use, in whole percent, when the
@@ -69,15 +90,11 @@ impl RenderOnce for UsageRing {
         let muted = cx.theme().muted_foreground;
         let cost = self.cost();
         let Some(percent) = self.percent() else {
-            return div()
-                .id("composer-usage")
-                .test_support()
-                .flex_shrink_0()
-                .px_1()
-                .text_xs()
-                .text_color(muted)
-                .children(cost)
-                .into_any_element();
+            let Some(cost) = cost else {
+                return div().into_any_element();
+            };
+            let text = div().text_xs().text_color(muted).child(cost.clone());
+            return trigger(self.on_click, cost, text.into_any_element());
         };
         let label = match &cost {
             Some(cost) => format!("Context {percent}% · {cost}"),
@@ -86,17 +103,11 @@ impl RenderOnce for UsageRing {
         // Past 100% the model has overrun its window; the ring can only
         // show it full.
         let shown = u16::try_from(percent.min(100)).unwrap_or(100);
-        let ring = div()
-            .id("composer-usage")
-            .test_support()
-            .aria_label(label)
-            .p_1()
-            .child(
-                ProgressCircle::new("usage-ring")
-                    .value(f32::from(shown))
-                    .color(muted)
-                    .size_4(),
-            );
+        let ring = ProgressCircle::new("usage-ring")
+            .value(f32::from(shown))
+            .color(muted)
+            .size_4();
+        let ring = trigger(self.on_click, label, ring.into_any_element());
         let usage = self.usage;
         HoverCard::new("usage-card")
             .anchor(Anchor::BottomRight)
@@ -104,6 +115,30 @@ impl RenderOnce for UsageRing {
             .trigger(ring)
             .content(move |_, _, cx| Self::render_details(&usage, percent, cost.clone(), cx))
             .into_any_element()
+    }
+}
+
+/// The ring or cost as drawn, labelled `label`: a button when a click
+/// opens something, else plain, so it doesn't look pressable.
+fn trigger(on_click: Option<OnClick>, label: String, shows: AnyElement) -> AnyElement {
+    match on_click {
+        Some(on_click) => Button::new("composer-usage")
+            .ghost()
+            .xsmall()
+            .compact()
+            .flex_shrink_0()
+            .accessibility_label(label)
+            .child(shows)
+            .on_click(move |_, window, cx| on_click(window, cx))
+            .into_any_element(),
+        None => div()
+            .id("composer-usage")
+            .test_support()
+            .flex_shrink_0()
+            .aria_label(label)
+            .p_1()
+            .child(shows)
+            .into_any_element(),
     }
 }
 

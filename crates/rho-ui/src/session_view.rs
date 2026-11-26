@@ -138,6 +138,9 @@ pub(crate) enum SessionEvent {
     /// Show this session's Background surface in the right panel, which
     /// shows the output of the process a row opened.
     ShowBackground,
+    /// Show this session's context in the right panel, from the context
+    /// ring in its composer.
+    ShowContext,
     /// Start a side chat of this session, sending the prompt first if
     /// there is one; see [`SessionView::start_side_chat`].
     SideChat(Option<Prompt>),
@@ -578,6 +581,12 @@ impl SessionView {
     /// The auth profile the session's model runs on, once known.
     fn model_auth(&self) -> Option<&str> {
         self.session.auth()
+    }
+
+    /// The daemon of the session's machine, which changes as the session
+    /// is followed again on another connection.
+    pub(crate) fn daemon(&self) -> &Daemon {
+        &self.daemon
     }
 
     /// The session, and the machine it is on.
@@ -1904,7 +1913,7 @@ impl SessionView {
                 )
                 .leading(SessionSettings::render_mode(&self.settings, cx))
                 .trailing(SessionSettings::render_panel_button(&self.settings, cx))
-                .usage(self.session.usage().cloned().map(UsageRing::new)),
+                .usage(self.usage_ring(cx)),
             )
             .into_any_element()
     }
@@ -1912,7 +1921,7 @@ impl SessionView {
     /// Where a subagent's session would have its composer: the agent and
     /// model it runs as and how full its context is. Read-only, as only the
     /// subagent writes.
-    fn render_subagent_status(&self, cx: &App) -> impl IntoElement {
+    fn render_subagent_status(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let label = runs_as(
             self.session.agent(),
             self.session.options().and_then(model_summary),
@@ -1935,7 +1944,21 @@ impl SessionView {
                     .truncate()
                     .child(label),
             )
-            .children(self.session.usage().cloned().map(UsageRing::new))
+            .children(self.usage_ring(cx))
+    }
+
+    /// How full the context is, for the composer's footer, which opens the
+    /// session's context in the right panel. A side chat's opens nothing:
+    /// the panel it sits in shows the session it forks.
+    fn usage_ring(&self, cx: &Context<'_, Self>) -> Option<UsageRing> {
+        let ring = UsageRing::new(self.session.usage()?.clone());
+        if self.is_side() {
+            return Some(ring);
+        }
+        let view = cx.entity().downgrade();
+        Some(ring.on_click(move |_, cx| {
+            let _ = view.update(cx, |_, cx| cx.emit(SessionEvent::ShowContext));
+        }))
     }
 
     /// The steers the turn has taken that the model has not read yet,

@@ -9,17 +9,19 @@ use rho_ui_core::{
     agent_settings::{SettingChange, SettingKey, SettingValue},
     fake_daemon::{
         surface::{FORM_SURFACE, REFUSED_EVENT},
-        FakeDaemon, PullRequestMethods, Script, SessionLists, Started, TuiJob, KEY_AUTH,
-        LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
+        FakeDaemon, PullRequestMethods, ReportMethod, Script, SessionLists, Started, TuiJob,
+        KEY_AUTH, LOGIN_AUTH, LOGIN_URL, TUI_SESSION,
     },
     surface::{Node, SurfaceStore},
     AgentSettings, Answer, Attachment, AuthStatus, BackgroundKind, BackgroundStatus,
     BackgroundWork, Checkout, ChoiceKind, Choices, Continuity, Daemon, DaemonError, DaemonEvent,
     DaemonEvents, DaemonTarget, Detached, Entry, Form, Image, ImageFormat, JobActivity,
     LoginOutcome, ModelRef, NewSessionMark, OptionChange, PermissionMode, Prompt, PromptKey,
-    PullRequestError, PullRequestId, RestartCost, RunState, Session, SessionId, SessionMark,
-    SessionSummary, StartedMode, StartedSessionChange, StartedSessionDefaults, SurfaceActionError,
-    ToolStatus, Unsteered, VersionFix, WorktreeVerdict, MAX_PROMPT_ATTACHMENT_BYTES,
+    PullRequestError, PullRequestId, ReportError, RestartCost, RunState, Session,
+    SessionCompactionReport, SessionContextReport, SessionHooksReport, SessionId, SessionMark,
+    SessionProviderContextReport, SessionSummary, StartedMode, StartedSessionChange,
+    StartedSessionDefaults, SurfaceActionError, ToolStatus, Unsteered, VersionFix, WorktreeVerdict,
+    MAX_PROMPT_ATTACHMENT_BYTES,
 };
 use smol::block_on;
 
@@ -558,6 +560,67 @@ fn pull_request_refusals_read_as_what_they_are() {
             .map(|link| &link.id)
             .collect();
         assert_eq!((&linked.pull_request, links), (&widgets, vec![&widgets]));
+    });
+}
+
+/// A session's reports come between turns, typed: a turn under way reads
+/// as busy, a session the daemon hasn't loaded as such, and a daemon from
+/// before typed reports as one that serves none, so the app can say each
+/// plainly rather than fail.
+#[test]
+fn reports_come_between_turns_and_refusals_read_as_what_they_are() {
+    let older = FakeDaemon::start(Script {
+        reports: ReportMethod::Unserved,
+        ..Script::default()
+    });
+    let served = FakeDaemon::start(Script::default());
+    block_on(async {
+        let (daemon, _events) = connect(&older).await;
+        let session = new_session(&daemon).await;
+        let unserved = daemon
+            .session_report::<SessionContextReport>(session.id())
+            .await;
+        assert_eq!(unserved, Err(ReportError::Unserved));
+
+        let (daemon, mut events) = connect(&served).await;
+        let unloaded = daemon
+            .session_report::<SessionContextReport>(&SessionId::from("s1"))
+            .await;
+        assert_eq!(unloaded, Err(ReportError::NotLoaded));
+
+        let mut session = new_session(&daemon).await;
+        daemon
+            .prompt(session.id(), &"list files".into(), &PromptKey::generate())
+            .await
+            .unwrap();
+        until(&mut events, &mut session, |s| !s.inputs().is_empty()).await;
+        let busy = daemon
+            .session_report::<SessionHooksReport>(session.id())
+            .await;
+        assert_eq!(busy, Err(ReportError::Busy));
+
+        let request = session.inputs()[0].clone();
+        let Form::Choices { choices, .. } = request.form() else {
+            panic!("an approval is answered by choosing");
+        };
+        let allow = choices[0].answer("");
+        daemon
+            .answer(session.id(), request.id(), &allow)
+            .await
+            .unwrap();
+        until(&mut events, &mut session, |s| !s.state().is_busy()).await;
+        let id = session.id();
+        // Each type reads its own report: another would be refused.
+        let context = daemon.session_report::<SessionContextReport>(id).await;
+        assert!(context.is_ok(), "{context:?}");
+        let hooks = daemon.session_report::<SessionHooksReport>(id).await;
+        assert!(hooks.is_ok(), "{hooks:?}");
+        let compaction = daemon.session_report::<SessionCompactionReport>(id).await;
+        assert!(compaction.is_ok(), "{compaction:?}");
+        let native = daemon
+            .session_report::<SessionProviderContextReport>(id)
+            .await;
+        assert!(native.is_ok(), "{native:?}");
     });
 }
 

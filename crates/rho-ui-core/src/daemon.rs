@@ -69,10 +69,12 @@ mod auth;
 mod marks;
 mod processes;
 mod pull_requests;
+mod reports;
 mod worktrees;
 
 pub use marks::SessionMark;
 pub use pull_requests::PullRequestError;
+pub use reports::{Report, ReportError};
 pub use worktrees::ReportedWorktree;
 
 /// How to reach the daemon.

@@ -37,9 +37,9 @@ use rho_ui_core::{
     Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef,
     NewSessionMark, PermissionMode, ProcessStream, PromptKey, PullRequestId, PullRequestLinkOrigin,
     PullRequestRead, PullRequestRollup, PullRequestState, PullRequestSummary, PullRequestTrouble,
-    ReasoningLevel, RestartCost, RetryReason, RhoInstall, RunState, Session, SessionId,
-    SessionMark, SessionOptions, SessionPullRequests, StartedMode, StartedSessionDefaults,
-    ToolStatus, WorktreeVerdict, LEAD_AGENT,
+    ReasoningLevel, ReportError, RestartCost, RetryReason, RhoInstall, RunState, Session,
+    SessionId, SessionMark, SessionOptions, SessionPullRequests, StartedMode,
+    StartedSessionDefaults, ToolStatus, WorktreeVerdict, LEAD_AGENT,
 };
 
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
@@ -5932,6 +5932,106 @@ fn a_shell_that_exits_closes_its_pane() {
     ui.wait_until("the tab to close", |window, _, _| {
         !is_visible(window, "panel-tab-terminal")
     });
+}
+
+/// The composer's context ring opens the session's context in the right
+/// panel: how full it is, where it compacts, what it left out, and what
+/// fills it, a source opening to its parts. The daemon reads it between
+/// turns only: the ring asks again during a turn, which keeps the numbers
+/// shown, and the turn's end reads them again. Coming back to the session
+/// after the app let it go reads it once the session is loaded again.
+#[test]
+fn the_context_ring_opens_what_fills_the_context() {
+    let mut ui = Harness::start("context", Script::default());
+    new_session_with(&mut ui, "list files");
+    ui.wait_until("the approval card", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.click("approval-allow-once");
+    ui.wait_for_session("the turn to finish", |session| {
+        session.state() == &RunState::Idle && session.usage().is_some()
+    });
+    let key = active_key(&mut ui);
+    ui.fake().leave_out_native_context(&key.id);
+
+    ui.click("composer-usage");
+    ui.wait_until("the context", |window, cx, app| {
+        matches!(app.context_read(cx), Some((None, Some(_), _)))
+            && is_visible(window, "context-figure")
+    });
+    ui.act(|window, cx| {
+        assert!(PanelLayout::get(cx), "the panel shows");
+        assert!(is_visible(window, "panel-tab-context"));
+        // What the fake reports: a threshold, a compaction, and two blocks
+        // another model wrote.
+        for line in ["context-compacted", "context-left-out"] {
+            assert!(is_visible(window, line), "{line} shows");
+        }
+        assert!(
+            !is_visible(window, "context-part-system-prompt-0"),
+            "a source's parts show once it opens"
+        );
+    });
+    assert_eq!(
+        ui.label("context-fill").as_deref(),
+        Some("36k of 200k. Compacts at 160k."),
+        "the bar reads as it shows"
+    );
+    ui.shot("context");
+
+    ui.click("context-source-system-prompt");
+    // Past the panel's reveal.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the system prompt's parts", |window, _, _| {
+        is_visible(window, "context-part-system-prompt-0")
+    });
+    ui.shot("open");
+    ui.act(|window, cx| window.hover("context-compacted", cx));
+    // Past the hover card's delay.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the last compaction's details", |window, _, _| {
+        is_visible(window, "context-compacted-details")
+    });
+    ui.shot("compaction");
+
+    // Asked during a turn, it keeps the numbers it read.
+    let read = ui.cx.update(|cx| ui.app.read(cx).context_read(cx));
+    let Some((_, Some(before), _)) = read else {
+        panic!("the context read")
+    };
+    ui.send("list files");
+    ui.wait_until("the second approval", |window, _, _| {
+        is_visible(window, "approval-allow-once")
+    });
+    ui.click("composer-usage");
+    ui.wait_until("the busy read", |window, cx, app| {
+        matches!(app.context_read(cx), Some((Some(ReportError::Busy), Some(tokens), _)) if tokens == before)
+            && is_visible(window, "context-figure")
+    });
+
+    // The turn's end reads it again, grown by its conversation.
+    ui.click("approval-allow-once");
+    ui.wait_until(
+        "the context after the turn",
+        |_, cx, app| matches!(app.context_read(cx), Some((None, Some(after), _)) if after > before),
+    );
+
+    // The app lets the session go while another shows, so the daemon can
+    // unload it; back on screen, it is read once it is followed again.
+    let read = ui.cx.update(|cx| ui.app.read(cx).context_read(cx));
+    let Some((_, _, landed)) = read else {
+        panic!("the context read")
+    };
+    ui.click("session-local-s1");
+    ui.wait_for_daemon("the session let go", |fake| {
+        fake.followers(key.id.as_str()) == 0
+    });
+    let row = SharedString::from(format!("session-{key}"));
+    ui.act(|window, cx| window.click(row, cx));
+    ui.wait_until(
+        "the context read once loaded",
+        |_, cx, app| matches!(app.context_read(cx), Some((None, Some(_), now)) if now > landed),
+    );
 }
 
 /// Dragging the right panel's edge resizes it, as far as leaves the pane

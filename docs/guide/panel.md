@@ -1,6 +1,6 @@
 # The right panel
 
-The panel beside the transcript (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>) holds a terminal, side chats, the session's files, its diff, its pull request, and its background work, and for a lead, its work and its brief (see [Leads](./sessions#leads)). Each session has its own tabs, and they stay alive while you look at another session, terminal shells included, until rho-ui quits. Everything in the panel runs on the session's machine.
+The panel beside the transcript (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd>) holds a terminal, side chats, the session's files, its diff, its pull request, its background work, and what fills its context, and for a lead, its work and its brief (see [Leads](./sessions#leads)). Each session has its own tabs, and they stay alive while you look at another session, terminal shells included, until rho-ui quits. Everything in the panel runs on the session's machine.
 
 ![A pull request in the panel, beside its session](/shots/pull-request-pr.webp)
 
@@ -40,3 +40,11 @@ Shows the GitHub pull request for the session's branch, with its checks, reviews
 - **One tab holds all of a session's PRs.** It opens on the branch's PR, or the one linked last when the branch has none, and stays on the PR you're reading until you switch or unlink it, even as the agent links more. The menu on the PR's name switches between them. Closing the tab only closes it. **Unlink** is the only thing that unlinks a PR, and it ends the agent's watch on it.
 - **The sidebar and the title bar mark each session's PR**, with how its checks stand while it is open, so it shows with the panel hidden; `+1` counts the other PRs linked to the session. Away from its tab, rho reads a PR every 5 minutes, so a mark can trail GitHub by that long.
 - **A watched PR keeps its session going.** While the agent watches a PR, rho wakes the session when the PR changes: its row says **Watching** where it would say Done, and the title bar's mark says **watched**. See [Sessions](./sessions#pinned-snoozed-and-settled).
+
+## Context
+
+Shows how full the session's context window is, where automatic compaction starts, and what fills the window: the system prompt, tool schemas, messages and tool results.
+
+- **It needs a recent rho.** The session machine's rho must report on sessions, which rho does from rho-protocol 1.6; an older one says to update rho.
+- **It reads between turns.** rho reports on a session only while no turn runs, so the tab reads when it opens, when a turn ends, and when you click the context ring. During a turn it keeps the numbers it read before.
+- **Left out** means the conversation holds blocks another provider's model wrote, which the session's model can't be sent: its requests leave them out.

@@ -213,6 +213,7 @@ mod config;
 mod listener;
 mod processes;
 mod pull_requests;
+mod reports;
 mod service;
 mod started;
 pub mod surface;
@@ -224,6 +225,8 @@ use listener::Listener;
 use processes::FakeProcesses;
 use pull_requests::FakePullRequests;
 pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
+use reports::FakeReports;
+pub use reports::ReportMethod;
 use service::Fake;
 use started::{HeldChange, StartedChoice};
 
@@ -373,6 +376,8 @@ pub struct Script {
     pub signed_out: bool,
     /// Whether the daemon serves pull requests, or is from before them.
     pub pull_requests: PullRequestMethods,
+    /// Whether the daemon serves session reports, or is from before them.
+    pub reports: ReportMethod,
 }
 
 /// Whether the fake daemon serves `rho/session/list_detailed`, and with it
@@ -2115,6 +2120,7 @@ struct State {
     models: watch::Sender<Arc<ModelList>>,
     auth: FakeAuth,
     pull_requests: FakePullRequests,
+    reports: FakeReports,
     /// Restart as the next prompt arrives; see
     /// [`FakeDaemon::restart_at_next_prompt`].
     restart_at_prompt: bool,
@@ -2244,6 +2250,7 @@ impl State {
             models: watch::Sender::new(Arc::new(model_list(&MODELS))),
             auth: FakeAuth::new(&script),
             pull_requests: FakePullRequests::new(script.pull_requests),
+            reports: FakeReports::new(script.reports),
             restart_at_prompt: false,
         };
         if script.tui_job == TuiJob::Running {

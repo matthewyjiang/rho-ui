@@ -12,7 +12,9 @@
 //! fork. Pull request opens one, named for the number of the PR it shows,
 //! and switches between the session's PRs in place; the others open one.
 //! Work and Brief are a lead's alone ([`crate::leads::Kind`]): what it
-//! started, and its `brief.md`. With none open, the panel lists the
+//! started, and its `brief.md`. Context shows how full the session's
+//! context window is and what fills it, and opens from the context ring in
+//! its composer too ([`RightPanel::show_context`]). With none open, the panel lists the
 //! surfaces to open; + in the header opens a menu of the rest. Each
 //! session has its own tabs ([`TabSet`]): switching sessions switches
 //! tabs, and a session's first time on screen it has none, but a lead's
@@ -27,6 +29,7 @@
 //! opens ([`Tab`]) for the session the tab belongs to.
 
 mod brief;
+mod context;
 mod diff;
 mod files;
 mod lead_work;
@@ -57,6 +60,7 @@ use gpui_kit::{
 use rho_ui_core::PullRequestId;
 
 use self::brief::BriefSurface;
+use self::context::ContextSurface;
 use self::diff::DiffSurface;
 use self::files::FilesSurface;
 use self::lead_work::WorkSurface;
@@ -112,12 +116,14 @@ pub(crate) enum Surface {
     Work,
     /// A lead's `brief.md`, which it keeps current and rereads after compaction.
     Brief,
+    /// How full the session's context window is, and what fills it.
+    Context,
 }
 
 impl Surface {
     /// Every surface, in the order the panel lists them: a lead's own
     /// first.
-    const ALL: [Surface; 8] = [
+    const ALL: [Surface; 9] = [
         Surface::Work,
         Surface::Brief,
         Surface::Files,
@@ -126,6 +132,7 @@ impl Surface {
         Surface::Diff,
         Surface::PullRequest,
         Surface::Background,
+        Surface::Context,
     ];
 
     /// A lead's own surfaces, which no other session offers, in the order
@@ -143,6 +150,7 @@ impl Surface {
             Surface::SideChat => "side-chat",
             Surface::Work => "work",
             Surface::Brief => "brief",
+            Surface::Context => "context",
         }
     }
 
@@ -156,6 +164,7 @@ impl Surface {
             Surface::SideChat => "Side chat",
             Surface::Work => "Work",
             Surface::Brief => "Brief",
+            Surface::Context => "Context",
         }
     }
 
@@ -169,6 +178,7 @@ impl Surface {
             Surface::SideChat => Lucide::MessagesSquare,
             Surface::Work => Lucide::LayoutList,
             Surface::Brief => Lucide::NotebookText,
+            Surface::Context => Lucide::Gauge,
         }
     }
 
@@ -455,7 +465,12 @@ impl RightPanel {
             Tab::PullRequest { view, .. } => view.read(cx).has_keyboard(window, cx),
             Tab::Terminal { view, .. } => view.read(cx).has_keyboard_anywhere(window, cx),
             Tab::SideChat { view, .. } => view.read(cx).has_keyboard(window, cx),
-            Tab::Background | Tab::Diff(_) | Tab::Files(_) | Tab::Work(_) | Tab::Brief(_) => false,
+            Tab::Background
+            | Tab::Diff(_)
+            | Tab::Files(_)
+            | Tab::Work(_)
+            | Tab::Brief(_)
+            | Tab::Context(_) => false,
         })
     }
 
@@ -567,23 +582,37 @@ impl RightPanel {
         cx.notify();
     }
 
-    /// Reads `session`'s surfaces again whenever `view`'s turn ends.
+    /// Reads `session`'s surfaces again whenever `view`'s turn ends, and
+    /// its Context again once `view` has caught up with the session after
+    /// a read found it unloaded, as coming back to a session the app let
+    /// go reads before the session is followed again.
     fn follow_turns(
         session: &SessionKey,
         view: &Entity<SessionView>,
         cx: &mut Context<'_, Self>,
     ) -> Subscription {
         let session = session.clone();
-        cx.subscribe(view, move |this, _, event: &SessionEvent, cx| {
-            if matches!(event, SessionEvent::Saved) {
-                this.reload(&session, Reload::TurnEnded, cx);
+        cx.subscribe(view, move |this, _, event: &SessionEvent, cx| match event {
+            SessionEvent::Saved => this.reload(&session, Reload::TurnEnded, cx),
+            SessionEvent::LiveChanged => {
+                let Some(set) = this.sets.get(&session) else {
+                    return;
+                };
+                for tab in &set.tabs {
+                    if let Tab::Context(context) = tab {
+                        if context.read(cx).waits_for_load() {
+                            read_context(&set.view, context, cx);
+                        }
+                    }
+                }
             }
+            _ => {}
         })
     }
 
-    /// Reads what `session`'s Diff, Files and Brief show again, and when
-    /// its turn ended, its PR on screen (which is asked for again as it
-    /// comes back).
+    /// Reads what `session`'s Diff, Files, Brief and Context show again,
+    /// and when its turn ended, its PR on screen (which is asked for again
+    /// as it comes back).
     fn reload(&self, session: &SessionKey, why: Reload, cx: &mut Context<'_, Self>) {
         let Some(set) = self.sets.get(session) else {
             return;
@@ -593,6 +622,7 @@ impl RightPanel {
                 Tab::Diff(diff) => diff.update(cx, DiffSurface::reload),
                 Tab::Files(files) => files.update(cx, FilesSurface::reload),
                 Tab::Brief(brief) => brief.update(cx, BriefSurface::reload),
+                Tab::Context(context) => read_context(&set.view, context, cx),
                 Tab::PullRequest { view, .. } if why == Reload::TurnEnded => {
                     view.update(cx, PullRequestSurface::turn_ended);
                 }
@@ -687,6 +717,25 @@ impl RightPanel {
         }
     }
 
+    /// Shows the Context surface of the session on screen, as its
+    /// composer's context ring asks: its tab opens if it wasn't, and reads
+    /// the context again if it was, as the ring is the way to ask.
+    pub(crate) fn show_context(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        // A new tab reads as it opens.
+        let opened = self
+            .set()
+            .is_some_and(|set| set.tabs.iter().any(|tab| matches!(tab, Tab::Context(_))));
+        let Some(key) = self.tab_for(Surface::Context, window, cx) else {
+            return;
+        };
+        if let (Some(set), Some(Tab::Context(context))) = (self.set(), self.tab(key)) {
+            if opened {
+                read_context(&set.view, context, cx);
+            }
+        }
+        self.show(key, cx);
+    }
+
     /// A new tab `key` of `session`, which works in `place`.
     fn new_tab(
         &self,
@@ -728,6 +777,13 @@ impl RightPanel {
                 }
             }
             Surface::SideChat => unreachable!("open() asks the session for a fork"),
+            Surface::Context => {
+                let context = cx.new(|_| ContextSurface::new());
+                if let Some(set) = self.sets.get(session) {
+                    read_context(&set.view, &context, cx);
+                }
+                Tab::Context(context)
+            }
             Surface::Work | Surface::Brief => {
                 let sources = LeadSources {
                     workspaces: &self.workspaces,
@@ -764,7 +820,8 @@ impl RightPanel {
             | Surface::Files
             | Surface::PullRequest
             | Surface::Terminal
-            | Surface::SideChat => unreachable!("{surface:?} is not a lead's own"),
+            | Surface::SideChat
+            | Surface::Context => unreachable!("{surface:?} is not a lead's own"),
         }
     }
 
@@ -955,6 +1012,19 @@ impl RightPanel {
     pub(crate) fn brief_text(&self, cx: &App) -> Option<String> {
         self.set()?.tabs.iter().find_map(|tab| match tab {
             Tab::Brief(brief) => brief.read(cx).text(),
+            _ => None,
+        })
+    }
+
+    /// Why the Context surface's latest read found nothing, the context's
+    /// tokens it last found, and how many reads have landed, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn context_read(
+        &self,
+        cx: &App,
+    ) -> Option<(Option<rho_ui_core::ReportError>, Option<u64>, usize)> {
+        self.set()?.tabs.iter().find_map(|tab| match tab {
+            Tab::Context(context) => Some(context.read(cx).state()),
             _ => None,
         })
     }
@@ -1236,6 +1306,7 @@ impl RightPanel {
             Tab::Files(files) => files.clone().into_any_element(),
             Tab::Work(work) => work.clone().into_any_element(),
             Tab::Brief(brief) => brief.clone().into_any_element(),
+            Tab::Context(context) => context.clone().into_any_element(),
             Tab::PullRequest { view, .. } => view.clone().into_any_element(),
             Tab::Terminal { view, .. } => view.clone().into_any_element(),
             Tab::SideChat { view, .. } => view.clone().into_any_element(),
@@ -1245,6 +1316,18 @@ impl RightPanel {
 
 /// A message in place of a surface's content, such as why it has none,
 /// over `media` such as a spinner.
+/// Has `context` read the reports of the session `view` shows, from the
+/// daemon it follows the session on now: one view can take another's place
+/// for the session, and a view's daemon changes as it follows again.
+fn read_context(view: &WeakEntity<SessionView>, context: &Entity<ContextSurface>, cx: &mut App) {
+    let Some(view) = view.upgrade() else {
+        return;
+    };
+    let view = view.read(cx);
+    let (daemon, session) = (view.daemon().clone(), view.key().id);
+    context.update(cx, |context, cx| context.reload(daemon, session, cx));
+}
+
 fn message(text: impl Into<SharedString>, media: Option<AnyElement>) -> AnyElement {
     let mut header = EmptyHeader::new().description(EmptyDescription::new().child(text.into()));
     if let Some(media) = media {

@@ -200,6 +200,8 @@ gpui_kit::assets::icon_assets!(
         NotebookText,
         // Settings → Notifications.
         Bell,
+        // The right panel's Context surface.
+        Gauge,
         // The A2UI basic catalog's icons, for surfaces (`surface_view.rs`).
         BellOff,
         CalendarDays,
