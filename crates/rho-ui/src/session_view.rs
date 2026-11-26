@@ -349,7 +349,7 @@ impl SessionView {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let cwd = workspace.read(cx).place().clone();
-        let pictures = cx.new(|_| Pictures::new(cwd.clone(), workspace.table().clone()));
+        let pictures = cx.new(|_| Pictures::files(cwd.clone(), workspace.table().clone()));
         let transcript = Transcript::new(pictures, cx);
         // A session about to attach may have run background work in an
         // earlier run of the app, which the daemon may no longer list.

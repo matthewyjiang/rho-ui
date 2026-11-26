@@ -4,7 +4,9 @@
 //! agent. Its toolbar switches between them ([`Which`],
 //! [`PullRequests::which`]). It shows what the PR is ([`header`]), its
 //! checks ([`checks`]), its description, and its threads on the code and
-//! conversation, with a box to comment in ([`conversation`]). It asks the
+//! conversation, with a box to comment in ([`conversation`]); the images
+//! in its text show as a message's do ([`pictures`]), fetched from the
+//! web on the session's machine. It asks the
 //! daemon to keep reading the PR only while it shows; the session's turn
 //! ending reads it again, and so does Refresh. What it shows is
 //! [`PullRequests::reading`]'s to say; the surface draws it.
@@ -48,8 +50,10 @@ use self::{
 use super::Visibility;
 use crate::{
     machines::SessionKey,
+    pictures::{self, PictureRead, Pictures},
     pull_requests::{every_post, PullRequests, Seen, Shown, Which},
     time,
+    workspaces::Workspaces,
 };
 
 /// The Pull request surface of [`super::RightPanel`]: one PR of the
@@ -68,11 +72,15 @@ pub(super) struct PullRequestSurface {
     texts: HashMap<SharedString, (SharedString, Entity<TextViewState>)>,
     /// The diagrams in those texts.
     diagrams: DiagramState,
+    /// The images in those texts, of the PR on screen alone: the one
+    /// named here.
+    pictures: Entity<Pictures>,
+    pictures_of: Option<PullRequestId>,
     /// What the user has under way on the PR on screen.
     pr: PrState,
     /// The form to link a PR by hand, while it is open.
     link_form: Option<LinkForm>,
-    _subscriptions: [Subscription; 1],
+    _subscriptions: [Subscription; 3],
 }
 
 /// What the user has under way on the one PR on screen, which the next PR
@@ -94,15 +102,25 @@ struct PrState {
 impl PullRequestSurface {
     pub(super) fn new(
         prs: Entity<PullRequests>,
+        workspaces: Entity<Workspaces>,
         session: SessionKey,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let subscriptions = [cx.observe(&prs, |this, _, cx| {
-            this.sync_which(cx);
-            this.sync_texts(cx);
-            this.forget_stale_refusal(cx);
-            cx.notify();
-        })];
+        let pictures = cx.new(|_| Pictures::web(session.machine.clone(), workspaces));
+        let subscriptions = [
+            cx.observe(&prs, |this, _, cx| {
+                this.sync_which(cx);
+                this.sync_texts(cx);
+                this.sync_pictures(cx);
+                this.forget_stale_refusal(cx);
+                cx.notify();
+            }),
+            cx.subscribe(&pictures, |_, _, _: &PictureRead, cx| cx.notify()),
+            // What GPUI decoded of its images goes with it.
+            cx.on_release(|this: &mut Self, cx| {
+                this.pictures.update(cx, |pictures, cx| pictures.clear(cx));
+            }),
+        ];
         // Closing the tab stops the daemon reading it for this surface.
         let surface = cx.entity_id();
         cx.on_release(move |this, cx| {
@@ -117,6 +135,8 @@ impl PullRequestSurface {
             visibility: Visibility::Hidden,
             texts: HashMap::new(),
             diagrams: DiagramState::new(),
+            pictures,
+            pictures_of: None,
             pr: PrState::default(),
             link_form: None,
             _subscriptions: subscriptions,
@@ -208,7 +228,22 @@ impl PullRequestSurface {
             Visibility::Hidden => prs.hide(surface, cx),
         });
         self.sync_texts(cx);
+        self.sync_pictures(cx);
         cx.notify();
+    }
+
+    /// Drops the images of a PR no longer on screen, as when a new one on
+    /// the branch replaces it, and fetches those of the one on screen
+    /// from its forge, signed in as its machine's `gh` can.
+    fn sync_pictures(&mut self, cx: &mut Context<'_, Self>) {
+        let shown = self.shown_pr(cx);
+        if shown != self.pictures_of {
+            self.pictures_of = shown;
+            self.pictures.update(cx, |pictures, cx| pictures.clear(cx));
+        }
+        let site = self.prs.read(cx).picture_site(&self.shown(), cx);
+        self.pictures
+            .update(cx, |pictures, cx| pictures.set_site(site, cx));
     }
 
     /// Whether the comment box, or the form to link a PR, has the keyboard.
@@ -289,12 +324,17 @@ impl PullRequestSurface {
         }
     }
 
-    /// `key`'s Markdown, as [`Self::texts`] holds it, with its diagrams and
-    /// formulas drawn.
+    /// `key`'s Markdown, as [`Self::texts`] holds it, with its diagrams,
+    /// formulas and images drawn.
     fn text(&self, key: &str) -> Option<AnyElement> {
         let (_, state) = self.texts.get(key)?;
+        // Every text is entry 0: an image shown twice is fetched once.
+        let pictures = pictures::Plugin {
+            pictures: self.pictures.clone(),
+            entry: 0,
+        };
         let view = TextView::new(state)
-            .markdown_extensions(self.diagrams.extensions())
+            .markdown_extensions(self.diagrams.extensions().plugin(pictures))
             // Its links are anyone's: only web ones open, as Kit opens
             // links without a handler.
             .on_link_click(|url, event, _, cx| {

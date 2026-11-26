@@ -21,6 +21,7 @@ use rho_ui_core::{
 
 use super::PullRequestSurface;
 use crate::{
+    pictures::Pictures,
     pr_mark::state_look,
     pull_requests::{PullRequests, Reading, Seen, Which},
 };
@@ -303,6 +304,7 @@ pub(super) fn refresh_button(cx: &Context<'_, PullRequestSurface>) -> Button {
         .tooltip("Refresh")
         .on_click(cx.listener(|this, _, _, cx| {
             this.prs.update(cx, PullRequests::refresh);
+            this.pictures.update(cx, Pictures::retry);
         }))
 }
 

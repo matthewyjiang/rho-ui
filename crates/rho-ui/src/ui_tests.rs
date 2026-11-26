@@ -46,7 +46,10 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use crate::{
     app::{LaunchConfig, RhoApp},
     attention::Notifier,
-    forge::{avatar::test::serve_pictures, Check, ForgeCli},
+    forge::{
+        picture::{self, test::serve_pictures},
+        Check, ForgeCli,
+    },
     leads::Kind,
     machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
@@ -4822,8 +4825,13 @@ fn advance_until(
 }
 
 /// A new session on this machine, its first turn ended, whose branch the
-/// daemon then finds PR 12 on. Returns its key.
-fn open_pr_session(name: &'static str, settings: Settings) -> (Harness, SessionKey) {
+/// daemon then finds PR 12 on, as `open` gives the session it. Returns
+/// its key.
+fn open_pr_session(
+    name: &'static str,
+    settings: Settings,
+    open: impl FnOnce(&FakeDaemon, &SessionId),
+) -> (Harness, SessionKey) {
     let daemon = FakeDaemon::start(Script::default());
     keep(&daemon, &["s1"]);
     let mut ui = Harness::open_with(
@@ -4842,14 +4850,26 @@ fn open_pr_session(name: &'static str, settings: Settings) -> (Harness, SessionK
         session.state() == &RunState::Idle
     });
     let key = active_key(&mut ui);
-    ui.fake().open_pull_request(&key.id, &serve_pictures());
+    open(ui.fake(), &key.id);
     (ui, key)
 }
 
 /// Opens the Pull request surface over a session made by
 /// [`open_pr_session`], and waits for PR 12 and its checks.
 fn open_pr_surface(name: &'static str, settings: Settings) -> (Harness, SessionKey) {
-    let (mut ui, key) = open_pr_session(name, settings);
+    let pictures = serve_pictures();
+    open_pr_surface_with(name, settings, |fake, session| {
+        fake.open_pull_request(session, &pictures);
+    })
+}
+
+/// [`open_pr_surface`], the session given its PR as `open` does.
+fn open_pr_surface_with(
+    name: &'static str,
+    settings: Settings,
+    open: impl FnOnce(&FakeDaemon, &SessionId),
+) -> (Harness, SessionKey) {
+    let (mut ui, key) = open_pr_session(name, settings, open);
     ui.act(|window, cx| window.press("secondary-alt-b", cx));
     ui.click("open-surface-pull-request");
     ui.wait_until("the PR and its checks", |window, _, _| {
@@ -4957,6 +4977,117 @@ fn the_pull_request_surface_shows_the_branchs_pr() {
         is_visible(window, "pull-request-trouble") && is_visible(window, "pull-request-title")
     });
     ui.shot("paused");
+}
+
+/// A PR's images show in its description and comments, fetched from
+/// where their addresses say, each once: a Markdown screenshot scaled to
+/// the surface's measure, and an `<img>` upload at the width its tag
+/// says. One that doesn't load says so in its place, with its address. A
+/// click opens one in the lightbox.
+#[test]
+fn a_pull_requests_images_show_and_open_in_the_lightbox() {
+    let pictures = picture::test::serve();
+    let (mut ui, key) = open_pr_surface_with(
+        "pull-request-images",
+        Settings::default(),
+        |fake, session| {
+            fake.open_pull_request_with_images(session, &pictures.address);
+        },
+    );
+    let id = PullRequestId::new("github.com", "acme", "widgets", 12);
+    let body = ui.cx.update(|cx| {
+        let prs = ui.app.read(cx).pull_requests().read(cx);
+        prs.detail(&key.machine, &id)
+            .expect("its detail")
+            .body
+            .clone()
+    });
+    // Each picture's row is named for where its paragraph or tag starts.
+    let row = |starts: &str| -> SharedString {
+        let start = body.find(starts).expect("the description holds it");
+        format!("image-{start}-0").into()
+    };
+    let (widget, icon, missing) = (row("![The widget"), row("<img"), row("![A missing"));
+    let tracker = row("![A tracker");
+    // The comment's image is the description's icon.
+    let post = SharedString::from("pull-request-post-0");
+    // Whether each `(within, element)` is drawn.
+    let drawn = |ui: &mut Harness, wanted: &[(&SharedString, &'static str)]| {
+        ui.frame();
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                wanted
+                    .iter()
+                    .all(|(within, id)| window.within((*within).clone()).try_find(*id).is_some())
+            })
+            .expect("window is open")
+    };
+    let wanted = [
+        (&widget, "picture"),
+        (&icon, "picture"),
+        // With its address, as a link, to try again.
+        (&missing, "picture-link"),
+        (&missing, "picture-retry"),
+        // On a host rho-ui doesn't fetch from: a link alone.
+        (&tracker, "picture-link"),
+        (&post, "picture"),
+    ];
+    ui.poll(
+        WAIT,
+        "the description's and the comment's images",
+        |ui| drawn(ui, &wanted),
+        Harness::labels_seen,
+    );
+    ui.act(|window, _| {
+        assert!(window
+            .within(tracker.clone())
+            .try_find("picture-retry")
+            .is_none());
+        let column = window.find(widget.clone()).bounds();
+        let shown = window.within(widget.clone()).find("picture").bounds();
+        assert!(
+            shown.size.width < px(1200.)
+                && (shown.size.width - column.size.width).abs() < px(1.)
+                && (shown.size.width - shown.size.height * 2.).abs() < px(2.),
+            "the screenshot is scaled to the surface's measure {column:?}: {shown:?}"
+        );
+        let shown = window.within(icon.clone()).find("picture").bounds();
+        assert!(
+            (shown.size.width - px(160.)).abs() < px(1.)
+                && (shown.size.height - px(160.)).abs() < px(1.),
+            "the upload shows at its tag's width: {shown:?}"
+        );
+    });
+    // Each fetched once.
+    let fetched = |path: &str| {
+        let requests = pictures.requests();
+        requests.iter().filter(|(asked, _)| asked == path).count()
+    };
+    let paths = ["/widget-1200x600.png", "/icon-320x320.png", "/gone.png"];
+    assert_eq!(paths.map(fetched), [1; 3]);
+    ui.shot("images");
+
+    ui.act(|window, cx| window.within(widget.clone()).click("picture", cx));
+    ui.wait_until("the lightbox", |window, _, _| {
+        is_visible(window, "lightbox-picture")
+    });
+    // The dialog fades in.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.act(|window, _| {
+        let shown = window.find("lightbox-picture").bounds().size;
+        assert!(
+            shown.width > px(600.) && (shown.width - shown.height * 2.).abs() < px(2.),
+            "the screenshot, larger: {shown:?}"
+        );
+    });
+    ui.shot("lightbox");
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.act(|window, cx| {
+        let down = gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-360.)));
+        window.scroll("pull-request-body", down, cx);
+    });
+    ui.shot("missing");
 }
 
 /// A row marks its session's PR, failing checks and all, for a session
