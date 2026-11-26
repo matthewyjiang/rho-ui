@@ -697,10 +697,7 @@ fn a_prompts_answer_and_its_turns_events_may_come_in_either_order() {
 /// A turn the daemon begins by itself, to deliver finished background work,
 /// opens with a wake row, so it is a turn of its own. A prompt's turn opens
 /// with its prompt, even after a notice the daemon sent first. A turn under
-/// way when the session was attached opens nothing as it runs on. A replay,
-/// which marks no turn starts, opens a wake where a card follows the reply,
-/// a `/compact` turn's compaction between them too, but not for a card a
-/// turn's tool calls lead to, nor before a prompt.
+/// way when the session was attached opens nothing as it runs on.
 #[test]
 fn a_turn_without_a_prompt_opens_with_a_wake() {
     let ended = |session: &mut Session, id: &str| {
@@ -749,7 +746,14 @@ fn a_turn_without_a_prompt_opens_with_a_wake() {
     );
     let kinds: Vec<&str> = texts(&session).into_iter().map(|(kind, _)| kind).collect();
     assert_eq!(kinds, ["agent", "user", "wake", "agent", "notice", "user"]);
+}
 
+/// A replay marks no turn starts, so a card after the agent's reply opens
+/// the daemon's turn that delivers it, with a `/compact` turn's compaction
+/// between them too; a card a turn's tool calls lead to, or one before a
+/// prompt, does not.
+#[test]
+fn a_replay_opens_a_wake_at_a_card_after_the_reply() {
     let card =
         || json!({"type": "card", "title": "Done", "markdown": "", "plain": "", "tone": "neutral"});
     let tool = |id: &str| json!({"type": "tool_call", "id": id, "title": "read", "kind": "read"});
@@ -772,7 +776,8 @@ fn a_turn_without_a_prompt_opens_with_a_wake() {
         say("m4"),
     ];
     let mut replayed = Session::new(SessionId::from("s2"));
-    replayed.attached(attach_response(JobState::Idle, 14));
+    let events = u64::try_from(saved.len()).expect("a short history");
+    replayed.attached(attach_response(JobState::Idle, events));
     for event in saved {
         replayed.apply(update(event));
     }
@@ -799,6 +804,41 @@ fn a_turn_without_a_prompt_opens_with_a_wake() {
             "agent"
         ]
     );
+}
+
+/// A session that falls behind mid-turn, and attaches again with its cursor
+/// after the turn ended, carries on with the rest of that turn: the attach's
+/// idle state starts no turn of the daemon's own.
+#[test]
+fn a_turn_that_ended_while_detached_runs_on_in_its_tail() {
+    let mut session = session();
+    session.attached(attach_response(JobState::Idle, 0));
+    session.apply(update(
+        json!({"type": "state", "state": "running", "turn": "t1"}),
+    ));
+    session.apply(update(
+        json!({"type": "user_message", "message": "u1", "content": [{"type": "text", "text": "go"}]}),
+    ));
+    session.apply(update(
+        json!({"type": "tool_call", "id": "c1", "title": "read", "kind": "read"}),
+    ));
+
+    session.reattach();
+    let mut tail = attach_response(JobState::Idle, 3);
+    tail.0.replay = Replay::Tail;
+    assert_eq!(session.attached(tail), Continuity::Kept);
+    session.apply(update(
+        json!({"type": "agent_message_chunk", "message": "m1", "text": "done"}),
+    ));
+    session.apply(update(json!({"type": "turn_ended", "turn": "t1",
+        "outcome": {"type": "answered", "text": "done", "stop": "end_turn"}})));
+    session.apply(update(
+        json!({"type": "state", "state": "completed", "turn": "t1"}),
+    ));
+
+    assert!(!session.is_replaying());
+    let kinds: Vec<&str> = texts(&session).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(kinds, ["user", "tool", "agent"]);
 }
 
 /// A message refused because a turn was under way is due once a turn ended

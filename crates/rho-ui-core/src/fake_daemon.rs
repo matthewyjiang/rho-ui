@@ -48,7 +48,8 @@
 //! - The prompt "background" starts a background process, `sleep 30`, and
 //!   answers at once, leaving it running. Stopping it, or
 //!   [`FakeDaemon::finish_background`], ends it, and the daemon starts a
-//!   turn of its own that tells the model; that turn runs until a steer
+//!   turn of its own that delivers it as a card and tells the model; that
+//!   turn runs until a steer
 //!   ends it, and drops the work it delivered from the list as it ends.
 //!   `rho/session/processes` lists the session's processes while their
 //!   work is listed, and reads what [`FakeDaemon::write_process`] had one
@@ -61,7 +62,8 @@
 //!   default agent, but for a new one that names its own.
 //!   [`FakeDaemon::finish_subagent`] ends its run: the parent shows its
 //!   whole result as a card, `subagent_result`, and the parent's daemon
-//!   turn tells the model, as for a process.
+//!   turn tells the model, as for a process; a turn the parent runs reads
+//!   it instead, and says what it found.
 //! - [`FakeDaemon::deliver`] runs a turn of the daemon's own to its end,
 //!   as rho's daemon does to deliver work that finished while the session
 //!   was idle: a card, a read, and a reply.
@@ -856,9 +858,14 @@ impl FakeDaemon {
         process.status = BackgroundStatus::Completed;
         process.exit_code = Some(code);
         let told = format!("`{}` exited with {code}.", process.title);
+        let result = Card::new(
+            &format!("Completed · {}", process.title),
+            &told,
+            CardTone::Success,
+        );
         session.report_background();
         if session.turn.is_none() {
-            session.wake(turn, &told);
+            session.wake(turn, &result, &told);
         }
     }
 
@@ -1107,15 +1114,17 @@ impl FakeDaemon {
             panic!("the fake's subagents open their session as they start");
         };
         parent.report_background();
-        parent.publish(SessionEvent::Card {
-            title: format!("Completed · {SUBAGENT_TASK}"),
-            markdown: subagent_result(),
-            plain: subagent_result(),
-            tone: CardTone::Neutral,
-            display: None,
-        });
+        let result = Card::new(
+            &format!("Completed · {SUBAGENT_TASK}"),
+            &subagent_result(),
+            CardTone::Neutral,
+        );
         if parent.turn.is_none() {
-            parent.wake(turn, "The subagent found the parser.");
+            parent.wake(turn, &result, "The subagent found the parser.");
+        } else {
+            // The running turn reads it at its next boundary, and answers.
+            parent.publish(result.event());
+            parent.say("m-sub-told", "The subagent found the parser.");
         }
         let child = state
             .sessions
@@ -1124,6 +1133,33 @@ impl FakeDaemon {
         child.answer("sub-m2", "Found the parser.");
         for publisher in child.publishers.drain(..) {
             publisher.close(DetachReason::NotLoaded);
+        }
+    }
+}
+
+/// A result rho's daemon delivers to a session as a card.
+pub(crate) struct Card {
+    title: String,
+    text: String,
+    tone: CardTone,
+}
+
+impl Card {
+    pub(crate) fn new(title: &str, text: &str, tone: CardTone) -> Self {
+        Self {
+            title: title.to_owned(),
+            text: text.to_owned(),
+            tone,
+        }
+    }
+
+    fn event(&self) -> SessionEvent {
+        SessionEvent::Card {
+            title: self.title.clone(),
+            markdown: self.text.clone(),
+            plain: self.text.clone(),
+            tone: self.tone,
+            display: None,
         }
     }
 }
@@ -1403,7 +1439,8 @@ impl FakeSession {
             self.updated_at,
         );
         fork.history.clone_from(&self.history);
-        fork.saved_events = self.saved_events;
+        // rho opens a fork from its file, which marks no turns.
+        fork.saved_events = fork.history.len();
         fork.agent.clone_from(&self.agent);
         fork.settings.model = self.settings.model.clone();
         fork.settings.reasoning = self.settings.reasoning;
@@ -1749,14 +1786,23 @@ impl FakeSession {
         self.report_background();
     }
 
-    /// Starts `turn`, one of the daemon's own that tells the model `told`
-    /// about background work that ended. It runs until a steer ends it.
-    fn wake(&mut self, turn: Turn, told: &str) {
+    /// Starts `turn`, one of the daemon's own, as rho's daemon does: its
+    /// first boundary delivers the `result` that woke it as a card. Returns
+    /// the turn's id.
+    fn begin_own_turn(&mut self, turn: Turn, result: &Card) -> TurnId {
         // A prompt's key names only the session's latest turn.
         self.last_prompt = None;
         let id = turn.id.clone();
         self.turn = Some(turn);
         self.state(JobState::Running);
+        self.publish(result.event());
+        id
+    }
+
+    /// Starts `turn`, one of the daemon's own that tells the model `told`
+    /// about background work that ended. It runs until a steer ends it.
+    fn wake(&mut self, turn: Turn, result: &Card, told: &str) {
+        let id = self.begin_own_turn(turn, result);
         self.publish(SessionEvent::ThoughtChunk {
             message: MessageId::new(format!("th-{id}")),
             text: "Reading what ended.".to_owned(),
@@ -1768,17 +1814,12 @@ impl FakeSession {
     /// delivers a worker's result as a card, then the model reads a file
     /// and answers `reply`.
     fn deliver(&mut self, turn: Turn, reply: &str) {
-        self.last_prompt = None;
-        let id = turn.id.clone();
-        self.turn = Some(turn);
-        self.state(JobState::Running);
-        self.publish(SessionEvent::Card {
-            title: "Completed · worker".to_owned(),
-            markdown: "The worker finished.".to_owned(),
-            plain: "The worker finished.".to_owned(),
-            tone: CardTone::Success,
-            display: None,
-        });
+        let result = Card::new(
+            "Completed · worker",
+            "The worker finished.",
+            CardTone::Success,
+        );
+        let id = self.begin_own_turn(turn, &result);
         let read = card(
             ToolStatus::Completed,
             ToolFamily::FileCommand,

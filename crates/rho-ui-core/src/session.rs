@@ -561,10 +561,10 @@ pub enum Entry {
     /// The daemon began a turn of its own, as it does when the session's
     /// background work finishes or a subagent asks its parent to act, to
     /// give the model the result. It opens that turn, as a prompt opens one,
-    /// before the turn's first model output. Live, the turn's start marks
-    /// it; a replay of saved turns marks no turn starts or ends, so there
-    /// the result's card after the agent's reply does: rho delivers every
-    /// result as a card.
+    /// before the turn's first model output. The turn's start marks it, or,
+    /// since a replay of saved turns marks no turn starts or ends, the
+    /// result's card after the agent's reply does, live or replayed alike:
+    /// rho delivers every result as a card.
     Wake,
 }
 
@@ -727,9 +727,9 @@ pub struct Session {
     /// that arrives after its whole turn.
     ended_turn: Option<TurnId>,
     /// The next turn, or the one under way, has not opened: since a turn
-    /// ended, one began live, or a card came after the agent's reply,
-    /// nothing [`opening`] reads has arrived. Its prompt opens it, or else
-    /// an [`Entry::Wake`] does.
+    /// began or ended, as the session's state says, or a card came after
+    /// the agent's reply, nothing [`opening`] reads has arrived. Its prompt
+    /// opens it, or else an [`Entry::Wake`] does.
     unopened: bool,
     /// The directory the session works in, once attached. Diffs name their
     /// files relative to it.
@@ -826,7 +826,6 @@ impl Session {
     pub fn attached(&mut self, attached: Attached) -> Continuity {
         let response = *attached.0;
         let followed = self.stream.is_some();
-        let reset = response.replay == Replay::Reset;
         let continuity = match response.replay {
             Replay::Tail => Continuity::Kept,
             Replay::Reset => {
@@ -854,12 +853,10 @@ impl Session {
             self.title = response.title;
         }
         self.apply_options(response.options);
+        // The attach's state is no turn starting or ending: the replay
+        // after it marks its own, from the conversation's beginning or from
+        // where the session left off.
         self.settle(response.state);
-        if reset {
-            // The replay starts at the conversation's beginning, which the
-            // turn settling here doesn't end.
-            self.unopened = false;
-        }
         for request in response.inputs {
             self.open_input(InputRequest::from_wire(request));
         }
@@ -1360,14 +1357,7 @@ impl Session {
                 )))
             }
             SessionEvent::State { state, turn } => {
-                if !state.in_progress() {
-                    // A turn the daemon's restart cut short ends here,
-                    // with no `turn_ended` before it.
-                    if let Some(turn) = &turn {
-                        self.ended_turn = Some(TurnId::from_wire(turn));
-                    }
-                }
-                self.settle(state);
+                self.change_state(state, turn.as_ref());
                 None
             }
             SessionEvent::TurnEnded { turn, outcome } => {
@@ -1622,11 +1612,6 @@ impl Session {
             JobState::Running | JobState::Queued => {
                 if !self.state.is_busy() {
                     self.early_steers.clear();
-                    // The attach's state is no turn starting: the replay
-                    // after it starts at the conversation's beginning.
-                    if matches!(self.sync, Sync::Live) {
-                        self.unopened = true;
-                    }
                 }
                 self.state = RunState::Running;
             }
@@ -1641,10 +1626,25 @@ impl Session {
             {
                 self.state = RunState::Idle;
                 self.turn = LiveTurn::default();
-                self.unopened = true;
             }
             // Already settled, or a state a newer daemon added.
             _ => {}
+        }
+    }
+
+    /// Applies the session's new state: a turn began or ended, or waits.
+    fn change_state(&mut self, state: JobState, turn: Option<&rho_protocol::TurnId>) {
+        if !state.in_progress() {
+            // A turn the daemon's restart cut short ends here, with no
+            // `turn_ended` before it.
+            if let Some(turn) = turn {
+                self.ended_turn = Some(TurnId::from_wire(turn));
+            }
+        }
+        let was_busy = self.state.is_busy();
+        self.settle(state);
+        if self.state.is_busy() != was_busy {
+            self.unopened = true;
         }
     }
 

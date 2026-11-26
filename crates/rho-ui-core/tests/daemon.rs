@@ -1131,11 +1131,11 @@ fn a_session_that_fell_behind_carries_on_from_its_cursor() {
         assert_eq!(&session.entries()[..shown.len()], shown.as_slice());
         assert_eq!(
             session.entries().len(),
-            shown.len() + 3,
-            "the daemon's turn's wake, thought and reply, once"
+            shown.len() + 4,
+            "the daemon's turn's result card, wake, thought and reply, once"
         );
         assert_eq!(
-            session.entries()[shown.len()],
+            session.entries()[shown.len() + 1],
             Entry::Wake,
             "the missed turn opens as it would have live"
         );

@@ -378,9 +378,13 @@ impl Transcript {
         self.worked.resize(turns, Disclosure::Folded);
         self.took.resize(turns, None);
         for turn in known..turns {
-            let prompt = self.prompt(turn, entries);
+            let opener = self.opener(turn, entries);
+            let prompt = match opener {
+                Some(Entry::User(prompt)) => Some(prompt),
+                _ => None,
+            };
             self.took[turn] = prompt.and_then(|prompt| cx.global::<TurnTimes>().get(prompt.id()));
-            if prompt.is_some_and(UserMessage::is_steer) || self.is_wake(turn, entries) {
+            if prompt.is_some_and(UserMessage::is_steer) || matches!(opener, Some(Entry::Wake)) {
                 self.split(turn, entries, cx);
             }
         }
@@ -670,11 +674,6 @@ impl Transcript {
             Entry::User(prompt) => Some(prompt),
             _ => None,
         }
-    }
-
-    /// Whether the daemon began `turn` itself.
-    fn is_wake(&self, turn: usize, entries: &[Entry]) -> bool {
-        matches!(self.opener(turn, entries), Some(Entry::Wake))
     }
 
     /// The entry that opens `turn`: its prompt, steer, or wake.
