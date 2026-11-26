@@ -2,7 +2,13 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Local, Utc};
 use web_time::{SystemTime, UNIX_EPOCH};
+
+/// `at` as a wall-clock time here, 24-hour: "14:05".
+pub(crate) fn clock(at: DateTime<Utc>) -> String {
+    at.with_timezone(&Local).format("%H:%M").to_string()
+}
 
 /// Seconds since the Unix epoch, or 0 if the clock is before it.
 pub(crate) fn now_unix() -> i64 {

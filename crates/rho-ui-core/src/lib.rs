@@ -90,7 +90,7 @@ pub use rho_protocol::{SessionWorktree, WorktreeVerdict};
 pub use server::{ServerLink, ServerTarget};
 pub use session::{
     Attached, Checkout, Compaction, ContextSize, Continuity, Cursor, Delay, Entry, Message, Notice,
-    NoticeLevel, PlanItem, PlanStatus, RetryReason, RunState, Session, SessionSetup, SessionUpdate,
+    NoticeTone, PlanItem, PlanStatus, RetryReason, RunState, Session, SessionSetup, SessionUpdate,
     SteerId, ToolCall, ToolContent, ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
 };
 #[cfg(not(target_family = "wasm"))]

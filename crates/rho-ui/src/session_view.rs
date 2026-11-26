@@ -910,10 +910,11 @@ impl SessionView {
         match std::mem::replace(&mut self.loading, Loading::Ready) {
             Loading::Ready | Loading::Attaching => {}
             Loading::Replaying(shown) => {
+                self.session.keep_arrivals(&shown);
                 let from = first_change(&shown, self.session.entries());
                 // `from`, not the start that the replay itself reports.
                 self.session.take_removed();
-                self.transcript.truncate(from, cx);
+                self.transcript.truncate(from, self.session.entries(), cx);
                 // The replay placed its surfaces again, for a store of
                 // their own.
                 self.surfaces = Surfaces::default();
@@ -973,7 +974,7 @@ impl SessionView {
         // it replays. A new one's replay is short, and builds as it comes.
         if matches!(self.loading, Loading::Ready) {
             if let Some(from) = self.session.take_removed() {
-                self.transcript.truncate(from, cx);
+                self.transcript.truncate(from, self.session.entries(), cx);
             }
             self.transcript.sync(self.session.entries(), cx);
             self.surfaces.sync(&mut self.session, window, cx);

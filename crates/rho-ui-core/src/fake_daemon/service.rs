@@ -201,6 +201,23 @@ fn start_prompt(
         session.answer(&format!("m-{turn_id}"), FIGURES);
         return Ok(SessionPromptResponse { turn: turn_id });
     }
+    if prompt == "cards" {
+        session.turn = Some(turn);
+        session.state(JobState::Running);
+        session.publish(echo(&turn_id, params));
+        session.say(
+            &format!("m-{turn_id}-a"),
+            "Six workers running. Watching their PRs.",
+        );
+        for card in super::CARDS {
+            session.publish(super::notification(card));
+        }
+        session.answer(
+            &format!("m-{turn_id}"),
+            "One test fails; the rest is good news.",
+        );
+        return Ok(SessionPromptResponse { turn: turn_id });
+    }
     if prompt == "report" {
         session.turn = Some(turn);
         session.state(JobState::Running);

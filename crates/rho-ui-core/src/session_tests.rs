@@ -593,7 +593,7 @@ fn a_timed_out_question_leaves_the_answer_rho_gave() {
                 notice.title(),
                 "No answer came in time, so Rho answered “A”"
             );
-            assert_eq!(notice.level(), NoticeLevel::Warning);
+            assert_eq!(notice.tone(), NoticeTone::Warning);
         }
         other => panic!("the transcript holds {other:?}"),
     }
@@ -937,4 +937,51 @@ fn a_ui_calls_surface_is_placed_once_after_the_call() {
             Row::Message(4),
         ]
     );
+}
+
+/// A message, reply or card knows when it arrived only if it came live:
+/// the daemon's events carry no time, so every replayed entry, the
+/// replay's last one included, has none. A notification card keeps its
+/// tone and the reference its display names it by.
+/// Only what this client saw arrive live has a time: a replay's events
+/// carry none. A replay of the whole conversation over it keeps the times
+/// this client saw, up to the first entry that differs.
+#[test]
+fn only_live_entries_know_when_they_arrived() {
+    let user = |id: &str, text: &str| {
+        update(json!({"type": "user_message", "message": id,
+            "content": [{"type": "text", "text": text}]}))
+    };
+    let notice = || update(json!({"type": "notice", "text": "PR merged"}));
+    let arrived = |session: &Session| -> Vec<bool> {
+        session
+            .entries()
+            .iter()
+            .map(|entry| match entry {
+                Entry::User(message) => message.arrived().is_some(),
+                Entry::Notice(notice) => notice.arrived().is_some(),
+                other => panic!("no {other:?} was sent"),
+            })
+            .collect()
+    };
+    let mut session = Session::new(SessionId::from("s1"));
+    session.attached(attach_response(JobState::Idle, 2));
+    session.apply(user("u1", "replayed"));
+    session.apply(notice());
+    session.apply(user("u2", "live"));
+    session.apply(notice());
+    session.apply(user("u3", "live too"));
+    assert_eq!(arrived(&session), [false, false, true, true, true]);
+
+    let Continuity::Replaced(shown) = session.attached(attach_response(JobState::Idle, 5)) else {
+        panic!("a reset replays the whole conversation");
+    };
+    session.apply(user("u1", "replayed"));
+    session.apply(notice());
+    session.apply(user("u2", "live"));
+    session.apply(notice());
+    session.apply(user("u3", "edited"));
+    assert_eq!(arrived(&session), [false; 5]);
+    session.keep_arrivals(&shown);
+    assert_eq!(arrived(&session), [false, false, true, true, false]);
 }

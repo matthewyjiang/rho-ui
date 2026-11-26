@@ -7292,6 +7292,7 @@ name = "rho-ui"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "chrono",
  "embed-resource",
  "futures",
  "getrandom 0.3.4",

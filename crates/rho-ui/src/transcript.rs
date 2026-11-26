@@ -1,28 +1,28 @@
-//! The transcript: a session's entries as rows in a scroller. Messages and
-//! notices are drawn here; runs of tool calls and thoughts by
-//! [`crate::work`]. Under each prompt, a header says "Working for 38s"
-//! while the turn runs; when it finishes, the same line says "Worked for"
-//! and the turn's working folds behind it. This owns what the user opened
-//! and folded, the turns' lengths, and the user messages' attachments,
-//! ready to draw.
+//! The transcript: a session's entries as rows in a scroller. Messages are
+//! drawn here; runs of tool calls and thoughts by [`crate::work`], and the
+//! cards rho sends between replies on a rail by [`crate::rail`]. Under each
+//! prompt, a header says "Working for 38s" while the turn runs; when it
+//! finishes, the same line says "Worked for" and the turn's working folds
+//! behind it. This owns what the user opened and folded, the turns'
+//! lengths, and the user messages' attachments, ready to draw.
 //!
-//! A notice's detail is Markdown, and can be long: a subagent's card holds
-//! its whole result. It shows its first [`NOTICE_LINES`] lines, with a
-//! button to show the rest.
+//! A message shows when it arrived on hover, if this client saw it arrive,
+//! in the rail's faint small style: a reply in its top right corner, in
+//! the column the rail's times make, and a user message left of its
+//! bubble.
 //!
 //! A row is one of the scroller's items, but a long reply's row is one for
 //! each of its parts ([`crate::parts`]), so the scroller draws only the
 //! parts near the window.
 
-use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::HashSet, ops::Range, rc::Rc, time::Duration};
 
 use web_time::Instant;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{text::CodeBlock, TestSupportExt as _};
 use gpui_kit::component::{
-    alert::{Alert, AlertVariant},
-    attachment::Attachment as Card,
+    attachment::Attachment,
     bubble::{Bubble, BubbleVariant},
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
@@ -30,17 +30,16 @@ use gpui_kit::component::{
     message_scroller::MessageScrollerState,
     separator::Separator,
     text::{MarkdownExtensions, TextView, TextViewState, TextViewStyle},
-    v_flex, ActiveTheme as _, Colorize as _, Icon, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Icon, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, rems, transparent_white, AnyElement, App, AppContext as _, ClipboardItem, ElementId,
-    Entity, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
+    div, px, rems, AnyElement, App, AppContext as _, ClipboardItem, ElementId, Entity,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window,
 };
 use rho_ui_core::{
-    surface::SurfaceRef, Compaction, Delay, Entry, Notice, NoticeLevel, Row, Timeline, ToolContent,
-    UserMessage,
+    surface::SurfaceRef, Compaction, Delay, Entry, Notice, Row, Timeline, ToolContent, UserMessage,
 };
 
 use crate::{
@@ -50,6 +49,7 @@ use crate::{
     lightbox,
     parts::{self, Edit, Items, Place},
     pictures::{self, PictureRead, Pictures},
+    rail::{self, Line},
     surface_view::Surfaces,
     turn_times::TurnTimes,
     usage,
@@ -81,17 +81,8 @@ const CODE_BLOCK_PAD_TOP: f32 = 26.;
 /// letters as Kit's corner leaves the first line's under the icon.
 const CODE_BLOCK_PAD_BOTTOM: f32 = 21.;
 
-/// How many lines of a notice's detail show until it is opened. Kit caps
-/// the height at this many body lines, so headings and code blocks take
-/// more room: a subagent's result cut at 6 lines shows its first line and
-/// heading, and measured 202px tall, card and all, in the UI test's window
-/// (12 lines measured 340px and read as most of the result). A short card,
-/// such as a finished command's, still shows whole.
-const NOTICE_LINES: usize = 6;
-
-/// The gap between a notice's paragraphs, in rems: Kit's alerts' own, so a
-/// detail sets as tight as the card it is in.
-const NOTICE_PARAGRAPH_GAP: f32 = 0.2;
+/// The group a message's hover shows its time through.
+const MESSAGE_GROUP: &str = "message";
 
 /// A Markdown heading's size relative to the body text, by level. Kit 0.9.1
 /// steps down from 1.8 and sets `####` at body size, so the `##` and `###`
@@ -109,7 +100,7 @@ fn heading_scale(level: u8) -> f32 {
     }
 }
 
-/// How messages and notices draw their Markdown, around body text of size
+/// How messages and cards draw their Markdown, around body text of size
 /// `body`. Kit's heading sizes are pixels, so they come from `body` to follow
 /// the UI scale.
 fn message_style(body: Pixels) -> TextViewStyle {
@@ -123,17 +114,23 @@ fn message_style(body: Pixels) -> TextViewStyle {
     .heading_font_size(|level, body| body * heading_scale(level))
 }
 
-/// The body size of text in a user's bubble or a notice card: both set it
-/// `text_sm`, 0.875 rem (Kit's `BubbleContent`, and [`notice_card`]).
+/// The body size of text in a user's bubble: Kit's `BubbleContent` sets it
+/// `text_sm`, 0.875 rem.
 fn small_text(cx: &App) -> Pixels {
     cx.theme().font_size * 0.875
+}
+
+/// The body size of a card's body: `text_xs`, 0.75 rem, which the rail's
+/// detail panel sets for the rest of it.
+fn xsmall_text(cx: &App) -> Pixels {
+    cx.theme().font_size * 0.75
 }
 
 /// How long a code block's copy button shows a check after it copies, as
 /// Kit's own `Clipboard` does.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 
-/// A code block's corner in a message or notice: its language, and a button
+/// A code block's corner in a message or card: its language, and a button
 /// that copies its code. Kit drops its own language name once a block has
 /// actions, so this sets it, as Kit does.
 fn code_actions(block: &CodeBlock, window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -198,8 +195,10 @@ pub(crate) enum Action {
     Fold { row: usize, fold: Fold },
     /// Open or fold a finished turn's working.
     Worked { turn: usize },
-    /// Show all of notice `entry`'s detail, or only its first lines.
-    Notice { entry: usize },
+    /// Open or close card `entry`'s body under its row on the rail.
+    Card { entry: usize },
+    /// Unfold the routine cards of the run that card `entry` opens.
+    Unfold { entry: usize },
 }
 
 /// Carries out an [`Action`]; the session view owns the transcript.
@@ -231,9 +230,7 @@ struct Running {
 /// 15px, then 2,884px, and the transcript jumped as it scrolled up.
 struct Markdown {
     text: Entity<TextViewState>,
-    /// Remeasures the text's item when it lays out anew: its parse arrived,
-    /// or a notice's detail started or stopped being cut short, which adds
-    /// or drops its button.
+    /// Remeasures the text's item when it lays out anew: its parse arrived.
     _relayout: Subscription,
 }
 
@@ -246,9 +243,11 @@ pub(crate) struct Transcript {
     items: Rc<RefCell<Items>>,
     /// Per row: whether a work row lists its steps.
     steps: Vec<Disclosure>,
-    /// Per entry: whether a step shows its details, or a notice all of its
-    /// detail.
+    /// Per entry: whether a step shows its details, or a card its body.
     details: Vec<Disclosure>,
+    /// The runs of cards the user unfolded, by their first card's entry:
+    /// one opened stays open.
+    unfolded: HashSet<usize>,
     /// Per turn: whether its folded working is open.
     worked: Vec<Disclosure>,
     /// Per turn: how long it took, for turns rho-ui watched. The daemon
@@ -265,7 +264,7 @@ pub(crate) struct Transcript {
     attachments: Vec<Vec<Preview>>,
     /// The images the session's messages show by path.
     pictures: Entity<Pictures>,
-    /// Per entry: a message's text, or a notice's detail, with one for each
+    /// Per entry: a message's text, or a card's body, with one for each
     /// part of a reply; none for anything else.
     markdown: Vec<Vec<Markdown>>,
 }
@@ -279,6 +278,7 @@ impl Transcript {
             items: Rc::default(),
             steps: Vec::new(),
             details: Vec::new(),
+            unfolded: HashSet::new(),
             worked: Vec::new(),
             took: Vec::new(),
             running: None,
@@ -378,16 +378,57 @@ impl Transcript {
                 self.remeasure(self.timeline.turn_rows(newest), cx);
             }
         }
+        // A card that joins a run moves the run's end and may fold some of
+        // it: the run's rows draw anew.
+        if let Some(before) = (rows - synced.added).checked_sub(1) {
+            if synced.added > 0 && self.card_at(before, entries).is_some() {
+                self.remeasure(self.run_of(before, entries), cx);
+            }
+        }
+    }
+
+    /// The card row `row` shows, if it shows one, with its entry.
+    fn card_at<'a>(&self, row: usize, entries: &'a [Entry]) -> Option<(usize, &'a Notice)> {
+        let Row::Message(entry) = self.timeline.rows().get(row)? else {
+            return None;
+        };
+        match entries.get(*entry)? {
+            Entry::Notice(notice) => Some((*entry, notice)),
+            _ => None,
+        }
+    }
+
+    /// The rows of the run of cards around `row`: the cards between two
+    /// other rows, such as replies. It costs the run's length, not the
+    /// transcript's.
+    fn run_of(&self, row: usize, entries: &[Entry]) -> Range<usize> {
+        let is_card = |row: usize| self.card_at(row, entries).is_some();
+        let mut start = row;
+        while start > 0 && is_card(start - 1) {
+            start -= 1;
+        }
+        let mut end = row + 1;
+        while is_card(end) {
+            end += 1;
+        }
+        start..end
+    }
+
+    /// Whether `row` is a card the rail runs on below: rows keep a gap
+    /// below them, but a card only at the end of its run.
+    fn continues_rail(&self, row: usize, entries: &[Entry]) -> bool {
+        self.card_at(row, entries).is_some() && self.card_at(row + 1, entries).is_some()
     }
 
     /// Forgets what it built for entries from `from` on, which went or
     /// moved, as a discarded response's do; [`Self::sync`] builds what is
     /// there now.
-    pub(crate) fn truncate(&mut self, from: usize, cx: &mut App) {
+    pub(crate) fn truncate(&mut self, from: usize, entries: &[Entry], cx: &mut App) {
         let rows = self.timeline.truncate(from);
         let turns = self.timeline.turns().len();
         self.steps.truncate(rows);
         self.details.truncate(from);
+        self.unfolded.retain(|&first| first < from);
         self.attachments.truncate(from);
         self.markdown.truncate(from);
         self.pictures
@@ -397,9 +438,14 @@ impl Transcript {
         self.took.truncate(turns);
         let gone = self.items.borrow_mut().truncate(rows);
         self.splice(gone, cx);
-        // A run of work may have lost steps.
+        // A run of work may have lost steps, and a run of cards the cards
+        // that folded.
         if let Some(last) = rows.checked_sub(1) {
-            self.remeasure(last..rows, cx);
+            let run = match self.card_at(last, entries) {
+                Some(_) => self.run_of(last, entries),
+                None => last..rows,
+            };
+            self.remeasure(run, cx);
         }
     }
 
@@ -647,7 +693,7 @@ impl Transcript {
                 worked.toggle();
                 self.timeline.turn_rows(turn)
             }
-            Action::Notice { entry } => {
+            Action::Card { entry } => {
                 let Some(shows) = self.details.get_mut(entry) else {
                     return;
                 };
@@ -656,6 +702,13 @@ impl Transcript {
                     return;
                 };
                 row..row + 1
+            }
+            Action::Unfold { entry } => {
+                let Some(row) = self.timeline.row_of(entry) else {
+                    return;
+                };
+                self.unfolded.insert(entry);
+                self.run_of(row, entries)
             }
         };
         self.remeasure(rows, cx);
@@ -711,9 +764,10 @@ impl Transcript {
                 .when_some(panel, |this, panel| this.pb_3().child(panel))
                 .into_any_element();
         }
+        let gap_below = ends_row && !self.continues_rail(row, entries);
         let Some(turn) = self.timeline.turn_of(row) else {
             return measure
-                .when(ends_row, Styled::pb_3)
+                .when(gap_below, Styled::pb_3)
                 .child(self.render_content(place, entries, act, cx))
                 .into_any_element();
         };
@@ -735,7 +789,7 @@ impl Transcript {
                     shows,
                     move |window, cx| {
                         div()
-                            .when(ends_row, Styled::pb_3)
+                            .when(gap_below, Styled::pb_3)
                             .child(content(place, window, cx))
                             .into_any_element()
                     },
@@ -744,7 +798,7 @@ impl Transcript {
         }
         let opens_turn = self.timeline.turns().get(turn) == Some(&row);
         measure
-            .when(ends_row, Styled::pb_3)
+            .when(gap_below, Styled::pb_3)
             .child(self.render_content(place, entries, act, cx))
             .when(opens_turn, |this| {
                 this.child(self.render_header(turn, act, cx))
@@ -822,7 +876,7 @@ impl Transcript {
         };
         match drawn {
             Row::Message(entry) => match &entries[*entry] {
-                Entry::Notice(notice) => self.render_notice(*entry, notice, act, cx),
+                Entry::Notice(_) => self.render_card(row, *entry, entries, act, cx),
                 message => {
                     let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
                     let shown = Shown {
@@ -860,99 +914,64 @@ impl Transcript {
 }
 
 impl Transcript {
-    /// Notice `ix`: its title, and its detail in Markdown, cut to
-    /// [`NOTICE_LINES`] lines until opened with the button under it.
-    fn render_notice(
+    /// Card `ix`, at `row`, on the rail with the rest of its run: its row,
+    /// the row that folds it with the run's other routine cards, or nothing
+    /// while it is folded. An open card shows its body under its row.
+    fn render_card(
         &self,
+        row: usize,
         ix: usize,
-        notice: &Notice,
+        entries: &[Entry],
         act: &ActionHandler,
         cx: &App,
     ) -> AnyElement {
-        let key = ElementId::named_usize("row", ix);
-        let variant = match notice.level() {
-            NoticeLevel::Info => AlertVariant::Info,
-            NoticeLevel::Warning => AlertVariant::Warning,
-            NoticeLevel::Error => AlertVariant::Error,
+        let run = self.run_of(row, entries);
+        let cards: Vec<(usize, &Notice)> = run
+            .clone()
+            .filter_map(|row| self.card_at(row, entries))
+            .collect();
+        let tones: Vec<_> = cards.iter().map(|(_, card)| card.tone()).collect();
+        // `run_of` spans only card rows, so `cards` has one for each.
+        let first = cards[0].0;
+        let shown = if self.unfolded.contains(&first) {
+            Disclosure::Open
+        } else {
+            Disclosure::Folded
         };
-        let Some(detail) = self.text(ix, 0) else {
-            return Alert::new(key, SharedString::from(notice.title().to_owned()))
-                .with_variant(variant)
-                .small()
-                .into_any_element();
-        };
-        let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
-        let mut text = TextView::new(detail)
-            .style(message_style(small_text(cx)).paragraph_gap(rems(NOTICE_PARAGRAPH_GAP)))
-            .code_block_actions(code_actions)
-            .selectable(true);
-        if !open {
-            text = text.max_lines(NOTICE_LINES);
+        let at = row - run.start;
+        match rail::place(&tones, shown, at) {
+            // An empty row. When it ends the run, it carries the gap below
+            // the run (see `continues_rail`).
+            rail::Place::Hidden => div().into_any_element(),
+            rail::Place::Fold { ends, folded } => {
+                let folded: Vec<Line<'_>> =
+                    folded.iter().map(|&card| Line::of(cards[card].1)).collect();
+                let act = Rc::clone(act);
+                let unfold = move |window: &mut Window, cx: &mut App| {
+                    act(Action::Unfold { entry: first }, window, cx);
+                };
+                rail::fold_row(ix, &folded, ends, unfold, cx)
+            }
+            rail::Place::Card(ends) => {
+                let body = self.text(ix, 0);
+                let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
+                let detail = body.filter(|_| open).map(|body| {
+                    TextView::new(body)
+                        .style(message_style(xsmall_text(cx)))
+                        .code_block_actions(code_actions)
+                        .selectable(true)
+                        .into_any_element()
+                });
+                let toggle = body.map(|_| {
+                    let act = Rc::clone(act);
+                    move |window: &mut Window, cx: &mut App| {
+                        act(Action::Card { entry: ix }, window, cx);
+                    }
+                });
+                rail::card_row(ix, &Line::of(cards[at].1), ends, detail, toggle, cx)
+            }
         }
-        // Kit's text view says whether the last frame cut it short.
-        let toggle = (open || detail.read(cx).is_clamped()).then(|| {
-            let act = Rc::clone(act);
-            let (label, icon) = if open {
-                ("Show less", Lucide::ChevronUp)
-            } else {
-                ("Show more", Lucide::ChevronDown)
-            };
-            Button::new(SharedString::from(format!("notice-{ix}-toggle")))
-                .ghost()
-                .xsmall()
-                .icon(icon)
-                .label(label)
-                .on_click(move |_, window, cx| act(Action::Notice { entry: ix }, window, cx))
-        });
-        v_flex()
-            .id(SharedString::from(format!("notice-{ix}")))
-            .test_support()
-            .aria_label(notice.title().to_owned())
-            .w_full()
-            .gap_1()
-            .child(notice_card(key, notice, text, cx))
-            .children(toggle)
-            .into_any_element()
     }
-}
-
-/// A notice with a detail: Kit's small [`Alert`], drawn here because Kit's
-/// sets its own style on its message, which drops the code-block padding
-/// [`message_style`] gives `text`. Sizes and colors are Kit 0.9.1's.
-fn notice_card(key: ElementId, notice: &Notice, text: TextView, cx: &App) -> impl IntoElement {
-    let theme = cx.theme();
-    let color = match notice.level() {
-        NoticeLevel::Info => theme.info,
-        NoticeLevel::Warning => theme.warning,
-        NoticeLevel::Error => theme.danger,
-    };
-    h_flex()
-        .id(key)
-        .w_full()
-        .items_start()
-        .gap(px(6.))
-        .px(px(12.))
-        .py(px(8.))
-        .text_sm()
-        .text_color(color)
-        .bg(color.mix_oklab(transparent_white(), 0.04))
-        .border_1()
-        .border_color(color.mix_oklab(transparent_white(), 0.3))
-        .rounded(theme.radius)
-        .child(div().mt(px(5.)).child(Icon::new(Lucide::Info)))
-        .child(
-            v_flex()
-                .flex_1()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .font_semibold()
-                        .child(notice.title().to_owned()),
-                )
-                .child(text),
-        )
 }
 
 /// Whether a row is still being written.
@@ -1022,7 +1041,7 @@ fn attachment_row(cells: impl Iterator<Item = AnyElement>) -> Option<impl IntoEl
 /// Attachment `n` of user message `ix`, drawn as `card`; an image opens in
 /// the lightbox when clicked. Wrapped so UI tests can find it: Kit's
 /// Attachment does not register its ID with them.
-fn attachment_cell(ix: usize, n: usize, preview: &Preview, card: Card) -> AnyElement {
+fn attachment_cell(ix: usize, n: usize, preview: &Preview, card: Attachment) -> AnyElement {
     let id = SharedString::from(format!("user-{ix}-attachment-{n}"));
     let card = card.id((ElementId::from(id.clone()), "card"));
     match preview.image() {
@@ -1098,6 +1117,35 @@ fn compaction_divider(ix: usize, compaction: Compaction, cx: &App) -> AnyElement
         .into_any_element()
 }
 
+/// The height of a reply's first line, which its time centers on: GPUI's
+/// default line height, φ, which Kit's text view keeps.
+fn first_line(cx: &App) -> Pixels {
+    cx.theme().font_size * 1.618
+}
+
+/// When a reply arrived, in its top right corner, in the rail's column of
+/// times, over the first line's end on the page's color.
+fn reply_time(at: chrono::DateTime<chrono::Utc>, cx: &App) -> gpui_kit::Div {
+    hover_time(at, cx)
+        .absolute()
+        .top_0()
+        .right_0()
+        .h(first_line(cx))
+        .flex()
+        .items_center()
+        .bg(cx.theme().background)
+}
+
+/// When a message arrived, shown while the pointer is on it, as faint as
+/// the rail's times. Not Kit's `MessageHeader` or `MessageFooter`: each
+/// keeps its line while the time is hidden, which would space every
+/// message out for a time that shows only on hover.
+fn hover_time(at: chrono::DateTime<chrono::Utc>, cx: &App) -> gpui_kit::Div {
+    rail::clock(Some(at), cx)
+        .opacity(0.)
+        .group_hover(MESSAGE_GROUP, |style| style.opacity(1.))
+}
+
 /// Builds the row for a user message, a reply, a wake or a compaction:
 /// entry `ix`, with what `shown` holds. Tool calls and thoughts are drawn by [`crate::work`].
 fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyElement {
@@ -1111,7 +1159,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
     } = *shown;
     let key = ElementId::named_usize("row", ix);
     match entry {
-        Entry::User(_) => {
+        Entry::User(message) => {
             // Above the text, the images in their own proportions on one
             // row, then the file chips on the next: one height to a row.
             // IDs number the attachments in the order they were sent.
@@ -1139,17 +1187,30 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                         ),
                 )
             });
-            let mut content = MessageContent::new().children(images).children(files);
-            if let Some(text) = text {
-                content = content.bubble(text);
-            }
+            // The time sits left of the bubble, where the row is empty: a
+            // bubble is at most 80% of it wide. (`MessageContent::bubble`
+            // only marks a ghost bubble; this one is muted.)
+            let text = text.map(|text| {
+                h_flex()
+                    .group(MESSAGE_GROUP)
+                    .w_full()
+                    .justify_end()
+                    .items_center()
+                    .gap_2()
+                    .children(message.arrived().map(|at| hover_time(at, cx)))
+                    .child(text)
+            });
+            let content = MessageContent::new()
+                .children(images)
+                .children(files)
+                .children(text);
             Message::new()
                 .id(key)
                 .alignment(MessageAlignment::End)
                 .content(content)
                 .into_any_element()
         }
-        Entry::Agent(_) => {
+        Entry::Agent(message) => {
             let style = message_style(cx.theme().font_size);
             // The gap Kit would leave after the part's last block, were
             // the reply one text.
@@ -1158,11 +1219,18 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                 0 => format!("reply-{ix}"),
                 part => format!("reply-{ix}-{part}"),
             };
+            let time = message
+                .arrived()
+                .filter(|_| part == 0)
+                .map(|at| reply_time(at, cx));
             div()
                 .id(SharedString::from(id))
                 .test_support()
+                .group(MESSAGE_GROUP)
+                .relative()
                 .w_full()
                 .when(!ends_message, |this| this.pb(gap))
+                .children(time)
                 .children(text.map(|text| {
                     TextView::new(text)
                         .style(style)
