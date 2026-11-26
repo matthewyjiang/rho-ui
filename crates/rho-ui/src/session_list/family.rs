@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{machines::SessionKey, shelf::Shelf};
+use crate::{leads::Kind, machines::SessionKey, shelf::Shelf};
 
 use super::{Activity, Attention, Item, Passes, Row, SessionList};
 
@@ -36,7 +36,8 @@ pub(crate) struct FamilyMarks {
 }
 
 /// The most pressing thing of the sessions under a fold: how many wait for
-/// the user, else how many are Done, else how many work.
+/// the user, else how many are Done, else how many work. A lead's are
+/// never Done here: see [`Row::attention_under`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Pressing {
     Waiting(usize),
@@ -46,11 +47,11 @@ pub(crate) enum Pressing {
 
 impl Pressing {
     /// The one thing a fold line says of `rows`, the sessions that show
-    /// under it.
-    fn of<'a>(rows: impl Iterator<Item = &'a Row>) -> Option<Self> {
+    /// under a starter of kind `starter`.
+    fn of<'a>(rows: impl Iterator<Item = &'a Row>, starter: Kind) -> Option<Self> {
         let (mut waiting, mut done, mut working) = (0, 0, 0);
         for row in rows {
-            match row.attention() {
+            match row.attention_under(starter) {
                 Attention::Asks => waiting += 1,
                 Attention::Done => done += 1,
                 Attention::Runs if matches!(row.activity, Activity::Working(_)) => working += 1,
@@ -100,6 +101,17 @@ impl Row {
             Family::Started => !self.activity.is_idle(),
         }
     }
+
+    /// What it presses on the family it folds in, under a starter of kind
+    /// `starter`: its own, but a lead reads its sessions' results itself,
+    /// so one of those that is Done rests there. Its own row still says
+    /// Done.
+    fn attention_under(&self, starter: Kind) -> Attention {
+        match (starter, self.attention()) {
+            (Kind::Lead, Attention::Done) => Attention::Rests,
+            (_, attention) => attention,
+        }
+    }
 }
 
 /// Which rows fold under which, as of one rebuild.
@@ -139,7 +151,8 @@ impl Families {
     }
 
     /// The marks of top row `top`'s family, from what its rows do, are
-    /// Done and watch as they stand.
+    /// Done and watch as they stand, each session under it by what it
+    /// presses on the family ([`Row::attention_under`]).
     pub(super) fn marks(&self, rows: &[Row], top: usize) -> FamilyMarks {
         let starter = &rows[top];
         let mut marks = FamilyMarks {
@@ -149,7 +162,7 @@ impl Families {
         };
         for row in self.members(top).iter().map(|&ix| &rows[ix]) {
             marks.updated = marks.updated.max(row.updated);
-            marks.attention = marks.attention.min(row.attention());
+            marks.attention = marks.attention.min(row.attention_under(starter.kind));
             marks.busy |= !row.activity.is_idle();
         }
         marks
@@ -249,7 +262,7 @@ impl SessionList {
         items.push(Item::Fold(FoldLine {
             starter: top,
             sessions: drawn.len(),
-            pressing: Pressing::of(drawn.iter().map(|&ix| &self.rows[ix])),
+            pressing: Pressing::of(drawn.iter().map(|&ix| &self.rows[ix]), starter.kind),
             fold,
         }));
         if fold != Fold::Closed {
@@ -297,7 +310,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        leads::Kind,
         machines::{MachineId, Place},
         session_list::{
             tests::{here, id, job, mark, rebuild, saved, shown},
@@ -475,8 +487,11 @@ mod tests {
 
     /// Active leads list first, under their header, each over the sessions
     /// it started, then the other active sessions, which alone the active
-    /// shelf counts; a settled lead lists on its shelf. A lead is in no
-    /// project, so a project filter that hides the others leaves it.
+    /// shelf counts; a settled lead lists on its shelf. A lead reads its
+    /// sessions' results itself: its fold line says who asks, else who
+    /// works, never who is Done, and their Done doesn't rank it, though its
+    /// own does. A lead is in no project, so a project filter that hides
+    /// the others leaves it.
     #[test]
     fn active_leads_list_apart_over_their_families() {
         let lead = |text: &str, title: &str, updated: i64| SavedSession {
@@ -487,6 +502,8 @@ mod tests {
         list.set_saved(
             &here(),
             vec![
+                // Newer than any turn here ends.
+                lead("next", "Next", 20),
                 saved("other", Some("Other"), 6),
                 started("w1", "Write", 5, "lead"),
                 lead("lead", "Lead", 3),
@@ -497,6 +514,7 @@ mod tests {
         rebuild(&mut list, 10);
         let listed = [
             "[Leads]",
+            "Next",
             "Lead",
             "› 1 started",
             "[Sessions]",
@@ -507,12 +525,47 @@ mod tests {
         assert_eq!(shown(&list), listed);
         assert_eq!(list.count(Shelf::Active), 1);
 
+        let writes = job("w1", JobActivity::Working, None);
+        list.set_jobs(&here(), vec![writes], Instant::now(), 11);
+        rebuild(&mut list, 11);
+        let working = ["[Leads]", "Next", "Lead", "› 1 started, 1 working"];
+        assert_eq!(shown(&list)[..4], working);
+        // Write's turn ends off screen, and a session Lead starts asks.
+        let asks = JobSession {
+            parent: Some(id("lead")),
+            ..job("w2", JobActivity::Waiting, None)
+        };
+        list.set_jobs(&here(), vec![asks], Instant::now(), 12);
+        rebuild(&mut list, 12);
+        let asking = ["[Leads]", "Lead", "› 2 started, 1 waiting", "Next"];
+        assert_eq!(shown(&list)[..4], asking);
+        list.set_jobs(&here(), Vec::new(), Instant::now(), 13);
+        rebuild(&mut list, 13);
+        assert_eq!(
+            shown(&list)[..4],
+            ["[Leads]", "Next", "Lead", "› 1 started"]
+        );
+        // Lead's own turn ends off screen.
+        list.set_jobs(
+            &here(),
+            vec![job("lead", JobActivity::Working, None)],
+            Instant::now(),
+            14,
+        );
+        list.set_jobs(&here(), Vec::new(), Instant::now(), 15);
+        rebuild(&mut list, 15);
+        assert_eq!(
+            shown(&list)[..4],
+            ["[Leads]", "Lead", "› 1 started", "Next"]
+        );
+
         // Kept to a project none of them is in.
         let mut filter = Filter::default();
         filter.toggle_project(&Place::new(here(), "/srv"));
         list.set_filter(filter);
-        rebuild(&mut list, 10);
-        assert_eq!(shown(&list), ["[Leads]", "Lead", "~", "[Settled 1]"]);
+        rebuild(&mut list, 15);
+        let kept = ["[Leads]", "Lead", "Next", "~", "[Settled 1]"];
+        assert_eq!(shown(&list), kept);
     }
 
     /// A search or a filter that shows only sessions a session started
