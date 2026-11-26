@@ -262,3 +262,38 @@ fn settle_catalog(ui: &mut Harness, reads: usize, why: &str) {
     ui.frame();
     assert_eq!(ui.fake().mcp_catalog_reads(), reads, "asked {why}");
 }
+
+/// Find and the `@` menu share the keyboard: Ctrl+F opens find while the
+/// menu is open, and Escape closes what is nearest the keyboard first,
+/// the menu, then the find bar.
+#[test]
+fn escape_closes_the_mention_menu_before_find() {
+    let mut ui = Harness::start("mcp-find", Script::default());
+    open_session(&mut ui);
+    let intro = SharedString::from(format!("completion-@docs:{MCP_INTRO}"));
+    ui.type_in("@intr");
+    ui.wait_until("the mention menu", |window, _, _| {
+        is_visible(window, intro.clone())
+    });
+    ui.act(|window, cx| window.press("secondary-f", cx));
+    ui.wait_until("the find bar", |window, _, _| {
+        is_visible(window, "find-bar")
+    });
+
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        let composer = view.read(cx).composer_focus_handle(cx);
+        window.focus(&composer, cx);
+    });
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.wait_until("the menu closed", |window, _, _| {
+        !is_visible(window, intro.clone())
+    });
+    ui.act(|window, _| assert!(is_visible(window, "find-bar"), "find stays open"));
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.wait_until("the find bar closed", |window, _, _| {
+        !is_visible(window, "find-bar")
+    });
+    assert_eq!(ui.composer_text(), "@intr", "nothing typed went");
+}
