@@ -384,7 +384,10 @@ fn mcp_item(server: &ConfiguredMcpServer, config: &str) -> SettingItem {
         McpServerSource::Plugin { plugin } => format!("Plugin {plugin}"),
         _ => "Another source".to_owned(),
     };
-    // An invalid server has no transport: its error stands in for it.
+    // An invalid server has no transport: its error stands in for it. A
+    // command line shows as written, as no rule tells a secret argument
+    // from another; a URL hides its credentials and query values. Should
+    // rho list a server's environment or headers, show their names only.
     let (source, reach) = match &server.transport {
         Some(McpTransport::Stdio { command, args }) => (
             format!("{source} · stdio"),
@@ -396,7 +399,7 @@ fn mcp_item(server: &ConfiguredMcpServer, config: &str) -> SettingItem {
             ),
         ),
         Some(McpTransport::StreamableHttp { url }) => {
-            (format!("{source} · HTTP"), Some(url.clone()))
+            (format!("{source} · HTTP"), Some(redacted_url(url)))
         }
         Some(_) => (source, Some("Another transport".to_owned())),
         None => (source, server.error.clone()),
@@ -548,5 +551,92 @@ fn event_name(event: HookEvent) -> &'static str {
         HookEvent::WorkflowFailed => "workflow_failed",
         HookEvent::WorkflowCancelled => "workflow_cancelled",
         _ => "another event",
+    }
+}
+
+/// `url` with what most often holds a token by accident left out, as the
+/// page may be screen-shared: its user and password, its query's values,
+/// and its fragment, each as "…". The host, path and query keys stay, so
+/// servers can still be told apart. A string that isn't a URL keeps its
+/// query and fragment the same way.
+fn redacted_url(url: &str) -> String {
+    const HIDDEN: &str = "…";
+    let (rest, fragment) = match url.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (url, None),
+    };
+    let (rest, query) = match rest.split_once('?') {
+        Some((rest, query)) => (rest, Some(query)),
+        None => (rest, None),
+    };
+    let mut out = match rest.split_once("://") {
+        Some((scheme, after)) => {
+            let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
+            let host = match authority.rsplit_once('@') {
+                Some((_, host)) => format!("{HIDDEN}@{host}"),
+                None => authority.to_owned(),
+            };
+            format!("{scheme}://{host}{path}")
+        }
+        None => rest.to_owned(),
+    };
+    if let Some(query) = query {
+        let pairs: Vec<String> = query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((key, "")) => format!("{key}="),
+                Some((key, _)) => format!("{key}={HIDDEN}"),
+                // A bare item may be the token itself.
+                None if pair.is_empty() => String::new(),
+                None => HIDDEN.to_owned(),
+            })
+            .collect();
+        out.push('?');
+        out.push_str(&pairs.join("&"));
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        if !fragment.is_empty() {
+            out.push_str(HIDDEN);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redacted_url;
+
+    /// A token in an HTTP server's URL doesn't show; what tells servers
+    /// apart does.
+    #[test]
+    fn urls_hide_their_credentials_and_query_values() {
+        let cases = [
+            ("https://api.example.com/mcp", "https://api.example.com/mcp"),
+            ("http://localhost:8080", "http://localhost:8080"),
+            (
+                "https://api.example.com/mcp?key=sk-123",
+                "https://api.example.com/mcp?key=…",
+            ),
+            (
+                "https://h.example/mcp?a=1&b=&token",
+                "https://h.example/mcp?a=…&b=&…",
+            ),
+            (
+                "https://user:pass@h.example:443/mcp",
+                "https://…@h.example:443/mcp",
+            ),
+            ("https://tok@h.example?x=1", "https://…@h.example?x=…"),
+            // An @ in the path is no user.
+            ("https://h.example/@team/mcp", "https://h.example/@team/mcp"),
+            (
+                "https://h.example/cb#access_token=abc",
+                "https://h.example/cb#…",
+            ),
+            ("https://h.example/mcp?", "https://h.example/mcp?"),
+        ];
+        for (url, shown) in cases {
+            assert_eq!(redacted_url(url), shown, "{url}");
+        }
     }
 }

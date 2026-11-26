@@ -40,6 +40,7 @@ What each machine's rho sets up for its sessions: its MCP servers, from `config.
 
 - **Project.** A project's plugins and hooks file apply only to sessions in it, so the page reads for one project: the folder of the session or draft on screen when Settings opened (and its machine), else none, which lists your own alone. For a session in a worktree that's the worktree, whose hooks file the session loads, not the main checkout's; for a lead, the first project it works in. Pick another of that machine's projects to see what its sessions get.
 - **Trusting a project.** rho loads a project's hooks file only when the environment rho-ui gives its sessions sets `RHO_TRUST_PROJECT_HOOKS=1`, and a project's plugins, with their MCP servers, only with `RHO_TRUST_PROJECT_PLUGINS=1`. Either trusts every project on that machine, not just one. On this machine that environment is the one rho-ui started with; on a remote machine, the login environment there. Restart rho-ui after changing it. An untrusted project's MCP servers don't show at all: rho doesn't list the plugins it skipped.
+- **Secrets.** An HTTP server's URL shows without its user, password, query values or fragment, the usual places of a token, as `https://api.example.com/mcp?key=…`. A stdio server's command line shows as written: keep tokens in its environment, not its arguments.
 - **An invalid hooks file** stops every hook, the other file's too, until it's fixed.
 - **A rho too old** to list them says so; update rho on that machine.
 
