@@ -583,9 +583,14 @@ impl RightPanel {
     }
 
     /// Reads `session`'s surfaces again whenever `view`'s turn ends, and
-    /// its Context again once `view` has caught up with the session after
-    /// a read found it unloaded, as coming back to a session the app let
-    /// go reads before the session is followed again.
+    /// its Context again on any change to `view`'s live state while its
+    /// latest read may predate the session's load (see
+    /// [`ContextSurface::may_predate_load`]). Coming back to a session the
+    /// app let go reads before the session is followed again, and that
+    /// read's answer, that the session isn't loaded, can land after the
+    /// view has caught up; the change that catching up makes replaces it.
+    /// At a turn's end the live change comes in the same flush as `Saved`,
+    /// so the read it replaces hasn't started.
     fn follow_turns(
         session: &SessionKey,
         view: &Entity<SessionView>,
@@ -600,7 +605,7 @@ impl RightPanel {
                 };
                 for tab in &set.tabs {
                     if let Tab::Context(context) = tab {
-                        if context.read(cx).waits_for_load() {
+                        if context.read(cx).may_predate_load() {
                             read_context(&set.view, context, cx);
                         }
                     }
