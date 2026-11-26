@@ -92,6 +92,13 @@ impl FakeConfigured {
     }
 }
 
+/// `rest` in `workspace`, as a daemon on a Unix machine names it: the
+/// fake's workspaces are such paths (`/w/a`) on any OS the tests run on,
+/// and `Path::join` would add the test machine's separator instead.
+fn in_workspace(workspace: &Path, rest: &str) -> PathBuf {
+    PathBuf::from(format!("{}/{rest}", workspace.display()))
+}
+
 /// The fake's rho home, as a real daemon of this user's would have it.
 fn rho_home() -> PathBuf {
     platform::home_dir()
@@ -179,7 +186,7 @@ impl State {
                 HooksFileStatus::Loaded,
             )]));
         };
-        let project_path = workspace.join(".rho/hooks.toml");
+        let project_path = in_workspace(workspace, ".rho/hooks.toml");
         if workspace == Path::new(INVALID_HOOKS_WORKSPACE) {
             return Ok(HooksListResponse::new(vec![
                 user_file(
@@ -206,7 +213,9 @@ impl State {
                 patterns: vec!["edit".to_owned(), "write".to_owned()],
             },
             command: vec![
-                workspace.join("scripts/fmt.sh").display().to_string(),
+                in_workspace(workspace, "scripts/fmt.sh")
+                    .display()
+                    .to_string(),
                 "--check".to_owned(),
             ],
             working_directory: workspace.clone(),
