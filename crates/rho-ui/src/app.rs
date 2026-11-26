@@ -1046,16 +1046,17 @@ impl RhoApp {
         settings_view::open(app, window, cx);
     }
 
-    /// The project of the session or draft on screen, which Settings → MCP
-    /// & hooks shows first.
+    /// The folder of the session or draft on screen, as rho reads its
+    /// project's hooks file from it (a worktree's own, not its main
+    /// checkout's), which Settings → MCP & hooks shows first.
     fn shown_project(&self, cx: &App) -> Option<Place> {
         match &self.pane {
             Pane::Session(view) => view
                 .read(cx)
                 .projects(cx)
                 .first()
-                .map(|project| project.root()),
-            Pane::Draft(draft) => Some(draft.read(cx).cwd().clone()),
+                .map(|project| project.place().clone()),
+            Pane::Draft(draft) => draft.read(cx).project(cx),
             Pane::Empty => None,
         }
     }

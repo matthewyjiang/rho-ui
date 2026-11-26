@@ -45,9 +45,6 @@ pub(crate) struct Reading {
 /// One connected machine's.
 struct MachineConfig {
     id: MachineId,
-    /// Which of the machine's connections this is, so a read sent on an
-    /// earlier one doesn't answer for it.
-    connection: u64,
     daemon: Daemon,
     /// The latest read that answered.
     read: Option<Reading>,
@@ -61,8 +58,8 @@ struct MachineConfig {
 #[derive(Default)]
 pub(crate) struct Configured {
     machines: Vec<MachineConfig>,
-    connections: u64,
-    /// Numbers each read, so only the latest one answers.
+    /// Numbers each read, so only the latest one answers: a read sent on
+    /// an earlier connection, or for another project, answers for nothing.
     asks: u64,
 }
 
@@ -95,10 +92,8 @@ impl Configured {
         cx: &mut Context<'_, Self>,
     ) {
         self.forget(machine, cx);
-        self.connections += 1;
         self.machines.push(MachineConfig {
             id: machine.clone(),
-            connection: self.connections,
             daemon,
             read: None,
             asking: None,
@@ -149,7 +144,7 @@ impl Configured {
             return;
         };
         entry.asking = Some((ask, workspace.clone()));
-        let (daemon, connection) = (entry.daemon.clone(), entry.connection);
+        let daemon = entry.daemon.clone();
         let id = machine.clone();
         cx.spawn(async move |this, cx| {
             let place = workspace.as_deref();
@@ -160,11 +155,10 @@ impl Configured {
             .await;
             let _ = this.update(cx, |this, cx| {
                 let Some(entry) = this.entry_mut(&id).filter(|entry| {
-                    entry.connection == connection
-                        && entry
-                            .asking
-                            .as_ref()
-                            .is_some_and(|(asked, _)| *asked == ask)
+                    entry
+                        .asking
+                        .as_ref()
+                        .is_some_and(|(asked, _)| *asked == ask)
                 }) else {
                     return;
                 };

@@ -293,6 +293,19 @@ impl DraftView {
         &self.cwd
     }
 
+    /// The project the draft's session will work in: a session's draft's
+    /// directory, or the first a lead's draft picked for its lead, if any.
+    pub(crate) fn project(&self, cx: &App) -> Option<Place> {
+        match self.added_dirs() {
+            None => Some(self.cwd.clone()),
+            Some(dirs) => dirs
+                .read(cx)
+                .dirs()
+                .first()
+                .map(|dir| Place::new(self.cwd.machine.clone(), dir.clone())),
+        }
+    }
+
     /// The draft's workspace's index into the shared table; `None` for a
     /// lead's draft until its session opens.
     pub(crate) fn workspace_index(&self) -> Option<usize> {

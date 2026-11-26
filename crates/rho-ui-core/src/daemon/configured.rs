@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use rho_protocol::{
-    methods, ClientEnvironment, ClientError, ErrorCode, HooksListParams, HooksListResponse,
-    McpListParams, McpListResponse,
+    methods, ClientEnvironment, ErrorCode, HooksListParams, HooksListResponse, McpListParams,
+    McpListResponse,
 };
 
 use super::{Daemon, DaemonError};
@@ -34,7 +34,11 @@ impl Daemon {
             workspace.map(Path::to_path_buf),
             ClientEnvironment::clone(&self.environment),
         );
-        unless_unknown(self.client.request::<methods::McpList>(&params).await)
+        match self.client.request::<methods::McpList>(&params).await {
+            Ok(list) => Ok(Some(list)),
+            Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The hooks files a session in `workspace` would load, the user's
@@ -56,15 +60,10 @@ impl Daemon {
             workspace.map(Path::to_path_buf),
             ClientEnvironment::clone(&self.environment),
         );
-        unless_unknown(self.client.request::<methods::HooksList>(&params).await)
-    }
-}
-
-/// `answer`, or `None` if the daemon doesn't know the method.
-fn unless_unknown<T>(answer: Result<T, ClientError>) -> Result<Option<T>, DaemonError> {
-    match answer {
-        Ok(response) => Ok(Some(response)),
-        Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => Ok(None),
-        Err(error) => Err(error.into()),
+        match self.client.request::<methods::HooksList>(&params).await {
+            Ok(list) => Ok(Some(list)),
+            Err(error) if error.error_code() == Some(ErrorCode::MethodNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }

@@ -120,15 +120,23 @@ fn settings_list_the_configured_mcp_servers_and_hooks() {
         "one read, for the picked project"
     );
     scroll_page(&mut ui, End::Bottom);
-    let hooks = ["hooks-file-project", "hook-user:notify"].map(|id| row(&mut ui, id));
+    let hooks =
+        ["hooks-file-project", "hooks-file-user", "hook-user:notify"].map(|id| row(&mut ui, id));
     assert_eq!(
-        hooks,
-        [
-            format!("{INVALID_HOOKS_WORKSPACE}/.rho/hooks.toml: Invalid"),
-            "user:notify: Disabled".to_owned(),
-        ]
-        .map(Some),
+        hooks[0],
+        Some(format!(
+            "{INVALID_HOOKS_WORKSPACE}/.rho/hooks.toml: Invalid"
+        ))
     );
+    // The user's file, as its machine's home names it.
+    assert!(
+        hooks[1]
+            .as_deref()
+            .is_some_and(|label| label.ends_with(": Disabled")),
+        "the user's file is disabled, not {:?}",
+        hooks[1]
+    );
+    assert_eq!(hooks[2].as_deref(), Some("user:notify: Disabled"));
     ui.shot("invalid");
 
     ui.click("configured-refresh");
@@ -176,4 +184,35 @@ fn an_older_rho_says_it_is_too_old_to_list_them() {
         .iter()
         .all(|read| read.workspace.is_none()));
     ui.shot("too-old");
+}
+
+/// A lead's draft is in no project yet: the page reads for none, not for
+/// the leads folder its session opens in.
+#[test]
+fn a_leads_draft_reads_for_no_project() {
+    let rho_home = tempfile::tempdir().expect("a rho home");
+    let daemon = FakeDaemon::start(Script::default());
+    let machines = Machines {
+        rho_home: Some(rho_home.path().to_path_buf()),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_with("configured-lead", daemon.target(), Some(daemon), machines);
+    ui.wait_until("the sidebar", |window, _, _| is_visible(window, "new-lead"));
+    ui.click("new-lead");
+    ui.wait_until("the lead's draft", |_, cx, app| {
+        app.draft()
+            .is_some_and(|draft| draft.read(cx).session_key().is_some())
+    });
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "MCP & hooks");
+    ui.wait_until("the MCP servers", |window, _, _| {
+        is_visible(window, "mcp-config-docs")
+    });
+    let workspaces: Vec<_> = ui
+        .fake()
+        .configured_reads()
+        .into_iter()
+        .map(|read| read.workspace)
+        .collect();
+    assert_eq!(workspaces, [None, None], "one read, for no project");
 }

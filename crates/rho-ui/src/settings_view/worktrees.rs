@@ -11,22 +11,18 @@
 use std::{path::Path, rc::Rc};
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    h_flex,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage},
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+    Disableable as _, IconName, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{
-    div, App, Context, Entity, Hsla, InteractiveElement as _, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription,
-};
+use gpui_kit::{div, App, Context, Entity, ParentElement as _, SharedString, Subscription};
 use rho_ui_core::{ReportedWorktree, WorktreeVerdict};
 
 use super::{
-    machine_picker, page_header, unreachable_note, value, PickedMachine, SettingsView, Tone,
+    described, machine_picker, page_header, status_field, unreachable_note, value, Mark,
+    PickedMachine, SettingsView, Tone,
 };
 use crate::{
     machines::{MachineId, Machines, SessionKey},
@@ -254,15 +250,6 @@ fn summary_item(
     described(SettingItem::new(summary.title, field), summary.about)
 }
 
-/// `item`, with `description` under its title if there is one. Kit gives
-/// even an empty description a line, which sets the title off its control.
-fn described(item: SettingItem, description: Option<String>) -> SettingItem {
-    match description {
-        Some(description) => item.description(description),
-        None => item,
-    }
-}
-
 /// Runs `pass` on `machine`'s worktrees, from a click.
 fn run_pass(
     worktrees: &Entity<Worktrees>,
@@ -328,22 +315,12 @@ enum Concern {
 }
 
 impl Concern {
-    /// The icon that flags it, for those that need the user.
-    fn icon(self) -> Option<IconName> {
+    fn mark(self) -> Mark {
         match self {
-            Self::Failed => Some(IconName::CircleX),
-            Self::Dirty => Some(IconName::TriangleAlert),
-            Self::Unmerged | Self::InUse | Self::Other | Self::Removable => None,
-        }
-    }
-
-    fn color(self, cx: &App) -> Hsla {
-        let theme = cx.theme();
-        match self {
-            Self::Failed => theme.danger,
-            Self::Dirty => theme.warning,
-            Self::Unmerged => theme.foreground,
-            Self::InUse | Self::Other | Self::Removable => theme.muted_foreground,
+            Self::Failed => Mark::Bad,
+            Self::Dirty => Mark::Warn,
+            Self::Unmerged => Mark::On,
+            Self::InUse | Self::Other | Self::Removable => Mark::Off,
         }
     }
 }
@@ -390,22 +367,8 @@ fn worktree_item(worktree: &ReportedWorktree, title: Option<SharedString>) -> Se
     let title = title.unwrap_or_else(|| branch.clone().into());
     // A worktree's path is unique on its machine; its branch need not be.
     let id = SharedString::from(format!("worktree-{}", worktree.worktree.path.display()));
-    let label = SharedString::from(format!("{title}: {verdict}"));
-    let verdict = SharedString::from(verdict);
-    let field = SettingField::render(move |_, _, cx| {
-        let color = concern.color(cx);
-        h_flex()
-            .id(id.clone())
-            .test_support()
-            .aria_label(label.clone())
-            .gap_1p5()
-            .text_sm()
-            .text_color(color)
-            .when_some(concern.icon(), |this, icon| {
-                this.child(Icon::new(icon).small().text_color(color))
-            })
-            .child(verdict.clone())
-    });
+    let label = format!("{title}: {verdict}");
+    let field = status_field(id, label, concern.mark(), verdict);
     let keywords = [
         SharedString::from(branch.clone()),
         SharedString::from(worktree.worktree.path.display().to_string()),

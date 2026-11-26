@@ -22,12 +22,11 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     setting::{SettingField, SettingGroup, SettingItem, SettingPage},
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    rems, App, Context, Entity, Hsla, InteractiveElement as _, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity,
+    rems, App, Context, Entity, InteractiveElement as _, ParentElement as _, SharedString,
+    Styled as _, Subscription, WeakEntity,
 };
 use rho_ui_core::{
     ConfiguredMcpServer, HookContract, HookEvent, HookStatus, HookTools, HookWarning, HooksFile,
@@ -36,8 +35,8 @@ use rho_ui_core::{
 };
 
 use super::{
-    machine_picker, page_header, unreachable_note, value, PickedMachine, SettingsView, Tone,
-    CONTROL_REMS,
+    described, machine_picker, page_header, status_field, unreachable_note, value, Mark,
+    PickedMachine, SettingsView, Tone, CONTROL_REMS,
 };
 use crate::{
     configured::{Answer, Configured, Reading},
@@ -81,7 +80,7 @@ impl ConfiguredFields {
         cx: &mut Context<'_, SettingsView>,
     ) -> Self {
         let machine = shown.as_ref().map_or_else(PickedMachine::new, |place| {
-            PickedMachine::of(place.machine.clone())
+            PickedMachine(place.machine.clone())
         });
         let fields = Self {
             _subscriptions: [
@@ -259,29 +258,31 @@ fn project_picker(
     if let Some(workspace) = workspace.filter(|shown| !paths.iter().any(|path| path == shown)) {
         paths.push(workspace.to_path_buf());
     }
-    let value_of = |path: &Path| SharedString::from(path.display().to_string());
-    let options: Vec<(SharedString, SharedString)> = std::iter::once(("".into(), "None".into()))
-        .chain(
-            paths
-                .iter()
-                .map(|path| (value_of(path), tilde(path, home).into())),
-        )
+    // Options are keyed by position, "0" for none, so no path can stand
+    // for another, or for none.
+    let options: Vec<(SharedString, SharedString)> = std::iter::once("None".to_owned())
+        .chain(paths.iter().map(|path| tilde(path, home)))
+        .enumerate()
+        .map(|(ix, label)| (ix.to_string().into(), label.into()))
         .collect();
-    let current = workspace.map(value_of).unwrap_or_default();
-    let choices: Vec<(SharedString, PathBuf)> = paths
-        .into_iter()
-        .map(|path| (value_of(&path), path))
-        .collect();
+    let current = SharedString::from(
+        workspace
+            .and_then(|shown| paths.iter().position(|path| path == shown))
+            .map_or(0, |ix| ix + 1)
+            .to_string(),
+    );
     SettingItem::new(
         "Project",
         SettingField::dropdown(
             options,
             move |_: &App| current.clone(),
             move |picked: SharedString, cx: &mut App| {
-                let workspace = choices
-                    .iter()
-                    .find(|(value, _)| *value == picked)
-                    .map(|(_, path)| path.clone());
+                let workspace = picked
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|ix| ix.checked_sub(1))
+                    .and_then(|ix| paths.get(ix))
+                    .cloned();
                 let _ = view.update(cx, |this, cx| this.pick_configured_project(workspace, cx));
             },
         )
@@ -323,39 +324,6 @@ fn refresh_button(
     }
 }
 
-/// How a row's status reads.
-#[derive(Clone, Copy)]
-enum Mark {
-    /// As it should be: enabled, loaded, active.
-    On,
-    /// Off on purpose, or not there.
-    Off,
-    /// Doesn't run until the user does something.
-    Warn,
-    /// Broken.
-    Bad,
-}
-
-impl Mark {
-    fn icon(self) -> Option<IconName> {
-        match self {
-            Self::Warn => Some(IconName::TriangleAlert),
-            Self::Bad => Some(IconName::CircleX),
-            Self::On | Self::Off => None,
-        }
-    }
-
-    fn color(self, cx: &App) -> Hsla {
-        let theme = cx.theme();
-        match self {
-            Self::On => theme.foreground,
-            Self::Off => theme.muted_foreground,
-            Self::Warn => theme.warning,
-            Self::Bad => theme.danger,
-        }
-    }
-}
-
 /// A row titled `title`, whose control says `status` as `mark` reads, its
 /// `lines` under the title. `id` names the status for tests, labelled
 /// "title: status".
@@ -367,28 +335,9 @@ fn status_item(
 ) -> SettingItem {
     let lines: Vec<String> = lines.into_iter().collect();
     let title: SharedString = title.into();
-    let id = SharedString::from(id);
-    let label = SharedString::from(format!("{title}: {status}"));
-    let field = SettingField::render(move |_, _, cx| {
-        let color = mark.color(cx);
-        h_flex()
-            .id(id.clone())
-            .test_support()
-            .aria_label(label.clone())
-            .gap_1p5()
-            .text_sm()
-            .text_color(color)
-            .when_some(mark.icon(), |this, icon| {
-                this.child(Icon::new(icon).small().text_color(color))
-            })
-            .child(status)
-    });
-    let item = SettingItem::new(title, field);
-    if lines.is_empty() {
-        item
-    } else {
-        item.description(lines.join("\n"))
-    }
+    let field = status_field(id, format!("{title}: {status}"), mark, status);
+    let description = (!lines.is_empty()).then(|| lines.join("\n"));
+    described(SettingItem::new(title, field), description)
 }
 
 /// A section that couldn't be read: `failed`'s reason, or that the rho is
@@ -435,31 +384,27 @@ fn mcp_item(server: &ConfiguredMcpServer, config: &str) -> SettingItem {
         McpServerSource::Plugin { plugin } => format!("Plugin {plugin}"),
         _ => "Another source".to_owned(),
     };
-    let reach = match (&server.error, &server.transport) {
-        (Some(error), _) => Some(error.clone()),
-        (None, Some(McpTransport::Stdio { command, args })) => Some(
-            std::iter::once(command.as_str())
-                .chain(args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" "),
+    // An invalid server has no transport: its error stands in for it.
+    let (source, reach) = match &server.transport {
+        Some(McpTransport::Stdio { command, args }) => (
+            format!("{source} · stdio"),
+            Some(
+                std::iter::once(command.as_str())
+                    .chain(args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
         ),
-        (None, Some(McpTransport::StreamableHttp { url })) => Some(url.clone()),
-        (None, Some(_)) => Some("Another transport".to_owned()),
-        (None, None) => None,
+        Some(McpTransport::StreamableHttp { url }) => {
+            (format!("{source} · HTTP"), Some(url.clone()))
+        }
+        Some(_) => (source, Some("Another transport".to_owned())),
+        None => (source, server.error.clone()),
     };
     let status = match (&server.error, server.enabled) {
         (Some(_), _) => (Mark::Bad, "Invalid"),
         (None, true) => (Mark::On, "Enabled"),
         (None, false) => (Mark::Off, "Disabled"),
-    };
-    let kind = match &server.transport {
-        Some(McpTransport::Stdio { .. }) => Some("stdio"),
-        Some(McpTransport::StreamableHttp { .. }) => Some("HTTP"),
-        _ => None,
-    };
-    let source = match kind {
-        Some(kind) => format!("{source} · {kind}"),
-        None => source,
     };
     status_item(
         format!("mcp-config-{}", server.identity),
@@ -534,7 +479,7 @@ fn file_lines(file: &HooksFile, shown: &Shown<'_>) -> Vec<String> {
             lines.extend(
                 error
                     .iter()
-                    .map(|error| format!("It doesn't parse: {error}")),
+                    .map(|error| format!("It can't be loaded: {error}")),
             );
             lines
         }

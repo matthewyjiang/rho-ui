@@ -24,14 +24,17 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     dialog::DialogEntrance,
     group_box::GroupBoxVariant,
+    h_flex,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings as SettingsPanel},
-    ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, rems, size, App, AppContext as _, Context, Entity, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
-    StyleRefinement, Styled as _, Subscription, WeakEntity, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Subscription, WeakEntity,
+    Window,
 };
 
 use crate::{
@@ -360,12 +363,7 @@ struct PickedMachine(MachineId);
 impl PickedMachine {
     /// This machine, until the user picks another.
     fn new() -> Self {
-        Self::of(MachineId::local())
-    }
-
-    /// `machine`, until the user picks another.
-    fn of(machine: MachineId) -> Self {
-        Self(machine)
+        Self(MachineId::local())
     }
 
     fn shown(&self, machines: &Machines) -> MachineId {
@@ -461,6 +459,73 @@ fn value(text: impl Into<SharedString>, tone: Tone) -> SettingField<SharedString
             .text_color(tone.color(cx))
             .child(text.clone())
     })
+}
+
+/// How a row's status reads.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// As it should be.
+    On,
+    /// Off, idle, or not the user's concern.
+    Off,
+    /// Needs the user before it runs.
+    Warn,
+    /// Broken.
+    Bad,
+}
+
+impl Mark {
+    fn icon(self) -> Option<IconName> {
+        match self {
+            Self::Warn => Some(IconName::TriangleAlert),
+            Self::Bad => Some(IconName::CircleX),
+            Self::On | Self::Off => None,
+        }
+    }
+
+    fn color(self, cx: &App) -> Hsla {
+        let theme = cx.theme();
+        match self {
+            Self::On => theme.foreground,
+            Self::Off => theme.muted_foreground,
+            Self::Warn => theme.warning,
+            Self::Bad => theme.danger,
+        }
+    }
+}
+
+/// A row's status, `text` as `mark` reads, flagged with its icon. `id`
+/// finds it in tests, which read it as `label`.
+fn status_field(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    mark: Mark,
+    text: impl Into<SharedString>,
+) -> SettingField<SharedString> {
+    let (id, label, text) = (id.into(), label.into(), text.into());
+    SettingField::render(move |_, _, cx| {
+        let color = mark.color(cx);
+        h_flex()
+            .id(id.clone())
+            .test_support()
+            .aria_label(label.clone())
+            .gap_1p5()
+            .text_sm()
+            .text_color(color)
+            .when_some(mark.icon(), |this, icon| {
+                this.child(Icon::new(icon).small().text_color(color))
+            })
+            .child(text.clone())
+    })
+}
+
+/// `item`, with `description` under its title if there is one. Kit gives
+/// even an empty description a line, which sets the title off its control.
+fn described(item: SettingItem, description: Option<String>) -> SettingItem {
+    match description {
+        Some(description) => item.description(description),
+        None => item,
+    }
 }
 
 fn set_font(role: FontRole, family: SharedString, cx: &mut App) {
