@@ -8,8 +8,8 @@
 //! To add a CLI: add a [`ForgeCli`] variant, with its check script and
 //! parser in a module of its own, as [`gh`] has.
 //!
-//! Each machine's rho daemon reads pull requests, with the `gh` on its own
-//! `PATH`; rho-ui only acts on one, through the CLI here ([`act`]), so the
+//! Each machine's rho daemon reads pull requests, with a `gh` it finds on
+//! its own; rho-ui only acts on one, through the CLI here ([`act`]), so the
 //! program Settings name steers that alone.
 //!
 //! People's pictures come from where the forge serves them, without its

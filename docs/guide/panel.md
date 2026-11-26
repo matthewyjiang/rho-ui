@@ -31,7 +31,7 @@ Both have limits: Files won't open a file over 2 MiB or a binary one, and lists 
 
 Shows the GitHub pull request for the session's branch, with its checks, reviews and threads, and lets you comment, merge, and mark it ready or draft.
 
-- **The session machine's rho reads it.** Each machine's rho daemon reads GitHub for its own sessions, with the `gh` on its own `PATH`, signed in on that machine. It needs a rho newer than 3.3; an older one says to update rho. Comments and merges run rho-ui's `gh` on the session's machine. See [Source control](./settings#source-control).
+- **The session machine's rho reads it.** Each machine's rho daemon reads GitHub for its own sessions, with a `gh` it finds on its own, signed in on that machine. It needs a rho newer than 3.3; an older one says to update rho. Comments and merges run rho-ui's `gh` on the session's machine. See [Source control](./settings#source-control).
 - **Only github.com origins get a branch PR.** A session whose `origin` is on another host, GitHub Enterprise included, shows none for its branch; link one by its URL instead.
 - **Profile pictures need `curl`** on the session's machine, which fetches each from where GitHub serves it. Without it, or for a picture that needs a sign-in, initials show. Refresh asks again for the ones that didn't load.
 - **Merging is guarded.** A merge only merges the head commit you were shown, so a commit the session pushed since doesn't slip in. It doesn't delete the branch, which the session may still use.

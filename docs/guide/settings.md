@@ -8,7 +8,7 @@ rho-ui's own settings live in `~/.config/rho-ui/settings`, apart from rho's: the
 
 ## Source control
 
-The Pull request panel's comments and merges run `gh`. rho-ui looks for it on `PATH`, then through your login shell, then among [mise](https://mise.jdx.dev)'s shims (`MISE_SHIMS_DIR`, else `shims` in mise's data folder, `~/.local/share/mise` by default); set **Program** if it lives elsewhere. A shim runs only when mise has a `gh` version to run, as from its global config. Reading the PR is rho's job: each machine's rho daemon runs the `gh` on its own `PATH`, whatever **Program** says, so a `gh` rho-ui finds only through your login shell or mise's shims may be missing from a daemon rho-ui started. Signing in to `gh` asks questions in a terminal, so run `gh auth login` there.
+The Pull request panel's comments and merges run `gh`. rho-ui looks for it on `PATH`, then through your login shell, then among [mise](https://mise.jdx.dev)'s shims (`MISE_SHIMS_DIR`, else `shims` in mise's data folder, `~/.local/share/mise` by default); set **Program** if it lives elsewhere. A shim runs only when mise has a `gh` version to run, as from its global config. Reading the PR is rho's job: each machine's rho daemon finds `gh` on its own, whatever **Program** says. A rho newer than 3.5.0 looks where rho-ui does (`PATH`, your login shell, mise's shims); rho 3.4 and 3.5 check only their `PATH` and your login shell. Signing in to `gh` asks questions in a terminal, so run `gh auth login` there.
 
 rho-ui runs `gh` without a login shell. Variables such as `GH_TOKEN`, or a proxy set only in a login profile, don't reach it:
 
