@@ -698,6 +698,13 @@ impl PullRequests {
         self.machines.get(machine).map(|entry| entry.serving)
     }
 
+    /// Whether a show is on its way, or waits for the one on its way: a
+    /// test that counts the daemon's shows waits for none before it counts.
+    #[cfg(test)]
+    pub(crate) fn is_showing(&self) -> bool {
+        self.show.is_running()
+    }
+
     /// `session`'s set, once its daemon answered with one.
     pub(crate) fn of(&self, session: &SessionKey) -> Option<&SessionPullRequests> {
         self.machines
@@ -1190,24 +1197,22 @@ impl PullRequests {
         // What the daemon refused of the list alone has no one to tell: the
         // next list asks again.
         let sets = entry.take(machine, answer).unwrap_or_default();
-        let mut stored = false;
+        let mut stored = Vec::new();
         for (session, set) in sets {
-            stored |= entry.store(&session, set);
+            if entry.store(&session, set) {
+                stored.push(session);
+            }
         }
-        let changed = stored || entry.health() != before;
+        let changed = !stored.is_empty() || entry.health() != before;
         let again = entry.list.finish();
         // Every notify redraws the sidebar and syncs the panel's tabs: only
         // when something changed.
         if changed {
             cx.notify();
         }
-        let shown = self
-            .shown
-            .as_ref()
-            .map(|shown| shown.session.clone())
-            .filter(|session| session.machine == *machine);
-        if let Some(session) = shown.filter(|_| stored) {
-            self.show_if_moved(&session, cx);
+        // As for an event: only the shown session's own set can move its PR.
+        for session in stored {
+            self.show_if_moved(&SessionKey::new(machine.clone(), session), cx);
         }
         if again {
             self.list_now(machine, cx);
