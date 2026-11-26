@@ -6,7 +6,9 @@
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType};
 
-use crate::{NewSession, NewSessionIn, OpenSettings, Quit, ToggleRightPanel, ToggleSidebar};
+use crate::{
+    FindInTranscript, NewSession, NewSessionIn, OpenSettings, Quit, ToggleRightPanel, ToggleSidebar,
+};
 
 gpui_kit::actions!(
     rho_ui,
@@ -71,6 +73,8 @@ pub(crate) fn install(cx: &mut App) {
             MenuItem::os_action("Copy", Copy, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Find…", FindInTranscript),
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),

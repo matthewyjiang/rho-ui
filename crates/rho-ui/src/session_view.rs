@@ -47,6 +47,7 @@
 //! opened again after a restart lists what ended from that record (see
 //! [`crate::background_log`]).
 
+mod find_bar;
 mod side_chat;
 
 use std::{rc::Rc, time::Duration};
@@ -61,8 +62,8 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia},
     h_flex,
-    input::InputEvent,
-    message_scroller::MessageScroller,
+    input::{InputEvent, Search},
+    message_scroller::{MessageScroller, MessageScrollerState},
     spinner::Spinner,
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, ThemeStyled as _,
 };
@@ -81,6 +82,7 @@ use rho_ui_core::{
     TurnId, Unsteered,
 };
 
+use self::find_bar::FindBar;
 use self::side_chat::{side_question, Discarding};
 use crate::{
     added_dirs::{AddedDirs, DirsAccess},
@@ -106,11 +108,11 @@ use crate::{
     sign_in::SignInSlot,
     surface_view::{SurfaceEvent, SurfacePanel, Surfaces},
     title_bar::TitleBar,
-    transcript::{ActionHandler, ItemContent, Transcript},
+    transcript::{find::Direction, ActionHandler, ItemContent, Transcript},
     usage::UsageRing,
     work::Disclosure,
     workspaces::{Workspace, WorkspaceRef},
-    StopTurn,
+    FindInTranscript, StopTurn,
 };
 
 /// How often a running turn's header redraws: it counts whole seconds.
@@ -303,6 +305,8 @@ pub(crate) struct SessionView {
     plan: Disclosure,
     /// Text selected in the transcript, offered to the composer as a quote.
     selected: Option<Selected>,
+    /// The find bar over the transcript, while open.
+    find: Option<FindBar>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
     /// What the title bar reads besides the session.
@@ -387,7 +391,7 @@ impl SessionView {
                 // The rows say what the daemon read of each process.
                 cx.observe(&processes, |_, _, cx| cx.notify()),
                 // The jump-to-latest button follows the scroll position.
-                cx.observe(transcript.scroller(), |_, _, cx| cx.notify()),
+                cx.observe(transcript.scroller(), Self::scroller_changed),
                 // A picture a message shows was read.
                 cx.subscribe(transcript.pictures(), |this, _, read: &PictureRead, cx| {
                     this.transcript.picture_read(read, cx);
@@ -440,6 +444,7 @@ impl SessionView {
             surfaces: Surfaces::default(),
             plan: Disclosure::default(),
             selected: None,
+            find: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             title_bar: TitleBarSources::default(),
@@ -2237,6 +2242,52 @@ impl SessionView {
     }
 }
 
+impl SessionView {
+    /// The transcript scrolled, or remeasured an item, as a text view does
+    /// when its parse lands: find may have been waiting for that parse.
+    fn scroller_changed(&mut self, _: Entity<MessageScrollerState>, cx: &mut Context<'_, Self>) {
+        let drawn = self.loading.drawn(&self.session).unwrap_or_default();
+        self.transcript.find_reparsed(drawn, cx);
+        cx.notify();
+    }
+
+    /// Opens the find bar, or puts the keyboard back in it with its text
+    /// selected.
+    pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let bar = self.find.get_or_insert_with(|| FindBar::new(window, cx));
+        bar.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Finds what the find bar holds now.
+    fn find_query(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(bar) = &self.find else {
+            return;
+        };
+        let query = bar.query(cx);
+        let drawn = self.loading.drawn(&self.session).unwrap_or_default();
+        self.transcript.find(&query, drawn, cx);
+        cx.notify();
+    }
+
+    /// Moves to the next or previous match.
+    fn find_step(&mut self, direction: Direction, cx: &mut Context<'_, Self>) {
+        let drawn = self.loading.drawn(&self.session).unwrap_or_default();
+        self.transcript.find_step(direction, drawn, cx);
+        cx.notify();
+    }
+
+    /// Closes the find bar and clears its matches; what they opened stays
+    /// open.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.find.take().is_some() {
+            self.transcript.close_find(cx);
+            window.focus(&self.focus_target(cx), cx);
+            cx.notify();
+        }
+    }
+}
+
 #[cfg(test)]
 impl SessionView {
     /// The composer's focus, for UI tests.
@@ -2284,12 +2335,30 @@ impl Render for SessionView {
             .id("session-view")
             .key_context("SessionView")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &StopTurn, window, cx| this.stop(window, cx)))
+            // Escape closes the find bar first, wherever the keyboard is.
+            .on_action(cx.listener(|this, _: &StopTurn, window, cx| {
+                if this.find.is_some() {
+                    this.close_find(window, cx);
+                } else {
+                    this.stop(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FindInTranscript, window, cx| {
+                this.open_find(window, cx);
+            }))
+            // Kit's text fields, such as the composer, take the same keys
+            // for their own search, which they pass up when they have none.
+            .on_action(cx.listener(|this, _: &Search, window, cx| this.open_find(window, cx)))
             .size_full()
             // A side chat's tab names it.
             .when(!self.is_side(), |this| {
                 this.child(self.render_title_bar(cx))
             })
+            .children(
+                self.find
+                    .as_ref()
+                    .map(|bar| bar.render(self.transcript.find_count(), cx)),
+            )
             .child(self.render_transcript(cx))
             .child(self.render_footer(cx))
     }

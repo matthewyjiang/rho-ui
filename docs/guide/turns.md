@@ -30,6 +30,7 @@ A session whose model isn't signed in still opens, with a card above the compose
 - **Diagrams and formulas**: ` ```mermaid ` blocks draw as diagrams and `$$ … $$` or `$ … $` as formulas. A diagram that takes over 1 s or 64 MiB to draw stays as code.
 - **Long replies** are drawn in parts of about 2,000 characters, so <kbd>Ctrl</kbd>+<kbd>A</kbd> selects the part you clicked in, not the whole reply.
 - **Add to prompt** appears when you select text in the transcript. It quotes the selection in your next message.
+- **Find** (<kbd>Ctrl</kbd>+<kbd>F</kbd>) searches the open session's messages, notices, tool lines and the folded working of finished turns, ignoring case. A match inside a fold opens it, and the fold stays open after you close the bar. Diffs, forms and images aren't searched, nor are other sessions.
 
 ## Times
 

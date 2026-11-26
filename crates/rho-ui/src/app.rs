@@ -31,6 +31,7 @@ use gpui_kit::component::{
     button::Button,
     empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader},
     h_flex,
+    input::Search,
     notification::Notification,
     ActiveTheme as _, IconName, WindowExt as _,
 };
@@ -82,7 +83,7 @@ use crate::{
     window_chrome,
     workspaces::{self, WorkspaceRef, Workspaces},
     worktrees::Worktrees,
-    NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
+    FindInTranscript, NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
 };
 
 /// How often the sidebar asks each daemon which sessions have work under
@@ -1426,6 +1427,21 @@ impl RhoApp {
         cx.notify();
     }
 
+    /// Find, where no session view has the keyboard (a session view opens
+    /// its own find bar): the open session's find bar, or with none open,
+    /// the sidebar's search, which finds sessions.
+    fn find(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Pane::Session(view) = &self.pane {
+            view.update(cx, |view, cx| view.open_find(window, cx));
+            return;
+        }
+        if self.sidebar.read(cx).is_collapsed() {
+            self.toggle_sidebar(window, cx);
+        }
+        let search = self.sidebar.read(cx).search_focus_handle(cx);
+        window.focus(&search, cx);
+    }
+
     /// Shows a new session's draft with its project list open.
     fn new_session_in(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.new_session(window, cx);
@@ -2357,6 +2373,10 @@ impl Render for RhoApp {
                 this.toggle_sidebar(window, cx);
             }))
             .on_action(|_: &ToggleRightPanel, _, cx| PanelLayout::toggle(cx))
+            .on_action(cx.listener(|this, _: &FindInTranscript, window, cx| this.find(window, cx)))
+            // A text field with no search of its own, such as a draft's
+            // composer, passes the same key up as Kit's.
+            .on_action(cx.listener(|this, _: &Search, window, cx| this.find(window, cx)))
             .on_action(
                 cx.listener(|this, shortcut: &TerminalShortcut, window, cx| {
                     this.terminal_shortcut(*shortcut, window, cx);

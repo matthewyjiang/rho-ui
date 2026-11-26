@@ -40,6 +40,9 @@ markdown = "1"
 # values a surface's controls write to its data model (`surface_view/`).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Finds the find bar's text in the transcript, ignoring case; see
+# src/transcript/find.rs. rho-ui-core builds it already.
+regex = "1"
 
 # In a browser: the page's address, and the fonts it fetches (web.rs);
 # pele, drawn by the browser's own JavaScript (pele.rs); `log` says what

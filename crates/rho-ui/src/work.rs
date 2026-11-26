@@ -5,7 +5,7 @@
 //! is just that step's line. While the turn runs, the folded summary line
 //! shows the newest step instead.
 
-use std::{rc::Rc, time::Duration};
+use std::{borrow::Cow, ops::Range, rc::Rc, time::Duration};
 
 use web_time::Instant;
 
@@ -19,14 +19,14 @@ use gpui_kit::component::{
     separator::Separator,
     shimmer::ShimmerText,
     spinner::Spinner,
-    text::{TextView, TextViewStyle},
+    text::{RenderedText, TextView, TextViewState, TextViewStyle},
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, ElementId, Entity, HighlightStyle,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledText, Window,
+    div, rems, AnyElement, App, AppContext as _, Entity, HighlightStyle, InteractiveElement as _,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled as _, Subscription, Window,
 };
 use rho_ui_core::{
     Delay, Entry, RetryReason, SearchLine, Step, ToolBody, ToolCall, ToolContent, ToolFact,
@@ -36,7 +36,10 @@ use rho_ui_core::{
 use crate::{
     attachments::Preview,
     lightbox, time,
-    transcript::{Phase, IMAGE_HEIGHT},
+    transcript::{
+        find::{Field, Find, Marks},
+        Phase, IMAGE_HEIGHT,
+    },
 };
 
 /// Output past this many lines shows only its tail: a card's text and code
@@ -213,6 +216,136 @@ fn parse_patches(tool: &ToolCall) -> Patches {
     }
 }
 
+/// What a step's details draw as Markdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyKind {
+    Thought,
+    /// A tool's Markdown body, such as an agent's message.
+    Markdown,
+    /// A tool's code body, highlighted in a fenced block.
+    Code,
+}
+
+/// A step's details as Markdown, as its text view is given it.
+struct MarkdownBody<'a> {
+    kind: BodyKind,
+    source: Cow<'a, str>,
+    /// Where in `source` the text [`searched`] gives lies: a code body's
+    /// fence comes before it.
+    shown: Range<usize>,
+    /// How many earlier lines of a code body [`tail`] hid.
+    hidden: usize,
+}
+
+/// The Markdown `step`'s details draw, if they draw any: a thought, or a
+/// tool card's Markdown or code body.
+fn markdown_body(step: Step<'_>) -> Option<MarkdownBody<'_>> {
+    fn whole(kind: BodyKind, text: &str) -> MarkdownBody<'_> {
+        MarkdownBody {
+            kind,
+            shown: 0..text.len(),
+            source: Cow::Borrowed(text),
+            hidden: 0,
+        }
+    }
+    match step {
+        Step::Thought(thought) => Some(whole(BodyKind::Thought, thought.text())),
+        Step::Tool(tool) => match tool.card().map(rho_ui_core::ToolCard::body)? {
+            ToolBody::Markdown(text) => Some(whole(BodyKind::Markdown, text)),
+            ToolBody::Code { language, text } => Some(markdown_body_of_code(language, text)),
+            ToolBody::None | ToolBody::Text(_) | ToolBody::Search(_) => None,
+        },
+    }
+}
+
+/// The text view of an open step's Markdown details, made when they first
+/// open, so find can highlight in it (Kit's highlights live on a view's
+/// state).
+pub(crate) struct BodyView {
+    /// The step's entry index.
+    pub(crate) entry: usize,
+    kind: BodyKind,
+    state: Entity<TextViewState>,
+    source: String,
+    shown: Range<usize>,
+    hidden: usize,
+    _relayout: Subscription,
+}
+
+impl BodyView {
+    /// The view for step `entry`, if its details draw Markdown. `relayout`
+    /// runs when the view lays out anew, as once a long text's parse
+    /// arrives.
+    pub(crate) fn new(
+        entry: usize,
+        step: Step<'_>,
+        relayout: impl Fn(&mut App) + 'static,
+        cx: &mut App,
+    ) -> Option<Self> {
+        let MarkdownBody {
+            kind,
+            source,
+            shown,
+            hidden,
+        } = markdown_body(step)?;
+        let state = cx.new(|cx| TextViewState::markdown(&source, cx));
+        let relayout = cx.observe(&state, move |_, cx| relayout(cx));
+        Some(Self {
+            entry,
+            kind,
+            state,
+            source: source.into_owned(),
+            shown,
+            hidden,
+            _relayout: relayout,
+        })
+    }
+
+    /// Shows `step`'s details as they are now.
+    pub(crate) fn update(&mut self, step: Step<'_>, cx: &mut App) {
+        let Some(body) = markdown_body(step) else {
+            return;
+        };
+        if body.source != self.source {
+            self.state
+                .update(cx, |state, cx| state.set_text(&body.source, cx));
+            self.source = body.source.into_owned();
+        }
+        (self.kind, self.shown, self.hidden) = (body.kind, body.shown, body.hidden);
+    }
+
+    pub(crate) fn state(&self) -> &Entity<TextViewState> {
+        &self.state
+    }
+
+    /// The view's text as it parsed it, if it has parsed what it was last
+    /// given, so `range` of the text [`searched`] gives for the step maps
+    /// onto it ([`Self::rendered_range`]).
+    pub(crate) fn rendered(&self, cx: &App) -> Option<RenderedText> {
+        let rendered = self.state.read(cx).rendered_text();
+        (rendered.source() == self.source).then_some(rendered)
+    }
+
+    /// Where `range` of the step's searched text is in `rendered`, if it
+    /// draws any of it.
+    pub(crate) fn rendered_range(
+        &self,
+        rendered: &RenderedText,
+        range: &Range<usize>,
+    ) -> Option<Range<usize>> {
+        let start = self.shown.start;
+        rendered.range_for_source(start + range.start..start + range.end)
+    }
+
+    fn render(&self) -> AnyElement {
+        let view = TextView::new(&self.state).selectable(true);
+        match self.kind {
+            BodyKind::Thought | BodyKind::Markdown => view.into_any_element(),
+            BodyKind::Code => tailed(self.hidden, code_view(view)).into_any_element(),
+        }
+    }
+}
+
 /// Everything a work row needs to draw.
 pub(crate) struct WorkRow<'a> {
     pub(crate) entries: &'a [Entry],
@@ -225,6 +358,9 @@ pub(crate) struct WorkRow<'a> {
     /// The images each tool made, ready to draw, one list per entry.
     pub(crate) images: &'a [Vec<Preview>],
     pub(crate) diffs: &'a [DiffView],
+    pub(crate) bodies: &'a [BodyView],
+    /// What the find bar found, to mark in the steps.
+    pub(crate) find: &'a Find,
     pub(crate) phase: Phase,
     pub(crate) on_fold: FoldHandler,
 }
@@ -237,6 +373,8 @@ pub(crate) fn render(row: WorkRow<'_>, cx: &App) -> AnyElement {
         details,
         images,
         diffs,
+        bodies,
+        find,
         phase,
         on_fold,
     } = row;
@@ -254,6 +392,8 @@ pub(crate) fn render(row: WorkRow<'_>, cx: &App) -> AnyElement {
                     newest: live && n + 1 == entries.len(),
                     images: images.get(n).map_or(&[], Vec::as_slice),
                     diff: diffs.iter().find(|diff| diff.entry == ix),
+                    body: bodies.iter().find(|body| body.entry == ix),
+                    find,
                 };
                 Some(step(entry.as_step()?, state, &on_fold, cx))
             })
@@ -308,8 +448,8 @@ pub(crate) fn render(row: WorkRow<'_>, cx: &App) -> AnyElement {
 }
 
 /// Where a step is: its entry index, whether its details are open, whether
-/// it is the newest step of a running turn, the images it made, and its
-/// diff viewer if any.
+/// it is the newest step of a running turn, the images it made, its diff
+/// viewer and Markdown view if any, and what find marks in it.
 #[derive(Clone, Copy)]
 struct StepState<'a> {
     ix: usize,
@@ -317,6 +457,21 @@ struct StepState<'a> {
     newest: bool,
     images: &'a [Preview],
     diff: Option<&'a DiffView>,
+    body: Option<&'a BodyView>,
+    find: &'a Find,
+}
+
+impl StepState<'_> {
+    /// How tall a part of the details holding `fields` may grow: all of it
+    /// while it holds find's current match, so the transcript can scroll
+    /// to it.
+    fn height(&self, fields: impl Fn(Field) -> bool) -> Height {
+        if self.find.current_in(self.ix).is_some_and(fields) {
+            Height::Whole
+        } else {
+            Height::Capped
+        }
+    }
 }
 
 /// One step: its line, and its details when open.
@@ -350,7 +505,7 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
     let label = if newest && is_running(step) {
         ShimmerText::new(label).into_any_element()
     } else {
-        label.into_any_element()
+        state.find.marks(ix, Field::Line).text(label, cx)
     };
     let toggle = Rc::clone(on_fold);
     v_flex()
@@ -398,35 +553,38 @@ fn step(step: Step<'_>, state: StepState<'_>, on_fold: &FoldHandler, cx: &App) -
 }
 
 /// What an open step shows: a thought's text, or a tool's command, notes,
-/// output, images and diff.
+/// output, images and diff. A Markdown or code body draws in the text view
+/// the transcript makes as the details open ([`BodyView`]).
 fn details_body(step: Step<'_>, state: StepState<'_>, cx: &App) -> AnyElement {
     let StepState {
-        ix, images, diff, ..
+        ix,
+        images,
+        diff,
+        body,
+        find,
+        ..
     } = state;
+    let output_height = state.height(|field| matches!(field, Field::Output(_) | Field::Body));
     match step {
-        Step::Thought(thought) => part(
-            "output",
-            ix,
-            TextView::markdown(
-                ElementId::named_usize("thought", ix),
-                thought.text().to_owned(),
-            )
-            .selectable(true)
-            .into_any_element(),
-        )
-        .into_any_element(),
+        Step::Thought(_) => {
+            let text = body.map_or_else(|| div().into_any_element(), BodyView::render);
+            part("output", ix, output_height, text).into_any_element()
+        }
         Step::Tool(tool) => v_flex()
             .gap_1p5()
             // The command as written, then what it printed, dimmer.
             .when_some(full_title(tool), |this, title| {
-                let command = div()
-                    .text_color(cx.theme().foreground)
-                    .child(monospace(title, cx));
-                this.child(part("command", ix, command.into_any_element()))
+                let command = div().text_color(cx.theme().foreground).child(monospace(
+                    title,
+                    find.marks(ix, Field::Command),
+                    cx,
+                ));
+                let height = state.height(|field| field == Field::Command);
+                this.child(part("command", ix, height, command.into_any_element()))
             })
-            .children(notes(tool, cx))
-            .when_some(output(tool, ix, diff, cx), |this, output| {
-                this.child(part("output", ix, output))
+            .children(notes(tool, ix, find, cx))
+            .when_some(output(tool, state, cx), |this, output| {
+                this.child(part("output", ix, output_height, output))
             })
             .when(!images.is_empty(), |this| {
                 this.child(tool_images(tool, ix, images))
@@ -436,11 +594,21 @@ fn details_body(step: Step<'_>, state: StepState<'_>, cx: &App) -> AnyElement {
     }
 }
 
-/// A part of step `ix`'s details, scrolling past `MAX_DETAILS_REMS`. Kit's
-/// scroll area, not a raw `overflow_y_scroll`: the transcript takes every
-/// wheel event no scroll area inside it claims, and only Kit's areas claim
-/// them.
-fn part(name: &str, ix: usize, content: AnyElement) -> impl IntoElement {
+/// How tall a part of a step's details may grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Height {
+    /// Up to [`MAX_DETAILS_REMS`], scrolling past it.
+    Capped,
+    /// All of it, as while it holds find's current match: the transcript
+    /// scrolls to the match, which can't reach into the part's own scroll.
+    Whole,
+}
+
+/// A part of step `ix`'s details, scrolling past `MAX_DETAILS_REMS` unless
+/// `height` lets it grow. Kit's scroll area, not a raw `overflow_y_scroll`:
+/// the transcript takes every wheel event no scroll area inside it claims,
+/// and only Kit's areas claim them.
+fn part(name: &str, ix: usize, height: Height, content: AnyElement) -> impl IntoElement {
     div()
         .id(SharedString::from(format!("{name}-{ix}")))
         .test_support()
@@ -457,7 +625,9 @@ fn part(name: &str, ix: usize, content: AnyElement) -> impl IntoElement {
                 // One call site makes every part, so each needs its own id or
                 // they would share one scroll position.
                 .id(SharedString::from(format!("{name}-scroll-{ix}")))
-                .max_h(rems(MAX_DETAILS_REMS)),
+                .when(height == Height::Capped, |this| {
+                    this.max_h(rems(MAX_DETAILS_REMS))
+                }),
         )
 }
 
@@ -715,48 +885,113 @@ fn line_facts(tool: &ToolCall, cx: &App) -> Option<AnyElement> {
     })
 }
 
-/// A tool's notes, such as the items of a checklist, and what went wrong.
-fn notes(tool: &ToolCall, cx: &App) -> Option<AnyElement> {
-    let notes: Vec<AnyElement> = tool
-        .card()?
-        .facts()
-        .iter()
-        .filter_map(|fact| match fact {
-            ToolFact::Note(note) => Some(div().child(note.clone()).into_any_element()),
-            ToolFact::Error(error) => Some(
-                div()
-                    .text_color(cx.theme().danger)
-                    .child(error.clone())
-                    .into_any_element(),
-            ),
-            ToolFact::Changed { .. } | ToolFact::Stat(_) => None,
+/// A tool's notes, such as the items of a checklist, and what went wrong:
+/// its card's [`ToolFact::Note`]s and [`ToolFact::Error`]s, in order.
+fn note_texts(tool: &ToolCall) -> impl Iterator<Item = (&str, &ToolFact)> {
+    let facts = tool.card().map_or(&[][..], rho_ui_core::ToolCard::facts);
+    facts.iter().filter_map(|fact| match fact {
+        ToolFact::Note(text) | ToolFact::Error(text) => Some((text.as_str(), fact)),
+        ToolFact::Changed { .. } | ToolFact::Stat(_) => None,
+    })
+}
+
+/// Step `ix`'s notes ([`note_texts`]), with what find marks in them.
+fn notes(tool: &ToolCall, ix: usize, find: &Find, cx: &App) -> Option<AnyElement> {
+    let notes: Vec<AnyElement> = note_texts(tool)
+        .enumerate()
+        .map(|(n, (text, fact))| {
+            div()
+                .when(matches!(fact, ToolFact::Error(_)), |this| {
+                    this.text_color(cx.theme().danger)
+                })
+                .child(find.marks(ix, Field::Note(n)).text(text.to_owned(), cx))
+                .into_any_element()
         })
         .collect();
     (!notes.is_empty()).then(|| v_flex().text_sm().children(notes).into_any_element())
 }
 
+/// The texts a call without a card shows: its text content, as the model
+/// read it, which [`monospace`] cuts to its tail.
+fn content_texts(tool: &ToolCall) -> impl Iterator<Item = &str> {
+    tool.content().iter().filter_map(|content| match content {
+        ToolContent::Text(text) => Some(text.as_str()),
+        ToolContent::Diff { .. } | ToolContent::Image(_) => None,
+    })
+}
+
+/// The part of `text` [`monospace`] shows.
+fn shown_tail(text: &str) -> &str {
+    tail(text.trim_end()).0
+}
+
+/// What find searches in `step`, each text as its part of the transcript
+/// draws it: a tool's line, its command, notes and output, or a thought.
+/// The file changes a call shows in a diff aren't searched.
+pub(crate) fn searched(step: Step<'_>) -> Vec<(Field, Cow<'_, str>)> {
+    let tool = match step {
+        Step::Thought(thought) => return vec![(Field::Body, Cow::Borrowed(thought.text()))],
+        Step::Tool(tool) => tool,
+    };
+    let mut texts = vec![(Field::Line, Cow::Owned(step_label(step).to_string()))];
+    let command = full_title(tool).map(shown_tail);
+    texts.extend(command.map(|title| (Field::Command, Cow::Borrowed(title))));
+    let notes = note_texts(tool).enumerate();
+    texts.extend(notes.map(|(n, (text, _))| (Field::Note(n), Cow::Borrowed(text))));
+    match tool.card().map(rho_ui_core::ToolCard::body) {
+        Some(ToolBody::None) => {}
+        Some(ToolBody::Text(text)) => {
+            texts.push((Field::Output(0), Cow::Borrowed(shown_tail(text))));
+        }
+        // As [`markdown_body`] shows them.
+        Some(ToolBody::Markdown(text)) => texts.push((Field::Body, Cow::Borrowed(text))),
+        Some(ToolBody::Code { text, .. }) => {
+            texts.push((Field::Body, Cow::Borrowed(shown_tail(text))));
+        }
+        Some(ToolBody::Search(lines)) => {
+            texts.extend(lines.iter().enumerate().map(|(n, line)| {
+                let text = match line {
+                    SearchLine::File(text)
+                    | SearchLine::Note(text)
+                    | SearchLine::Hit { text, .. } => text,
+                };
+                (Field::Output(n), Cow::Borrowed(text.as_str()))
+            }));
+        }
+        None => {
+            let outputs = content_texts(tool).map(shown_tail).enumerate();
+            texts.extend(outputs.map(|(n, text)| (Field::Output(n), Cow::Borrowed(text))));
+        }
+    }
+    texts
+}
+
 /// What a tool printed, as its card shows it, and its file changes as plain
 /// text where `diff` doesn't show them; `None` when that leaves nothing. A
 /// call without a card shows its content as the model read it.
-fn output(tool: &ToolCall, ix: usize, diff: Option<&DiffView>, cx: &App) -> Option<AnyElement> {
+fn output(tool: &ToolCall, state: StepState<'_>, cx: &App) -> Option<AnyElement> {
+    let StepState {
+        ix,
+        diff,
+        body,
+        find,
+        ..
+    } = state;
     let mut parts: Vec<AnyElement> = match tool.card().map(rho_ui_core::ToolCard::body) {
         Some(ToolBody::None) => Vec::new(),
-        Some(ToolBody::Text(text)) => vec![monospace(text, cx).into_any_element()],
-        Some(ToolBody::Markdown(text)) => {
-            vec![
-                TextView::markdown(ElementId::named_usize("tool-body", ix), text.clone())
-                    .selectable(true)
-                    .into_any_element(),
-            ]
+        Some(ToolBody::Text(text)) => {
+            let marks = find.marks(ix, Field::Output(0));
+            vec![monospace(text, marks, cx).into_any_element()]
         }
-        Some(ToolBody::Code { language, text }) => vec![code(language, text, ix)],
-        Some(ToolBody::Search(lines)) => vec![search_results(lines, cx)],
-        None => tool
-            .content()
-            .iter()
-            .filter_map(|content| match content {
-                ToolContent::Text(text) => Some(monospace(text, cx).into_any_element()),
-                ToolContent::Diff { .. } | ToolContent::Image(_) => None,
+        Some(ToolBody::Markdown(_) | ToolBody::Code { .. }) => {
+            body.map(BodyView::render).into_iter().collect()
+        }
+        Some(ToolBody::Search(lines)) => vec![search_results(lines, ix, find, cx)],
+        None => content_texts(tool)
+            .enumerate()
+            .map(|(n, text)| {
+                let marks = find.marks(ix, Field::Output(n));
+                monospace(text, marks, cx).into_any_element()
             })
             .collect(),
     };
@@ -776,7 +1011,7 @@ fn output(tool: &ToolCall, ix: usize, diff: Option<&DiffView>, cx: &App) -> Opti
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .child(path.display().to_string()),
                         )
-                        .child(monospace(patch, cx))
+                        .child(monospace(patch, Marks::default(), cx))
                         .into_any_element(),
                 ),
                 ToolContent::Text(_) | ToolContent::Image(_) => None,
@@ -811,13 +1046,25 @@ fn tool_images(tool: &ToolCall, ix: usize, images: &[Preview]) -> AnyElement {
         .into_any_element()
 }
 
-/// Source code, highlighted as `language`, its tail only when long (see
-/// [`tail`]). Kit highlights code only in a text view's code blocks, so it
-/// is one, without the block's frame: the details are framed already.
-fn code(language: &str, text: &str, ix: usize) -> AnyElement {
+/// [`markdown_body`] of a code body: its tail only when long (see
+/// [`tail`]), fenced as `language`. Kit highlights code only in a text
+/// view's code blocks, so it is one, drawn without the block's frame
+/// ([`code_view`]): the details are framed already.
+fn markdown_body_of_code<'a>(language: &str, text: &'a str) -> MarkdownBody<'a> {
     let (text, hidden) = tail(text.trim_end());
     let longest_ticks = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest_ticks.max(2) + 1);
+    let start = fence.len() + language.len() + 1;
+    MarkdownBody {
+        kind: BodyKind::Code,
+        source: Cow::Owned(format!("{fence}{language}\n{text}\n{fence}")),
+        shown: start..start + text.len(),
+        hidden,
+    }
+}
+
+/// `view`, a code body's fenced block, drawn without the block's frame.
+fn code_view(view: TextView) -> TextView {
     let style = TextViewStyle {
         code_block: StyleRefinement::default()
             .p_0()
@@ -826,22 +1073,17 @@ fn code(language: &str, text: &str, ix: usize) -> AnyElement {
             .text_xs(),
         ..TextViewStyle::default()
     };
-    let view = TextView::markdown(
-        ElementId::named_usize("tool-code", ix),
-        format!("{fence}{language}\n{text}\n{fence}"),
-    )
-    .style(style)
-    // Actions take the corner the language name would; none, so neither
-    // shows.
-    .code_block_actions(|_, _, _| div())
-    .selectable(true);
-    tailed(hidden, view).into_any_element()
+    view.style(style)
+        // Actions take the corner the language name would; none, so neither
+        // shows.
+        .code_block_actions(|_, _, _| div())
+        .selectable(true)
 }
 
-/// What a search found: each file, then its matching lines under it, each
-/// with its line number and what matched marked, cut at the edge rather than
-/// wrapped.
-fn search_results(lines: &[SearchLine], cx: &App) -> AnyElement {
+/// What a search found, step `ix`'s output: each file, then its matching
+/// lines under it, each with its line number and what matched marked, cut
+/// at the edge rather than wrapped.
+fn search_results(lines: &[SearchLine], ix: usize, find: &Find, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let mark = HighlightStyle {
         color: Some(theme.foreground),
@@ -853,7 +1095,7 @@ fn search_results(lines: &[SearchLine], cx: &App) -> AnyElement {
             .when(n > 0, gpui_kit::Styled::mt_1)
             .text_color(theme.foreground)
             .truncate()
-            .child(path.clone())
+            .child(find.marks(ix, Field::Output(n)).text(path.clone(), cx))
             .into_any_element(),
         SearchLine::Hit {
             line,
@@ -869,18 +1111,18 @@ fn search_results(lines: &[SearchLine], cx: &App) -> AnyElement {
                     .opacity(0.6)
                     .child(line.to_string()),
             )
-            .child(
-                div().min_w_0().flex_1().truncate().child(
-                    // Raw GPUI: Kit's `Label` marks a substring, not ranges.
-                    StyledText::new(text.clone())
-                        .with_highlights(matches.iter().map(|range| (range.clone(), mark))),
+            .child(div().min_w_0().flex_1().truncate().child(
+                find.marks(ix, Field::Output(n)).text_over(
+                    text.clone().into(),
+                    matches.iter().map(|range| (range.clone(), mark)).collect(),
+                    cx,
                 ),
-            )
+            ))
             .into_any_element(),
         SearchLine::Note(note) => div()
             .when(n > 0, gpui_kit::Styled::mt_1)
             .font_family(theme.font_family.clone())
-            .child(note.clone())
+            .child(find.marks(ix, Field::Output(n)).text(note.clone(), cx))
             .into_any_element(),
     });
     v_flex()
@@ -919,14 +1161,16 @@ fn tailed(hidden: usize, body: impl IntoElement) -> impl IntoElement {
         .child(body)
 }
 
-fn monospace(text: &str, cx: &App) -> impl IntoElement {
+/// `text` in monospace, its tail only when long (see [`tail`]), with what
+/// `marks` marks in that tail.
+fn monospace(text: &str, marks: Marks, cx: &App) -> impl IntoElement {
     let (shown, hidden) = tail(text.trim_end());
     tailed(
         hidden,
         div()
             .text_xs()
             .font_family(cx.theme().mono_font_family.clone())
-            .child(shown.to_owned()),
+            .child(marks.text(shown.to_owned(), cx)),
     )
 }
 

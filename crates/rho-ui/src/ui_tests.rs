@@ -2975,6 +2975,125 @@ fn a_turn_started_elsewhere_is_its_own_turn_and_leaves_typing_alone() {
     assert_eq!(typed, "half a thought", "the message being typed is intact");
 }
 
+/// Cmd/Ctrl+F finds text in the session's transcript, folded turns
+/// included: moving to a match inside one opens the fold and scrolls to
+/// it, and Escape closes the bar and clears the marks, leaving the fold
+/// open. With no session open, it goes to the sidebar's search.
+#[test]
+fn find_steps_through_matches_into_folded_work() {
+    use crate::transcript::find::{Count, Field};
+
+    let script = Script {
+        replay_turns: 3,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("find", script);
+    // With no session open, it finds sessions: the sidebar's search.
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.act(|window, cx| window.press("secondary-f", cx));
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        let search = app.read(cx).sidebar_search(cx);
+        assert!(
+            search.is_focused(window),
+            "the sidebar's search has the keyboard"
+        );
+    });
+    ui.open_old_session();
+    ui.wait_until("every turn folded", |window, _, _| {
+        is_visible(window, "worked-2") && !is_visible(window, "details-2")
+    });
+    let entries = ui.session().entries().to_vec();
+    let kind = |current: Option<(usize, Field)>| {
+        current.map(|(entry, field)| match &entries[entry] {
+            Entry::Agent(message) => (message.text().lines().next().map(str::to_owned), field),
+            Entry::Thought(_) => (Some(format!("thought {entry}")), field),
+            _ => (None, field),
+        })
+    };
+    let app = ui.app.clone();
+    let state = move |ui: &mut Harness| {
+        ui.cx.update(|cx| {
+            let view = app.read(cx).active_session().expect("a session is open");
+            let view = view.read(cx);
+            let transcript = view.transcript();
+            (
+                transcript.find_count(),
+                transcript.find_current(),
+                view.scroll_top(cx).0,
+            )
+        })
+    };
+
+    ui.act(|window, cx| window.press("secondary-f", cx));
+    ui.wait_until("the find bar", |window, _, _| {
+        is_visible(window, "find-bar")
+    });
+    ui.act(|window, cx| window.input("WALK", cx));
+    // In each turn: the thought's "walker" and "walk", the search's
+    // `src/n/walk.rs`, the command's `walk(n)`, and the answer's "walks".
+    // The first match from the top of the view on is current: turn 1's
+    // answer, near the end.
+    ui.wait_for_label("find-count", "10 of 15");
+    let (_, current, bottom) = state(&mut ui);
+    assert_eq!(
+        kind(current),
+        Some((Some("## Answer 1".to_owned()), Field::Part(0)))
+    );
+    ui.shot("found");
+
+    // Back to the first match, in turn 0's thought: its working, its run
+    // of steps and the thought's details open, and the transcript
+    // scrolls up to it.
+    for _ in 0..9 {
+        ui.act(|window, cx| window.press("shift-enter", cx));
+    }
+    ui.wait_for_label("find-count", "1 of 15");
+    // Turn 0's question is entry 1, and its thought entry 2.
+    ui.wait_until("the thought, open", |window, _, _| {
+        is_visible(window, "details-2")
+    });
+    let (_, current, top) = state(&mut ui);
+    assert_eq!(
+        kind(current),
+        Some((Some("thought 2".to_owned()), Field::Body))
+    );
+    assert!(top < bottom, "scrolled up from item {bottom} to {top}");
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.shot("in-fold");
+
+    // It wraps around to the last match, and back.
+    ui.act(|window, cx| window.press("shift-enter", cx));
+    ui.wait_for_label("find-count", "15 of 15");
+    ui.act(|window, cx| window.press("enter", cx));
+    ui.wait_for_label("find-count", "1 of 15");
+
+    // Escape closes it from outside its field too, rather than stopping
+    // the turn as it does with no bar open.
+    let app = ui.app.clone();
+    ui.act(|window, cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        let composer = view.read(cx).composer_focus_handle(cx);
+        window.focus(&composer, cx);
+    });
+    ui.act(|window, cx| window.press("escape", cx));
+    ui.wait_until("the bar gone", |window, _, _| {
+        !is_visible(window, "find-bar")
+    });
+    let (count, current, _) = state(&mut ui);
+    assert_eq!((count, current), (Count::NoQuery, None), "no matches left");
+    ui.act(|window, cx| {
+        assert!(is_visible(window, "details-2"), "the fold stays open");
+        let view = app.read(cx).active_session().expect("a session is open");
+        let composer = view.read(cx).composer_focus_handle(cx);
+        assert!(
+            composer.is_focused(window),
+            "the keyboard is back in the composer"
+        );
+    });
+}
+
 /// A saved session's replay goes into the session before any of its rows
 /// are built: the transcript doesn't grow row by row as history arrives,
 /// which drew every event and made a long session slow to open. It is

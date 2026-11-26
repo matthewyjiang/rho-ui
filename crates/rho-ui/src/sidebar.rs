@@ -684,6 +684,11 @@ impl SidebarView {
         self.layout.save_width();
     }
 
+    /// Whether it is collapsed to its rail.
+    pub(crate) fn is_collapsed(&self) -> bool {
+        self.layout.current() == Layout::Rail
+    }
+
     /// The search's, which the collapsed sidebar doesn't show.
     pub(crate) fn search_focus_handle(&self, cx: &App) -> FocusHandle {
         self.search.read(cx).focus_handle(cx)
@@ -698,7 +703,7 @@ impl SidebarView {
         self.hover = None;
         self.draft_hover = None;
         cx.notify();
-        self.layout.current() == Layout::Rail
+        self.is_collapsed()
     }
 
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
