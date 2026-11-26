@@ -157,6 +157,10 @@
 //!   for the docs server's prompts and resources, as `fake_daemon/mcp.rs`
 //!   lists them; the session's commands include its prompt
 //!   `/mcp:docs:search`.
+//! - `rho/mcp/list` and `rho/hooks/list` list what its configuration sets
+//!   up, as `fake_daemon/configured.rs` says, and
+//!   [`FakeDaemon::configured_reads`] the workspace each request named.
+//!   [`Script::configured`] makes it a daemon from before them.
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
 //!   set, if any, and what [`FakeDaemon::set_in_progress`] set.
 //!   `rho/daemon/restart` restarts in place, as rho does: it counts
@@ -229,6 +233,7 @@ use crate::{agent_settings::SettingValue, DaemonTarget, SessionId as UiSessionId
 
 mod auth;
 mod config;
+mod configured;
 mod listener;
 mod mcp;
 mod processes;
@@ -241,6 +246,8 @@ pub mod surface;
 use auth::FakeAuth;
 pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
 use config::FakeConfig;
+use configured::FakeConfigured;
+pub use configured::{ConfiguredList, ConfiguredMethods, ConfiguredRead, INVALID_HOOKS_WORKSPACE};
 use listener::Listener;
 use mcp::FakeMcp;
 pub use mcp::{
@@ -403,6 +410,9 @@ pub struct Script {
     pub reports: ReportMethod,
     /// Whether the sessions' MCP servers are still starting.
     pub mcp: McpStartup,
+    /// Whether the daemon lists its configured MCP servers and hooks, or
+    /// is from before that.
+    pub configured: ConfiguredMethods,
 }
 
 /// Whether the fake daemon serves `rho/session/list_detailed`, and with it
@@ -2340,6 +2350,7 @@ struct State {
     pull_requests: FakePullRequests,
     reports: FakeReports,
     mcp: FakeMcp,
+    configured: FakeConfigured,
     /// Restart as the next prompt arrives; see
     /// [`FakeDaemon::restart_at_next_prompt`].
     restart_at_prompt: bool,
@@ -2468,6 +2479,7 @@ impl State {
             pull_requests: FakePullRequests::new(script.pull_requests),
             reports: FakeReports::new(script.reports),
             mcp: FakeMcp::new(&script),
+            configured: FakeConfigured::new(&script),
             restart_at_prompt: false,
         };
         if script.tui_job == TuiJob::Running {

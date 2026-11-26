@@ -66,6 +66,7 @@ use crate::{
     window_chrome::Chrome,
 };
 
+mod configured;
 mod live;
 mod mcp;
 mod surfaces;

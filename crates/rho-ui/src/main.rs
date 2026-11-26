@@ -26,6 +26,7 @@ mod background_log;
 mod badge;
 mod cloning;
 mod composer;
+mod configured;
 mod draft;
 mod figures;
 mod fold;

@@ -66,6 +66,7 @@ use crate::{
 };
 
 mod auth;
+mod configured;
 mod marks;
 mod mcp;
 mod processes;
