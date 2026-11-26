@@ -169,13 +169,7 @@ fn start_prompt(
     session.updated_at = date;
     if prompt == "busy" && !session.refused_busy {
         session.refused_busy = true;
-        let told = "Nothing new from the background.";
-        session.wake(
-            turn,
-            &Card::new("Checked · background", told, CardTone::Neutral),
-            told,
-        );
-        session.answer(&format!("m-{turn_id}-done"), "Back to you.");
+        run_own_turn(session, turn);
         return Err(busy());
     }
     if prompt == "subagent" {
@@ -247,6 +241,16 @@ fn start_prompt(
     let (ask, timeout) = other_ask(&prompt).unwrap_or_else(|| (ls_approval(&session.cwd), None));
     session.ask(params, turn, ask, timeout);
     Ok(SessionPromptResponse { turn: turn_id })
+}
+
+/// Runs `turn`, one of the daemon's own begun just before a prompt came,
+/// to its end: it answers at once.
+fn run_own_turn(session: &mut FakeSession, turn: Turn) {
+    let id = turn.id.clone();
+    let told = "Nothing new from the background.";
+    let result = Card::new("Checked · background", told, CardTone::Neutral);
+    session.wake(turn, &result, told);
+    session.answer(&format!("m-{id}-done"), "Back to you.");
 }
 
 fn busy() -> RpcError {

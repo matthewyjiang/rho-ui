@@ -6566,7 +6566,11 @@ fn cards_between_replies_sit_on_a_rail_that_folds() {
             assert!(!is_visible(window, card(ix)), "card {ix} is folded");
         }
     });
-    let reply = SharedString::from(format!("reply-{}", cards[cards.len() - 1] + 1));
+    // The model answers after the cards as a turn of their own, opened
+    // with its wake row, as the conversation replays.
+    let after = cards[cards.len() - 1] + 1;
+    assert!(matches!(session.entries()[after], Entry::Wake));
+    let reply = SharedString::from(format!("reply-{}", after + 1));
     ui.act(|window, cx| {
         let center = window.find(reply.clone()).bounds().center();
         window.pointer_move(center, None, cx);
