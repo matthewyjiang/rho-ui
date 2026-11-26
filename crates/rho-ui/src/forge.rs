@@ -215,13 +215,16 @@ pub(crate) enum FoundBy {
     /// Only through the user's login shell, whose `PATH` a non-interactive
     /// ssh session may lack.
     LoginShell,
+    /// Only among mise's shims, which mise puts on the `PATH` of the
+    /// interactive shells that activate it alone.
+    Mise,
 }
 
 /// What checking a CLI on a machine found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CliProbe {
-    /// Not on the `PATH`, nor through the login shell, and Settings name
-    /// no program.
+    /// Not on the `PATH`, nor through the login shell, nor among mise's
+    /// shims, and Settings name no program.
     Missing,
     /// Found, but it doesn't run or doesn't answer as rho-ui needs, and why.
     Broken {

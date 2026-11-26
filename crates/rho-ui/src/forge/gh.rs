@@ -18,8 +18,10 @@ use crate::{folders, local};
 /// The POSIX `sh` script that checks `gh` on a machine. Its argument is the
 /// program set in Settings: empty finds `gh` on the `PATH`, then through
 /// the user's login shell, as a non-interactive ssh session may lack the
-/// `PATH` a terminal has; a `~/` path is from the home folder, and a bare
-/// name is looked up on the `PATH`. After [`MARKER`] it prints NUL-separated
+/// `PATH` a terminal has, then among mise's shims, as mise usually
+/// activates from an interactive shell's rc file, which neither reads; a
+/// `~/` path is from the home folder, and a bare name is looked up on the
+/// `PATH`. After [`MARKER`] it prints NUL-separated
 /// fields: `missing`; or `found`, how, the path, then `broken` and why, or
 /// `version` and `auth` with what `gh` printed for each. Read
 /// with [`parse`]. `gh auth status` reports a failing token in its JSON, so
@@ -39,6 +41,11 @@ case $want in
       found=login
       gh=$("$SHELL" -l -c 'command -v gh' </dev/null 2>/dev/null)
       gh=${gh##*"$nl"}
+    fi
+    if ! [ -f "$gh" ]; then
+      found=mise
+      data=${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}
+      gh=${MISE_SHIMS_DIR:-$data/shims}/gh
     fi
     if ! [ -f "$gh" ]; then
       printf 'rho-ui-forge\0missing\0'
@@ -85,11 +92,19 @@ pub(super) fn command(program: &OsStr) -> Command {
     command
 }
 
-/// The environment [`check_here_in`] finds `gh` in.
+/// The environment [`check_here_in`] finds `gh` in: its variables, by
+/// name, and the home folder.
 struct Env<'a> {
-    path: Option<&'a OsStr>,
-    shell: Option<&'a OsStr>,
+    vars: &'a dyn Fn(&str) -> Option<OsString>,
     home: Option<&'a Path>,
+}
+
+impl Env<'_> {
+    /// Variable `name`, unset when empty, as [`SCRIPT`]'s `${name:-…}`
+    /// reads it.
+    fn var(&self, name: &str) -> Option<OsString> {
+        (self.vars)(name).filter(|value| !value.is_empty())
+    }
 }
 
 /// [`SCRIPT`] in Rust, with the same argument, printing what it prints.
@@ -98,12 +113,9 @@ struct Env<'a> {
     reason = "a Job's here may fail; this one says why in what it prints"
 )]
 fn check_here(args: &[OsString]) -> Result<Vec<u8>, String> {
-    let path = std::env::var_os("PATH");
-    let shell = std::env::var_os("SHELL");
     let home = platform::home_dir();
     let env = Env {
-        path: path.as_deref(),
-        shell: shell.as_deref(),
+        vars: &|name| std::env::var_os(name),
         home: home.as_deref(),
     };
     let want = args.first().map(OsString::as_os_str).unwrap_or_default();
@@ -117,10 +129,12 @@ fn check_here_in(want: &OsStr, env: &Env<'_>) -> Vec<u8> {
         out.push(0);
     };
     let want = Path::new(want);
+    let path = env.var("PATH");
     let found = if want.as_os_str().is_empty() {
-        on_path("gh", env.path)
+        on_path("gh", path.as_deref())
             .map(|gh| ("path", gh))
-            .or_else(|| login_shell_gh(env.shell).map(|gh| ("login", gh)))
+            .or_else(|| login_shell_gh(env.var("SHELL").as_deref()).map(|gh| ("login", gh)))
+            .or_else(|| mise_gh(env).map(|gh| ("mise", gh)))
     } else if want.starts_with("~") {
         let gh = env.home.map_or_else(
             || want.to_path_buf(),
@@ -132,7 +146,7 @@ fn check_here_in(want: &OsStr, env: &Env<'_>) -> Vec<u8> {
     } else {
         Some((
             "setting",
-            on_path(want, env.path).unwrap_or_else(|| want.to_path_buf()),
+            on_path(want, path.as_deref()).unwrap_or_else(|| want.to_path_buf()),
         ))
     };
     let Some((how, gh)) = found else {
@@ -173,11 +187,45 @@ fn check_here_in(want: &OsStr, env: &Env<'_>) -> Vec<u8> {
 
 /// `name` in a folder of `path`, as the shell finds a program.
 fn on_path(name: impl AsRef<Path>, path: Option<&OsStr>) -> Option<PathBuf> {
-    let mut program = name.as_ref().as_os_str().to_owned();
-    program.push(std::env::consts::EXE_SUFFIX);
+    let program = file_name(name.as_ref().as_os_str());
     std::env::split_paths(path?)
         .map(|dir| dir.join(&program))
         .find(|candidate| is_program(candidate))
+}
+
+/// The file name of program `name` on this OS: `gh.exe` on Windows.
+fn file_name(name: &OsStr) -> OsString {
+    let mut file = name.to_owned();
+    file.push(std::env::consts::EXE_SUFFIX);
+    file
+}
+
+/// `gh` among mise's shims, in the folder mise puts them in: the
+/// `MISE_SHIMS_DIR` variable; else `shims` in `MISE_DATA_DIR`; else in
+/// `mise` in `XDG_DATA_HOME`, which defaults to `~/.local/share`, or on
+/// Windows to `LOCALAPPDATA` (`~/AppData/Local`). mise's `shims_dir` in its
+/// config file goes unread.
+fn mise_gh(env: &Env<'_>) -> Option<PathBuf> {
+    let shims = match (env.var("MISE_SHIMS_DIR"), env.var("MISE_DATA_DIR")) {
+        (Some(shims), _) => PathBuf::from(shims),
+        (None, Some(data)) => Path::new(&data).join("shims"),
+        (None, None) => data_home(env)?.join("mise").join("shims"),
+    };
+    Some(shims.join(file_name(OsStr::new("gh")))).filter(|gh| gh.is_file())
+}
+
+/// `XDG_DATA_HOME`, or its default as mise reads it.
+fn data_home(env: &Env<'_>) -> Option<PathBuf> {
+    if let Some(dir) = env.var("XDG_DATA_HOME") {
+        return Some(dir.into());
+    }
+    if cfg!(windows) {
+        if let Some(dir) = env.var("LOCALAPPDATA") {
+            return Some(dir.into());
+        }
+        return Some(env.home?.join("AppData").join("Local"));
+    }
+    Some(env.home?.join(".local").join("share"))
 }
 
 /// Where the user's login shell `shell` finds `gh`: its last line, after
@@ -253,6 +301,7 @@ pub(super) fn parse(output: &[u8]) -> Result<CliProbe, String> {
                 b"setting" => FoundBy::Setting,
                 b"path" => FoundBy::Path,
                 b"login" => FoundBy::LoginShell,
+                b"mise" => FoundBy::Mise,
                 _ => return Err("The gh check printed something else.".to_owned()),
             };
             (found_by, platform::path_from_bytes(path), rest)
@@ -372,30 +421,46 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /// Runs [`SCRIPT`] with `want`, a `PATH` of `path` and a login shell
-    /// `shell`, and reads what it found; [`check_here`], run here in the
-    /// same environment, must find the same.
-    fn check(want: &str, path: &Path, shell: &Path, home: &Path) -> CliProbe {
+    /// Variables of the environment a check runs in, by name.
+    type Vars<'a> = [(&'a str, &'a Path)];
+
+    #[cfg(unix)]
+    /// `bare`'s variables, and `more` besides.
+    fn with<'a>(bare: &Vars<'a>, more: &Vars<'a>) -> Vec<(&'a str, &'a Path)> {
+        [bare, more].concat()
+    }
+
+    #[cfg(unix)]
+    /// Runs [`SCRIPT`] with `want`, the variables `vars` and the home folder
+    /// `home`, and reads what it found; [`check_here`], run here in the same
+    /// environment, must find the same.
+    fn check(want: &str, vars: &Vars<'_>, home: &Path) -> CliProbe {
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(set, _)| *set == name)
+                .map(|(_, value)| value.as_os_str().to_owned())
+        };
         let env = Env {
-            path: Some(path.as_os_str()),
-            shell: Some(shell.as_os_str()),
+            vars: &var,
             home: Some(home),
         };
         let here = parse(&check_here_in(OsStr::new(want), &env)).unwrap();
-        let there = check_there(want, path, shell, home);
-        assert_eq!(here, there, "Program {want:?}: here and there differ");
+        let there = check_there(want, vars, home);
+        assert_eq!(
+            here, there,
+            "Program {want:?} with {vars:?}: here and there differ"
+        );
         there
     }
 
     #[cfg(unix)]
-    fn check_there(want: &str, path: &Path, shell: &Path, home: &Path) -> CliProbe {
+    fn check_there(want: &str, vars: &Vars<'_>, home: &Path) -> CliProbe {
         use std::process::Command;
 
         let output = Command::new("/bin/sh")
             .args(["-c", SCRIPT, "sh", want])
             .env_clear()
-            .env("PATH", path)
-            .env("SHELL", shell)
+            .envs(vars.iter().copied())
             .env("HOME", home)
             .output()
             .unwrap();
@@ -404,15 +469,16 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /// A lookup: the Program setting, the `PATH`, the login shell, and the
-    /// program found and how.
-    type Lookup<'a> = (&'a str, &'a Path, &'a Path, Option<(PathBuf, FoundBy)>);
+    /// A lookup: the Program setting, the variables, and the program found
+    /// and how.
+    type Lookup<'a> = (&'a str, &'a Vars<'a>, Option<(PathBuf, FoundBy)>);
 
     #[cfg(unix)]
     /// The check finds `gh` the way the Program setting says, here and on
-    /// a remote machine: a set path,
-    /// a `~/` path, a name on the `PATH`; and with none, on the `PATH`,
-    /// else where the login shell finds it, else nowhere.
+    /// a remote machine: a set path, a `~/` path, a name on the `PATH`; and
+    /// with none, on the `PATH`, else where the login shell finds it, else
+    /// among mise's shims, in the folder mise's variables or defaults put
+    /// them, else nowhere.
     #[test]
     fn the_check_finds_gh_as_the_setting_says() {
         let dir = tempfile::tempdir().unwrap();
@@ -420,13 +486,30 @@ mod tests {
         let on_path = dir.join("bin");
         let login_bin = dir.join("login-bin");
         let empty = dir.join("empty");
-        for folder in [&on_path, &login_bin, &empty] {
-            std::fs::create_dir(folder).unwrap();
+        let default_shims = dir.join(".local/share/mise/shims");
+        let xdg = dir.join("xdg");
+        let mise_data = dir.join("mise-data");
+        let mise_shims = dir.join("mise-shims");
+        let xdg_shims = xdg.join("mise/shims");
+        let data_shims = mise_data.join("shims");
+        for folder in [
+            &on_path,
+            &login_bin,
+            &empty,
+            &default_shims,
+            &xdg_shims,
+            &data_shims,
+            &mise_shims,
+        ] {
+            std::fs::create_dir_all(folder).unwrap();
         }
         let signed_in = r#"{"hosts":{}}"#;
         let gh = fake_gh(&on_path, "gh", signed_in);
         let renamed = fake_gh(&on_path, "gh-2", signed_in);
         let via_login = fake_gh(&login_bin, "gh", signed_in);
+        let [by_default, by_xdg, by_data, by_shims] =
+            [&default_shims, &xdg_shims, &data_shims, &mise_shims]
+                .map(|shims| fake_gh(shims, "gh", signed_in));
         // A login shell whose PATH holds `login-bin`, printing a greeting
         // first, as login files do.
         let shell = dir.join("login-sh");
@@ -438,6 +521,7 @@ mod tests {
             ),
         );
         let no_shell = dir.join("no-shell");
+        let bare = [("PATH", empty.as_path()), ("SHELL", no_shell.as_path())];
 
         let found = |probe: CliProbe| match probe {
             CliProbe::Found(status) => Some((status.path, status.found_by)),
@@ -446,28 +530,41 @@ mod tests {
             }
             CliProbe::Missing => None,
         };
-        let cases: [Lookup<'_>; 5] = [
-            ("", &on_path, &shell, Some((gh.clone(), FoundBy::Path))),
-            ("", &empty, &shell, Some((via_login, FoundBy::LoginShell))),
-            ("", &empty, &no_shell, None),
-            (
-                "gh-2",
-                &on_path,
-                &no_shell,
-                Some((renamed, FoundBy::Setting)),
-            ),
-            ("~/bin/gh", &empty, &no_shell, Some((gh, FoundBy::Setting))),
+        let on_path_vars = [("PATH", on_path.as_path()), ("SHELL", shell.as_path())];
+        let login_vars = [("PATH", empty.as_path()), ("SHELL", shell.as_path())];
+        let xdg_vars = with(&bare, &[("XDG_DATA_HOME", &xdg)]);
+        let data_vars = with(
+            &bare,
+            &[("XDG_DATA_HOME", &xdg), ("MISE_DATA_DIR", &mise_data)],
+        );
+        let shims_vars = with(
+            &bare,
+            &[
+                ("MISE_DATA_DIR", &mise_data),
+                ("MISE_SHIMS_DIR", &mise_shims),
+            ],
+        );
+        let no_mise_vars = with(&bare, &[("XDG_DATA_HOME", &empty)]);
+        let cases: [Lookup<'_>; 9] = [
+            ("", &on_path_vars, Some((gh.clone(), FoundBy::Path))),
+            ("", &login_vars, Some((via_login, FoundBy::LoginShell))),
+            ("", &bare, Some((by_default, FoundBy::Mise))),
+            ("", &xdg_vars, Some((by_xdg, FoundBy::Mise))),
+            ("", &data_vars, Some((by_data, FoundBy::Mise))),
+            ("", &shims_vars, Some((by_shims, FoundBy::Mise))),
+            ("", &no_mise_vars, None),
+            ("gh-2", &on_path_vars, Some((renamed, FoundBy::Setting))),
+            ("~/bin/gh", &bare, Some((gh, FoundBy::Setting))),
         ];
-        for (want, path, shell, expected) in cases {
+        for (want, vars, expected) in cases {
             assert_eq!(
-                found(check(want, path, shell, dir)),
+                found(check(want, vars, dir)),
                 expected,
-                "Program {want:?} with PATH {}",
-                path.display()
+                "Program {want:?} with {vars:?}"
             );
         }
 
-        let probe = check("~/bin/nothing", &empty, &no_shell, dir);
+        let probe = check("~/bin/nothing", &bare, dir);
         assert!(
             matches!(&probe, CliProbe::Broken { path, .. } if *path == on_path.join("nothing")),
             "a set path with no program there: {probe:?}"
