@@ -2032,6 +2032,7 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
     });
     assert_eq!(ui.label("title-project-names"), named);
     assert_eq!(ui.label("session-local-new-2-project-names"), named);
+    ui.click("toggle-settled");
     ui.shot("projects");
     ui.act(|window, cx| {
         let stack = window.find("title-projects").bounds().center();
