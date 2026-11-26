@@ -323,6 +323,7 @@ fn found(found_by: FoundBy, path: &str) -> String {
         FoundBy::Setting => path.to_owned(),
         FoundBy::Path => format!("{path} · on the PATH"),
         FoundBy::LoginShell => format!("{path} · via your login shell"),
+        FoundBy::Mise => format!("{path} · via mise's shims"),
     }
 }
 
