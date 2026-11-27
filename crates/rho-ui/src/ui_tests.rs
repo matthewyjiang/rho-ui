@@ -1990,6 +1990,82 @@ fn a_lead_starts_in_a_folder_of_its_own_and_lists_apart() {
     });
 }
 
+/// No project in the picker starts a session in a scratch folder of its
+/// own, named from its first message, in the rho home's scratch, in its
+/// checkout with no worktree. It is in no project: its sidebar row and
+/// title bar name none, and a new session from it starts in a project.
+#[test]
+fn a_session_in_no_project_starts_in_a_scratch_folder() {
+    let rho_home = tempfile::tempdir().expect("a rho home");
+    let daemon = FakeDaemon::start(Script::default());
+    let machines = Machines {
+        projects: Projects::of(["/w/a"]),
+        rho_home: Some(rho_home.path().to_path_buf()),
+        ..Machines::default()
+    };
+    let mut ui = Harness::open_with("scratch", daemon.target(), Some(daemon), machines);
+    ui.wait_until("the sidebar", |window, _, _| {
+        is_visible(window, "new-session")
+    });
+    let scratch = platform::canonicalize(rho_home.path())
+        .expect("the rho home")
+        .join("scratch");
+    ui.click("new-session");
+    ui.wait_until("No project offered", |window, _, _| {
+        checked(window, "project-none") == Some(false)
+    });
+    ui.shot("picker");
+
+    ui.click("project-none");
+    ui.wait_until("the draft in the scratch root", |window, cx, app| {
+        checked(window, "project-none") == Some(true)
+            && app.draft().is_some_and(|draft| {
+                let draft = draft.read(cx);
+                draft.cwd().path == scratch && draft.session_key().is_some()
+            })
+    });
+    ui.send("Try a quick thing");
+    // The draft's own sessions, in /tmp then in the root, came first.
+    ui.wait_for_session("the scratch session", |session| {
+        session.id().as_str() == "new-3"
+    });
+    let folder = scratch.join("try-a-quick-thing");
+    assert_eq!(ui.fake().cwd("new-3"), Some(folder.clone()));
+    assert!(folder.is_dir(), "its folder is made");
+    assert_eq!(ui.fake().worktrees(), 0, "no worktree");
+    ui.wait_until("its row", |window, _, _| {
+        is_visible(window, "session-local-new-3")
+    });
+    // The title bar reads its title alone.
+    let names = ui.label("session-local-new-3-project-names");
+    assert_eq!(names.as_deref(), Some(""), "the row names no project");
+    assert_eq!(
+        ui.label("title-project-names"),
+        None,
+        "nor does the title bar"
+    );
+    let app = ui.app.clone();
+    ui.act(|_, cx| {
+        let view = app.read(cx).active_session().expect("the session's view");
+        assert!(view.read(cx).in_no_project(cx));
+    });
+    ui.shot("session");
+
+    ui.act(|window, cx| {
+        let view = app.read(cx).active_session().expect("the session's view");
+        let composer = view.read(cx).composer_focus_handle(cx);
+        window.focus(&composer, cx);
+        window.press("secondary-n", cx);
+    });
+    ui.wait_until("a new draft in a project", |window, cx, app| {
+        checked(window, "project-none") == Some(false)
+            && app.draft().is_some_and(|draft| {
+                let draft = draft.read(cx);
+                !draft.in_no_project(cx) && draft.cwd().path == std::env::temp_dir()
+            })
+    });
+}
+
 /// A project picked in a lead's draft stays in the draft, not on the
 /// draft's own session, which is not the lead's; a pick can be taken out
 /// again. The lead that the first message starts reaches the picks from
@@ -7472,11 +7548,14 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
         .update(|cx| assert_eq!(selected_project(cx, ui.app.read(cx)), None));
     ui.shot("hover");
 
-    // Ctrl+Shift+N in the draft goes to the search, which filters.
-    ui.act(|window, cx| {
-        window.press("secondary-shift-n", cx);
-        window.input("/w/b", cx);
+    // Ctrl+Shift+N in the draft goes to the search, selecting the newest
+    // project rather than No project, since the draft is in neither; the
+    // search filters.
+    ui.act(|window, cx| window.press("secondary-shift-n", cx));
+    ui.wait_until("the newest project selected", |_, cx, app| {
+        selected_project(cx, app).as_deref() == Some("project-local:/w/a")
     });
+    ui.act(|window, cx| window.input("/w/b", cx));
     ui.wait_until("the search to filter", |window, cx, app| {
         !is_visible(window, "project-local:/w/a")
             && is_visible(window, "project-local:/w/b")

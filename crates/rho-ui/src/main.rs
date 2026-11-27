@@ -39,6 +39,7 @@ mod lightbox;
 mod local;
 mod machines;
 mod mcp_status;
+mod no_project;
 mod parts;
 mod pele;
 mod pictures;

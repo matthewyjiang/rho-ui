@@ -69,6 +69,7 @@ use crate::{
         DaemonAction, Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach,
         SessionKey,
     },
+    no_project::Root,
     projects::Projects,
     pull_requests::{Focus, PullRequests},
     rho_install::{render_setup, Installs, InstallsEvent, Offer},
@@ -121,10 +122,10 @@ pub(crate) struct LaunchConfig {
     pub(crate) remote: Rc<dyn Fn(&RemoteMachine) -> Reach>,
     /// What the right panel's terminal runs on this machine.
     pub(crate) shell: TerminalShell,
-    /// This machine's rho home, which keeps its leads' folders (see
-    /// [`crate::leads`]): `platform::rho_home()`, except in tests, which
-    /// keep it in a temporary folder. A browser reaches even this machine
-    /// through its link, so it has none.
+    /// This machine's rho home, which keeps the folders of its sessions in
+    /// no project (see [`crate::no_project`]): `platform::rho_home()`,
+    /// except in tests, which keep it in a temporary folder. A browser
+    /// reaches even this machine through its link, so it has none.
     pub(crate) rho_home: Option<PathBuf>,
     /// Where notifications go: the desktop's, except in tests.
     pub(crate) notifier: Notifier,
@@ -633,6 +634,7 @@ impl RhoApp {
             });
         }
         self.find_projects(machine, cx);
+        self.find_scratch_root(machine, cx);
         let status = MachineStatus::Ready {
             version: info.version().to_owned().into(),
             pid: info.pid(),
@@ -1224,20 +1226,21 @@ impl RhoApp {
 
     /// Where a new session starts: in the project of the session or draft
     /// on screen, else where the last new session started, else the launch
-    /// directory, or in a browser this machine's home. A lead's session or
-    /// draft is in no project, so one on screen counts as none.
+    /// directory, or in a browser this machine's home. A session or draft
+    /// in no project, a lead's or a scratch one, counts as none: a new
+    /// session never starts in no project.
     fn new_session_cwd(&self, cx: &App) -> Place {
         let on_screen = match &self.pane {
             Pane::Session(view) => {
                 let view = view.read(cx);
-                (view.kind(cx) == Kind::Session).then(|| {
+                (!view.in_no_project(cx)).then(|| {
                     let live = view.live();
                     Place::new(live.id.machine, live.cwd)
                 })
             }
             Pane::Draft(view) => {
                 let draft = view.read(cx);
-                (draft.kind() == Kind::Session).then(|| draft.cwd().clone())
+                (!draft.in_no_project(cx)).then(|| draft.cwd().clone())
             }
             Pane::Empty => None,
         };
@@ -1277,11 +1280,13 @@ impl RhoApp {
             self.find_projects(&connection.machine, cx);
         }
         // An empty draft of the kind on screen is reused, so its settings
-        // survive; one with a message is left for the sidebar, in place of
-        // the new one.
+        // survive, unless it was moved to no project: a new session starts
+        // in a project. One with a message is left for the sidebar, in
+        // place of the new one.
         if let Pane::Draft(view) = &self.pane {
             let draft = view.read(cx);
-            if draft.kind() == kind && !draft.has_message(cx) {
+            let scratch = draft.no_project_root(cx) == Some(Root::Scratch);
+            if draft.kind() == kind && !draft.has_message(cx) && !scratch {
                 let view = view.clone();
                 self.show(Pane::Draft(view), window, cx);
                 return;
@@ -1524,6 +1529,7 @@ impl RhoApp {
                 })?;
                 match setup {
                     Ok((setup, dir)) => {
+                        this.opened_in(&opening, &machine, &dir, cx);
                         let session = Session::from_setup(setup);
                         let id = SessionKey::new(machine.clone(), session.id().clone());
                         let daemon = daemon.clone();
@@ -1581,13 +1587,14 @@ impl RhoApp {
 
     /// Starts `draft`'s first message, `prompt`, in a session of its own,
     /// as [`Self::opening`] says: for a session's draft, in a new worktree
-    /// of its directory; for a lead's, as a lead in a folder made for it,
-    /// named from `prompt`, reaching the projects its draft picked. Opens
-    /// it, gives it `settings`, the draft session's own and its choice for
-    /// the sessions it starts, follows it, then shows it and sends
-    /// `prompt`. Until then the draft stays, with its own session, so a
-    /// failure leaves it as it was: only a session that starts keeps its
-    /// worktree, and a lead's folder goes again while it is empty.
+    /// of its directory, or in no project, in a scratch folder named from
+    /// `prompt`; for a lead's, as a lead in a folder named so, reaching the
+    /// projects its draft picked. Opens it, gives it `settings`, the draft
+    /// session's own and its choice for the sessions it starts, follows it,
+    /// then shows it and sends `prompt`. Until then the draft stays, with
+    /// its own session, so a failure leaves it as it was: only a session
+    /// that starts keeps its worktree, and a folder made for it goes again
+    /// while it is empty.
     fn start_in(
         &mut self,
         draft: &Entity<DraftView>,
@@ -1648,7 +1655,8 @@ impl RhoApp {
                     .upgrade()
                     .filter(|draft| this.is_current(&machine, epoch) && draft.read(cx).launching());
                 match (opened, draft) {
-                    (Ok((mut session, _, Ok(attached))), Some(draft)) => {
+                    (Ok((mut session, dir, Ok(attached))), Some(draft)) => {
+                        this.opened_in(&opening, &machine, &dir, cx);
                         let cwd = Place::new(machine.clone(), attached.workspace());
                         session.attached(attached);
                         this.start_session(&draft, session, &cwd, prompt, window, cx);
@@ -1676,7 +1684,8 @@ impl RhoApp {
                     (Err(_), None) => None,
                 }
             });
-            // A lead's folder its lead won't use goes while it is empty.
+            // A folder made for a session that won't use it goes while it
+            // is empty.
             if let Ok(Some(dir)) = abandoned {
                 opening.unmake(&dir).await;
             }
@@ -1703,9 +1712,9 @@ impl RhoApp {
             self.sync_drafts(cx);
             return;
         };
-        // The project, not a worktree the daemon added in it; a lead is in
-        // none.
-        if draft.read(cx).kind() == Kind::Session {
+        // The project, not a worktree the daemon added in it; a session in
+        // no project leaves the last one.
+        if !draft.read(cx).in_no_project(cx) {
             self.last_project = Some(draft.read(cx).cwd().clone());
         }
         let view = self.open_new_session(daemon, cwd, session, prompt, window, cx);

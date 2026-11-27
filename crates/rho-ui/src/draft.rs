@@ -21,9 +21,15 @@
 //! sends the message there, so choosing New worktree and back leaves no
 //! worktree behind.
 //!
+//! The picker's No project moves a session's draft to no project: its own
+//! session works in the scratch root, and the first message starts a
+//! session in a scratch folder of its own, named from the message, in its
+//! checkout (see [`crate::no_project`]).
+//!
 //! A lead's draft ([`Kind::Lead`]) has no project picker: its session is a
-//! lead in the leads root (see [`crate::leads`]), with the lead agent's
-//! settings, and the draft shows no folder until that session is open.
+//! lead in the leads root (see [`crate::no_project`]), with the lead
+//! agent's settings, and the draft shows no folder until that session is
+//! open.
 //! Its title bar picks the projects the lead will work in ([`AddedDirs`]),
 //! kept in the draft, not on that session, which is not the lead's. The
 //! first message starts the lead in a folder of its own, named from the
@@ -50,7 +56,9 @@ use crate::{
     composer::{Composer, ComposerMode, ComposerState},
     leads::Kind,
     machines::{MachineId, Machines, Place, SessionKey},
-    project_picker::{PickerEvent, ProjectPicker},
+    no_project::Root,
+    project_picker::{Pick, PickerEvent, ProjectPicker},
+    project_stack::session_projects,
     projects::Projects,
     session_list::{NEW_LEAD, NEW_SESSION},
     session_settings::{SessionSettings, SettingsEvent},
@@ -84,7 +92,8 @@ pub(crate) enum DraftEvent {
 
 /// A session's draft, or a lead's.
 enum DraftKind {
-    /// A session's, which `picker` moves between projects and checkouts.
+    /// A session's, which `picker` moves between projects and checkouts,
+    /// or to no project.
     Session { picker: Entity<ProjectPicker> },
     /// A lead's, which picks no project to start in but, in `added_dirs`,
     /// the projects the lead works in, for the whole of the draft's life.
@@ -122,14 +131,14 @@ enum SessionState {
 
 pub(crate) struct DraftView {
     kind: DraftKind,
-    /// Where the session will work: for a lead's draft, the leads root its
-    /// session opened in, with no path before that.
+    /// Where the session will work: in no project, the root its session
+    /// opened in, with no path before that.
     cwd: Place,
     machines: Entity<Machines>,
     /// Every machine's sign-ins, for the session's.
     auths: Entity<Auths>,
     workspaces: Entity<Workspaces>,
-    /// `cwd`'s; `None` for a lead's draft until its session opens.
+    /// `cwd`'s; `None` in no project until its session opens.
     workspace: Option<WorkspaceRef>,
     composer: Entity<ComposerState>,
     state: SessionState,
@@ -161,8 +170,9 @@ impl DraftView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let picker = cx
-            .new(|cx| ProjectPicker::new(workspaces, projects, machines, cwd.clone(), window, cx));
+        let current = Pick::Folder(cwd.clone());
+        let picker =
+            cx.new(|cx| ProjectPicker::new(workspaces, projects, machines, current, window, cx));
         let kind = DraftKind::Session { picker };
         Self::of_kind(kind, cwd, workspaces, machines, auths, window, cx)
     }
@@ -259,6 +269,25 @@ impl DraftView {
         }
     }
 
+    /// The root of the folders for sessions in no project that the draft's
+    /// session opens in, if it is in no project: a lead's draft's, or a
+    /// session's draft moved to No project.
+    pub(crate) fn no_project_root(&self, cx: &App) -> Option<Root> {
+        match &self.kind {
+            DraftKind::Lead { .. } => Some(Root::Leads),
+            DraftKind::Session { picker } => match picker.read(cx).current(cx) {
+                Pick::NoProject(_) => Some(Root::Scratch),
+                Pick::Folder(_) => None,
+            },
+        }
+    }
+
+    /// Whether the draft is in no project, as a lead's always is; a new
+    /// session doesn't start in its directory.
+    pub(crate) fn in_no_project(&self, cx: &App) -> bool {
+        self.no_project_root(cx).is_some()
+    }
+
     /// The project picker, which a lead's draft hasn't.
     fn picker(&self) -> Option<&Entity<ProjectPicker>> {
         match &self.kind {
@@ -284,7 +313,7 @@ impl DraftView {
         cx: &mut Context<'_, Self>,
     ) {
         match event {
-            PickerEvent::Picked(cwd) => self.move_to(cwd.clone(), window, cx),
+            PickerEvent::Picked(pick) => self.move_to(pick.clone(), window, cx),
             PickerEvent::Dismissed => window.focus(&self.composer.focus_handle(cx), cx),
         }
     }
@@ -294,10 +323,11 @@ impl DraftView {
     }
 
     /// The project the draft's session will work in: a session's draft's
-    /// directory, or the first a lead's draft picked for its lead, if any.
+    /// directory, none in no project, or the first a lead's draft picked
+    /// for its lead, if any.
     pub(crate) fn project(&self, cx: &App) -> Option<Place> {
         match self.added_dirs() {
-            None => Some(self.cwd.clone()),
+            None => (!self.in_no_project(cx)).then(|| self.cwd.clone()),
             Some(dirs) => dirs
                 .read(cx)
                 .dirs()
@@ -306,8 +336,8 @@ impl DraftView {
         }
     }
 
-    /// The draft's workspace's index into the shared table; `None` for a
-    /// lead's draft until its session opens.
+    /// The draft's workspace's index into the shared table; `None` in no
+    /// project until its session opens.
     pub(crate) fn workspace_index(&self) -> Option<usize> {
         self.workspace.as_ref().map(WorkspaceRef::index)
     }
@@ -381,22 +411,34 @@ impl DraftView {
         }
     }
 
-    /// Moves the draft to `cwd`. The session opened for the old directory
-    /// goes, unfollowed and unsaved, and the app opens one in the new; the
-    /// text in the composer stays. A draft already sent stays where it is,
+    /// Moves the draft to `pick`: a directory, or no project, whose root
+    /// its session opens in. The session opened for the old directory goes,
+    /// unfollowed and unsaved, and the app opens one in the new; the text
+    /// in the composer stays. A draft already sent stays where it is,
     /// including one whose worktree is still being made.
-    fn move_to(&mut self, cwd: Place, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if cwd == self.cwd || self.launching || matches!(self.state, SessionState::Started) {
+    fn move_to(&mut self, pick: Pick, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(picker) = self.picker().cloned() else {
+            return;
+        };
+        if *picker.read(cx).current(cx) == pick
+            || self.launching
+            || matches!(self.state, SessionState::Started)
+        {
             window.focus(&self.composer.focus_handle(cx), cx);
             return;
         }
-        self.workspace = Some(WorkspaceRef::new(&self.workspaces, &cwd, cx));
+        let (cwd, workspace) = match &pick {
+            Pick::Folder(cwd) => (
+                cwd.clone(),
+                Some(WorkspaceRef::new(&self.workspaces, cwd, cx)),
+            ),
+            Pick::NoProject(machine) => (Place::new(machine.clone(), PathBuf::new()), None),
+        };
+        self.workspace = workspace;
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         self.composer
             .update(cx, |composer, cx| composer.set_remote(remote, cx));
-        if let Some(picker) = self.picker() {
-            picker.update(cx, |picker, cx| picker.set_current(cwd.clone(), window, cx));
-        }
+        picker.update(cx, |picker, cx| picker.set_current(pick, window, cx));
         self.cwd = cwd;
         self.replace_session(cx);
         window.focus(&self.composer.focus_handle(cx), cx);
@@ -470,7 +512,8 @@ impl DraftView {
     }
 
     /// Takes the session the app opened in `dir`, and sends a waiting
-    /// message. A lead's draft works in `dir`, the leads root, from then on.
+    /// message. A draft in no project works in `dir`, its root, from then
+    /// on.
     pub(crate) fn open(
         &mut self,
         daemon: Daemon,
@@ -603,10 +646,11 @@ impl DraftView {
             return;
         }
         // In the project's checkout, the draft's own session takes it; in a
-        // new worktree, or as a lead, a session of its own.
-        let own = self
-            .picker()
-            .is_some_and(|picker| picker.read(cx).checkout(cx) == Checkout::Local);
+        // new worktree, or in no project, a session of its own.
+        let own = !self.in_no_project(cx)
+            && self
+                .picker()
+                .is_some_and(|picker| picker.read(cx).checkout(cx) == Checkout::Local);
         match (
             std::mem::replace(&mut self.state, SessionState::Started),
             own,
@@ -702,16 +746,15 @@ impl Render for DraftView {
             Kind::Session => NEW_SESSION,
             Kind::Lead => NEW_LEAD,
         };
-        // A session's draft names its project; a lead's, those it picked,
-        // whether they are the user's projects or not.
-        let projects = match self.added_dirs() {
-            Some(dirs) => dirs.read(cx).projects(None, None, cx),
-            None => self
-                .workspace
-                .iter()
-                .map(|workspace| workspace.read(cx))
-                .collect(),
-        };
+        // A session's draft names its project, if it is in one; a lead's,
+        // those it picked, whether they are the user's projects or not.
+        let projects = self.added_dirs().map_or_else(
+            || {
+                let own = self.workspace.as_ref().map(|workspace| workspace.read(cx));
+                session_projects(Kind::Session, own, [], None)
+            },
+            |dirs| dirs.read(cx).projects(None, None, cx),
+        );
         // A lead's projects, at the right, where a session's title bar has
         // its added directories.
         let title_bar = TitleBar::new(&projects, title).trailing(self.added_dirs().cloned());
