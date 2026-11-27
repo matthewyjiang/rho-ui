@@ -1136,6 +1136,53 @@ fn a_card_sent_again_stays_one_row() {
     );
 }
 
+/// Each item of a card is as urgent as rho says it is, so routine news on
+/// a card with a failure stays routine; one from a rho that doesn't say,
+/// or that says a value this client doesn't know, is as urgent as its card.
+#[test]
+fn a_cards_item_is_as_urgent_as_rho_says_or_as_its_card() {
+    let subject = json!({"kind": "other"});
+    let item = |urgency: Option<&str>| {
+        let mut item = json!({"outcome": "new_commits", "subject": subject, "text": "New commits"});
+        if let Some(urgency) = urgency {
+            item["urgency"] = json!(urgency);
+        }
+        item
+    };
+    let mut session = session();
+    session.apply(SessionUpdate {
+        notification: Some(
+            serde_json::from_value(
+                json!({"id": "n-1", "urgency": "needs_you", "subject": subject,
+                "items": [item(Some("routine")), item(Some("needs_you")), item(None),
+                    item(Some("someday"))]}),
+            )
+            .expect("a valid notification"),
+        ),
+        ..update(
+            json!({"type": "card", "title": "New commits, checks failed",
+            "markdown": "", "plain": "", "tone": "error"}),
+        )
+    });
+    let [Entry::Notice(notice)] = session.entries() else {
+        panic!("one card: {:?}", session.entries());
+    };
+    let urgencies: Vec<Urgency> = notice
+        .items()
+        .iter()
+        .map(|item| notice.item_urgency(item))
+        .collect();
+    assert_eq!(
+        urgencies,
+        [
+            Urgency::Routine,
+            Urgency::NeedsYou,
+            Urgency::NeedsYou,
+            Urgency::NeedsYou
+        ]
+    );
+}
+
 /// A notice of several lines, as a provider's diagnostic is, reads its
 /// first line on one row and keeps the rest to open.
 #[test]

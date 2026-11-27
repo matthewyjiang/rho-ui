@@ -10,8 +10,10 @@ use super::*;
 
 /// While a server is connecting and another has timed out, a mark shows
 /// in the composer's footer, and it lists the session's servers, the one
-/// that failed first. Once they are up, the mark goes by itself: the view
-/// reads them again while they start, with nothing clicked.
+/// that failed first, led by why it failed rather than the start of the
+/// daemon's lines on it, its transport. Once they are up, the mark goes by
+/// itself: the view reads them again while they start, with nothing
+/// clicked.
 #[test]
 fn a_mark_shows_while_mcp_servers_are_in_trouble() {
     let mut ui = Harness::start(
@@ -64,6 +66,11 @@ fn a_mark_shows_while_mcp_servers_are_in_trouble() {
             Some("notes: Disabled".to_owned()),
         ],
         "the one that failed first"
+    );
+    assert_eq!(
+        ui.label("mcp-server-0-why").as_deref(),
+        Some("no answer to initialize within 30s"),
+        "why it failed, not its transport"
     );
     ui.shot("trouble");
 
