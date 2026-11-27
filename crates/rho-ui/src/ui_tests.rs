@@ -2085,9 +2085,10 @@ fn a_leads_draft_hands_its_projects_to_the_lead() {
 }
 
 /// A lead's panel starts on Work, beside Brief. Work lists the sessions
-/// the lead started and the PRs linked to it, and a session's row opens
-/// that session, whose panel offers neither. Brief reads the lead's
-/// `brief.md` again as its turn ends.
+/// the lead started and the PRs linked to it, its finished part folded
+/// until its header opens it, and a session's row opens that session,
+/// whose panel offers neither. Coming back, the finished part is as the
+/// user left it. Brief reads the lead's `brief.md` again as its turn ends.
 #[test]
 fn a_leads_panel_shows_its_work_and_brief() {
     let (mut ui, _rho_home) = start_lead("lead-view");
@@ -2148,8 +2149,9 @@ fn a_leads_panel_shows_its_work_and_brief() {
         "lead-work-item-local-w1",
         "lead-work-item-local-w2",
         "lead-work-item-acme/widgets#14",
-        "lead-work-item-acme/widgets#15",
+        "lead-work-finished",
     ];
+    let finished = "lead-work-item-acme/widgets#15";
     // The daemon's jobs, polled each second, list the sessions it started.
     advance_until(&mut ui, Duration::from_secs(1), "the lead's work", |ui| {
         ui.cx
@@ -2160,7 +2162,19 @@ fn a_leads_panel_shows_its_work_and_brief() {
     });
     // The jobs also say which of them works, which the shot shows.
     ui.wait_for_label("session-local-new-2-fold", "2 sessions · 1 working");
+    // The merged PR is finished, folded under a header that counts it.
+    ui.wait_for_label("lead-work-finished", "Finished · 1");
+    ui.act(|window, _| assert!(!is_visible(window, finished), "finished starts folded"));
     ui.shot("work");
+
+    // Its header opens the finished part, folds it, and opens it again.
+    for shows in [true, false, true] {
+        ui.click("lead-work-finished");
+        ui.wait_until("the finished part to open or fold", |window, _, _| {
+            is_visible(window, finished) == shows
+        });
+    }
+    ui.shot("work-finished-open");
 
     ui.click("panel-tab-brief");
     ui.wait_until("the lead's brief", |window, cx, app| {
@@ -2182,6 +2196,13 @@ fn a_leads_panel_shows_its_work_and_brief() {
                 && !is_visible(window, "open-surface-brief")
         },
     );
+
+    // Back on the lead, its finished part is still open.
+    ui.click("session-local-new-2");
+    ui.wait_for_session("the lead open", |session| session.id().as_str() == "new-2");
+    ui.wait_until("Work, its finished part open", |window, _, _| {
+        is_visible(window, "lead-work") && is_visible(window, finished)
+    });
 }
 
 /// Sessions quiet for long start settled. A draft makes no session until
