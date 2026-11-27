@@ -213,6 +213,8 @@ gpui_kit::assets::icon_assets!(
         Bell,
         // The right panel's Context surface.
         Gauge,
+        // Settings → Plugins.
+        Puzzle,
         // The A2UI basic catalog's icons, for surfaces (`surface_view.rs`).
         BellOff,
         CalendarDays,

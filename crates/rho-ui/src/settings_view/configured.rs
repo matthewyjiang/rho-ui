@@ -46,19 +46,19 @@ use crate::{
 };
 
 /// The machine a page shows, as its rows name it.
-struct Shown<'a> {
-    machine: &'a MachineId,
-    label: &'a str,
+pub(super) struct Shown<'a> {
+    pub(super) machine: &'a MachineId,
+    pub(super) label: &'a str,
     /// Its home, which paths show as `~`.
-    home: Option<&'a Path>,
+    pub(super) home: Option<&'a Path>,
 }
 
 /// The page's own state: which machine it shows, and which project on
-/// each.
+/// each. Plugins shows the same.
 pub(super) struct ConfiguredFields {
-    configured: Entity<Configured>,
-    projects: Entity<Projects>,
-    workspaces: Entity<Workspaces>,
+    pub(super) configured: Entity<Configured>,
+    pub(super) projects: Entity<Projects>,
+    pub(super) workspaces: Entity<Workspaces>,
     machine: PickedMachine,
     /// The project on screen when Settings opened, which its machine shows
     /// until another is picked there.
@@ -132,12 +132,16 @@ impl ConfiguredFields {
 
 impl SettingsView {
     /// The machine the page shows, and the project it reads there.
-    fn configured_target(&self, cx: &App) -> (MachineId, Option<PathBuf>) {
+    pub(super) fn configured_target(&self, cx: &App) -> (MachineId, Option<PathBuf>) {
         self.configured.target(self.machine_list.read(cx))
     }
 
     /// Shows `machine`, read afresh for its project.
-    fn pick_configured_machine(&mut self, machine: MachineId, cx: &mut Context<'_, Self>) {
+    pub(super) fn pick_configured_machine(
+        &mut self,
+        machine: MachineId,
+        cx: &mut Context<'_, Self>,
+    ) {
         let workspace = self.configured.workspace(&machine);
         self.configured.configured.update(cx, |configured, cx| {
             configured.read(&machine, workspace, cx);
@@ -228,7 +232,7 @@ impl SettingsView {
 }
 
 /// The quiet line of a rho too old to list `what`.
-fn too_old(machine: &str, what: &str) -> SettingItem {
+pub(super) fn too_old(machine: &str, what: &str) -> SettingItem {
     let text = format!("Rho on {machine} is too old to list {what}. Update it there to see them.");
     SettingItem::render(move |_, _, cx| {
         h_flex()
@@ -242,7 +246,7 @@ fn too_old(machine: &str, what: &str) -> SettingItem {
 
 /// The picker of the project to read for, among `machine`'s projects,
 /// set to `workspace`; "None" reads for no project.
-fn project_picker(
+pub(super) fn project_picker(
     projects: &Projects,
     machine: &MachineId,
     workspace: Option<&Path>,
@@ -296,7 +300,7 @@ fn project_picker(
 }
 
 /// Reads `machine`'s again for `workspace`; it spins while a read runs.
-fn refresh_button(
+pub(super) fn refresh_button(
     configured: &Entity<Configured>,
     machine: &MachineId,
     workspace: Option<PathBuf>,
@@ -342,7 +346,7 @@ fn status_item(
 
 /// A section that couldn't be read: `failed`'s reason, or that the rho is
 /// too old for it, as `what` names it.
-fn unlisted<T>(listed: &Answer<T>, what: &str, machine: &str) -> Option<SettingItem> {
+pub(super) fn unlisted<T>(listed: &Answer<T>, what: &str, machine: &str) -> Option<SettingItem> {
     match listed {
         Answer::Listed(_) => None,
         Answer::TooOld => Some(too_old(machine, what)),
@@ -470,14 +474,13 @@ fn file_lines(file: &HooksFile, shown: &Shown<'_>) -> Vec<String> {
             n => format!("Sessions run its {n} hooks."),
         }],
         HooksFileStatus::Untrusted { error } => {
-            let place = if shown.machine.is_local() {
-                "rho-ui's environment".to_owned()
-            } else {
-                format!("the login environment on {}", shown.label)
-            };
             let mut lines = vec![format!(
-                "Sessions skip it. To trust project hooks, set RHO_TRUST_PROJECT_HOOKS=1 \
-                 in {place} and restart rho-ui. That trusts every project's hooks file."
+                "Sessions skip it. To trust project hooks, {}",
+                trust_hint(
+                    shown,
+                    "RHO_TRUST_PROJECT_HOOKS",
+                    "every project's hooks file"
+                )
             )];
             lines.extend(
                 error
@@ -498,6 +501,17 @@ fn file_lines(file: &HooksFile, shown: &Shown<'_>) -> Vec<String> {
         )],
         _ => vec!["A status this rho-ui doesn't know.".to_owned()],
     }
+}
+
+/// How to trust what a project brings on the machine shown: set
+/// `variable` where its sessions get their environment, which `trusts`.
+pub(super) fn trust_hint(shown: &Shown<'_>, variable: &str, trusts: &str) -> String {
+    let place = if shown.machine.is_local() {
+        "rho-ui's environment".to_owned()
+    } else {
+        format!("the login environment on {}", shown.label)
+    };
+    format!("set {variable}=1 in {place} and restart rho-ui. That trusts {trusts}.")
 }
 
 fn hook_item(hook: &HookContract) -> SettingItem {
@@ -559,7 +573,7 @@ fn event_name(event: HookEvent) -> &'static str {
 /// and its fragment, each as "…". The host, path and query keys stay, so
 /// servers can still be told apart. A string that isn't a URL keeps its
 /// query and fragment the same way.
-fn redacted_url(url: &str) -> String {
+pub(super) fn redacted_url(url: &str) -> String {
     const HIDDEN: &str = "…";
     let (rest, fragment) = match url.split_once('#') {
         Some((rest, fragment)) => (rest, Some(fragment)),

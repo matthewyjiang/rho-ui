@@ -7,13 +7,15 @@
 //! Then come rho's own: each machine's sign-ins to providers, in
 //! [`providers`], the worktrees it added for sessions, in [`worktrees`], a
 //! page per category its daemon describes, saved in that machine's
-//! `config.toml`: see [`rho`], and the MCP servers and hooks its
-//! configuration sets up, read-only, in [`configured`]. Last, [`about`]
+//! `config.toml`: see [`rho`], the MCP servers and hooks its
+//! configuration sets up, read-only, in [`configured`], and its agent
+//! plugins, which [`plugins`] manages. Last, [`about`]
 //! shows the versions of rho-ui and of Rho on each machine.
 
 mod about;
 mod configured;
 mod machines;
+mod plugins;
 mod providers;
 mod rho;
 mod source_control;
@@ -504,19 +506,30 @@ fn status_field(
 ) -> SettingField<SharedString> {
     let (id, label, text) = (id.into(), label.into(), text.into());
     SettingField::render(move |_, _, cx| {
-        let color = mark.color(cx);
-        h_flex()
-            .id(id.clone())
-            .test_support()
-            .aria_label(label.clone())
-            .gap_1p5()
-            .text_sm()
-            .text_color(color)
-            .when_some(mark.icon(), |this, icon| {
-                this.child(Icon::new(icon).small().text_color(color))
-            })
-            .child(text.clone())
+        status_mark(id.clone(), label.clone(), mark, text.clone(), cx)
     })
+}
+
+/// [`status_field`]'s content, for a field that shows more beside it.
+fn status_mark(
+    id: SharedString,
+    label: impl Into<SharedString>,
+    mark: Mark,
+    text: impl Into<SharedString>,
+    cx: &App,
+) -> impl IntoElement {
+    let color = mark.color(cx);
+    h_flex()
+        .id(id)
+        .test_support()
+        .aria_label(label.into())
+        .gap_1p5()
+        .text_sm()
+        .text_color(color)
+        .when_some(mark.icon(), |this, icon| {
+            this.child(Icon::new(icon).small().text_color(color))
+        })
+        .child(text.into())
 }
 
 /// `item`, with `description` under its title if there is one. Kit gives
@@ -680,6 +693,7 @@ impl Render for SettingsView {
         let worktrees = self.worktrees_page(cx);
         let rho = self.rho_page(window, cx);
         let configured = self.configured_page(cx);
+        let plugins = self.plugins_page(cx);
         let about = about::about_page(&self.machine_list, &self.installs, &self.app_update, cx);
         let theme = cx.theme();
         // The page list is tinted and rounded where it meets the dialog's
@@ -705,6 +719,7 @@ impl Render for SettingsView {
                     .page(worktrees)
                     .page(rho)
                     .page(configured)
+                    .page(plugins)
                     .page(about),
             )
     }
