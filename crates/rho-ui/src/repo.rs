@@ -230,7 +230,7 @@ fn find_git_dir(start: &Path) -> Option<(PathBuf, PathBuf)> {
 
 /// Branch `main` for `ref: refs/heads/main`, a short hash for a detached
 /// HEAD.
-fn parse_head(head: &str) -> Option<Head> {
+pub(crate) fn parse_head(head: &str) -> Option<Head> {
     let head = head.trim();
     match head.strip_prefix("ref:") {
         Some(reference) => {

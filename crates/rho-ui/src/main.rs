@@ -30,6 +30,7 @@ mod configured;
 mod draft;
 mod figures;
 mod fold;
+mod folder_chooser;
 mod folders;
 mod forge;
 mod input_card;
@@ -420,6 +421,7 @@ fn open_app(launch: LaunchConfig, db: &StateDb, settings: Settings, cx: &mut App
 /// things between runs in `db`.
 fn init(cx: &mut App, db: &StateDb) {
     gpui_kit::init(cx);
+    folder_chooser::init(cx);
     themes::install(cx);
     window_chrome::install(cx);
     // Notifications name the app (on Linux, `notify-rust`'s app name).
