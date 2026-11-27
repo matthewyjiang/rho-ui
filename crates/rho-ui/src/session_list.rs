@@ -32,7 +32,7 @@ use crate::{
 
 mod family;
 
-use family::{Families, FamilyMarks};
+use family::{Families, FamilyMarks, OnScreen};
 pub(crate) use family::{Family, Fold, FoldLine, Pressing};
 
 /// What a session is doing, for the status at the right of its row.
@@ -379,8 +379,8 @@ pub(crate) struct SessionList {
     filter: Filter,
     /// The starters whose fold the user opened, for this run.
     open_folds: HashSet<SessionKey>,
-    /// The session on screen, until a rebuild opens the fold it's under.
-    reveal: Option<SessionKey>,
+    /// The session on screen, which its starter's fold shows and opens for.
+    on_screen: Option<OnScreen>,
 }
 
 /// What an open session's view last said of it, and its added directories'
@@ -459,7 +459,7 @@ impl SessionList {
             query: String::new(),
             filter: Filter::default(),
             open_folds: HashSet::new(),
-            reveal: None,
+            on_screen: None,
         }
     }
 
@@ -745,17 +745,19 @@ impl SessionList {
         }
     }
 
-    /// Clears session `id`'s Done, as it is on screen: whether it had one.
-    /// The list needs a rebuild after it.
-    pub(crate) fn mark_seen(&mut self, id: &SessionKey) -> bool {
-        self.unseen.remove(id)
+    /// Clears the Done of the session on screen ([`Self::set_on_screen`]),
+    /// as the user sees it. The list needs a rebuild after it.
+    pub(crate) fn mark_on_screen_seen(&mut self) {
+        if let Some(shown) = &self.on_screen {
+            self.unseen.remove(&shown.id);
+        }
     }
 
     /// Drops a deleted session.
     pub(crate) fn remove(&mut self, id: &SessionKey) {
         self.unseen.remove(id);
-        if self.reveal.as_ref() == Some(id) {
-            self.reveal = None;
+        if self.on_screen() == Some(id) {
+            self.on_screen = None;
         }
         self.rows.retain(|row| row.id != *id);
         self.live.retain(|open| open.live.id != *id);
@@ -763,8 +765,11 @@ impl SessionList {
     }
 
     /// Forgets every open session and job of `machine`, once the
-    /// connection that followed them is gone.
+    /// connection that followed them is gone, and its session on screen.
     pub(crate) fn clear_live(&mut self, machine: &MachineId) {
+        if self.on_screen().is_some_and(|id| id.machine == *machine) {
+            self.on_screen = None;
+        }
         self.live.retain(|open| open.live.id.machine != *machine);
         self.jobs.retain(|job| job.id.machine != *machine);
         self.rows
@@ -1621,7 +1626,8 @@ mod tests {
         // The app lists the sessions again when the jobs change.
         list.set_saved(&here(), vec![saved("a", Some("a"), 8)]);
         assert!(done(&mut list), "the daemon's list keeps Done");
-        assert!(list.mark_seen(&id("a")));
+        list.set_on_screen(Some(&id("a")));
+        list.mark_on_screen_seen();
         assert!(!done(&mut list));
 
         list.set_live(live("a", None, Activity::Working(now)), 0, None, 9);
@@ -1653,7 +1659,8 @@ mod tests {
         };
         let mut list = restart(&db);
         assert!(done(&mut list), "Done outlives a restart");
-        assert!(list.mark_seen(&id("a")));
+        list.set_on_screen(Some(&id("a")));
+        list.mark_on_screen_seen();
         assert!(!done(&mut restart(&db)), "seen stays seen");
     }
 

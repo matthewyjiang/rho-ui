@@ -1826,8 +1826,9 @@ fn the_row_menu_renames_pins_and_copies_a_session() {
     assert_eq!(copied.as_deref(), Some("s1"));
 }
 
-/// Settling a session that started others saves the mark of each in the
-/// daemon, so another rho-ui shows the whole family settled.
+/// Snoozing a session that started others saves the mark of each in the
+/// daemon, so another rho-ui shows the whole family snoozed. Pinning the
+/// snoozed starter brings the family back, as Restore does.
 #[test]
 fn a_move_marks_a_whole_family_in_the_daemon() {
     let fake = FakeDaemon::start(Script::default());
@@ -1839,24 +1840,41 @@ fn a_move_marks_a_whole_family_in_the_daemon() {
         is_visible(window, "session-local-s1-fold")
     });
     ui.act(|window, cx| window.hover("session-local-s1", cx));
-    ui.click("settle");
-    ui.wait_until("the family on the settled list", |window, _, _| {
-        !is_visible(window, "session-local-s1") && is_visible(window, "toggle-settled")
+    ui.click("snooze");
+    ui.click("snooze-4h");
+    ui.wait_until("the family on the snoozed list", |window, _, _| {
+        !is_visible(window, "session-local-s1") && is_visible(window, "toggle-snoozed")
     });
-    ui.wait_for_daemon("s1 and w1 marked done", |fake| {
+    ui.wait_for_daemon("s1 and w1 marked snoozed", |fake| {
         ["s1", "w1"]
             .iter()
-            .all(|id| matches!(fake.mark(id), Some(SessionMark::Done { .. })))
+            .all(|id| matches!(fake.mark(id), Some(SessionMark::Snoozed { .. })))
+    });
+
+    ui.click("toggle-snoozed");
+    ui.act(|window, cx| window.right_click("session-local-s1", cx));
+    click_label(&mut ui, "Pin");
+    ui.wait_for_daemon("s1 pinned and w1 kept", |fake| {
+        matches!(fake.mark("s1"), Some(SessionMark::Pinned { .. }))
+            && matches!(fake.mark("w1"), Some(SessionMark::Kept { .. }))
+    });
+    ui.click("session-local-s1-fold");
+    ui.wait_until("the family back on the active list", |window, _, _| {
+        is_visible(window, "session-local-w1") && !is_visible(window, "toggle-snoozed")
     });
 }
 
 /// Sessions a session started fold under it, behind a line that counts
 /// them: closed at first, opened by a click, and opened by itself when one
 /// of them comes on screen from elsewhere. A row under the fold opens its
-/// session as any row does.
+/// session as any row does, and one rho settled on its own, as it does when
+/// its pull request merges, shows there while it is on screen.
 #[test]
 fn sessions_a_session_started_fold_under_it() {
     let fake = FakeDaemon::start(Script::default());
+    // First, so the daemon dates it no later than it stamps the mark.
+    fake.start_session("s1", "w0", "Merge the lexer", Started::Idle);
+    fake.set_mark("w0", &NewSessionMark::Done);
     fake.start_session("s1", "w1", "Write the parser", Started::Idle);
     fake.start_session("s1", "w2", "Test the parser", Started::Idle);
     fake.start_session("s1", "w3", "Review the parser", Started::Working);
@@ -1890,20 +1908,22 @@ fn sessions_a_session_started_fold_under_it() {
     ui.wait_for_session("another session open", |session| {
         session.id().as_str() == "old"
     });
+    // Opened from elsewhere, as from its lead's Work.
     let app = ui.app.clone();
     ui.act(|window, cx| {
         app.update(cx, |app, cx| {
-            let w2 = SessionKey::local("w2");
-            app.open_session(w2, PathBuf::from("/w/a"), None, Kind::Session, window, cx);
+            let w0 = SessionKey::local("w0");
+            app.open_session(w0, PathBuf::from("/w/a"), None, Kind::Session, window, cx);
         });
     });
     ui.wait_until(
         "the fold open on the session on screen",
         |window, cx, app| {
             let on_screen = app.active_session().map(|view| view.read(cx).live().id);
-            is_visible(window, "session-local-w2") && on_screen == Some(SessionKey::local("w2"))
+            is_visible(window, "session-local-w0") && on_screen == Some(SessionKey::local("w0"))
         },
     );
+    ui.shot("merged-on-screen");
 }
 
 /// Starts a lead, "new-2", from the sidebar with the first message "Fix

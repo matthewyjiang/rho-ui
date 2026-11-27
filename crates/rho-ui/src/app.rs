@@ -1016,9 +1016,7 @@ impl RhoApp {
             SidebarEvent::Rename { id, title } => {
                 self.rename_session(id.clone(), title.clone(), window, cx);
             }
-            SidebarEvent::Mark { sessions, mark } => {
-                self.mark_sessions(sessions.clone(), mark.clone(), window, cx);
-            }
+            SidebarEvent::Mark { marks } => self.mark_sessions(marks.clone(), window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
             SidebarEvent::ToggleCollapsed => self.toggle_sidebar(window, cx),
             // The sidebar's width is laid out here.
@@ -1777,8 +1775,8 @@ impl RhoApp {
         .detach();
     }
 
-    /// Saves `mark` as the mark of each of `sessions`, a session and the
-    /// sessions it started, in their daemon, then lists the machine's
+    /// Saves each of `marks`, a session's mark, for sessions of one family,
+    /// in their daemon, one after another, then lists the machine's
     /// sessions again: the list holds each mark as the daemon stamped it,
     /// or, from the first the daemon refused on, the one the session had,
     /// and the user is told why. A list still being read goes unanswered,
@@ -1787,12 +1785,11 @@ impl RhoApp {
     /// marks it had.
     fn mark_sessions(
         &mut self,
-        sessions: Vec<SessionKey>,
-        mark: NewSessionMark,
+        marks: Vec<(SessionKey, NewSessionMark)>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(machine) = sessions.first().map(|id| id.machine.clone()) else {
+        let Some(machine) = marks.first().map(|(id, _)| id.machine.clone()) else {
             return;
         };
         // A pin moves it too: to the top of the list, or back off it.
@@ -1806,8 +1803,8 @@ impl RhoApp {
         }
         cx.spawn_in(window, async move |this, cx| {
             let mut result = Ok(());
-            for id in &sessions {
-                result = daemon.mark_session(&id.id, mark.clone()).await;
+            for (id, mark) in marks {
+                result = daemon.mark_session(&id.id, mark).await;
                 if result.is_err() {
                     break;
                 }
@@ -1965,7 +1962,7 @@ impl RhoApp {
         }
         self.sync_drafts(cx);
         self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_active(active, cx));
+            .update(cx, |sidebar, cx| sidebar.set_active(active.as_ref(), cx));
         self.panel
             .update(cx, |panel, cx| panel.set_session(session, cx));
         cx.notify();

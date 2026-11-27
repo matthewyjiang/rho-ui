@@ -278,12 +278,11 @@ pub(crate) enum SidebarEvent {
         id: SessionKey,
         title: SharedString,
     },
-    /// Save `mark` as the mark of each of `sessions`, a session and the
-    /// sessions it started, in their daemon. Their rows show it already
-    /// when the machine is connected.
+    /// Save each of `marks`, a session's mark, for sessions of one family,
+    /// in their daemon, as one move. Their rows show them already when the
+    /// machine is connected.
     Mark {
-        sessions: Vec<SessionKey>,
-        mark: NewSessionMark,
+        marks: Vec<(SessionKey, NewSessionMark)>,
     },
     OpenSettings,
     /// Collapse the sidebar to its rail, or open it again; see
@@ -353,7 +352,6 @@ pub(crate) struct SidebarView {
     prs: Entity<PullRequests>,
     layout: SidebarLayout,
     saved_filter: SavedFilter,
-    active: Option<SessionKey>,
     /// Whether the window has the focus, as its last change said: the
     /// session on screen counts as seen only while it does.
     focus: Focus,
@@ -447,7 +445,6 @@ impl SidebarView {
             prs,
             layout: state.layout,
             saved_filter: state.filter,
-            active: None,
             focus: Focus::Focused,
             active_draft: None,
             hover: None,
@@ -524,14 +521,6 @@ impl SidebarView {
     pub(crate) fn remove_machine(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
         self.list.remove_machine(machine);
         self.prune_filter(|filter| filter.forget_machine(machine));
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.machine == *machine)
-        {
-            self.list.reveal(None);
-            self.active = None;
-        }
         self.rebuild(cx);
     }
 
@@ -588,9 +577,6 @@ impl SidebarView {
     /// Drops a session that was deleted.
     pub(crate) fn remove(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
         self.list.remove(id);
-        if self.active.as_ref() == Some(id) {
-            self.active = None;
-        }
         self.rebuild(cx);
     }
 
@@ -598,26 +584,16 @@ impl SidebarView {
     /// connection is gone.
     pub(crate) fn clear_live(&mut self, machine: &MachineId, cx: &mut Context<'_, Self>) {
         self.list.clear_live(machine);
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.machine == *machine)
-        {
-            self.list.reveal(None);
-            self.active = None;
-        }
         self.rebuild(cx);
     }
 
-    /// Puts session `id` on screen, opening the fold it is under.
-    pub(crate) fn set_active(&mut self, id: Option<SessionKey>, cx: &mut Context<'_, Self>) {
-        if self.active != id {
-            self.list.reveal(id.as_ref());
-            self.active = id;
+    /// Puts session `id` on screen, opening the fold it is under and
+    /// showing it there while it is on screen.
+    pub(crate) fn set_active(&mut self, id: Option<&SessionKey>, cx: &mut Context<'_, Self>) {
+        if self.list.on_screen() != id {
+            self.list.set_on_screen(id);
             // Opening a session is seeing it, focus or not.
-            if let Some(active) = &self.active {
-                self.list.mark_seen(active);
-            }
+            self.list.mark_on_screen_seen();
             // Its PR is listed, whichever shelf it is on.
             self.rebuild(cx);
         }
@@ -642,8 +618,8 @@ impl SidebarView {
     /// have seen it, so its row says Done until the focus comes back
     /// ([`Self::set_focus`]). The list needs a rebuild after it.
     fn mark_active_seen(&mut self) {
-        if let (Some(active), Focus::Focused) = (&self.active, self.focus) {
-            self.list.mark_seen(active);
+        if self.focus == Focus::Focused {
+            self.list.mark_on_screen_seen();
         }
     }
 
@@ -730,7 +706,11 @@ impl SidebarView {
         });
         let active = self.list.on_active_shelf(named);
         let mut listed: Vec<SessionKey> = Vec::new();
-        for id in active.into_iter().chain(drawn).chain(self.active.clone()) {
+        for id in active
+            .into_iter()
+            .chain(drawn)
+            .chain(self.list.on_screen().cloned())
+        {
             if !listed.contains(&id) {
                 listed.push(id);
             }
@@ -771,38 +751,52 @@ impl SidebarView {
 
     fn shelve(&mut self, id: &SessionKey, action: ShelfAction, cx: &mut Context<'_, Self>) {
         // A family moves as one.
+        let mark = action.mark(now());
         let family = self.list.family(id);
-        self.mark(family, action.mark(now()), cx);
+        self.mark(
+            family.into_iter().map(|id| (id, mark.clone())).collect(),
+            cx,
+        );
     }
 
+    /// Pins session `id` or unpins it. Pinning a snoozed family also brings
+    /// back the sessions snoozed with it, as Restore does
+    /// ([`SessionList::pinned_with`]).
     fn set_pinned(&mut self, id: &SessionKey, pin: Pin, cx: &mut Context<'_, Self>) {
-        self.mark(vec![id.clone()], pin.mark(), cx);
+        let kept = match pin {
+            Pin::Pin => self.list.pinned_with(id),
+            Pin::Unpin => Vec::new(),
+        };
+        let kept = kept.into_iter().map(|id| (id, NewSessionMark::Kept));
+        self.mark(
+            std::iter::once((id.clone(), pin.mark()))
+                .chain(kept)
+                .collect(),
+            cx,
+        );
     }
 
-    /// Asks the app to save `mark` as the mark of each of `sessions`, a
-    /// session and the sessions it started, in their daemon; each is one it
-    /// has saved, as a row offers no move otherwise and
-    /// [`SessionList::family`] leaves the others out. They show it at once,
-    /// stamped with this machine's time until the daemon's own comes, only
-    /// when the daemon can take it, as a rename is; the daemon's next list
-    /// replaces it either way, so a mark it refused goes.
-    fn mark(
-        &mut self,
-        sessions: Vec<SessionKey>,
-        mark: NewSessionMark,
-        cx: &mut Context<'_, Self>,
-    ) {
+    /// Asks the app to save `marks`, each a session's mark, for sessions of
+    /// one family, in their daemon; each is one it has saved, as a row
+    /// offers no move otherwise and [`SessionList::family`] leaves the
+    /// others out. They show at once, stamped with this machine's time
+    /// until the daemon's own comes, only when the daemon can take them, as
+    /// a rename is; the daemon's next list replaces them either way, so a
+    /// mark it refused goes.
+    fn mark(&mut self, marks: Vec<(SessionKey, NewSessionMark)>, cx: &mut Context<'_, Self>) {
         let machines = self.machines.read(cx);
-        let connected = sessions.first().is_some_and(|id| {
+        let connected = marks.first().is_some_and(|(id, _)| {
             matches!(
                 machines.status(&id.machine),
                 Some(MachineStatus::Ready { .. })
             )
         });
-        if let Some(shown) = SessionMark::stamped(&mark, now()).filter(|_| connected) {
+        if connected {
             let mut moved = false;
-            for id in &sessions {
-                moved |= self.list.set_mark(id, shown);
+            for (id, mark) in &marks {
+                if let Some(shown) = SessionMark::stamped(mark, now()) {
+                    moved |= self.list.set_mark(id, shown);
+                }
             }
             if moved {
                 // The row moves away from the pointer.
@@ -810,7 +804,7 @@ impl SidebarView {
                 self.rebuild(cx);
             }
         }
-        cx.emit(SidebarEvent::Mark { sessions, mark });
+        cx.emit(SidebarEvent::Mark { marks });
     }
 
     /// Turns `id`'s title into a text box holding it, all selected.
@@ -1211,7 +1205,7 @@ impl SidebarView {
 
     fn row_state(&self, row: &Row) -> RowState {
         RowState {
-            active: self.active.as_ref() == Some(&row.id),
+            active: self.list.on_screen() == Some(&row.id),
             hovered: self.hover.as_ref().is_some_and(|hover| hover.id == row.id),
         }
     }
@@ -1643,7 +1637,7 @@ impl SidebarView {
             .chain(machines.iter().filter_map(|machine| {
                 let offer = installs.offer(&machine.id, cx)?;
                 if machine.id.is_local()
-                    && self.active.is_none()
+                    && self.list.on_screen().is_none()
                     && offer.replaces_connection_error()
                 {
                     return None;

@@ -4,7 +4,8 @@
 //! folds under and what each family comes to ([`FamilyMarks`]), which
 //! shelves, ranks and dates it, and [`SessionList::push_family`] lays one
 //! out under its starter. An active family's fold leaves out the sessions
-//! of it that are settled or snoozed on their own ([`Row::away`]).
+//! of it that are settled or snoozed on their own ([`Row::away`]), but for
+//! the one on screen.
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,6 +89,15 @@ pub(crate) enum Fold {
     Showing,
 }
 
+/// The session on screen, as the sidebar last said: its row shows under
+/// its starter even when it is away from the fold ([`Row::away`]).
+pub(super) struct OnScreen {
+    pub(super) id: SessionKey,
+    /// Whether a rebuild has opened the fold it is under: once, so the user
+    /// can close it again.
+    revealed: bool,
+}
+
 /// The line under a starter's row: how many of the sessions it started
 /// show under it, the most pressing thing of those, and whether they
 /// show.
@@ -125,7 +135,8 @@ impl Row {
 
     /// Whether it is settled or snoozed apart from its family ([`Row::apart`])
     /// while the family shows on the active list: its starter's fold leaves
-    /// it out, but for a search, and nothing counts it as wanting the user.
+    /// it out, but for a search or while it is on screen, and nothing counts
+    /// it as wanting the user.
     pub(crate) fn away(&self) -> bool {
         self.shelf == Shelf::Active && self.apart.is_some()
     }
@@ -214,12 +225,16 @@ impl SessionList {
         }
     }
 
-    /// Opens the fold session `id`, on screen now, is under, at the first
-    /// rebuild that lists it under its starter, which may come a poll
-    /// later. The user can close it again. Another session, or `None`,
-    /// drops the request.
-    pub(crate) fn reveal(&mut self, id: Option<&SessionKey>) {
-        self.reveal = id.cloned();
+    /// Puts session `id` on screen, or none. The fold it is under opens at
+    /// the first rebuild that lists it under its starter, which may come a
+    /// poll later, and the user can close it again. While it is on screen
+    /// the fold shows and counts it even when it is away ([`Row::away`]),
+    /// as when it was opened from its lead's Work.
+    pub(crate) fn set_on_screen(&mut self, id: Option<&SessionKey>) {
+        self.on_screen = id.map(|id| OnScreen {
+            id: id.clone(),
+            revealed: false,
+        });
     }
 
     /// The sessions of the family `starter` heads that a move marks,
@@ -230,21 +245,50 @@ impl SessionList {
     /// anyway. One settled or snoozed apart from the family
     /// ([`Row::away`]) keeps its own mark.
     pub(crate) fn family(&self, starter: &SessionKey) -> Vec<SessionKey> {
-        let families = Families::of(&self.rows);
-        let top = self.rows.iter().position(|row| row.id == *starter);
-        let members = top.map_or(&[][..], |ix| families.members(ix));
-        let saved = members
-            .iter()
-            .map(|&ix| &self.rows[ix])
-            .filter(|row| row.saved && row.apart.is_none());
         std::iter::once(starter.clone())
-            .chain(saved.map(|row| row.id.clone()))
+            .chain(self.moved_with(starter))
             .collect()
     }
 
+    /// The sessions under `starter` that a pin of it brings back, as
+    /// Restore would: those [`Self::family`] marks when the family rests
+    /// snoozed, which were snoozed with it. None otherwise: an active
+    /// family's are where they are, and in a settled family one settled
+    /// with it can't be told apart from one rho settled on its own when its
+    /// pull request merged.
+    pub(crate) fn pinned_with(&self, starter: &SessionKey) -> Vec<SessionKey> {
+        let snoozed = self.row(starter).is_some_and(
+            |row| matches!(row.family, Family::Top(marks) if marks.rest == Shelf::Snoozed),
+        );
+        if snoozed {
+            self.moved_with(starter)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The sessions under `starter` that a move of it marks; see
+    /// [`Self::family`].
+    fn moved_with(&self, starter: &SessionKey) -> Vec<SessionKey> {
+        let families = Families::of(&self.rows);
+        let top = self.rows.iter().position(|row| row.id == *starter);
+        let members = top.map_or(&[][..], |ix| families.members(ix));
+        members
+            .iter()
+            .map(|&ix| &self.rows[ix])
+            .filter(|row| row.saved && row.apart.is_none())
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    /// The session on screen, as [`Self::set_on_screen`] last said.
+    pub(crate) fn on_screen(&self) -> Option<&SessionKey> {
+        self.on_screen.as_ref().map(|shown| &shown.id)
+    }
+
     /// Readies the folds for a rebuild: forgets those of sessions the list
-    /// no longer holds on their own, and opens the one the session to
-    /// reveal is under, once it is under one. A starter keeps its fold
+    /// no longer holds on their own, and opens the one the session on
+    /// screen is under, once it is under one. A starter keeps its fold
     /// while none of its sessions is listed, as between a job's end and
     /// the saved list that names it.
     pub(super) fn keep_folds(&mut self, families: &Families) {
@@ -252,17 +296,19 @@ impl SessionList {
         let position = |id: &SessionKey| rows.iter().position(|row| row.id == *id);
         self.open_folds
             .retain(|id| position(id).is_some_and(|ix| families.starter(ix).is_none()));
-        let revealed = self.reveal.as_ref().and_then(position);
-        if let Some(starter) = revealed.and_then(|ix| families.starter(ix)) {
+        let Some(shown) = self.on_screen.as_mut().filter(|shown| !shown.revealed) else {
+            return;
+        };
+        if let Some(starter) = position(&shown.id).and_then(|ix| families.starter(ix)) {
             self.open_folds.insert(rows[starter].id.clone());
-            self.reveal = None;
+            shown.revealed = true;
         }
     }
 
     /// The rows under top row `top` that show, by `passes`: those the
     /// filter shows that match the search, or whose starter does. One away
     /// from the fold ([`Row::away`]) shows only for a search, which opens
-    /// every shelf.
+    /// every shelf, or while it is on screen.
     pub(super) fn drawn<'a>(
         &'a self,
         families: &'a Families,
@@ -270,10 +316,12 @@ impl SessionList {
         passes: &'a [Passes],
     ) -> impl Iterator<Item = usize> + 'a {
         let searching = !self.query.is_empty();
+        let on_screen = self.on_screen();
         families.members(top).iter().copied().filter(move |&ix| {
+            let row = &self.rows[ix];
             passes[ix].filter
                 && (passes[ix].search || passes[top].search)
-                && (searching || !self.rows[ix].away())
+                && (searching || !row.away() || on_screen == Some(&row.id))
         })
     }
 
@@ -370,7 +418,8 @@ mod tests {
     /// A move of a family asks the daemon to mark the sessions it has
     /// saved, not one it only runs, which it would refuse, nor one settled
     /// on its own while the family is elsewhere, which a snooze's end or a
-    /// restore would bring back.
+    /// restore would bring back. A pin brings back the same sessions of a
+    /// snoozed family, and none of an active or a settled one.
     #[test]
     fn a_move_marks_the_family_sessions_the_daemon_has_saved() {
         let mut list = SessionList::default();
@@ -391,14 +440,24 @@ mod tests {
         list.set_jobs(&here(), vec![running], Instant::now(), 5);
         rebuild(&mut list, 5);
         assert_eq!(list.family(&id("lead")), [id("lead"), id("w1")]);
+        assert!(list.pinned_with(&id("lead")).is_empty(), "active");
 
-        // Snoozed as it was moved, the family's Restore leaves Merge out.
+        // Snoozed as it was moved, the family's Restore, or its pin, leaves
+        // Merge out.
         list.set_jobs(&here(), Vec::new(), Instant::now(), 6);
         for snoozed in ["lead", "w1"] {
             mark(&mut list, snoozed, SessionMark::Snoozed { until: 100 });
         }
         rebuild(&mut list, 6);
         assert_eq!(list.family(&id("lead")), [id("lead"), id("w1")]);
+        assert_eq!(list.pinned_with(&id("lead")), [id("w1")]);
+
+        // Settled, Write reads as Merge does.
+        for settled in ["lead", "w1"] {
+            mark(&mut list, settled, SessionMark::Done { at: 7 });
+        }
+        rebuild(&mut list, 7);
+        assert!(list.pinned_with(&id("lead")).is_empty(), "settled");
     }
 
     #[test]
@@ -522,7 +581,7 @@ mod tests {
 
         // On screen before the list says who started it, it shows on its
         // own until a poll says, which opens the fold.
-        list.reveal(Some(&id("w4")));
+        list.set_on_screen(Some(&id("w4")));
         let unknown = job("w4", JobActivity::Working, None);
         list.set_jobs(&here(), vec![testing(), unknown], Instant::now(), 13);
         rebuild(&mut list, 13);
@@ -550,7 +609,8 @@ mod tests {
     /// as rho settles one when its last linked pull request merges, leaves
     /// its family's fold: the fold neither draws nor counts it, its line
     /// says nothing of it, it doesn't rank the family, and it isn't on the
-    /// active list that the title's count reads. A search finds it; the end
+    /// active list that the title's count reads. A search finds it, and it
+    /// shows while it is on screen; the end
     /// of its snooze or new activity brings it back, by its shelf's rule; a
     /// family off the active shelf shows all of it, and so does one snoozed
     /// together that a busy session wakes.
@@ -592,6 +652,15 @@ mod tests {
         rebuild(&mut list, 100);
         assert_eq!(shown(&list), ["Lead", "• 1 started, 1 done", "  Test"]);
         list.set_query("");
+        // Opened from elsewhere, as from the lead's Work, until another is.
+        list.set_on_screen(Some(&id("w2")));
+        rebuild(&mut list, 100);
+        let opened = ["Other", "Lead", "⌄ 2 started, 1 done", "  Test", "  Write"];
+        assert_eq!(shown(&list), opened);
+        list.set_on_screen(Some(&id("other")));
+        rebuild(&mut list, 100);
+        assert_eq!(shown(&list), ["Other", "Lead", "⌄ 1 started", "  Write"]);
+        list.set_on_screen(None);
         rebuild(&mut list, 200);
         let woke = ["Other", "Lead", "⌄ 2 started", "  Review", "  Write"];
         assert_eq!(shown(&list), woke);
