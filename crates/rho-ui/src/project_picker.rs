@@ -22,6 +22,10 @@
 //! session instead of its checkout; see [`Checkout`]. The choice holds for
 //! new sessions after it, across runs too ([`LastCheckout`]).
 //!
+//! Above the projects, No project starts the session in a scratch folder of
+//! its own instead (see [`crate::no_project`]), for work that belongs to no
+//! repository. It is never the draft's default.
+//!
 //! A project's age and the check read [`Workspaces`]: the saved sessions
 //! date each folder, and its repository says which project it is in, so a
 //! session in a worktree counts for its project.
@@ -77,11 +81,38 @@ pub(crate) const ROW_REMS: f32 = 3.22;
 const MAX_ROWS: u8 = 5;
 /// Rows the list keeps room for, so the empty state has space.
 const MIN_ROWS: u8 = 2;
+/// What the row that starts a session in no project reads.
+const NO_PROJECT: &str = "No project";
+
+/// Where a draft's session starts, as its picker checks it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Pick {
+    /// In this directory: a project's folder, or one in it.
+    Folder(Place),
+    /// In no project: in a scratch folder of its own on this machine.
+    NoProject(MachineId),
+}
+
+impl Pick {
+    pub(crate) fn machine(&self) -> &MachineId {
+        match self {
+            Pick::Folder(place) => &place.machine,
+            Pick::NoProject(machine) => machine,
+        }
+    }
+
+    fn folder(&self) -> Option<&Place> {
+        match self {
+            Pick::Folder(place) => Some(place),
+            Pick::NoProject(_) => None,
+        }
+    }
+}
 
 /// What the picker tells its draft.
 pub(crate) enum PickerEvent {
-    /// The user chose this directory for the new session.
-    Picked(Place),
+    /// The user chose where the new session starts.
+    Picked(Pick),
     /// The user left the search with Escape: back to the composer.
     Dismissed,
 }
@@ -138,13 +169,12 @@ pub(crate) struct ProjectPicker {
 impl EventEmitter<PickerEvent> for ProjectPicker {}
 
 impl ProjectPicker {
-    /// A picker over `projects` on `machines` with the project of
-    /// `current` checked.
+    /// A picker over `projects` on `machines` with `current` checked.
     pub(crate) fn new(
         workspaces: &Entity<Workspaces>,
         projects: &Entity<Projects>,
         machines: &Entity<Machines>,
-        current: Place,
+        current: Pick,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -203,8 +233,8 @@ impl ProjectPicker {
 
     /// Where the session works: the project's checkout, or a new worktree
     /// of it, which the daemon adds only as the session starts. The user's
-    /// last choice ([`LastCheckout`]), but the checkout outside git, which
-    /// leaves the choice for the next git project.
+    /// last choice ([`LastCheckout`]), but the checkout outside git and in
+    /// no project, which leaves the choice for the next git project.
     pub(crate) fn checkout(&self, cx: &App) -> Checkout {
         if self.in_repository(cx) {
             LastCheckout::get(cx)
@@ -223,9 +253,15 @@ impl ProjectPicker {
     fn in_repository(&self, cx: &App) -> bool {
         let list = self.list.read(cx).delegate();
         let workspaces = list.workspaces.read(cx);
-        workspaces
-            .find(&[&list.current])
+        list.current
+            .folder()
+            .and_then(|folder| workspaces.find(&[folder]))
             .is_some_and(|ix| workspaces.get(ix).branch.is_some())
+    }
+
+    /// Where the draft's session starts, as checked.
+    pub(crate) fn current<'a>(&self, cx: &'a App) -> &'a Pick {
+        &self.list.read(cx).delegate().current
     }
 
     /// The button naming where the session works, with a menu to choose:
@@ -278,7 +314,7 @@ impl ProjectPicker {
         if !machines.several() {
             return None;
         }
-        let current = list.current.machine.clone();
+        let current = list.current.machine().clone();
         // A machine not connected can't open the draft's session.
         let choices: Vec<(MachineId, SharedString, bool)> = machines
             .iter()
@@ -323,11 +359,16 @@ impl ProjectPicker {
     }
 
     /// Runs the session on `machine`: moves the draft to its project's
-    /// checkout there, or with none, to the machine's home folder.
+    /// checkout there, or with none, to the machine's home folder; in no
+    /// project, it stays in none.
     fn choose_machine(&mut self, machine: MachineId, cx: &mut Context<'_, Self>) {
         let list = self.list.read(cx).delegate();
         // Already there, maybe in a worktree or subfolder: stay.
-        if machine == list.current.machine {
+        if machine == *list.current.machine() {
+            return;
+        }
+        if let Pick::NoProject(_) = list.current {
+            cx.emit(PickerEvent::Picked(Pick::NoProject(machine)));
             return;
         }
         let target = list.checkout_on(&machine, cx).unwrap_or_else(|| {
@@ -335,7 +376,7 @@ impl ProjectPicker {
             let home = list.workspaces.read(cx).home(&machine);
             Place::new(machine, home.unwrap_or_else(|| "/".into()))
         });
-        cx.emit(PickerEvent::Picked(target));
+        cx.emit(PickerEvent::Picked(Pick::Folder(target)));
     }
 
     /// Puts `query` in the search, with the keyboard there, as browsing
@@ -369,16 +410,16 @@ impl ProjectPicker {
         });
     }
 
-    /// Checks the project of `cwd`, as the draft moved there, and clears
-    /// the search. The list now shows its machine's checkouts.
+    /// Checks `pick`, as the draft moved there, and clears the search. The
+    /// list now shows its machine's checkouts.
     pub(crate) fn set_current(
         &mut self,
-        cwd: Place,
+        pick: Pick,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         self.list.update(cx, |list, cx| {
-            list.delegate_mut().current = cwd;
+            list.delegate_mut().current = pick;
             list.set_query("", window, cx);
             cx.notify();
         });
@@ -398,12 +439,17 @@ impl ProjectPicker {
     }
 
     /// Acts on the row at `ix`: starts the session in a project, adding a
-    /// typed folder's project to the list first; goes into a subfolder; or
-    /// looks for a project elsewhere on the chosen machine, at its path
-    /// there.
+    /// typed folder's project to the list first, or in no project; goes
+    /// into a subfolder; or looks for a project elsewhere on the chosen
+    /// machine, at its path there.
     fn pick(&mut self, ix: IndexPath, window: &mut Window, cx: &mut Context<'_, Self>) {
         let list = self.list.read(cx).delegate();
         let root = match list.rows.get(ix.row).cloned() {
+            Some(Row::NoProject) => {
+                let machine = list.current.machine().clone();
+                cx.emit(PickerEvent::Picked(Pick::NoProject(machine)));
+                return;
+            }
             Some(Row::Project(ix)) => list.workspaces.read(cx).get(ix).place().clone(),
             Some(Row::Add(folder)) => {
                 add(&self.projects, folder.root.clone(), cx);
@@ -429,7 +475,7 @@ impl ProjectPicker {
             }
             Some(Row::Unread(_)) | None => return,
         };
-        cx.emit(PickerEvent::Picked(root));
+        cx.emit(PickerEvent::Picked(Pick::Folder(root)));
     }
 
     /// Clones `source` into the draft's machine's clone folder, then adds
@@ -443,7 +489,7 @@ impl ProjectPicker {
         if list.cloning.is_some() {
             return;
         }
-        let machine = list.current.machine.clone();
+        let machine = list.current.machine().clone();
         let reader = list.reader(cx);
         let folder = list.machines.read(cx).clone_folder(&machine).to_string();
         let executor = cx.background_executor().clone();
@@ -456,7 +502,7 @@ impl ProjectPicker {
                     Ok(path) => {
                         let root = Place::new(machine, path);
                         add(&this.projects, root.clone(), cx);
-                        cx.emit(PickerEvent::Picked(root));
+                        cx.emit(PickerEvent::Picked(Pick::Folder(root)));
                     }
                     Err(why) => window.push_notification(
                         Notification::error(why).title(format!("Couldn't clone {}", source.name)),
@@ -526,7 +572,7 @@ impl ProjectPicker {
     /// chooser on this one, else, or in a browser, by browsing from `~/`
     /// in the search.
     fn add_project(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if workspaces::reads_here(&self.list.read(cx).delegate().current.machine) {
+        if workspaces::reads_here(self.list.read(cx).delegate().current.machine()) {
             Self::browse(window, cx);
         } else {
             self.search("~/", window, cx);
@@ -564,7 +610,7 @@ impl ProjectPicker {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 add(&this.projects, root.clone(), cx);
-                cx.emit(PickerEvent::Picked(root));
+                cx.emit(PickerEvent::Picked(Pick::Folder(root)));
             });
         })
         .detach();
@@ -579,6 +625,7 @@ impl ProjectPicker {
         let list = self.list.read(cx);
         let delegate = list.delegate();
         Some(match delegate.rows.get(list.selected_index()?.row)? {
+            Row::NoProject => NO_PROJECT_ID.to_owned(),
             Row::Project(ix) => {
                 element_id(delegate.workspaces.read(cx).get(*ix).place()).to_string()
             }
@@ -592,6 +639,9 @@ impl ProjectPicker {
         })
     }
 }
+
+/// The No project row's element ID.
+const NO_PROJECT_ID: &str = "project-none";
 
 /// A project row's element ID: `project-<machine>:<path>`.
 fn element_id(place: &Place) -> SharedString {
@@ -722,6 +772,8 @@ struct Folder {
 /// One row of the list.
 #[derive(Clone, PartialEq)]
 enum Row {
+    /// No project: a scratch folder of the session's own.
+    NoProject,
     /// A project's checkout on the chosen machine: the index of its folder
     /// in the workspaces.
     Project(usize),
@@ -747,10 +799,11 @@ struct ProjectList {
     machines: Entity<Machines>,
     /// Each project's index in the workspaces, in the order added.
     known: Vec<usize>,
-    /// The draft's directory, whose project is checked. Its machine is the
-    /// one the session runs on, whose checkouts the list shows and whose
-    /// folders a typed path names.
-    current: Place,
+    /// Where the draft's session starts, which is checked: its directory's
+    /// project, or No project. Its machine is the one the session runs on,
+    /// whose checkouts the list shows and whose folders a typed path
+    /// names.
+    current: Pick,
     /// The draft's project, if it is on the list.
     checked: Option<usize>,
     /// The project under the mouse, which shows Remove instead of its age.
@@ -760,7 +813,7 @@ struct ProjectList {
     /// first, then the subfolders it can go on to.
     found: Vec<Row>,
     rows: Vec<Row>,
-    /// How many rows an empty search lists.
+    /// How many rows an empty search lists, No project's too.
     listed: usize,
     /// The URL of the repository being cloned.
     cloning: Option<String>,
@@ -776,7 +829,7 @@ impl ProjectList {
         workspaces: Entity<Workspaces>,
         projects: Entity<Projects>,
         machines: Entity<Machines>,
-        current: Place,
+        current: Pick,
         cx: &mut App,
     ) -> Self {
         let mut list = Self {
@@ -826,7 +879,7 @@ impl ProjectList {
                 .child(Spinner::new().xsmall())
                 .child("Cloning…")
         } else {
-            let machine = self.machines.read(cx).label(&self.current.machine);
+            let machine = self.machines.read(cx).label(self.current.machine());
             h_flex()
                 .gap_1()
                 .child(Icon::new(gpui_kit::assets::IconName::Download).xsmall())
@@ -837,7 +890,7 @@ impl ProjectList {
 
     /// How the draft's machine's folders are read.
     fn reader(&self, cx: &App) -> Reader {
-        self.workspaces.read(cx).reader(&self.current.machine)
+        self.workspaces.read(cx).reader(self.current.machine())
     }
 
     /// Unix seconds of the newest session in the project at `ix`; 0 with
@@ -853,7 +906,7 @@ impl ProjectList {
     /// used if it has several.
     fn checkout_on(&self, machine: &MachineId, cx: &App) -> Option<Place> {
         let workspaces = self.workspaces.read(cx);
-        let draft = workspaces.get(workspaces.find(&[&self.current])?);
+        let draft = workspaces.get(workspaces.find(&[self.current.folder()?])?);
         self.known
             .iter()
             .map(|&ix| workspaces.get(ix))
@@ -864,15 +917,18 @@ impl ProjectList {
             .map(|workspace| workspace.place().clone())
     }
 
-    /// Lists what the search names as a path, then the projects on the
-    /// draft's machine whose name or path matches it, most recently used
-    /// first, then the projects only other machines hold.
+    /// Lists what the search names as a path, then No project and the
+    /// projects on the draft's machine if their name or path matches it,
+    /// the projects most recently used first, then the projects only other
+    /// machines hold.
     fn refilter(&mut self, cx: &App) {
         let workspaces = self.workspaces.read(cx);
-        let machine = &self.current.machine;
-        let current = workspaces
-            .find(&[&self.current])
-            .map_or_else(|| self.current.clone(), |ix| workspaces.get(ix).root());
+        let machine = self.current.machine();
+        let current = self.current.folder().map(|folder| {
+            workspaces
+                .find(&[folder])
+                .map_or_else(|| folder.clone(), |ix| workspaces.get(ix).root())
+        });
         self.last_used = self
             .known
             .iter()
@@ -899,16 +955,21 @@ impl ProjectList {
         self.checked = here
             .iter()
             .copied()
-            .find(|&ix| *workspaces.get(ix).place() == current);
-        self.listed = here.len() + elsewhere.len();
+            .find(|&ix| current.as_ref() == Some(workspaces.get(ix).place()));
+        self.listed = 1 + here.len() + elsewhere.len();
         let query = self.query.as_str();
         let name_matches = |ix: &usize| contains_ignore_case(&workspaces.get(*ix).name, query);
         let matches =
             |ix: &usize| name_matches(ix) || contains_ignore_case(&workspaces.get(*ix).path, query);
+        let no_project = contains_ignore_case(NO_PROJECT, query)
+            || self
+                .scratch_path(cx)
+                .is_some_and(|path| contains_ignore_case(&path, query));
         let found = &self.found;
         self.rows = found
             .iter()
             .cloned()
+            .chain(no_project.then_some(Row::NoProject))
             .chain(
                 here.into_iter()
                     .filter(|ix| matches(ix) && !found.contains(&Row::Project(*ix)))
@@ -926,19 +987,63 @@ impl ProjectList {
         self.now = time::now_unix();
     }
 
-    /// The row of the draft's project, if it matches the search.
+    /// The row of the draft's project, or No project, if it matches the
+    /// search.
     fn current_row(&self) -> Option<IndexPath> {
-        let checked = self.checked?;
-        let row = self
-            .rows
-            .iter()
-            .position(|row| matches!(row, Row::Project(ix) if *ix == checked))?;
+        let row = match self.current {
+            Pick::NoProject(_) => self.rows.iter().position(|row| *row == Row::NoProject)?,
+            Pick::Folder(_) => {
+                let checked = self.checked?;
+                self.rows
+                    .iter()
+                    .position(|row| matches!(row, Row::Project(ix) if *ix == checked))?
+            }
+        };
         Some(IndexPath::default().row(row))
+    }
+
+    /// The draft's machine's scratch root, with the home directory as `~`,
+    /// once found; what No project's row says it works in.
+    fn scratch_path(&self, cx: &App) -> Option<SharedString> {
+        let workspaces = self.workspaces.read(cx);
+        let machine = self.current.machine();
+        let root = workspaces.scratch_root(machine)?;
+        Some(workspaces::tilde(root, workspaces.home(machine).as_deref()).into())
+    }
+
+    /// No project's row: a tile without a badge, its scratch root, and the
+    /// check while the draft is in no project.
+    fn no_project_item(&self, cx: &App) -> ListItem {
+        let toggled = if matches!(self.current, Pick::NoProject(_)) {
+            Toggled::True
+        } else {
+            Toggled::False
+        };
+        ListItem::new(NO_PROJECT_ID)
+            .accessibility_label(NO_PROJECT)
+            .aria_toggled(toggled)
+            .child(
+                row(
+                    folder_tile(Icon::new(gpui_kit::assets::IconName::SquareDashed), cx)
+                        .into_any_element(),
+                    NO_PROJECT.into(),
+                    div().truncate().child(
+                        self.scratch_path(cx)
+                            .unwrap_or_else(|| "A folder of its own".into()),
+                    ),
+                    cx,
+                )
+                .child(check(toggled, cx)),
+            )
     }
 
     fn project_item(&self, ix: usize, cx: &mut Context<'_, ListState<Self>>) -> ListItem {
         let workspace = self.workspaces.read(cx).get(ix);
-        let checked = self.checked == Some(ix);
+        let toggled = if self.checked == Some(ix) {
+            Toggled::True
+        } else {
+            Toggled::False
+        };
         let root = workspace.place().clone();
         let removable = !self.projects.read(cx).is_found(&root);
         let trailing = if removable && self.hovered == Some(ix) {
@@ -964,22 +1069,9 @@ impl ProjectList {
                 .into_any_element()
         };
         let projects = self.projects.clone();
-        // Kit's `confirmed` check turns off the row's hover, so the check
-        // is drawn here.
-        let check = div().w_4().flex_shrink_0().when(checked, |this| {
-            this.child(
-                Icon::new(IconName::Check)
-                    .small()
-                    .text_color(cx.theme().muted_foreground),
-            )
-        });
         ListItem::new(element_id(&root))
             .accessibility_label(workspace.name.clone())
-            .aria_toggled(if checked {
-                Toggled::True
-            } else {
-                Toggled::False
-            })
+            .aria_toggled(toggled)
             .on_hover(cx.listener(move |list, hovered: &bool, _, cx| {
                 let this = list.delegate_mut();
                 if *hovered {
@@ -998,7 +1090,7 @@ impl ProjectList {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(trailing)
-                            .child(check),
+                            .child(check(toggled, cx)),
                     )
                     .context_menu(move |menu, _, cx| with_remove(menu, &projects, &root, cx)),
             )
@@ -1010,7 +1102,7 @@ impl ProjectList {
     fn elsewhere_item(&self, ix: usize, cx: &App) -> ListItem {
         let workspace = self.workspaces.read(cx).get(ix);
         let machines = self.machines.read(cx);
-        let here = machines.label(&self.current.machine);
+        let here = machines.label(self.current.machine());
         let trailing = match workspace.origin() {
             Some(origin) => self.clone_tag(origin, cx).into_any_element(),
             None => div()
@@ -1077,7 +1169,7 @@ impl ListDelegate for ProjectList {
         cx: &mut Context<'_, ListState<Self>>,
     ) -> Task<()> {
         query.clone_into(&mut self.query);
-        let machine = self.current.machine.clone();
+        let machine = self.current.machine().clone();
         let workspaces = self.workspaces.read(cx);
         let home = workspaces.home(&machine);
         let typed = Typed::parse(query, home.as_deref(), PathStyle::of(&machine));
@@ -1154,6 +1246,7 @@ impl ListDelegate for ProjectList {
     ) -> Option<ListItem> {
         let radius = cx.theme().radius;
         let item = match self.rows.get(ix.row)? {
+            Row::NoProject => self.no_project_item(cx),
             Row::Add(folder) => ListItem::new("project-typed")
                 .accessibility_label(folder.shown.clone())
                 .child(row(
@@ -1206,17 +1299,12 @@ impl ListDelegate for ProjectList {
         _: &mut Window,
         cx: &mut Context<'_, ListState<Self>>,
     ) -> impl IntoElement {
-        let (title, hint) = if self.listed == 0 && self.query.is_empty() {
-            (
-                "No projects yet",
-                "Add one with Add project…, or type its path",
-            )
-        } else {
-            (
-                "No matching projects",
-                "Type a path such as ~/code/app to add it",
-            )
-        };
+        // No project lists for an empty search, so only a search empties
+        // the list.
+        let (title, hint) = (
+            "No matching projects",
+            "Type a path such as ~/code/app to add it",
+        );
         v_flex()
             .size_full()
             .items_center()
@@ -1261,6 +1349,21 @@ fn row(tile: gpui_kit::AnyElement, name: SharedString, path: impl IntoElement, c
             .child(Label::new(name).text_sm().truncate())
             .child(div().text_xs().text_color(muted).child(path)),
     )
+}
+
+/// The check of the row the draft starts in, or the space it takes. Kit's
+/// `confirmed` check turns off the row's hover, so it is drawn here.
+fn check(toggled: Toggled, cx: &App) -> impl IntoElement {
+    div()
+        .w_4()
+        .flex_shrink_0()
+        .when(toggled == Toggled::True, |this| {
+            this.child(
+                Icon::new(IconName::Check)
+                    .small()
+                    .text_color(cx.theme().muted_foreground),
+            )
+        })
 }
 
 /// `icon` in a tile the size of a project badge.

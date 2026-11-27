@@ -146,8 +146,8 @@ pub(crate) struct DraftRow {
     /// The first line of its message; `None` while it has none, such as a
     /// message of attachments alone.
     pub(crate) title: Option<SharedString>,
-    /// Index into [`crate::workspaces::Workspaces`]; `None` for a lead's
-    /// draft until its session opens in the leads root.
+    /// Index into [`crate::workspaces::Workspaces`]; `None` for a draft in
+    /// no project until its session opens in its root.
     pub(crate) workspace: Option<usize>,
     /// The projects a lead's draft picked, by index into the workspaces.
     pub(crate) added: Vec<usize>,
@@ -401,7 +401,8 @@ struct Sifted<'r> {
     machine: &'r MachineId,
     kind: Kind,
     title: Option<&'r str>,
-    /// Its workspace's index; `None` for a lead's draft before it has one.
+    /// Its workspace's index; `None` for a draft in no project before it
+    /// has one.
     own: Option<usize>,
     /// Its added directories' indices.
     added: &'r [usize],
@@ -1024,7 +1025,7 @@ impl SessionList {
         let matches = |text: &str| contains_ignore_case(text, &self.query);
         let roots = named.iter().map(|&(_, root)| root);
         Passes {
-            filter: self.filter.shows(item.machine, roots, item.kind),
+            filter: self.filter.shows(item.machine, roots),
             search: self.query.is_empty()
                 || item.title.is_some_and(matches)
                 || named.iter().any(|&(name, _)| matches(name)),
@@ -1043,7 +1044,7 @@ impl SessionList {
             .filter(|row| {
                 let named = named(row.kind, Some(row.workspace), &row.added);
                 let roots = named.iter().map(|&(_, root)| root);
-                row.shelf == Shelf::Active && self.filter.shows(&row.id.machine, roots, row.kind)
+                row.shelf == Shelf::Active && self.filter.shows(&row.id.machine, roots)
             })
             .map(|row| row.id.clone())
             .collect()
@@ -1120,16 +1121,11 @@ pub(crate) struct Filter {
 }
 
 impl Filter {
-    /// Whether a session of `kind` on `machine` that works in the
-    /// projects at `roots` is listed: one of them must be chosen, if any
-    /// are. A lead given no project is in none, so only its machine
-    /// counts.
-    fn shows<'a>(
-        &self,
-        machine: &MachineId,
-        roots: impl IntoIterator<Item = &'a Path>,
-        kind: Kind,
-    ) -> bool {
+    /// Whether a session on `machine` that works in the projects at
+    /// `roots` is listed: one of them must be chosen, if any are. A session
+    /// in no project and given none, such as a lead's or a scratch
+    /// session's, has no roots, so only its machine counts.
+    fn shows<'a>(&self, machine: &MachineId, roots: impl IntoIterator<Item = &'a Path>) -> bool {
         if self.hidden.contains(machine) {
             return false;
         }
@@ -1137,7 +1133,7 @@ impl Filter {
             return true;
         }
         let mut roots = roots.into_iter().peekable();
-        if kind == Kind::Lead && roots.peek().is_none() {
+        if roots.peek().is_none() {
             return true;
         }
         roots.any(|root| {
@@ -1746,8 +1742,8 @@ mod tests {
 
     /// Under a project filter, a session shows for any project it works
     /// in, a lead for those it was given and not its own folder, and the
-    /// search finds it by any of their names; a lead given none shows
-    /// under any filter.
+    /// search finds it by any of their names; one in no project and given
+    /// none, as a lead can be, shows under any filter.
     #[test]
     fn a_session_in_several_projects_shows_for_each() {
         let in_projects =

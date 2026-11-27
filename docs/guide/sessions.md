@@ -56,6 +56,10 @@ A project is a repository rather than one checkout of it. Adding a linked worktr
 
 For a repository with an origin remote on a web host, the button beside the project's name in the title bar opens the repository's page in your browser. rho-ui leaves out any credentials in the remote's URL, and drops an ssh port.
 
+### No project
+
+For a quick question or throwaway work, pick **No project** instead. The session gets a folder of its own, `~/.rho/scratch/<name>/` on its machine (under `$RHO_HOME` if you set one), named from its first message like a lead's, and works there in place, never in a worktree. Like a lead's folder, it is in no project: nothing names it as one, the project filter never hides the session, and a new session started from it opens in a project. No project is never the default, and rho-ui doesn't remove these folders.
+
 ### Sessions in several projects
 
 A session names every project it works in, in its title bar and on its sidebar row, with their badges stacked: a lead the projects you picked for it, and a plain session its own project, then those of its added directories that are among your projects (other directories don't count). The project filter shows such a session when any of its projects is chosen, and the search finds it by any of their names. A subagent's session shows the projects of the session it runs under.

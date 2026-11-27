@@ -42,6 +42,9 @@ pub(crate) struct Workspace {
     pub(crate) path: SharedString,
     /// Unix seconds of its newest saved session; 0 with none.
     pub(crate) last_used: i64,
+    /// Whether it is its machine's scratch root or a folder in it, once
+    /// [`Workspaces::set_scratch_root`] says where that is.
+    scratch: bool,
 }
 
 impl Workspace {
@@ -55,6 +58,7 @@ impl Workspace {
             branch: repo.head.as_ref().map(|head| head.name().to_owned().into()),
             repo,
             last_used: 0,
+            scratch: false,
         }
     }
 
@@ -68,6 +72,12 @@ impl Workspace {
 
     pub(crate) fn place(&self) -> &Place {
         &self.place
+    }
+
+    /// Whether it is in its machine's scratch root, where sessions started
+    /// in no project work (see [`crate::no_project`]).
+    pub(crate) fn is_scratch(&self) -> bool {
+        self.scratch
     }
 
     /// Its repository's origin remote URL, which clones it elsewhere.
@@ -118,6 +128,12 @@ impl Workspace {
             root: root.into(),
         };
         Self::new(Place::local(path), repo, None)
+    }
+
+    /// The same workspace, in its machine's scratch root.
+    pub(crate) fn in_scratch(mut self) -> Self {
+        self.scratch = true;
+        self
     }
 }
 
@@ -186,6 +202,8 @@ pub(crate) fn reads_here(machine: &MachineId) -> bool {
 pub(crate) struct Workspaces {
     list: Vec<Workspace>,
     remotes: Vec<Remote>,
+    /// Each machine's scratch root, resolved, once found.
+    scratch_roots: Vec<Place>,
     /// Workspaces [`Self::index`] added this effect cycle, read together
     /// at its end: a session list of a remote machine names many at once,
     /// and reading each alone would run an ssh script per workspace, ahead
@@ -207,6 +225,7 @@ impl Workspaces {
         Self {
             list: Vec::new(),
             remotes: Vec::new(),
+            scratch_roots: Vec::new(),
             unread: Vec::new(),
             _reread: reread,
         }
@@ -298,11 +317,9 @@ impl Workspaces {
             return ix;
         }
         let home = self.home(&cwd.machine);
-        self.list.push(Workspace::new(
-            cwd.clone(),
-            repo::folder(&cwd.path),
-            home.as_deref(),
-        ));
+        let mut workspace = Workspace::new(cwd.clone(), repo::folder(&cwd.path), home.as_deref());
+        workspace.scratch = self.in_scratch(cwd);
+        self.list.push(workspace);
         let ix = self.list.len() - 1;
         if self.unread.is_empty() {
             let this = cx.weak_entity();
@@ -315,6 +332,38 @@ impl Workspaces {
         }
         self.unread.push(ix);
         ix
+    }
+
+    /// Takes `root` as its machine's scratch root, resolved, and marks the
+    /// workspaces in it there ([`Workspace::is_scratch`]).
+    pub(crate) fn set_scratch_root(&mut self, root: Place, cx: &mut Context<'_, Self>) {
+        self.scratch_roots
+            .retain(|known| known.machine != root.machine);
+        self.scratch_roots.push(root);
+        let mut changed = false;
+        for ix in 0..self.list.len() {
+            let scratch = self.in_scratch(self.list[ix].place());
+            let workspace = &mut self.list[ix];
+            changed |= workspace.scratch != scratch;
+            workspace.scratch = scratch;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The scratch root of `machine`, once found.
+    pub(crate) fn scratch_root(&self, machine: &MachineId) -> Option<&Path> {
+        self.scratch_roots
+            .iter()
+            .find(|root| root.machine == *machine)
+            .map(|root| root.path.as_path())
+    }
+
+    /// Whether `place` is its machine's scratch root or in it.
+    fn in_scratch(&self, place: &Place) -> bool {
+        self.scratch_root(&place.machine)
+            .is_some_and(|root| place.path.starts_with(root))
     }
 
     /// The indices for `dirs`, on `machine`, each as [`Self::index`] finds

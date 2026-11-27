@@ -119,7 +119,7 @@ If rho isn't installed, rho-ui says so and offers **Install Rho**, which runs rh
 
 ## Your first session
 
-Press <kbd>Ctrl</kbd>+<kbd>N</kbd> and pick a project. The folders in `$RHO_HOME/projects` are listed already; add any other folder you work in. Then type what you want done. [Sessions](./sessions) covers projects, worktrees and attachments; [Working with a turn](./turns) covers steering and background work.
+Press <kbd>Ctrl</kbd>+<kbd>N</kbd> and pick a project. The folders in `$RHO_HOME/projects` are listed already; add any other folder you work in, or pick **No project** for work that belongs to none. Then type what you want done. [Sessions](./sessions) covers projects, worktrees and attachments; [Working with a turn](./turns) covers steering and background work.
 
 ## Where rho-ui keeps things
 

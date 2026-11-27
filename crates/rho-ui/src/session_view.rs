@@ -97,6 +97,7 @@ use crate::{
     leads::Kind,
     machines::{Place, SessionKey},
     mcp_status::McpStatus,
+    no_project,
     pictures::{PictureRead, Pictures},
     plan::PlanList,
     pr_mark::pr_pill,
@@ -748,6 +749,13 @@ impl SessionView {
             Some(parent) if own == Kind::Session => parent.read(cx).kind(cx),
             _ => own,
         }
+    }
+
+    /// Whether the session is in no project, as a lead and a session in a
+    /// scratch folder are ([`no_project::in_no_project`]): its folder is no
+    /// project to start a new session in.
+    pub(crate) fn in_no_project(&self, cx: &App) -> bool {
+        no_project::in_no_project(self.kind(cx), self.workspace.read(cx))
     }
 
     /// rho's title, or until it sends one (rho names a session after its
@@ -2241,8 +2249,7 @@ impl SessionView {
         }
         let mut bar = TitleBar::new(&self.projects(cx), self.title());
         let this = cx.entity().downgrade();
-        // A lead's folder is no project to start a session in.
-        if self.kind(cx) == Kind::Session {
+        if !self.in_no_project(cx) {
             bar = bar.on_project({
                 let this = this.clone();
                 move |_, cx| {

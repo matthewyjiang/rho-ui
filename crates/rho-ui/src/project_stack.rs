@@ -3,11 +3,11 @@
 //! ever; several as their badges overlapped in a stack, which fans apart
 //! while hovered, and their names together, as `rho-ui + rho`.
 //!
-//! Which projects a session has ([`session_workspaces`]) follows its kind: a
-//! lead works in the projects it was given, not in its own folder, which
-//! is named from its first message; a plain session works in its
-//! workspace's project, and in those of its added directories that are
-//! the user's projects.
+//! Which projects a session has ([`session_workspaces`]): its own
+//! workspace's, unless it is in no project ([`in_no_project`]), as a lead
+//! or a session in a scratch folder is; then a lead's added directories,
+//! the projects it was given, or a plain session's that are the user's
+//! projects.
 
 use gpui_kit::base::{spring, TestSupportExt as _};
 use gpui_kit::component::{tooltip::Tooltip, ActiveTheme as _};
@@ -18,7 +18,9 @@ use gpui_kit::{
     Window,
 };
 
-use crate::{badge::Badge, leads::Kind, projects::Projects, workspaces::Workspace};
+use crate::{
+    badge::Badge, leads::Kind, no_project::in_no_project, projects::Projects, workspaces::Workspace,
+};
 
 /// The most badges a stack draws; the names say how many more there are.
 /// Three still read as separate tiles at the sidebar's 16px.
@@ -42,12 +44,13 @@ const RING_REMS: f32 = 0.09;
 const RECEDED: f32 = 0.4;
 
 /// The workspaces whose projects a session of `kind` works in, first to
-/// last: a lead's `added` directories, as it was given its projects; a
-/// plain session's `own` workspace, then those of its `added` directories
-/// in one of the user's `projects`. A view not given the user's projects
-/// counts none of a plain session's added directories. Two checkouts of
-/// one project both stay, so a filter can match either's folder;
-/// [`session_projects`] names each project once.
+/// last: its `own` workspace, unless it is in no project
+/// ([`in_no_project`]), then a lead's `added` directories, as it was given
+/// its projects, or those of a plain session's in one of the user's
+/// `projects`. A view not given the user's projects counts none of a plain
+/// session's added directories. Two checkouts of one project both stay, so
+/// a filter can match either's folder; [`session_projects`] names each
+/// project once.
 pub(crate) fn session_workspaces<'a>(
     kind: Kind,
     own: Option<&'a Workspace>,
@@ -56,13 +59,11 @@ pub(crate) fn session_workspaces<'a>(
 ) -> Vec<&'a Workspace> {
     let is_project =
         |workspace: &Workspace| projects.is_some_and(|projects| is_users(workspace, projects));
-    match kind {
-        Kind::Lead => added.into_iter().collect(),
-        Kind::Session => own
-            .into_iter()
-            .chain(added.into_iter().filter(|workspace| is_project(workspace)))
-            .collect(),
-    }
+    let own = own.filter(|own| !in_no_project(kind, own));
+    let added = added
+        .into_iter()
+        .filter(|workspace| kind == Kind::Lead || is_project(workspace));
+    own.into_iter().chain(added).collect()
 }
 
 /// The projects a session works in, as [`session_workspaces`] finds
@@ -292,8 +293,9 @@ mod tests {
     use super::*;
 
     /// A lead names the projects it was given and never its own folder; a
-    /// plain session names its workspace's project, then the added
-    /// directories that are the user's projects, each project once.
+    /// plain session names its workspace's project, unless that is a
+    /// scratch folder, then the added directories that are the user's
+    /// projects, each project once.
     #[test]
     fn a_session_names_its_projects_by_its_kind() {
         /// The session's kind, workspace and added directories, whether the
@@ -305,8 +307,10 @@ mod tests {
         let worktree = Workspace::local("/rho/worktrees/ui-1", "me/rho-ui", "/w/rho-ui");
         let rho = Workspace::local("/w/rho", "me/rho", "/w/rho");
         let crates = Workspace::local("/w/rho/crates", "me/rho", "/w/rho");
-        let scratch = Workspace::local("/tmp/scratch", "scratch", "/tmp/scratch");
-        let table: [Case<'_>; 7] = [
+        let notes = Workspace::local("/tmp/notes", "notes", "/tmp/notes");
+        let scratch =
+            Workspace::local("/rho/scratch/try-it", "try-it", "/rho/scratch/try-it").in_scratch();
+        let table: [Case<'_>; 9] = [
             (
                 Kind::Lead,
                 &leads,
@@ -316,14 +320,17 @@ mod tests {
             ),
             (Kind::Lead, &leads, vec![], true, &[]),
             // A lead's projects are what it was given, the user's or not.
-            (Kind::Lead, &leads, vec![&scratch], true, &["scratch"]),
+            (Kind::Lead, &leads, vec![&notes], true, &["notes"]),
             (
                 Kind::Session,
                 &ui,
-                vec![&rho, &scratch],
+                vec![&rho, &notes],
                 true,
                 &["rho-ui", "rho"],
             ),
+            // A scratch folder is no project, as a lead's folder is.
+            (Kind::Session, &scratch, vec![], true, &[]),
+            (Kind::Session, &scratch, vec![&rho, &notes], true, &["rho"]),
             // A folder in a project, and a worktree's own project.
             (
                 Kind::Session,

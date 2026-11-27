@@ -1,26 +1,29 @@
 //! How a draft's session opens: a plain session, in the draft's directory
-//! or a new worktree of it, or a lead, in a folder made for it (see
-//! [`crate::leads`]).
+//! or a new worktree of it, or a session in no project, a lead or a
+//! scratch session, in a folder made for it (see [`crate::no_project`]).
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::App;
+use gpui_kit::{App, Context};
 use rho_ui_core::{Checkout, Daemon, Prompt, SessionSetup};
 
 use super::RhoApp;
 use crate::{
     draft::DraftView,
-    leads::{Folder, Kind, Leads},
+    machines::{MachineId, Place},
+    no_project::{Folder, FolderMaker, Root},
 };
 
 /// How [`Opening::open`] opens a session.
 pub(super) enum Opening {
     /// A plain session, in the draft's directory checked out so.
     Plain(Checkout),
-    /// A lead, in the folder of the leads root that [`Leads`] makes, whose
-    /// tools reach `added_dirs` too: the projects its draft picked.
-    Lead {
-        leads: Leads,
+    /// A session in no project, in the folder `maker` makes in its root: a
+    /// lead in the leads root, whose tools reach `added_dirs` too, the
+    /// projects its draft picked; or in the scratch root, a plain session
+    /// in its folder's checkout.
+    Made {
+        maker: FolderMaker,
         folder: Folder,
         added_dirs: Vec<PathBuf>,
     },
@@ -29,15 +32,15 @@ pub(super) enum Opening {
 impl Opening {
     /// Opens a session on `daemon` for a draft that works in `cwd`, and
     /// returns it with the directory it was opened in: `cwd` for a plain
-    /// session, whose worktree its attach says, or the lead's folder. A
-    /// lead's folder that its lead didn't open in goes again.
+    /// session, whose worktree its attach says, or the folder made for it.
+    /// A folder its session didn't open in goes again.
     ///
     /// # Errors
     ///
     /// Says why, in the file system's, ssh's or the daemon's words, if the
-    /// machine isn't connected, a lead's folder can't be made, or the
-    /// daemon won't open the session, as a rho without the lead agent
-    /// won't open a lead, or one with a directory that no longer exists.
+    /// machine isn't connected, a folder can't be made, or the daemon won't
+    /// open the session, as a rho without the lead agent won't open a lead,
+    /// or one with a directory that no longer exists.
     pub(super) async fn open(
         &self,
         daemon: &Daemon,
@@ -49,13 +52,17 @@ impl Opening {
                 .await
                 .map(|setup| (setup, cwd.to_path_buf()))
                 .map_err(|error| error.to_string()),
-            Opening::Lead {
-                leads,
-                folder,
+            Opening::Made {
+                maker,
                 added_dirs,
+                folder,
             } => {
-                let dir = leads.make(folder).await?;
-                match daemon.new_lead(&dir, added_dirs).await {
+                let dir = maker.make(folder).await?;
+                let opened = match maker.root() {
+                    Root::Leads => daemon.new_lead(&dir, added_dirs).await,
+                    Root::Scratch => daemon.new_session(&dir, Checkout::Local).await,
+                };
+                match opened {
                     Ok(setup) => Ok((setup, dir)),
                     Err(error) => {
                         self.unmake(&dir).await;
@@ -67,17 +74,17 @@ impl Opening {
     }
 
     /// Removes `dir`, the directory [`Self::open`] opened a session in, if
-    /// that was a lead's own folder and it is still empty, as when its lead
-    /// didn't start, so a retry takes its name again. The leads root and a
-    /// plain session's directory stay.
+    /// that was a folder made for the session and it is still empty, as
+    /// when its session didn't start, so a retry takes its name again. A
+    /// root and a plain session's directory stay.
     pub(super) async fn unmake(&self, dir: &Path) {
-        if let Opening::Lead {
-            leads,
-            folder: Folder::Lead(_),
+        if let Opening::Made {
+            maker,
+            folder: Folder::Named(_),
             ..
         } = self
         {
-            leads.unmake(dir).await;
+            maker.unmake(dir).await;
         }
     }
 
@@ -85,8 +92,8 @@ impl Opening {
     /// session's draft picks no directories, so its opening takes none.
     pub(super) fn with_added_dirs(self, dirs: Vec<PathBuf>) -> Self {
         match self {
-            Opening::Lead { leads, folder, .. } => Opening::Lead {
-                leads,
+            Opening::Made { maker, folder, .. } => Opening::Made {
+                maker,
                 folder,
                 added_dirs: dirs,
             },
@@ -97,23 +104,43 @@ impl Opening {
 
 impl RhoApp {
     /// How `draft`'s session opens: with no `first` message, the session
-    /// the draft holds, in its directory or the leads root; with one, a
-    /// session of its own, in a new worktree or a lead's folder named from
-    /// it.
+    /// the draft holds, in its directory or, in no project, its root; with
+    /// one, a session of its own, in a new worktree or, in no project, a
+    /// folder named from it.
     pub(super) fn opening(&self, draft: &DraftView, first: Option<&Prompt>, cx: &App) -> Opening {
-        match (draft.kind(), first) {
-            (Kind::Session, None) => Opening::Plain(Checkout::Local),
-            (Kind::Session, Some(_)) => Opening::Plain(Checkout::NewWorktree),
-            (Kind::Lead, first) => {
-                let reader = self.workspaces.read(cx).reader(&draft.cwd().machine);
-                let executor = cx.background_executor().clone();
-                let leads = Leads::new(reader, self.launch.rho_home.clone(), executor);
-                Opening::Lead {
-                    leads,
-                    folder: first.map_or(Folder::Root, |first| Folder::named_from(first.text())),
-                    added_dirs: Vec::new(),
-                }
-            }
+        match (draft.no_project_root(cx), first) {
+            (None, None) => Opening::Plain(Checkout::Local),
+            (None, Some(_)) => Opening::Plain(Checkout::NewWorktree),
+            (Some(root), first) => Opening::Made {
+                maker: self.folder_maker(root, &draft.cwd().machine, cx),
+                folder: first.map_or(Folder::Root, |first| Folder::named_from(root, first.text())),
+                added_dirs: Vec::new(),
+            },
         }
+    }
+
+    /// Makes `machine`'s scratch root, if missing, and tells the workspaces
+    /// where it is, so the sessions in it are in no project. Best effort: a
+    /// root that can't be made leaves them in their folders' projects, and
+    /// a scratch draft says why when it can't open.
+    pub(super) fn find_scratch_root(&self, machine: &MachineId, cx: &mut Context<'_, Self>) {
+        let maker = self.folder_maker(Root::Scratch, machine, cx);
+        let (workspaces, machine) = (self.workspaces.clone(), machine.clone());
+        cx.spawn(async move |_, cx| {
+            let Ok(root) = maker.make(&Folder::Root).await else {
+                return;
+            };
+            workspaces.update(cx, |workspaces, cx| {
+                workspaces.set_scratch_root(Place::new(machine, root), cx);
+            });
+        })
+        .detach();
+    }
+
+    /// `machine`'s `root`, to make folders in.
+    fn folder_maker(&self, root: Root, machine: &MachineId, cx: &App) -> FolderMaker {
+        let reader = self.workspaces.read(cx).reader(machine);
+        let executor = cx.background_executor().clone();
+        FolderMaker::new(root, reader, self.launch.rho_home.clone(), executor)
     }
 }
