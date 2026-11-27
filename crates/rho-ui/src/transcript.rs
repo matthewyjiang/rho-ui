@@ -368,6 +368,13 @@ impl Transcript {
         )
     }
 
+    fn is_wake_row(&self, row: usize, entries: &[Entry]) -> bool {
+        matches!(
+            self.timeline.rows().get(row),
+            Some(Row::Message(entry)) if matches!(entries.get(*entry), Some(Entry::Wake))
+        )
+    }
+
     /// The surface row `row` is for, if it is a surface's row.
     fn surface_row<'a>(&self, row: usize, entries: &'a [Entry]) -> Option<&'a SurfaceRef> {
         let Row::Message(entry) = self.timeline.rows().get(row)? else {
@@ -430,8 +437,10 @@ impl Transcript {
                 self.remeasure(self.timeline.turn_rows(newest), cx);
             }
         }
-        // A card that joins a run moves the run's end and may fold some of
-        // it: the run's rows are placed and draw anew.
+        // A row added after a card changes its run: a card that joins it
+        // moves the run's end and may fold some of it, so the run's rows
+        // are placed and draw anew; a wake the run explains takes the
+        // run's gap ([`Self::keeps_gap_below`]).
         if synced.added > 0 {
             self.placed.get_mut().clear();
         }
@@ -470,10 +479,25 @@ impl Transcript {
         start..end
     }
 
-    /// Whether `row` is a card the rail runs on below: rows keep a gap
-    /// below them, but a card only at the end of its run.
-    fn continues_rail(&self, row: usize, entries: &[Entry]) -> bool {
-        self.card_at(row, entries).is_some() && self.card_at(row + 1, entries).is_some()
+    /// Whether `row` keeps a gap below it. Rows do, but a card only at the
+    /// end of its run, and not above a wake it explains: that wake's turn
+    /// header keeps the gap above itself, so the gap folds away with the
+    /// header of a turn that has no working.
+    fn keeps_gap_below(&self, row: usize, entries: &[Entry]) -> bool {
+        let gap_goes_on =
+            self.card_at(row + 1, entries).is_some() || self.is_wake_row(row + 1, entries);
+        self.card_at(row, entries).is_none() || !gap_goes_on
+    }
+
+    /// Whether `row` is a wake right under a card. The card says why rho
+    /// continued, so the wake draws no line of its own: only its turn's
+    /// header. A wake with no card above it keeps its line, so no turn
+    /// starts unexplained.
+    fn is_explained_wake(&self, row: usize, entries: &[Entry]) -> bool {
+        self.is_wake_row(row, entries)
+            && row
+                .checked_sub(1)
+                .is_some_and(|above| self.card_at(above, entries).is_some())
     }
 
     /// Forgets what it built for entries from `from` on, which went or
@@ -861,7 +885,7 @@ impl Transcript {
                 .when_some(panel, |this, panel| this.pb_3().child(panel))
                 .into_any_element();
         }
-        let gap_below = ends_row && !self.continues_rail(row, entries);
+        let gap_below = ends_row && self.keeps_gap_below(row, entries);
         let Some(turn) = self.timeline.turn_of(row) else {
             return measure
                 .when(gap_below, Styled::pb_3)
@@ -891,9 +915,11 @@ impl Transcript {
                 .into_any_element();
         }
         let opens_turn = self.timeline.turns().get(turn) == Some(&row);
+        let content = (!self.is_explained_wake(row, entries))
+            .then(|| self.render_content(place, entries, handlers, cx));
         measure
             .when(gap_below, Styled::pb_3)
-            .child(self.render_content(place, entries, handlers, cx))
+            .children(content)
             .when(opens_turn, |this| {
                 this.child(self.render_header(turn, &handlers.act, cx))
             })
@@ -1057,7 +1083,7 @@ impl Transcript {
         let first = self.card_at(start, entries).map_or(ix, |(entry, _)| entry);
         match &places[row - start] {
             // An empty row. When it ends the run, it carries the gap below
-            // the run (see `continues_rail`).
+            // the run (see `keeps_gap_below`).
             rail::Place::Hidden => div().into_any_element(),
             rail::Place::Fold { ends, folded } => {
                 let folded: Vec<Card<'_>> = folded
@@ -1305,7 +1331,8 @@ fn hover_time(
         .group_hover(MESSAGE_GROUP, |style| style.opacity(1.))
 }
 
-/// Builds the row for a user message, a reply, a wake or a compaction:
+/// Builds the row for a user message, a reply, a wake no card explains
+/// ([`Transcript::is_explained_wake`]), or a compaction:
 /// entry `ix`, with what `shown` holds. Tool calls and thoughts are drawn by [`crate::work`].
 fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyElement {
     let Shown {

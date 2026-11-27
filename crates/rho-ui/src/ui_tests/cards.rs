@@ -183,7 +183,7 @@ fn an_older_rhos_cards_sit_on_the_rail_by_their_tone() {
         }
     });
     // The model answers after the cards as a turn of their own, opened
-    // with its wake row, as the conversation replays.
+    // with its wake, as the conversation replays.
     let after = cards[cards.len() - 1].0 + 1;
     assert!(matches!(session.entries()[after], Entry::Wake));
     ui.shot("folded");
