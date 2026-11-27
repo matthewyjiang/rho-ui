@@ -193,16 +193,12 @@ impl PathStyle {
                 crumbs.push(("~".to_owned(), at));
                 break;
             }
-            match self.split(&at) {
-                Some((parent, name)) => {
-                    crumbs.push((name.to_string_lossy().into_owned(), at));
-                    at = parent;
-                }
-                None => {
-                    crumbs.push((at.display().to_string(), at));
-                    break;
-                }
-            }
+            let Some((parent, name)) = self.split(&at) else {
+                crumbs.push((at.display().to_string(), at));
+                break;
+            };
+            crumbs.push((name.to_string_lossy().into_owned(), at));
+            at = parent;
         }
         crumbs.reverse();
         crumbs
@@ -529,12 +525,12 @@ pub(crate) fn last_path(output: &[u8]) -> Option<PathBuf> {
 /// What a folder holds, as [`list`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Listing {
-    /// The folder with its symlinks resolved, when it is one. Projects are
-    /// kept resolved, so this tells a subfolder that is one already.
+    /// The folder with its symlinks resolved, if that could be read.
+    /// Projects are kept resolved, so this tells a subfolder that is one
+    /// already.
     pub(crate) real: Option<PathBuf>,
-    /// Its subfolders, sorted by name ignoring case, or why they couldn't
-    /// be read.
-    pub(crate) subfolders: Result<Vec<Subfolder>, Unlisted>,
+    /// Its subfolders, sorted by name ignoring case.
+    pub(crate) subfolders: Vec<Subfolder>,
 }
 
 /// A subfolder in a [`Listing`].
@@ -580,8 +576,8 @@ impl std::fmt::Display for Unlisted {
 struct Read {
     /// The first path asked, when it is a folder.
     folder: Option<Resolved>,
-    /// The subfolders of the second, when asked.
-    listed: Option<Result<Vec<Subfolder>, Unlisted>>,
+    /// The second, when asked.
+    listed: Option<Result<Listing, Unlisted>>,
 }
 
 /// A folder that is there.
@@ -620,7 +616,7 @@ impl Lookup {
     /// folder. The search lists no subfolders it can't read.
     fn new(typed: &Typed, read: Read) -> Self {
         let subfolders = match read.listed {
-            Some(Ok(subfolders)) => subfolders,
+            Some(Ok(listing)) => listing.subfolders,
             Some(Err(_)) | None => Vec::new(),
         };
         Self {
@@ -636,10 +632,11 @@ impl Lookup {
     }
 }
 
-/// Lists `folder`'s subfolders with `reader`, doing file I/O on
-/// `executor`. On a remote machine, one script lists them all, git roots
-/// and branches too, after [`REMOTE_PAUSE`]: a folder chooser drops the
-/// listing it no longer shows, so a burst of moves runs one script.
+/// Lists `folder`'s subfolders with `reader`, or says why they can't be,
+/// doing file I/O on `executor`. On a remote machine, one script lists
+/// them all, git roots and branches too, after [`REMOTE_PAUSE`]: a folder
+/// chooser drops the listing it no longer shows, so a burst of moves runs
+/// one script.
 ///
 /// # Errors
 ///
@@ -649,13 +646,11 @@ pub(crate) async fn list(
     reader: Reader,
     folder: PathBuf,
     executor: BackgroundExecutor,
-) -> Result<Listing, DaemonError> {
+) -> Result<Result<Listing, Unlisted>, DaemonError> {
     pause(&reader, &executor).await;
-    let read = read(reader, folder.clone(), Some(folder), &executor).await?;
-    Ok(Listing {
-        real: read.folder.map(|folder| folder.real),
-        subfolders: read.listed.unwrap_or(Err(Unlisted::Gone)),
-    })
+    // Nothing to resolve: what it is in git costs most of the script.
+    let read = read(reader, PathBuf::new(), Some(folder), &executor).await?;
+    Ok(read.listed.unwrap_or(Err(Unlisted::Gone)))
 }
 
 /// The project of `folder` with `reader`, as adding it finds it: its
@@ -729,7 +724,7 @@ fn look_here(path: &Path, browse: Option<&Path>) -> Read {
 }
 
 /// `folder`'s subfolders on this machine.
-fn list_here(folder: &Path) -> Result<Vec<Subfolder>, Unlisted> {
+fn list_here(folder: &Path) -> Result<Listing, Unlisted> {
     use std::io::ErrorKind;
 
     match std::fs::metadata(folder) {
@@ -752,7 +747,10 @@ fn list_here(folder: &Path) -> Result<Vec<Subfolder>, Unlisted> {
                 name: path.file_name()?.to_owned(),
             })
         });
-    Ok(sorted(subfolders))
+    Ok(Listing {
+        subfolders: sorted(subfolders),
+        real: platform::canonicalize(folder).ok(),
+    })
 }
 
 /// Whether `folder` is a git checkout's root, from its `.git` alone, as
@@ -789,8 +787,8 @@ fn sorted(subfolders: impl Iterator<Item = Subfolder>) -> Vec<Subfolder> {
 /// `y` if the path is a folder, else `n`; its resolved path; and as `git`
 /// says, its work tree root and common git dir, empty outside a
 /// repository. Then, if asked to list a folder, it prints why it can't
-/// (`gone`, `file` or `denied`), or `listed` and three fields for each
-/// subfolder: its name; `y` if it has a `.git` folder, or a `.git` file
+/// (`gone`, `file` or `denied`), or `listed`, its resolved path (empty if
+/// it can't be entered), and three fields for each subfolder: its name; `y` if it has a `.git` folder, or a `.git` file
 /// that points to one, else `n`; and the first line of that git dir's
 /// `HEAD`, empty if it can't be read. Only `sh` builtins run per subfolder,
 /// so a folder of hundreds lists in one quick script. Read with
@@ -815,7 +813,8 @@ elif [ ! -d "$2" ]; then
 elif [ ! -r "$2" ]; then
   printf 'denied\0'
 else
-  printf 'listed\0'
+  here=$(cd "$2" && pwd -P) || here=
+  printf 'listed\0%s\0' "$here"
   for sub in "$2"/* "$2"/.*; do
     [ -d "$sub" ] || continue
     name=${sub##*/}
@@ -874,6 +873,7 @@ fn parse_remote(output: &[u8]) -> Option<Read> {
             b"file" => Err(Unlisted::NotFolder),
             b"denied" => Err(Unlisted::Denied),
             b"listed" => {
+                let (here, subfolders) = subfolders.split_first()?;
                 let (facts, []) = subfolders.as_chunks::<3>() else {
                     return None;
                 };
@@ -891,7 +891,10 @@ fn parse_remote(output: &[u8]) -> Option<Read> {
                         Some(Subfolder { name, git })
                     })
                     .collect::<Option<Vec<_>>>()?;
-                Ok(sorted(subfolders.into_iter()))
+                Ok(Listing {
+                    real: (!here.is_empty()).then(|| platform::path_from_bytes(here)),
+                    subfolders: sorted(subfolders.into_iter()),
+                })
             }
             _ => return None,
         }),
@@ -1038,102 +1041,117 @@ mod tests {
         );
     }
 
-    /// [`REMOTE_SCRIPT`], run with this machine's `sh` and `git`, reads
-    /// what reading the files here does. Typed paths: a subfolder of a
-    /// checkout, a linked worktree, a plain folder, a symlink to one and to
-    /// a checkout, a prefix, a hidden folder, and a missing path. Listings:
-    /// git roots by a `.git` folder or a `.git` file pointing to one,
-    /// relative too, on a branch or detached, and a folder that is gone, a
-    /// file, or unreadable.
+    /// Folders for [`REMOTE_SCRIPT`] to agree on with the files: a
+    /// checkout with a subfolder, a linked worktree of it, a plain folder,
+    /// symlinks to both, a hidden folder, a file, a `.git` file pointing to
+    /// the checkout's by a relative path, a detached checkout, and a folder
+    /// no one can read.
     // The script runs on remote machines, which are Unix.
     #[cfg(unix)]
+    struct Folders {
+        _temp: tempfile::TempDir,
+        dir: PathBuf,
+        /// Whether the unreadable folder is: root reads any folder.
+        unreadable: bool,
+    }
+
+    #[cfg(unix)]
+    impl Folders {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let temp = tempfile::tempdir().unwrap();
+            let dir = platform::canonicalize(temp.path()).unwrap();
+            let git = |args: &[&str]| crate::local::test::git(&dir, args);
+            git(&["init", "-q", "-b", "main", "project"]);
+            git(&["-C", "project", "commit", "-q", "--allow-empty", "-m", "x"]);
+            git(&[
+                "-C", "project", "worktree", "add", "-q", "-b", "feat", "../wt",
+            ]);
+            std::fs::create_dir_all(dir.join("project/docs")).unwrap();
+            std::fs::create_dir_all(dir.join("Plain")).unwrap();
+            std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+            std::fs::write(dir.join("project-notes"), "a file").unwrap();
+            std::os::unix::fs::symlink(dir.join("Plain"), dir.join("link")).unwrap();
+            std::os::unix::fs::symlink(dir.join("project"), dir.join("plink")).unwrap();
+            std::fs::create_dir_all(dir.join("rel")).unwrap();
+            std::fs::write(dir.join("rel/.git"), "gitdir: ../project/.git\n").unwrap();
+            std::fs::create_dir_all(dir.join("det/.git")).unwrap();
+            std::fs::write(
+                dir.join("det/.git/HEAD"),
+                format!("{}\n", "ab12".repeat(10)),
+            )
+            .unwrap();
+            let denied = dir.join("denied");
+            std::fs::create_dir_all(&denied).unwrap();
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = std::fs::read_dir(&denied).is_err();
+            Self {
+                _temp: temp,
+                dir,
+                unreadable,
+            }
+        }
+
+        /// What the files say of `path` and `browse`, once the script,
+        /// after what a login file that talks prints, says the same.
+        fn read(path: &Path, browse: Option<&Path>) -> Read {
+            let local = look_here(path, browse);
+            let browse = browse.map(Path::to_path_buf).unwrap_or_default();
+            let output =
+                crate::local::test::sh(REMOTE_SCRIPT, &[path, &browse]).expect("the script runs");
+            let output = [b"Welcome!\n".as_slice(), output.as_slice()].concat();
+            let remote = parse_remote(&output).expect("the script's fields");
+            assert_eq!(remote, local, "{path:?} listing {browse:?}");
+            local
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Folders {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            // So the temporary directory can be removed.
+            let _ = std::fs::set_permissions(
+                self.dir.join("denied"),
+                std::fs::Permissions::from_mode(0o755),
+            );
+        }
+    }
+
+    /// [`REMOTE_SCRIPT`], run with this machine's `sh` and `git`, finds
+    /// what reading the files here does for a typed path: a subfolder of a
+    /// checkout, a linked worktree, a plain folder, a symlink to one and to
+    /// a checkout, a prefix, a hidden folder, and a missing path.
+    #[cfg(unix)]
     #[test]
-    fn the_remote_script_agrees_with_the_files() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let dir = platform::canonicalize(dir.path()).unwrap();
-        let git = |args: &[&str]| crate::local::test::git(&dir, args);
-        git(&["init", "-q", "-b", "main", "project"]);
-        git(&["-C", "project", "commit", "-q", "--allow-empty", "-m", "x"]);
-        git(&[
-            "-C", "project", "worktree", "add", "-q", "-b", "feat", "../wt",
-        ]);
+    fn the_remote_script_finds_what_the_files_name() {
+        let folders = Folders::new();
+        let dir = &folders.dir;
         let (main, plain) = (dir.join("project"), dir.join("Plain"));
-        std::fs::create_dir_all(main.join("docs")).unwrap();
-        std::fs::create_dir_all(&plain).unwrap();
-        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
-        std::fs::write(dir.join("project-notes"), "a file").unwrap();
-        std::os::unix::fs::symlink(&plain, dir.join("link")).unwrap();
-        std::os::unix::fs::symlink(&main, dir.join("plink")).unwrap();
-        // A `.git` file pointing back to the checkout's, by a relative path.
-        std::fs::create_dir_all(dir.join("rel")).unwrap();
-        std::fs::write(dir.join("rel/.git"), "gitdir: ../project/.git\n").unwrap();
-        // A detached checkout, made of bare files.
-        std::fs::create_dir_all(dir.join("det/.git")).unwrap();
-        std::fs::write(
-            dir.join("det/.git/HEAD"),
-            format!("{}\n", "ab12".repeat(10)),
-        )
-        .unwrap();
-        let denied = dir.join("denied");
-        std::fs::create_dir_all(&denied).unwrap();
-        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // Root reads any folder, so the case is only checked without it.
-        let unreadable = std::fs::read_dir(&denied).is_err();
-
-        let at = |rest: &str| {
-            Typed::parse(
+        let looked: Vec<Lookup> = [
+            "project/docs",
+            "wt",
+            "Plain/",
+            "link/",
+            "plink",
+            "p",
+            ".h",
+            "gone",
+        ]
+        .iter()
+        .map(|rest| {
+            let typed = Typed::parse(
                 &format!("{}/{rest}", dir.display()),
                 None,
                 PathStyle::Native,
             )
-            .unwrap()
-        };
-        let typed = [
-            at("project/docs"),
-            at("wt"),
-            at("Plain/"),
-            at("link/"),
-            at("plink"),
-            at("p"),
-            at(".h"),
-            at("gone"),
-        ];
-        let folder = |name: &str| dir.join(name);
-        let mut asked: Vec<(PathBuf, Option<PathBuf>)> = typed
-            .iter()
-            .map(|typed| (typed.path.clone(), Some(typed.browse.clone())))
-            .collect();
-        asked.extend([
-            (dir.clone(), Some(dir.clone())),
-            (folder("gone"), Some(folder("gone"))),
-            (folder("project-notes"), Some(folder("project-notes"))),
-            (folder("wt"), None),
-        ]);
-        if unreadable {
-            asked.push((denied.clone(), Some(denied.clone())));
-        }
-        let read: Vec<Read> = asked
-            .iter()
-            .map(|(path, browse)| {
-                let local = look_here(path, browse.as_deref());
-                let browse = browse.clone().unwrap_or_default();
-                let output = crate::local::test::sh(REMOTE_SCRIPT, &[path, &browse])
-                    .expect("the script runs");
-                // As a login file that prints would have it.
-                let output = [b"Welcome!\n".as_slice(), output.as_slice()].concat();
-                let remote = parse_remote(&output).expect("the script's fields");
-                assert_eq!(remote, local, "{path:?} listing {browse:?}");
-                local
-            })
-            .collect();
-        let mut read = read.into_iter();
-        let looked: Vec<Lookup> = typed
-            .iter()
-            .zip(read.by_ref())
-            .map(|(typed, read)| Lookup::new(typed, read))
-            .collect();
+            .unwrap();
+            let read = Folders::read(&typed.path, Some(&typed.browse));
+            Lookup::new(&typed, read)
+        })
+        .collect();
 
         // What the cases name, so agreeing on nothing can't pass.
         let found = |root: &Path, alias: Option<&str>| {
@@ -1155,8 +1173,19 @@ mod tests {
         assert_eq!(looked[5].next, [plain, dir.join("plink"), main]);
         assert_eq!(looked[6].next, [dir.join(".hidden")], "hidden after a dot");
         assert!(looked[7].found.is_none() && looked[7].next.is_empty());
+    }
 
-        let listed = read.next().and_then(|read| read.listed);
+    /// [`REMOTE_SCRIPT`] lists a folder as reading the files here does,
+    /// asked as [`list`] asks, with nothing to resolve: every subfolder,
+    /// with git roots by a `.git` folder or a `.git` file pointing to one,
+    /// on a branch or detached; a symlink as the folder it leads to; and
+    /// why a folder that is gone, a file, or unreadable can't be listed.
+    #[cfg(unix)]
+    #[test]
+    fn the_remote_script_lists_what_the_files_hold() {
+        let folders = Folders::new();
+        let dir = &folders.dir;
+        let listed = |folder: &Path| Folders::read(Path::new(""), Some(folder)).listed;
         let branch = |name: &str| {
             Some(GitRoot {
                 head: Some(repo::Head::Branch(name.to_owned())),
@@ -1166,16 +1195,14 @@ mod tests {
             name: name.into(),
             git,
         };
+        let detached = Some(GitRoot {
+            head: Some(repo::Head::Detached("ab12ab1".to_owned())),
+        });
         let want = vec![
             subfolder(".hidden", None),
             // A folder, though nothing in it can be read.
             subfolder("denied", None),
-            subfolder(
-                "det",
-                Some(GitRoot {
-                    head: Some(repo::Head::Detached("ab12ab1".to_owned())),
-                }),
-            ),
+            subfolder("det", detached),
             subfolder("link", None),
             subfolder("Plain", None),
             subfolder("plink", branch("main")),
@@ -1184,20 +1211,33 @@ mod tests {
             subfolder("wt", branch("feat")),
         ];
         assert_eq!(
-            listed,
-            Some(Ok(want)),
+            listed(dir),
+            Some(Ok(Listing {
+                real: Some(dir.clone()),
+                subfolders: want,
+            })),
             "every subfolder, sorted, files left out"
         );
-        let unlisted: Vec<_> = read.map(|read| read.listed).collect();
-        let mut want = vec![
-            Some(Err(Unlisted::Gone)),
-            Some(Err(Unlisted::NotFolder)),
-            None,
-        ];
-        if unreadable {
-            want.push(Some(Err(Unlisted::Denied)));
+        assert_eq!(
+            listed(&dir.join("link")),
+            Some(Ok(Listing {
+                real: Some(dir.join("Plain")),
+                subfolders: Vec::new(),
+            })),
+            "a symlink lists as the folder it leads to"
+        );
+        assert_eq!(listed(&dir.join("gone")), Some(Err(Unlisted::Gone)));
+        assert_eq!(
+            listed(&dir.join("project-notes")),
+            Some(Err(Unlisted::NotFolder))
+        );
+        if folders.unreadable {
+            assert_eq!(listed(&dir.join("denied")), Some(Err(Unlisted::Denied)));
         }
-        assert_eq!(unlisted, want);
-        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            Folders::read(&dir.join("wt"), None).listed,
+            None,
+            "nothing listed unasked"
+        );
     }
 }

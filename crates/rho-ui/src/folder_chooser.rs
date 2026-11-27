@@ -209,7 +209,6 @@ impl FolderChooser {
             chooser: cx.weak_entity(),
             style,
             folder: start,
-            real: None,
             contents: Contents::Reading,
             filter: String::new(),
             rows: Vec::new(),
@@ -300,7 +299,6 @@ impl FolderChooser {
         self.list.update(cx, |list, cx| {
             let delegate = list.delegate_mut();
             delegate.contents = Contents::Reading;
-            delegate.real = None;
             delegate.refilter();
             list.set_selected_index(None, window, cx);
             cx.notify();
@@ -318,22 +316,13 @@ impl FolderChooser {
             let listing = folders::list(reader, folder, executor).await;
             let _ = list.update_in(cx, |list, window, cx| {
                 let delegate = list.delegate_mut();
-                match listing {
-                    Ok(listing) => {
-                        delegate.real = listing.real;
-                        delegate.contents = match listing.subfolders {
-                            Ok(subfolders) => Contents::Folders(subfolders),
-                            Err(why) => {
-                                Contents::Unread(format!("Couldn't read {name}: {why}").into())
-                            }
-                        };
-                    }
+                delegate.contents = match listing {
+                    Ok(Ok(listing)) => Contents::Listed(listing),
+                    Ok(Err(why)) => Contents::Unread(format!("Couldn't read {name}: {why}").into()),
                     Err(why) => {
-                        delegate.contents = Contents::Unread(
-                            format!("Couldn't read {label}'s folders: {why}").into(),
-                        );
+                        Contents::Unread(format!("Couldn't read {label}'s folders: {why}").into())
                     }
-                }
+                };
                 delegate.refilter();
                 let first = delegate.first_match();
                 list.set_selected_index(first, window, cx);
@@ -756,14 +745,14 @@ fn common_prefix(names: &[String]) -> String {
 /// What the folder shown holds, as far as it is read.
 enum Contents {
     Reading,
-    Folders(Vec<Subfolder>),
+    Listed(folders::Listing),
     /// Why it, or its machine, couldn't be read.
     Unread(SharedString),
 }
 
 /// One row of the folder list.
 enum Row {
-    /// The subfolder at this index in [`Contents::Folders`].
+    /// The subfolder at this index in [`Contents::Listed`].
     Folder(usize),
     Unread(SharedString),
 }
@@ -773,8 +762,6 @@ struct FolderList {
     chooser: WeakEntity<FolderChooser>,
     style: PathStyle,
     folder: PathBuf,
-    /// The folder shown with its symlinks resolved, once read.
-    real: Option<PathBuf>,
     contents: Contents,
     /// The name typed after the folder in the path bar.
     filter: String,
@@ -788,7 +775,8 @@ impl FolderList {
         self.rows = match &self.contents {
             Contents::Reading => Vec::new(),
             Contents::Unread(why) => vec![Row::Unread(why.clone())],
-            Contents::Folders(subfolders) => subfolders
+            Contents::Listed(listing) => listing
+                .subfolders
                 .iter()
                 .enumerate()
                 .filter(|(_, subfolder)| folders::matches_prefix(&subfolder.name, &self.filter))
@@ -804,7 +792,7 @@ impl FolderList {
 
     fn subfolder(&self, row: &Row) -> Option<&Subfolder> {
         match (row, &self.contents) {
-            (Row::Folder(ix), Contents::Folders(subfolders)) => subfolders.get(*ix),
+            (Row::Folder(ix), Contents::Listed(listing)) => listing.subfolders.get(*ix),
             _ => None,
         }
     }
@@ -827,7 +815,13 @@ impl FolderList {
     /// Whether the subfolder `name` is a project already, by its path or
     /// its resolved one, as projects are kept.
     fn added(&self, path: &Path, name: &std::ffi::OsStr) -> bool {
-        let real = self.real.as_ref().map(|real| self.style.join(real, name));
+        let real = match &self.contents {
+            Contents::Listed(listing) => listing
+                .real
+                .as_ref()
+                .map(|real| self.style.join(real, name)),
+            Contents::Reading | Contents::Unread(_) => None,
+        };
         self.projects
             .iter()
             .any(|project| project == path || Some(project) == real.as_ref())

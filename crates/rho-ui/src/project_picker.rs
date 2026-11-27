@@ -606,7 +606,7 @@ impl ProjectPicker {
             &chooser,
             window,
             |this, _, Chosen(folder): &Chosen, window, cx| {
-                this.add_folder(folder.clone(), window, cx)
+                this.add_folder(folder.clone(), window, cx);
             },
         ));
     }

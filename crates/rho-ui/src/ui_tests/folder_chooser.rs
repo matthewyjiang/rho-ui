@@ -1,10 +1,10 @@
 //! Add project… opens rho-ui's folder chooser (`folder_chooser.rs`), on
 //! this machine and on a remote one, reached over the fake sshd, and adds
-//! the folder chosen's project.
+//! the folder chosen's project. Unix only: the fake sshd runs this
+//! machine's `sh`, and Unix permissions make the unreadable folder.
+#![cfg(unix)]
 
 use rho_ui_core::fake_sshd::FakeSshd;
-
-use crate::folders;
 
 use super::*;
 
@@ -42,7 +42,7 @@ fn assert_closed(ui: &mut Harness) {
 
 /// Opens the folder chooser from a new draft's Add project…, and lets
 /// Kit's dialog fade in on the harness's clock, past a remote read's
-/// debounce ([`folders::REMOTE_PAUSE`]) too.
+/// debounce ([`crate::folders::REMOTE_PAUSE`]) too.
 fn open_chooser(ui: &mut Harness) {
     ui.click("project-add");
     ui.wait_until("the folder chooser", |window, _, _| {
@@ -56,8 +56,6 @@ fn open_chooser(ui: &mut Harness) {
 /// folder it starts; a typed path goes where it leads, and a folder there
 /// that can't be read says so and can't be added. Ctrl+Enter adds the
 /// selected folder's project and moves the draft there.
-// Unix permissions make the unreadable folder.
-#[cfg(unix)]
 #[test]
 fn the_folder_chooser_adds_a_project_on_this_machine() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -148,8 +146,6 @@ fn the_folder_chooser_adds_a_project_on_this_machine() {
 /// On a remote machine, the chooser reads its folders over ssh, git
 /// checkouts and their branches too, and Add adds the selected folder's
 /// project there.
-// The fake sshd runs its commands with this machine's `sh`.
-#[cfg(unix)]
 #[test]
 fn the_folder_chooser_adds_a_project_on_a_remote_machine() {
     let dir = tempfile::tempdir().expect("a temporary directory");
