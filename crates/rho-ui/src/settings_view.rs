@@ -3,7 +3,8 @@
 //! on the left with a search, groups of items on the right. Each change
 //! applies at once and is saved. rho-ui's own settings come first, kept in
 //! its settings file: Appearance, Notifications, the Machines page in
-//! [`machines`], and the forge CLIs on each machine in [`source_control`].
+//! [`machines`], which ends with settings sync between machines, in
+//! [`sync`], and the forge CLIs on each machine in [`source_control`].
 //! Then come rho's own: each machine's sign-ins to providers, in
 //! [`providers`], the worktrees it added for sessions, in [`worktrees`], a
 //! page per category its daemon describes, saved in that machine's
@@ -19,6 +20,7 @@ mod plugins;
 mod providers;
 mod rho;
 mod source_control;
+mod sync;
 mod worktrees;
 
 use gpui_kit::assets::IconName as Lucide;
@@ -61,6 +63,7 @@ use machines::MachineFields;
 use providers::ProvidersFields;
 use rho::RhoFields;
 use source_control::SourceControlFields;
+use sync::SyncFields;
 use worktrees::WorktreesFields;
 
 /// How much of the window the dialog takes in each direction, so a large
@@ -219,6 +222,7 @@ struct SettingsView {
     providers: ProvidersFields,
     worktrees: WorktreesFields,
     configured: ConfiguredFields,
+    sync: SyncFields,
     /// Each machine's rho, for About.
     installs: Entity<Installs>,
     /// rho-ui's own updates, for About.
@@ -269,6 +273,7 @@ impl SettingsView {
             ),
             source_control: SourceControlFields::new(&machines, workspaces, forges, cx),
             providers: ProvidersFields::new(&machines, auths, cx),
+            sync: SyncFields::new(&machines, &rho_settings, cx),
             worktrees: WorktreesFields::new(&machines, worktrees, sidebar, cx),
             rho: RhoFields::new(&machines, rho_settings, window, cx),
             machine_list: machines,

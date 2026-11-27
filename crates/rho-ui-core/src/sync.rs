@@ -348,6 +348,15 @@ impl Snapshot {
         }
     }
 
+    /// The rows of `applied` that landed at `at`, as a retried row that
+    /// landed after the rest of its sync failed.
+    pub fn landed(at: i64, applied: &Applied) -> Self {
+        Self {
+            at,
+            items: applied.landed.clone(),
+        }
+    }
+
     /// How many rows it can revert.
     pub fn len(&self) -> usize {
         self.items.len()
