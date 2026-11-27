@@ -627,7 +627,7 @@ impl ProjectPicker {
                     cx.emit(PickerEvent::Picked(Pick::Folder(root)));
                 }
                 Ok(None) => window.push_notification(
-                    Notification::error(format!("{} isn't a folder", folder.path.display()))
+                    Notification::error(format!("Couldn't open {}", folder.path.display()))
                         .title("Couldn't add the project"),
                     cx,
                 ),

@@ -85,10 +85,18 @@ const CRUMBS: usize = 4;
 
 /// Binds the chooser's keys. Its path bar holds the keyboard, so Enter,
 /// Tab and the arrows reach these through Kit's single-line input, which
-/// leaves them alone.
+/// leaves them alone. Call it after `gpui_kit::init`, whose bindings it
+/// overrides.
 pub(crate) fn init(cx: &mut App) {
     let context = Some(CONTEXT);
     let mac = cx.platform_info().is_mac();
+    // Kit's input takes Cmd+Up to its start on macOS, single-line too; a
+    // binding as deep as its own, bound after it, wins.
+    let up_context = Some(if mac {
+        "FolderChooser > Input"
+    } else {
+        CONTEXT
+    });
     cx.bind_keys([
         KeyBinding::new("enter", Open, context),
         KeyBinding::new(
@@ -99,7 +107,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("tab", Complete, context),
         KeyBinding::new("up", SelectPrev, context),
         KeyBinding::new("down", SelectNext, context),
-        KeyBinding::new(if mac { "cmd-up" } else { "alt-up" }, Up, context),
+        KeyBinding::new(if mac { "cmd-up" } else { "alt-up" }, Up, up_context),
         KeyBinding::new(if mac { "cmd-[" } else { "alt-left" }, Back, context),
         KeyBinding::new(if mac { "cmd-]" } else { "alt-right" }, Forward, context),
     ]);
@@ -390,25 +398,29 @@ impl FolderChooser {
     }
 
     /// Completes the name typed: goes into the one folder it matches, or
-    /// types on to what all its matches start with.
+    /// types on to what all its matches start with. With nothing to
+    /// complete, Tab moves the focus on, as elsewhere.
     fn complete(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let delegate = self.list.read(cx).delegate();
-        let names: Vec<String> = delegate
-            .matches()
-            .map(|subfolder| subfolder.name.to_string_lossy().into_owned())
-            .collect();
-        match names.as_slice() {
-            [] => {}
+        let matches: Vec<&Subfolder> = delegate.matches().collect();
+        match matches.as_slice() {
+            [] => cx.propagate(),
             [only] => {
-                let folder = self.style.join(&delegate.folder, only.as_ref());
+                let folder = self.style.join(&delegate.folder, &only.name);
                 self.visit(folder, "", window, cx);
             }
             several => {
-                let common = common_prefix(several);
+                let names: Vec<String> = several
+                    .iter()
+                    .map(|subfolder| subfolder.name.to_string_lossy().into_owned())
+                    .collect();
+                let common = common_prefix(&names);
                 if common.chars().count() > delegate.filter.chars().count() {
                     self.path
                         .update(cx, |path, cx| path.set_value(common.clone(), window, cx));
                     self.filter(common, window, cx);
+                } else {
+                    cx.propagate();
                 }
             }
         }
@@ -496,7 +508,7 @@ impl FolderChooser {
             })
         };
         let mut items: Vec<BreadcrumbItem> = Vec::new();
-        if crumbs.len() >= CRUMBS {
+        if crumbs.len() > CRUMBS {
             let tail = crumbs.split_off(crumbs.len() - (CRUMBS - 2));
             items.extend(crumbs.into_iter().next().map(crumb));
             items.push(BreadcrumbItem::new("…").disabled(true));
@@ -730,13 +742,18 @@ fn common_prefix(names: &[String]) -> String {
     let Some((first, rest)) = names.split_first() else {
         return String::new();
     };
+    // A byte offset in `first`, after the last character all share: two
+    // names' characters can differ in width where they match in case.
     let mut end = first.len();
     for name in rest {
+        let mut name = name.chars();
         let same = first
             .char_indices()
-            .zip(name.chars())
-            .find(|((_, a), b)| !a.to_lowercase().eq(b.to_lowercase()))
-            .map_or_else(|| first.len().min(name.len()), |((at, _), _)| at);
+            .find(|&(_, a)| {
+                name.next()
+                    .is_none_or(|b| !a.to_lowercase().eq(b.to_lowercase()))
+            })
+            .map_or(first.len(), |(at, _)| at);
         end = end.min(same);
     }
     first[..end].to_owned()
@@ -871,12 +888,24 @@ impl ListDelegate for FolderList {
         } else {
             Icon::new(IconName::Folder)
         };
+        // The row read out: its name, then its badges.
+        let label = [
+            Some(name.as_str()),
+            added.then_some("added"),
+            git.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
         let chooser = self.chooser.clone();
         Some(
             ListItem::new(SharedString::from(format!("folder-row:{}", path.display())))
-                .accessibility_label(name.clone())
+                .accessibility_label(label)
                 // One click selects, as the keyboard does; two go in. Kit's
-                // list would take one as Enter.
+                // list would take one as Enter. It gives the keyboard back to
+                // the path bar here as well as on the list's focus, which
+                // headless UI tests don't get.
                 .on_click(move |event, window, cx| {
                     cx.stop_propagation();
                     let _ = chooser.update(cx, |this, cx| {
@@ -951,5 +980,8 @@ mod tests {
         assert_eq!(common_prefix(&names(&["rust-viz", "rust"])), "rust");
         assert_eq!(common_prefix(&names(&["a", "b"])), "");
         assert_eq!(common_prefix(&names(&["éa", "Éb"])), "é");
+        // Characters that match in case but not in width.
+        assert_eq!(common_prefix(&names(&["ẞx", "ß"])), "ẞ");
+        assert_eq!(common_prefix(&names(&["\u{212A}x", "k"])), "\u{212A}");
     }
 }

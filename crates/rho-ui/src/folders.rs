@@ -603,7 +603,7 @@ pub(crate) async fn look(
     pause(&reader, &executor).await;
     let read = read(
         reader,
-        typed.path.clone(),
+        Some(typed.path.clone()),
         Some(typed.browse.clone()),
         &executor,
     )
@@ -649,8 +649,8 @@ pub(crate) async fn list(
 ) -> Result<Result<Listing, Unlisted>, DaemonError> {
     pause(&reader, &executor).await;
     // Nothing to resolve: what it is in git costs most of the script.
-    let read = read(reader, PathBuf::new(), Some(folder), &executor).await?;
-    Ok(read.listed.unwrap_or(Err(Unlisted::Gone)))
+    let read = read(reader, None, Some(folder), &executor).await?;
+    read.listed.ok_or_else(printed_something_else)
 }
 
 /// The project of `folder` with `reader`, as adding it finds it: its
@@ -666,7 +666,7 @@ pub(crate) async fn resolve(
     folder: PathBuf,
     executor: BackgroundExecutor,
 ) -> Result<Option<Found>, DaemonError> {
-    let read = read(reader, folder.clone(), None, &executor).await?;
+    let read = read(reader, Some(folder.clone()), None, &executor).await?;
     Ok(read
         .folder
         .map(|found| Found::new(found.root, &found.real, &folder)))
@@ -680,38 +680,41 @@ async fn pause(reader: &Reader, executor: &BackgroundExecutor) {
     }
 }
 
-/// Resolves `path` and lists `browse`'s subfolders, if asked, with
+/// Resolves `path` and lists `browse`'s subfolders, each if asked, with
 /// `reader`: here on `executor`, there with [`REMOTE_SCRIPT`].
 async fn read(
     reader: Reader,
-    path: PathBuf,
+    path: Option<PathBuf>,
     browse: Option<PathBuf>,
     executor: &BackgroundExecutor,
 ) -> Result<Read, DaemonError> {
     match reader {
         Reader::Here => Ok(executor
-            .spawn(async move { look_here(&path, browse.as_deref()) })
+            .spawn(async move { look_here(path.as_deref(), browse.as_deref()) })
             .await),
         Reader::There(link) => {
-            let browse = browse.map_or_else(OsString::new, PathBuf::into_os_string);
+            // The script takes an empty argument as not asked.
+            let arg =
+                |path: Option<PathBuf>| path.map_or_else(OsString::new, PathBuf::into_os_string);
             let output = link
-                .run_script(REMOTE_SCRIPT, &[path.as_os_str(), &browse])
+                .run_script(REMOTE_SCRIPT, &[arg(path), arg(browse)])
                 .await?;
-            parse_remote(&output).ok_or_else(|| {
-                DaemonError::Unreachable("the folder script printed something else".into())
-            })
+            parse_remote(&output).ok_or_else(printed_something_else)
         }
         Reader::Unread => Err(DaemonError::Unreachable("it isn't connected".into())),
     }
 }
 
-/// Resolves `path` and lists `browse`'s subfolders, if asked, on this
-/// machine, as [`REMOTE_SCRIPT`] does on another. Does file I/O; call it
-/// off the UI thread.
-fn look_here(path: &Path, browse: Option<&Path>) -> Read {
-    // One that can't be read is none, as the script can't `cd` into it.
-    let folder = match platform::canonicalize(path) {
-        Ok(real) if real.is_dir() && std::fs::read_dir(&real).is_ok() => Some(Resolved {
+fn printed_something_else() -> DaemonError {
+    DaemonError::Unreachable("the folder script printed something else".into())
+}
+
+/// Resolves `path` and lists `browse`'s subfolders, each if asked, on
+/// this machine, as [`REMOTE_SCRIPT`] does on another. Does file I/O;
+/// call it off the UI thread.
+fn look_here(path: Option<&Path>, browse: Option<&Path>) -> Read {
+    let folder = match path.map(platform::canonicalize) {
+        Some(Ok(real)) if real.is_dir() => Some(Resolved {
             root: repo::inspect(&real).root,
             real,
         }),
@@ -756,14 +759,8 @@ fn list_here(folder: &Path) -> Result<Listing, Unlisted> {
 /// Whether `folder` is a git checkout's root, from its `.git` alone, as
 /// [`REMOTE_SCRIPT`] tells it.
 fn git_root(folder: &Path) -> Option<GitRoot> {
-    let dot_git = folder.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else {
-        let pointer = std::fs::read_to_string(&dot_git).ok()?;
-        folder.join(pointer.strip_prefix("gitdir:")?.trim())
-    };
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok();
+    let git_dir = repo::git_dir_at(folder)?;
+    let head = repo::read_small(&git_dir.join("HEAD"));
     Some(GitRoot {
         head: head.as_deref().and_then(repo::parse_head),
     })
@@ -782,20 +779,20 @@ fn sorted(subfolders: impl Iterator<Item = Subfolder>) -> Vec<Subfolder> {
 }
 
 /// The POSIX `sh` script that looks a folder up on a remote machine, given
-/// a path to resolve and a folder to list, or an empty one, as its
-/// arguments. After [`LOOKED`], it prints four fields, each ended by a NUL:
-/// `y` if the path is a folder, else `n`; its resolved path; and as `git`
-/// says, its work tree root and common git dir, empty outside a
+/// a path to resolve and a folder to list, each empty when not asked, as
+/// its arguments. After [`LOOKED`], it prints four fields, each ended by a
+/// NUL: `y` if the path is a folder, else `n`; its resolved path; and as
+/// `git` says, its work tree root and common git dir, empty outside a
 /// repository. Then, if asked to list a folder, it prints why it can't
 /// (`gone`, `file` or `denied`), or `listed`, its resolved path (empty if
-/// it can't be entered), and three fields for each subfolder: its name; `y` if it has a `.git` folder, or a `.git` file
-/// that points to one, else `n`; and the first line of that git dir's
-/// `HEAD`, empty if it can't be read. Only `sh` builtins run per subfolder,
-/// so a folder of hundreds lists in one quick script. Read with
-/// [`parse_remote`].
+/// it can't be entered), and three fields for each subfolder: its name;
+/// `y` if it has a `.git` folder, or a `.git` file that points to one,
+/// else `n`; and the first line of that git dir's `HEAD`, empty if it
+/// can't be read. Only `sh` builtins run per subfolder, so a folder of
+/// hundreds lists in one quick script. Read with [`parse_remote`].
 pub(crate) const REMOTE_SCRIPT: &str = r#"unset CDPATH
 printf 'rho-ui-folder\0'
-if [ -d "$1" ] && real=$(cd "$1" && pwd -P); then
+if [ -n "$1" ] && [ -d "$1" ] && real=$(cd "$1" && pwd -P); then
   if top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null); then
     common=$(cd "$1" && cd "$(git rev-parse --git-common-dir)" && pwd -P)
   else
@@ -835,7 +832,7 @@ else
     fi
     if [ -n "$gitdir" ]; then
       head=
-      { IFS= read -r head < "$gitdir/HEAD"; } 2>/dev/null
+      [ -f "$gitdir/HEAD" ] && { IFS= read -r head < "$gitdir/HEAD"; } 2>/dev/null
       printf '%s\0y\0%s\0' "$name" "$head"
     else
       printf '%s\0n\0\0' "$name"
@@ -1082,6 +1079,13 @@ mod tests {
                 format!("{}\n", "ab12".repeat(10)),
             )
             .unwrap();
+            // A HEAD no one writes to, which reading would wait on forever.
+            std::fs::create_dir_all(dir.join("fifo/.git")).unwrap();
+            let status = std::process::Command::new("mkfifo")
+                .arg(dir.join("fifo/.git/HEAD"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "mkfifo");
             let denied = dir.join("denied");
             std::fs::create_dir_all(&denied).unwrap();
             std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1095,11 +1099,12 @@ mod tests {
 
         /// What the files say of `path` and `browse`, once the script,
         /// after what a login file that talks prints, says the same.
-        fn read(path: &Path, browse: Option<&Path>) -> Read {
+        fn read(path: Option<&Path>, browse: Option<&Path>) -> Read {
             let local = look_here(path, browse);
+            let path = path.map(Path::to_path_buf).unwrap_or_default();
             let browse = browse.map(Path::to_path_buf).unwrap_or_default();
             let output =
-                crate::local::test::sh(REMOTE_SCRIPT, &[path, &browse]).expect("the script runs");
+                crate::local::test::sh(REMOTE_SCRIPT, &[&path, &browse]).expect("the script runs");
             let output = [b"Welcome!\n".as_slice(), output.as_slice()].concat();
             let remote = parse_remote(&output).expect("the script's fields");
             assert_eq!(remote, local, "{path:?} listing {browse:?}");
@@ -1148,7 +1153,7 @@ mod tests {
                 PathStyle::Native,
             )
             .unwrap();
-            let read = Folders::read(&typed.path, Some(&typed.browse));
+            let read = Folders::read(Some(&typed.path), Some(&typed.browse));
             Lookup::new(&typed, read)
         })
         .collect();
@@ -1185,7 +1190,7 @@ mod tests {
     fn the_remote_script_lists_what_the_files_hold() {
         let folders = Folders::new();
         let dir = &folders.dir;
-        let listed = |folder: &Path| Folders::read(Path::new(""), Some(folder)).listed;
+        let listed = |folder: &Path| Folders::read(None, Some(folder)).listed;
         let branch = |name: &str| {
             Some(GitRoot {
                 head: Some(repo::Head::Branch(name.to_owned())),
@@ -1203,6 +1208,7 @@ mod tests {
             // A folder, though nothing in it can be read.
             subfolder("denied", None),
             subfolder("det", detached),
+            subfolder("fifo", Some(GitRoot { head: None })),
             subfolder("link", None),
             subfolder("Plain", None),
             subfolder("plink", branch("main")),
@@ -1235,7 +1241,7 @@ mod tests {
             assert_eq!(listed(&dir.join("denied")), Some(Err(Unlisted::Denied)));
         }
         assert_eq!(
-            Folders::read(&dir.join("wt"), None).listed,
+            Folders::read(Some(&dir.join("wt")), None).listed,
             None,
             "nothing listed unasked"
         );

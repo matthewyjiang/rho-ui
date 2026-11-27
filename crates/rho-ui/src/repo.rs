@@ -217,15 +217,43 @@ pub(crate) fn nul_fields(output: &[u8]) -> Option<Vec<&[u8]>> {
 /// directory in a normal checkout and a `gitdir: <path>` file in a linked
 /// worktree or submodule.
 fn find_git_dir(start: &Path) -> Option<(PathBuf, PathBuf)> {
-    start.ancestors().find_map(|dir| {
-        let dot_git = dir.join(".git");
-        if dot_git.is_dir() {
-            return Some((dir.to_path_buf(), dot_git));
-        }
-        let pointer = std::fs::read_to_string(&dot_git).ok()?;
-        let target = pointer.strip_prefix("gitdir:")?.trim();
-        Some((dir.to_path_buf(), dir.join(target)))
-    })
+    start
+        .ancestors()
+        .find_map(|dir| Some((dir.to_path_buf(), git_dir_at(dir)?)))
+}
+
+/// The git dir of `dir` when it is a work tree's root: its `.git`
+/// directory, or where its `.git` file points.
+pub(crate) fn git_dir_at(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let pointer = read_small(&dot_git)?;
+    let target = pointer.strip_prefix("gitdir:")?.trim();
+    Some(dir.join(target))
+}
+
+/// The most a git pointer file (`.git`, `HEAD`) is read of: a path, which
+/// Linux caps at 4096 bytes (`PATH_MAX`), after a short tag.
+const SMALL_FILE: u64 = 4096 + 64;
+
+/// The start of the regular file at `path`, as git's small pointer files
+/// are read. Nothing for anything else, such as a FIFO, which would block,
+/// or `/dev/zero`, which never ends, in a folder another user shares.
+pub(crate) fn read_small(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(SMALL_FILE)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 /// Branch `main` for `ref: refs/heads/main`, a short hash for a detached
