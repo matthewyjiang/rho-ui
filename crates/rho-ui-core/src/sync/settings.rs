@@ -56,7 +56,6 @@ fn row(spec: &SettingSpec, source: &Side, target: &Side) -> Option<Row> {
             id: key.to_string(),
         },
         label: spec.label.clone(),
-        note: None,
         source: Some(show(from)),
         target: target_value,
         action,

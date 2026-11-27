@@ -278,7 +278,6 @@ fn a_setting_write_resets_to_a_shared_default() {
         let plan = diff.plan(&diff.initially_checked());
         let writes: Vec<_> = plan
             .items()
-            .iter()
             .filter_map(|item| match &item.change {
                 Change::Setting { key, after, .. } => Some(after.write(key)),
                 Change::Plugin { .. } => None,
@@ -405,7 +404,6 @@ fn a_revert_holds_back_what_the_target_changed_since() {
     let before = machine("box", specs(), &[], Vec::new());
     let diff = diff(&laptop, &before);
     let snapshot = Snapshot::new(0, &diff.plan(&diff.initially_checked()));
-    assert_eq!(snapshot.len(), 4);
     // After the sync, the target changed the mode again, and swapped lint
     // for a copy of a folder.
     let now = machine(
@@ -435,26 +433,8 @@ fn a_revert_holds_back_what_the_target_changed_since() {
         ),
         "{states:?}"
     );
-    let writes = |plan: Plan| -> Vec<(String, Option<SettingChange>)> {
-        plan.items
-            .into_iter()
-            .map(|item| match item.change {
-                Change::Setting { key, after, .. } => (key.to_string(), Some(after.write(&key))),
-                Change::Plugin { name, after, .. } => {
-                    assert_eq!(
-                        after, None,
-                        "{name}: the sync installed it, so Revert removes it"
-                    );
-                    (name, None)
-                }
-            })
-            .collect()
-    };
-    let reset = |key: &str| SettingChange::Reset {
-        key: SettingKey::new(key),
-    };
     assert_eq!(
-        writes(review.plan(&BTreeSet::new())),
+        writes(&review.plan(&BTreeSet::new())),
         [
             ("c.shell".to_owned(), Some(reset("c.shell"))),
             ("review".to_owned(), None),
@@ -462,7 +442,7 @@ fn a_revert_holds_back_what_the_target_changed_since() {
     );
     let anyway: BTreeSet<_> = review.changed().map(|row| row.key.clone()).collect();
     assert_eq!(
-        writes(review.plan(&anyway)),
+        writes(&review.plan(&anyway)),
         [
             ("c.mode".to_owned(), Some(reset("c.mode"))),
             ("c.shell".to_owned(), Some(reset("c.shell"))),
@@ -471,20 +451,83 @@ fn a_revert_holds_back_what_the_target_changed_since() {
     );
 }
 
-/// A kept snapshot is dropped once its sync is past the target's journal.
+/// A snapshot keeps each row a sync landed with what the row first
+/// overwrote, through a retry of a plugin that installed but didn't
+/// disable, so Revert removes it; a revert drops what it put back.
 #[test]
-fn a_snapshot_expires_with_the_targets_journal() {
-    let plan = Plan {
-        revision: ConfigRevision::new("r0"),
-        items: Vec::new(),
+fn a_snapshot_keeps_what_a_sync_first_overwrote() {
+    let review = "https://github.com/acme/review";
+    let modes = ["auto", "plan", "supervised"];
+    let specs = || vec![choice(&modes, "auto")];
+    let lint = || vec![disabled(plugin("lint", git(review, "a1")))];
+    let laptop = machine("laptop", specs(), &[("c.mode", text("plan"))], lint());
+    let diff = diff(&laptop, &machine("box", specs(), &[], Vec::new()));
+    let plan = diff.plan(&diff.initially_checked());
+    let [mode, lint_item] = [0, 1].map(|at| plan.items().nth(at).cloned().expect("two rows"));
+    let Change::Plugin {
+        name,
+        after: Some(after),
+        ..
+    } = &lint_item.change
+    else {
+        panic!("lint installs");
     };
-    let snapshot = Snapshot::new(1_000, &plan);
-    let cases = [
-        (1_000, false),
-        (1_000 + Snapshot::KEEP_FOR - 1, false),
-        (1_000 + Snapshot::KEEP_FOR, true),
-    ];
-    for (now, expired) in cases {
-        assert_eq!(snapshot.is_expired(now), expired, "{now}");
+    let rest = Planned {
+        change: plugins::left_to_disable(name, after),
+        ..lint_item.clone()
+    };
+    let mut snapshot = Snapshot::empty(0);
+    snapshot.after_sync(&Written {
+        landed: vec![mode.clone(), lint_item],
+        failed: vec![Failure {
+            item: rest.clone(),
+            reason: String::new(),
+        }],
+    });
+    snapshot.after_sync(&Written {
+        landed: vec![rest],
+        failed: Vec::new(),
+    });
+    let synced = machine("box", specs(), &[("c.mode", text("plan"))], lint());
+    assert_eq!(
+        writes(&review_revert(&snapshot, &synced).plan(&BTreeSet::new())),
+        [
+            ("c.mode".to_owned(), Some(reset("c.mode"))),
+            ("lint".to_owned(), None),
+        ]
+    );
+    snapshot.after_revert(&Written {
+        landed: vec![mode],
+        failed: Vec::new(),
+    });
+    let left: Vec<_> = review_revert(&snapshot, &synced)
+        .rows
+        .into_iter()
+        .map(|row| row.key.id)
+        .collect();
+    assert_eq!(left, ["lint"]);
+}
+
+/// What `plan` writes, row by row: a setting's write, or `None` for a
+/// plugin, which must be removed.
+fn writes(plan: &Plan) -> Vec<(String, Option<SettingChange>)> {
+    plan.items()
+        .cloned()
+        .map(|item| match item.change {
+            Change::Setting { key, after, .. } => (key.to_string(), Some(after.write(&key))),
+            Change::Plugin { name, after, .. } => {
+                assert_eq!(
+                    after, None,
+                    "{name}: the sync installed it, so Revert removes it"
+                );
+                (name, None)
+            }
+        })
+        .collect()
+}
+
+fn reset(key: &str) -> SettingChange {
+    SettingChange::Reset {
+        key: SettingKey::new(key),
     }
 }

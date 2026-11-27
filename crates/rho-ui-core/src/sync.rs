@@ -4,7 +4,8 @@
 //! [`diff`] compares two machines' [`Side`]s, as groups of rows by kind,
 //! listing only what differs; each row knows what syncing it would write
 //! and what that overwrites. [`Diff::plan`] takes the rows the user
-//! checked, and [`apply`] writes them to the target, one at a time,
+//! checked, and [`apply`] writes them to the target: the rows the daemon
+//! guards with a revision first, all at once, then the rest one at a time,
 //! saying which landed. A [`Snapshot`] of the plan keeps what the target
 //! held before, so [`review_revert`] can tell which rows the target changed
 //! since the sync, and [`RevertReview::plan`] puts back the rest.
@@ -94,8 +95,6 @@ pub struct Row {
     pub key: RowKey,
     /// Its name for people.
     pub label: String,
-    /// A line under the label, such as where the thing came from.
-    pub note: Option<String>,
     /// What the source has, for people; `None` when it has nothing.
     pub source: Option<String>,
     /// What the target has, for people; `None` when it has nothing.
@@ -234,12 +233,8 @@ impl Diff {
                     change: change.clone(),
                 }),
                 Copy::Cannot(_) => None,
-            })
-            .collect();
-        Plan {
-            revision: self.revision.clone(),
-            items,
-        }
+            });
+        Plan::new(&self.revision, items)
     }
 }
 
@@ -257,6 +252,36 @@ enum Change {
         before: Option<PluginCopy>,
         after: Option<PluginCopy>,
     },
+}
+
+impl Change {
+    /// Whether the daemon writes it only against the revision it was read
+    /// at, refusing it as stale once another client wrote since.
+    fn is_guarded(&self) -> bool {
+        match self {
+            Self::Setting { .. } => true,
+            Self::Plugin { .. } => false,
+        }
+    }
+
+    /// This change, then `later` to the same thing: what this one
+    /// overwrote, and what `later` left.
+    fn then(&self, later: &Self) -> Self {
+        match (self, later) {
+            (Self::Setting { before, .. }, Self::Setting { key, after, .. }) => Self::Setting {
+                key: key.clone(),
+                before: before.clone(),
+                after: after.clone(),
+            },
+            (Self::Plugin { before, .. }, Self::Plugin { name, after, .. }) => Self::Plugin {
+                name: name.clone(),
+                before: before.clone(),
+                after: after.clone(),
+            },
+            // Rows of the same key are of the same kind.
+            _ => later.clone(),
+        }
+    }
 }
 
 /// One row a plan writes.
@@ -285,37 +310,58 @@ impl Planned {
     }
 }
 
-/// The rows to write to the target, and the settings revision they were
-/// read at.
+/// The rows to write to the target: first the guarded ones, all at once
+/// against the revision they were read at, then, once those landed, the
+/// unguarded ones, each on its own. So a sync refused as stale writes
+/// nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
+    guarded: Option<Guarded>,
+    unguarded: Vec<Planned>,
+}
+
+/// A plan's guarded rows, never none, and the revision they were read at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Guarded {
     revision: ConfigRevision,
     items: Vec<Planned>,
 }
 
 impl Plan {
-    /// `item` alone, written against `revision`, as a retry does once it
-    /// read the target again.
-    pub fn retry(item: Planned, revision: ConfigRevision) -> Self {
+    /// `items`, read at `revision`, split by whether they are guarded.
+    fn new(revision: &ConfigRevision, items: impl IntoIterator<Item = Planned>) -> Self {
+        let (guarded, unguarded): (Vec<_>, Vec<_>) =
+            items.into_iter().partition(|item| item.change.is_guarded());
+        let guarded = (!guarded.is_empty()).then(|| Guarded {
+            revision: revision.clone(),
+            items: guarded,
+        });
+        Self { guarded, unguarded }
+    }
+
+    /// `failure`'s row alone, to write again. Only an unguarded row fails
+    /// alone, so it needs no revision.
+    pub fn retry(failure: &Failure) -> Self {
         Self {
-            revision,
-            items: vec![item],
+            guarded: None,
+            unguarded: vec![failure.item.clone()],
         }
     }
 
     /// The rows it writes, in order.
-    pub fn items(&self) -> &[Planned] {
-        &self.items
+    pub fn items(&self) -> impl Iterator<Item = &Planned> {
+        let guarded = self.guarded.iter().flat_map(|guarded| &guarded.items);
+        guarded.chain(&self.unguarded)
     }
 
     /// How many rows it writes.
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.items().count()
     }
 
     /// Whether it writes nothing.
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.guarded.is_none() && self.unguarded.is_empty()
     }
 }
 
@@ -329,9 +375,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// How long a snapshot is kept after its sync, in seconds: 7 days, as
-    /// long as the target daemon keeps its journal of overwritten secrets,
-    /// so a revert never outlives what the target can put back.
+    /// How long a snapshot is kept after its sync, in seconds: 7 days, the
+    /// span rho's sync design (for the methods still to come) gives the
+    /// target daemon's journal of overwritten secrets, so both expire
+    /// together. rho-protocol 1.6.0 has no such journal yet.
     pub const KEEP_FOR: i64 = 7 * 24 * 60 * 60;
 
     /// Whether the snapshot is past [`Self::KEEP_FOR`] at `now`, in Unix
@@ -340,26 +387,21 @@ impl Snapshot {
         now.saturating_sub(self.at) >= Self::KEEP_FOR
     }
 
-    /// `plan`'s rows, before it is applied at `at`.
+    /// Nothing yet, for a sync at `at`.
+    pub fn empty(at: i64) -> Self {
+        Self {
+            at,
+            items: Vec::new(),
+        }
+    }
+
+    /// All of `plan`'s rows, before it is applied at `at`: what Revert
+    /// finds if rho-ui stops while it writes.
     pub fn new(at: i64, plan: &Plan) -> Self {
         Self {
             at,
-            items: plan.items.clone(),
+            items: plan.items().cloned().collect(),
         }
-    }
-
-    /// The rows of `applied` that landed at `at`, as a retried row that
-    /// landed after the rest of its sync failed.
-    pub fn landed(at: i64, applied: &Applied) -> Self {
-        Self {
-            at,
-            items: applied.landed.clone(),
-        }
-    }
-
-    /// How many rows it can revert.
-    pub fn len(&self) -> usize {
-        self.items.len()
     }
 
     /// Whether it has nothing left to revert.
@@ -367,24 +409,22 @@ impl Snapshot {
         self.items.is_empty()
     }
 
-    /// Keeps only the rows of the sync that landed, once it is applied:
-    /// the target holds nothing of the rest to revert.
-    pub fn keep_landed(&mut self, applied: &Applied) {
-        self.items
-            .retain(|item| applied.landed.iter().any(|landed| landed.key == item.key));
+    /// Adds what a sync, or a retry of one of its rows, `written` to the
+    /// target. A row already here keeps what it first overwrote.
+    pub fn after_sync(&mut self, written: &Written) {
+        for item in &written.landed {
+            match self.items.iter_mut().find(|kept| kept.key == item.key) {
+                Some(kept) => kept.change = kept.change.then(&item.change),
+                None => self.items.push(item.clone()),
+            }
+        }
     }
 
-    /// Drops the rows a revert put back, once it is applied: what is left
-    /// can still be reverted.
-    pub fn drop_reverted(&mut self, applied: &Applied) {
+    /// Drops what a revert `written` put back: the rest can still be
+    /// reverted.
+    pub fn after_revert(&mut self, written: &Written) {
         self.items
-            .retain(|item| !applied.landed.iter().any(|landed| landed.key == item.key));
-    }
-
-    /// Adds `item`, as a retried row that landed.
-    pub fn add(&mut self, item: Planned) {
-        self.items.retain(|kept| kept.key != item.key);
-        self.items.push(item);
+            .retain(|item| !written.landed.iter().any(|landed| landed.key == item.key));
     }
 }
 
@@ -470,72 +510,112 @@ impl RevertReview {
                 RevertState::Changed => anyway.contains(&row.key),
                 RevertState::Blocked(_) => false,
             })
-            .filter_map(|row| row.item.clone())
-            .collect();
-        Plan {
-            revision: self.revision.clone(),
-            items,
-        }
+            .filter_map(|row| row.item.clone());
+        Plan::new(&self.revision, items)
     }
 }
 
 /// What applying a plan came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// The guarded rows were refused, so nothing was written.
+    Refused(Refusal),
+    /// The guarded rows landed, and the unguarded ones were written.
+    Written(Written),
+}
+
+/// Why the target refused a plan's guarded rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Its settings changed since they were read: read them again.
+    Stale,
+    /// It refused them, in the daemon's words.
+    Failed(String),
+}
+
+/// The rows a plan wrote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Applied {
-    /// The rows that landed, in order.
+pub struct Written {
+    /// The rows that landed, in order, with those that landed only in part.
     pub landed: Vec<Planned>,
-    /// The rows that didn't, in order.
+    /// The rows that didn't, or only in part, in order: an unguarded row
+    /// each.
     pub failed: Vec<Failure>,
-    /// The target's settings changed since they were read, so no setting
-    /// past that point was written: read them again.
-    pub stale: bool,
+}
+
+impl Written {
+    /// The rows that landed whole.
+    pub fn whole(&self) -> impl Iterator<Item = &Planned> {
+        self.landed
+            .iter()
+            .filter(|item| !self.failed.iter().any(|f| f.item.key == item.key))
+    }
 }
 
 /// A row that didn't land, and why, in the daemon's words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
-    /// The row, to retry.
+    /// What of the row is left to write, to retry.
     pub item: Planned,
     /// Why it didn't land.
     pub reason: String,
 }
 
-/// Writes `plan` to `target`'s daemon, one row at a time, so one refusal
-/// fails its row alone: settings first, each against the revision the plan
-/// read (the daemon takes it while only this client wrote since), then
-/// plugins. Settings stop at the first stale write.
+/// Why a row's write didn't land, and what of it is left when part did.
+struct Unwritten {
+    reason: String,
+    rest: Option<Box<Change>>,
+}
+
+/// Writes `plan` to `target`'s daemon: its guarded rows at once, against
+/// the revision the plan read (the daemon takes it while only this client
+/// wrote since); then, only if they landed, each unguarded row on its own,
+/// so one refusal fails its row alone.
 pub async fn apply(target: &Daemon, plan: Plan) -> Applied {
-    let mut applied = Applied::default();
-    for item in plan.items {
-        let written = match &item.change {
-            Change::Setting { key, after, .. } => {
-                if applied.stale {
-                    continue;
-                }
-                let write = after.write(key);
-                match target
-                    .set_agent_settings(plan.revision.clone(), vec![write])
-                    .await
-                {
-                    Err(DaemonError::Conflict(_)) => {
-                        applied.stale = true;
-                        continue;
-                    }
-                    written => written.map_err(|error| error.to_string()),
-                }
-            }
-            Change::Plugin {
-                name,
-                before,
-                after,
-            } => plugins::write(target, name, before.as_ref(), after.as_ref()).await,
-        };
-        match written {
-            Ok(()) => applied.landed.push(item),
-            Err(reason) => applied.failed.push(Failure { item, reason }),
+    let mut written = Written::default();
+    if let Some(Guarded { revision, items }) = plan.guarded {
+        let changes = items
+            .iter()
+            .filter_map(|item| match &item.change {
+                Change::Setting { key, after, .. } => Some(after.write(key)),
+                Change::Plugin { .. } => None,
+            })
+            .collect();
+        match target.set_agent_settings(revision, changes).await {
+            Ok(()) => written.landed = items,
+            Err(DaemonError::Conflict(_)) => return Applied::Refused(Refusal::Stale),
+            Err(error) => return Applied::Refused(Refusal::Failed(error.to_string())),
         }
     }
-    applied
+    for item in plan.unguarded {
+        // A plan keeps settings with the guarded rows.
+        let Change::Plugin {
+            name,
+            before,
+            after,
+        } = &item.change
+        else {
+            continue;
+        };
+        let result = plugins::write(target, name, before.as_ref(), after.as_ref()).await;
+        match result {
+            Ok(()) => written.landed.push(item),
+            Err(Unwritten { reason, rest }) => {
+                let left = match rest {
+                    Some(change) => {
+                        written.landed.push(item.clone());
+                        Planned {
+                            change: *change,
+                            ..item
+                        }
+                    }
+                    None => item,
+                };
+                written.failed.push(Failure { item: left, reason });
+            }
+        }
+    }
+    Applied::Written(written)
 }
 
 #[cfg(test)]

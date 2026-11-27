@@ -17,13 +17,15 @@ use gpui_kit::component::{
 use gpui_kit::{
     rems, App, Context, Entity, ParentElement as _, SharedString, Styled as _, Subscription,
 };
-use rho_ui_core::sync::{Action, Group, RevertRow, RevertState, Row, RowKey, RowState, Snapshot};
+use rho_ui_core::sync::{
+    Action, Group, Refusal, RevertRow, RevertState, Row, RowKey, RowState, Snapshot,
+};
 
 use super::{described, status_mark, value, Mark, SettingsView, Tone, CONTROL_REMS};
 use crate::{
     machines::{self, DaemonAction, MachineId, Machines},
     rho_settings::RhoSettings,
-    settings_sync::{clock, Busy, Compare, Outcome, Revert, RunKind, SettingsSync},
+    settings_sync::{clock, Busy, Compare, Outcome, Ran, Revert, RunKind, SettingsSync},
 };
 
 /// The group's own state: the app's sync, which outlives the dialog.
@@ -75,6 +77,7 @@ impl SettingsView {
             ))];
         };
         let target = machines.label(&to);
+        let busy = sync.busy();
         head = head
             .item(machine_item(
                 "From",
@@ -82,6 +85,7 @@ impl SettingsView {
                 sync.from(),
                 &entity,
                 SettingsSync::pick_from,
+                busy,
             ))
             .item(machine_item(
                 "To",
@@ -89,6 +93,7 @@ impl SettingsView {
                 &to,
                 &entity,
                 SettingsSync::pick_to,
+                busy,
             ))
             .item(compare_item(sync, machines, &to, &entity));
         head = head.items(banners(sync, &target, &entity, &self.machine_list, cx));
@@ -113,6 +118,7 @@ fn machine_item(
     shown: &MachineId,
     sync: &Entity<SettingsSync>,
     pick: fn(&mut SettingsSync, MachineId, &mut Context<'_, SettingsSync>),
+    busy: Option<&Busy>,
 ) -> SettingItem {
     let options: Vec<(SharedString, SharedString)> = machines
         .iter()
@@ -132,6 +138,7 @@ fn machine_item(
         .w(rems(CONTROL_REMS))
         .justify_between(),
     )
+    .disabled(busy.is_some())
 }
 
 /// What the comparison stands at, with Swap and Re-read.
@@ -161,7 +168,7 @@ fn compare_item(
             if cant > 0 {
                 parts.push(format!("{cant} can't be copied"));
             }
-            if differ == 0 {
+            if diff.is_empty() {
                 "Both machines hold the same.".to_owned()
             } else {
                 parts.join(" · ")
@@ -197,8 +204,8 @@ fn compare_item(
 }
 
 /// The last run's outcome and Revert, a line with Retry per row that
-/// failed, one prompt to restart the target, and why some settings
-/// weren't written.
+/// failed, one prompt to restart the target, or why the run wrote
+/// nothing.
 fn banners(
     sync: &SettingsSync,
     target: &str,
@@ -212,10 +219,9 @@ fn banners(
         .outcome()
         .filter(|outcome| Some(&outcome.target) == sync.to());
     let mut items = Vec::new();
-    let title = match outcome {
-        Some(outcome) => Some(outcome_title(outcome, target)),
-        None => revertible.map(|at| format!("Last sync to {target} · {}", clock(at))),
-    };
+    let title = outcome
+        .and_then(|outcome| outcome_title(outcome, target))
+        .or_else(|| revertible.map(|at| format!("Last sync to {target} · {}", clock(at))));
     if let Some(title) = title {
         let revert = revertible.map(|_| {
             let (entity, busy) = (entity.clone(), busy.cloned());
@@ -241,11 +247,20 @@ fn banners(
     let Some(outcome) = outcome else {
         return items;
     };
+    let (failed, restart) = match &outcome.ran {
+        Ran::Refused(refusal) => {
+            items.push(refused_item(outcome.kind, refusal, target));
+            return items;
+        }
+        Ran::Written {
+            failed, restart, ..
+        } => (failed, restart),
+    };
     let verb = match outcome.kind {
         RunKind::Sync => "sync",
         RunKind::Revert => "revert",
     };
-    for failure in &outcome.failed {
+    for failure in failed {
         let key = failure.item.key().clone();
         let (entity, busy) = (entity.clone(), busy.cloned());
         let field = SettingField::render(move |options, _, _| {
@@ -262,7 +277,7 @@ fn banners(
         let title = format!("{} didn't {verb}", failure.item.label());
         items.push(SettingItem::new(title, field).description(failure.reason.clone()));
     }
-    if !outcome.restart.is_empty() {
+    if !restart.is_empty() {
         let (machines, machine) = (machine_list.clone(), outcome.target.clone());
         let label = SharedString::from(format!("Restart {target}"));
         let field = SettingField::render(move |options, _, _| {
@@ -277,8 +292,8 @@ fn banners(
         });
         let title = format!(
             "{} {} once {target}'s Rho restarts",
-            outcome.restart.join(", "),
-            if outcome.restart.len() == 1 {
+            restart.join(", "),
+            if restart.len() == 1 {
                 "applies"
             } else {
                 "apply"
@@ -289,27 +304,36 @@ fn banners(
                 .description("Or leave it: they apply whenever its daemon next starts."),
         );
     }
-    if outcome.stale {
-        items.push(
-            SettingItem::new(
-                format!("{target}'s settings changed since they were read"),
-                value("", Tone::Muted),
-            )
-            .description("The settings after that weren't written. What still differs is below."),
-        );
-    }
     items
 }
 
-/// What the last run came to, as its banner's title.
-fn outcome_title(outcome: &Outcome, target: &str) -> String {
-    let Outcome { landed, total, .. } = outcome;
-    match outcome.kind {
+/// Why a run wrote nothing, and what to do about it.
+fn refused_item(kind: RunKind, refusal: &Refusal, target: &str) -> SettingItem {
+    let (title, again) = match kind {
+        RunKind::Sync => (format!("Nothing was synced to {target}"), "sync again"),
+        RunKind::Revert => (format!("Nothing was reverted on {target}"), "revert again"),
+    };
+    let why = match refusal {
+        Refusal::Stale => format!(
+            "Its settings changed since they were read. Check what differs now, then {again}."
+        ),
+        Refusal::Failed(why) => why.clone(),
+    };
+    SettingItem::new(title, value("", Tone::Muted)).description(why)
+}
+
+/// What the last run wrote, as its banner's title; `None` when it wrote
+/// nothing.
+fn outcome_title(outcome: &Outcome, target: &str) -> Option<String> {
+    let Ran::Written { landed, total, .. } = &outcome.ran else {
+        return None;
+    };
+    Some(match outcome.kind {
         RunKind::Sync if landed == total => format!("Synced {total} to {target}"),
         RunKind::Sync => format!("Synced {landed} of {total} to {target}"),
         RunKind::Revert if landed == total => format!("Reverted {total} on {target}"),
         RunKind::Revert => format!("Reverted {landed} of {total} on {target}"),
-    }
+    })
 }
 
 /// One kind's rows, under a header that checks or unchecks them all.
@@ -389,8 +413,8 @@ fn row_item(
     SettingItem::new(row.label.clone(), field).description(lines.join("\n"))
 }
 
-/// What a row says under its label: what syncing it changes, where it came
-/// from, when it applies, and why it can't be copied.
+/// What a row says under its label: what syncing it changes, when it
+/// applies, and why it can't be copied.
 fn row_lines(row: &Row, target: &str) -> Vec<String> {
     let missing = String::new;
     let source = row.source.clone().unwrap_or_else(missing);
@@ -404,12 +428,7 @@ fn row_lines(row: &Row, target: &str) -> Vec<String> {
         RowState::CantCopy(why) => Some(why),
         RowState::Checked | RowState::Unchecked => None,
     };
-    // A row that can't be copied for where it came from says that instead
-    // of what it would change.
-    let change = (reason.is_none() || row.note.is_none()).then_some(change);
-    change
-        .into_iter()
-        .chain(row.note.clone())
+    std::iter::once(change)
         .chain(
             row.restart
                 .then(|| format!("Applies once {target}'s Rho restarts.")),

@@ -9,9 +9,9 @@ use super::*;
 /// How far one step of [`shown`] scrolls the page.
 const STEP: f32 = 80.;
 
-/// The most steps [`shown`] takes: 4,800 pixels, past the end of the
-/// longest Machines page here.
-const STEPS: usize = 60;
+/// The most steps [`shown`] takes: twice the 14 the deepest row here,
+/// Revert's button under its review, measured at.
+const STEPS: usize = 30;
 
 /// Room under the dialog's top for the page title.
 const TITLE_ROOM: f32 = 60.;
@@ -122,12 +122,13 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         "sync-row-settings-tools.shell",
         "sync-row-plugins-deploy",
         "sync-row-plugins-review",
+        "sync-row-plugins-kit",
     ];
     let starts = rows.map(|id| checked(&mut ui, id));
-    assert_eq!(starts, [Some(true); 4]);
+    // The folder plugin has no checkbox.
     assert_eq!(
-        row_label(&mut ui, "sync-row-plugins-kit").as_deref(),
-        Some("kit: can't copy")
+        starts,
+        [Some(true), Some(true), Some(true), Some(true), None]
     );
     reveal(&mut ui, "sync-submit");
     ui.shot("review");
@@ -142,6 +143,17 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     assert!(has_plugin(&remote, "review") && !has_plugin(&remote, "deploy"));
     reveal(&mut ui, "sync-restart");
     ui.shot("synced");
+
+    // Retry runs alone, and fails the same row again.
+    click_revealed(&mut ui, "sync-retry-plugins-deploy");
+    // Revert is disabled while anything writes.
+    ui.wait_until("the retry done", |window, _, _| {
+        window
+            .try_find("sync-revert")
+            .is_some_and(|revert| revert.disabled() != Some(true))
+    });
+    reveal(&mut ui, "sync-retry-plugins-deploy");
+    assert!(!has_plugin(&remote, "deploy"));
 
     // The target changes the mode again since the sync.
     remote.edit_agent_setting("general.permission_mode", text("supervised"));
@@ -160,10 +172,4 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         Some(text("supervised")),
         "the newer change stays"
     );
-}
-
-/// The accessibility label of `id`, once revealed.
-fn row_label(ui: &mut Harness, id: &str) -> Option<String> {
-    reveal(ui, id);
-    ui.label(SharedString::from(id.to_owned()))
 }

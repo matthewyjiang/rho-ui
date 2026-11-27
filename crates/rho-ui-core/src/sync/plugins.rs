@@ -10,8 +10,10 @@ use std::{fmt::Write as _, path::PathBuf};
 use rho_protocol::{Plugin, PluginInstallSource, PluginScope, PluginSource, PluginTarget};
 use serde::{Deserialize, Serialize};
 
-use super::{Action, Change, Copy, GroupKind, Planned, RevertRow, RevertState, Row, RowKey};
-use crate::{Daemon, Enablement, IfExists};
+use super::{
+    Action, Change, Copy, GroupKind, Planned, RevertRow, RevertState, Row, RowKey, Unwritten,
+};
+use crate::{Daemon, Enablement, IfExists, PluginError};
 
 /// A user plugin as an install can make it again on any machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,26 +161,12 @@ fn shown_state(enabled: Enablement) -> &'static str {
     }
 }
 
-/// The enabled flag rho-protocol and the snapshot carry, as the enum the
-/// daemon's API takes.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "converts the wire's flag into the enum"
-)]
-fn enablement(enabled: bool) -> Enablement {
-    if enabled {
-        Enablement::Enabled
-    } else {
-        Enablement::Disabled
-    }
-}
-
 fn shown_copy(copy: &PluginCopy) -> String {
     let origin = match &copy.origin {
         Origin::Git { url, git_ref, path } => shown_git(url, git_ref.as_ref(), path.as_ref()),
         Origin::Link { path } => format!("linked to {}", path.display()),
     };
-    format!("{origin} · {}", shown_state(enablement(copy.enabled)))
+    format!("{origin} · {}", shown_state(copy.enabled.into()))
 }
 
 fn shown_plugin(plugin: &Plugin) -> String {
@@ -191,7 +179,7 @@ fn shown_plugin(plugin: &Plugin) -> String {
         PluginSource::Local => "put in place by hand".to_owned(),
         _ => "installed some other way".to_owned(),
     };
-    format!("{origin} · {}", shown_state(enablement(plugin.enabled)))
+    format!("{origin} · {}", shown_state(plugin.enabled.into()))
 }
 
 /// Whether `a` and `b` are the same install: the same source, but for the
@@ -233,11 +221,10 @@ pub(super) fn rows(from: &[Plugin], to: &[Plugin], source: &str, target: &str) -
             Action::Add
         };
         let copy = match from_source(plugin, source) {
-            Err(note) => {
-                let why = format!(
-                    "Can't be copied: install it on {target} from git, or link a folder there"
-                );
-                return Some(row(plugin, there, action, Some(note), Copy::Cannot(why)));
+            Err(origin) => {
+                let why =
+                    format!("{origin}: install it on {target} from git, or link a folder there");
+                return Some(row(plugin, there, action, Copy::Cannot(why)));
             }
             Ok(copy) => copy,
         };
@@ -248,7 +235,7 @@ pub(super) fn rows(from: &[Plugin], to: &[Plugin], source: &str, target: &str) -
                     let why = format!(
                         "{target}'s copy came from a folder: Revert couldn't bring it back"
                     );
-                    return Some(row(plugin, Some(there), action, None, Copy::Cannot(why)));
+                    return Some(row(plugin, Some(there), action, Copy::Cannot(why)));
                 };
                 Some(theirs)
             }
@@ -258,7 +245,7 @@ pub(super) fn rows(from: &[Plugin], to: &[Plugin], source: &str, target: &str) -
             before,
             after: Some(copy),
         };
-        Some(row(plugin, there, action, None, Copy::Write(change)))
+        Some(row(plugin, there, action, Copy::Write(change)))
     });
     let only_theirs = user(to)
         .filter(|plugin| !user(from).any(|ours| ours.name == plugin.name))
@@ -275,27 +262,20 @@ pub(super) fn rows(from: &[Plugin], to: &[Plugin], source: &str, target: &str) -
             };
             Row {
                 source: None,
-                ..row(plugin, Some(plugin), Action::Remove, None, copy)
+                ..row(plugin, Some(plugin), Action::Remove, copy)
             }
         });
     ours.chain(only_theirs).collect()
 }
 
 /// The row of plugin `plugin`, which the target has as `there`.
-fn row(
-    plugin: &Plugin,
-    there: Option<&Plugin>,
-    action: Action,
-    note: Option<String>,
-    copy: Copy,
-) -> Row {
+fn row(plugin: &Plugin, there: Option<&Plugin>, action: Action, copy: Copy) -> Row {
     Row {
         key: RowKey {
             kind: GroupKind::Plugins,
             id: plugin.name.clone(),
         },
         label: plugin.name.clone(),
-        note,
         source: Some(shown_plugin(plugin)),
         target: there.map(shown_plugin),
         action,
@@ -307,41 +287,69 @@ fn row(
 
 /// Writes one plugin row: installs it, changes whether it is enabled, or
 /// removes it. An install starts enabled, so a disabled one is disabled
-/// after.
+/// after; if that fails, what is left is to disable it.
 pub(super) async fn write(
     target: &Daemon,
     name: &str,
     before: Option<&PluginCopy>,
     after: Option<&PluginCopy>,
-) -> Result<(), String> {
+) -> Result<(), Unwritten> {
     let plugin = || PluginTarget::new(name.to_owned(), PluginScope::User);
-    let written = match (before, after) {
-        (_, None) => target.remove_plugin(plugin(), None).await.map(drop),
-        (Some(before), Some(after)) if before.origin == after.origin => target
-            .set_plugin_enabled(plugin(), enablement(after.enabled), None)
+    let failed = |error: PluginError| Unwritten {
+        reason: error.to_string(),
+        rest: None,
+    };
+    match (before, after) {
+        (_, None) => target
+            .remove_plugin(plugin(), None)
             .await
-            .map(drop),
+            .map(drop)
+            .map_err(failed),
+        (Some(before), Some(after)) if before.origin == after.origin => target
+            .set_plugin_enabled(plugin(), after.enabled.into(), None)
+            .await
+            .map(drop)
+            .map_err(failed),
         (before, Some(after)) => {
             let Some(source) = after.install_source() else {
-                return Err("No install can name where this plugin came from".to_owned());
+                return Err(Unwritten {
+                    reason: "No install can name where this plugin came from".to_owned(),
+                    rest: None,
+                });
             };
             let if_exists = match before {
                 Some(_) => IfExists::Replace,
                 None => IfExists::Refuse,
             };
-            match target
+            target
                 .install_plugin(source, PluginScope::User, if_exists, None)
                 .await
-            {
-                Ok(_) if !after.enabled => target
-                    .set_plugin_enabled(plugin(), Enablement::Disabled, None)
-                    .await
-                    .map(drop),
-                installed => installed.map(drop),
+                .map_err(failed)?;
+            if after.enabled {
+                return Ok(());
             }
+            let disabled = target
+                .set_plugin_enabled(plugin(), Enablement::Disabled, None)
+                .await;
+            disabled.map(drop).map_err(|error| Unwritten {
+                reason: error.to_string(),
+                rest: Some(Box::new(left_to_disable(name, after))),
+            })
         }
-    };
-    written.map_err(|error| error.to_string())
+    }
+}
+
+/// What is left of installing `after` as plugin `name` once the install
+/// landed, enabled, but disabling it didn't.
+pub(super) fn left_to_disable(name: &str, after: &PluginCopy) -> Change {
+    Change::Plugin {
+        name: name.to_owned(),
+        before: Some(PluginCopy {
+            enabled: true,
+            ..after.clone()
+        }),
+        after: Some(after.clone()),
+    }
 }
 
 /// What the target has of a plugin now, as Revert finds it.

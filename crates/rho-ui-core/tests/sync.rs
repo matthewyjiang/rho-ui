@@ -1,12 +1,10 @@
 //! Settings sync against two scripted fake daemons, a source and a target:
-//! what a plan writes over rho-protocol, and what Revert puts back.
-
-use std::collections::BTreeSet;
+//! what a plan writes over rho-protocol, and in what order.
 
 use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{FakeDaemon, Script},
-    sync::{self, Side},
+    sync::{self, Applied, Refusal, Side},
     Daemon, DaemonEvents, PluginInstallSource,
 };
 use smol::block_on;
@@ -28,14 +26,13 @@ fn text(value: &str) -> SettingValue {
     SettingValue::Text(value.to_owned())
 }
 
-/// A sync makes the target hold what the source does, but for a write
-/// refused as stale and an install that fails; after the target changes a
-/// row again, Revert puts back the rest and leaves that row as it is.
+/// A sync refused as stale writes nothing, plugins included; once read
+/// again, its settings land first, then its plugins, each on its own, so
+/// an install that fails fails its row alone.
 #[test]
-fn a_sync_lands_and_reverts_over_the_protocol() {
+fn a_sync_writes_plugins_only_after_its_settings_land() {
     let laptop = FakeDaemon::start(Script::default());
     let target = FakeDaemon::start(Script::default());
-    laptop.edit_agent_setting("general.permission_mode", text("plan"));
     laptop.edit_agent_setting("tools.shell", text("zsh"));
     // The laptop has a plugin from a GitHub branch's folder the target
     // lacks, and one the target lacks whose host no fetch reaches.
@@ -43,58 +40,44 @@ fn a_sync_lands_and_reverts_over_the_protocol() {
         url: "https://github.com/acme/kit/tree/release%2F2/plugins/lint".to_owned(),
     });
     target.remove_plugin("deploy");
+    let has = |name: &str| {
+        target
+            .plugins(None)
+            .iter()
+            .any(|plugin| plugin.name == name)
+    };
     block_on(async {
         let (from, _from_events) = connect(&laptop).await;
         let (to, _to_events) = connect(&target).await;
         let source = read("laptop", &from).await;
 
-        // A hand edit of the target after the read: the settings writes are
-        // refused, the plugins still install.
+        // A hand edit of the target after the read.
         let diff = sync::diff(&source, &read("box", &to).await);
         target.edit_agent_setting("general.auto_compact", SettingValue::Bool(false));
         let applied = sync::apply(&to, diff.plan(&diff.initially_checked())).await;
-        assert!(applied.stale);
-        let landed: Vec<_> = applied
-            .landed
-            .iter()
-            .map(|item| item.key().id.as_str())
-            .collect();
-        assert_eq!(landed, ["lint"]);
-        let failed: Vec<_> = applied
-            .failed
-            .iter()
-            .map(|f| f.item.key().id.as_str())
-            .collect();
-        assert_eq!(failed, ["deploy"]);
+        assert_eq!(applied, Applied::Refused(Refusal::Stale));
+        assert_eq!(target.agent_setting("tools.shell"), Some(text("bash")));
+        assert!(!has("lint"), "nothing past a stale refusal is written");
         target.edit_agent_setting("general.auto_compact", SettingValue::Bool(true));
 
-        // Read again: the settings land, and only the failed plugin still
-        // differs.
         let diff = sync::diff(&source, &read("box", &to).await);
-        let plan = diff.plan(&diff.initially_checked());
-        let mut snapshot = sync::Snapshot::new(0, &plan);
-        let applied = sync::apply(&to, plan).await;
-        assert!(!applied.stale);
-        snapshot.keep_landed(&applied);
-        assert_eq!(target.agent_setting("tools.shell"), Some(text("zsh")));
-        let left: Vec<_> = sync::diff(&source, &read("box", &to).await)
-            .rows()
-            .map(|row| row.key.id.clone())
-            .collect();
-        assert_eq!(left, ["deploy"]);
-
-        // The target changes the mode again; Revert leaves it and puts
-        // back the shell.
-        target.edit_agent_setting("general.permission_mode", text("supervised"));
-        let review = sync::review_revert(&snapshot, &read("box", &to).await);
-        let changed: Vec<_> = review.changed().map(|row| row.key.id.as_str()).collect();
-        assert_eq!(changed, ["general.permission_mode"]);
-        let applied = sync::apply(&to, review.plan(&BTreeSet::new())).await;
-        assert!(applied.failed.is_empty() && !applied.stale);
+        let Applied::Written(written) =
+            sync::apply(&to, diff.plan(&diff.initially_checked())).await
+        else {
+            panic!("a fresh read's settings land");
+        };
+        let ids = |items: Vec<&sync::Planned>| -> Vec<String> {
+            items
+                .into_iter()
+                .map(|item| item.key().id.clone())
+                .collect()
+        };
+        assert_eq!(ids(written.whole().collect()), ["tools.shell", "lint"]);
         assert_eq!(
-            target.agent_setting("general.permission_mode"),
-            Some(text("supervised"))
+            ids(written.failed.iter().map(|f| &f.item).collect()),
+            ["deploy"]
         );
-        assert_eq!(target.agent_setting("tools.shell"), Some(text("bash")));
+        assert_eq!(target.agent_setting("tools.shell"), Some(text("zsh")));
+        assert!(has("lint") && !has("deploy"));
     });
 }
