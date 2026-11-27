@@ -17,7 +17,8 @@
 //! opens on a click, or by itself when one of them comes on screen, or
 //! while the search or the filter shows some of them and not their starter.
 //! Hovering a row shows its details in a card. The filter beside the
-//! search hides machines or keeps to chosen projects, and the footer says
+//! search hides machines or keeps to chosen projects, shown as chips under
+//! the search while it does (see [`filter`]), and the footer says
 //! which machines aren't connected, with what would fix it (Retry, a
 //! restart of a daemon too old for rho-ui or of another build, Start for
 //! one the user stopped), and why any remote machine's repositories
@@ -73,7 +74,7 @@ use crate::{
     pull_requests::{Focus, PullRequests},
     rho_install::{render_offer, Installs},
     session_list::{
-        DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Pressing, Row,
+        DraftRow, Family, Fold, FoldLine, Item, JobSession, LiveSession, Named, Pressing, Row,
         SavedSession, SessionList, Status, SHELF_PAGE,
     },
     settings::{self, Settings},
@@ -688,17 +689,8 @@ impl SidebarView {
     }
 
     fn rebuild(&mut self, cx: &mut Context<'_, Self>) {
-        let workspaces = self.workspaces.read(cx);
-        let projects = self.projects.read(cx);
         let watching = self.prs.read(cx).watching();
-        let named = |kind: Kind, own: Option<usize>, added: &[usize]| {
-            let added = added.iter().map(|&ix| workspaces.get(ix));
-            let own = own.map(|ix| workspaces.get(ix));
-            session_workspaces(kind, own, added, Some(projects))
-                .into_iter()
-                .map(|workspace| (workspace.name.as_ref(), workspace.root_path()))
-                .collect()
-        };
+        let named = named(self.workspaces.read(cx), self.projects.read(cx));
         self.list.rebuild(time::now_unix(), &watching, named);
         // Every session on the active shelf the filter shows has its PRs
         // listed by its daemon, under a closed fold too, as what it watches
@@ -1926,8 +1918,9 @@ impl Render for SidebarView {
                                 .cleanable(true),
                         ),
                     )
-                    .child(filter::button(self, cx)),
+                    .child(filter::button(self, window, cx)),
             )
+            .children(filter::chips(self, cx))
             .when(!self.list.query().is_empty(), |frame| {
                 frame.child(
                     div()
@@ -2048,6 +2041,23 @@ fn project_line(
 /// stack rings its badges with.
 fn surface(state: RowState, theme: &Theme) -> Hsla {
     row_bg(state, theme).map_or(theme.sidebar, |bg| theme.sidebar.blend(bg))
+}
+
+/// The projects a session works in, as the filter and the search find
+/// it: of its kind, its own workspace and those it added, given by index
+/// into `workspaces`.
+fn named<'a>(
+    workspaces: &'a Workspaces,
+    projects: &'a Projects,
+) -> impl Fn(Kind, Option<usize>, &[usize]) -> Named<'a> + Copy {
+    move |kind, own, added| {
+        let added = added.iter().map(|&ix| workspaces.get(ix));
+        let own = own.map(|ix| workspaces.get(ix));
+        session_workspaces(kind, own, added, Some(projects))
+            .into_iter()
+            .map(|workspace| (workspace.name.as_ref(), workspace.root_path()))
+            .collect()
+    }
 }
 
 /// A workspace's badge, a line of the sidebar's text tall.

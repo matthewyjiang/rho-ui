@@ -68,6 +68,7 @@ use crate::{
 
 mod cards;
 mod configured;
+mod filter;
 mod live;
 mod mcp;
 mod plugins;
@@ -8252,10 +8253,10 @@ fn a_compaction_shows_as_a_divider() {
 
 /// Two machines list their sessions side by side, though their daemons
 /// issue the same session IDs, and each row names its machine. A session
-/// opens from the daemon it is on, a new session starts on the machine its
-/// project is on, and the filter hides a machine. A project with a
-/// checkout on each machine lists once, at the chosen machine's checkout,
-/// and choosing the other machine moves the draft to its checkout there.
+/// opens from the daemon it is on, and a new session starts on the machine
+/// its project is on. A project with a checkout on each machine lists
+/// once, at the chosen machine's checkout, and choosing the other machine
+/// moves the draft to its checkout there.
 /// A machine that can't be reached says so with Retry while the others
 /// work on.
 #[test]
@@ -8363,14 +8364,6 @@ fn machines_list_side_by_side() {
     });
 
     choose_this_machine(&mut ui);
-
-    // The filter hides the workstation's sessions.
-    ui.click("sidebar-filter");
-    click_menu_item(&mut ui, "Workstation");
-    ui.wait_until("only this machine's sessions", |window, _, _| {
-        is_visible(window, "session-local-s1") && !is_visible(window, "session-workstation-s1")
-    });
-    ui.shot("filtered");
 }
 
 /// Waits for the project list of a draft on the workstation: `app` once,

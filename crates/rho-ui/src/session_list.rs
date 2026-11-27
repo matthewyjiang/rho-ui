@@ -13,7 +13,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -395,6 +395,13 @@ struct Open {
 /// works in, given its own workspace and its added directories by index;
 /// see [`crate::project_stack::session_workspaces`].
 pub(crate) type Named<'a> = Vec<(&'a str, &'a Path)>;
+
+/// See [`SessionList::family_counts`].
+#[derive(Debug, Default)]
+pub(crate) struct FamilyCounts {
+    pub(crate) projects: HashMap<Place, usize>,
+    pub(crate) machines: HashMap<MachineId, usize>,
+}
 
 /// What the filter and the search read of a row or a draft.
 struct Sifted<'r> {
@@ -1089,6 +1096,36 @@ impl SessionList {
         &self.rows
     }
 
+    /// How many families of sessions, on any shelf, work in each project
+    /// and run on each machine, whatever the filter and the search show: a
+    /// session and those it started count once, as the shelf headers count
+    /// them. A session works in the projects `named`, [`Self::rebuild`]'s,
+    /// gives it, so the counts match what the filter lets through.
+    pub(crate) fn family_counts<'a>(
+        &self,
+        named: impl Fn(Kind, Option<usize>, &[usize]) -> Named<'a>,
+    ) -> FamilyCounts {
+        let families = Families::of(&self.rows);
+        let mut in_project: HashSet<(Place, usize)> = HashSet::new();
+        let mut on_machine: HashSet<(&MachineId, usize)> = HashSet::new();
+        for (ix, row) in self.rows.iter().enumerate() {
+            let top = families.starter(ix).unwrap_or(ix);
+            let machine = &row.id.machine;
+            on_machine.insert((machine, top));
+            for (_, root) in named(row.kind, Some(row.workspace), &row.added) {
+                in_project.insert((Place::new(machine.clone(), root), top));
+            }
+        }
+        let mut counts = FamilyCounts::default();
+        for (project, _) in in_project {
+            *counts.projects.entry(project).or_default() += 1;
+        }
+        for (machine, _) in on_machine {
+            *counts.machines.entry(machine.clone()).or_default() += 1;
+        }
+        counts
+    }
+
     /// The rows of the sessions `starter` started itself, not those they
     /// started in turn, in the list's order, whatever the search and the
     /// filter show.
@@ -1167,6 +1204,42 @@ impl Filter {
         if !self.projects.remove(project) {
             self.projects.insert(project.clone());
         }
+    }
+
+    /// Hides nothing and keeps to no project.
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Shows `machine`'s sessions, if they were hidden.
+    pub(crate) fn show_machine(&mut self, machine: &MachineId) {
+        self.hidden.remove(machine);
+    }
+
+    /// Takes `project` off the chosen projects, if it was on them.
+    pub(crate) fn drop_project(&mut self, project: &Place) {
+        self.projects.remove(project);
+    }
+
+    /// Keeps to `project` alone, showing its machine if it was hidden.
+    pub(crate) fn only_project(&mut self, project: &Place) {
+        self.hidden.remove(&project.machine);
+        self.projects = BTreeSet::from([project.clone()]);
+    }
+
+    /// Shows `machine` alone of `machines`: hides the others, and drops the
+    /// chosen projects on them, which would leave it nothing to keep to.
+    pub(crate) fn only_machine<'a>(
+        &mut self,
+        machine: &MachineId,
+        machines: impl IntoIterator<Item = &'a MachineId>,
+    ) {
+        self.hidden = machines
+            .into_iter()
+            .filter(|other| *other != machine)
+            .cloned()
+            .collect();
+        self.projects.retain(|project| project.machine == *machine);
     }
 
     /// Forgets `machine`, gone from the settings, which the menu no longer
