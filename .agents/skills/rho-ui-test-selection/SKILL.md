@@ -90,7 +90,7 @@ Tests must be deterministic under parallel `cargo test` and a loaded machine.
 - Waiting on an explicit signal: a channel, an `Atomic*`, or a condition the code under test owns
 - A timeout as a **failure bound** around that signal, not as the sync mechanism
 - The UI harness's `wait_until` on an observable condition, with its named timeout
-- The fake daemon's scripted replies and its counters (`holds()` and the like) instead of guessing when the daemon got a request
+- The fake daemon's scripted replies and its counters (`session_holds()` and the like) instead of guessing when the daemon got a request
 - Fake or manual clocks when the product logic is time-based
 
 ### If a test is flaky

@@ -143,7 +143,7 @@ fn the_composer_attaches_mcp_resources() {
     let entries = ui.session().entries().len();
 
     // A read cancelled with Backspace attaches nothing, even once it ends.
-    ui.fake().hold_mcp_reads();
+    ui.fake().hold(Answers::McpReads);
     ui.type_in("@intr");
     let intro = SharedString::from(format!("completion-@docs:{MCP_INTRO}"));
     ui.wait_until("the matching resource", |window, _, _| {
@@ -159,7 +159,7 @@ fn the_composer_attaches_mcp_resources() {
         app.active_session()
             .is_some_and(|view| !view.read(cx).composer_is_reading(cx))
     });
-    ui.fake().release_mcp_reads();
+    ui.fake().release(Answers::McpReads);
 
     ui.type_in("read @us");
     ui.wait_until("the template", |window, _, _| {
@@ -168,7 +168,7 @@ fn the_composer_attaches_mcp_resources() {
     ui.act(|window, cx| window.press("tab", cx));
     assert_eq!(ui.composer_text(), "read @docs://users/{id} ");
 
-    ui.fake().hold_mcp_reads();
+    ui.fake().hold(Answers::McpReads);
     ui.act(|window, cx| window.input("@intr", cx));
     ui.wait_until("the matching resource", |window, _, _| {
         is_visible(window, intro.clone())
@@ -190,7 +190,7 @@ fn the_composer_attaches_mcp_resources() {
     assert_eq!(ui.session().entries().len(), entries, "nothing sent");
     ui.shot("reading");
 
-    ui.fake().release_mcp_reads();
+    ui.fake().release(Answers::McpReads);
     ui.wait_until("the page attached", |_, cx, app| {
         composer_prompt(cx, app).attachments().len() == 1
     });
@@ -236,13 +236,13 @@ fn a_failed_catalog_read_asks_again_at_the_next_key() {
     let mut ui = Harness::start("mcp-catalog-fails", Script::default());
     open_session(&mut ui);
     ui.fake().fail_mcp_catalog();
-    ui.fake().hold_mcp_catalog();
+    ui.fake().hold(Answers::McpCatalog);
 
     // `b` comes while `@a`'s read is held: the same mention, so it asks
     // nothing until that one fails.
     ui.type_in("@a");
     ui.type_in("b");
-    ui.fake().release_mcp_catalog();
+    ui.fake().release(Answers::McpCatalog);
     settle_catalog(&mut ui, 2, "for the key typed while it was asked");
 
     ui.type_in("c");

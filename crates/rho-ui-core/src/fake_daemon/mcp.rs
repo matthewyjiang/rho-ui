@@ -9,8 +9,8 @@
 //! The docs server offers two prompts: [`MCP_SEARCH`], one argument whose
 //! values it suggests, and `outline`, which suggests none. It offers three
 //! resources: [`MCP_INTRO`], a page it reads; [`MCP_CHANGELOG`], whose read
-//! fails; and [`MCP_USER`], a template. Reads wait while a test holds them
-//! ([`FakeDaemon::hold_mcp_reads`]).
+//! fails; and [`MCP_USER`], a template. Listings and reads wait while a
+//! test holds them ([`super::Answers`]).
 
 use std::path::PathBuf;
 
@@ -20,8 +20,6 @@ use rho_protocol::{
     SessionMcpPrompt, SessionMcpPromptArgument, SessionMcpResource, SessionMcpResourceContent,
     SessionMcpResourceParams, SessionMcpResourceResponse, SessionMcpServer, SessionMcpStatus,
 };
-
-use tokio::sync::watch;
 
 use super::{FakeDaemon, Script, State};
 
@@ -61,10 +59,6 @@ pub enum McpStartup {
 #[derive(Debug)]
 pub(super) struct FakeMcp {
     startup: McpStartup,
-    /// Whether resource reads wait; see [`FakeDaemon::hold_mcp_reads`].
-    pub(super) reads_held: watch::Sender<bool>,
-    /// Whether the catalog waits; see [`FakeDaemon::hold_mcp_catalog`].
-    pub(super) catalog_held: watch::Sender<bool>,
     /// Whether the catalog fails; see [`FakeDaemon::fail_mcp_catalog`].
     catalog_fails: bool,
     /// How many times the catalog was asked for.
@@ -75,8 +69,6 @@ impl FakeMcp {
     pub(super) fn new(script: &Script) -> Self {
         Self {
             startup: script.mcp,
-            reads_held: watch::Sender::new(false),
-            catalog_held: watch::Sender::new(false),
             catalog_fails: false,
             catalog_reads: 0,
         }
@@ -252,32 +244,8 @@ impl FakeDaemon {
         self.service.lock().mcp.catalog_fails = true;
     }
 
-    /// Makes `rho/session/mcp/catalog` wait until
-    /// [`Self::release_mcp_catalog`], as a slow server's listing does.
-    pub fn hold_mcp_catalog(&self) {
-        self.service.lock().mcp.catalog_held.send_replace(true);
-    }
-
-    /// Answers the listings [`Self::hold_mcp_catalog`] held, and those
-    /// after.
-    pub fn release_mcp_catalog(&self) {
-        self.service.lock().mcp.catalog_held.send_replace(false);
-    }
-
     /// How many times `rho/session/mcp/catalog` was answered.
     pub fn mcp_catalog_reads(&self) -> usize {
         self.service.lock().mcp.catalog_reads
-    }
-
-    /// Makes resource reads wait until [`Self::release_mcp_reads`], as a
-    /// slow server's do.
-    pub fn hold_mcp_reads(&self) {
-        self.service.lock().mcp.reads_held.send_replace(true);
-    }
-
-    /// Answers the resource reads [`Self::hold_mcp_reads`] held, and those
-    /// after.
-    pub fn release_mcp_reads(&self) {
-        self.service.lock().mcp.reads_held.send_replace(false);
     }
 }

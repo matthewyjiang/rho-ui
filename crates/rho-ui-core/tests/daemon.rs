@@ -335,7 +335,7 @@ fn a_held_question_waits_for_its_answers() {
                 .is_some_and(|open| open.timeout().is_none())
         })
         .await;
-        assert_eq!(fake.holds(), 1);
+        assert_eq!(fake.session_holds(), 1);
 
         let answers = Answer::questions(
             [

@@ -28,9 +28,9 @@ use gpui_kit::{
 use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
-        report, write_program, FakeDaemon, PullRequestMethods, Script, SessionLists, Started,
-        TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
-        SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
+        report, write_program, Answers, FakeDaemon, PullRequestMethods, Script, SessionLists,
+        Started, TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY,
+        SUBAGENT_AGENT, SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
     Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef,
@@ -1134,7 +1134,11 @@ fn a_timed_question_holds_on_the_first_key() {
         "the countdown names the fallback: {countdown:?}"
     );
     ui.shot("countdown");
-    assert_eq!(ui.fake().holds(), 0, "showing the question holds nothing");
+    assert_eq!(
+        ui.fake().session_holds(),
+        0,
+        "showing the question holds nothing"
+    );
 
     // The card took the keyboard as it opened, so the keys land in it;
     // the second comes before the daemon says the first held it.
@@ -1153,7 +1157,7 @@ fn a_timed_question_holds_on_the_first_key() {
         });
         held && !is_visible(window, "input-timeout")
     });
-    assert_eq!(ui.fake().holds(), 1, "a request is held once");
+    assert_eq!(ui.fake().session_holds(), 1, "a request is held once");
     ui.shot("held");
 
     ui.click("approval-decline");
@@ -6603,7 +6607,7 @@ fn let_go_and_come_back(ui: &mut Harness, key: &SessionKey, answer: Answer) {
         fake.followers(key.id.as_str()) == 0
     });
     if let Answer::Late = answer {
-        ui.fake().hold_reports();
+        ui.fake().hold(Answers::Reports);
     }
     let row = SharedString::from(format!("session-{key}"));
     ui.act(|window, cx| window.click(row, cx));
@@ -6614,9 +6618,9 @@ fn let_go_and_come_back(ui: &mut Harness, key: &SessionKey, answer: Answer) {
         // session came back, and the one the view catching up sends, once
         // its replay has ended.
         ui.wait_for_daemon("a read once the view caught up", |fake| {
-            fake.held_reports() >= 6
+            fake.waiting(Answers::Reports) >= 6
         });
-        ui.fake().release_reports();
+        ui.fake().release(Answers::Reports);
     }
     ui.wait_until("the context read once loaded", |window, cx, app| {
         matches!(app.context_read(cx), Some((None, Some(_), now)) if now > landed)
