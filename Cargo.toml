@@ -23,7 +23,7 @@ rust-version = "1.98"
 # (rho#2045), and sends each event's time and a card's typed notification
 # (rho#2048), which no release has yet. The release takes it from
 # crates.io again.
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "fed8b6ba282e0ee00a08718e0e3d7e35c78d84d1" }
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "65fff27a677c64e6de7122bbf8553a7651001839" }
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 

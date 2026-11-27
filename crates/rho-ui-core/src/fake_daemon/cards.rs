@@ -72,21 +72,21 @@ pub struct FakeCard {
     /// The tone rho gives the card, which, as rho's own does in places,
     /// may say otherwise than its urgency.
     pub tone: CardTone,
-    /// What it asks of the reader.
-    pub urgency: NotificationUrgency,
     /// What the card is about.
     pub subject: FakeSubject,
     /// One per event the card tells of, each about [`Self::subject`]: what
-    /// happened, and the line that says it.
-    pub items: &'static [(NotificationOutcome, &'static str)],
+    /// happened, what it asks of the reader, and the line that says it.
+    /// The card asks what its most urgent item does, as rho's do.
+    pub items: &'static [(NotificationOutcome, NotificationUrgency, &'static str)],
     /// Its body in Markdown, which opens under its row.
     pub body: &'static str,
 }
 
 /// The cards, as a lead gets them from its workers, processes, peers and
 /// pull requests. Four show: the first three, which fill the four rows the
-/// rail always shows, as the second tells of two events, and a peer's
-/// question, which needs the user, though rho tones it a warning. The rest
+/// rail always shows, as the second tells of two events, routine new
+/// commits and the failing checks that make the card need the user, and a
+/// peer's question, which needs the user, though rho tones it a warning. The rest
 /// fold: a merge, new comments rho tones as an accent, and routine news.
 /// A rail that went by the tones instead would show the comments and the
 /// subagent that stopped, and fold the question.
@@ -95,55 +95,51 @@ pub const CARDS: [FakeCard; 8] = [
         id: "n-test",
         title: "Failed (exit 101) · cargo test -j 6 -p rho-ui",
         tone: CardTone::Error,
-        urgency: NotificationUrgency::NeedsYou,
         subject: FakeSubject::Process("p-3"),
         items: &[(
-            NotificationOutcome::Failed,
+            NotificationOutcome::Failed, NotificationUrgency::NeedsYou,
             "Failed (exit 101) · cargo test -j 6 -p rho-ui",
         )],
         body: "test ui_tests::transcript_keeps_scroll_on_resize ... FAILED",
     },
     FakeCard {
         id: "n-pr-99",
-        title: "New commits, checks passed · matthewyjiang/rho-ui#99",
-        tone: CardTone::Success,
-        urgency: NotificationUrgency::Notable,
+        title: "New commits, checks failed · matthewyjiang/rho-ui#99",
+        tone: CardTone::Error,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho-ui",
             number: 99,
         },
         items: &[
             (
-                NotificationOutcome::NewCommits,
+                NotificationOutcome::NewCommits, NotificationUrgency::Routine,
                 "New commits: the head is now 4f2a91c",
             ),
             (
-                NotificationOutcome::ChecksPassed,
-                "All 9 checks passed on 4f2a91c",
+                NotificationOutcome::ChecksFailed, NotificationUrgency::NeedsYou,
+                "2 of 9 checks failed on 4f2a91c",
             ),
         ],
-        body: "- New commits: the head is now `4f2a91c`.\n- All 9 checks passed on `4f2a91c`.",
+        body: "- New commits: the head is now `4f2a91c`.\n- 2 of 9 checks failed on `4f2a91c`: `clippy`, `test (ubuntu)`.",
     },
     FakeCard {
         id: "n-brief",
         title: "Completed · brief rereads",
         tone: CardTone::Success,
-        urgency: NotificationUrgency::Notable,
         subject: FakeSubject::Subagent("run-7"),
-        items: &[(NotificationOutcome::Completed, "Completed · brief rereads")],
+        items: &[(NotificationOutcome::Completed, NotificationUrgency::Notable, "Completed · brief rereads")],
         body: "Fixed and pushed to `feat/lead-brief-after-compaction`.",
     },
     FakeCard {
         id: "n-pr-102",
         title: "Merged · matthewyjiang/rho-ui#102",
         tone: CardTone::Success,
-        urgency: NotificationUrgency::Notable,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho-ui",
             number: 102,
         },
         items: &[(
-            NotificationOutcome::Merged,
+            NotificationOutcome::Merged, NotificationUrgency::Notable,
             "Merged into main by matthewyjiang",
         )],
         body: "",
@@ -152,10 +148,9 @@ pub const CARDS: [FakeCard; 8] = [
         id: "n-question",
         title: "Waiting for an answer · first",
         tone: CardTone::Warning,
-        urgency: NotificationUrgency::NeedsYou,
         subject: FakeSubject::Session("s1"),
         items: &[(
-            NotificationOutcome::Question,
+            NotificationOutcome::Question, NotificationUrgency::NeedsYou,
             "Waiting for an answer · first",
         )],
         body: "Which branch should the fix go on?",
@@ -164,25 +159,23 @@ pub const CARDS: [FakeCard; 8] = [
         id: "n-pr-101",
         title: "New comments · matthewyjiang/rho-ui#101",
         tone: CardTone::Accent,
-        urgency: NotificationUrgency::Notable,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho-ui",
             number: 101,
         },
-        items: &[(NotificationOutcome::NewComments, "1 new comment")],
+        items: &[(NotificationOutcome::NewComments, NotificationUrgency::Notable, "1 new comment")],
         body: "- 1 new comment:\n  - coderabbitai: \"Split the status view out of #10?\"",
     },
     FakeCard {
         id: "n-pr-2040",
         title: "New commits · matthewyjiang/rho#2040",
         tone: CardTone::Neutral,
-        urgency: NotificationUrgency::Routine,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho",
             number: 2040,
         },
         items: &[(
-            NotificationOutcome::NewCommits,
+            NotificationOutcome::NewCommits, NotificationUrgency::Routine,
             "New commits: the head is now 9c0e1d2",
         )],
         body: "",
@@ -191,9 +184,8 @@ pub const CARDS: [FakeCard; 8] = [
         id: "n-sweep",
         title: "Stopped · lint sweep",
         tone: CardTone::Accent,
-        urgency: NotificationUrgency::Routine,
         subject: FakeSubject::Subagent("run-9"),
-        items: &[(NotificationOutcome::Stopped, "Stopped · lint sweep")],
+        items: &[(NotificationOutcome::Stopped, NotificationUrgency::Routine, "Stopped · lint sweep")],
         body: "",
     },
 ];
@@ -237,14 +229,31 @@ impl FakeCard {
         let items = self
             .items
             .iter()
-            .map(|&(outcome, text)| NotificationItem::new(outcome, subject.clone(), text))
+            .map(|&(outcome, urgency, text)| {
+                NotificationItem::new(outcome, urgency, subject.clone(), text)
+            })
             .collect();
         Box::new(NotificationInfo::new(
             NotificationId::new(self.id),
-            self.urgency,
+            self.urgency(),
             subject,
             items,
         ))
+    }
+
+    /// What the card asks of the reader: what its most urgent item does,
+    /// as rho says.
+    fn urgency(&self) -> NotificationUrgency {
+        let rank = |urgency: NotificationUrgency| match urgency {
+            NotificationUrgency::NeedsYou => 2,
+            NotificationUrgency::Notable => 1,
+            _ => 0,
+        };
+        self.items
+            .iter()
+            .map(|&(_, urgency, _)| urgency)
+            .max_by_key(|&urgency| rank(urgency))
+            .unwrap_or(NotificationUrgency::Routine)
     }
 }
 

@@ -2,8 +2,8 @@
 //! mark that shows only while one of the session's servers failed, timed
 //! out, has an invalid config, or is still connecting, or while the session
 //! still loads its tool sources. Clicking it lists the session's servers,
-//! the failed ones first with the daemon's lines on them, which say why,
-//! and every server's lines on hover. When all is well, nothing shows.
+//! the failed ones first with why they failed, and every server's lines
+//! from the daemon on hover. When all is well, nothing shows.
 //!
 //! The daemon pushes no changes to the servers (`rho/session/mcp`), so the
 //! view reads them once its session is loaded, again after a reconnect
@@ -154,8 +154,9 @@ fn need(status: SessionMcpStatus) -> ((&'static str, Tag), Need) {
 }
 
 /// One server: its name, tool count and status, and for one that failed,
-/// the start of the daemon's lines on it, which say why; all of them show
-/// on hover. Labelled "name: status" for UI tests.
+/// why: the daemon's error, or from a daemon that sends none, the start of
+/// its lines on the server. All the lines show on hover. Labelled
+/// "name: status" for UI tests, and the why by what it says.
 fn render_server(ix: usize, server: &SessionMcpServer, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let ((label, tag), need) = need(server.status);
@@ -193,13 +194,17 @@ fn render_server(ix: usize, server: &SessionMcpServer, cx: &App) -> AnyElement {
                 }))
                 .child(tag.xsmall().child(label)),
         )
-        // The protocol gives the detail for showing, not parsing, so the
-        // error is wherever the daemon put it: rho puts it second.
         .children((need == Need::Fix).then(|| {
+            // The detail is for showing, not parsing: without the error, it
+            // says why wherever the daemon put it (rho puts it second).
+            let why = server.error.clone().map_or(detail, SharedString::from);
             div()
+                .id(SharedString::from(format!("mcp-server-{ix}-why")))
+                .test_support()
+                .aria_label(why.clone())
                 .text_color(theme.muted_foreground)
                 .line_clamp(2)
-                .child(detail)
+                .child(why)
         }))
         .into_any_element()
 }

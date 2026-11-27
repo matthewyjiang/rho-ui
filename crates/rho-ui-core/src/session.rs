@@ -458,13 +458,14 @@ pub enum Urgency {
 }
 
 impl Urgency {
-    /// What rho says a notification card asks. A value a newer rho adds
-    /// reads as routine, as the protocol says.
-    fn from_wire(urgency: NotificationUrgency) -> Self {
+    /// What rho says a notification card or item asks; none for a value
+    /// this client doesn't know, or an item that doesn't say.
+    fn from_wire(urgency: NotificationUrgency) -> Option<Self> {
         match urgency {
-            NotificationUrgency::NeedsYou => Self::NeedsYou,
-            NotificationUrgency::Notable => Self::Notable,
-            _ => Self::Routine,
+            NotificationUrgency::NeedsYou => Some(Self::NeedsYou),
+            NotificationUrgency::Notable => Some(Self::Notable),
+            NotificationUrgency::Routine => Some(Self::Routine),
+            _ => None,
         }
     }
 
@@ -518,8 +519,9 @@ impl Notice {
     }
 
     /// A card. Its detail is the first of its bodies that isn't empty,
-    /// Markdown then plain. It is as urgent as its `notification` says,
-    /// or, from a rho that sends none, as its tone reads.
+    /// Markdown then plain. It is as urgent as its `notification` says (a
+    /// value a newer rho adds reads as routine, as the protocol says), or,
+    /// from a rho that sends none, as its tone reads.
     fn card(
         title: String,
         [markdown, plain]: [String; 2],
@@ -530,7 +532,7 @@ impl Notice {
         let tone = NoticeTone::from_wire(tone);
         let urgency = notification.as_ref().map_or_else(
             || Urgency::of_tone(tone),
-            |info| Urgency::from_wire(info.urgency),
+            |info| Urgency::from_wire(info.urgency).unwrap_or(Urgency::Routine),
         );
         Self {
             tone,
@@ -574,6 +576,15 @@ impl Notice {
         self.notification
             .as_ref()
             .map_or(&[][..], |info| info.items.as_slice())
+    }
+
+    /// What `item`, one of [`Self::items`], asks of the reader: what rho
+    /// says of it, so a card that bundles routine news with a failure
+    /// tells them apart. An item from a rho that doesn't say, or that says
+    /// a value this client doesn't know, is as urgent as its card, as the
+    /// protocol says.
+    pub fn item_urgency(&self, item: &NotificationItem) -> Urgency {
+        Urgency::from_wire(item.urgency).unwrap_or(self.urgency)
     }
 
     /// When it happened, as the daemon says. From a daemon that says no

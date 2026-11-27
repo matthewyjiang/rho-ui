@@ -83,12 +83,22 @@ impl State {
     ) -> Result<SessionMcpInventory, RpcError> {
         self.session(&params.session)?;
         let connecting = self.mcp.startup == McpStartup::Connecting;
-        let server = |identity: &str, status, tool_count, detail: &str| SessionMcpServer {
-            identity: identity.to_owned(),
-            enabled: true,
-            status,
-            tool_count,
-            detail: detail.to_owned(),
+        // As rho words them: a failed server's error is in its detail too,
+        // after its other lines.
+        let server = |identity: &str, status, tool_count, lines: &[&str], error: Option<&str>| {
+            let detail: Vec<String> = lines
+                .iter()
+                .map(|&line| line.to_owned())
+                .chain(error.map(|error| format!("error: {error}")))
+                .collect();
+            SessionMcpServer {
+                identity: identity.to_owned(),
+                enabled: true,
+                status,
+                tool_count,
+                detail: detail.join("\n"),
+                error: error.map(str::to_owned),
+            }
         };
         let (docs, github) = if connecting {
             (
@@ -96,13 +106,15 @@ impl State {
                     MCP_DOCS,
                     SessionMcpStatus::Connecting,
                     0,
-                    "stdio · docs-server --stdio\nconnecting",
+                    &["stdio · docs-server --stdio", "connecting"],
+                    None,
                 ),
                 server(
                     MCP_GITHUB,
                     SessionMcpStatus::TimedOut,
                     0,
-                    "http · https://api.github.com/mcp\nerror: no answer to initialize within 30s",
+                    &["http · https://api.github.com/mcp"],
+                    Some("no answer to initialize within 30s"),
                 ),
             )
         } else {
@@ -111,13 +123,21 @@ impl State {
                     MCP_DOCS,
                     SessionMcpStatus::Connected,
                     2,
-                    "stdio · docs-server --stdio\n2 tool(s): mcp__docs__search, mcp__docs__read",
+                    &[
+                        "stdio · docs-server --stdio",
+                        "2 tool(s): mcp__docs__search, mcp__docs__read",
+                    ],
+                    None,
                 ),
                 server(
                     MCP_GITHUB,
                     SessionMcpStatus::Connected,
                     1,
-                    "http · https://api.github.com/mcp\n1 tool(s): mcp__github__issues",
+                    &[
+                        "http · https://api.github.com/mcp",
+                        "1 tool(s): mcp__github__issues",
+                    ],
+                    None,
                 ),
             )
         };
@@ -133,6 +153,7 @@ impl State {
                     status: SessionMcpStatus::Disabled,
                     tool_count: 0,
                     detail: "stdio · notes-mcp\nenabled = false".to_owned(),
+                    error: None,
                 },
             ],
             tool_sources_loading: connecting,
