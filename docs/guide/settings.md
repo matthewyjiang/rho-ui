@@ -38,11 +38,20 @@ A model setting lists the models that machine's rho can run with its sign-ins, a
 
 What each machine's rho sets up for its sessions: its MCP servers, from `config.toml` and plugins, and its hooks files, the user's `~/.rho/hooks.toml` and a project's `.rho/hooks.toml`. The page only reads them; change them in those files, then refresh. It starts no server and runs no hook, so a server that is enabled here can still fail to start in a session: the plug mark in a session's composer says so.
 
-- **Project.** A project's plugins and hooks file apply only to sessions in it, so the page reads for one project: the folder of the session or draft on screen when Settings opened (and its machine), else none, which lists your own alone. For a session in a worktree that's the worktree, whose hooks file the session loads, not the main checkout's; for a lead, the first project it works in. Pick another of that machine's projects to see what its sessions get.
-- **Trusting a project.** rho loads a project's hooks file only when the environment rho-ui gives its sessions sets `RHO_TRUST_PROJECT_HOOKS=1`, and a project's plugins, with their MCP servers, only with `RHO_TRUST_PROJECT_PLUGINS=1`. Either trusts every project on that machine, not just one. On this machine that environment is the one rho-ui started with; on a remote machine, the login environment there. Restart rho-ui after changing it. An untrusted project's MCP servers don't show at all: rho doesn't list the plugins it skipped.
+- **Project.** A project's plugins and hooks file apply only to sessions in it, so the page reads for one project, as Plugins does: the folder of the session or draft on screen when Settings opened (and its machine), else none, which lists your own alone. For a session in a worktree that's the worktree, whose hooks file the session loads, not the main checkout's; for a lead, the first project it works in. Pick another of that machine's projects to see what its sessions get.
+- **Trusting a project.** rho loads a project's hooks file only when the environment rho-ui gives its sessions sets `RHO_TRUST_PROJECT_HOOKS=1`, and a project's plugins, with their MCP servers, only with `RHO_TRUST_PROJECT_PLUGINS=1`. Either trusts every project on that machine, not just one. On this machine that environment is the one rho-ui started with; on a remote machine, the login environment there. Restart rho-ui after changing it. An untrusted project's plugins show on Plugins as untrusted, and their MCP servers don't show here.
 - **Secrets.** An HTTP server's URL shows without its user, password, query values or fragment, the usual places of a token, as `https://api.example.com/mcp?key=…`. A stdio server's command line shows as written: keep tokens in its environment, not its arguments.
 - **An invalid hooks file** stops every hook, the other file's too, until it's fixed.
 - **A rho too old** to list them says so; update rho on that machine.
+
+## Plugins
+
+Agent plugins bring sessions skills, MCP servers and agent files. Each machine's rho has your plugins, in `~/.agents/plugins`, and each project's, in its `.agents/plugins`, which load only for sessions in that project, and only when it's trusted (see [MCP & hooks](#mcp-hooks) for the project the page reads and how to trust one).
+
+- **New sessions only.** Adding, enabling, updating or removing a plugin changes what sessions opened afterwards load. Open sessions keep what they loaded.
+- **Same name.** A trusted project's plugin takes the place of yours of the same name in sessions there.
+- **Where it runs.** A path names a folder on that machine, never this one; a copy keeps the folder as it was, a link follows its edits. A git URL, including a GitHub link to a branch or a folder, is fetched by `git` on that machine, and so is every update. git can't prompt there, and rho refuses a URL with a password in it, so a private repository needs credentials git finds on its own, such as an ssh key or a credential helper.
+- **Removing** deletes the plugin's folder, or only the link to one, and keeps its data.
 
 ## The daemon
 
