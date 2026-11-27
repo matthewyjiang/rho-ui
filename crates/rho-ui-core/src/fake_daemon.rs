@@ -171,6 +171,10 @@
 //!   up, as `fake_daemon/configured.rs` says, and
 //!   [`FakeDaemon::configured_reads`] the workspace each request named.
 //!   [`Script::configured`] makes it a daemon from before them.
+//! - `rho/plugins/*` list and change the agent plugins it keeps in memory,
+//!   as `fake_daemon/plugins.rs` says; [`FakeDaemon::plugins`] lists them
+//!   as they are now. [`Script::configured`] makes it a daemon from before
+//!   them too.
 //! - `rho/daemon/status` reports the upgrade [`FakeDaemon::replace_program`]
 //!   set, if any, and what [`FakeDaemon::set_in_progress`] set.
 //!   `rho/daemon/restart` restarts in place, as rho does: it counts
@@ -249,6 +253,7 @@ mod configured;
 mod hold;
 mod listener;
 mod mcp;
+mod plugins;
 mod processes;
 mod pull_requests;
 mod reports;
@@ -271,6 +276,8 @@ pub use mcp::{
     McpStartup, MCP_CHANGELOG, MCP_DOCS, MCP_GITHUB, MCP_INTRO, MCP_INTRO_TEXT, MCP_NOTES,
     MCP_QUERIES, MCP_SEARCH, MCP_USER,
 };
+use plugins::FakePlugins;
+pub use plugins::TRUSTED_PLUGINS_WORKSPACE;
 use processes::FakeProcesses;
 use pull_requests::FakePullRequests;
 pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
@@ -2422,6 +2429,7 @@ struct State {
     /// The answers a test holds; see [`FakeDaemon::hold`].
     answer_holds: Holds,
     configured: FakeConfigured,
+    plugins: FakePlugins,
     /// Restart as the next prompt arrives; see
     /// [`FakeDaemon::restart_at_next_prompt`].
     restart_at_prompt: bool,
@@ -2558,6 +2566,7 @@ impl State {
             mcp: FakeMcp::new(&script),
             answer_holds: Holds::default(),
             configured: FakeConfigured::new(&script),
+            plugins: FakePlugins::new(&script),
             restart_at_prompt: false,
         };
         if script.tui_job == TuiJob::Running {

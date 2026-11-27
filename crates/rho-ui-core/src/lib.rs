@@ -37,10 +37,10 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{mcp_command, ArgumentAsk, ArgumentValue, Completion, Edit, Mention};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
-    Detached, Excerpt, ExcerptRole, Location, PendingUpgrade, PromptKey, PullRequestError, Report,
-    ReportError, ReportedWorktree, ResourceAttachment, RestartCost, SearchHit, SearchPage,
-    SessionId, SessionMark, SessionSummary, SurfaceActionError, Unsteered, VersionFix,
-    VersionMismatch, LEAD_AGENT, MAX_RESOURCE_TEXT_BYTES,
+    Detached, Enablement, Excerpt, ExcerptRole, IfExists, Location, PendingUpgrade, PluginError,
+    PromptKey, PullRequestError, Report, ReportError, ReportedWorktree, ResourceAttachment,
+    RestartCost, SearchHit, SearchPage, SessionId, SessionMark, SessionSummary, SurfaceActionError,
+    Unsteered, VersionFix, VersionMismatch, LEAD_AGENT, MAX_RESOURCE_TEXT_BYTES,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -100,6 +100,12 @@ pub use rho_protocol::{
     ConfiguredMcpServer, HookContract, HookEvent, HookStatus, HookTools, HookWarning, HooksFile,
     HooksFileScope, HooksFileStatus, HooksListResponse, McpListResponse, McpServerSource,
     McpTransport,
+};
+/// A machine's agent plugins, as [`Daemon::plugins`] lists them and its
+/// sibling methods change them, as rho-protocol has them.
+pub use rho_protocol::{
+    Plugin, PluginConflict, PluginInstallSource, PluginScope, PluginSource, PluginStatus,
+    PluginTarget, PluginUpdate, PluginUpdateOutcome, PluginsUpdateResponse,
 };
 /// A session's background processes and their output, as
 /// [`Daemon::processes`] reads them, as rho-protocol has them.
