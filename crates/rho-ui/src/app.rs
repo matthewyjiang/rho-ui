@@ -78,6 +78,7 @@ use crate::{
         PanelLayout, ResizeRightPanel, RightPanel, TerminalShell, TerminalShortcut, MIN_PANE_REMS,
     },
     session_list::DraftRow,
+    session_search::{self, OpenHit},
     session_view::{Link, Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
     settings_view,
@@ -85,7 +86,8 @@ use crate::{
     window_chrome,
     workspaces::{self, WorkspaceRef, Workspaces},
     worktrees::Worktrees,
-    FindInTranscript, NewSession, NewSessionIn, OpenSettings, ToggleRightPanel, ToggleSidebar,
+    FindInTranscript, NewSession, NewSessionIn, OpenSettings, SearchSessions, ToggleRightPanel,
+    ToggleSidebar,
 };
 
 /// How often the sidebar asks each daemon which sessions have work under
@@ -1020,6 +1022,7 @@ impl RhoApp {
             }
             SidebarEvent::Mark { marks } => self.mark_sessions(marks.clone(), window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
+            SidebarEvent::SearchSessions { query } => self.search_sessions(query, window, cx),
             SidebarEvent::ToggleCollapsed => self.toggle_sidebar(window, cx),
             // The sidebar's width is laid out here.
             SidebarEvent::Resized => cx.notify(),
@@ -1475,6 +1478,42 @@ impl RhoApp {
         }
         let search = self.sidebar.read(cx).search_focus_handle(cx);
         window.focus(&search, cx);
+    }
+
+    /// Opens the palette that searches every connected machine's saved
+    /// sessions, with `query` typed in it.
+    fn search_sessions(&mut self, query: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let machines = self
+            .connections
+            .iter()
+            .filter_map(|connection| Some((connection.machine.clone(), connection.daemon.clone()?)))
+            .collect();
+        let labels = self.machines.clone();
+        let Some(view) = session_search::open(machines, labels, query, window, cx) else {
+            return;
+        };
+        // The subscription goes with the palette's view, when it closes.
+        cx.subscribe_in(&view, window, |this, _, hit: &OpenHit, window, cx| {
+            window.close_dialog(cx);
+            this.open_hit(hit.clone(), window, cx);
+        })
+        .detach();
+    }
+
+    /// Opens the session a search found, with the find bar on its match.
+    fn open_hit(&mut self, hit: OpenHit, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let OpenHit {
+            key,
+            cwd,
+            title,
+            kind,
+            query,
+            at,
+        } = hit;
+        self.open_session(key.clone(), cwd, title, kind, window, cx);
+        if let Some(view) = self.opened(&key).map(|open| open.view.clone()) {
+            view.update(cx, |view, cx| view.find_at(&query, at, window, cx));
+        }
     }
 
     /// Shows a new session's draft with its project list open.
@@ -2431,6 +2470,9 @@ impl Render for RhoApp {
             }))
             .on_action(|_: &ToggleRightPanel, _, cx| PanelLayout::toggle(cx))
             .on_action(cx.listener(|this, _: &FindInTranscript, window, cx| this.find(window, cx)))
+            .on_action(cx.listener(|this, _: &SearchSessions, window, cx| {
+                this.search_sessions("", window, cx);
+            }))
             // A text field with no search of its own, such as a draft's
             // composer, passes the same key up as Kit's.
             .on_action(cx.listener(|this, _: &Search, window, cx| this.find(window, cx)))

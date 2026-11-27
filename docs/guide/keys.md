@@ -33,6 +33,7 @@ On macOS, <kbd>Cmd</kbd> takes the place of <kbd>Ctrl</kbd> in these, and the me
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> | Copy the selected text |
 | <kbd>Ctrl</kbd>+<kbd>A</kbd> | Select all of the message you clicked in (a long reply is selected in parts) |
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> | Find in the transcript: <kbd>Enter</kbd> and <kbd>Shift</kbd>+<kbd>Enter</kbd> move to the next and previous match, <kbd>Escape</kbd> closes. With no session open, it goes to the sidebar's search |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> | Search every saved session's conversation, and open one on its match |
 
 In the image viewer, <kbd>+</kbd>, <kbd>-</kbd>, <kbd>0</kbd> (fit) and <kbd>1</kbd> (full size) zoom, and <kbd>Escape</kbd> closes it.
 

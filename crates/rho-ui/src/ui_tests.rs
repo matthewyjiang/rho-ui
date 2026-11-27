@@ -42,7 +42,7 @@ use rho_ui_core::{
     StartedMode, StartedSessionDefaults, ToolStatus, WorktreeVerdict, LEAD_AGENT,
 };
 
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
+use gpui_kit::component::{ActiveTheme as _, IndexPath, WindowExt as _};
 
 use crate::{
     app::{LaunchConfig, RhoApp},
@@ -3354,6 +3354,71 @@ fn find_steps_through_matches_into_folded_work() {
             "the keyboard is back in the composer"
         );
     });
+}
+
+/// The sidebar's search, which matches titles, hands its query on to the
+/// search of every saved session's conversation, which follows what is
+/// typed in it. Opening a hit opens its session with the find bar on the
+/// message that matched: turn 0's answer, scrolled up to, not the thought
+/// before it that find also matches (search doesn't look in thoughts),
+/// nor the match nearest the end, where the session opens.
+#[test]
+fn search_opens_a_session_on_its_match() {
+    let script = Script {
+        replay_turns: 3,
+        ..Script::default()
+    };
+    let mut ui = Harness::start("search", script);
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-old")
+    });
+    // No title holds "walk".
+    ui.act(|window, cx| window.press("secondary-f", cx));
+    ui.act(|window, cx| window.input("walk", cx));
+    ui.wait_until("the hand-off", |window, _, _| {
+        is_visible(window, "search-sessions") && !is_visible(window, "session-local-old")
+    });
+    ui.shot("hand-off");
+    ui.click("search-sessions");
+    // Past the wait for typing to settle.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("a hit", |window, _, _| {
+        is_visible(window, IndexPath::new(0))
+    });
+    ui.shot("hits");
+    // Typed in the palette: no message holds "walkzz", and then "walk"
+    // again.
+    ui.act(|window, cx| window.input("zz", cx));
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("no hit", |window, _, _| {
+        !is_visible(window, IndexPath::new(0))
+    });
+    for _ in 0..2 {
+        ui.act(|window, cx| window.press("backspace", cx));
+    }
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.wait_until("the hit again", |window, _, _| {
+        is_visible(window, IndexPath::new(0))
+    });
+
+    ui.act(|window, cx| window.press("enter", cx));
+    // Each turn's thought, search, command and answer match "walk" (see
+    // `find_steps_through_matches_into_folded_work`): turn 0's answer is
+    // the fifth.
+    ui.wait_for_label("find-count", "5 of 15");
+    let app = ui.app.clone();
+    let current = ui.cx.update(|cx| {
+        let view = app.read(cx).active_session().expect("a session is open");
+        view.read(cx).transcript().find_current()
+    });
+    let entries = ui.session().entries().to_vec();
+    let entry = current.map(|(entry, _)| &entries[entry]);
+    assert!(
+        matches!(entry, Some(Entry::Agent(message)) if message.text().starts_with("## Answer 0")),
+        "the current match is turn 0's answer, not {entry:?}"
+    );
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.shot("opened");
 }
 
 /// A saved session's replay goes into the session before any of its rows

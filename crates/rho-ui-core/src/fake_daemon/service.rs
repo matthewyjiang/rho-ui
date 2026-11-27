@@ -34,10 +34,11 @@ use rho_protocol::{
     SessionProcessesResponse, SessionPromptParams, SessionPromptResponse,
     SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
     SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
-    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSteerParams,
-    SessionSteerResponse, SessionSurfaceActionParams, SessionSurfaceActionResponse,
-    SessionWorktree, SettingsService, SignIn, Subscription, ToolKind, ToolStatus, TurnOutcome,
-    UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
+    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSearchParams,
+    SessionSearchResponse, SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
+    SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription, ToolKind,
+    ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse,
+    WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -102,11 +103,9 @@ struct SavedPage<'state> {
 }
 
 impl State {
-    /// The page of saved sessions after `cursor` that `rho/session/list`
-    /// and `list_detailed` answer, newest first and leaving forks out.
-    fn saved_page(&self, cursor: Option<&str>) -> Result<SavedPage<'_>, RpcError> {
-        /// Small, so two sessions already exercise the cursor.
-        const PAGE: usize = 2;
+    /// The saved sessions that `rho/session/list` and `rho/session/search`
+    /// cover, newest first and leaving forks out.
+    pub(super) fn saved(&self) -> Vec<(&str, &FakeSession)> {
         let mut saved: Vec<(&str, &FakeSession)> = self
             .sessions
             .iter()
@@ -114,6 +113,15 @@ impl State {
             .map(|(id, session)| (id.as_str(), session))
             .collect();
         saved.sort_by_key(|(_, session)| std::cmp::Reverse(session.updated_at));
+        saved
+    }
+
+    /// The page of saved sessions after `cursor` that `rho/session/list`
+    /// and `list_detailed` answer.
+    fn saved_page(&self, cursor: Option<&str>) -> Result<SavedPage<'_>, RpcError> {
+        /// Small, so two sessions already exercise the cursor.
+        const PAGE: usize = 2;
+        let saved = self.saved();
         let start = match cursor.map(str::parse::<usize>) {
             None => 0,
             Some(Ok(start)) => start,
@@ -128,6 +136,16 @@ impl State {
             next_cursor,
         })
     }
+}
+
+/// Session `id` as a row of `rho/session/list_detailed`.
+pub(super) fn detailed(id: &str, session: &FakeSession) -> DetailedSessionSummary {
+    DetailedSessionSummary::new(
+        summary(id, session),
+        Some(session.agent.clone()),
+        session.parent.as_deref().map(SessionId::new),
+        session.mark.clone(),
+    )
 }
 
 /// Session `id` as a row of `rho/session/list`.
@@ -1050,18 +1068,21 @@ impl Service for Fake {
             ));
         }
         let page = state.saved_page(params.cursor.as_deref())?;
-        let sessions = page.sessions.iter().map(|(id, session)| {
-            DetailedSessionSummary::new(
-                summary(id, session),
-                Some(session.agent.clone()),
-                session.parent.as_deref().map(SessionId::new),
-                session.mark.clone(),
-            )
-        });
+        let sessions = page
+            .sessions
+            .iter()
+            .map(|(id, session)| detailed(id, session));
         Ok(SessionListDetailedResponse::new(
             sessions.collect(),
             page.next_cursor,
         ))
+    }
+
+    async fn search_sessions(
+        &self,
+        params: SessionSearchParams,
+    ) -> Result<SessionSearchResponse, RpcError> {
+        self.lock().search(&params)
     }
 
     /// Stamps the mark with the time, as rho does, and refuses a kind it

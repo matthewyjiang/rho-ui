@@ -7,7 +7,8 @@ use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType};
 
 use crate::{
-    FindInTranscript, NewSession, NewSessionIn, OpenSettings, Quit, ToggleRightPanel, ToggleSidebar,
+    FindInTranscript, NewSession, NewSessionIn, OpenSettings, Quit, SearchSessions,
+    ToggleRightPanel, ToggleSidebar,
 };
 
 gpui_kit::actions!(
@@ -75,6 +76,7 @@ pub(crate) fn install(cx: &mut App) {
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
             MenuItem::separator(),
             MenuItem::action("Find…", FindInTranscript),
+            MenuItem::action("Search Sessions…", SearchSessions),
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),

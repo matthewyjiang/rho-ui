@@ -285,6 +285,11 @@ pub(crate) enum SidebarEvent {
         marks: Vec<(SessionKey, NewSessionMark)>,
     },
     OpenSettings,
+    /// Search every session's conversation for `query`, the sidebar
+    /// search's text.
+    SearchSessions {
+        query: SharedString,
+    },
     /// Collapse the sidebar to its rail, or open it again; see
     /// [`SidebarView::toggle_collapsed`].
     ToggleCollapsed,
@@ -1923,6 +1928,15 @@ impl Render for SidebarView {
                     )
                     .child(filter::button(self, cx)),
             )
+            .when(!self.list.query().is_empty(), |frame| {
+                frame.child(
+                    div()
+                        .flex_shrink_0()
+                        .px_3()
+                        .pb_2()
+                        .child(search_sessions_button(self.list.query(), cx)),
+                )
+            })
             .child(self.render_list(window, cx))
             .child(self.render_footer(cx))
             // [`crate::app::RhoApp`] follows the drag, as it lays out the
@@ -1950,6 +1964,24 @@ fn new_session_button(cx: &Context<'_, SidebarView>) -> Button {
         .accessibility_label("New session")
         .tooltip_with_action("New session", &crate::NewSession, Some("RhoApp"))
         .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewSession)))
+}
+
+/// Hands the search's `query` on to the search of every session's
+/// conversation, as the sidebar's search matches only titles and names.
+fn search_sessions_button(query: &str, cx: &Context<'_, SidebarView>) -> Button {
+    let query = SharedString::from(query.to_owned());
+    Button::new("search-sessions")
+        .ghost()
+        .small()
+        .w_full()
+        .icon(IconName::Search)
+        .label(format!("Search conversations for “{query}”"))
+        .tooltip_with_action("Search sessions", &crate::SearchSessions, Some("RhoApp"))
+        .on_click(cx.listener(move |_, _, _, cx| {
+            cx.emit(SidebarEvent::SearchSessions {
+                query: query.clone(),
+            });
+        }))
 }
 
 fn new_lead_button(cx: &Context<'_, SidebarView>) -> Button {

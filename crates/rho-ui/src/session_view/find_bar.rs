@@ -58,6 +58,19 @@ impl FindBar {
         self.input.read(cx).value()
     }
 
+    /// Puts `query` in the field, without finding it: the session view
+    /// finds it where it wants the current match.
+    pub(super) fn set_query(
+        &self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, SessionView>,
+    ) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(query.to_owned(), window, cx);
+        });
+    }
+
     /// Puts the keyboard in the field, its text selected to type over.
     pub(super) fn focus(&self, window: &mut Window, cx: &mut Context<'_, SessionView>) {
         self.input.update(cx, |input, cx| {

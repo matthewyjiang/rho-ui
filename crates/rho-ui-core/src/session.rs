@@ -37,7 +37,7 @@ use rho_protocol::{
 
 use crate::{
     background::{BackgroundKind, BackgroundStatus, BackgroundWork},
-    daemon::{SessionId, SessionMark},
+    daemon::{Location, SessionId, SessionMark},
     input::{InputId, InputRequest},
     options::{commands, CommandInfo, SessionOptions, StartedSessionDefaults},
     prompt::{Attachment, Image, Prompt},
@@ -1146,6 +1146,20 @@ impl Session {
     /// Transcript rows in the order they first appeared.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// The entry that shows the message at `at`, as a search found it;
+    /// `None` while the session hasn't shown it, as before its replay
+    /// reaches it.
+    pub fn entry_at(&self, at: &Location) -> Option<usize> {
+        self.entries.iter().position(|entry| match (entry, at) {
+            (Entry::User(message), Location::Message(id)) => message.id() == id,
+            (Entry::Agent(message) | Entry::Thought(message), Location::Message(id)) => {
+                message.id() == id
+            }
+            (Entry::Tool(call), Location::ToolCall(id)) => call.id() == id,
+            _ => false,
+        })
     }
 
     /// Whether rho is working.

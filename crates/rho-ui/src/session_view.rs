@@ -77,9 +77,9 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     surface::SurfaceAction, Answer, Attached, Attachment, BackgroundId, BackgroundStatus,
-    Continuity, Cursor, Daemon, DaemonError, Entry, InputId, JobActivity, Prompt, PromptKey,
-    PullRequestId, Run, RunState, Session, SessionId, SessionUpdate, SteerId, SurfaceActionError,
-    TurnId, Unsteered,
+    Continuity, Cursor, Daemon, DaemonError, Entry, InputId, JobActivity, Location, Prompt,
+    PromptKey, PullRequestId, Run, RunState, Session, SessionId, SessionUpdate, SteerId,
+    SurfaceActionError, TurnId, Unsteered,
 };
 
 use self::find_bar::FindBar;
@@ -237,6 +237,15 @@ impl Loading {
     }
 }
 
+/// What a search across sessions asks find for in the session it opened,
+/// once its history is in ([`SessionView::find_at`]).
+struct PendingFind {
+    query: String,
+    /// The first match at or after the entry that shows this message is
+    /// current; with none, the first from the top.
+    at: Option<Location>,
+}
+
 pub(crate) struct SessionView {
     daemon: Daemon,
     session: Session,
@@ -312,6 +321,9 @@ pub(crate) struct SessionView {
     selected: Option<Selected>,
     /// The find bar over the transcript, while open.
     find: Option<FindBar>,
+    /// Where [`Self::find_at`] wants find's current match, until the
+    /// transcript is built.
+    pending_find: Option<PendingFind>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
     /// What the title bar reads besides the session.
@@ -450,6 +462,7 @@ impl SessionView {
             plan: Disclosure::default(),
             selected: None,
             find: None,
+            pending_find: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             title_bar: TitleBarSources::default(),
@@ -1074,6 +1087,7 @@ impl SessionView {
                 self.transcript.truncate(from, self.session.entries(), cx);
             }
             self.transcript.sync(self.session.entries(), cx);
+            self.find_pending(cx);
             self.surfaces.sync(&mut self.session, window, cx);
             self.transcript.set_delay(self.session.delay());
         }
@@ -2323,8 +2337,45 @@ impl SessionView {
         cx.notify();
     }
 
+    /// Opens the find bar on `query`, as a search across sessions does to
+    /// show a match it found: its current match is the first at or after
+    /// the entry that shows `at`, once the transcript is built.
+    pub(crate) fn find_at(
+        &mut self,
+        query: &str,
+        at: Option<Location>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let bar = self.find.get_or_insert_with(|| FindBar::new(window, cx));
+        bar.set_query(query, window, cx);
+        bar.focus(window, cx);
+        self.pending_find = Some(PendingFind {
+            query: query.to_owned(),
+            at,
+        });
+        self.find_pending(cx);
+    }
+
+    /// Finds what [`Self::find_at`] asked for, once the transcript is
+    /// built.
+    fn find_pending(&mut self, cx: &mut Context<'_, Self>) {
+        if !matches!(self.loading, Loading::Ready) {
+            return;
+        }
+        let Some(PendingFind { query, at }) = self.pending_find.take() else {
+            return;
+        };
+        let from = at.and_then(|at| self.session.entry_at(&at)).unwrap_or(0);
+        self.transcript
+            .find_from(&query, self.session.entries(), from, cx);
+        cx.notify();
+    }
+
     /// Finds what the find bar holds now.
     fn find_query(&mut self, cx: &mut Context<'_, Self>) {
+        // The user's own query replaces the one a search opened with.
+        self.pending_find = None;
         let Some(bar) = &self.find else {
             return;
         };
