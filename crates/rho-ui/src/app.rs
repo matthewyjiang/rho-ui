@@ -97,7 +97,7 @@ use crate::{
 /// turn started in a terminal shows up here within a second. The list holds
 /// every job the daemon has a record of, so the cost grows with a rho
 /// home's history: measure again before polling faster.
-const JOB_POLL: Duration = Duration::from_secs(1);
+pub(crate) const JOB_POLL: Duration = Duration::from_secs(1);
 
 /// How often to ask a daemon for the upgrade it waits to run when its jobs
 /// stay the same. `rho/daemon/status` reads the daemon's settings and its
@@ -105,7 +105,7 @@ const JOB_POLL: Duration = Duration::from_secs(1);
 /// with every job poll. An upgrade appears when rho is replaced, which
 /// rho-ui asks after at once when it updates rho itself; one replaced from
 /// a terminal shows within this.
-const UPGRADE_POLL: Duration = Duration::from_secs(30);
+pub(crate) const UPGRADE_POLL: Duration = Duration::from_secs(30);
 
 /// What the command line asked for.
 pub(crate) struct LaunchConfig {
@@ -1558,7 +1558,8 @@ impl RhoApp {
     /// message was sent. With neither left, nothing follows the session,
     /// so the daemon is told. An answer from a connection that ended since
     /// is dropped: the views outlive it, and the next connection follows
-    /// them again.
+    /// them again. A session a view or draft follows has its pull requests
+    /// listed again ([`PullRequests::followed`]).
     fn attached(
         &mut self,
         daemon: &Daemon,
@@ -1571,17 +1572,24 @@ impl RhoApp {
         if !self.is_current(&id.machine, epoch) {
             return;
         }
+        let followed = attached.is_ok();
         if let Some(draft) = self.draft_with(id, cx) {
             draft.update(cx, |draft, cx| draft.attached(attached, window, cx));
         } else if let Some(open) = self.opened(id) {
             open.view
                 .update(cx, |view, cx| view.attached(attached, window, cx));
-        } else if attached.is_ok() {
-            let (daemon, id) = (daemon.clone(), id.id.clone());
-            cx.spawn(async move |_, _| {
-                let _ = daemon.detach(&id).await;
-            })
-            .detach();
+        } else {
+            if followed {
+                let (daemon, id) = (daemon.clone(), id.id.clone());
+                cx.spawn(async move |_, _| {
+                    let _ = daemon.detach(&id).await;
+                })
+                .detach();
+            }
+            return;
+        }
+        if followed {
+            self.prs.update(cx, |prs, cx| prs.followed(id, cx));
         }
     }
 

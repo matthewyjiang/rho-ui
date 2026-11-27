@@ -3674,9 +3674,12 @@ fn an_update_installs_then_restarts_the_daemon_on_request() {
     ui.wait_for_daemon("s1 attached", |daemon| daemon.attaches("s1") == 1);
     ui.fake().replace_program("3.2.0", 2);
     // Its status is asked now and then, on the app's clock.
-    ui.cx.advance_clock(Duration::from_secs(31));
-    ui.wait_until("the restart offer", |window, _, _| {
-        is_visible(window, "restart-rho-local")
+    advance_until(&mut ui, UPGRADE_STEP, "the restart offer", |ui| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                is_visible(window, "restart-rho-local")
+            })
+            .expect("window is open")
     });
     ui.shot("waiting");
 
@@ -3979,9 +3982,12 @@ fn a_stopped_daemon_stays_stopped_until_started() {
     });
     ui.fake().replace_program("3.2.0", 1);
     ui.fake().set_in_progress(1);
-    ui.cx.advance_clock(Duration::from_secs(31));
-    ui.wait_until("the upgrade it waits on", |window, _, _| {
-        is_visible(window, "restart-rho-local")
+    advance_until(&mut ui, UPGRADE_STEP, "the upgrade it waits on", |ui| {
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                is_visible(window, "restart-rho-local")
+            })
+            .expect("window is open")
     });
 
     open_settings(&mut ui);
@@ -5296,6 +5302,13 @@ fn linked_numbers(fake: &FakeDaemon, session: &SessionKey) -> Vec<u32> {
     let set = fake.pull_requests(&session.id);
     set.linked.iter().map(|link| link.id.number).collect()
 }
+
+/// How far to move the clock at a time for a daemon's status to be asked
+/// again: past the app's status poll. The status is asked from the jobs
+/// loop, whose next timer starts only once the last status answers, which
+/// may be after a step.
+const UPGRADE_STEP: Duration =
+    Duration::from_secs(crate::app::UPGRADE_POLL.as_secs() + crate::app::JOB_POLL.as_secs());
 
 /// Moves the clock on by `step` at a time until `ready` holds: for a
 /// timer that starts as an answer lands, which may still be on its way.
