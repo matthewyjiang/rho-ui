@@ -675,6 +675,17 @@ impl PullRequests {
         }
     }
 
+    /// `session` is followed from this attach or observe on, so changes to
+    /// its set arrive as events. rho sends none for a change made before,
+    /// so one since the last list would wait for the next, up to
+    /// [`LIST_EVERY`]: its machine is listed now. While the window is
+    /// unfocused nothing is listed, and the next list waits for its period.
+    pub(crate) fn followed(&mut self, session: &SessionKey, cx: &mut Context<'_, Self>) {
+        if self.listed.contains(session) {
+            self.list_now(&session.machine, cx);
+        }
+    }
+
     /// Shows `shown` for `surface`, the Pull request surface on screen, in
     /// place of what another showed. What wasn't shown in the last
     /// [`SHOW_EVERY`] is shown at once.

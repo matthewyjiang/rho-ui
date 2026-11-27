@@ -11,7 +11,12 @@ use rho_ui_core::{
 };
 
 use super::{is_visible, Harness};
-use crate::{rail, right_panel::PanelLayout, time};
+use crate::{
+    machines::{MachineId, SessionKey},
+    rail,
+    right_panel::PanelLayout,
+    time,
+};
 
 /// The cards in `session`, with their entries.
 fn cards(session: &Session) -> Vec<(usize, Notice)> {
@@ -39,13 +44,32 @@ fn looks(ix: usize, notice: &Notice) -> Vec<(Urgency, NoticeTone)> {
         .collect()
 }
 
+/// Has rho link PR 99 to session `old` once rho-ui has listed its pull
+/// requests, and returns the PR. Nothing follows `old` yet, so no event
+/// says so, and the next list is a minute away on a clock the test doesn't
+/// move.
+fn link_after_first_list(ui: &mut Harness, old: &SessionKey) -> PullRequestId {
+    ui.wait_until("the saved sessions' PRs, listed", |window, cx, app| {
+        is_visible(window, "session-local-old") && app.pull_requests().read(cx).of(old).is_some()
+    });
+    // rho tells of the PRs its agent watches, which links them.
+    let pr = PullRequestId::new("github.com", "matthewyjiang", "rho-ui", 99);
+    let url = "https://github.com/matthewyjiang/rho-ui/pull/99";
+    let link = LinkedPullRequest::new(pr.clone(), url, PullRequestLinkOrigin::Agent, 1_767_258_000);
+    ui.fake()
+        .edit_pull_requests(&old.id, |set| set.linked.push(link));
+    pr
+}
+
 /// A conversation opened again shows its cards as rho saved them: each at
 /// the time it happened, to the second, as rho's file keeps it; one row
 /// for each event a card tells of, each as urgent and in the tone rho gives
 /// its event rather than the card's; and past the first few rows, the cards
 /// that don't need the user fold behind one row, whatever tone rho gave them,
 /// while a peer's question, toned a warning, shows. A pull request's chip
-/// shows it in the panel, and a session a card is about opens from its row.
+/// shows it in the panel, though rho linked it after rho-ui last listed
+/// the session's pull requests, and a session a card is about opens from
+/// its row.
 #[test]
 fn replayed_cards_keep_their_times_and_fold_by_urgency() {
     let script = Script {
@@ -53,16 +77,9 @@ fn replayed_cards_keep_their_times_and_fold_by_urgency() {
         ..Script::default()
     };
     let mut ui = Harness::start("rail-replayed", script);
-    // rho tells of the PRs its agent watches, which links them.
     let old = SessionId::from("old");
-    let pr = PullRequestId::new("github.com", "matthewyjiang", "rho-ui", 99);
-    let url = "https://github.com/matthewyjiang/rho-ui/pull/99";
-    let link = LinkedPullRequest::new(pr.clone(), url, PullRequestLinkOrigin::Agent, 1_767_258_000);
-    ui.fake()
-        .edit_pull_requests(&old, |set| set.linked.push(link));
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-local-old")
-    });
+    let old_key = SessionKey::new(MachineId::local(), old.clone());
+    let pr = link_after_first_list(&mut ui, &old_key);
     ui.click("session-local-old");
     ui.wait_for_session("the replayed cards", |session| {
         !session.is_replaying() && matches!(session.entries().last(), Some(Entry::Agent(_)))
@@ -141,6 +158,12 @@ fn replayed_cards_keep_their_times_and_fold_by_urgency() {
     ui.frame();
     ui.shot("replayed");
 
+    // The chip opens the panel only for a PR the session links, as rho-ui
+    // has it: opening the session followed it, which listed its PRs again.
+    ui.wait_until("the session's linked PR", |_, cx, app| {
+        let prs = app.pull_requests().read(cx);
+        prs.of(&old_key).is_some_and(|set| set.link(&pr).is_some())
+    });
     ui.click("card-n-pr-99-chip-0");
     ui.wait_until("the PR in the panel", |window, cx, _| {
         PanelLayout::get(cx) && is_visible(window, "panel-tab-pull-request")
