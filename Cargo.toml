@@ -17,16 +17,13 @@ rust-version = "1.98"
 # 1.4 serves a session's pull requests, names the agent a session runs
 # as (`SessionEvent::Agent`), and lists the models a model setting may
 # take (`rho/model/list`). 1.5 forks a session (`rho/session/fork`), for
-# side chats.
-# Until rho-ui 0.3.0, from a rho commit rather than crates.io: it types a
-# session's reports (rho#2040), lists the configured MCP servers and hooks
-# (rho#2045), sends each event's time and a card's typed notification
-# (rho#2048), each card item's urgency and why a session's MCP server
-# failed (rho#2052), each card item's tone (rho#2054), manages agent
-# plugins (`rho/plugins/*`, rho#2055), and why the agent asks its
-# questions (rho#2056), which no release has yet. The release takes it
-# from crates.io again.
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "048d5ea5afbf92e8f4120c06db698ab5c39077a9" }
+# side chats. 1.6 types a session's reports (`rho/session/report`), lists
+# the configured MCP servers and hooks (`rho/mcp/list`, `rho/hooks/list`),
+# manages agent plugins (`rho/plugins/*`) and searches sessions
+# (`rho/session/search`). It also sends each event's time and a card's
+# typed notification, each card item's urgency and tone, why a session's
+# MCP server failed, and why the agent asks its questions.
+rho-protocol = "1.6.0"
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 
