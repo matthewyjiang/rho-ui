@@ -452,7 +452,8 @@ impl Transcript {
         self.find_again(seen_entries..entries.len(), entries, cx);
     }
 
-    /// The card row `row` shows, if it shows one, with its entry.
+    /// The rail row `row` shows, if it shows one, with its entry: a card,
+    /// or a plain notice, which sits on the rail too ([`Notice::is_card`]).
     fn card_at<'a>(&self, row: usize, entries: &'a [Entry]) -> Option<(usize, &'a Notice)> {
         let Row::Message(entry) = self.timeline.rows().get(row)? else {
             return None;
@@ -479,25 +480,28 @@ impl Transcript {
         start..end
     }
 
-    /// Whether `row` keeps a gap below it. Rows do, but a card only at the
-    /// end of its run, and not above a wake it explains: that wake's turn
-    /// header keeps the gap above itself, so the gap folds away with the
-    /// header of a turn that has no working.
+    /// Whether `row` keeps a gap below it. Rows do, but a rail row only at
+    /// the end of its run, and not above a wake it explains: that wake's
+    /// turn header keeps the gap above itself, so the gap folds away with
+    /// the header of a turn that has no working.
     fn keeps_gap_below(&self, row: usize, entries: &[Entry]) -> bool {
         let gap_goes_on =
-            self.card_at(row + 1, entries).is_some() || self.is_wake_row(row + 1, entries);
+            self.card_at(row + 1, entries).is_some() || self.is_explained_wake(row + 1, entries);
         self.card_at(row, entries).is_none() || !gap_goes_on
     }
 
-    /// Whether `row` is a wake right under a card. The card says why rho
-    /// continued, so the wake draws no line of its own: only its turn's
-    /// header. A wake with no card above it keeps its line, so no turn
-    /// starts unexplained.
+    /// Whether `row` is a wake under a card: the run of rail rows right
+    /// above it holds one. The card says why rho continued, so the wake
+    /// draws no line of its own: only its turn's header. A plain notice,
+    /// the daemon's or rho-ui's own, sits on the rail too, but says nothing
+    /// of why rho went on, so a wake with no card above it keeps its line,
+    /// and no turn starts unexplained. It costs the run's length.
     fn is_explained_wake(&self, row: usize, entries: &[Entry]) -> bool {
         self.is_wake_row(row, entries)
-            && row
-                .checked_sub(1)
-                .is_some_and(|above| self.card_at(above, entries).is_some())
+            && (0..row)
+                .rev()
+                .map_while(|above| self.card_at(above, entries))
+                .any(|(_, notice)| notice.is_card())
     }
 
     /// Forgets what it built for entries from `from` on, which went or
@@ -1044,10 +1048,10 @@ impl Transcript {
             return run.clone();
         }
         let run = self.run_of(row, entries);
-        let urgencies: Vec<_> = run
+        let sizes: Vec<_> = run
             .clone()
             .filter_map(|row| self.card_at(row, entries))
-            .map(|(_, card)| card.urgency())
+            .map(|(_, card)| rail::RunCard::of(card))
             .collect();
         let first = self.card_at(run.start, entries).map(|(entry, _)| entry);
         let shown = if first.is_some_and(|first| self.unfolded.contains(&first)) {
@@ -1057,7 +1061,7 @@ impl Transcript {
         };
         let placed = PlacedRun {
             start: run.start,
-            places: rail::places(&urgencies, shown).into(),
+            places: rail::places(&sizes, shown).into(),
         };
         let mut cache = self.placed.borrow_mut();
         for row in run {

@@ -72,6 +72,7 @@
 //!   as rho's daemon does to deliver work that finished while the session
 //!   was idle: a card, a read, and a reply.
 //!   [`FakeDaemon::deliver_after_compacting`] compacts the context first.
+//!   [`FakeDaemon::notice`] sends a plain notice.
 //! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
 //!   in a session. Its two agent nodes are in the job list only: one
 //!   queued second in line, one failed with the error [`WORKFLOW_ERROR`].
@@ -965,6 +966,23 @@ impl FakeDaemon {
     /// has a bug.
     pub fn deliver(&self, session: &UiSessionId, reply: &str) {
         self.deliver_in(session, reply, ContextFill::Fits);
+    }
+
+    /// Sends `session` a plain notice saying `text`, as rho's daemon does
+    /// to tell the user something outside the conversation.
+    ///
+    /// # Panics
+    ///
+    /// If the daemon has no session `session`: the test has a bug.
+    pub fn notice(&self, session: &UiSessionId, text: &str) {
+        let mut state = self.service.lock();
+        let session = state
+            .sessions
+            .get_mut(session.as_str())
+            .unwrap_or_else(|| panic!("the fake daemon has no session {session}"));
+        session.publish(SessionEvent::Notice {
+            text: text.to_owned(),
+        });
     }
 
     /// [`Self::deliver`], but the session's context is full: rho compacts

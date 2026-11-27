@@ -2794,7 +2794,9 @@ fn replies(session: &Session) -> usize {
 
 /// A wake with no card right above it keeps its line, so its turn doesn't
 /// start unexplained: live, rho compacts a full context before it delivers
-/// the result's card, so the wake opens above the compaction.
+/// the result's card, so the wake opens above the compaction. A plain
+/// notice right above it sits on the rail as a card does, but says nothing
+/// of why rho went on, so the wake keeps its line under it too.
 #[test]
 fn a_wake_with_no_card_above_keeps_its_line() {
     let mut ui = Harness::start("bare-wake", Script::default());
@@ -2807,8 +2809,8 @@ fn a_wake_with_no_card_above_keeps_its_line() {
     let idle_after =
         |session: &Session, n: usize| session.state() == &RunState::Idle && replies(session) == n;
     ui.wait_for_session("the prompt's reply", |session| idle_after(session, 1));
-    ui.fake()
-        .deliver_after_compacting(&SessionId::from("new-1"), "Result in.");
+    let id = SessionId::from("new-1");
+    ui.fake().deliver_after_compacting(&id, "Result in.");
     ui.wait_for_session("the daemon's reply", |session| idle_after(session, 2));
     let session = ui.session();
     let wake = session
@@ -2837,6 +2839,31 @@ fn a_wake_with_no_card_above_keeps_its_line() {
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.frame();
     ui.shot("line");
+
+    ui.fake().notice(&id, "Switched to the fallback model.");
+    ui.wait_for_session("the notice", |session| {
+        matches!(session.entries().last(), Some(Entry::Notice(_)))
+    });
+    ui.fake().deliver_after_compacting(&id, "Result in again.");
+    ui.wait_for_session("the second daemon reply", |session| idle_after(session, 3));
+    let session = ui.session();
+    let wake = session
+        .entries()
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::Wake))
+        .expect("the second daemon turn opens with a wake");
+    assert!(
+        matches!(&session.entries()[wake - 1], Entry::Notice(notice) if !notice.is_card()),
+        "the plain notice sits right above the wake: {:?}",
+        session.entries()
+    );
+    let wake = SharedString::from(format!("wake-{wake}"));
+    ui.wait_until("the wake's line under the notice", |window, _, _| {
+        is_visible(window, wake.clone())
+    });
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.frame();
+    ui.shot("notice");
 }
 
 /// A step shows what rho's terminal UI shows for it, once: an edit's line

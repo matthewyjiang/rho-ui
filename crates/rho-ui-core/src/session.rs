@@ -489,6 +489,8 @@ pub struct Notice {
     title: String,
     description: Option<String>,
     arrived: Option<DateTime<Utc>>,
+    /// Whether rho sent it as a card ([`Self::is_card`]).
+    card: bool,
     /// What a notification card is about, typed, when rho says.
     notification: Option<Box<NotificationInfo>>,
 }
@@ -510,6 +512,7 @@ impl Notice {
             title,
             description,
             arrived,
+            card: false,
             notification: None,
         }
     }
@@ -535,8 +538,17 @@ impl Notice {
             title,
             description: [markdown, plain].into_iter().find(|body| !body.is_empty()),
             arrived,
+            card: true,
             notification,
         }
+    }
+
+    /// Whether rho sent it as a card, which tells of something that
+    /// happened, such as the result that woke the session; not a plain
+    /// notice, the daemon's or rho-ui's own. Every rho sends a card as its
+    /// card event, typed notification or not.
+    pub fn is_card(&self) -> bool {
+        self.card
     }
 
     /// How it reads.
@@ -1625,6 +1637,7 @@ impl Session {
                         timeout.fallback()
                     )),
                     arrived,
+                    card: false,
                     notification: None,
                 }));
             }

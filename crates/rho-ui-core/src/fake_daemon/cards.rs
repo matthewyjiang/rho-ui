@@ -84,9 +84,10 @@ pub struct FakeCard {
 }
 
 /// The cards, as a lead gets them from its workers, processes, peers and
-/// pull requests. Five show: the first four, as the rail always shows, and
-/// a peer's question, which needs the user, though rho tones it a warning.
-/// The rest fold: new comments rho tones as an accent, and routine news.
+/// pull requests. Four show: the first three, which fill the four rows the
+/// rail always shows, as the second tells of two events, and a peer's
+/// question, which needs the user, though rho tones it a warning. The rest
+/// fold: a merge, new comments rho tones as an accent, and routine news.
 /// A rail that went by the tones instead would show the comments and the
 /// subagent that stopped, and fold the question.
 pub const CARDS: [FakeCard; 8] = [
