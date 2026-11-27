@@ -2705,13 +2705,6 @@ fn every_wake_turn_keeps_its_reply_after_a_replay() {
     ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
     // A prompt: a read and a reply.
     ui.send("pictures");
-    let replies = |session: &Session| {
-        session
-            .entries()
-            .iter()
-            .filter(|entry| matches!(entry, Entry::Agent(_)))
-            .count()
-    };
     ui.wait_for_session("the prompt's reply", |session| {
         session.state() == &RunState::Idle && replies(session) == 1
     });
@@ -2768,6 +2761,12 @@ fn every_wake_turn_keeps_its_reply_after_a_replay() {
         ui.act(|window, _| {
             shows_turn(window, ("worked-1", "step-5", "reply-6"));
             shows_turn(window, ("worked-2", "step-9", "reply-10"));
+            for wake in ["wake-4", "wake-8"] {
+                assert!(
+                    window.try_find(wake).is_none(),
+                    "{when}: the card above {wake} says why rho went on, so it draws no row"
+                );
+            }
         });
         session.entries().to_vec()
     };
@@ -2782,6 +2781,62 @@ fn every_wake_turn_keeps_its_reply_after_a_replay() {
     let replayed = shows_three_turns(&mut ui, "replayed");
     ui.shot("replayed");
     assert_eq!(replayed, live, "the replay shows what live did");
+}
+
+/// How many replies `session` shows.
+fn replies(session: &Session) -> usize {
+    session
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, Entry::Agent(_)))
+        .count()
+}
+
+/// A wake with no card right above it keeps its line, so its turn doesn't
+/// start unexplained: live, rho compacts a full context before it delivers
+/// the result's card, so the wake opens above the compaction.
+#[test]
+fn a_wake_with_no_card_above_keeps_its_line() {
+    let mut ui = Harness::start("bare-wake", Script::default());
+    ui.wait_until("saved sessions", |window, _, _| {
+        is_visible(window, "session-local-s1")
+    });
+    ui.click("new-session");
+    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
+    ui.send("pictures");
+    let idle_after =
+        |session: &Session, n: usize| session.state() == &RunState::Idle && replies(session) == n;
+    ui.wait_for_session("the prompt's reply", |session| idle_after(session, 1));
+    ui.fake()
+        .deliver_after_compacting(&SessionId::from("new-1"), "Result in.");
+    ui.wait_for_session("the daemon's reply", |session| idle_after(session, 2));
+    let session = ui.session();
+    let wake = session
+        .entries()
+        .iter()
+        .position(|entry| matches!(entry, Entry::Wake))
+        .expect("the daemon's turn opens with a wake");
+    assert!(
+        matches!(session.entries()[wake - 1], Entry::Agent(_))
+            && matches!(session.entries()[wake + 1], Entry::Compaction(_))
+            && matches!(session.entries()[wake + 2], Entry::Notice(_)),
+        "the compaction comes between the wake and its card: {:?}",
+        session.entries()
+    );
+    let wake = SharedString::from(format!("wake-{wake}"));
+    ui.wait_until("the wake's line", |window, _, _| {
+        is_visible(window, wake.clone())
+    });
+    ui.act(|window, _| {
+        assert!(
+            is_visible(window, "worked-1"),
+            "the daemon's turn has its own header"
+        );
+    });
+    // Past the folds' springs.
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.frame();
+    ui.shot("line");
 }
 
 /// A step shows what rho's terminal UI shows for it, once: an edit's line
@@ -4504,8 +4559,17 @@ fn background_work_is_listed_stopped_and_handed_to_the_daemons_turn() {
         .iter()
         .position(|entry| matches!(entry, Entry::Wake))
         .expect("the daemon's turn opens with a wake");
-    let wake: &'static str = Box::leak(format!("wake-{wake}").into_boxed_str());
-    ui.act(|window, _| assert!(is_visible(window, wake), "the wake row shows"));
+    let wake = SharedString::from(format!("wake-{wake}"));
+    ui.act(|window, _| {
+        assert!(
+            window.try_find(wake).is_none(),
+            "the stop's card says why rho went on, so the wake draws no row"
+        );
+        assert!(
+            is_visible(window, "worked-1"),
+            "the daemon's turn has its own header"
+        );
+    });
     ui.shot("stopped");
 
     // A message sent during the daemon's turn steers it, which ends it.

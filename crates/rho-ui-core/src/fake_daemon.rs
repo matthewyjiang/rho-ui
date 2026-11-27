@@ -71,6 +71,7 @@
 //! - [`FakeDaemon::deliver`] runs a turn of the daemon's own to its end,
 //!   as rho's daemon does to deliver work that finished while the session
 //!   was idle: a card, a read, and a reply.
+//!   [`FakeDaemon::deliver_after_compacting`] compacts the context first.
 //! - [`FakeDaemon::start_workflow`] starts the workflow [`WORKFLOW_NAME`]
 //!   in a session. Its two agent nodes are in the job list only: one
 //!   queued second in line, one failed with the error [`WORKFLOW_ERROR`].
@@ -963,6 +964,21 @@ impl FakeDaemon {
     /// If the daemon has no session `session`, or it runs a turn: the test
     /// has a bug.
     pub fn deliver(&self, session: &UiSessionId, reply: &str) {
+        self.deliver_in(session, reply, ContextFill::Fits);
+    }
+
+    /// [`Self::deliver`], but the session's context is full: rho compacts
+    /// it automatically before the turn's first boundary delivers the
+    /// result's card, so the compaction comes first.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::deliver`].
+    pub fn deliver_after_compacting(&self, session: &UiSessionId, reply: &str) {
+        self.deliver_in(session, reply, ContextFill::Full);
+    }
+
+    fn deliver_in(&self, session: &UiSessionId, reply: &str, context: ContextFill) {
         let mut state = self.service.lock();
         let turn = state.next_turn();
         let session = state
@@ -973,7 +989,7 @@ impl FakeDaemon {
             session.turn.is_none(),
             "the daemon wakes only an idle session"
         );
-        session.deliver(turn, reply);
+        session.deliver(turn, reply, context);
     }
 
     /// Starts the workflow [`WORKFLOW_NAME`] in `session`, as the
@@ -1894,23 +1910,23 @@ impl FakeSession {
         self.report_background();
     }
 
-    /// Starts `turn`, one of the daemon's own, as rho's daemon does: its
-    /// first boundary delivers the `result` that woke it as a card. Returns
-    /// the turn's id.
-    fn begin_own_turn(&mut self, turn: Turn, result: &Card) -> TurnId {
+    /// Starts `turn`, one of the daemon's own, as rho's daemon does; its
+    /// first boundary delivers the result that woke it as a card, which
+    /// the caller sends. Returns the turn's id.
+    fn begin_own_turn(&mut self, turn: Turn) -> TurnId {
         // A prompt's key names only the session's latest turn.
         self.last_prompt = None;
         let id = turn.id.clone();
         self.turn = Some(turn);
         self.state(JobState::Running);
-        self.publish(result.event());
         id
     }
 
     /// Starts `turn`, one of the daemon's own that tells the model `told`
     /// about background work that ended. It runs until a steer ends it.
     fn wake(&mut self, turn: Turn, result: &Card, told: &str) {
-        let id = self.begin_own_turn(turn, result);
+        let id = self.begin_own_turn(turn);
+        self.publish(result.event());
         self.publish(SessionEvent::ThoughtChunk {
             message: MessageId::new(format!("th-{id}")),
             text: "Reading what ended.".to_owned(),
@@ -1921,13 +1937,18 @@ impl FakeSession {
     /// Runs `turn`, one of the daemon's own, to its end: its first boundary
     /// delivers a worker's result as a card, then the model reads a file
     /// and answers `reply`.
-    fn deliver(&mut self, turn: Turn, reply: &str) {
+    fn deliver(&mut self, turn: Turn, reply: &str, context: ContextFill) {
         let result = Card::new(
             "Completed · worker",
             "The worker finished.",
             CardTone::Success,
         );
-        let id = self.begin_own_turn(turn, &result);
+        let id = self.begin_own_turn(turn);
+        // rho compacts a full context before the step's boundary input.
+        if context == ContextFill::Full {
+            self.compacted(&format!("c-{id}"), CompactionTrigger::Automatic);
+        }
+        self.publish(result.event());
         let read = card(
             ToolStatus::Completed,
             ToolFamily::FileCommand,
@@ -2102,6 +2123,14 @@ fn user_message(id: &str, text: &str) -> SessionEvent {
 /// How much of a streamed reply one event carries, in bytes: less than a
 /// line of [`report`]'s prose, so its lines arrive unfinished.
 const STREAM_CHUNK: usize = 53;
+
+/// Whether a session's context fits, or must be compacted before the
+/// next model request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextFill {
+    Fits,
+    Full,
+}
 
 /// The context before and after the prompt "/compact" compacts it.
 pub const COMPACTED: CompactionCounts = CompactionCounts {
