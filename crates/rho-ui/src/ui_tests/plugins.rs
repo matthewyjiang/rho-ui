@@ -10,9 +10,65 @@ use rho_ui_core::{
 use super::configured::{scroll_page, End};
 use super::*;
 
-/// The accessibility label of row status `id`, once it shows.
+/// How far one step of [`reveal`] scrolls the page.
+const STEP: f32 = 40.;
+
+/// How far below the page's Refresh button [`reveal`] stops an element's
+/// top: past the header's 16 pixels of padding by more than a [`STEP`],
+/// so the element is never under the header.
+const BELOW_HEADER: f32 = 70.;
+
+/// Scrolls the Settings page from its top until element `id` is near the
+/// top of the page, or the page's end, as a user scrolls to a row: where
+/// a row lies depends on how the machine's fonts wrap the text above it.
+/// Near the top, a row that grows, as one that says why it failed does,
+/// stays on screen.
+fn reveal(ui: &mut Harness, id: &str) {
+    let id = SharedString::from(id.to_owned());
+    scroll_page(ui, End::Top);
+    let place = |ui: &mut Harness| {
+        ui.frame();
+        ui.cx
+            .update_window(ui.window, |_, window, _| {
+                let header = window.find("configured-refresh").bounds().bottom();
+                let shown = window
+                    .try_find(id.clone())
+                    .filter(gpui_kit::test::ElementSnapshot::visible)
+                    .map(|element| element.bounds());
+                (header, shown)
+            })
+            .expect("window is open")
+    };
+    let mut last = None;
+    // No page here is taller than 100 steps.
+    for _ in 0..100 {
+        let (header, shown) = place(ui);
+        let near_top = shown.is_some_and(|it| it.top() < header + px(BELOW_HEADER));
+        // At the page's end, the scroll moves nothing.
+        if near_top || (shown.is_some() && shown == last) {
+            return;
+        }
+        last = shown;
+        let delta = gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-STEP)));
+        ui.act(|window, cx| window.scroll("settings-view", delta, cx));
+    }
+    panic!("{id} never showed on the page");
+}
+
+/// The accessibility label of row status `id`, once revealed.
 fn row(ui: &mut Harness, id: &str) -> Option<String> {
+    reveal(ui, id);
     ui.label(SharedString::from(id.to_owned()))
+}
+
+/// Settings with no glide, so a scroll moves the page at once, by as much
+/// as it asks: a glide's fling follows the wall clock, not the test's.
+fn without_glide(ui: &mut Harness) {
+    ui.cx.update(|cx| {
+        let mut settings = cx.global::<Settings>().clone();
+        settings.smooth_scroll = SmoothScroll::Off;
+        settings.apply(cx);
+    });
 }
 
 /// Plugin `name` of `scope`, as the daemon now lists it for `workspace`.
@@ -33,6 +89,7 @@ fn commit(plugin: &Plugin) -> Option<&str> {
 
 /// Opens Settings → Plugins, for `project` if one is given.
 fn open_plugins(ui: &mut Harness, project: Option<&str>) {
+    without_glide(ui);
     open_settings(ui);
     open_settings_page(ui, "Plugins");
     ui.wait_until("the plugins", |window, _, _| {
@@ -66,19 +123,26 @@ fn plugins_list_by_scope_with_their_status() {
         Projects::of(["/w/a", TRUSTED_PLUGINS_WORKSPACE]),
     );
     open_plugins(&mut ui, Some(TRUSTED_PLUGINS_WORKSPACE));
-    let top = ["plugin-project-fmt", "plugin-user-broken"].map(|id| row(&mut ui, id));
     ui.shot("plugins");
-    scroll_page(&mut ui, End::Bottom);
-    let bottom = ["plugin-user-fmt", "plugin-user-notes"].map(|id| row(&mut ui, id));
-    ui.shot("shadowed");
+    let ids = [
+        "plugin-project-fmt",
+        "plugin-user-broken",
+        "plugin-user-fmt",
+        "plugin-user-notes",
+    ];
+    let labels = ids.map(|id| row(&mut ui, id));
     assert_eq!(
-        [top, bottom],
+        labels,
         [
-            ["fmt: Loaded", "broken: Rejected"],
-            ["fmt: Shadowed", "notes: Disabled"],
+            "fmt: Loaded",
+            "broken: Rejected",
+            "fmt: Shadowed",
+            "notes: Disabled",
         ]
-        .map(|labels| labels.map(|label| Some(label.to_owned()))),
+        .map(|label| Some(label.to_owned())),
     );
+    reveal(&mut ui, "plugin-user-fmt");
+    ui.shot("shadowed");
     scroll_page(&mut ui, End::Top);
 
     pick_project(&mut ui, TRUSTED_PLUGINS_WORKSPACE, "/w/a");
@@ -87,15 +151,15 @@ fn plugins_list_by_scope_with_their_status() {
 }
 
 /// A row's switch enables its plugin, its Update fetches it again and
-/// shows why that failed, and its Remove… removes it only once the user
-/// confirms.
+/// shows why that failed, and its Remove… removes it, even a rejected
+/// one, only once the user confirms.
 #[test]
 fn a_plugin_row_enables_updates_and_removes_it() {
     let mut ui = Harness::start("plugins-rows", Script::default());
     open_plugins(&mut ui, None);
     let user = PluginScope::User;
 
-    scroll_page(&mut ui, End::Bottom);
+    reveal(&mut ui, "plugin-user-notes");
     ui.wait_for_label("plugin-user-notes", "notes: Disabled");
     ui.click("plugin-enabled-user-notes");
     ui.wait_for_label("plugin-user-notes", "notes: Loaded");
@@ -105,6 +169,7 @@ fn a_plugin_row_enables_updates_and_removes_it() {
     );
 
     let before = listed(&ui, None, user, "deploy").expect("deploy is installed");
+    reveal(&mut ui, "plugin-menu-user-deploy");
     ui.click("plugin-menu-user-deploy");
     click_menu_item(&mut ui, "Update");
     ui.wait_for_label("plugin-user-deploy", "deploy: Update failed");
@@ -116,19 +181,25 @@ fn a_plugin_row_enables_updates_and_removes_it() {
     );
     ui.shot("update-failed");
 
-    ui.click("plugin-menu-user-scratch");
+    // A rejected plugin can't be switched, only removed.
+    reveal(&mut ui, "plugin-menu-user-broken");
+    assert!(
+        ui.label("plugin-enabled-user-broken").is_none(),
+        "no switch"
+    );
+    ui.click("plugin-menu-user-broken");
     click_menu_item(&mut ui, "Remove…");
     shot_dialog(&mut ui, "Remove", "remove");
     assert!(
-        listed(&ui, None, user, "scratch").is_some(),
+        listed(&ui, None, user, "broken").is_some(),
         "nothing is removed before the user confirms"
     );
     click_label(&mut ui, "Remove");
     ui.wait_until("the row gone", |window, _, _| {
-        window.try_find("plugin-user-scratch").is_none()
+        window.try_find("plugin-user-broken").is_none()
     });
     assert!(
-        listed(&ui, None, user, "scratch").is_none(),
+        listed(&ui, None, user, "broken").is_none(),
         "the daemon removed it"
     );
 }
@@ -146,7 +217,7 @@ fn a_plugin_change_reaches_mcp_and_hooks() {
     });
 
     open_settings_page(&mut ui, "Plugins");
-    scroll_page(&mut ui, End::Bottom);
+    reveal(&mut ui, "plugin-user-review");
     ui.wait_for_label("plugin-user-review", "review: Loaded");
     ui.click("plugin-enabled-user-review");
     ui.wait_for_label("plugin-user-review", "review: Disabled");
@@ -180,8 +251,13 @@ fn add_plugin_installs_a_folder_and_asks_before_replacing() {
     });
     let tidy = listed(&ui, None, user, "tidy").expect("the daemon installed it");
     assert_eq!(tidy.source, PluginSource::Install, "a copy of the folder");
-    scroll_page(&mut ui, End::Bottom);
-    ui.wait_for_label("plugin-user-tidy", "tidy: Loaded");
+    ui.wait_until("tidy's row", |window, _, _| {
+        window.try_find("plugin-user-tidy").is_some()
+    });
+    assert_eq!(
+        row(&mut ui, "plugin-user-tidy").as_deref(),
+        Some("tidy: Loaded")
+    );
 
     scroll_page(&mut ui, End::Top);
     // Enter sends it, as the button does, and the dialog stays to ask.
