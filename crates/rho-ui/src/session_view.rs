@@ -2309,6 +2309,8 @@ impl SessionView {
     /// Opens the find bar, or puts the keyboard back in it with its text
     /// selected.
     pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let drawn = self.loading.drawn(&self.session).unwrap_or_default();
+        self.transcript.prepare_find(drawn);
         let bar = self.find.get_or_insert_with(|| FindBar::new(window, cx));
         bar.focus(window, cx);
         cx.notify();

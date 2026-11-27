@@ -2192,7 +2192,8 @@ fn replay(session: &mut FakeSession, turns: usize) {
         session.publish(SessionEvent::ThoughtChunk {
             message: MessageId::new(format!("th{n}")),
             text: format!(
-                "**Finding the walker**\n\nThe tree walk for {n} is probably in src/{n}.rs."
+                "**Finding the walker**\n\nThe **tree** walk for {n} is probably in \
+                 [src/{n}.rs](https://example.com/walk/{n})."
             ),
         });
         tool_calls(session, n);
