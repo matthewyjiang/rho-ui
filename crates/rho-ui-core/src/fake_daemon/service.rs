@@ -41,8 +41,10 @@ use rho_protocol::{
 };
 
 use super::{
-    report, shell_card, shell_output, started::StartedChange, surface, Card, FakeSession,
-    SessionLists, Settings, State, Turn, KEY_AUTH, TOOL_IMAGE,
+    hold::{self, Answers},
+    report, shell_card, shell_output,
+    started::StartedChange,
+    surface, Card, FakeSession, SessionLists, Settings, State, Turn, KEY_AUTH, TOOL_IMAGE,
 };
 
 #[derive(Debug)]
@@ -64,13 +66,14 @@ impl Fake {
 
     /// Restarts in place, as rho does: the restarted daemon runs the new
     /// program, so no upgrade waits; every attached session is detached as
-    /// restarting, new sessions no prompt saved are gone, then every
-    /// connection closes.
+    /// restarting, new sessions no prompt saved are gone, the answers a
+    /// test held end, then every connection closes.
     pub(super) fn restart_now(&self) {
         let mut state = self.lock();
         state.upgrade = None;
         // It runs the program installed, rho-ui's own build.
         state.skew = None;
+        state.answer_holds.end();
         state
             .sessions
             .retain(|_, session| session.saved || session.subagent);
@@ -584,6 +587,7 @@ impl Service for Fake {
         state.stops += 1;
         state.upgrade = None;
         state.skew = None;
+        state.answer_holds.end();
         for session in state.sessions.values_mut() {
             for publisher in session.publishers.drain(..) {
                 publisher.close(DetachReason::DaemonStopping);
@@ -883,7 +887,7 @@ impl Service for Fake {
         params: SessionHoldParams,
     ) -> Result<SessionHoldResponse, RpcError> {
         let mut state = self.lock();
-        state.holds += 1;
+        state.session_holds += 1;
         let session = state.session(&params.session)?;
         let open = session
             .turn
@@ -1207,16 +1211,12 @@ impl Service for Fake {
         &self,
         params: SessionReportParams,
     ) -> Result<SessionReportResponse, RpcError> {
-        let (answer, mut held) = {
+        let (answer, wait) = {
             let mut state = self.lock();
             let answer = state.report(&params);
-            if !*state.reports.held.borrow() {
-                return answer;
-            }
-            (answer, state.reports.held.subscribe())
+            (answer, state.answer_holds.of(Answers::Reports).arrive())
         };
-        // The sender outlives this call, so this only waits.
-        let _ = held.wait_for(|held| !held).await;
+        hold::released(wait).await?;
         answer
     }
 
@@ -1228,9 +1228,8 @@ impl Service for Fake {
         &self,
         params: SessionMcpCatalogParams,
     ) -> Result<SessionMcpCatalog, RpcError> {
-        let mut held = self.lock().mcp.catalog_held.subscribe();
-        // The sender outlives this call, so this only waits.
-        let _ = held.wait_for(|held| !held).await;
+        let wait = self.lock().answer_holds.of(Answers::McpCatalog).arrive();
+        hold::released(wait).await?;
         self.lock().mcp_catalog(&params)
     }
 
@@ -1238,9 +1237,8 @@ impl Service for Fake {
         &self,
         params: SessionMcpResourceParams,
     ) -> Result<SessionMcpResourceResponse, RpcError> {
-        let mut held = self.lock().mcp.reads_held.subscribe();
-        // The sender outlives this call, so this only waits.
-        let _ = held.wait_for(|held| !held).await;
+        let wait = self.lock().answer_holds.of(Answers::McpReads).arrive();
+        hold::released(wait).await?;
         self.lock().mcp_resource(&params)
     }
 

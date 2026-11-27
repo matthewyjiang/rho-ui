@@ -172,12 +172,14 @@
 //!   `rho/daemon/restart` restarts in place, as rho does: it counts
 //!   ([`FakeDaemon::restarts`]), drops the upgrade, as the restarted daemon
 //!   runs the new program, detaches every attached session as restarting,
-//!   forgets new sessions no prompt saved, and closes every connection;
-//!   new ones are served as before. [`FakeDaemon::restart`] restarts it so
+//!   forgets new sessions no prompt saved, lifts every hold
+//!   ([`FakeDaemon::hold`]), and closes every connection; new ones are
+//!   served as before. [`FakeDaemon::restart`] restarts it so
 //!   as rho does by itself to upgrade, and
 //!   [`FakeDaemon::restart_at_next_prompt`] as a prompt arrives, which it
 //!   answers `DaemonStopping`, having run nothing. `rho/daemon/stop`
-//!   detaches every session as stopping and closes every connection
+//!   detaches every session as stopping, lifts every hold, and closes
+//!   every connection
 //!   ([`FakeDaemon::stops`]), and the next connection is served as a daemon
 //!   started afresh would be. [`FakeDaemon::attaches`] counts each
 //!   session's attaches.
@@ -240,6 +242,7 @@ mod auth;
 mod cards;
 mod config;
 mod configured;
+mod hold;
 mod listener;
 mod mcp;
 mod processes;
@@ -255,6 +258,8 @@ pub use cards::{FakeCard, FakeSubject, CARDS};
 use config::FakeConfig;
 use configured::FakeConfigured;
 pub use configured::{ConfiguredList, ConfiguredMethods, ConfiguredRead, INVALID_HOOKS_WORKSPACE};
+pub use hold::Answers;
+use hold::Holds;
 use listener::Listener;
 use mcp::FakeMcp;
 pub use mcp::{
@@ -571,8 +576,8 @@ impl FakeDaemon {
     }
 
     /// How many open requests clients have held ([`rho_protocol::SESSION_HOLD`]).
-    pub fn holds(&self) -> usize {
-        self.service.lock().holds
+    pub fn session_holds(&self) -> usize {
+        self.service.lock().session_holds
     }
 
     /// Has the daemon find rho `version` installed over its program,
@@ -2353,7 +2358,7 @@ struct State {
     /// Session worktrees on disk, for `rho/worktree/prune`.
     session_worktrees: Vec<WorktreeReport>,
     /// How many requests clients held.
-    holds: usize,
+    session_holds: usize,
     /// The upgrade `rho/daemon/status` reports.
     upgrade: Option<PendingUpgrade>,
     /// What `rho/daemon/status` says stopping or restarting would cut short.
@@ -2383,6 +2388,8 @@ struct State {
     pull_requests: FakePullRequests,
     reports: FakeReports,
     mcp: FakeMcp,
+    /// The answers a test holds; see [`FakeDaemon::hold`].
+    answer_holds: Holds,
     configured: FakeConfigured,
     /// Restart as the next prompt arrives; see
     /// [`FakeDaemon::restart_at_next_prompt`].
@@ -2500,7 +2507,7 @@ impl State {
             forks: 0,
             worktrees: 0,
             session_worktrees: Vec::new(),
-            holds: 0,
+            session_holds: 0,
             upgrade: None,
             in_progress: 0,
             skew: None,
@@ -2518,6 +2525,7 @@ impl State {
             pull_requests: FakePullRequests::new(script.pull_requests),
             reports: FakeReports::new(script.reports),
             mcp: FakeMcp::new(&script),
+            answer_holds: Holds::default(),
             configured: FakeConfigured::new(&script),
             restart_at_prompt: false,
         };

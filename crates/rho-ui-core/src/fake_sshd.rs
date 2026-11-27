@@ -47,6 +47,7 @@ use tokio::{
 };
 
 use crate::{
+    hold::{Hold, Wake},
     platform,
     ssh::{AgentKeys, IdentityAgent, Resolved, SshTarget},
 };
@@ -112,7 +113,7 @@ pub struct FakeSshd {
     /// How each session under a pseudo-terminal ended, in order.
     terminal_ends: Mutex<mpsc::UnboundedReceiver<TerminalEnd>>,
     /// Whether session channels asked for wait unconfirmed.
-    hold_sessions: watch::Sender<bool>,
+    hold_sessions: Hold,
     /// The session channels it took, and those of them over.
     sessions: watch::Sender<Sessions>,
     /// Numbers each target's host, so each gets a connection of its own.
@@ -187,7 +188,7 @@ impl FakeSshd {
         let sign_ins: Arc<AtomicUsize> = Arc::default();
         let refuse_terminals: Arc<AtomicBool> = Arc::default();
         let (terminal_ended, ends) = mpsc::unbounded_channel();
-        let hold_sessions = watch::Sender::new(false);
+        let hold_sessions = Hold::default();
         let sessions = watch::Sender::new(Sessions::default());
         let sshd = Sshd {
             home: home.to_path_buf(),
@@ -296,13 +297,13 @@ impl FakeSshd {
     /// Leaves each session channel asked for from now on unconfirmed, as
     /// a slow link does for a moment, until [`Self::confirm_sessions`].
     pub fn hold_sessions(&self) {
-        self.hold_sessions.send_replace(true);
+        self.hold_sessions.hold();
     }
 
     /// Confirms the session channels [`Self::hold_sessions`] held, and
     /// each asked for from now on.
     pub fn confirm_sessions(&self) {
-        self.hold_sessions.send_replace(false);
+        self.hold_sessions.release();
     }
 
     /// Waits until clients have asked for `count` session channels it
@@ -354,7 +355,7 @@ struct Sshd {
     sign_ins: Arc<AtomicUsize>,
     refuse_terminals: Arc<AtomicBool>,
     terminal_ended: mpsc::UnboundedSender<TerminalEnd>,
-    hold_sessions: watch::Sender<bool>,
+    hold_sessions: Hold,
     sessions: watch::Sender<Sessions>,
     /// A permit for each session channel open on this connection, held
     /// ones too, of [`MAX_SESSIONS`].
@@ -400,14 +401,18 @@ impl server::Handler for Sshd {
             reply.reject(ChannelOpenFailure::ConnectFailed).await;
             return Ok(());
         };
+        // Held or not as it is asked for, whenever its task runs; before
+        // it counts as asked, so a test that saw it asked acts after.
+        let wait = self.hold_sessions.arrive();
         self.sessions.send_modify(|sessions| sessions.asked += 1);
         let sshd = self.clone();
         // In a task, so a held channel doesn't hold up the connection's
         // other messages, such as the close of one before it.
         tokio::spawn(async move {
-            let mut held = sshd.hold_sessions.subscribe();
-            // The sender lives as long as `sshd`.
-            let _ = held.wait_for(|held| !held).await;
+            // Only a release wakes it: nothing here ends the hold, and
+            // this task's `sshd` keeps it alive.
+            let wake = wait.woken().await;
+            debug_assert_eq!(wake, Wake::Released, "sshd ends no hold");
             reply.accept().await;
             let sessions = sshd.sessions.clone();
             run_session(channel, sshd).await;
