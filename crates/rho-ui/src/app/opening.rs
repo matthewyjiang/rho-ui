@@ -2,7 +2,8 @@
 //! or a new worktree of it, or a session in no project, a lead or a
 //! scratch session, in a folder made for it (see [`crate::no_project`]).
 //! Each machine's scratch root, which tells the sessions in it, is learned
-//! as a connection starts and whenever a scratch session opens.
+//! as a connection starts, if it is there, and whenever a scratch session
+//! opens.
 
 use std::path::{Path, PathBuf};
 
@@ -168,15 +169,17 @@ impl RhoApp {
         }
     }
 
-    /// Makes `machine`'s scratch root, if missing, and tells the workspaces
-    /// where it is, so the sessions in it, from earlier runs too, are in no
-    /// project. Best effort: until a scratch session opens there, a root
-    /// that can't be made leaves them in their folders' projects.
+    /// Finds `machine`'s scratch root and tells the workspaces where it
+    /// is, so the sessions in it, from earlier runs, are in no project.
+    /// It makes nothing: connecting writes nothing to the machine, and a
+    /// root that isn't there holds no session. Best effort: until a scratch
+    /// session opens there, a root that can't be read leaves them in their
+    /// folders' projects.
     pub(super) fn find_scratch_root(&self, machine: &MachineId, cx: &mut Context<'_, Self>) {
         let maker = self.folder_maker(Root::Scratch, machine, cx);
         let (workspaces, machine) = (self.workspaces.clone(), machine.clone());
         cx.spawn(async move |_, cx| {
-            let Ok(root) = maker.make(&Folder::Root).await else {
+            let Ok(Some(root)) = maker.find_root().await else {
                 return;
             };
             workspaces.update(cx, |workspaces, cx| {

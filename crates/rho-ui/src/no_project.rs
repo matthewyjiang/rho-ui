@@ -115,6 +115,25 @@ fi
 printf '\0%s\0' "$dest"
 "#;
 
+/// The POSIX `sh` script that finds the root named by its argument on a
+/// remote machine without making it, as [`find_here`] does here: it prints
+/// a NUL, then the root's resolved path, or [`NO_ROOT`] if there is none,
+/// and a NUL.
+const FIND_SCRIPT: &str = r#"unset CDPATH
+cd || exit
+root=${RHO_HOME:-$HOME/.rho}/$1
+if [ -d "$root" ]; then
+  root=$(cd -P -- "$root" && pwd -P) || exit
+else
+  root=rho-ui-no-root
+fi
+printf '\0%s\0' "$root"
+"#;
+
+/// What [`FIND_SCRIPT`] prints for a root that isn't there: no path, which
+/// is absolute.
+const NO_ROOT: &str = "rho-ui-no-root";
+
 /// The POSIX `sh` script that removes the folder given as its argument on
 /// a remote machine if it is empty, as [`unmake_here`] does here.
 const UNMAKE_SCRIPT: &str = "rmdir -- \"$1\"\n";
@@ -206,6 +225,40 @@ impl FolderMaker {
             .await
     }
 
+    /// The root's resolved path, if it is there, with [`find_here`] on this
+    /// machine and [`FIND_SCRIPT`] on a remote one; `None` if it isn't.
+    /// Unlike [`Self::make`], it makes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Says why, in the file system's or ssh's words, if the machine isn't
+    /// connected or the root can't be read.
+    pub(crate) async fn find_root(&self) -> Result<Option<PathBuf>, String> {
+        let (rho_home, dir) = (self.rho_home.clone(), self.root.dir());
+        let here = move || -> Result<Option<PathBuf>, String> {
+            let rho_home =
+                rho_home.ok_or_else(|| format!("There's no rho home to keep {dir} in."))?;
+            find_here(&rho_home.join(dir))
+        };
+        let parse = move |output: Vec<u8>| match folders::last_path(&output) {
+            Some(path) if path == Path::new(NO_ROOT) => Ok(None),
+            Some(path) => Ok(Some(path)),
+            None => Err(format!("the {dir} script printed no path")),
+        };
+        let args = vec![OsString::from(dir)];
+        self.reader
+            .clone()
+            .query(
+                &self.executor,
+                here,
+                FIND_SCRIPT,
+                args,
+                Deadline::Script,
+                parse,
+            )
+            .await
+    }
+
     /// Removes `dir`, a session's folder [`Self::make`] made, if it is
     /// still empty, as when its session didn't start, so a retry takes its
     /// name again: with [`unmake_here`] on this machine and
@@ -254,6 +307,17 @@ fn make_here(root: &Path, folder: &Folder) -> Result<PathBuf, String> {
             }
             Err(error) => return Err(format!("Couldn't make {}: {error}", dest.display())),
         }
+    }
+}
+
+/// `root` on this machine, resolved, if it is there, as [`FIND_SCRIPT`]
+/// finds a remote one; `None` if it isn't. Does file I/O; call it off the
+/// UI thread.
+fn find_here(root: &Path) -> Result<Option<PathBuf>, String> {
+    match platform::canonicalize(root) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Couldn't open {}: {error}", root.display())),
     }
 }
 
@@ -347,6 +411,48 @@ mod tests {
                 return Err(String::from_utf8_lossy(&output.stderr).into_owned());
             }
             Ok(folders::last_path(&output.stdout).unwrap())
+        });
+    }
+
+    /// A root is found once it is there, and finding it makes nothing: a
+    /// connection that looks for one writes nothing. `find` finds a root
+    /// of a rho home.
+    fn finds_a_root_without_making_it(
+        find: impl Fn(&Path, Root) -> Result<Option<PathBuf>, String>,
+    ) {
+        let rho_home = tempfile::tempdir().unwrap();
+        let rho_home = rho_home.path();
+        for root in [Root::Leads, Root::Scratch] {
+            assert_eq!(find(rho_home, root), Ok(None), "{root:?}");
+            assert!(!rho_home.join(root.dir()).exists(), "{root:?} made");
+            let made = make_here(&rho_home.join(root.dir()), &Folder::Root).unwrap();
+            assert_eq!(find(rho_home, root), Ok(Some(made)), "{root:?}");
+        }
+    }
+
+    #[test]
+    fn finding_a_root_here_makes_nothing() {
+        finds_a_root_without_making_it(|rho_home, root| find_here(&rho_home.join(root.dir())));
+    }
+
+    /// [`FIND_SCRIPT`], which finds a remote machine's, does the same.
+    #[cfg(unix)]
+    #[test]
+    fn the_find_script_makes_nothing() {
+        finds_a_root_without_making_it(|rho_home, root| {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(FIND_SCRIPT)
+                .arg("sh")
+                .arg(root.dir())
+                .env("RHO_HOME", rho_home)
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
+            let path = folders::last_path(&output.stdout).unwrap();
+            Ok((path != Path::new(NO_ROOT)).then_some(path))
         });
     }
 
