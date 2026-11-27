@@ -131,7 +131,7 @@ impl Workspace {
     }
 
     /// The same workspace, in its machine's scratch root.
-    pub(crate) fn in_scratch(mut self) -> Self {
+    pub(crate) fn scratch(mut self) -> Self {
         self.scratch = true;
         self
     }
@@ -318,7 +318,7 @@ impl Workspaces {
         }
         let home = self.home(&cwd.machine);
         let mut workspace = Workspace::new(cwd.clone(), repo::folder(&cwd.path), home.as_deref());
-        workspace.scratch = self.in_scratch(cwd);
+        workspace.scratch = self.under_scratch_root(cwd);
         self.list.push(workspace);
         let ix = self.list.len() - 1;
         if self.unread.is_empty() {
@@ -337,16 +337,22 @@ impl Workspaces {
     /// Takes `root` as its machine's scratch root, resolved, and marks the
     /// workspaces in it there ([`Workspace::is_scratch`]).
     pub(crate) fn set_scratch_root(&mut self, root: Place, cx: &mut Context<'_, Self>) {
-        self.scratch_roots
-            .retain(|known| known.machine != root.machine);
-        self.scratch_roots.push(root);
+        if self.scratch_root(&root.machine) == Some(root.path.as_path()) {
+            return;
+        }
         let mut changed = false;
-        for ix in 0..self.list.len() {
-            let scratch = self.in_scratch(self.list[ix].place());
-            let workspace = &mut self.list[ix];
+        let theirs = self
+            .list
+            .iter_mut()
+            .filter(|workspace| workspace.place.machine == root.machine);
+        for workspace in theirs {
+            let scratch = workspace.place.path.starts_with(&root.path);
             changed |= workspace.scratch != scratch;
             workspace.scratch = scratch;
         }
+        self.scratch_roots
+            .retain(|known| known.machine != root.machine);
+        self.scratch_roots.push(root);
         if changed {
             cx.notify();
         }
@@ -361,7 +367,7 @@ impl Workspaces {
     }
 
     /// Whether `place` is its machine's scratch root or in it.
-    fn in_scratch(&self, place: &Place) -> bool {
+    fn under_scratch_root(&self, place: &Place) -> bool {
         self.scratch_root(&place.machine)
             .is_some_and(|root| place.path.starts_with(root))
     }

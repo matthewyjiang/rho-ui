@@ -178,10 +178,6 @@ impl FolderMaker {
         }
     }
 
-    pub(crate) fn root(&self) -> Root {
-        self.root
-    }
-
     /// Makes `folder`, with [`make_here`] on this machine and [`SCRIPT`] on
     /// a remote one, and returns its resolved path.
     ///

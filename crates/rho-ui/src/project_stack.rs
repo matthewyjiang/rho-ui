@@ -309,7 +309,7 @@ mod tests {
         let crates = Workspace::local("/w/rho/crates", "me/rho", "/w/rho");
         let notes = Workspace::local("/tmp/notes", "notes", "/tmp/notes");
         let scratch =
-            Workspace::local("/rho/scratch/try-it", "try-it", "/rho/scratch/try-it").in_scratch();
+            Workspace::local("/rho/scratch/try-it", "try-it", "/rho/scratch/try-it").scratch();
         let table: [Case<'_>; 9] = [
             (
                 Kind::Lead,

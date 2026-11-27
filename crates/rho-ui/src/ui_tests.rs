@@ -7548,11 +7548,14 @@ fn a_new_session_starts_in_one_of_the_users_projects() {
         .update(|cx| assert_eq!(selected_project(cx, ui.app.read(cx)), None));
     ui.shot("hover");
 
-    // Ctrl+Shift+N in the draft goes to the search, which filters.
-    ui.act(|window, cx| {
-        window.press("secondary-shift-n", cx);
-        window.input("/w/b", cx);
+    // Ctrl+Shift+N in the draft goes to the search, selecting the newest
+    // project rather than No project, since the draft is in neither; the
+    // search filters.
+    ui.act(|window, cx| window.press("secondary-shift-n", cx));
+    ui.wait_until("the newest project selected", |_, cx, app| {
+        selected_project(cx, app).as_deref() == Some("project-local:/w/a")
     });
+    ui.act(|window, cx| window.input("/w/b", cx));
     ui.wait_until("the search to filter", |window, cx, app| {
         !is_visible(window, "project-local:/w/a")
             && is_visible(window, "project-local:/w/b")

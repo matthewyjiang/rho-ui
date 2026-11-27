@@ -426,12 +426,19 @@ impl ProjectPicker {
     }
 
     /// Puts the keyboard in the search field, the current project
-    /// selected, else the first.
+    /// selected, else the first project: Enter never takes No project
+    /// unless the draft is in no project already.
     pub(crate) fn focus(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.list.update(cx, |list, cx| {
             let delegate = list.delegate();
+            let first = delegate
+                .rows
+                .iter()
+                .position(|row| *row != Row::NoProject)
+                .map(|row| IndexPath::default().row(row));
             let row = delegate
                 .current_row()
+                .or(first)
                 .or_else(|| (!delegate.rows.is_empty()).then(IndexPath::default));
             list.set_selected_index(row, window, cx);
             list.focus(window, cx);
@@ -917,10 +924,10 @@ impl ProjectList {
             .map(|workspace| workspace.place().clone())
     }
 
-    /// Lists what the search names as a path, then No project and the
-    /// projects on the draft's machine if their name or path matches it,
-    /// the projects most recently used first, then the projects only other
-    /// machines hold.
+    /// Lists what the search names as a path, then the projects on the
+    /// draft's machine whose name or path matches it, most recently used
+    /// first, with No project if its name matches, then the projects only
+    /// other machines hold.
     fn refilter(&mut self, cx: &App) {
         let workspaces = self.workspaces.read(cx);
         let machine = self.current.machine();
@@ -956,25 +963,32 @@ impl ProjectList {
             .iter()
             .copied()
             .find(|&ix| current.as_ref() == Some(workspaces.get(ix).place()));
+        // No project's row, then the projects'.
         self.listed = 1 + here.len() + elsewhere.len();
         let query = self.query.as_str();
         let name_matches = |ix: &usize| contains_ignore_case(&workspaces.get(*ix).name, query);
         let matches =
             |ix: &usize| name_matches(ix) || contains_ignore_case(&workspaces.get(*ix).path, query);
-        let no_project = contains_ignore_case(NO_PROJECT, query)
-            || self
-                .scratch_path(cx)
-                .is_some_and(|path| contains_ignore_case(&path, query));
+        // First with no search; after the projects a search finds, so the
+        // row Kit selects as a search starts, which Enter takes, is one of
+        // theirs.
+        let no_project = contains_ignore_case(NO_PROJECT, query).then_some(Row::NoProject);
+        let (before, after) = if query.is_empty() {
+            (no_project, None)
+        } else {
+            (None, no_project)
+        };
         let found = &self.found;
         self.rows = found
             .iter()
             .cloned()
-            .chain(no_project.then_some(Row::NoProject))
+            .chain(before)
             .chain(
                 here.into_iter()
                     .filter(|ix| matches(ix) && !found.contains(&Row::Project(*ix)))
                     .map(Row::Project),
             )
+            .chain(after)
             // By name only: their paths are on another machine, which a
             // typed path doesn't name.
             .chain(
@@ -1301,10 +1315,6 @@ impl ListDelegate for ProjectList {
     ) -> impl IntoElement {
         // No project lists for an empty search, so only a search empties
         // the list.
-        let (title, hint) = (
-            "No matching projects",
-            "Type a path such as ~/code/app to add it",
-        );
         v_flex()
             .size_full()
             .items_center()
@@ -1312,8 +1322,12 @@ impl ListDelegate for ProjectList {
             .gap_1()
             .text_sm()
             .text_color(cx.theme().muted_foreground)
-            .child(title)
-            .child(div().text_xs().child(hint))
+            .child("No matching projects")
+            .child(
+                div()
+                    .text_xs()
+                    .child("Type a path such as ~/code/app to add it"),
+            )
     }
 
     fn set_selected_index(

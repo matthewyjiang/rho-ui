@@ -58,6 +58,7 @@ use crate::{
     machines::{MachineId, Machines, Place, SessionKey},
     no_project::Root,
     project_picker::{Pick, PickerEvent, ProjectPicker},
+    project_stack::session_projects,
     projects::Projects,
     session_list::{NEW_LEAD, NEW_SESSION},
     session_settings::{SessionSettings, SettingsEvent},
@@ -287,11 +288,6 @@ impl DraftView {
         self.no_project_root(cx).is_some()
     }
 
-    /// Whether the draft is a session's moved to No project.
-    pub(crate) fn in_scratch(&self, cx: &App) -> bool {
-        self.no_project_root(cx) == Some(Root::Scratch)
-    }
-
     /// The project picker, which a lead's draft hasn't.
     fn picker(&self) -> Option<&Entity<ProjectPicker>> {
         match &self.kind {
@@ -431,14 +427,14 @@ impl DraftView {
             window.focus(&self.composer.focus_handle(cx), cx);
             return;
         }
-        let cwd = match &pick {
-            Pick::Folder(cwd) => cwd.clone(),
-            Pick::NoProject(machine) => Place::new(machine.clone(), PathBuf::new()),
+        let (cwd, workspace) = match &pick {
+            Pick::Folder(cwd) => (
+                cwd.clone(),
+                Some(WorkspaceRef::new(&self.workspaces, cwd, cx)),
+            ),
+            Pick::NoProject(machine) => (Place::new(machine.clone(), PathBuf::new()), None),
         };
-        self.workspace = match pick {
-            Pick::Folder(_) => Some(WorkspaceRef::new(&self.workspaces, &cwd, cx)),
-            Pick::NoProject(_) => None,
-        };
+        self.workspace = workspace;
         let remote = self.machines.read(cx).remote_label(&cwd.machine);
         self.composer
             .update(cx, |composer, cx| composer.set_remote(remote, cx));
@@ -752,15 +748,13 @@ impl Render for DraftView {
         };
         // A session's draft names its project, if it is in one; a lead's,
         // those it picked, whether they are the user's projects or not.
-        let projects = match self.added_dirs() {
-            Some(dirs) => dirs.read(cx).projects(None, None, cx),
-            None if self.in_no_project(cx) => Vec::new(),
-            None => self
-                .workspace
-                .iter()
-                .map(|workspace| workspace.read(cx))
-                .collect(),
-        };
+        let projects = self.added_dirs().map_or_else(
+            || {
+                let own = self.workspace.as_ref().map(|workspace| workspace.read(cx));
+                session_projects(Kind::Session, own, [], None)
+            },
+            |dirs| dirs.read(cx).projects(None, None, cx),
+        );
         // A lead's projects, at the right, where a session's title bar has
         // its added directories.
         let title_bar = TitleBar::new(&projects, title).trailing(self.added_dirs().cloned());

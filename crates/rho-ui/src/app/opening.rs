@@ -1,6 +1,8 @@
 //! How a draft's session opens: a plain session, in the draft's directory
 //! or a new worktree of it, or a session in no project, a lead or a
 //! scratch session, in a folder made for it (see [`crate::no_project`]).
+//! Each machine's scratch root, which tells the sessions in it, is learned
+//! as a connection starts and whenever a scratch session opens.
 
 use std::path::{Path, PathBuf};
 
@@ -18,15 +20,16 @@ use crate::{
 pub(super) enum Opening {
     /// A plain session, in the draft's directory checked out so.
     Plain(Checkout),
-    /// A session in no project, in the folder `maker` makes in its root: a
-    /// lead in the leads root, whose tools reach `added_dirs` too, the
-    /// projects its draft picked; or in the scratch root, a plain session
-    /// in its folder's checkout.
-    Made {
+    /// A lead, in the folder `maker` makes in the leads root, whose tools
+    /// reach `added_dirs` too: the projects its draft picked.
+    Lead {
         maker: FolderMaker,
         folder: Folder,
         added_dirs: Vec<PathBuf>,
     },
+    /// A plain session in no project, in the checkout of the folder `maker`
+    /// makes in the scratch root.
+    Scratch { maker: FolderMaker, folder: Folder },
 }
 
 impl Opening {
@@ -46,29 +49,34 @@ impl Opening {
         daemon: &Daemon,
         cwd: &Path,
     ) -> Result<(SessionSetup, PathBuf), String> {
-        match self {
-            Opening::Plain(checkout) => daemon
-                .new_session(cwd, *checkout)
-                .await
-                .map(|setup| (setup, cwd.to_path_buf()))
-                .map_err(|error| error.to_string()),
-            Opening::Made {
+        let (dir, opened) = match self {
+            Opening::Plain(checkout) => {
+                return daemon
+                    .new_session(cwd, *checkout)
+                    .await
+                    .map(|setup| (setup, cwd.to_path_buf()))
+                    .map_err(|error| error.to_string());
+            }
+            Opening::Lead {
                 maker,
-                added_dirs,
                 folder,
+                added_dirs,
             } => {
                 let dir = maker.make(folder).await?;
-                let opened = match maker.root() {
-                    Root::Leads => daemon.new_lead(&dir, added_dirs).await,
-                    Root::Scratch => daemon.new_session(&dir, Checkout::Local).await,
-                };
-                match opened {
-                    Ok(setup) => Ok((setup, dir)),
-                    Err(error) => {
-                        self.unmake(&dir).await;
-                        Err(error.to_string())
-                    }
-                }
+                let opened = daemon.new_lead(&dir, added_dirs).await;
+                (dir, opened)
+            }
+            Opening::Scratch { maker, folder } => {
+                let dir = maker.make(folder).await?;
+                let opened = daemon.new_session(&dir, Checkout::Local).await;
+                (dir, opened)
+            }
+        };
+        match opened {
+            Ok(setup) => Ok((setup, dir)),
+            Err(error) => {
+                self.unmake(&dir).await;
+                Err(error.to_string())
             }
         }
     }
@@ -78,26 +86,43 @@ impl Opening {
     /// when its session didn't start, so a retry takes its name again. A
     /// root and a plain session's directory stay.
     pub(super) async fn unmake(&self, dir: &Path) {
-        if let Opening::Made {
-            maker,
-            folder: Folder::Named(_),
-            ..
-        } = self
-        {
-            maker.unmake(dir).await;
+        match self {
+            Opening::Lead {
+                maker,
+                folder: Folder::Named(_),
+                ..
+            }
+            | Opening::Scratch {
+                maker,
+                folder: Folder::Named(_),
+            } => maker.unmake(dir).await,
+            Opening::Plain(_) | Opening::Lead { .. } | Opening::Scratch { .. } => {}
         }
     }
 
-    /// The same opening, for a lead whose tools reach `dirs` too. A plain
+    /// The scratch root, resolved, when [`Self::open`] opened a scratch
+    /// session in `dir`: `dir` itself for a draft's, else its parent.
+    fn scratch_root<'a>(&self, dir: &'a Path) -> Option<&'a Path> {
+        match self {
+            Opening::Scratch {
+                folder: Folder::Root,
+                ..
+            } => Some(dir),
+            Opening::Scratch { .. } => dir.parent(),
+            Opening::Plain(_) | Opening::Lead { .. } => None,
+        }
+    }
+
+    /// The same opening, for a lead whose tools reach `dirs` too. A
     /// session's draft picks no directories, so its opening takes none.
     pub(super) fn with_added_dirs(self, dirs: Vec<PathBuf>) -> Self {
         match self {
-            Opening::Made { maker, folder, .. } => Opening::Made {
+            Opening::Lead { maker, folder, .. } => Opening::Lead {
                 maker,
                 folder,
                 added_dirs: dirs,
             },
-            plain @ Opening::Plain(_) => plain,
+            other @ (Opening::Plain(_) | Opening::Scratch { .. }) => other,
         }
     }
 }
@@ -108,21 +133,45 @@ impl RhoApp {
     /// one, a session of its own, in a new worktree or, in no project, a
     /// folder named from it.
     pub(super) fn opening(&self, draft: &DraftView, first: Option<&Prompt>, cx: &App) -> Opening {
-        match (draft.no_project_root(cx), first) {
-            (None, None) => Opening::Plain(Checkout::Local),
-            (None, Some(_)) => Opening::Plain(Checkout::NewWorktree),
-            (Some(root), first) => Opening::Made {
-                maker: self.folder_maker(root, &draft.cwd().machine, cx),
-                folder: first.map_or(Folder::Root, |first| Folder::named_from(root, first.text())),
+        let Some(root) = draft.no_project_root(cx) else {
+            return Opening::Plain(match first {
+                None => Checkout::Local,
+                Some(_) => Checkout::NewWorktree,
+            });
+        };
+        let maker = self.folder_maker(root, &draft.cwd().machine, cx);
+        let folder = first.map_or(Folder::Root, |first| Folder::named_from(root, first.text()));
+        match root {
+            Root::Leads => Opening::Lead {
+                maker,
+                folder,
                 added_dirs: Vec::new(),
             },
+            Root::Scratch => Opening::Scratch { maker, folder },
+        }
+    }
+
+    /// Takes the scratch root `opening` shows in `dir`, the directory it
+    /// opened a session in on `machine`, so that session is in no project
+    /// even if [`Self::find_scratch_root`] didn't find the root.
+    pub(super) fn opened_in(
+        &self,
+        opening: &Opening,
+        machine: &MachineId,
+        dir: &Path,
+        cx: &mut App,
+    ) {
+        if let Some(root) = opening.scratch_root(dir) {
+            let root = Place::new(machine.clone(), root);
+            self.workspaces
+                .update(cx, |workspaces, cx| workspaces.set_scratch_root(root, cx));
         }
     }
 
     /// Makes `machine`'s scratch root, if missing, and tells the workspaces
-    /// where it is, so the sessions in it are in no project. Best effort: a
-    /// root that can't be made leaves them in their folders' projects, and
-    /// a scratch draft says why when it can't open.
+    /// where it is, so the sessions in it, from earlier runs too, are in no
+    /// project. Best effort: until a scratch session opens there, a root
+    /// that can't be made leaves them in their folders' projects.
     pub(super) fn find_scratch_root(&self, machine: &MachineId, cx: &mut Context<'_, Self>) {
         let maker = self.folder_maker(Root::Scratch, machine, cx);
         let (workspaces, machine) = (self.workspaces.clone(), machine.clone());

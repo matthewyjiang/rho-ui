@@ -69,6 +69,7 @@ use crate::{
         DaemonAction, Listing, Machine, MachineId, MachineStatus, Machines, Place, Reach,
         SessionKey,
     },
+    no_project::Root,
     projects::Projects,
     pull_requests::{Focus, PullRequests},
     rho_install::{render_setup, Installs, InstallsEvent, Offer},
@@ -122,9 +123,9 @@ pub(crate) struct LaunchConfig {
     /// What the right panel's terminal runs on this machine.
     pub(crate) shell: TerminalShell,
     /// This machine's rho home, which keeps the folders of its sessions in
-    /// no project (see [`crate::no_project`]): `platform::rho_home()`, except in tests, which
-    /// keep it in a temporary folder. A browser reaches even this machine
-    /// through its link, so it has none.
+    /// no project (see [`crate::no_project`]): `platform::rho_home()`,
+    /// except in tests, which keep it in a temporary folder. A browser
+    /// reaches even this machine through its link, so it has none.
     pub(crate) rho_home: Option<PathBuf>,
     /// Where notifications go: the desktop's, except in tests.
     pub(crate) notifier: Notifier,
@@ -1284,7 +1285,8 @@ impl RhoApp {
         // place of the new one.
         if let Pane::Draft(view) = &self.pane {
             let draft = view.read(cx);
-            if draft.kind() == kind && !draft.has_message(cx) && !draft.in_scratch(cx) {
+            let scratch = draft.no_project_root(cx) == Some(Root::Scratch);
+            if draft.kind() == kind && !draft.has_message(cx) && !scratch {
                 let view = view.clone();
                 self.show(Pane::Draft(view), window, cx);
                 return;
@@ -1527,6 +1529,7 @@ impl RhoApp {
                 })?;
                 match setup {
                     Ok((setup, dir)) => {
+                        this.opened_in(&opening, &machine, &dir, cx);
                         let session = Session::from_setup(setup);
                         let id = SessionKey::new(machine.clone(), session.id().clone());
                         let daemon = daemon.clone();
@@ -1652,7 +1655,8 @@ impl RhoApp {
                     .upgrade()
                     .filter(|draft| this.is_current(&machine, epoch) && draft.read(cx).launching());
                 match (opened, draft) {
-                    (Ok((mut session, _, Ok(attached))), Some(draft)) => {
+                    (Ok((mut session, dir, Ok(attached))), Some(draft)) => {
+                        this.opened_in(&opening, &machine, &dir, cx);
                         let cwd = Place::new(machine.clone(), attached.workspace());
                         session.attached(attached);
                         this.start_session(&draft, session, &cwd, prompt, window, cx);
