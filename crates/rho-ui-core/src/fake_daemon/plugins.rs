@@ -2,7 +2,8 @@
 //! memory and changes as each request asks, shaped as rho's are.
 //!
 //! The user has six plugins, in the order rho lists them, by name:
-//! `broken`, whose `plugin.json` doesn't parse, so it is rejected;
+//! `broken`, whose `plugin.json` doesn't parse, so it is rejected, and
+//! can be removed but not enabled or disabled;
 //! `deploy`, installed from git on [`UNREACHABLE_HOST`], whose updates fail
 //! to fetch; `fmt`; `notes`, copied in by an install and disabled; `review`,
 //! installed from git, which brings the MCP server `review/lint`, which
@@ -522,7 +523,11 @@ impl State {
     ) -> Result<PluginsSetEnabledResponse, RpcError> {
         self.plugins.served(PLUGINS_SET_ENABLED)?;
         let workspace = params.workspace.as_deref();
-        self.plugins.package_mut(&params.plugin, workspace)?.enabled = params.enabled;
+        let package = self.plugins.package_mut(&params.plugin, workspace)?;
+        if let Some(error) = &package.error {
+            return Err(RpcError::new(ErrorCode::PluginInvalid, error.clone()));
+        }
+        package.enabled = params.enabled;
         Ok(PluginsSetEnabledResponse::new(
             self.plugins.listed(&params.plugin, workspace),
         ))

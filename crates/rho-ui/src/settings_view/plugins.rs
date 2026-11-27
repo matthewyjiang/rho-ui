@@ -461,8 +461,9 @@ fn status_of(status: PluginStatus) -> (Mark, &'static str) {
 struct Unreachable(usize);
 
 /// A row's controls: its status, its switch, and its menu, which offers
-/// Update for a git install, and Remove…. While a change is on its way
-/// they wait, and the status says so.
+/// Update for a git install, and Remove…; a rejected plugin has only
+/// Remove…. While a change is on its way they wait, and the status says
+/// so.
 fn row_field(
     plugin: &Plugin,
     row: Row,
@@ -494,7 +495,10 @@ fn row_field(
         _ => (false, plugin.enabled, status_of(plugin.status)),
     };
     let still = busy || unreachable.is_some();
-    let git = matches!(plugin.source, PluginSource::Git { .. });
+    // rho can't enable, disable or fetch a plugin whose plugin.json doesn't
+    // load, only remove it.
+    let rejected = plugin.status == PluginStatus::Rejected;
+    let git = !rejected && matches!(plugin.source, PluginSource::Git { .. });
     let removal = Removal::of(plugin, shown);
     SettingField::render(move |options, _, cx| {
         let label = format!("{name}: {status}");
@@ -509,7 +513,7 @@ fn row_field(
         } else {
             status_mark(status_id.clone(), label, mark, status, cx).into_any_element()
         };
-        let toggle = {
+        let toggle = (!rejected).then(|| {
             let (configured, row) = (configured.clone(), row.clone());
             Switch::new(switch_id.clone())
                 .accessibility_label(format!("Enable {name}"))
@@ -520,7 +524,7 @@ fn row_field(
                     let change = if *on { Change::Enable } else { Change::Disable };
                     row.send(&configured, change, cx);
                 })
-        };
+        });
         let menu = {
             let (configured, row, removal) = (configured.clone(), row.clone(), removal.clone());
             Button::new(menu_id.clone())
@@ -551,7 +555,7 @@ fn row_field(
             .w(rems(CONTROL_REMS))
             .justify_between()
             .child(status)
-            .child(h_flex().gap_1().child(toggle).child(menu))
+            .child(h_flex().gap_1().children(toggle).child(menu))
     })
 }
 
