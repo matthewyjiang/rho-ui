@@ -36,6 +36,5 @@ Then open the printed URL on your machine.
 ## What differs from the desktop
 
 - `rho-ui serve` runs on Linux and macOS, not Windows.
-- There is no desktop folder chooser. Adding a project browses from `~/` in the search, as on a remote machine.
 - The composer has no attach button.
 - On a Linux server without a desktop, `rho-ui` still needs the desktop's `libxcb`, `libxkbcommon` and `libxkbcommon-x11` libraries installed to start: `sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0` on Debian or Ubuntu, `sudo dnf install libxcb libxkbcommon libxkbcommon-x11` on Fedora.
