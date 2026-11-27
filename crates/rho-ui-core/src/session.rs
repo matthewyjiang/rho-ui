@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rho_protocol::display::{
-    NotificationId, NotificationInfo, NotificationItem, NotificationUrgency,
+    NotificationId, NotificationInfo, NotificationItem, NotificationTone, NotificationUrgency,
 };
 use rho_protocol::{
     AnswerStop, CardTone, CompactionStatus, CompactionTrigger, JobState, Replay, Resolution, Seq,
@@ -417,8 +417,8 @@ fn now() -> DateTime<Utc> {
         .unwrap_or_default()
 }
 
-/// How a [`Notice`] reads, as rho's card tone says: the color it shows in.
-/// What it asks of the reader is its [`Urgency`].
+/// How a [`Notice`], or one event it tells of, reads, as rho's tone says:
+/// the color it shows in. What it asks of the reader is its [`Urgency`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeTone {
     /// Routine news.
@@ -442,6 +442,19 @@ impl NoticeTone {
             CardTone::Accent => Self::Accent,
             // Neutral, and a tone a newer daemon adds.
             _ => Self::Neutral,
+        }
+    }
+
+    /// What rho says a notification item reads as; none for a value this
+    /// client doesn't know, or an item that doesn't say.
+    fn from_item(tone: NotificationTone) -> Option<Self> {
+        match tone {
+            NotificationTone::Neutral => Some(Self::Neutral),
+            NotificationTone::Success => Some(Self::Success),
+            NotificationTone::Warning => Some(Self::Warning),
+            NotificationTone::Error => Some(Self::Error),
+            NotificationTone::Accent => Some(Self::Accent),
+            _ => None,
         }
     }
 }
@@ -585,6 +598,14 @@ impl Notice {
     /// protocol says.
     pub fn item_urgency(&self, item: &NotificationItem) -> Urgency {
         Urgency::from_wire(item.urgency).unwrap_or(self.urgency)
+    }
+
+    /// How `item`, one of [`Self::items`], reads: what rho says of it, so
+    /// a card toned for its failure doesn't color the news beside it. An
+    /// item from a rho that doesn't say, or that says a tone this client
+    /// doesn't know, reads as its card, as the protocol says.
+    pub fn item_tone(&self, item: &NotificationItem) -> NoticeTone {
+        NoticeTone::from_item(item.tone).unwrap_or(self.tone)
     }
 
     /// When it happened, as the daemon says. From a daemon that says no

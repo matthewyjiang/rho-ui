@@ -8,8 +8,9 @@
 //!
 //! A row's dot says what its event asks of the reader ([`Urgency`]): a
 //! ring for news, filled when someone must act (a question, a failure), so
-//! the urgency doesn't rest on color alone. A card that bundles routine
-//! news with a failure draws each row as its own. Clicking a row opens the
+//! the urgency doesn't rest on color alone; its color is the event's tone
+//! ([`Dot::of`] says how the two combine). A card that bundles routine news
+//! with a failure draws each row as its own event. Clicking a row opens the
 //! card's body under it; its pull request's chip shows the pull request,
 //! and a session it is about opens from the row. Past the first
 //! [`FOLD_AFTER`] rows of one run, the cards that don't need the reader
@@ -224,8 +225,10 @@ pub(crate) type ToggleHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(crate) struct Line<'a> {
     /// The event in words.
     pub(crate) text: &'a str,
-    /// What the event asks of the reader.
-    urgency: Urgency,
+    /// What the event asks of the reader, and how it reads: its dot and
+    /// its text's color ([`Dot::of`]).
+    pub(crate) urgency: Urgency,
+    pub(crate) tone: NoticeTone,
     /// What happened, for a fold row's tally.
     outcome: Option<NotificationOutcome>,
     /// What clicking its subject opens.
@@ -233,8 +236,8 @@ pub(crate) struct Line<'a> {
 }
 
 impl<'a> Line<'a> {
-    /// The row of `item`, which asks `urgency`.
-    fn of(item: &'a NotificationItem, urgency: Urgency) -> Self {
+    /// The row of `item`, which asks `urgency` and reads as `tone`.
+    fn of(item: &'a NotificationItem, urgency: Urgency, tone: NoticeTone) -> Self {
         let link = match &item.subject {
             NotificationSubject::PullRequest { id, url } => Some(Link::PullRequest {
                 id: id.clone(),
@@ -255,6 +258,7 @@ impl<'a> Line<'a> {
         Self {
             text: &item.text,
             urgency,
+            tone,
             outcome: Some(item.outcome),
             link,
         }
@@ -277,12 +281,6 @@ pub(crate) struct Card<'a> {
     /// id, which stays put however often rho sends it, or its entry's
     /// index from a rho that sends none ([`card_key`]).
     pub(crate) key: SharedString,
-    /// The card's tone, which each row's dot takes. rho tones only the
-    /// card, as its most pressing event: rho-protocol has no tone per item.
-    /// So a row worth a look draws in the card's color even when another
-    /// of its events gave it that color; a routine row draws faint whatever
-    /// the tone.
-    tone: NoticeTone,
     arrived: Option<DateTime<Utc>>,
     pub(crate) lines: Vec<Line<'a>>,
 }
@@ -293,12 +291,13 @@ impl<'a> Card<'a> {
         let mut lines: Vec<Line<'a>> = notice
             .items()
             .iter()
-            .map(|item| Line::of(item, notice.item_urgency(item)))
+            .map(|item| Line::of(item, notice.item_urgency(item), notice.item_tone(item)))
             .collect();
         if lines.is_empty() {
             lines.push(Line {
                 text: notice.title(),
                 urgency: notice.urgency(),
+                tone: notice.tone(),
                 outcome: None,
                 link: None,
             });
@@ -306,7 +305,6 @@ impl<'a> Card<'a> {
         debug_assert_eq!(lines.len(), rows(notice), "the rows the run is placed by");
         Self {
             key: card_key(ix, notice),
-            tone: notice.tone(),
             arrived: notice.arrived(),
             lines,
         }
@@ -416,7 +414,7 @@ impl CardRows<'_> {
                         .child(detail)
                 }),
             );
-            rows.push(on_rail(Dot::of(line.urgency, card.tone, cx), line_ends, cx).child(content));
+            rows.push(on_rail(Dot::of(line, cx), line_ends, cx).child(content));
         }
         v_flex()
             .id(card.key.clone())
@@ -551,11 +549,9 @@ pub(crate) fn fold_row(
     let key = folded
         .first()
         .map_or_else(SharedString::default, |card| card.key.clone());
-    let dots = folded.iter().flat_map(|card| {
-        card.lines
-            .iter()
-            .map(|line| Dot::of(line.urgency, card.tone, cx))
-    });
+    let dots = folded
+        .iter()
+        .flat_map(|card| card.lines.iter().map(|line| Dot::of(line, cx)));
     let stack = h_flex().flex_none().children(
         dots.take(STACKED_DOTS)
             .map(|kind| dot(kind, STACKED_DOT, STACKED_RING, cx).mr(px(-STACKED_OVERLAP))),
@@ -706,15 +702,21 @@ enum Dot {
 }
 
 impl Dot {
-    /// A row's dot, for its urgency and its card's tone: filled when it
-    /// needs the reader, red for a failure and the accent for the rest,
-    /// such as a question, whatever its tone; a ring in its tone's color
-    /// when it is worth a look; a faint ring for routine news.
-    fn of(urgency: Urgency, tone: NoticeTone, cx: &App) -> Self {
+    /// A row's dot. Its urgency says how loud it is, and its tone, which
+    /// color, only where the urgency leaves room for one:
+    ///
+    /// - needs the reader: filled, red when its tone is an error and the
+    ///   accent for any other, such as a question's warning;
+    /// - worth a look: a ring in its tone's color, faint when neutral;
+    /// - routine: a faint ring, whatever its tone.
+    ///
+    /// Its text takes the body's color when it needs the reader, and is
+    /// muted otherwise ([`line_row`]).
+    fn of(line: &Line<'_>, cx: &App) -> Self {
         let theme = cx.theme();
         // Kit's `info` is cyan; the design's accent is blue.
         let accent = theme.blue;
-        match (urgency, tone) {
+        match (line.urgency, line.tone) {
             (Urgency::NeedsYou, NoticeTone::Error) => Self::Filled(theme.danger),
             (Urgency::NeedsYou, _) => Self::Filled(accent),
             (Urgency::Notable, NoticeTone::Success) => Self::Ring(theme.success),
@@ -887,7 +889,7 @@ mod tests {
                 "outcome": "completed", "subject": subject, "text": "done"
             }))
             .expect("an item");
-            let line = Line::of(&item, Urgency::Routine);
+            let line = Line::of(&item, Urgency::Routine, NoticeTone::Neutral);
             assert_eq!(
                 (line.chip().as_deref(), line.link),
                 (chip, link),

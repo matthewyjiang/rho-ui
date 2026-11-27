@@ -69,37 +69,42 @@ pub struct FakeCard {
     /// The title rho's terminal shows, which a rho that sends no items
     /// shows alone.
     pub title: &'static str,
-    /// The tone rho gives the card, which, as rho's own does in places,
-    /// may say otherwise than its urgency.
-    pub tone: CardTone,
     /// What the card is about.
     pub subject: FakeSubject,
     /// One per event the card tells of, each about [`Self::subject`]: what
-    /// happened, what it asks of the reader, and the line that says it.
-    /// The card asks what its most urgent item does, as rho's do.
-    pub items: &'static [(NotificationOutcome, NotificationUrgency, &'static str)],
+    /// happened, what it asks of the reader, how it reads, and the line
+    /// that says it. As rho's do, the card asks what its most urgent item
+    /// does, and reads as its most pressing tone, which, as rho's own does
+    /// in places, may say otherwise than its urgency.
+    pub items: &'static [(
+        NotificationOutcome,
+        NotificationUrgency,
+        NotificationTone,
+        &'static str,
+    )],
     /// Its body in Markdown, which opens under its row.
     pub body: &'static str,
 }
 
 /// The cards, as a lead gets them from its workers, processes, peers and
 /// pull requests. Four show: the first three, which fill the four rows the
-/// rail always shows, as the second tells of two events, routine new
-/// commits and the failing checks that make the card need the user, and a
-/// peer's question, which needs the user, though rho tones it a warning.
-/// The rest fold: a merge, new comments rho tones as an accent, and
-/// routine news.
-/// A rail that went by the tones instead would show the comments and the
-/// subagent that stopped, and fold the question.
+/// rail always shows and one more, as the second and third each tell of
+/// two events, and a peer's question, which needs the user, though rho
+/// tones it a warning. The second bundles routine new commits with the
+/// failing checks that make the card need the user, and the third checks
+/// that passed with a watch that stopped, each event in its own tone. The
+/// rest fold: a merge, new comments rho tones as an accent, and routine
+/// news. A rail that went by the tones instead would show the comments and
+/// the subagent that stopped, and fold the question.
 pub const CARDS: [FakeCard; 8] = [
     FakeCard {
         id: "n-test",
         title: "Failed (exit 101) · cargo test -j 6 -p rho-ui",
-        tone: CardTone::Error,
         subject: FakeSubject::Process("p-3"),
         items: &[(
             NotificationOutcome::Failed,
             NotificationUrgency::NeedsYou,
+            NotificationTone::Error,
             "Failed (exit 101) · cargo test -j 6 -p rho-ui",
         )],
         body: "test ui_tests::transcript_keeps_scroll_on_resize ... FAILED",
@@ -107,7 +112,6 @@ pub const CARDS: [FakeCard; 8] = [
     FakeCard {
         id: "n-pr-99",
         title: "New commits, checks failed · matthewyjiang/rho-ui#99",
-        tone: CardTone::Error,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho-ui",
             number: 99,
@@ -116,11 +120,13 @@ pub const CARDS: [FakeCard; 8] = [
             (
                 NotificationOutcome::NewCommits,
                 NotificationUrgency::Routine,
+                NotificationTone::Neutral,
                 "New commits: the head is now 4f2a91c",
             ),
             (
                 NotificationOutcome::ChecksFailed,
                 NotificationUrgency::NeedsYou,
+                NotificationTone::Error,
                 "2 of 9 checks failed on 4f2a91c",
             ),
         ],
@@ -128,21 +134,32 @@ pub const CARDS: [FakeCard; 8] = [
                - 2 of 9 checks failed on `4f2a91c`: `clippy`, `test (ubuntu)`.",
     },
     FakeCard {
-        id: "n-brief",
-        title: "Completed · brief rereads",
-        tone: CardTone::Success,
-        subject: FakeSubject::Subagent("run-7"),
-        items: &[(
-            NotificationOutcome::Completed,
-            NotificationUrgency::Notable,
-            "Completed · brief rereads",
-        )],
-        body: "Fixed and pushed to `feat/lead-brief-after-compaction`.",
+        id: "n-pr-103",
+        title: "Checks passed, stopped watching (comment loop) · matthewyjiang/rho-ui#103",
+        subject: FakeSubject::PullRequest {
+            repo: "matthewyjiang/rho-ui",
+            number: 103,
+        },
+        items: &[
+            (
+                NotificationOutcome::ChecksPassed,
+                NotificationUrgency::Notable,
+                NotificationTone::Success,
+                "All 9 checks passed on 7b3e0d1",
+            ),
+            (
+                NotificationOutcome::WatchStopped,
+                NotificationUrgency::Routine,
+                NotificationTone::Warning,
+                "Stopped watching after 10 comment-only updates in a row",
+            ),
+        ],
+        body: "- All 9 checks passed on `7b3e0d1`.\n\
+               - Stopped watching after 10 comment-only updates in a row.",
     },
     FakeCard {
         id: "n-pr-102",
         title: "Merged · matthewyjiang/rho-ui#102",
-        tone: CardTone::Success,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho-ui",
             number: 102,
@@ -150,6 +167,7 @@ pub const CARDS: [FakeCard; 8] = [
         items: &[(
             NotificationOutcome::Merged,
             NotificationUrgency::Notable,
+            NotificationTone::Success,
             "Merged into main by matthewyjiang",
         )],
         body: "",
@@ -157,11 +175,11 @@ pub const CARDS: [FakeCard; 8] = [
     FakeCard {
         id: "n-question",
         title: "Waiting for an answer · first",
-        tone: CardTone::Warning,
         subject: FakeSubject::Session("s1"),
         items: &[(
             NotificationOutcome::Question,
             NotificationUrgency::NeedsYou,
+            NotificationTone::Warning,
             "Waiting for an answer · first",
         )],
         body: "Which branch should the fix go on?",
@@ -169,7 +187,6 @@ pub const CARDS: [FakeCard; 8] = [
     FakeCard {
         id: "n-pr-101",
         title: "New comments · matthewyjiang/rho-ui#101",
-        tone: CardTone::Accent,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho-ui",
             number: 101,
@@ -177,6 +194,7 @@ pub const CARDS: [FakeCard; 8] = [
         items: &[(
             NotificationOutcome::NewComments,
             NotificationUrgency::Notable,
+            NotificationTone::Accent,
             "1 new comment",
         )],
         body: "- 1 new comment:\n  - coderabbitai: \"Split the status view out of #10?\"",
@@ -184,7 +202,6 @@ pub const CARDS: [FakeCard; 8] = [
     FakeCard {
         id: "n-pr-2040",
         title: "New commits · matthewyjiang/rho#2040",
-        tone: CardTone::Neutral,
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho",
             number: 2040,
@@ -192,6 +209,7 @@ pub const CARDS: [FakeCard; 8] = [
         items: &[(
             NotificationOutcome::NewCommits,
             NotificationUrgency::Routine,
+            NotificationTone::Neutral,
             "New commits: the head is now 9c0e1d2",
         )],
         body: "",
@@ -199,11 +217,11 @@ pub const CARDS: [FakeCard; 8] = [
     FakeCard {
         id: "n-sweep",
         title: "Stopped · lint sweep",
-        tone: CardTone::Accent,
         subject: FakeSubject::Subagent("run-9"),
         items: &[(
             NotificationOutcome::Stopped,
             NotificationUrgency::Routine,
+            NotificationTone::Accent,
             "Stopped · lint sweep",
         )],
         body: "",
@@ -213,18 +231,19 @@ pub const CARDS: [FakeCard; 8] = [
 impl FakeCard {
     /// The card's event, as every rho sends it.
     pub(super) fn event(&self) -> SessionEvent {
-        let display_tone = match self.tone {
-            CardTone::Accent => NotificationTone::Accent,
-            CardTone::Success => NotificationTone::Success,
-            CardTone::Warning => NotificationTone::Warning,
-            CardTone::Error => NotificationTone::Error,
-            _ => NotificationTone::Neutral,
+        let display_tone = self.tone();
+        let tone = match display_tone {
+            NotificationTone::Accent => CardTone::Accent,
+            NotificationTone::Success => CardTone::Success,
+            NotificationTone::Warning => CardTone::Warning,
+            NotificationTone::Error => CardTone::Error,
+            _ => CardTone::Neutral,
         };
         SessionEvent::Card {
             title: self.title.to_owned(),
             markdown: self.body.to_owned(),
             plain: self.body.to_owned(),
-            tone: self.tone,
+            tone,
             display: Some(Box::new(NotificationCard {
                 title: self.title.to_owned(),
                 sender: "github".to_owned(),
@@ -249,8 +268,8 @@ impl FakeCard {
         let items = self
             .items
             .iter()
-            .map(|&(outcome, urgency, text)| {
-                NotificationItem::new(outcome, urgency, subject.clone(), text)
+            .map(|&(outcome, urgency, tone, text)| {
+                NotificationItem::new(outcome, urgency, tone, subject.clone(), text)
             })
             .collect();
         Box::new(NotificationInfo::new(
@@ -271,9 +290,26 @@ impl FakeCard {
         };
         self.items
             .iter()
-            .map(|&(_, urgency, _)| urgency)
+            .map(|&(_, urgency, _, _)| urgency)
             .max_by_key(|&urgency| rank(urgency))
             .unwrap_or(NotificationUrgency::Routine)
+    }
+
+    /// How the card reads: as its most pressing item, as rho's pull
+    /// request news says.
+    fn tone(&self) -> NotificationTone {
+        let pressing = |tone: NotificationTone| match tone {
+            NotificationTone::Error => 4,
+            NotificationTone::Warning => 3,
+            NotificationTone::Accent => 2,
+            NotificationTone::Success => 1,
+            _ => 0,
+        };
+        self.items
+            .iter()
+            .map(|&(_, _, tone, _)| tone)
+            .max_by_key(|&tone| pressing(tone))
+            .unwrap_or(NotificationTone::Neutral)
     }
 }
 
