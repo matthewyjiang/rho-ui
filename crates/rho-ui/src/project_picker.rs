@@ -13,11 +13,11 @@
 //!
 //! A git URL typed in the search offers to clone that repository, unless
 //! the machine holds it already. Typing an absolute or `~/` path browses
-//! that machine's folders: the
-//! subfolders the path can go on to are listed, and a folder that is there
-//! offers to add its project. Add project… asks the desktop for a folder on
-//! this machine, and starts the search at `~/` on a remote one, whose
-//! folders are read over ssh (see [`folders`]). Remove takes a project off
+//! that machine's folders: the subfolders the path can go on to are
+//! listed, and a folder that is there offers to add its project. Add
+//! project… opens rho-ui's folder chooser on the chosen machine, this one
+//! or a remote one, whose folders are read over ssh (see
+//! [`folder_chooser`] and [`folders`]). Remove takes a project off
 //! the list. In the footer, a git project offers a new worktree for the
 //! session instead of its checkout; see [`Checkout`]. The choice holds for
 //! new sessions after it, across runs too ([`LastCheckout`]).
@@ -51,7 +51,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     accesskit::Toggled, div, px, rems, Anchor, App, AppContext as _, BorrowAppContext as _,
     Context, Div, Entity, EventEmitter, Focusable as _, Global, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
+    IntoElement, MouseButton, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
 };
 
@@ -60,6 +60,7 @@ use rho_ui_core::Checkout;
 use crate::{
     badge::Badge,
     cloning::{self, Source},
+    folder_chooser::{self, Chosen},
     folders::{self, PathStyle, Reader, Typed},
     machines::{MachineId, MachineStatus, Machines, Place},
     projects::Projects,
@@ -163,6 +164,8 @@ impl LastCheckout {
 pub(crate) struct ProjectPicker {
     list: Entity<ListState<ProjectList>>,
     projects: Entity<Projects>,
+    /// What the folder chooser that Add project… opened chooses.
+    chooser: Option<Subscription>,
     _subscriptions: [Subscription; 5],
 }
 
@@ -227,6 +230,7 @@ impl ProjectPicker {
         Self {
             list,
             projects: projects.clone(),
+            chooser: None,
             _subscriptions: subscriptions,
         }
     }
@@ -575,49 +579,63 @@ impl ProjectPicker {
             }))
     }
 
-    /// Adds a project on the chosen machine: from the desktop's folder
-    /// chooser on this one, else, or in a browser, by browsing from `~/`
-    /// in the search.
+    /// Opens the folder chooser on the chosen machine, whose folder's
+    /// project the picker adds and picks.
     fn add_project(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if workspaces::reads_here(self.list.read(cx).delegate().current.machine()) {
-            Self::browse(window, cx);
-        } else {
-            self.search("~/", window, cx);
-        }
+        let list = self.list.read(cx).delegate();
+        let machine = list.current.machine().clone();
+        let workspaces = list.workspaces.read(cx);
+        let mut order: Vec<usize> = list
+            .known
+            .iter()
+            .copied()
+            .filter(|&ix| *workspaces.get(ix).machine() == machine)
+            .collect();
+        workspaces.sort_by_use(&mut order);
+        let projects = order
+            .into_iter()
+            .map(|ix| workspaces.get(ix).place().path.clone())
+            .collect();
+        let (workspaces, machines) = (list.workspaces.clone(), list.machines.clone());
+        let Some(chooser) =
+            folder_chooser::open(machine, projects, &workspaces, &machines, window, cx)
+        else {
+            return;
+        };
+        self.chooser = Some(cx.subscribe_in(
+            &chooser,
+            window,
+            |this, _, Chosen(folder): &Chosen, window, cx| {
+                this.add_folder(folder.clone(), window, cx);
+            },
+        ));
     }
 
-    /// Asks the desktop's folder chooser for a folder, and adds its project.
-    fn browse(window: &mut Window, cx: &mut Context<'_, Self>) {
-        let chosen = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add".into()),
-        });
+    /// Adds the project of `folder`, as [`repo::inspect`] finds it, and
+    /// picks it.
+    fn add_folder(&mut self, folder: Place, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let list = self.list.read(cx).delegate();
+        let reader = list.workspaces.read(cx).reader(&folder.machine);
+        let label = list.machines.read(cx).label(&folder.machine);
+        let executor = cx.background_executor().clone();
         cx.spawn_in(window, async move |this, cx| {
-            let folder = match chosen.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next(),
-                // Cancelled, or the chooser went away.
-                Ok(Ok(None)) | Err(_) => None,
-                Ok(Err(error)) => {
-                    let _ = this.update_in(cx, |_, window, cx| {
-                        window.push_notification(
-                            Notification::error(error.to_string())
-                                .title("Couldn't open a folder chooser"),
-                            cx,
-                        );
-                    });
-                    None
+            let found = folders::resolve(reader, folder.path.clone(), executor).await;
+            let _ = this.update_in(cx, |this, window, cx| match found {
+                Ok(Some(found)) => {
+                    let root = Place::new(folder.machine, found.root);
+                    add(&this.projects, root.clone(), cx);
+                    cx.emit(PickerEvent::Picked(Pick::Folder(root)));
                 }
-            };
-            let Some(folder) = folder else { return };
-            let root = cx
-                .background_executor()
-                .spawn(async move { Place::new(MachineId::local(), repo::inspect(&folder).root) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                add(&this.projects, root.clone(), cx);
-                cx.emit(PickerEvent::Picked(Pick::Folder(root)));
+                Ok(None) => window.push_notification(
+                    Notification::error(format!("Couldn't open {}", folder.path.display()))
+                        .title("Couldn't add the project"),
+                    cx,
+                ),
+                Err(why) => window.push_notification(
+                    Notification::error(format!("Couldn't read {label}'s folders: {why}"))
+                        .title("Couldn't add the project"),
+                    cx,
+                ),
             });
         })
         .detach();

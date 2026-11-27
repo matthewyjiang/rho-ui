@@ -69,6 +69,7 @@ use crate::{
 mod cards;
 mod configured;
 mod filter;
+mod folder_chooser;
 mod live;
 mod mcp;
 mod plugins;
@@ -284,6 +285,7 @@ impl Harness {
             projects,
             mut settings,
             remote_sockets,
+            remote_ssh,
             workspace,
             rho,
             rho_home,
@@ -322,6 +324,13 @@ impl Harness {
                 rho: rho.clone(),
             },
             remote: Rc::new(move |remote: &RemoteMachine| {
+                if let Some((_, target)) = remote_ssh.iter().find(|(host, _)| *host == remote.host)
+                {
+                    return Reach {
+                        daemon: DaemonTarget::Ssh(target.clone()),
+                        rho: rho.clone(),
+                    };
+                }
                 let socket = remote_sockets
                     .iter()
                     .find(|(host, _)| *host == remote.host)
@@ -797,6 +806,9 @@ struct Machines {
     settings: Settings,
     /// The socket each remote machine reaches, by host.
     remote_sockets: Vec<(String, PathBuf)>,
+    /// The fake sshd each remote machine reaches over ssh instead, by
+    /// host, for what reads its files.
+    remote_ssh: Vec<(String, rho_ui_core::SshTarget)>,
     /// Where new sessions start on this machine; the temporary directory
     /// when `None`.
     workspace: Option<PathBuf>,
