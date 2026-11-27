@@ -33,3 +33,12 @@ A dead link, as when a laptop sleeps, shows within about 45 seconds. Open sessio
 
 - **When the daemon restarts in place**, as it does to upgrade, open sessions reconnect by themselves. What you typed stays, and a message sent as it went is sent again once it's back. It runs once.
 - **When the daemon stops or the link dies**, open sessions keep what they showed and wait for **Retry** in the sidebar. rho-ui never restarts a daemon by itself here, because it can't tell a restart from `rho daemon stop`.
+
+## Syncing settings
+
+**Settings → Machines → Sync** copies rho's settings and your plugins from one machine to another, once. It doesn't keep them in step afterwards.
+
+- **What can't be copied.** A plugin syncs only when it came from git, since the target fetches it again with its own `git` and credentials, on the same branch and folder. A plugin copied from a folder or linked to one names a folder on the source machine, so it can't be copied: install it on the target from git, or link a folder there. A setting the target's rho doesn't have, or a value it doesn't take, such as a choice an older rho lacks, can't be copied either. Project plugins aren't synced.
+- **Rows that start unchecked.** Something only the target has would be removed from it, so it syncs only if you check it. So does a setting that belongs to one machine, once rho marks such settings.
+- **A setting at its default** on the source resets it on the target, so the target follows its own default, unless that default differs.
+- **Revert** puts back what the target had before the last sync to it, for 7 days after it. It first reads the target again. Anything that changed there since the sync is left as it is now, unless you check it. A plugin replaced since by a copy of a folder can't be reverted, since Revert couldn't bring it back.
