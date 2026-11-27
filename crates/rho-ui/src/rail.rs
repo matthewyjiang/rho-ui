@@ -225,9 +225,11 @@ pub(crate) type ToggleHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(crate) struct Line<'a> {
     /// The event in words.
     pub(crate) text: &'a str,
-    /// What the event asks of the reader, and how it reads: its dot and
-    /// its text's color ([`Dot::of`]).
+    /// What the event asks of the reader: how loud its dot is, and its
+    /// text's color.
     pub(crate) urgency: Urgency,
+    /// How the event reads: its dot's color, where its urgency leaves room
+    /// for one ([`Dot::of`]).
     pub(crate) tone: NoticeTone,
     /// What happened, for a fold row's tally.
     outcome: Option<NotificationOutcome>,

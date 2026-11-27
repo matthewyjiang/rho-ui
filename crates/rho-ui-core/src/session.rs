@@ -445,9 +445,10 @@ impl NoticeTone {
         }
     }
 
-    /// What rho says a notification item reads as; none for a value this
-    /// client doesn't know, or an item that doesn't say.
-    fn from_item(tone: NotificationTone) -> Option<Self> {
+    /// What rho's typed notification tone says, as an item's is; unlike a
+    /// card's tone, none for a value this client doesn't know, or an item
+    /// that doesn't say, so it reads as its card.
+    fn from_notification(tone: NotificationTone) -> Option<Self> {
         match tone {
             NotificationTone::Neutral => Some(Self::Neutral),
             NotificationTone::Success => Some(Self::Success),
@@ -605,7 +606,7 @@ impl Notice {
     /// item from a rho that doesn't say, or that says a tone this client
     /// doesn't know, reads as its card, as the protocol says.
     pub fn item_tone(&self, item: &NotificationItem) -> NoticeTone {
-        NoticeTone::from_item(item.tone).unwrap_or(self.tone)
+        NoticeTone::from_notification(item.tone).unwrap_or(self.tone)
     }
 
     /// When it happened, as the daemon says. From a daemon that says no

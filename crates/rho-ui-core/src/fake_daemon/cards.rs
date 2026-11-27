@@ -91,8 +91,9 @@ pub struct FakeCard {
 /// rail always shows and one more, as the second and third each tell of
 /// two events, and a peer's question, which needs the user, though rho
 /// tones it a warning. The second bundles routine new commits with the
-/// failing checks that make the card need the user, and the third checks
-/// that passed with a watch that stopped, each event in its own tone. The
+/// failing checks that make the card need the user, and the third, toned a
+/// warning, new comments with the watch they stopped, each event in its
+/// own tone. The
 /// rest fold: a merge, new comments rho tones as an accent, and routine
 /// news. A rail that went by the tones instead would show the comments and
 /// the subagent that stopped, and fold the question.
@@ -135,17 +136,17 @@ pub const CARDS: [FakeCard; 8] = [
     },
     FakeCard {
         id: "n-pr-103",
-        title: "Checks passed, stopped watching (comment loop) · matthewyjiang/rho-ui#103",
+        title: "New comments, stopped watching (comment loop) · matthewyjiang/rho-ui#103",
         subject: FakeSubject::PullRequest {
             repo: "matthewyjiang/rho-ui",
             number: 103,
         },
         items: &[
             (
-                NotificationOutcome::ChecksPassed,
+                NotificationOutcome::NewComments,
                 NotificationUrgency::Notable,
-                NotificationTone::Success,
-                "All 9 checks passed on 7b3e0d1",
+                NotificationTone::Accent,
+                "2 new comments",
             ),
             (
                 NotificationOutcome::WatchStopped,
@@ -154,7 +155,7 @@ pub const CARDS: [FakeCard; 8] = [
                 "Stopped watching after 10 comment-only updates in a row",
             ),
         ],
-        body: "- All 9 checks passed on `7b3e0d1`.\n\
+        body: "- 2 new comments:\n  - coderabbitai: \"Nit: rename `look`.\"\n\
                - Stopped watching after 10 comment-only updates in a row.",
     },
     FakeCard {

@@ -95,15 +95,17 @@ fn replayed_cards_keep_their_times_and_fold_by_urgency() {
         CARDS.iter().partition(|card| !folded.contains(&card.id));
     let shown_rows: usize = shown.iter().map(|card| card.items.len().max(1)).sum();
     assert_eq!(shown_rows, rail::FOLD_AFTER + 2);
-    // A card toned a warning for the watch that stopped draws its passing
-    // checks in their own tone, and the watch as the routine news it is.
+    // A card toned a warning for the watch that stopped draws its new
+    // comments in their own tone, and the watch as the routine news it is.
+    // The card's own tone differs from the comments', so this tells a row
+    // in its item's tone from one in its card's.
     let (ix, mixed) = &cards[2];
     assert_eq!(mixed.id().map(NotificationId::as_str), Some("n-pr-103"));
     assert_eq!(mixed.tone(), NoticeTone::Warning);
     assert_eq!(
         looks(*ix, mixed),
         [
-            (Urgency::Notable, NoticeTone::Success),
+            (Urgency::Notable, NoticeTone::Accent),
             (Urgency::Routine, NoticeTone::Warning)
         ]
     );
