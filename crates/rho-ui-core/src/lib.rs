@@ -10,6 +10,8 @@ mod exec;
 pub mod fake_daemon;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub mod fake_sshd;
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+mod hold;
 mod input;
 mod jobs;
 mod link;

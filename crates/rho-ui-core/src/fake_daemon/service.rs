@@ -41,8 +41,10 @@ use rho_protocol::{
 };
 
 use super::{
-    hold::Answers, report, shell_card, shell_output, started::StartedChange, surface, Card,
-    FakeSession, SessionLists, Settings, State, Turn, KEY_AUTH, TOOL_IMAGE,
+    hold::{self, Answers},
+    report, shell_card, shell_output,
+    started::StartedChange,
+    surface, Card, FakeSession, SessionLists, Settings, State, Turn, KEY_AUTH, TOOL_IMAGE,
 };
 
 #[derive(Debug)]
@@ -1212,9 +1214,9 @@ impl Service for Fake {
         let (answer, wait) = {
             let mut state = self.lock();
             let answer = state.report(&params);
-            (answer, state.answer_holds.arrive(Answers::Reports))
+            (answer, state.answer_holds.of(Answers::Reports).arrive())
         };
-        wait.until_released().await?;
+        hold::released(wait).await?;
         answer
     }
 
@@ -1226,8 +1228,8 @@ impl Service for Fake {
         &self,
         params: SessionMcpCatalogParams,
     ) -> Result<SessionMcpCatalog, RpcError> {
-        let wait = self.lock().answer_holds.arrive(Answers::McpCatalog);
-        wait.until_released().await?;
+        let wait = self.lock().answer_holds.of(Answers::McpCatalog).arrive();
+        hold::released(wait).await?;
         self.lock().mcp_catalog(&params)
     }
 
@@ -1235,8 +1237,8 @@ impl Service for Fake {
         &self,
         params: SessionMcpResourceParams,
     ) -> Result<SessionMcpResourceResponse, RpcError> {
-        let wait = self.lock().answer_holds.arrive(Answers::McpReads);
-        wait.until_released().await?;
+        let wait = self.lock().answer_holds.of(Answers::McpReads).arrive();
+        hold::released(wait).await?;
         self.lock().mcp_resource(&params)
     }
 
