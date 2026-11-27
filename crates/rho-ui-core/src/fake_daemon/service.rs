@@ -23,19 +23,22 @@ use rho_protocol::{
     DetachReason, DetailedSessionSummary, ErrorCode, HooksListParams, HooksListResponse,
     InputAnswer, InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream,
     McpListParams, McpListResponse, ModelListParams, ModelWatch, Operation, PermissionMode,
-    PlanApprovalAsk, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
-    SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
-    SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
-    SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
-    SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionMarkParams,
-    SessionMarkResponse, SessionMcpCatalog, SessionMcpCatalogParams, SessionMcpCompleteParams,
-    SessionMcpCompleteResponse, SessionMcpInventory, SessionMcpParams, SessionMcpResourceParams,
-    SessionMcpResourceResponse, SessionNewParams, SessionNewResponse, SessionProcessesParams,
-    SessionProcessesResponse, SessionPromptParams, SessionPromptResponse,
-    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
-    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
-    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSearchParams,
-    SessionSearchResponse, SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
+    PlanApprovalAsk, PluginsInstallParams, PluginsInstallResponse, PluginsListParams,
+    PluginsListResponse, PluginsRemoveParams, PluginsRemoveResponse, PluginsSetEnabledParams,
+    PluginsSetEnabledResponse, PluginsUpdateParams, PluginsUpdateResponse, ProtocolVersion,
+    QuestionAsk, RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
+    SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
+    SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
+    SessionEvent, SessionForkParams, SessionForkResponse, SessionHoldParams, SessionHoldResponse,
+    SessionListDetailedResponse, SessionMarkParams, SessionMarkResponse, SessionMcpCatalog,
+    SessionMcpCatalogParams, SessionMcpCompleteParams, SessionMcpCompleteResponse,
+    SessionMcpInventory, SessionMcpParams, SessionMcpResourceParams, SessionMcpResourceResponse,
+    SessionNewParams, SessionNewResponse, SessionProcessesParams, SessionProcessesResponse,
+    SessionPromptParams, SessionPromptResponse, SessionPullRequestLinkParams,
+    SessionPullRequestLinkResponse, SessionPullRequestListParams, SessionPullRequestListResponse,
+    SessionPullRequestShowParams, SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
+    SessionPullRequestUnlinkResponse, SessionSearchParams, SessionSearchResponse,
+    SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
     SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription, ToolKind,
     ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse,
     WorktreeVerdict, PROTOCOL_VERSION,
@@ -1369,5 +1372,46 @@ impl SettingsService for Fake {
 
     async fn list_hooks(&self, params: HooksListParams) -> Result<HooksListResponse, RpcError> {
         self.lock().configured_hooks(&params)
+    }
+
+    async fn list_plugins(
+        &self,
+        params: PluginsListParams,
+    ) -> Result<PluginsListResponse, RpcError> {
+        self.lock().plugins_list(&params)
+    }
+
+    async fn install_plugin(
+        &self,
+        params: PluginsInstallParams,
+    ) -> Result<PluginsInstallResponse, RpcError> {
+        let wait = self
+            .lock()
+            .answer_holds
+            .of(Answers::PluginInstalls)
+            .arrive();
+        hold::released(wait).await?;
+        self.lock().plugins_install(&params)
+    }
+
+    async fn update_plugins(
+        &self,
+        params: PluginsUpdateParams,
+    ) -> Result<PluginsUpdateResponse, RpcError> {
+        self.lock().plugins_update(&params)
+    }
+
+    async fn set_plugin_enabled(
+        &self,
+        params: PluginsSetEnabledParams,
+    ) -> Result<PluginsSetEnabledResponse, RpcError> {
+        self.lock().plugins_set_enabled(&params)
+    }
+
+    async fn remove_plugin(
+        &self,
+        params: PluginsRemoveParams,
+    ) -> Result<PluginsRemoveResponse, RpcError> {
+        self.lock().plugins_remove(&params)
     }
 }

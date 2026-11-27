@@ -14,7 +14,7 @@ fn row(ui: &mut Harness, id: &str) -> Option<String> {
 }
 
 /// Scrolls the page to its `end`: hooks come after the MCP servers.
-fn scroll_page(ui: &mut Harness, end: End) {
+pub(super) fn scroll_page(ui: &mut Harness, end: End) {
     let dy = match end {
         End::Top => 5000.,
         End::Bottom => -5000.,
@@ -30,7 +30,7 @@ fn scroll_page(ui: &mut Harness, end: End) {
 }
 
 #[derive(Clone, Copy)]
-enum End {
+pub(super) enum End {
     Top,
     Bottom,
 }

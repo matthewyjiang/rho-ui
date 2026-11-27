@@ -70,6 +70,7 @@ mod cards;
 mod configured;
 mod live;
 mod mcp;
+mod plugins;
 mod surfaces;
 
 /// Points the Vulkan loader at lavapipe before `main`, while the process has

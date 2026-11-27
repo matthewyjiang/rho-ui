@@ -23,6 +23,9 @@ pub enum Answers {
     /// `rho/session/mcp/resource`, read once released, as a slow server's
     /// reads are.
     McpReads,
+    /// `rho/plugins/install`, installed once released, as a slow git
+    /// fetch is.
+    PluginInstalls,
     /// `rho/session/report`, read as it is asked but answered once
     /// released, as a busy daemon's answer comes late: it says what was so
     /// when it was asked.
@@ -31,7 +34,7 @@ pub enum Answers {
 
 /// One [`Hold`] for each kind of [`Answers`].
 #[derive(Debug, Default)]
-pub(super) struct Holds([Hold; 3]);
+pub(super) struct Holds([Hold; 4]);
 
 impl Holds {
     pub(super) fn of(&self, answers: Answers) -> &Hold {
@@ -39,6 +42,7 @@ impl Holds {
             Answers::McpCatalog => 0,
             Answers::McpReads => 1,
             Answers::Reports => 2,
+            Answers::PluginInstalls => 3,
         };
         &self.0[index]
     }

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use rho_protocol::{
     ConfiguredMcpServer, ErrorCode, HookContract, HookEvent, HookStatus, HookTools, HookWarning,
     HooksFile, HooksFileScope, HooksFileStatus, HooksListParams, HooksListResponse, McpListParams,
-    McpListResponse, McpServerSource, McpTransport, RpcError, HOOKS_LIST, MCP_LIST,
+    McpListResponse, McpServerSource, McpTransport, PluginStatus, RpcError, HOOKS_LIST, MCP_LIST,
 };
 
 use super::{FakeDaemon, Script, State, MCP_DOCS, MCP_GITHUB, MCP_NOTES};
@@ -28,13 +28,14 @@ use crate::platform;
 /// The workspace whose project's hooks file is invalid.
 pub const INVALID_HOOKS_WORKSPACE: &str = "/w/b";
 
-/// Whether the fake daemon serves `rho/mcp/list` and `rho/hooks/list`.
+/// Whether the fake daemon serves `rho/mcp/list`, `rho/hooks/list` and
+/// `rho/plugins/*`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConfiguredMethods {
-    /// It serves both.
+    /// It serves them.
     #[default]
     Served,
-    /// As a daemon from before them: both answer `MethodNotFound`.
+    /// As a daemon from before them: each answers `MethodNotFound`.
     Unserved,
 }
 
@@ -95,12 +96,12 @@ impl FakeConfigured {
 /// `rest` in `workspace`, as a daemon on a Unix machine names it: the
 /// fake's workspaces are such paths (`/w/a`) on any OS the tests run on,
 /// and `Path::join` would add the test machine's separator instead.
-fn in_workspace(workspace: &Path, rest: &str) -> PathBuf {
+pub(super) fn in_workspace(workspace: &Path, rest: &str) -> PathBuf {
     PathBuf::from(format!("{}/{rest}", workspace.display()))
 }
 
 /// The fake's rho home, as a real daemon of this user's would have it.
-fn rho_home() -> PathBuf {
+pub(super) fn rho_home() -> PathBuf {
     platform::home_dir()
         .unwrap_or_else(|| PathBuf::from("/home/user"))
         .join(".rho")
@@ -122,6 +123,31 @@ impl State {
             })
         };
         let server = ConfiguredMcpServer::new;
+        // A loaded plugin's servers, each run as `uvx <plugin>-<name>-mcp`.
+        let plugin_servers: Vec<ConfiguredMcpServer> = self
+            .plugins
+            .list(params.workspace.as_deref())
+            .into_iter()
+            .filter(|plugin| plugin.status == PluginStatus::Loaded)
+            .flat_map(|plugin| {
+                plugin
+                    .mcp_servers
+                    .iter()
+                    .map(move |name| {
+                        let command = format!("{}-{name}-mcp", plugin.name);
+                        server(
+                            format!("{}/{name}", plugin.name),
+                            McpServerSource::Plugin {
+                                plugin: plugin.name.clone(),
+                            },
+                            true,
+                            stdio("uvx", &[&command]),
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Ok(McpListResponse::new(
             rho_home().join("config.toml"),
             vec![
@@ -155,16 +181,10 @@ impl State {
                     None,
                     Some("mcp.servers.broken: set `command` or `url`".to_owned()),
                 ),
-                server(
-                    "review/lint".to_owned(),
-                    McpServerSource::Plugin {
-                        plugin: "review".to_owned(),
-                    },
-                    true,
-                    stdio("uvx", &["review-lint-mcp"]),
-                    None,
-                ),
-            ],
+            ]
+            .into_iter()
+            .chain(plugin_servers)
+            .collect(),
         ))
     }
 

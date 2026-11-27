@@ -69,6 +69,7 @@ mod auth;
 mod configured;
 mod marks;
 mod mcp;
+mod plugins;
 mod processes;
 mod pull_requests;
 mod reports;
@@ -77,6 +78,7 @@ mod worktrees;
 
 pub use marks::SessionMark;
 pub use mcp::{ResourceAttachment, MAX_RESOURCE_TEXT_BYTES};
+pub use plugins::{Enablement, IfExists, PluginError};
 pub use pull_requests::PullRequestError;
 pub use reports::{Report, ReportError};
 pub use search::{Excerpt, ExcerptRole, Location, SearchHit, SearchPage};
