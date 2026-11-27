@@ -145,6 +145,10 @@ pub struct TextBox {
 /// Questions answered together, or declined.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Questions {
+    /// Why the agent asks, in Markdown: the context the user needs to
+    /// answer well, from a sentence to a whole design. `None` when the agent
+    /// gave none, never blank.
+    pub reason: Option<String>,
     /// No two share an ID, and no question offers two choices of one
     /// value.
     pub questions: Vec<Question>,
@@ -410,7 +414,11 @@ impl InputRequest {
 /// ID and choices by value, so a questionnaire that repeats one can't be
 /// answered here.
 fn questions(ask: QuestionAsk, timeout: Option<InputTimeout>) -> (String, Option<String>, Form) {
-    let QuestionAsk { title, questions } = ask;
+    let QuestionAsk {
+        title,
+        reason,
+        questions,
+    } = ask;
     let questions: Vec<Question> = questions.into_iter().map(question).collect();
     let ids: Vec<&str> = questions
         .iter()
@@ -442,6 +450,8 @@ fn questions(ask: QuestionAsk, timeout: Option<InputTimeout>) -> (String, Option
         reason: timeout.reason,
     });
     let form = Form::Questions(Questions {
+        // rho sends none blank; this keeps an empty box off the card if one did.
+        reason: reason.filter(|reason| !reason.trim().is_empty()),
         questions,
         decline,
         timeout,
