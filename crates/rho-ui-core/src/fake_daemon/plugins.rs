@@ -29,12 +29,12 @@ use std::{
 };
 
 use rho_protocol::{
-    ErrorCode, Plugin, PluginConflict, PluginInstallSource, PluginScope, PluginSource,
-    PluginStatus, PluginTarget, PluginUpdate, PluginUpdateOutcome, PluginsInstallParams,
-    PluginsInstallResponse, PluginsListParams, PluginsListResponse, PluginsRemoveParams,
-    PluginsRemoveResponse, PluginsSetEnabledParams, PluginsSetEnabledResponse, PluginsUpdateParams,
-    PluginsUpdateResponse, RpcError, PLUGINS_INSTALL, PLUGINS_LIST, PLUGINS_REMOVE,
-    PLUGINS_SET_ENABLED, PLUGINS_UPDATE,
+    ClientEnvironment, ErrorCode, Plugin, PluginConflict, PluginInstallSource, PluginScope,
+    PluginSource, PluginStatus, PluginTarget, PluginUpdate, PluginUpdateOutcome,
+    PluginsInstallParams, PluginsInstallResponse, PluginsListParams, PluginsListResponse,
+    PluginsRemoveParams, PluginsRemoveResponse, PluginsSetEnabledParams, PluginsSetEnabledResponse,
+    PluginsUpdateParams, PluginsUpdateResponse, RpcError, PLUGINS_INSTALL, PLUGINS_LIST,
+    PLUGINS_REMOVE, PLUGINS_SET_ENABLED, PLUGINS_UPDATE,
 };
 
 use super::{
@@ -382,6 +382,51 @@ fn unreachable(url: &str) -> String {
     )
 }
 
+/// The source an install of `url` records, as rho reads it: a GitHub
+/// link's `/tree/<ref>/<path>` names the ref and the package's folder, each
+/// segment percent-decoded; any other URL is its default branch's root.
+fn git_source(url: &str) -> PluginSource {
+    let github = "https://github.com/";
+    let Some((repo, tree)) = url
+        .strip_prefix(github)
+        .and_then(|rest| rest.split_once("/tree/"))
+    else {
+        return git(url, None, LATEST_COMMIT);
+    };
+    let mut segments = tree.split('/').map(decode);
+    let git_ref = segments.next();
+    let path = segments.collect::<Vec<_>>().join("/");
+    PluginSource::Git {
+        url: format!("{github}{repo}"),
+        git_ref,
+        path: (!path.is_empty()).then_some(path),
+        commit: LATEST_COMMIT.to_owned(),
+    }
+}
+
+/// `segment` with each `%XX` turned back into its byte.
+fn decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                at += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// The package an install of `source` brings: its name is its folder's,
 /// or the URL's last segment.
 fn installed(source: &PluginInstallSource) -> Result<Package, RpcError> {
@@ -411,12 +456,18 @@ fn installed(source: &PluginInstallSource) -> Result<Package, RpcError> {
                     unreachable(url),
                 ));
             }
-            let name = url
+            let source = git_source(url);
+            let PluginSource::Git { url, path, .. } = &source else {
+                unreachable!("git_source makes a git source");
+            };
+            let name = path
+                .as_deref()
+                .unwrap_or(url)
                 .trim_end_matches('/')
                 .rsplit('/')
                 .next()
                 .map(|last| last.trim_end_matches(".git").to_owned());
-            (name, git(url, None, LATEST_COMMIT))
+            (name, source)
         }
         _ => (None, PluginSource::Install),
     };
@@ -560,5 +611,40 @@ impl FakeDaemon {
     /// `rho/plugins/list` lists them now.
     pub fn plugins(&self, workspace: Option<&Path>) -> Vec<Plugin> {
         self.service.lock().plugins.list(workspace)
+    }
+
+    /// Installs `source` into the user's plugins, replacing one of the same
+    /// name, as `rho plugins install` on the machine does.
+    ///
+    /// # Panics
+    ///
+    /// If the install fails: the test has a bug.
+    pub fn install_plugin(&self, source: PluginInstallSource) {
+        let params = PluginsInstallParams::new(
+            source,
+            PluginScope::User,
+            true,
+            None,
+            ClientEnvironment::default(),
+        );
+        self.service
+            .lock()
+            .plugins_install(&params)
+            .expect("the test installs a plugin the fake can");
+    }
+
+    /// Removes the user's plugin `name`, as `rho plugins remove` on the
+    /// machine does.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such plugin: the test has a bug.
+    pub fn remove_plugin(&self, name: &str) {
+        let target = PluginTarget::new(name.to_owned(), PluginScope::User);
+        let params = PluginsRemoveParams::new(target, None);
+        self.service
+            .lock()
+            .plugins_remove(&params)
+            .expect("the test removes a plugin the fake has");
     }
 }

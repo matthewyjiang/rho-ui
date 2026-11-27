@@ -29,6 +29,7 @@ mod setup;
 #[cfg(not(target_family = "wasm"))]
 mod ssh;
 pub mod surface;
+pub mod sync;
 mod timeline;
 mod tool_card;
 
