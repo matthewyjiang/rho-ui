@@ -7275,7 +7275,8 @@ dependencies = [
 [[package]]
 name = "rho-protocol"
 version = "1.6.0"
-source = "git+https://github.com/matthewyjiang/rho?rev=048d5ea5afbf92e8f4120c06db698ab5c39077a9#048d5ea5afbf92e8f4120c06db698ab5c39077a9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab838143d422dc103237ed7ee576ec18502cd21fe0ed2c6fd4b303b5f01f2a4f"
 dependencies = [
  "schemars",
  "serde",
@@ -7288,7 +7289,7 @@ dependencies = [
 
 [[package]]
 name = "rho-ui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "chrono",
@@ -7330,7 +7331,7 @@ dependencies = [
 
 [[package]]
 name = "rho-ui-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "chrono",

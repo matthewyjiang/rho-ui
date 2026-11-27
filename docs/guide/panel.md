@@ -46,6 +46,6 @@ Shows the GitHub pull request for the session's branch, with its checks, reviews
 
 Shows how full the session's context window is, where automatic compaction starts, and what fills the window: the system prompt, tool schemas, messages and tool results.
 
-- **It needs a recent rho.** The session machine's rho must report on sessions, which rho does from rho-protocol 1.6; an older one says to update rho.
+- **It needs rho 3.6 or newer** on the session's machine; an older one says to update rho.
 - **It reads between turns.** rho reports on a session only while no turn runs, so the tab reads when it opens, when a turn ends, and when you click the context ring. During a turn it keeps the numbers it read before.
 - **Left out** means the conversation holds blocks another provider's model wrote, which the session's model can't be sent: its requests leave them out.
