@@ -227,6 +227,7 @@ fn hooks(session: &FakeSession) -> SessionHooksReport {
         enabled: true,
         files: vec![PathBuf::from("/home/user/.rho/hooks.toml"), file],
         skipped_untrusted: None,
+        invalid: None,
         hooks: vec![
             HookContract {
                 id: "user:notify".to_owned(),
