@@ -1089,6 +1089,15 @@ impl SessionList {
         &self.rows
     }
 
+    /// For each of [`Self::rows`], in its order, the row its family's top
+    /// sits at: itself unless it folds under a session that started it.
+    pub(crate) fn tops(&self) -> Vec<usize> {
+        let families = Families::of(&self.rows);
+        (0..self.rows.len())
+            .map(|ix| families.starter(ix).unwrap_or(ix))
+            .collect()
+    }
+
     /// The rows of the sessions `starter` started itself, not those they
     /// started in turn, in the list's order, whatever the search and the
     /// filter show.
@@ -1167,6 +1176,37 @@ impl Filter {
         if !self.projects.remove(project) {
             self.projects.insert(project.clone());
         }
+    }
+
+    /// Shows `machine`'s sessions, if they were hidden.
+    pub(crate) fn show_machine(&mut self, machine: &MachineId) {
+        self.hidden.remove(machine);
+    }
+
+    /// Takes `project` off the chosen projects, if it was on them.
+    pub(crate) fn drop_project(&mut self, project: &Place) {
+        self.projects.remove(project);
+    }
+
+    /// Keeps to `project` alone, showing its machine if it was hidden.
+    pub(crate) fn only_project(&mut self, project: &Place) {
+        self.hidden.remove(&project.machine);
+        self.projects = BTreeSet::from([project.clone()]);
+    }
+
+    /// Shows `machine` alone of `machines`: hides the others, and drops the
+    /// chosen projects on them, which would leave it nothing to keep to.
+    pub(crate) fn only_machine<'a>(
+        &mut self,
+        machine: &MachineId,
+        machines: impl IntoIterator<Item = &'a MachineId>,
+    ) {
+        self.hidden = machines
+            .into_iter()
+            .filter(|other| *other != machine)
+            .cloned()
+            .collect();
+        self.projects.retain(|project| project.machine == *machine);
     }
 
     /// Forgets `machine`, gone from the settings, which the menu no longer

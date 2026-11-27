@@ -17,7 +17,8 @@
 //! opens on a click, or by itself when one of them comes on screen, or
 //! while the search or the filter shows some of them and not their starter.
 //! Hovering a row shows its details in a card. The filter beside the
-//! search hides machines or keeps to chosen projects, and the footer says
+//! search hides machines or keeps to chosen projects, shown as chips under
+//! the search while it does (see [`filter`]), and the footer says
 //! which machines aren't connected, with what would fix it (Retry, a
 //! restart of a daemon too old for rho-ui or of another build, Start for
 //! one the user stopped), and why any remote machine's repositories
@@ -1926,8 +1927,9 @@ impl Render for SidebarView {
                                 .cleanable(true),
                         ),
                     )
-                    .child(filter::button(self, cx)),
+                    .child(filter::button(self, window, cx)),
             )
+            .children(filter::chips(self, cx))
             .when(!self.list.query().is_empty(), |frame| {
                 frame.child(
                     div()
