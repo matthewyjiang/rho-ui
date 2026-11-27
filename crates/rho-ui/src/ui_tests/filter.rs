@@ -170,6 +170,15 @@ fn the_filter_keeps_its_popover_open_and_shows_as_chips() {
             && !is_visible(window, "filter-chip-machine-local")
             && is_visible(window, "filter-chip-machine-gone")
     });
+    // One line of chips takes one line's height.
+    ui.act(|window, _| {
+        let chips = window.find("sidebar-filter-chips").bounds();
+        let chip = window.find("filter-chip-machine-gone").bounds();
+        assert!(
+            chips.size.height < chip.size.height * 2.,
+            "one line: {chips:?} for {chip:?}"
+        );
+    });
     ui.click("sidebar-filter-chips-clear");
     assert!(saved(&ui).is_empty());
     ui.wait_until("no chips", |window, _, _| {

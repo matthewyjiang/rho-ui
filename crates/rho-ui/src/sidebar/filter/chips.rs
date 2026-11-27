@@ -75,16 +75,23 @@ pub(in crate::sidebar) fn chips(
             .on_click(on_click(&view, Filter::clear))
             .into_any_element(),
     );
+    // Kit's scroll area names the element it scrolls after its own call
+    // site and fills its parent, so a parent sized by the chips holds the
+    // ID tests find them by.
     Some(
         div()
             .id("sidebar-filter-chips")
             .test_support()
             .flex_shrink_0()
-            .max_h(rems(CHIPS_REMS))
-            .overflow_y_scrollbar()
             .mx_3()
             .mb_2()
-            .child(h_flex().flex_wrap().gap_1().children(chips)),
+            .child(
+                div()
+                    .id("sidebar-filter-chips-scroll")
+                    .max_h(rems(CHIPS_REMS))
+                    .overflow_y_scrollbar()
+                    .child(h_flex().flex_wrap().gap_1().children(chips)),
+            ),
     )
 }
 

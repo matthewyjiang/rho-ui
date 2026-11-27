@@ -1,8 +1,8 @@
 //! The popover the filter's button opens: a header with Clear, then each
 //! project to keep to, then with more than one machine each machine to
-//! show. A click on a row turns it on or off and leaves the popover open;
-//! hovering one offers Only, which keeps to it alone. Escape or a click
-//! outside closes it.
+//! show. A click on a row, or Enter or Space once Tab reaches it, turns it
+//! on or off and leaves the popover open; hovering or focusing one offers
+//! Only, which keeps to it alone. Escape or a click outside closes it.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -17,9 +17,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    accesskit::Toggled, div, rems, AnyElement, App, Entity, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    WeakEntity, Window,
+    accesskit::Toggled, div, rems, AnyElement, App, ElementId, Entity, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, WeakEntity, Window,
 };
 
 use std::rc::Rc;
@@ -225,11 +225,12 @@ impl Rows<'_> {
         cx: &mut App,
     ) -> AnyElement {
         // Tab reaches each row, and Enter or Space turns it on or off.
-        let focus_key = SharedString::from(format!("{}-focus", row.id));
-        let focus = (window
-            .use_keyed_state(focus_key, cx, |_, cx| cx.focus_handle().tab_stop(true)))
-        .read(cx)
-        .clone();
+        let focus =
+            (window.use_keyed_state((ElementId::from(row.id.clone()), "focus"), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            }))
+            .read(cx)
+            .clone();
         let hovered = self.hovered.read(cx).as_ref() == Some(&row.id);
         let theme = cx.theme();
         // Only shows for the keyboard too, while the row or Only has it.
@@ -271,7 +272,7 @@ impl Rows<'_> {
             .px_2()
             .text_sm()
             .track_focus(&focus)
-            .when(focus.is_focused(window), |this| this.bg(theme.list_hover))
+            .when(focus.is_focused(window), |this| this.bg(theme.list_active))
             // As Kit's Button does: a click leaves the keyboard where it was.
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_hover(move |over, _, cx| {

@@ -268,9 +268,10 @@ impl Connection {
     }
 }
 
-/// Everything the popover offers, each with its families of sessions (see
-/// [`crate::session_list::SessionList::family_counts`]): each project, in the order the user's
-/// projects list them, and with more than one machine, each machine.
+/// Everything the popover offers, each with its families of sessions
+/// (see [`crate::session_list::SessionList::family_counts`]): each
+/// project, in the order the user's projects list them, and with more than
+/// one machine, each machine.
 struct Offer {
     projects: Vec<(ProjectChoice, usize)>,
     machines: Vec<(MachineChoice, usize)>,
