@@ -57,6 +57,7 @@ mod right_panel;
 #[cfg(unix)]
 mod serve;
 mod session_list;
+mod session_search;
 mod session_settings;
 mod session_view;
 mod settings;
@@ -126,6 +127,8 @@ gpui_kit::actions!(
         StopTurn,
         /// Find text in the focused session's transcript.
         FindInTranscript,
+        /// Find the saved sessions whose conversation holds some text.
+        SearchSessions,
         /// Open settings.
         OpenSettings,
         /// Collapse the sidebar to its rail, or open it again.
@@ -435,6 +438,7 @@ fn init(cx: &mut App, db: &StateDb) {
         shortcut("secondary-alt-b", ToggleRightPanel, Some("RhoApp"), cx),
         shortcut("secondary-q", Quit, None, cx),
         shortcut("secondary-f", FindInTranscript, Some("RhoApp"), cx),
+        shortcut("secondary-shift-f", SearchSessions, Some("RhoApp"), cx),
     ]);
     cx.bind_keys([
         KeyBinding::new("escape", StopTurn, Some("SessionView")),
@@ -453,6 +457,8 @@ fn init(cx: &mut App, db: &StateDb) {
         KeyBinding::new("ctrl-f", NoAction, Some("Terminal")),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-n", NoAction, Some("Terminal")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-f", NoAction, Some("Terminal")),
         // The terminal's clipboard keys, as Ghostty's: Cmd+C and Cmd+V on
         // macOS; elsewhere Ctrl+Shift+C and Ctrl+Shift+V, leaving Ctrl+C,
         // which Kit's root binds to copy, to the program.

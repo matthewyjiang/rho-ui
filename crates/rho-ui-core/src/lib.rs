@@ -37,9 +37,10 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{mcp_command, ArgumentAsk, ArgumentValue, Completion, Edit, Mention};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
-    Detached, PendingUpgrade, PromptKey, PullRequestError, Report, ReportError, ReportedWorktree,
-    ResourceAttachment, RestartCost, SessionId, SessionMark, SessionSummary, SurfaceActionError,
-    Unsteered, VersionFix, VersionMismatch, LEAD_AGENT, MAX_RESOURCE_TEXT_BYTES,
+    Detached, Excerpt, ExcerptRole, Location, PendingUpgrade, PromptKey, PullRequestError, Report,
+    ReportError, ReportedWorktree, ResourceAttachment, RestartCost, SearchHit, SearchPage,
+    SessionId, SessionMark, SessionSummary, SurfaceActionError, Unsteered, VersionFix,
+    VersionMismatch, LEAD_AGENT, MAX_RESOURCE_TEXT_BYTES,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,

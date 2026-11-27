@@ -17,6 +17,8 @@
 //!   [`Script::session_lists`] [`SessionLists::Plain`], the daemon is from
 //!   before `list_detailed`, which answers `MethodNotFound`.
 //!   [`FakeDaemon::detailed_lists`] counts the `list_detailed` requests.
+//! - `rho/session/search` finds the saved sessions with a user or agent
+//!   message that holds every word of the query (see `search.rs`).
 //! - `rho/session/mark` saves a session's mark, stamped with the time,
 //!   which `rho/session/list_detailed` lists and its followers hear of.
 //!   No session starts with a mark. [`FakeDaemon::set_mark`] marks one as
@@ -250,6 +252,7 @@ mod mcp;
 mod processes;
 mod pull_requests;
 mod reports;
+mod search;
 mod service;
 mod started;
 pub mod surface;

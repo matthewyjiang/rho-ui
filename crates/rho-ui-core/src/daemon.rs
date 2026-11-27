@@ -72,12 +72,14 @@ mod mcp;
 mod processes;
 mod pull_requests;
 mod reports;
+mod search;
 mod worktrees;
 
 pub use marks::SessionMark;
 pub use mcp::{ResourceAttachment, MAX_RESOURCE_TEXT_BYTES};
 pub use pull_requests::PullRequestError;
 pub use reports::{Report, ReportError};
+pub use search::{Excerpt, ExcerptRole, Location, SearchHit, SearchPage};
 pub use worktrees::ReportedWorktree;
 
 /// How to reach the daemon.

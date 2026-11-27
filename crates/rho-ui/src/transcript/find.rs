@@ -297,6 +297,10 @@ pub(crate) struct Find {
     /// searched in while it has no view. Kept while the bar is closed,
     /// until the entry changes.
     shown: Vec<Option<String>>,
+    /// The entry [`Transcript::find_from`] keeps the current match at or
+    /// after, while entries from it on are still parsing: their matches
+    /// may come before the one it picked, so it picks again as they parse.
+    from: Option<usize>,
     reveal: Reveal,
 }
 
@@ -312,6 +316,14 @@ impl Find {
         };
         let step = entries.get(entry).and_then(Entry::as_step);
         *slot = step.and_then(work::rendered_body).map(shown::shown_text);
+    }
+
+    /// Forgets every match, to search with `matcher`, or for nothing.
+    fn reset(&mut self, matcher: Option<Matcher>) {
+        self.matcher = matcher;
+        self.hits = Hits::default();
+        self.pending.clear();
+        self.from = None;
     }
 
     /// The current match's field in entry `entry`, if it lies there.
@@ -470,12 +482,7 @@ impl Transcript {
     /// scrolls to.
     pub(crate) fn find(&mut self, query: &str, entries: &[Entry], cx: &mut App) {
         let was = self.find.hits.current();
-        self.find.matcher = Matcher::new(query);
-        self.find.hits = Hits::default();
-        self.find.pending.clear();
-        for entry in 0..entries.len() {
-            self.search(entry, entries, cx);
-        }
+        self.search_all(query, entries, cx);
         let top = self.scroller.read(cx).logical_scroll_top().item_ix;
         let items = Rc::clone(&self.items);
         let timeline = &self.timeline;
@@ -492,9 +499,40 @@ impl Transcript {
         }
     }
 
+    /// Finds `query` in `entries`, and makes current the first match in
+    /// entry `from` or after it, or the last before it, which it scrolls
+    /// to. With no match at all, it scrolls to entry `from`.
+    pub(crate) fn find_from(&mut self, query: &str, entries: &[Entry], from: usize, cx: &mut App) {
+        let was = self.find.hits.current();
+        self.search_all(query, entries, cx);
+        self.find.hits.pick(|entry, _| entry >= from);
+        self.find.from = self.find.pending.range(from..).next().map(|_| from);
+        self.paint_all(cx);
+        if self.find.hits.current().is_some() {
+            self.reveal(entries, None, cx);
+        } else if let Some(row) = self.timeline.row_of(from) {
+            let item = self.items.borrow().of(row..row + 1).start;
+            self.scroller
+                .update(cx, |scroller, cx| scroller.scroll_to_item(item, cx));
+        }
+        // As in `find`: the last query's current match let its row grow.
+        if let Some(row) = was.and_then(|at| self.timeline.row_of(at.entry)) {
+            self.remeasure(row..row + 1, cx);
+        }
+    }
+
+    /// Searches every entry for `query`, forgetting the matches before.
+    fn search_all(&mut self, query: &str, entries: &[Entry], cx: &mut App) {
+        self.find.reset(Matcher::new(query));
+        for entry in 0..entries.len() {
+            self.search(entry, entries, cx);
+        }
+    }
+
     /// Moves to the next or previous match, and scrolls to it.
     pub(crate) fn find_step(&mut self, direction: Direction, entries: &[Entry], cx: &mut App) {
         let was = self.find.hits.current();
+        self.find.from = None;
         self.find.hits.step(direction);
         self.repaint_current(was, cx);
         self.reveal(entries, was, cx);
@@ -515,9 +553,7 @@ impl Transcript {
     /// Clears the matches; what they opened stays open.
     pub(crate) fn close_find(&mut self, cx: &mut App) {
         let was = self.find.hits.current();
-        self.find.matcher = None;
-        self.find.hits = Hits::default();
-        self.find.pending.clear();
+        self.find.reset(None);
         self.find.reveal.set(None);
         self.paint_all(cx);
         if let Some(row) = was.and_then(|at| self.timeline.row_of(at.entry)) {
@@ -598,11 +634,23 @@ impl Transcript {
             .copied()
             .filter(|&entry| !self.is_stale(entry, entries, cx))
             .collect();
+        let any = !parsed.is_empty();
         for entry in parsed {
             self.find.pending.remove(&entry);
             self.find_again(entry..entry + 1, entries, cx);
             if self.find.hits.current().is_some_and(|at| at.entry == entry) {
                 self.reveal_text(cx);
+            }
+        }
+        if let Some(from) = self.find.from.filter(|_| any) {
+            let was = self.find.hits.current();
+            self.find.hits.pick(|entry, _| entry >= from);
+            if self.find.hits.current() != was {
+                self.repaint_current(was, cx);
+                self.reveal(entries, was, cx);
+            }
+            if self.find.pending.range(from..).next().is_none() {
+                self.find.from = None;
             }
         }
     }

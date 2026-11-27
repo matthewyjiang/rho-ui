@@ -31,6 +31,7 @@ A session whose model isn't signed in still opens, with a card above the compose
 - **Long replies** are drawn in parts of about 2,000 characters, so <kbd>Ctrl</kbd>+<kbd>A</kbd> selects the part you clicked in, not the whole reply.
 - **Add to prompt** appears when you select text in the transcript. It quotes the selection in your next message.
 - **Find** (<kbd>Ctrl</kbd>+<kbd>F</kbd>) searches the open session's messages, notices, tool lines and the folded working of finished turns, ignoring case. A match inside a fold opens it, and the fold stays open after you close the bar. Diffs, forms and images aren't searched, nor are other sessions.
+- **Search sessions** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd>) finds the saved sessions on every connected machine whose messages or tool output hold all the words you type, newest first, and opens the one you pick with Find on its match. Each machine's rho searches its own sessions, matching whole words and their endings ("walk" finds "walks" and "walking"). The last word also matches the start of a word, up to where its ending begins: "deplo" finds "deployment", but "deploym" doesn't. So a session can be listed that Find, which matches the exact text, then finds nothing in; it opens at the message that matched. The sidebar's search, which matches titles and names, offers it for the same words. A machine whose rho predates search says so under the list.
 
 ## Times
 
