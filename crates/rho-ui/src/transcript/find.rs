@@ -34,20 +34,25 @@ use web_time::Instant;
 
 use super::{markdown_parts, Transcript};
 use crate::{
-    rail::{self, Line},
+    rail::{self, Card},
     work::{self, Disclosure},
 };
+
+/// Which part of a card's line a match lies in, in the order a line
+/// draws them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum CardPart {
+    /// What it is about, as its chip names it ([`rail::Line::chip`]).
+    Chip,
+    /// What happened, in words ([`rail::Line::text`]).
+    Text,
+}
 
 /// Where in an entry a match lies, in the order the transcript draws them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Field {
-    /// What a card is about, as its chip shows it ([`Line::subject`]).
-    Subject,
-    /// A card's title: what happened, as its line shows it
-    /// ([`Line::outcome`]).
-    Title,
-    /// Who or what it happened to, as its line names it ([`Line::name`]).
-    Name,
+    /// Line `n` of a card ([`rail::Card::lines`]): its chip or its words.
+    Card(usize, CardPart),
     /// Part `n` of the entry's Markdown: a reply's part, a prompt's text,
     /// or a notice's detail. Its ranges index the text Kit renders.
     Part(usize),
@@ -569,13 +574,11 @@ impl Transcript {
             hits.extend(matcher.find(text).map(|range| Hit { field, range }));
         };
         if let Entry::Notice(notice) = shown {
-            let line = Line::of(notice);
-            if let Some(subject) = &line.subject {
-                found(Field::Subject, subject.label());
-            }
-            found(Field::Title, line.outcome);
-            if let Some(name) = line.name {
-                found(Field::Name, name);
+            for (n, line) in Card::of(entry, notice).lines.iter().enumerate() {
+                if let Some(chip) = line.chip() {
+                    found(Field::Card(n, CardPart::Chip), &chip);
+                }
+                found(Field::Card(n, CardPart::Text), line.text);
             }
         }
         let parts = self.markdown.get(entry).map_or(&[][..], Vec::as_slice);
@@ -780,13 +783,9 @@ impl Transcript {
                 };
                 (body.state().clone(), range)
             }
-            Field::Subject
-            | Field::Title
-            | Field::Name
-            | Field::Line
-            | Field::Command
-            | Field::Note(_)
-            | Field::Output(_) => return,
+            Field::Card(..) | Field::Line | Field::Command | Field::Note(_) | Field::Output(_) => {
+                return
+            }
         };
         let revealed = state.update(cx, |state, cx| state.reveal_range(range, cx));
         if revealed.is_ok() {

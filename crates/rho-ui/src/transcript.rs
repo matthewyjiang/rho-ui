@@ -58,13 +58,13 @@ use crate::{
     lightbox,
     parts::{self, Edit, Items, Place},
     pictures::{self, PictureRead, Pictures},
-    rail::{self, Line},
+    rail::{self, Card},
     surface_view::Surfaces,
     turn_times::TurnTimes,
     usage,
     work::{self, BodyView, DiffView, Disclosure, Fold, FoldHandler, Header, WorkRow},
 };
-use find::{Field, Find};
+use find::{CardPart, Field, Find};
 
 /// [`figures::extensions`] and the plugin for images by path, for a
 /// `TextView` showing message `entry` of a session whose images `pictures`
@@ -207,12 +207,20 @@ pub(crate) enum Action {
     Worked { turn: usize },
     /// Open or close card `entry`'s body under its row on the rail.
     Card { entry: usize },
-    /// Unfold the routine cards of the run that card `entry` opens.
+    /// Unfold the folded cards of the run that card `entry` opens.
     Unfold { entry: usize },
 }
 
 /// Carries out an [`Action`]; the session view owns the transcript.
 pub(crate) type ActionHandler = Rc<dyn Fn(Action, &mut Window, &mut App)>;
+
+/// What a click in the transcript calls: `act` for what changes the
+/// transcript, and `open` for what a card on the rail is about, which the
+/// session view opens.
+pub(crate) struct Handlers {
+    pub(crate) act: ActionHandler,
+    pub(crate) open: rail::OpenHandler,
+}
 
 /// Builds the content of the scroller's item at a [`Place`]:
 /// [`Transcript::render_content`], reached through the session view, because
@@ -831,7 +839,7 @@ impl Transcript {
         item: usize,
         entries: &[Entry],
         surfaces: &Surfaces,
-        act: &ActionHandler,
+        handlers: &Handlers,
         content: &ItemContent,
         cx: &App,
     ) -> AnyElement {
@@ -857,7 +865,7 @@ impl Transcript {
         let Some(turn) = self.timeline.turn_of(row) else {
             return measure
                 .when(gap_below, Styled::pb_3)
-                .child(self.render_content(place, entries, act, cx))
+                .child(self.render_content(place, entries, handlers, cx))
                 .into_any_element();
         };
         if self.folds_in_working(turn, row, entries) {
@@ -885,9 +893,9 @@ impl Transcript {
         let opens_turn = self.timeline.turns().get(turn) == Some(&row);
         measure
             .when(gap_below, Styled::pb_3)
-            .child(self.render_content(place, entries, act, cx))
+            .child(self.render_content(place, entries, handlers, cx))
             .when(opens_turn, |this| {
-                this.child(self.render_header(turn, act, cx))
+                this.child(self.render_header(turn, &handlers.act, cx))
             })
             .into_any_element()
     }
@@ -942,9 +950,10 @@ impl Transcript {
         &self,
         place: Place,
         entries: &[Entry],
-        act: &ActionHandler,
+        handlers: &Handlers,
         cx: &App,
     ) -> AnyElement {
+        let act = &handlers.act;
         let Place {
             row,
             part,
@@ -962,7 +971,7 @@ impl Transcript {
         };
         match drawn {
             Row::Message(entry) => match &entries[*entry] {
-                Entry::Notice(_) => self.render_card(row, *entry, entries, act, cx),
+                Entry::Notice(_) => self.render_card(row, *entry, entries, handlers, cx),
                 message => {
                     let attachments = self.attachments.get(*entry).map_or(&[][..], Vec::as_slice);
                     let shown = Shown {
@@ -1009,10 +1018,10 @@ impl Transcript {
             return run.clone();
         }
         let run = self.run_of(row, entries);
-        let tones: Vec<_> = run
+        let urgencies: Vec<_> = run
             .clone()
             .filter_map(|row| self.card_at(row, entries))
-            .map(|(_, card)| card.tone())
+            .map(|(_, card)| card.urgency())
             .collect();
         let first = self.card_at(run.start, entries).map(|(entry, _)| entry);
         let shown = if first.is_some_and(|first| self.unfolded.contains(&first)) {
@@ -1022,7 +1031,7 @@ impl Transcript {
         };
         let placed = PlacedRun {
             start: run.start,
-            places: rail::places(&tones, shown).into(),
+            places: rail::places(&urgencies, shown).into(),
         };
         let mut cache = self.placed.borrow_mut();
         for row in run {
@@ -1032,14 +1041,14 @@ impl Transcript {
     }
 
     /// Card `ix`, at `row`, on the rail with the rest of its run: its row,
-    /// the row that folds it with the run's other routine cards, or nothing
+    /// the row that folds it with the run's other cards that may fold, or nothing
     /// while it is folded. An open card shows its body under its row.
     fn render_card(
         &self,
         row: usize,
         ix: usize,
         entries: &[Entry],
-        act: &ActionHandler,
+        Handlers { act, open }: &Handlers,
         cx: &App,
     ) -> AnyElement {
         let PlacedRun { start, places } = self.placed(row, entries);
@@ -1051,42 +1060,56 @@ impl Transcript {
             // the run (see `continues_rail`).
             rail::Place::Hidden => div().into_any_element(),
             rail::Place::Fold { ends, folded } => {
-                let folded: Vec<Line<'_>> = folded
+                let folded: Vec<Card<'_>> = folded
                     .iter()
-                    .filter_map(|&at| card(at))
-                    .map(Line::of)
+                    .filter_map(|&at| self.card_at(start + at, entries))
+                    .map(|(entry, card)| Card::of(entry, card))
                     .collect();
                 let act = Rc::clone(act);
                 let unfold = move |window: &mut Window, cx: &mut App| {
                     act(Action::Unfold { entry: first }, window, cx);
                 };
-                rail::fold_row(ix, &folded, *ends, unfold, cx)
+                rail::fold_row(&folded, *ends, unfold, cx)
             }
             rail::Place::Card(ends) => {
                 let Some(notice) = card(row - start) else {
                     return div().into_any_element();
                 };
-                let body = self.text(ix, 0);
-                let open = self.details.get(ix).is_some_and(|shows| shows.is_open());
-                let detail = body.filter(|_| open).map(|body| {
-                    TextView::new(body)
-                        .style(message_style(xsmall_text(cx)))
-                        .code_block_actions(code_actions)
-                        .selectable(true)
-                        .into_any_element()
-                });
-                let toggle = body.map(|_| {
-                    let act = Rc::clone(act);
-                    move |window: &mut Window, cx: &mut App| {
-                        act(Action::Card { entry: ix }, window, cx);
+                let card = Card::of(ix, notice);
+                let shows = self.details.get(ix).is_some_and(|shows| shows.is_open());
+                let body = match self.text(ix, 0) {
+                    None => rail::Body::None,
+                    Some(text) => {
+                        let act = Rc::clone(act);
+                        let on_toggle: rail::ToggleHandler = Rc::new(move |window, cx| {
+                            act(Action::Card { entry: ix }, window, cx);
+                        });
+                        if shows {
+                            let detail = TextView::new(text)
+                                .style(message_style(xsmall_text(cx)))
+                                .code_block_actions(code_actions)
+                                .selectable(true)
+                                .into_any_element();
+                            rail::Body::Open(on_toggle, detail)
+                        } else {
+                            rail::Body::Shut(on_toggle)
+                        }
                     }
-                });
-                let marks = rail::LineMarks {
-                    subject: self.find.marks(ix, Field::Subject),
-                    outcome: self.find.marks(ix, Field::Title),
-                    name: self.find.marks(ix, Field::Name),
                 };
-                rail::card_row(ix, &Line::of(notice), marks, *ends, detail, toggle, cx)
+                let marks = (0..card.lines.len())
+                    .map(|n| rail::LineMarks {
+                        chip: self.find.marks(ix, Field::Card(n, CardPart::Chip)),
+                        text: self.find.marks(ix, Field::Card(n, CardPart::Text)),
+                    })
+                    .collect();
+                rail::CardRows {
+                    card: &card,
+                    marks,
+                    ends: *ends,
+                    body,
+                    on_open: Rc::clone(open),
+                }
+                .render(cx)
             }
         }
     }
@@ -1251,8 +1274,12 @@ fn first_line(cx: &App) -> Pixels {
 
 /// When a reply arrived, in its top right corner, in the rail's column of
 /// times, over the first line's end on the page's color.
-fn reply_time(at: chrono::DateTime<chrono::Utc>, cx: &App) -> gpui_kit::Div {
-    hover_time(at, cx)
+fn reply_time(
+    ix: usize,
+    at: chrono::DateTime<chrono::Utc>,
+    cx: &App,
+) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+    hover_time("reply", ix, at, cx)
         .absolute()
         .top_0()
         .right_0()
@@ -1265,9 +1292,15 @@ fn reply_time(at: chrono::DateTime<chrono::Utc>, cx: &App) -> gpui_kit::Div {
 /// When a message arrived, shown while the pointer is on it, as faint as
 /// the rail's times. Not Kit's `MessageHeader` or `MessageFooter`: each
 /// keeps its line while the time is hidden, which would space every
-/// message out for a time that shows only on hover.
-fn hover_time(at: chrono::DateTime<chrono::Utc>, cx: &App) -> gpui_kit::Div {
-    rail::clock(Some(at), cx)
+/// message out for a time that shows only on hover. Its ID is
+/// `{kind}-{ix}-time`, for entry `ix`.
+fn hover_time(
+    kind: &str,
+    ix: usize,
+    at: chrono::DateTime<chrono::Utc>,
+    cx: &App,
+) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+    rail::clock(format!("{kind}-{ix}-time"), Some(at), cx)
         .opacity(0.)
         .group_hover(MESSAGE_GROUP, |style| style.opacity(1.))
 }
@@ -1323,7 +1356,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
                     .justify_end()
                     .items_center()
                     .gap_2()
-                    .children(message.arrived().map(|at| hover_time(at, cx)))
+                    .children(message.arrived().map(|at| hover_time("user", ix, at, cx)))
                     .child(text)
             });
             let content = MessageContent::new()
@@ -1348,7 +1381,7 @@ fn render_message(entry: &Entry, ix: usize, shown: &Shown<'_>, cx: &App) -> AnyE
             let time = message
                 .arrived()
                 .filter(|_| part == 0)
-                .map(|at| reply_time(at, cx));
+                .map(|at| reply_time(ix, at, cx));
             div()
                 .id(SharedString::from(id))
                 .test_support()

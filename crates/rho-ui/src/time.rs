@@ -10,6 +10,14 @@ pub(crate) fn clock(at: DateTime<Utc>) -> String {
     at.with_timezone(&Local).format("%H:%M").to_string()
 }
 
+/// `at` in full, here, as a time's tooltip says it: "Thu 26 Nov 2026,
+/// 14:05:09".
+pub(crate) fn stamp(at: DateTime<Utc>) -> String {
+    at.with_timezone(&Local)
+        .format("%a %-d %b %Y, %H:%M:%S")
+        .to_string()
+}
+
 /// Seconds since the Unix epoch, or 0 if the clock is before it.
 pub(crate) fn now_unix() -> i64 {
     SystemTime::now()

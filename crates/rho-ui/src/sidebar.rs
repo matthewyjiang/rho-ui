@@ -755,16 +755,18 @@ impl SidebarView {
     }
 
     /// Asks the app to open listed session `id`, as a click on its row
-    /// does.
-    pub(crate) fn open(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) {
-        if let Some(row) = self.list.row(id) {
-            cx.emit(SidebarEvent::Open {
-                id: row.id.clone(),
-                cwd: row.cwd.clone(),
-                title: row.title.clone(),
-                kind: row.kind,
-            });
-        }
+    /// does, and says whether it is listed: one that isn't can't open.
+    pub(crate) fn open(&mut self, id: &SessionKey, cx: &mut Context<'_, Self>) -> bool {
+        let Some(row) = self.list.row(id) else {
+            return false;
+        };
+        cx.emit(SidebarEvent::Open {
+            id: row.id.clone(),
+            cwd: row.cwd.clone(),
+            title: row.title.clone(),
+            kind: row.kind,
+        });
+        true
     }
 
     fn shelve(&mut self, id: &SessionKey, action: ShelfAction, cx: &mut Context<'_, Self>) {
@@ -1251,7 +1253,9 @@ impl SidebarView {
                     }
                 });
             })
-            .on_click(cx.listener(move |this, _, _, cx| this.open(&open_id, cx)));
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open(&open_id, cx);
+            }));
         div()
             .h(height)
             .px_2()

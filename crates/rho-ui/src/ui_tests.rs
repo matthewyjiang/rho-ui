@@ -29,8 +29,8 @@ use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
         report, write_program, FakeDaemon, PullRequestMethods, Script, SessionLists, Started,
-        TuiJob, CARDS, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY,
-        SUBAGENT_AGENT, SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
+        TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY, SUBAGENT_AGENT,
+        SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
     Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef,
@@ -54,7 +54,6 @@ use crate::{
     machines::{MachineId, MachineStatus, Place, Reach, RemoteMachine, SessionKey},
     projects::Projects,
     pull_requests::{Serving, Shown, Which},
-    rail,
     rho_install::Offer,
     right_panel::{PanelLayout, Surface, TerminalShell, TerminalView, PROGRAM_POLL},
     settings::{Appearance, Settings, SmoothScroll, UiScale},
@@ -66,6 +65,7 @@ use crate::{
     window_chrome::Chrome,
 };
 
+mod cards;
 mod configured;
 mod live;
 mod mcp;
@@ -6826,75 +6826,6 @@ fn restart_and_open_the_ended_run(mut ui: Harness, parent: &SessionId) {
     ui.shot("restarted");
     ui.click("background-ended-0");
     ui.wait_for_session("the subagent's session after the restart", subagent_saved);
-}
-
-/// The cards rho sends between two replies sit on the rail, one row each:
-/// past the first few, the routine ones fold behind one row, which
-/// unfolds them on a click, and a card that asks for a look never folds. A
-/// card's row opens its body under it.
-#[test]
-fn cards_between_replies_sit_on_a_rail_that_folds() {
-    let mut ui = Harness::start("rail", Script::default());
-    ui.wait_until("saved sessions", |window, _, _| {
-        is_visible(window, "session-local-s1")
-    });
-    ui.click("new-session");
-    ui.wait_until("the draft", |window, _, _| is_visible(window, "draft-view"));
-    ui.send("cards");
-    ui.wait_for_session("the answer after the cards", |session| {
-        session.state() == &RunState::Idle
-            && matches!(session.entries().last(), Some(Entry::Agent(_)))
-    });
-    let session = ui.session();
-    let cards: Vec<usize> = session
-        .entries()
-        .iter()
-        .enumerate()
-        .filter_map(|(ix, entry)| matches!(entry, Entry::Notice(_)).then_some(ix))
-        .collect();
-    assert_eq!(cards.len(), CARDS.len(), "every card is in the transcript");
-    let card = |ix: usize| SharedString::from(format!("card-{ix}"));
-    // `CARDS` puts the comments, which ask for a look, right after the
-    // cards that always show, and routine cards after them.
-    let (shown, folded) = cards.split_at(rail::FOLD_AFTER + 1);
-    let fold = SharedString::from(format!("rail-fold-{}", folded[0]));
-    ui.wait_until(
-        "the first cards, the comments and the fold",
-        |window, _, _| {
-            shown.iter().all(|&ix| is_visible(window, card(ix))) && is_visible(window, fold.clone())
-        },
-    );
-    ui.act(|window, _| {
-        for &ix in folded {
-            assert!(!is_visible(window, card(ix)), "card {ix} is folded");
-        }
-    });
-    // The model answers after the cards as a turn of their own, opened
-    // with its wake row, as the conversation replays.
-    let after = cards[cards.len() - 1] + 1;
-    assert!(matches!(session.entries()[after], Entry::Wake));
-    let reply = SharedString::from(format!("reply-{}", after + 1));
-    ui.act(|window, cx| {
-        let center = window.find(reply.clone()).bounds().center();
-        window.pointer_move(center, None, cx);
-    });
-    ui.shot("folded");
-
-    ui.click(Box::leak(fold.to_string().into_boxed_str()));
-    ui.wait_until("every card, unfolded", |window, _, _| {
-        cards.iter().all(|&ix| is_visible(window, card(ix))) && !is_visible(window, fold.clone())
-    });
-    let failed: &'static str = Box::leak(card(cards[0]).to_string().into_boxed_str());
-    ui.click(failed);
-    ui.wait_until("the failure's body", |window, _, _| {
-        is_visible(window, SharedString::from(format!("{failed}-detail")))
-    });
-    let prompt = SharedString::from(format!("user-{}", cards[0] - 2));
-    ui.act(|window, cx| {
-        let center = window.find(prompt.clone()).bounds().center();
-        window.pointer_move(center, None, cx);
-    });
-    ui.shot("unfolded");
 }
 
 /// A message the session's turn can't take waits above the composer and

@@ -26,11 +26,13 @@ use std::{
 use chrono::{DateTime, Utc};
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rho_protocol::display::NotificationCard;
+use rho_protocol::display::{
+    NotificationId, NotificationInfo, NotificationItem, NotificationUrgency,
+};
 use rho_protocol::{
     AnswerStop, CardTone, CompactionStatus, CompactionTrigger, JobState, Replay, Resolution, Seq,
-    SessionAttachResponse, SessionEvent, SessionOptions as WireOptions, SessionPullRequests,
-    StreamId, ToolCallUpdate, TurnOutcome,
+    SessionAttachResponse, SessionEvent, SessionEventEnvelope, SessionOptions as WireOptions,
+    SessionPullRequests, StreamId, ToolCallUpdate, TurnOutcome,
 };
 
 use crate::{
@@ -49,9 +51,33 @@ pub struct SessionUpdate {
     /// Its place in the session's stream; see [`Session::reattach`].
     pub(crate) seq: Seq,
     pub(crate) event: SessionEvent,
+    /// When it happened, when the daemon says: live, and for a saved event
+    /// a replay repeats, to the second.
+    pub(crate) at: Option<DateTime<Utc>>,
+    /// What the event, a notification card, is about, typed.
+    pub(crate) notification: Option<Box<NotificationInfo>>,
 }
 
 impl SessionUpdate {
+    /// What a `rho/session/event` notification carries, with the session
+    /// it is for.
+    pub(crate) fn from_wire(envelope: SessionEventEnvelope) -> (SessionId, Self) {
+        let SessionEventEnvelope {
+            params,
+            at,
+            notification,
+            ..
+        } = envelope;
+        let update = Self {
+            seq: params.seq,
+            event: params.event,
+            // Unix milliseconds.
+            at: at.and_then(|at| DateTime::from_timestamp_millis(i64::try_from(at).ok()?)),
+            notification,
+        };
+        (params.session.into(), update)
+    }
+
     /// The session's pull requests, when this update says they changed:
     /// all of them, to replace what the client holds, never to merge.
     /// [`Session::apply`] ignores them; a session holds no pull requests.
@@ -351,8 +377,7 @@ impl UserMessage {
         self.steer
     }
 
-    /// When it arrived, if this client saw it come live: the daemon's
-    /// events carry no time, so a replayed one has none.
+    /// When it arrived; see [`Notice::arrived`].
     pub fn arrived(&self) -> Option<DateTime<Utc>> {
         self.arrived
     }
@@ -377,8 +402,7 @@ impl Message {
         &self.text
     }
 
-    /// When its first text arrived, if this client saw it come live: the
-    /// daemon's events carry no time, so a replayed one has none.
+    /// When its first text arrived; see [`Notice::arrived`].
     pub fn arrived(&self) -> Option<DateTime<Utc>> {
         self.arrived
     }
@@ -393,7 +417,8 @@ fn now() -> DateTime<Utc> {
         .unwrap_or_default()
 }
 
-/// How a [`Notice`] reads, as rho's card tone says.
+/// How a [`Notice`] reads, as rho's card tone says: the color it shows in.
+/// What it asks of the reader is its [`Urgency`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeTone {
     /// Routine news.
@@ -421,15 +446,51 @@ impl NoticeTone {
     }
 }
 
+/// What a [`Notice`] asks of the reader, least first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Urgency {
+    /// Progress, or work stopped on purpose: safe to fold away.
+    Routine,
+    /// Worth a look: finished work, a pull request that moved.
+    Notable,
+    /// A question waits, or something failed that needs a fix.
+    NeedsYou,
+}
+
+impl Urgency {
+    /// What rho says a notification card asks. A value a newer rho adds
+    /// reads as routine, as the protocol says.
+    fn from_wire(urgency: NotificationUrgency) -> Self {
+        match urgency {
+            NotificationUrgency::NeedsYou => Self::NeedsYou,
+            NotificationUrgency::Notable => Self::Notable,
+            _ => Self::Routine,
+        }
+    }
+
+    /// What a card of `tone` asks, read off its tone, for a rho that sends
+    /// no urgency: an error or a question needs the reader, finished work
+    /// or a warning is worth a look, the rest is routine.
+    fn of_tone(tone: NoticeTone) -> Self {
+        match tone {
+            NoticeTone::Error | NoticeTone::Accent => Self::NeedsYou,
+            NoticeTone::Success | NoticeTone::Warning => Self::Notable,
+            NoticeTone::Neutral => Self::Routine,
+        }
+    }
+}
+
 /// A message from rho that is not part of the conversation: a card, such
 /// as a background result, or a notice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
     tone: NoticeTone,
+    urgency: Urgency,
     title: String,
-    reference: Option<String>,
     description: Option<String>,
     arrived: Option<DateTime<Utc>>,
+    /// What a notification card is about, typed, when rho says.
+    notification: Option<Box<NotificationInfo>>,
 }
 
 impl Notice {
@@ -445,29 +506,36 @@ impl Notice {
         };
         Self {
             tone: NoticeTone::Neutral,
+            urgency: Urgency::Routine,
             title,
-            reference: None,
             description,
             arrived,
+            notification: None,
         }
     }
 
     /// A card. Its detail is the first of its bodies that isn't empty,
-    /// Markdown then plain, and its reference is what a notification names
-    /// its subject by.
+    /// Markdown then plain. It is as urgent as its `notification` says,
+    /// or, from a rho that sends none, as its tone reads.
     fn card(
         title: String,
         [markdown, plain]: [String; 2],
         tone: CardTone,
-        display: Option<Box<NotificationCard>>,
+        notification: Option<Box<NotificationInfo>>,
         arrived: Option<DateTime<Utc>>,
     ) -> Self {
+        let tone = NoticeTone::from_wire(tone);
+        let urgency = notification.as_ref().map_or_else(
+            || Urgency::of_tone(tone),
+            |info| Urgency::from_wire(info.urgency),
+        );
         Self {
-            tone: NoticeTone::from_wire(tone),
+            tone,
+            urgency,
             title,
-            reference: display.and_then(|card| card.reference),
             description: [markdown, plain].into_iter().find(|body| !body.is_empty()),
             arrived,
+            notification,
         }
     }
 
@@ -476,14 +544,29 @@ impl Notice {
         self.tone
     }
 
-    /// What a notification card names its subject by, such as a pull
-    /// request's `owner/repo#12`, a session's ID or a process's.
-    pub fn reference(&self) -> Option<&str> {
-        self.reference.as_deref()
+    /// What it asks of the reader.
+    pub fn urgency(&self) -> Urgency {
+        self.urgency
     }
 
-    /// When it arrived, if this client saw it come live: the daemon's
-    /// events carry no time, so a replayed one has none.
+    /// The notification card's id, the same however often rho sends it,
+    /// when rho says.
+    pub fn id(&self) -> Option<&NotificationId> {
+        self.notification.as_ref().map(|info| &info.id)
+    }
+
+    /// One per event the notification card tells of, in its order, each
+    /// with its subject and its line; none from a rho that doesn't say,
+    /// which only titles the card.
+    pub fn items(&self) -> &[NotificationItem] {
+        self.notification
+            .as_ref()
+            .map_or(&[][..], |info| info.items.as_slice())
+    }
+
+    /// When it happened, as the daemon says. From a daemon that says no
+    /// time, when this client saw it arrive live, and none if it was
+    /// replayed: now would be when the conversation was read again.
     pub fn arrived(&self) -> Option<DateTime<Utc>> {
         self.arrived
     }
@@ -929,18 +1012,23 @@ impl Session {
     /// Gives the entries a replay of the whole conversation rebuilt the
     /// times their twins in `shown`, the entries it replaced
     /// ([`Continuity::Replaced`]), had, and returns the first that differs
-    /// from its twin: a replay carries no times, but this client saw those
-    /// arrive, so only what changed is new. The first that differs keeps
-    /// its time too if it is the same message, such as a reply that went
-    /// on streaming. Call it once the replay caught up.
+    /// from its twin, times aside: so only what changed is new. A twin
+    /// that has no time, as from an older daemon, which sends none, leaves
+    /// the replay's; one that has, which this client may have seen arrive
+    /// to the millisecond, is kept. The first that differs keeps its twin's
+    /// time too if it is the same message, such as a reply that went on
+    /// streaming. Call it once the replay caught up.
     pub fn keep_arrivals(&mut self, shown: &[Entry]) -> usize {
         for (at, (entry, was)) in self.entries.iter_mut().zip(shown).enumerate() {
             let replayed = entry.arrived();
             entry.set_arrived(was.arrived());
-            if entry != was {
-                if !entry.is_same_message(was) {
-                    entry.set_arrived(replayed);
-                }
+            let same = entry == was;
+            if same || entry.is_same_message(was) {
+                entry.set_arrived(was.arrived().or(replayed));
+            } else {
+                entry.set_arrived(replayed);
+            }
+            if !same {
                 return at;
             }
         }
@@ -1249,14 +1337,20 @@ impl Session {
         }
     }
 
-    fn apply_event(&mut self, SessionUpdate { seq, event }: SessionUpdate) -> Option<usize> {
+    fn apply_event(&mut self, update: SessionUpdate) -> Option<usize> {
+        let SessionUpdate {
+            seq,
+            event,
+            at,
+            notification,
+        } = update;
         self.seq = self.seq.max(seq);
-        // When the entry it makes arrived, for the transcript to show: now,
-        // if it came live. rho-protocol's events carry no time, so one from
-        // a replay, or from the events a reattach caught up on, has none:
-        // now would be when the conversation was read again, not when it
-        // happened.
-        let arrived = matches!(self.sync, Sync::Live).then(now);
+        // When the entry it makes happened, for the transcript to show: as
+        // the daemon says, live or replayed. A daemon that says no time
+        // leaves now, if it came live, and none for one from a replay, or
+        // from the events a reattach caught up on: now would be when the
+        // conversation was read again, not when it happened.
+        let arrived = at.or_else(|| matches!(self.sync, Sync::Live).then(now));
         let mut caught_up = false;
         if let Sync::Replaying(left) = &mut self.sync {
             *left -= 1;
@@ -1265,7 +1359,7 @@ impl Session {
                 caught_up = true;
             }
         }
-        let changed = self.apply_change(event, arrived);
+        let changed = self.apply_change(event, arrived, notification);
         if caught_up {
             self.settle_remembered();
         }
@@ -1295,11 +1389,13 @@ impl Session {
     }
 
     /// [`Self::apply_event`] once the attachment's place in the replay is
-    /// counted, and whether the event came live.
+    /// counted, with when the event happened and, for a notification card,
+    /// what it is about.
     fn apply_change(
         &mut self,
         event: SessionEvent,
         arrived: Option<DateTime<Utc>>,
+        notification: Option<Box<NotificationInfo>>,
     ) -> Option<usize> {
         self.open_turn(&event);
         // A retry says what the turn does until its next event.
@@ -1340,21 +1436,21 @@ impl Session {
                 markdown,
                 plain,
                 tone,
-                display,
+                ..
             } => {
+                let card = Notice::card(title, [markdown, plain], tone, notification, arrived);
+                // rho gives a card the same id wherever it sends it again,
+                // as a catch-up after a reattach may.
+                if self.has_card(&card) {
+                    return None;
+                }
                 // A result delivered after the agent answered starts model
                 // work of its own: the next turn, or the rest of this one
                 // once the model reads it, which a replay can't tell apart.
                 if self.answered() {
                     self.unopened = true;
                 }
-                Some(self.push_notice(Notice::card(
-                    title,
-                    [markdown, plain],
-                    tone,
-                    display,
-                    arrived,
-                )))
+                Some(self.push_notice(card))
             }
             SessionEvent::State { state, turn } => {
                 self.change_state(state, turn.as_ref());
@@ -1518,17 +1614,18 @@ impl Session {
                 // answer can run long, so the detail says it whole.
                 return Some(self.push_notice(Notice {
                     tone: NoticeTone::Accent,
+                    urgency: Urgency::NeedsYou,
                     title: format!(
                         "No answer came in time, so Rho answered “{}”",
                         timeout.fallback()
                     ),
-                    reference: None,
                     description: Some(format!(
                         "{}\n\nRho answered: {}",
                         closed.title(),
                         timeout.fallback()
                     )),
                     arrived,
+                    notification: None,
                 }));
             }
             SessionEvent::InputHeld { id } => {
@@ -1676,6 +1773,16 @@ impl Session {
     fn push_notice(&mut self, notice: Notice) -> usize {
         self.entries.push(Entry::Notice(notice));
         self.entries.len() - 1
+    }
+
+    /// Whether the session has notification card `card` already, by its
+    /// id; one without an id never matches.
+    fn has_card(&self, card: &Notice) -> bool {
+        card.id().is_some_and(|id| {
+            self.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Notice(was) if was.id() == Some(id)))
+        })
     }
 
     /// Puts `message` in place of the user message with its ID, or after

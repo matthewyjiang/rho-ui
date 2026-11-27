@@ -323,6 +323,8 @@ mod tests {
             session.apply(SessionUpdate {
                 seq: rho_protocol::Seq(0),
                 event: serde_json::from_value(event).expect("the script is a valid event"),
+                at: None,
+                notification: None,
             });
         }
         session.entries().to_vec()

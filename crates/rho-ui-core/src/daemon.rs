@@ -468,14 +468,9 @@ impl DaemonEvents {
     pub async fn recv(&mut self) -> Option<DaemonEvent> {
         loop {
             match self.notifications.recv().await? {
-                DaemonNotification::SessionEvent(event) => {
-                    return Some(DaemonEvent::Update {
-                        session: event.session.into(),
-                        update: SessionUpdate {
-                            seq: event.seq,
-                            event: event.event,
-                        },
-                    });
+                DaemonNotification::SessionEventEnvelope(envelope) => {
+                    let (session, update) = SessionUpdate::from_wire(envelope);
+                    return Some(DaemonEvent::Update { session, update });
                 }
                 DaemonNotification::SessionDetached(detached) => {
                     let reason = match detached.reason {
@@ -679,7 +674,10 @@ async fn open(target: DaemonTarget) -> Result<(Daemon, DaemonEvents), DaemonErro
         link: machine.link,
         plain_lists: Arc::default(),
     };
-    let events = DaemonEvents { notifications };
+    // Each event with when it happened, and a card with what it is about.
+    let events = DaemonEvents {
+        notifications: notifications.with_session_event_envelopes(),
+    };
     Ok((daemon, events))
 }
 

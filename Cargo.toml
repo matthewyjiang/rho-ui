@@ -19,10 +19,11 @@ rust-version = "1.98"
 # take (`rho/model/list`). 1.5 forks a session (`rho/session/fork`), for
 # side chats.
 # Until rho-ui 0.3.0, from a rho commit rather than crates.io: it types a
-# session's reports (rho#2040) and lists the configured MCP servers and
-# hooks (rho#2045), which no release has yet. The release takes it from
+# session's reports (rho#2040), lists the configured MCP servers and hooks
+# (rho#2045), and sends each event's time and a card's typed notification
+# (rho#2048), which no release has yet. The release takes it from
 # crates.io again.
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "2fa159719ab0577e0b4fc98da3144c80f65123f1" }
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "fed8b6ba282e0ee00a08718e0e3d7e35c78d84d1" }
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 

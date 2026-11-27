@@ -59,6 +59,11 @@ pub use remote_shell::{
     RemoteShell, ShellControl, ShellEnded, ShellError, ShellInput, ShellOutput,
 };
 pub use rho_install::{RhoCheck, RhoInstall, Update};
+/// What a notification card is about, which [`Notice::items`] tells, as
+/// rho-protocol has it.
+pub use rho_protocol::display::{
+    NotificationId, NotificationItem, NotificationOutcome, NotificationSubject,
+};
 /// A session's reports, which [`Daemon::session_report`] reads, as
 /// rho-protocol has them.
 pub use rho_protocol::methods::{
@@ -113,7 +118,8 @@ pub use server::{ServerLink, ServerTarget};
 pub use session::{
     Attached, Checkout, Compaction, ContextSize, Continuity, Cursor, Delay, Entry, Message, Notice,
     NoticeTone, PlanItem, PlanStatus, RetryReason, RunState, Session, SessionSetup, SessionUpdate,
-    SteerId, ToolCall, ToolContent, ToolKind, ToolStatus, TurnId, Usage, UserMessage, Worktree,
+    SteerId, ToolCall, ToolContent, ToolKind, ToolStatus, TurnId, Urgency, Usage, UserMessage,
+    Worktree,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use ssh::{SshLink, SshTarget, MAX_SHELLS};
