@@ -84,7 +84,7 @@ impl State {
         self.session(&params.session)?;
         let connecting = self.mcp.startup == McpStartup::Connecting;
         // As rho words them: a failed server's error is in its detail too,
-        // after its other lines.
+        // after its transport line, the only line such a server has.
         let server = |identity: &str, status, tool_count, lines: &[&str], error: Option<&str>| {
             let detail: Vec<String> = lines
                 .iter()

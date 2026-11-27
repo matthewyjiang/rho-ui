@@ -86,8 +86,9 @@ pub struct FakeCard {
 /// pull requests. Four show: the first three, which fill the four rows the
 /// rail always shows, as the second tells of two events, routine new
 /// commits and the failing checks that make the card need the user, and a
-/// peer's question, which needs the user, though rho tones it a warning. The rest
-/// fold: a merge, new comments rho tones as an accent, and routine news.
+/// peer's question, which needs the user, though rho tones it a warning.
+/// The rest fold: a merge, new comments rho tones as an accent, and
+/// routine news.
 /// A rail that went by the tones instead would show the comments and the
 /// subagent that stopped, and fold the question.
 pub const CARDS: [FakeCard; 8] = [
@@ -97,7 +98,8 @@ pub const CARDS: [FakeCard; 8] = [
         tone: CardTone::Error,
         subject: FakeSubject::Process("p-3"),
         items: &[(
-            NotificationOutcome::Failed, NotificationUrgency::NeedsYou,
+            NotificationOutcome::Failed,
+            NotificationUrgency::NeedsYou,
             "Failed (exit 101) · cargo test -j 6 -p rho-ui",
         )],
         body: "test ui_tests::transcript_keeps_scroll_on_resize ... FAILED",
@@ -112,22 +114,29 @@ pub const CARDS: [FakeCard; 8] = [
         },
         items: &[
             (
-                NotificationOutcome::NewCommits, NotificationUrgency::Routine,
+                NotificationOutcome::NewCommits,
+                NotificationUrgency::Routine,
                 "New commits: the head is now 4f2a91c",
             ),
             (
-                NotificationOutcome::ChecksFailed, NotificationUrgency::NeedsYou,
+                NotificationOutcome::ChecksFailed,
+                NotificationUrgency::NeedsYou,
                 "2 of 9 checks failed on 4f2a91c",
             ),
         ],
-        body: "- New commits: the head is now `4f2a91c`.\n- 2 of 9 checks failed on `4f2a91c`: `clippy`, `test (ubuntu)`.",
+        body: "- New commits: the head is now `4f2a91c`.\n\
+               - 2 of 9 checks failed on `4f2a91c`: `clippy`, `test (ubuntu)`.",
     },
     FakeCard {
         id: "n-brief",
         title: "Completed · brief rereads",
         tone: CardTone::Success,
         subject: FakeSubject::Subagent("run-7"),
-        items: &[(NotificationOutcome::Completed, NotificationUrgency::Notable, "Completed · brief rereads")],
+        items: &[(
+            NotificationOutcome::Completed,
+            NotificationUrgency::Notable,
+            "Completed · brief rereads",
+        )],
         body: "Fixed and pushed to `feat/lead-brief-after-compaction`.",
     },
     FakeCard {
@@ -139,7 +148,8 @@ pub const CARDS: [FakeCard; 8] = [
             number: 102,
         },
         items: &[(
-            NotificationOutcome::Merged, NotificationUrgency::Notable,
+            NotificationOutcome::Merged,
+            NotificationUrgency::Notable,
             "Merged into main by matthewyjiang",
         )],
         body: "",
@@ -150,7 +160,8 @@ pub const CARDS: [FakeCard; 8] = [
         tone: CardTone::Warning,
         subject: FakeSubject::Session("s1"),
         items: &[(
-            NotificationOutcome::Question, NotificationUrgency::NeedsYou,
+            NotificationOutcome::Question,
+            NotificationUrgency::NeedsYou,
             "Waiting for an answer · first",
         )],
         body: "Which branch should the fix go on?",
@@ -163,7 +174,11 @@ pub const CARDS: [FakeCard; 8] = [
             repo: "matthewyjiang/rho-ui",
             number: 101,
         },
-        items: &[(NotificationOutcome::NewComments, NotificationUrgency::Notable, "1 new comment")],
+        items: &[(
+            NotificationOutcome::NewComments,
+            NotificationUrgency::Notable,
+            "1 new comment",
+        )],
         body: "- 1 new comment:\n  - coderabbitai: \"Split the status view out of #10?\"",
     },
     FakeCard {
@@ -175,7 +190,8 @@ pub const CARDS: [FakeCard; 8] = [
             number: 2040,
         },
         items: &[(
-            NotificationOutcome::NewCommits, NotificationUrgency::Routine,
+            NotificationOutcome::NewCommits,
+            NotificationUrgency::Routine,
             "New commits: the head is now 9c0e1d2",
         )],
         body: "",
@@ -185,7 +201,11 @@ pub const CARDS: [FakeCard; 8] = [
         title: "Stopped · lint sweep",
         tone: CardTone::Accent,
         subject: FakeSubject::Subagent("run-9"),
-        items: &[(NotificationOutcome::Stopped, NotificationUrgency::Routine, "Stopped · lint sweep")],
+        items: &[(
+            NotificationOutcome::Stopped,
+            NotificationUrgency::Routine,
+            "Stopped · lint sweep",
+        )],
         body: "",
     },
 ];
