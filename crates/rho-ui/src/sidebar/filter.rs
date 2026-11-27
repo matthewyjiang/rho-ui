@@ -5,19 +5,17 @@
 //! database so it holds across runs. [`Filter`] decides which rows it lets
 //! through.
 
-use std::collections::{HashMap, HashSet};
-
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
     badge::Badge,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     input::InputState,
     popover::Popover,
-    ActiveTheme as _, Sizable as _, Theme,
+    ActiveTheme as _, Sizable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, Anchor, App, ClickEvent, Context, Focusable as _, Hsla, IntoElement, ParentElement as _,
+    div, Anchor, App, ClickEvent, Context, Focusable as _, IntoElement, ParentElement as _,
     ScrollStrategy, SharedString, Styled as _, WeakEntity, Window,
 };
 
@@ -26,7 +24,6 @@ use rho_ui_core::platform;
 use super::SidebarView;
 use crate::{
     machines::{MachineId, MachineStatus, Machines, Place},
-    project_stack::session_workspaces,
     repo,
     session_list::Filter,
     store::StateDb,
@@ -140,6 +137,28 @@ fn on_click(
     }
 }
 
+/// Which part of the filter's UI stands for a project or a machine, for
+/// its element ID.
+#[derive(Clone, Copy)]
+enum Part {
+    /// Its row in the popover.
+    Row,
+    /// Its row's Only.
+    Only,
+    /// Its chip.
+    Chip,
+}
+
+impl Part {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Row => "filter",
+            Self::Only => "filter-only",
+            Self::Chip => "filter-chip",
+        }
+    }
+}
+
 /// A project the filter offers, named as the sidebar's rows name it.
 struct ProjectChoice {
     place: Place,
@@ -147,8 +166,6 @@ struct ProjectChoice {
     initials: SharedString,
     /// Its machine's label, when that isn't this machine.
     machine: Option<SharedString>,
-    /// The families of sessions that work in it; see [`Counts`].
-    families: usize,
 }
 
 impl ProjectChoice {
@@ -170,15 +187,12 @@ impl ProjectChoice {
             name,
             initials,
             place,
-            families: 0,
         }
     }
 
-    /// The element ID of what stands for it, `kind` saying which part: a
-    /// menu row, its Only, a chip.
-    fn element_id(&self, kind: &str) -> SharedString {
+    fn element_id(&self, part: Part) -> SharedString {
         let Place { machine, path } = &self.place;
-        format!("filter-{kind}-{machine}:{}", path.display()).into()
+        format!("{}-project-{machine}:{}", part.prefix(), path.display()).into()
     }
 }
 
@@ -187,8 +201,6 @@ struct MachineChoice {
     id: MachineId,
     label: SharedString,
     connection: Connection,
-    /// The families of sessions on it; see [`Counts`].
-    families: usize,
 }
 
 impl MachineChoice {
@@ -197,13 +209,11 @@ impl MachineChoice {
             id: id.clone(),
             label: machines.label(id),
             connection: Connection::of(machines.status(id)),
-            families: 0,
         }
     }
 
-    /// See [`ProjectChoice::element_id`].
-    fn element_id(&self, kind: &str) -> SharedString {
-        format!("filter-{kind}-{}", self.id).into()
+    fn element_id(&self, part: Part) -> SharedString {
+        format!("{}-machine-{}", part.prefix(), self.id).into()
     }
 }
 
@@ -245,85 +255,45 @@ impl Connection {
         }
     }
 
-    fn color(self, theme: &Theme) -> Hsla {
-        match self {
+    /// Its status dot.
+    fn dot(self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let color = match self {
             Self::Connected => theme.success,
             Self::Connecting | Self::Stopped => theme.muted_foreground,
             Self::Outdated => theme.warning,
             Self::Unreachable => theme.danger,
-        }
+        };
+        div().flex_shrink_0().size_2().rounded_full().bg(color)
     }
 }
 
-/// How many families of sessions, on any shelf, work in each project and
-/// run on each machine, whatever the filter and the search show: a session
-/// and those it started count once, as the shelf headers count them.
-#[derive(Default)]
-struct Counts {
-    projects: HashMap<Place, usize>,
-    machines: HashMap<MachineId, usize>,
-}
-
-impl Counts {
-    fn of(sidebar: &SidebarView, cx: &App) -> Self {
-        let workspaces = sidebar.workspaces.read(cx);
-        let projects = sidebar.projects.read(cx);
-        let rows = sidebar.list.rows();
-        let mut in_project: HashSet<(Place, usize)> = HashSet::new();
-        let mut on_machine: HashSet<(&MachineId, usize)> = HashSet::new();
-        for (row, top) in rows.iter().zip(sidebar.list.tops()) {
-            let machine = &row.id.machine;
-            on_machine.insert((machine, top));
-            // A session is in the projects the filter finds it in.
-            let own = Some(workspaces.get(row.workspace));
-            let added = row.added.iter().map(|&ix| workspaces.get(ix));
-            for workspace in session_workspaces(row.kind, own, added, Some(projects)) {
-                let root = Place::new(machine.clone(), workspace.root_path());
-                in_project.insert((root, top));
-            }
-        }
-        let mut counts = Self::default();
-        for (project, _) in in_project {
-            *counts.projects.entry(project).or_default() += 1;
-        }
-        for (machine, _) in on_machine {
-            *counts.machines.entry(machine.clone()).or_default() += 1;
-        }
-        counts
-    }
-}
-
-/// Everything the popover offers: each project, in the order the user's
+/// Everything the popover offers, each with its families of sessions (see
+/// [`crate::session_list::SessionList::family_counts`]): each project, in the order the user's
 /// projects list them, and with more than one machine, each machine.
 struct Offer {
-    projects: Vec<ProjectChoice>,
-    machines: Vec<MachineChoice>,
+    projects: Vec<(ProjectChoice, usize)>,
+    machines: Vec<(MachineChoice, usize)>,
 }
 
 impl Offer {
     fn of(sidebar: &SidebarView, cx: &App) -> Self {
-        let counts = Counts::of(sidebar, cx);
-        let machines = sidebar.machines.read(cx);
         let workspaces = sidebar.workspaces.read(cx);
-        let projects = sidebar
-            .projects
-            .read(cx)
-            .roots()
-            .map(|place| ProjectChoice {
-                families: counts.projects.get(place).copied().unwrap_or_default(),
-                ..ProjectChoice::new(place.clone(), workspaces, machines)
+        let projects = sidebar.projects.read(cx);
+        let counts = (sidebar.list).family_counts(super::named(workspaces, projects));
+        let machines = sidebar.machines.read(cx);
+        let families = |count: Option<&usize>| count.copied().unwrap_or_default();
+        let projects = (projects.roots())
+            .map(|place| {
+                let choice = ProjectChoice::new(place.clone(), workspaces, machines);
+                (choice, families(counts.projects.get(place)))
             })
             .collect();
         let machines = if machines.several() {
-            machines
-                .iter()
-                .map(|machine| MachineChoice {
-                    families: counts
-                        .machines
-                        .get(&machine.id)
-                        .copied()
-                        .unwrap_or_default(),
-                    ..MachineChoice::new(&machine.id, machines)
+            (machines.iter())
+                .map(|machine| {
+                    let choice = MachineChoice::new(&machine.id, machines);
+                    (choice, families(counts.machines.get(&machine.id)))
                 })
                 .collect()
         } else {

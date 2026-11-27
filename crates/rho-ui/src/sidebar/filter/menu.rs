@@ -22,8 +22,12 @@ use gpui_kit::{
     WeakEntity, Window,
 };
 
-use super::{on_click, Connection, Filter, MachineChoice, Offer, ProjectChoice, SidebarView};
+use std::rc::Rc;
+
+use super::{on_click, Connection, Filter, MachineChoice, Offer, Part, ProjectChoice, SidebarView};
+use crate::machines::MachineId;
 use crate::session_list::contains_ignore_case;
+use crate::sidebar::badge;
 
 /// The rows' height at most before they scroll: about 13 rows, which
 /// leaves the popover inside the smallest window the app opens.
@@ -48,16 +52,24 @@ pub(super) fn render(
         filter,
         hovered: &hovered,
         view,
+        machines: offer
+            .machines
+            .iter()
+            .map(|(machine, _)| machine.id.clone())
+            .collect(),
     };
     let projects: Vec<AnyElement> = offer
         .projects
         .iter()
-        .filter(|project| {
+        .filter(|(project, _)| {
             contains_ignore_case(&project.name, query)
                 || (project.machine.as_ref())
                     .is_some_and(|machine| contains_ignore_case(machine, query))
         })
-        .map(|project| rows.project(project, cx))
+        .map(|(project, families)| rows.project(project, *families, window, cx))
+        .collect();
+    let machines: Vec<AnyElement> = (offer.machines.iter())
+        .map(|(machine, families)| rows.machine(machine, *families, window, cx))
         .collect();
     let muted = cx.theme().muted_foreground;
     let note = |text: &'static str| div().px_2().py_1().text_xs().text_color(muted).child(text);
@@ -80,10 +92,7 @@ pub(super) fn render(
                     list.child(Separator::horizontal().my_1())
                 })
                 .child(heading("Machines", cx))
-                .children(
-                    (offer.machines.iter())
-                        .map(|machine| rows.machine(machine, &offer.machines, cx)),
-                )
+                .children(machines)
             })
             .into_any_element()
     };
@@ -117,7 +126,7 @@ fn header(filter: &Filter, view: &WeakEntity<SidebarView>) -> impl IntoElement {
                 .xsmall()
                 .label("Clear")
                 .disabled(filter.is_empty())
-                .on_click(on_click(view, |filter| *filter = Filter::default())),
+                .on_click(on_click(view, Filter::clear)),
         )
 }
 
@@ -132,33 +141,42 @@ fn heading(text: &'static str, cx: &App) -> impl IntoElement {
 }
 
 /// What every row needs: the filter it shows, which row is under the
-/// pointer, and the view whose filter a click changes.
+/// pointer, the view whose filter a click changes, and the machines
+/// offered, which a machine's Only hides but for it.
 struct Rows<'a> {
     filter: &'a Filter,
     hovered: &'a Entity<Option<SharedString>>,
     view: &'a WeakEntity<SidebarView>,
+    machines: Rc<[MachineId]>,
 }
 
 impl Rows<'_> {
     /// A project's row: on while the filter keeps to it, dimmed while it
     /// keeps to others.
-    fn project(&self, project: &ProjectChoice, cx: &App) -> AnyElement {
+    fn project(
+        &self,
+        project: &ProjectChoice,
+        families: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
         let chosen = self.filter.chose(&project.place);
         let place = project.place.clone();
         let only = place.clone();
         self.row(
             Row {
-                id: project.element_id("project"),
-                only_id: project.element_id("only-project"),
+                id: project.element_id(Part::Row),
+                only_id: project.element_id(Part::Only),
                 name: project.name.clone(),
                 sub: project.machine.clone(),
                 on: chosen,
                 dimmed: !chosen && !self.filter.projects().is_empty(),
-                count: project.families.to_string().into(),
-                mark: super::super::badge(project.initials.clone()).into_any_element(),
+                count: Some(families),
+                mark: badge(project.initials.clone()).into_any_element(),
             },
             on_click(self.view, move |filter| filter.toggle_project(&place)),
             on_click(self.view, move |filter| filter.only_project(&only)),
+            window,
             cx,
         )
     }
@@ -166,29 +184,34 @@ impl Rows<'_> {
     /// A machine's row: on while its sessions show. It says how its
     /// connection is doing, and with none and no session known, a dash for
     /// its count, as rho-ui can't tell.
-    fn machine(&self, machine: &MachineChoice, offered: &[MachineChoice], cx: &App) -> AnyElement {
+    fn machine(
+        &self,
+        machine: &MachineChoice,
+        families: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
         let shown = !self.filter.hides(&machine.id);
-        let count = if machine.families == 0 && machine.connection != Connection::Connected {
-            "–".into()
-        } else {
-            machine.families.to_string().into()
-        };
+        let known = families > 0 || machine.connection == Connection::Connected;
         let id = machine.id.clone();
         let only = machine.id.clone();
-        let all: Vec<_> = offered.iter().map(|machine| machine.id.clone()).collect();
+        let all = Rc::clone(&self.machines);
         self.row(
             Row {
-                id: machine.element_id("machine"),
-                only_id: machine.element_id("only-machine"),
+                id: machine.element_id(Part::Row),
+                only_id: machine.element_id(Part::Only),
                 name: machine.label.clone(),
                 sub: Some(machine.connection.words(&machine.id).into()),
                 on: shown,
                 dimmed: !shown,
-                count,
-                mark: dot(machine.connection, cx).into_any_element(),
+                count: known.then_some(families),
+                mark: machine.connection.dot(cx).into_any_element(),
             },
             on_click(self.view, move |filter| filter.toggle_machine(&id)),
-            on_click(self.view, move |filter| filter.only_machine(&only, &all)),
+            on_click(self.view, move |filter| {
+                filter.only_machine(&only, all.iter());
+            }),
+            window,
             cx,
         )
     }
@@ -198,11 +221,19 @@ impl Rows<'_> {
         row: Row,
         toggle: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
         only: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> AnyElement {
-        let theme = cx.theme();
+        // Tab reaches each row, and Enter or Space turns it on or off.
+        let focus_key = SharedString::from(format!("{}-focus", row.id));
+        let focus = (window
+            .use_keyed_state(focus_key, cx, |_, cx| cx.focus_handle().tab_stop(true)))
+        .read(cx)
+        .clone();
         let hovered = self.hovered.read(cx).as_ref() == Some(&row.id);
-        let trailing = if hovered {
+        let theme = cx.theme();
+        // Only shows for the keyboard too, while the row or Only has it.
+        let trailing = if hovered || focus.contains_focused(window, cx) {
             div()
                 // Only acts on the row; it must not also turn it on or off.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -220,7 +251,10 @@ impl Rows<'_> {
                 .px_1()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(row.count)
+                .child(
+                    row.count
+                        .map_or_else(|| "–".into(), |count| count.to_string()),
+                )
                 .into_any_element()
         };
         let toggled = if row.on {
@@ -236,6 +270,10 @@ impl Rows<'_> {
             .rounded(theme.radius)
             .px_2()
             .text_sm()
+            .track_focus(&focus)
+            .when(focus.is_focused(window), |this| this.bg(theme.list_hover))
+            // As Kit's Button does: a click leaves the keyboard where it was.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_hover(move |over, _, cx| {
                 state.update(cx, |hovered, cx| {
                     if *over {
@@ -285,8 +323,9 @@ struct Row {
     on: bool,
     /// Faded: a project the filter leaves out, a hidden machine.
     dimmed: bool,
-    /// Its families of sessions, or a dash when unknown.
-    count: SharedString,
+    /// Its families of sessions; `None`, drawn as a dash, when rho-ui
+    /// can't tell.
+    count: Option<usize>,
     /// Its badge or status dot.
     mark: AnyElement,
 }
@@ -299,13 +338,4 @@ fn check(toggled: Toggled, cx: &App) -> impl IntoElement {
         .when(toggled == Toggled::True, |this| {
             this.child(Icon::new(Lucide::Check).small().text_color(cx.theme().blue))
         })
-}
-
-/// A machine's status dot, colored by how its connection is doing.
-pub(super) fn dot(connection: Connection, cx: &App) -> impl IntoElement {
-    div()
-        .flex_shrink_0()
-        .size_2()
-        .rounded_full()
-        .bg(connection.color(cx.theme()))
 }

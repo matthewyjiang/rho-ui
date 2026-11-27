@@ -9,15 +9,24 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
+    scroll::ScrollableElement as _,
     tag::Tag,
     ActiveTheme as _, Icon, IconName, Sizable as _,
 };
 use gpui_kit::{
-    div, AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    div, rems, AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
     Styled as _, WeakEntity,
 };
 
-use super::{menu::dot, on_click, Filter, MachineChoice, ProjectChoice, SidebarView};
+use super::{on_click, Filter, MachineChoice, Part, ProjectChoice, SidebarView};
+use crate::sidebar::badge;
+
+/// The chips' height at most before they scroll, so many chips can't push
+/// out the list: three lines of them, each a chip with an xsmall ×
+/// (`h_5`, 1.25rem) inside its 1px border, with `gap_1` (0.25rem) between,
+/// 4.25rem and 6px; at a 16px rem, 74px of 76px. The fourth line starts
+/// below it at any UI scale.
+const CHIPS_REMS: f32 = 4.75;
 
 /// The chips of the sidebar's filter, or nothing when it hides nothing.
 /// Projects come in the order the user's projects list them, and machines
@@ -63,19 +72,19 @@ pub(in crate::sidebar) fn chips(
             .border_color(cx.theme().border)
             .label("Clear")
             .accessibility_label("Clear the filter")
-            .on_click(on_click(&view, |filter| *filter = Filter::default()))
+            .on_click(on_click(&view, Filter::clear))
             .into_any_element(),
     );
     Some(
-        h_flex()
+        div()
             .id("sidebar-filter-chips")
             .test_support()
             .flex_shrink_0()
-            .flex_wrap()
-            .gap_1()
-            .px_3()
-            .pb_2()
-            .children(chips),
+            .max_h(rems(CHIPS_REMS))
+            .overflow_y_scrollbar()
+            .mx_3()
+            .mb_2()
+            .child(h_flex().flex_wrap().gap_1().children(chips)),
     )
 }
 
@@ -86,16 +95,18 @@ fn project_chip(project: &ProjectChoice, view: &WeakEntity<SidebarView>, cx: &Ap
     let place = project.place.clone();
     chip(
         cx,
-        super::super::badge(project.initials.clone()).into_any_element(),
+        badge(project.initials.clone()).into_any_element(),
         h_flex()
+            .min_w_0()
             .gap_1()
-            .child(project.name.clone())
-            .children(
-                (project.machine.clone())
-                    .map(|machine| div().text_color(cx.theme().muted_foreground).child(machine)),
-            )
+            .child(div().min_w_0().truncate().child(project.name.clone()))
+            .children((project.machine.clone()).map(|machine| {
+                (div().min_w_0().truncate())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(machine)
+            }))
             .into_any_element(),
-        Button::new(project.element_id("chip-project"))
+        Button::new(project.element_id(Part::Chip))
             .accessibility_label(format!("Stop keeping to {}", project.name))
             .on_click(on_click(view, move |filter| filter.drop_project(&place))),
     )
@@ -107,21 +118,26 @@ fn machine_chip(machine: &MachineChoice, view: &WeakEntity<SidebarView>, cx: &Ap
     let id = machine.id.clone();
     chip(
         cx,
-        dot(machine.connection, cx).into_any_element(),
+        machine.connection.dot(cx).into_any_element(),
         div()
+            .min_w_0()
+            .truncate()
             .line_through()
             .text_color(cx.theme().muted_foreground)
             .child(machine.label.clone())
             .into_any_element(),
-        Button::new(machine.element_id("chip-machine"))
+        Button::new(machine.element_id(Part::Chip))
             .accessibility_label(format!("Show {}", machine.label))
             .on_click(on_click(view, move |filter| filter.show_machine(&id))),
     )
 }
 
-/// A chip of `mark` and `label`, ended by `remove`, drawn as ×.
+/// A chip of `mark` and `label`, ended by `remove`, drawn as ×. A label
+/// too long for the sidebar is cut short, so × stays in it.
 fn chip(cx: &App, mark: AnyElement, label: AnyElement, remove: Button) -> AnyElement {
     Tag::secondary()
+        .max_w_full()
+        .min_w_0()
         .rounded_full()
         .gap_1()
         .py_0()
@@ -132,6 +148,7 @@ fn chip(cx: &App, mark: AnyElement, label: AnyElement, remove: Button) -> AnyEle
         .child(label)
         .child(
             remove
+                .flex_shrink_0()
                 .ghost()
                 .xsmall()
                 .rounded_full()

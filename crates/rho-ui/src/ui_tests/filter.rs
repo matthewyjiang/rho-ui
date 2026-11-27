@@ -20,9 +20,14 @@ fn filter(hidden: &[&MachineId], projects: &[&Place]) -> Filter {
     )
 }
 
+/// A project whose chip, with its machine's label, is wider than the
+/// sidebar at its narrowest.
+const LONG: &str = "/w/a-project-with-a-name-too-long-for-a-chip";
+
 /// Opens the app on this machine, which holds the projects /w/a and /w/b,
-/// and the workstation, which holds /w/a, each with sessions in both
-/// folders, and a machine that can't be reached; it waits for their rows.
+/// and the workstation, which holds /w/a and one with a long name, each
+/// with sessions in /w/a and /w/b, and a machine that can't be reached; it
+/// waits for their rows.
 /// The workstation's daemon runs while the returned one lives.
 fn open_two_machines(name: &'static str) -> (Harness, FakeDaemon) {
     let local = FakeDaemon::start(Script::default());
@@ -36,6 +41,7 @@ fn open_two_machines(name: &'static str) -> (Harness, FakeDaemon) {
     projects.add(Place::local("/w/a"));
     projects.add(Place::local("/w/b"));
     projects.add(Place::new(MachineId::remote("workstation"), "/w/a"));
+    projects.add(Place::new(MachineId::remote("workstation"), LONG));
     let mut settings = Settings::default();
     settings.machines = vec![
         RemoteMachine::new("workstation"),
@@ -63,14 +69,16 @@ fn open_two_machines(name: &'static str) -> (Harness, FakeDaemon) {
 /// The popover stays open while projects are chosen one after another;
 /// Only on a machine shows it alone and drops the project chosen on the
 /// machine it hides; Escape closes it. The filter then shows as chips,
-/// which still fit a sidebar at its narrowest, and each chip's × takes its
-/// part off, until the dashed Clear takes the rest and the row goes.
+/// which still fit a sidebar at its narrowest, a long name cut short
+/// before its ×, and each chip's × takes its part off, until the dashed
+/// Clear takes the rest and the row goes.
 #[test]
 fn the_filter_keeps_its_popover_open_and_shows_as_chips() {
     let (mut ui, _workstation) = open_two_machines("sidebar-filter");
     let (here, gone) = (MachineId::local(), MachineId::remote("gone"));
     let mine = Place::local("/w/a");
     let theirs = Place::new(MachineId::remote("workstation"), "/w/a");
+    let long = Place::new(MachineId::remote("workstation"), LONG);
     ui.click("sidebar-filter");
     ui.wait_until("the popover", |window, _, _| {
         is_visible(window, "sidebar-filter-menu")
@@ -118,6 +126,8 @@ fn the_filter_keeps_its_popover_open_and_shows_as_chips() {
     ui.wait_until("the workstation's session alone", |window, _, _| {
         is_visible(window, "session-workstation-s1") && !is_visible(window, "session-local-s1")
     });
+    ui.click("filter-project-workstation:/w/a-project-with-a-name-too-long-for-a-chip");
+    assert_eq!(saved(&ui), filter(&[&here, &gone], &[&theirs, &long]));
 
     ui.act(|window, cx| window.press("escape", cx));
     ui.wait_until("the popover closed, and the chips", |window, _, _| {
@@ -128,7 +138,8 @@ fn the_filter_keeps_its_popover_open_and_shows_as_chips() {
     });
     ui.shot("chips");
 
-    // At the sidebar's narrowest the chips wrap, Clear still inside it.
+    // At the sidebar's narrowest the chips wrap, each × and Clear still
+    // inside it.
     ui.act(|window, cx| {
         let edge = window.find("sidebar").bounds();
         let from = gpui_kit::point(edge.right() - px(2.), edge.center().y);
@@ -136,17 +147,23 @@ fn the_filter_keeps_its_popover_open_and_shows_as_chips() {
     });
     ui.act(|window, _| {
         let sidebar = window.find("sidebar").bounds();
-        let clear = window.find("sidebar-filter-chips-clear").bounds();
-        assert!(
-            clear.right() <= sidebar.right(),
-            "Clear fits: {clear:?} in {sidebar:?}"
-        );
+        for id in [
+            "filter-chip-project-workstation:/w/a-project-with-a-name-too-long-for-a-chip",
+            "sidebar-filter-chips-clear",
+        ] {
+            let chip = window.find(id).bounds();
+            assert!(
+                chip.right() <= sidebar.right(),
+                "{id} fits: {chip:?} in {sidebar:?}"
+            );
+        }
     });
     ui.shot("chips-narrow");
 
     ui.click("filter-chip-machine-local");
-    assert_eq!(saved(&ui), filter(&[&gone], &[&theirs]));
+    assert_eq!(saved(&ui), filter(&[&gone], &[&theirs, &long]));
     ui.click("filter-chip-project-workstation:/w/a");
+    ui.click("filter-chip-project-workstation:/w/a-project-with-a-name-too-long-for-a-chip");
     assert_eq!(saved(&ui), filter(&[&gone], &[]));
     ui.wait_until("this machine's sessions back", |window, _, _| {
         is_visible(window, "session-local-old")
@@ -162,7 +179,8 @@ fn the_filter_keeps_its_popover_open_and_shows_as_chips() {
 
 /// With more than eight projects, the popover's search has the keyboard
 /// as it opens and narrows the projects as it is typed in; Escape closes
-/// the popover from it, and the search is empty when it opens again.
+/// the popover from it, and the search is empty when it opens again. Tab
+/// goes on to the rows, where Space turns one on and Only shows.
 #[test]
 fn the_filters_search_narrows_many_projects() {
     let daemon = FakeDaemon::start(Script::default());
@@ -195,4 +213,15 @@ fn the_filters_search_narrows_many_projects() {
             && is_visible(window, "filter-project-local:/w/p7")
     });
     assert!(saved(&ui).is_empty(), "searching filters nothing");
+
+    let first = "filter-project-local:/w/p1";
+    // From the search, past Clear while it is off.
+    ui.act(|window, cx| window.press("tab", cx));
+    ui.act(|window, cx| window.press("space", cx));
+    assert_eq!(saved(&ui), filter(&[], &[&Place::local("/w/p1")]));
+    ui.wait_until("p1 on, with Only", |window, _, _| {
+        window.find(first).checked() == Some(true)
+            && is_visible(window, "filter-only-project-local:/w/p1")
+            && is_visible(window, "sidebar-filter-menu")
+    });
 }
