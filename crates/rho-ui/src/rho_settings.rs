@@ -58,6 +58,12 @@ impl RhoSettings {
         self.entry(machine).map(|entry| &entry.loaded)
     }
 
+    /// `machine`'s daemon, while it is connected: Settings sync reads and
+    /// writes through it.
+    pub(crate) fn daemon(&self, machine: &MachineId) -> Option<Daemon> {
+        self.entry(machine).map(|entry| entry.daemon.clone())
+    }
+
     /// Why the last change on `machine` didn't land as made.
     pub(crate) fn problem(&self, machine: &MachineId) -> Option<&SharedString> {
         self.entry(machine)?.problem.as_ref()

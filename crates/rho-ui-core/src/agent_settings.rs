@@ -161,3 +161,25 @@ impl AgentSettings {
         self.schema.settings.iter().find(|spec| spec.key == *key)
     }
 }
+
+/// What a number's suffix calls `unit`; nothing for a unit a newer daemon
+/// names.
+pub fn unit_label(unit: IntegerUnit) -> Option<&'static str> {
+    match unit {
+        IntegerUnit::Bytes => Some("bytes"),
+        IntegerUnit::Lines => Some("lines"),
+        IntegerUnit::Percent => Some("%"),
+        IntegerUnit::Seconds => Some("seconds"),
+        _ => None,
+    }
+}
+
+/// A model as rho names it: `provider/model`, or `claude-code/model`.
+pub fn selection_name(model: &ModelSelection) -> String {
+    match model {
+        ModelSelection::Rho { provider, model } => format!("{provider}/{model}"),
+        ModelSelection::ClaudeCli { model } => {
+            format!("claude-code/{}", model.as_deref().unwrap_or("default"))
+        }
+    }
+}

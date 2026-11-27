@@ -107,6 +107,17 @@ pub enum Enablement {
     Disabled,
 }
 
+impl From<bool> for Enablement {
+    /// rho-protocol's `enabled` flag.
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 impl Daemon {
     /// Every plugin a session in `workspace` would find, in the order it
     /// loads them: the project's, nearest root first, then the user's;

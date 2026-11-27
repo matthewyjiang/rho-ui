@@ -1,8 +1,9 @@
 //! The Machines page: this machine's name and clone folder, then each
 //! remote machine rho-ui reaches over SSH, with its name, the `rho` it runs
-//! there, its clone folder, and Remove, then a field to add one. Adding a machine connects to it at once;
-//! removing one drops its sessions from the sidebar, and they stay on the
-//! machine.
+//! there, its clone folder, and Remove, then a field to add one, and last
+//! settings sync between two machines ([`super::sync`]). Adding a machine
+//! connects to it at once; removing one drops its sessions from the
+//! sidebar, and they stay on the machine.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
@@ -216,6 +217,7 @@ impl SettingsView {
             .group(this_machine)
             .groups(remote)
             .group(self.add_group(cx))
+            .groups(self.sync_groups(cx))
     }
 
     /// The field to add a machine by its SSH host, with a note that says

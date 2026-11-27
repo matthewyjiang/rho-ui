@@ -61,6 +61,7 @@ mod session_search;
 mod session_settings;
 mod session_view;
 mod settings;
+mod settings_sync;
 mod settings_view;
 mod shelf;
 mod sidebar;
@@ -144,6 +145,7 @@ gpui_kit::actions!(
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
+        ArrowLeftRight,
         GitBranch,
         FolderGit2,
         Download,
@@ -430,6 +432,7 @@ fn init(cx: &mut App, db: &StateDb) {
     cx.set_global(BackgroundLog::new(db));
     cx.set_global(PanelLayout::load(db));
     cx.set_global(LastCheckout::load(db));
+    cx.set_global(settings_sync::SyncSnapshots::load(db));
     cx.on_action(|_: &Quit, cx| cx.quit());
     // `secondary` is Cmd on macOS and Ctrl elsewhere.
     cx.bind_keys([

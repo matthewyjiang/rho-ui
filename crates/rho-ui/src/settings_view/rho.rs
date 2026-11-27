@@ -28,8 +28,8 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     agent_settings::{
-        Applies, ConfigCategory, IntegerUnit, ListedModels, SettingChange, SettingKey, SettingKind,
-        SettingSpec, SettingValue,
+        selection_name, unit_label, Applies, ConfigCategory, ListedModels, SettingChange,
+        SettingKey, SettingKind, SettingSpec, SettingValue,
     },
     AgentSettings,
 };
@@ -41,7 +41,7 @@ use crate::{
     machines::{MachineId, Machines},
     rho_settings::{Loaded, RhoSettings},
 };
-use models::{selection_name, ModelPicker};
+use models::ModelPicker;
 
 mod models;
 
@@ -625,18 +625,6 @@ fn applies(applies: Applies) -> Option<&'static str> {
         Applies::NextSession => Some("Applies to new sessions."),
         Applies::Restart => Some("Applies once Rho restarts."),
         // `Immediately`, or a time a newer daemon names.
-        _ => None,
-    }
-}
-
-/// What a number box's suffix calls `unit`.
-fn unit_label(unit: IntegerUnit) -> Option<&'static str> {
-    match unit {
-        IntegerUnit::Bytes => Some("bytes"),
-        IntegerUnit::Lines => Some("lines"),
-        IntegerUnit::Percent => Some("%"),
-        IntegerUnit::Seconds => Some("seconds"),
-        // A unit a newer daemon names.
         _ => None,
     }
 }

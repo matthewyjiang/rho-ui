@@ -14,8 +14,8 @@ use gpui_kit::{
 };
 use rho_ui_core::{
     agent_settings::{
-        ListedModels, ModelList, ModelRuntime, ModelSelection, SettingKey, SettingKind,
-        SettingValue,
+        selection_name, ListedModels, ModelList, ModelRuntime, ModelSelection, SettingKey,
+        SettingKind, SettingValue,
     },
     AgentSettings,
 };
@@ -142,16 +142,6 @@ impl SettingsView {
             .iter()
             .find(|picker| picker.key == *key)
             .map(|picker| picker.state.clone())
-    }
-}
-
-/// A model as rho names it: `provider/model`, or `claude-code/model`.
-pub(super) fn selection_name(model: &ModelSelection) -> String {
-    match model {
-        ModelSelection::Rho { provider, model } => format!("{provider}/{model}"),
-        ModelSelection::ClaudeCli { model } => {
-            format!("claude-code/{}", model.as_deref().unwrap_or("default"))
-        }
     }
 }
 
