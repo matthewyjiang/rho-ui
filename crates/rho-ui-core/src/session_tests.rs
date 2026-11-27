@@ -1136,27 +1136,56 @@ fn a_card_sent_again_stays_one_row() {
     );
 }
 
-/// Each item of a card is as urgent as rho says it is, so routine news on
-/// a card with a failure stays routine; one from a rho that doesn't say,
-/// or that says a value this client doesn't know, is as urgent as its card.
+/// Each item of a card is as urgent as rho says it is, and reads in the
+/// tone rho gives it, so routine news on a card with a failure stays
+/// routine and isn't colored as the failure; one from a rho that doesn't
+/// say, or that says a value this client doesn't know, is as urgent as its
+/// card and reads in its tone.
 #[test]
-fn a_cards_item_is_as_urgent_as_rho_says_or_as_its_card() {
+fn a_cards_item_reads_as_rho_says_or_as_its_card() {
     let subject = json!({"kind": "other"});
-    let item = |urgency: Option<&str>| {
-        let mut item = json!({"outcome": "new_commits", "subject": subject, "text": "New commits"});
-        if let Some(urgency) = urgency {
-            item["urgency"] = json!(urgency);
-        }
-        item
-    };
+    // What each item says, urgency then tone, and how it reads.
+    let cases = [
+        (
+            Some("routine"),
+            Some("neutral"),
+            (Urgency::Routine, NoticeTone::Neutral),
+        ),
+        (
+            Some("notable"),
+            Some("success"),
+            (Urgency::Notable, NoticeTone::Success),
+        ),
+        (
+            Some("needs_you"),
+            Some("error"),
+            (Urgency::NeedsYou, NoticeTone::Error),
+        ),
+        (None, None, (Urgency::NeedsYou, NoticeTone::Error)),
+        (
+            Some("someday"),
+            Some("someday"),
+            (Urgency::NeedsYou, NoticeTone::Error),
+        ),
+    ];
+    let items: Vec<_> = cases
+        .iter()
+        .map(|(urgency, tone, _)| {
+            let mut item = json!({"outcome": "new_commits", "subject": subject, "text": "New"});
+            if let Some(urgency) = urgency {
+                item["urgency"] = json!(urgency);
+            }
+            if let Some(tone) = tone {
+                item["tone"] = json!(tone);
+            }
+            item
+        })
+        .collect();
     let mut session = session();
     session.apply(SessionUpdate {
         notification: Some(
-            serde_json::from_value(
-                json!({"id": "n-1", "urgency": "needs_you", "subject": subject,
-                "items": [item(Some("routine")), item(Some("needs_you")), item(None),
-                    item(Some("someday"))]}),
-            )
+            serde_json::from_value(json!({"id": "n-1", "urgency": "needs_you",
+                "subject": subject, "items": items}))
             .expect("a valid notification"),
         ),
         ..update(
@@ -1167,20 +1196,13 @@ fn a_cards_item_is_as_urgent_as_rho_says_or_as_its_card() {
     let [Entry::Notice(notice)] = session.entries() else {
         panic!("one card: {:?}", session.entries());
     };
-    let urgencies: Vec<Urgency> = notice
+    let read: Vec<(Urgency, NoticeTone)> = notice
         .items()
         .iter()
-        .map(|item| notice.item_urgency(item))
+        .map(|item| (notice.item_urgency(item), notice.item_tone(item)))
         .collect();
-    assert_eq!(
-        urgencies,
-        [
-            Urgency::Routine,
-            Urgency::NeedsYou,
-            Urgency::NeedsYou,
-            Urgency::NeedsYou
-        ]
-    );
+    let want: Vec<_> = cases.iter().map(|&(_, _, want)| want).collect();
+    assert_eq!(read, want);
 }
 
 /// A notice of several lines, as a provider's diagnostic is, reads its

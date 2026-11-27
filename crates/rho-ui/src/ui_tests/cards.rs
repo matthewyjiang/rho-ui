@@ -6,8 +6,8 @@ use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
 use gpui_kit::SharedString;
 use rho_ui_core::{
     fake_daemon::{FakeCard, Script, CARDS},
-    Entry, LinkedPullRequest, Notice, NotificationId, PullRequestId, PullRequestLinkOrigin,
-    RunState, Session, SessionId,
+    Entry, LinkedPullRequest, Notice, NoticeTone, NotificationId, PullRequestId,
+    PullRequestLinkOrigin, RunState, Session, SessionId, Urgency,
 };
 
 use super::{is_visible, Harness};
@@ -29,9 +29,20 @@ fn line(key: &str, n: usize) -> SharedString {
     SharedString::from(format!("{key}-line-{n}"))
 }
 
+/// How each row of entry `ix`'s card reads on the rail: its dot and text
+/// come of these.
+fn looks(ix: usize, notice: &Notice) -> Vec<(Urgency, NoticeTone)> {
+    let card = rail::Card::of(ix, notice);
+    card.lines
+        .iter()
+        .map(|line| (line.urgency, line.tone))
+        .collect()
+}
+
 /// A conversation opened again shows its cards as rho saved them: each at
 /// the time it happened, to the second, as rho's file keeps it; one row
-/// for each event a card tells of; and past the first few rows, the cards
+/// for each event a card tells of, each as urgent and in the tone rho gives
+/// its event rather than the card's; and past the first few rows, the cards
 /// that don't need the user fold behind one row, whatever tone rho gave them,
 /// while a peer's question, toned a warning, shows. A pull request's chip
 /// shows it in the panel, and a session a card is about opens from its row.
@@ -75,15 +86,29 @@ fn replayed_cards_keep_their_times_and_fold_by_urgency() {
     }
 
     // `CARDS` says why: the first three cards fill the rows that always
-    // show, as the pull request's takes two, so the merge after them folds
-    // with the comments, toned as an accent, and the routine news; the
-    // question shows though it comes past them.
+    // show, as the pull requests' take two each, so the merge after them
+    // folds with the comments, toned as an accent, and the routine news;
+    // the question shows though it comes past them.
     let folded = ["n-pr-102", "n-pr-101", "n-pr-2040", "n-sweep"];
     let key = |card: &FakeCard| format!("card-{}", card.id);
     let (shown, hidden): (Vec<&FakeCard>, Vec<&FakeCard>) =
         CARDS.iter().partition(|card| !folded.contains(&card.id));
     let shown_rows: usize = shown.iter().map(|card| card.items.len().max(1)).sum();
-    assert_eq!(shown_rows, rail::FOLD_AFTER + 1);
+    assert_eq!(shown_rows, rail::FOLD_AFTER + 2);
+    // A card toned a warning for the watch that stopped draws its new
+    // comments in their own tone, and the watch as the routine news it is.
+    // The card's own tone differs from the comments', so this tells a row
+    // in its item's tone from one in its card's.
+    let (ix, mixed) = &cards[2];
+    assert_eq!(mixed.id().map(NotificationId::as_str), Some("n-pr-103"));
+    assert_eq!(mixed.tone(), NoticeTone::Warning);
+    assert_eq!(
+        looks(*ix, mixed),
+        [
+            (Urgency::Notable, NoticeTone::Accent),
+            (Urgency::Routine, NoticeTone::Warning)
+        ]
+    );
     ui.wait_until("each shown card's rows, and the fold", |window, _, _| {
         is_visible(window, "rail-fold-card-n-pr-102")
             && shown
