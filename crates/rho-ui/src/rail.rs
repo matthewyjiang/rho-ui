@@ -10,9 +10,9 @@
 //! for news, filled when someone must act (a question, a failure), so the
 //! urgency doesn't rest on color alone. Clicking a row opens the card's
 //! body under it; its pull request's chip shows the pull request, and a
-//! session it is about opens from the row. Past [`FOLD_AFTER`] cards in one
-//! run, those that don't need the reader fold behind one row (see
-//! [`places`]).
+//! session it is about opens from the row. Past the first [`FOLD_AFTER`]
+//! rows of one run, the cards that don't need the reader fold behind one
+//! row, whole (see [`places`]).
 //!
 //! Each card is one of the transcript's rows, so only the rows near the
 //! window are drawn: each draws its own stretch of the line, which meets
@@ -50,12 +50,14 @@ use rho_ui_core::{
 
 use crate::{time, transcript::find::Marks, work::Disclosure};
 
-/// How many cards of a run always show before the rest may fold. It comes
-/// from the C1 mockup the design was picked from, not from measuring real
-/// sessions: tune it once leads' runs of cards are seen in use.
+/// How many rows of a run always show before the rest may fold. A card
+/// folds whole, so the budget rounds up: a card that starts inside it
+/// shows all its rows, even past it. It comes from the C1 mockup the
+/// design was picked from, not from measuring real sessions: tune it once
+/// leads' runs of cards are seen in use.
 pub(crate) const FOLD_AFTER: usize = 4;
 
-/// The fewest cards a fold hides: a fold row in place of one card would
+/// The fewest rows a fold hides: a fold row in place of one row would
 /// save no room.
 const FOLD_AT_LEAST: usize = 2;
 
@@ -92,18 +94,43 @@ fn may_fold(urgency: Urgency) -> bool {
     urgency != Urgency::NeedsYou
 }
 
-/// The places in a run of cards, asking these urgencies, that fold behind
-/// one row: those that may fold after the first [`FOLD_AFTER`], once there
-/// are at least [`FOLD_AT_LEAST`] of them. None fold otherwise.
-fn folded(urgencies: &[Urgency]) -> Vec<usize> {
-    let folds: Vec<usize> = urgencies
-        .iter()
-        .enumerate()
-        .skip(FOLD_AFTER)
-        .filter(|(_, urgency)| may_fold(**urgency))
-        .map(|(at, _)| at)
-        .collect();
-    if folds.len() < FOLD_AT_LEAST {
+/// What placing a card of a run takes: what it asks of the reader, and
+/// how many rows it draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RunCard {
+    urgency: Urgency,
+    rows: usize,
+}
+
+impl RunCard {
+    pub(crate) fn of(notice: &Notice) -> Self {
+        Self {
+            urgency: notice.urgency(),
+            rows: rows(notice),
+        }
+    }
+}
+
+/// How many rows `notice` draws: one per item, or its title alone from a
+/// rho that doesn't say ([`Card::of`]).
+fn rows(notice: &Notice) -> usize {
+    notice.items().len().max(1)
+}
+
+/// The places in a run of these cards that fold behind one row: those
+/// that may fold and start past the first [`FOLD_AFTER`] rows, once they
+/// draw at least [`FOLD_AT_LEAST`] rows. None fold otherwise.
+fn folded(cards: &[RunCard]) -> Vec<usize> {
+    let (mut above, mut hidden) = (0, 0);
+    let mut folds = Vec::new();
+    for (at, card) in cards.iter().enumerate() {
+        if above >= FOLD_AFTER && may_fold(card.urgency) {
+            folds.push(at);
+            hidden += card.rows;
+        }
+        above += card.rows;
+    }
+    if hidden < FOLD_AT_LEAST {
         return Vec::new();
     }
     folds
@@ -121,14 +148,14 @@ pub(crate) enum Place {
     Hidden,
 }
 
-/// Where each card of a run asking these urgencies goes, while the user
-/// has the run's folded cards `shown` or not: on its own rows, as the fold
-/// row, or nowhere. The line stops at the last card that shows.
-pub(crate) fn places(urgencies: &[Urgency], shown: Disclosure) -> Vec<Place> {
+/// Where each of a run's cards goes, while the user has the run's folded
+/// cards `shown` or not: on its own rows, as the fold row, or
+/// nowhere. The line stops at the last card that shows.
+pub(crate) fn places(cards: &[RunCard], shown: Disclosure) -> Vec<Place> {
     let folds = if shown.is_open() {
         Vec::new()
     } else {
-        folded(urgencies)
+        folded(cards)
     };
     // The fold row shows in the first folded card's place; the rest hide.
     let hidden = |card: usize| {
@@ -136,8 +163,8 @@ pub(crate) fn places(urgencies: &[Urgency], shown: Disclosure) -> Vec<Place> {
             .get(1..)
             .is_some_and(|rest| rest.binary_search(&card).is_ok())
     };
-    let last_shown = (0..urgencies.len()).rev().find(|&card| !hidden(card));
-    (0..urgencies.len())
+    let last_shown = (0..cards.len()).rev().find(|&card| !hidden(card));
+    (0..cards.len())
         .map(|at| {
             let ends = Ends {
                 first: at == 0,
@@ -250,7 +277,7 @@ pub(crate) struct Card<'a> {
 }
 
 impl<'a> Card<'a> {
-    /// Entry `ix`'s card.
+    /// Entry `ix`'s card, on [`rows`] rows.
     pub(crate) fn of(ix: usize, notice: &'a Notice) -> Self {
         let mut lines: Vec<Line<'a>> = notice.items().iter().map(Line::of).collect();
         if lines.is_empty() {
@@ -260,6 +287,7 @@ impl<'a> Card<'a> {
                 link: None,
             });
         }
+        debug_assert_eq!(lines.len(), rows(notice), "the rows the run is placed by");
         Self {
             key: card_key(ix, notice),
             urgency: notice.urgency(),
@@ -730,25 +758,36 @@ fn on_rail(kind: Dot, ends: Ends, cx: &App) -> Div {
 mod tests {
     use super::*;
 
-    /// The rule a run folds by: the first [`FOLD_AFTER`] always show, then
-    /// cards fold, but only two or more at once, and one that needs the
-    /// reader never.
+    /// A card of `urgency` that draws `rows` rows.
+    fn card(urgency: Urgency, rows: usize) -> RunCard {
+        RunCard { urgency, rows }
+    }
+
+    /// The rule a run folds by: its first [`FOLD_AFTER`] rows always show,
+    /// rounded up to whole cards, then cards fold whole, but only two rows
+    /// or more at once, and one that needs the reader never.
     #[test]
-    fn a_run_folds_its_cards_past_the_first_few() {
+    fn a_run_folds_its_cards_past_the_first_rows() {
         use Urgency::{NeedsYou as Act, Notable as Look, Routine as R};
-        let first = [R; FOLD_AFTER];
-        let run = |rest: &[Urgency]| [&first[..], rest].concat();
-        let cases: [(Vec<Urgency>, Vec<usize>); 4] = [
+        let one = |urgency| card(urgency, 1);
+        let first = [one(R); FOLD_AFTER];
+        let run = |rest: &[RunCard]| [&first[..], rest].concat();
+        let cases: [(Vec<RunCard>, Vec<usize>); 6] = [
             (run(&[]), vec![]),
-            (run(&[Look]), vec![]),
-            (run(&[Look, R]), vec![FOLD_AFTER, FOLD_AFTER + 1]),
+            (run(&[one(Look)]), vec![]),
+            (run(&[one(Look), one(R)]), vec![FOLD_AFTER, FOLD_AFTER + 1]),
             (
-                run(&[Act, Look, Act, R]),
+                run(&[one(Act), one(Look), one(Act), one(R)]),
                 vec![FOLD_AFTER + 1, FOLD_AFTER + 3],
             ),
+            // Two cards of two rows fill the budget.
+            (vec![card(R, 2), card(Look, 2), one(R), one(R)], vec![2, 3]),
+            // The second card starts inside the budget, so it shows all
+            // three rows; the third folds alone, as it draws two.
+            (vec![card(R, 3), card(R, 3), card(R, 2)], vec![2]),
         ];
-        for (urgencies, want) in cases {
-            assert_eq!(folded(&urgencies), want, "urgencies {urgencies:?}");
+        for (cards, want) in cases {
+            assert_eq!(folded(&cards), want, "cards {cards:?}");
         }
     }
 
@@ -758,9 +797,9 @@ mod tests {
     #[test]
     fn the_line_stops_at_the_last_card_shown() {
         use Urgency::{NeedsYou as Act, Routine as R};
-        let mut urgencies = vec![R; FOLD_AFTER];
-        urgencies.extend([R, Act, R]);
-        let folded = places(&urgencies, Disclosure::Folded);
+        let mut cards = vec![card(R, 1); FOLD_AFTER];
+        cards.extend([R, Act, R].map(|urgency| card(urgency, 1)));
+        let folded = places(&cards, Disclosure::Folded);
         let ends = |first, last| Ends { first, last };
         let mut want = vec![Place::Card(ends(true, false))];
         want.extend((1..FOLD_AFTER).map(|_| Place::Card(ends(false, false))));
@@ -774,7 +813,7 @@ mod tests {
         ]);
         assert_eq!(folded, want);
         assert_eq!(
-            places(&urgencies, Disclosure::Open).last(),
+            places(&cards, Disclosure::Open).last(),
             Some(&Place::Card(ends(false, true)))
         );
     }

@@ -31,8 +31,8 @@ fn line(key: &str, n: usize) -> SharedString {
 
 /// A conversation opened again shows its cards as rho saved them: each at
 /// the time it happened, to the second, as rho's file keeps it; one row
-/// for each event a card tells of; and past the first few, the cards that
-/// don't need the user fold behind one row, whatever tone rho gave them,
+/// for each event a card tells of; and past the first few rows, the cards
+/// that don't need the user fold behind one row, whatever tone rho gave them,
 /// while a peer's question, toned a warning, shows. A pull request's chip
 /// shows it in the panel, and a session a card is about opens from its row.
 #[test]
@@ -74,15 +74,18 @@ fn replayed_cards_keep_their_times_and_fold_by_urgency() {
         );
     }
 
-    // `CARDS` says why: the comments, toned as an accent, and the routine
-    // news fold; the question shows though it comes after the fourth.
-    let folded = ["n-pr-101", "n-pr-2040", "n-sweep"];
+    // `CARDS` says why: the first three cards fill the rows that always
+    // show, as the pull request's takes two, so the merge after them folds
+    // with the comments, toned as an accent, and the routine news; the
+    // question shows though it comes past them.
+    let folded = ["n-pr-102", "n-pr-101", "n-pr-2040", "n-sweep"];
     let key = |card: &FakeCard| format!("card-{}", card.id);
     let (shown, hidden): (Vec<&FakeCard>, Vec<&FakeCard>) =
         CARDS.iter().partition(|card| !folded.contains(&card.id));
-    assert_eq!(shown.len(), rail::FOLD_AFTER + 1);
+    let shown_rows: usize = shown.iter().map(|card| card.items.len().max(1)).sum();
+    assert_eq!(shown_rows, rail::FOLD_AFTER + 1);
     ui.wait_until("each shown card's rows, and the fold", |window, _, _| {
-        is_visible(window, "rail-fold-card-n-pr-101")
+        is_visible(window, "rail-fold-card-n-pr-102")
             && shown
                 .iter()
                 .all(|card| (0..card.items.len()).all(|n| is_visible(window, line(&key(card), n))))

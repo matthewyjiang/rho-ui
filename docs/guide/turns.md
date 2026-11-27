@@ -38,7 +38,7 @@ Hovering a message shows when it arrived, and each card rho sends between replie
 
 ## Cards between replies
 
-Past the first four in a row, the cards that don't need you, such as routine pull request news, fold behind one row that says what they hold. A failure or a question waiting on you never folds. rho says which is which; an older rho doesn't, and rho-ui goes by each card's color instead, so a peer's question can fold there.
+A card takes a row for each event it tells of. Past the first four rows of cards in a row, the cards that don't need you, such as routine pull request news, fold behind one row that says what they hold. A card folds whole, so one that starts within those four rows shows all of its own. A failure or a question waiting on you never folds. rho says which is which; an older rho doesn't, and rho-ui goes by each card's color instead, so a peer's question can fold there.
 
 ## Forms
 
