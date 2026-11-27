@@ -22,10 +22,10 @@ rust-version = "1.98"
 # session's reports (rho#2040), lists the configured MCP servers and hooks
 # (rho#2045), sends each event's time and a card's typed notification
 # (rho#2048), each card item's urgency and why a session's MCP server
-# failed (rho#2052), and each card item's tone (rho#2054), which no
-# release has yet. The release takes it from
-# crates.io again.
-rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "551667b497f4d50f71a22adfe4dabf9b7435e8f0" }
+# failed (rho#2052), each card item's tone (rho#2054), and why the agent
+# asks its questions (rho#2056), which no release has yet. The release
+# takes it from crates.io again.
+rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "048d5ea5afbf92e8f4120c06db698ab5c39077a9" }
 # GPUI Kit pins an exact GPUI snapshot (gpui-pre); move both together, on purpose.
 gpui-kit = { version = "=0.9.1", features = ["syntect"] }
 

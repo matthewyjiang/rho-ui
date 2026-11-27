@@ -4,7 +4,7 @@
 //! An approval or a plan approval is a row of buttons, with a text box for
 //! what some of them carry: a denial's reason, a plan approval's feedback.
 //! Questions are GPUI Kit's questionnaire, one question at a time, beside
-//! Decline.
+//! Decline, under why the agent asks, if it says.
 //!
 //! A request with a timeout shows its countdown and the answer the daemon
 //! gives at the deadline. The user's first key or click in the card holds
@@ -28,7 +28,9 @@ use gpui_kit::component::{
         QuestionnairePrevious, QuestionnaireProgress, QuestionnaireSkip, QuestionnaireState,
         QuestionnaireSubmission, QuestionnaireSubmit, QuestionnaireTitle,
     },
+    scroll::ScrollableElement as _,
     tag::Tag,
+    text::{TextView, TextViewState, TextViewStyle},
     tooltip::Tooltip,
     v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size,
 };
@@ -46,6 +48,11 @@ use rho_ui_core::{
 
 /// How often the countdown redraws.
 const TICK: Duration = Duration::from_secs(1);
+
+/// The tallest a plan or a question's reason shows before it scrolls inside
+/// the card, in rems: 192 px at 100%, about nine lines of a reason's `text_sm`,
+/// so the answers under it stay on screen.
+const DETAIL_MAX_REMS: f32 = 12.;
 
 /// A questionnaire's text size, in rems: the app's small text. Kit's own
 /// sizes are in pixels, so they stay put when the UI scale changes; this
@@ -82,6 +89,8 @@ enum Body {
     Questions {
         state: Entity<QuestionnaireState>,
         decline: InputChoice,
+        /// Why the agent asks, parsed once as Markdown.
+        reason: Option<Entity<TextViewState>>,
     },
     Unsupported,
 }
@@ -171,9 +180,11 @@ impl InputCard {
                         }
                     },
                 ));
+                let reason = questions.reason.as_deref();
                 Body::Questions {
                     state,
                     decline: questions.decline.clone(),
+                    reason: reason.map(|reason| cx.new(|cx| TextViewState::markdown(reason, cx))),
                 }
             }
             Form::Unsupported => Body::Unsupported,
@@ -445,12 +456,55 @@ impl InputCard {
         Some(
             div()
                 .id("approval-detail")
-                .max_h(rems(12.))
+                .max_h(rems(DETAIL_MAX_REMS))
                 .overflow_y_scroll()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .font_family(cx.theme().mono_font_family.clone())
                 .child(description)
+                .into_any_element(),
+        )
+    }
+
+    /// Why the agent asks, as body text: it carries what the user needs to
+    /// answer, sometimes a whole design. A long one scrolls inside the card,
+    /// so the questions stay on screen, and a hairline under it ends the
+    /// region that scrolls.
+    fn render_reason(&self, window: &Window, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        let Body::Questions {
+            reason: Some(reason),
+            ..
+        } = &self.body
+        else {
+            return None;
+        };
+        // Its headings, bold at the questions' text size, stay under the
+        // question they lead to; Kit's would set a `##` larger than it.
+        let style = TextViewStyle {
+            heading_base_font_size: window.rem_size() * QUESTION_TEXT_REMS,
+            ..TextViewStyle::default()
+        }
+        .heading_font_size(|_, body| body);
+        let text = div()
+            .id("question-reason-text")
+            .test_support()
+            .text_sm()
+            .child(TextView::new(reason).style(style).selectable(true));
+        Some(
+            div()
+                .id("question-reason")
+                .test_support()
+                .pb_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .max_h(rems(DETAIL_MAX_REMS))
+                        .overflow_y_scrollbar()
+                        // A position of its own, not the last request's.
+                        .id(("question-reason-scroll", cx.entity_id()))
+                        .child(text),
+                )
                 .into_any_element(),
         )
     }
@@ -653,7 +707,9 @@ enum Emphasis {
 impl Render for InputCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let body = match &self.body {
-            Body::Questions { state, decline } => self.render_questions(state, decline, window, cx),
+            Body::Questions { state, decline, .. } => {
+                self.render_questions(state, decline, window, cx)
+            }
             // The text box fills the buttons' row, so the card is no taller
             // for it.
             Body::Choices { choices, text } => h_flex()
@@ -687,6 +743,7 @@ impl Render for InputCard {
             .capture_key_down(cx.listener(|this, _, _, cx| this.start(cx)))
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.start(cx)))
             .child(self.render_header(cx))
+            .children(self.render_reason(window, cx))
             .children(self.render_timeout(cx))
             .children(self.render_description(cx))
             .child(body)

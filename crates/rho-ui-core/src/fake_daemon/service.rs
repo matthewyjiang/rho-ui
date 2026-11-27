@@ -359,28 +359,37 @@ fn reply(answer: &InputAnswer) -> String {
 }
 
 /// What the prompt `prompt` asks, if it asks something other than to run
-/// `ls`: [`super::questions`], with a timeout for "questions timeout", or a
-/// plan approval.
+/// `ls`: [`super::questions`], with [`super::QUESTION_REASON`] for "questions
+/// why", [`super::QUESTION_REASON_AT_LENGTH`] for "questions why at length",
+/// and a timeout for "questions timeout"; or a plan approval.
 fn other_ask(prompt: &str) -> Option<(Ask, Option<InputTimeout>)> {
+    let questions = |reason: Option<&str>| {
+        Ask::Question(QuestionAsk {
+            title: "Set up the tool".to_owned(),
+            reason: reason.map(str::to_owned),
+            questions: super::questions(),
+        })
+    };
     match prompt {
-        "questions" | "questions timeout" => {
+        "questions" => Some((questions(None), None)),
+        "questions why" => Some((questions(Some(super::QUESTION_REASON)), None)),
+        "questions why at length" => {
+            Some((questions(Some(super::QUESTION_REASON_AT_LENGTH)), None))
+        }
+        "questions timeout" => {
             let deadline = SystemTime::now() + Duration::from_secs(300);
             let deadline_ms = deadline
                 .duration_since(UNIX_EPOCH)
                 .expect("the clock is past 1970")
                 .as_millis();
-            let timeout = (prompt == "questions timeout").then(|| InputTimeout {
+            let timeout = InputTimeout {
                 deadline_ms: u64::try_from(deadline_ms).expect("a deadline before 2554"),
                 answer: InputAnswer::Answers {
                     answers: [("lang".to_owned(), vec!["rust".to_owned()])].into(),
                 },
                 reason: "Rust is what the repo uses".to_owned(),
-            });
-            let ask = Ask::Question(QuestionAsk {
-                title: "Set up the tool".to_owned(),
-                questions: super::questions(),
-            });
-            Some((ask, timeout))
+            };
+            Some((questions(None), Some(timeout)))
         }
         "plan" => Some((
             Ask::PlanApproval(PlanApprovalAsk {

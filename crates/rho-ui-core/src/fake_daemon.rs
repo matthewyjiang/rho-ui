@@ -33,9 +33,11 @@
 //!   question that takes the user's own text, and an optional
 //!   multiple-choice one that suggests "test". It answers "you answered"
 //!   and each question's values, or "you declined"; answers that give the
-//!   text "refuse" are refused, leaving the request open. "questions timeout"
-//!   asks the same with a five-minute timeout whose fallback picks Rust;
-//!   holding it drops the timeout.
+//!   text "refuse" are refused, leaving the request open. "questions why"
+//!   asks the same with a reason, [`QUESTION_REASON`], and "questions why
+//!   at length" with a long one, [`QUESTION_REASON_AT_LENGTH`]. "questions
+//!   timeout" asks the same with a five-minute timeout whose fallback picks
+//!   Rust; holding it drops the timeout.
 //! - The prompt "pictures" reads an image, whose call carries it, and
 //!   answers with two images by path, `plot.png` and `missing.png`, from
 //!   the session's folder.
@@ -358,6 +360,31 @@ pub fn questions() -> Vec<Question> {
         },
     ]
 }
+
+/// Why the agent asks [`questions`], for the prompt "questions why": one
+/// line of Markdown.
+pub const QUESTION_REASON: &str =
+    "The repo has no linter yet, so this picks what `rho-lint` is written in and what CI runs.";
+
+/// Why the agent asks [`questions`], for the prompt "questions why at
+/// length": a design in Markdown, as an agent puts in a reason, too tall
+/// for the card to show whole.
+pub const QUESTION_REASON_AT_LENGTH: &str = "## Where things stand\n\n\
+     The repo has no linter yet. Reviews catch the same three mistakes every week: \
+     unused imports, `unwrap` in library code, and tests that sleep instead of waiting \
+     on a signal.\n\n\
+     ## The plan\n\n\
+     1. Add a `rho-lint` crate under `tools/`, with one rule per mistake.\n\
+     2. Run it in CI beside the checks you pick, failing the build on any finding.\n\
+     3. Fix what it finds on main in one sweep, so nobody inherits a red build.\n\n\
+     ```toml\n[workspace]\nmembers = [\"crates/*\", \"tools/rho-lint\"]\n```\n\n\
+     ## Why the language matters\n\n\
+     Written in Rust, it shares the workspace's lints, build and release, and parses \
+     with `syn`. Written in Go, it builds quicker, but it needs a second toolchain in \
+     CI and on every machine that runs it.\n\n\
+     ## What the checks cost\n\n\
+     Format and Clippy take under a minute together. Tests take about eight, so \
+     running them on every push doubles the queue on a busy day.";
 
 /// Writes the program `text` to `path`, runnable, from a child process,
 /// for tests that stand in a fake `rho` or the like. A handle written through

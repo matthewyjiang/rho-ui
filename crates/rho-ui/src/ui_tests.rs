@@ -29,16 +29,17 @@ use rho_ui_core::{
     agent_settings::{ModelSelection, SettingValue},
     fake_daemon::{
         report, write_program, Answers, FakeDaemon, PullRequestMethods, Script, SessionLists,
-        Started, TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, REFUSED_KEY,
-        SUBAGENT_AGENT, SUBAGENT_MODEL, SUBAGENT_TASK, TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
+        Started, TuiJob, COMPACTED, KEY_AUTH, LOGIN_AUTH, PULL_REQUEST_BODY, QUESTION_REASON,
+        QUESTION_REASON_AT_LENGTH, REFUSED_KEY, SUBAGENT_AGENT, SUBAGENT_MODEL, SUBAGENT_TASK,
+        TUI_SESSION, UNCHECKED_KEY, WORKFLOW_ERROR,
     },
     platform, Attachment, BackgroundKind, BackgroundStatus, BranchLookup, Checkout, Choices,
-    Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, LinkedPullRequest, ModelRef,
-    NewSessionMark, PermissionMode, ProcessStream, PromptKey, PullRequestId, PullRequestLinkOrigin,
-    PullRequestRead, PullRequestRollup, PullRequestState, PullRequestSummary, PullRequestTrouble,
-    ReasoningLevel, ReportError, RestartCost, RetryReason, RhoInstall, RunState, Session,
-    SessionId, SessionMark, SessionOptions, SessionPullRequests, StartedMode,
-    StartedSessionDefaults, ToolStatus, WorktreeVerdict, LEAD_AGENT,
+    Compaction, ContextSize, Daemon, DaemonTarget, Delay, Entry, Form, InputRequest,
+    LinkedPullRequest, ModelRef, NewSessionMark, PermissionMode, ProcessStream, PromptKey,
+    PullRequestId, PullRequestLinkOrigin, PullRequestRead, PullRequestRollup, PullRequestState,
+    PullRequestSummary, PullRequestTrouble, ReasoningLevel, ReportError, RestartCost, RetryReason,
+    RhoInstall, RunState, Session, SessionId, SessionMark, SessionOptions, SessionPullRequests,
+    StartedMode, StartedSessionDefaults, ToolStatus, WorktreeVerdict, LEAD_AGENT,
 };
 
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
@@ -1031,8 +1032,18 @@ fn a_retried_response_replaces_the_discarded_one_and_the_plan_shows() {
     ui.shot("answered");
 }
 
+/// Why the agent asks the open questionnaire, if it says.
+fn asked_reason(ui: &mut Harness) -> Option<String> {
+    match ui.session().inputs().first().map(InputRequest::form) {
+        Some(Form::Questions(questions)) => questions.reason.clone(),
+        other => panic!("no questionnaire is open: {other:?}"),
+    }
+}
+
 /// A questionnaire of two questions, one taking the user's own text and
-/// one taking several choices, is answered one question at a time.
+/// one taking several choices, is answered one question at a time. Why
+/// the agent asks shows above them when it says, and a long reason scrolls
+/// inside the card rather than pushing the questions away.
 #[test]
 fn a_questionnaire_is_answered_one_question_at_a_time() {
     let mut ui = Harness::start("questions", Script::default());
@@ -1040,12 +1051,17 @@ fn a_questionnaire_is_answered_one_question_at_a_time() {
     ui.wait_until("the first question", |window, _, _| {
         is_visible(window, "question-lang-rust") && is_visible(window, "approval-decline")
     });
+    assert_eq!(asked_reason(&mut ui), None);
     ui.act(|window, _| {
         assert!(
             !is_visible(window, "question-checks-fmt"),
             "one question at a time"
         );
         assert!(!is_visible(window, "input-timeout"), "no timeout was set");
+        assert!(
+            window.try_find("question-reason").is_none(),
+            "no reason was given"
+        );
         // Both choices have a description; only Rust's wraps.
         let height = |id| bounds(window, id).map(|b| b.size.height);
         assert!(
@@ -1079,6 +1095,37 @@ fn a_questionnaire_is_answered_one_question_at_a_time() {
     ui.act(|window, _| {
         assert!(!is_visible(window, "input-card"), "the card closes");
     });
+
+    // A short reason shows whole; a long one scrolls in its box.
+    for (prompt, reason, scrolls, shot) in [
+        ("questions why", QUESTION_REASON, false, "reason"),
+        (
+            "questions why at length",
+            QUESTION_REASON_AT_LENGTH,
+            true,
+            "reason-long",
+        ),
+    ] {
+        ui.send(prompt);
+        ui.wait_until("the questions under their reason", |window, _, _| {
+            is_visible(window, "question-reason") && is_visible(window, "question-lang-rust")
+        });
+        assert_eq!(asked_reason(&mut ui).as_deref(), Some(reason));
+        ui.act(|window, _| {
+            let height = |id| bounds(window, id).map(|b| b.size.height);
+            let (shown, text) = (height("question-reason"), height("question-reason-text"));
+            assert_eq!(text > shown, scrolls, "{prompt}: {text:?} in {shown:?}");
+            assert!(
+                is_visible(window, "approval-decline"),
+                "{prompt}: the answers stay on screen"
+            );
+        });
+        ui.shot(shot);
+        ui.click("approval-decline");
+        ui.wait_for_session("the declined turn", |session| {
+            session.state() == &RunState::Idle && session.inputs().is_empty()
+        });
+    }
 }
 
 /// An answer the daemon refuses leaves the card as the user filled it in,
