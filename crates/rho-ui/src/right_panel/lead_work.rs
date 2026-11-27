@@ -1,16 +1,21 @@
 //! The Work surface: a lead's work at a glance. It lists the sessions the
 //! lead started, as the sidebar lists them, and the pull requests linked to
 //! the lead, as [`PullRequests`] holds them, in three parts by [`Stage`]:
-//! what needs the user, what is in progress, and what is finished. A
-//! session's row opens it, as its row in the sidebar does; a PR linked to
-//! the lead shows in the lead's Pull request surface. It redraws as the
-//! sidebar's list and the PRs change.
+//! what needs the user, what is in progress, and what is finished. The
+//! finished part starts folded under a header that counts it, and stays as
+//! the user leaves it while the tab is open. A session's row opens it, as its
+//! row in the sidebar does; a PR linked to the lead shows in the lead's Pull
+//! request surface. It redraws as the sidebar's list and the PRs change.
 
-use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{h_flex, list::ListItem, v_flex, ActiveTheme as _, StyledExt as _};
+use gpui_kit::base::{AccordionTrigger, TestSupportExt as _};
+use gpui_kit::component::{
+    collapsible::Collapsible, h_flex, list::ListItem, v_flex, ActiveTheme as _, GlobalState, Icon,
+    IconName, Sizable as _, StyledExt as _, ThemeStyled as _,
+};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    div, AnyElement, App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled,
     Subscription, WeakEntity, Window,
 };
 use rho_ui_core::{LinkedPullRequest, PullRequestId, PullRequestState};
@@ -22,6 +27,7 @@ use crate::{
     pull_requests::{Mark, PullRequests},
     session_list::Status,
     sidebar::SidebarView,
+    work::Disclosure,
 };
 
 /// What a session's row says while it has no PR.
@@ -202,6 +208,12 @@ pub(super) struct WorkSurface {
     // Called, not sent an event: showing a PR needs a window, and the
     // panel makes this tab where it has none to subscribe with.
     panel: WeakEntity<RightPanel>,
+    /// Whether the finished part shows its rows. It lives as long as this
+    /// tab: the panel keeps a lead's tabs while the app runs, unless the
+    /// user closes one.
+    finished: Disclosure,
+    /// The finished part's header, a Tab stop.
+    finished_focus: FocusHandle,
     _subscriptions: [Subscription; 2],
 }
 
@@ -222,6 +234,8 @@ impl WorkSurface {
             sidebar,
             prs,
             panel,
+            finished: Disclosure::Folded,
+            finished_focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
     }
@@ -314,30 +328,104 @@ impl WorkSurface {
         }
     }
 
-    /// `section`'s header over its rows.
-    fn render_section(section: Section<'_>, cx: &Context<'_, Self>) -> AnyElement {
-        let (id, label) = (section.stage.id(), section.stage.label());
-        v_flex()
-            .gap_0p5()
-            .child(
-                div()
-                    .id(id)
+    /// `section`'s header over its rows. Only the finished part's header
+    /// folds them away; folded, they aren't built.
+    fn render_section(
+        &self,
+        Section { stage, items }: Section<'_>,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let (header, open) = match stage {
+            Stage::Finished => (
+                self.render_fold(items.len(), window, cx),
+                self.finished.is_open(),
+            ),
+            Stage::NeedsYou | Stage::InProgress => {
+                let header = div()
+                    .id(stage.id())
                     .test_support()
-                    .aria_label(label)
-                    .pb_1()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label),
-            )
-            .children(
-                section
-                    .items
-                    .into_iter()
-                    .map(|item| Self::render_item(item, cx)),
-            )
+                    .aria_label(stage.label())
+                    .child(stage.label());
+                (header_type(header, cx).into_any_element(), true)
+            }
+        };
+        Collapsible::new()
+            .open(open)
+            .gap_0p5()
+            .child(header)
+            .when(open, |this| {
+                this.content(
+                    v_flex()
+                        .gap_0p5()
+                        .children(items.into_iter().map(|item| Self::render_item(item, cx))),
+                )
+            })
             .into_any_element()
     }
+
+    /// "› Finished · 12": the finished part's header over its `count`
+    /// rows, which a click, or Enter or Space while it has the keyboard,
+    /// opens or folds.
+    fn render_fold(&self, count: usize, window: &Window, cx: &Context<'_, Self>) -> AnyElement {
+        let stage = Stage::Finished;
+        let open = self.finished.is_open();
+        let label = format!("{} · {count}", stage.label());
+        let chevron = if open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        let theme = cx.theme();
+        let foreground = theme.foreground;
+        let view = cx.weak_entity();
+        let header = AccordionTrigger::new(stage.id())
+            .open(open)
+            .track_focus(&self.finished_focus)
+            .tab_index(0)
+            .aria_label(label.clone())
+            .h_flex()
+            .gap_1()
+            // The focus ring hugs the label, with room around it, and the
+            // label lines up with the other parts' headers.
+            .self_start()
+            .px_1()
+            .ml_neg_1()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .hover(move |style| style.text_color(foreground))
+            // As Kit's Button does: a press neither moves the keyboard here
+            // nor starts selecting text, so only Tab focuses the header.
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                GlobalState::suppress_text_selection(cx);
+            })
+            .when(self.finished_focus.is_focused(window), |this| {
+                this.focus_ring_style(window, cx)
+            })
+            .child(Icon::new(chevron).xsmall())
+            .child(label)
+            .on_change(move |open, _, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.finished = if open {
+                        Disclosure::Open
+                    } else {
+                        Disclosure::Folded
+                    };
+                    cx.notify();
+                });
+            });
+        header_type(header, cx).into_any_element()
+    }
+}
+
+/// `header` in a part header's type: small, bold and muted, over a gap.
+fn header_type<E: Styled>(header: E, cx: &App) -> E {
+    header
+        .pb_1()
+        .text_xs()
+        .font_semibold()
+        .text_color(cx.theme().muted_foreground)
 }
 
 /// A row with element ID `id`: `mark` and `title` on its first line, and
@@ -377,8 +465,8 @@ fn row(
 }
 
 impl Render for WorkSurface {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let cx = &*cx;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let (window, cx) = (&*window, &*cx);
         let prs = self.prs.read(cx);
         let workers: Vec<(Worker, Option<Mark<'_>>)> = self
             .sidebar
@@ -411,7 +499,7 @@ impl Render for WorkSurface {
             .children(
                 sections
                     .into_iter()
-                    .map(|section| Self::render_section(section, cx)),
+                    .map(|section| self.render_section(section, window, cx)),
             )
             .into_any_element()
     }
