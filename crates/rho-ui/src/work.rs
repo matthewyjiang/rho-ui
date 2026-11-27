@@ -217,49 +217,75 @@ fn parse_patches(tool: &ToolCall) -> Patches {
 }
 
 /// What a step's details draw as Markdown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum BodyKind {
     Thought,
     /// A tool's Markdown body, such as an agent's message.
     Markdown,
     /// A tool's code body, highlighted in a fenced block.
-    Code,
+    Code {
+        /// Where in the view's source the code [`searched`] gives lies:
+        /// its fence comes before it.
+        shown: Range<usize>,
+        /// How many earlier lines [`tail`] hid.
+        hidden: usize,
+    },
+}
+
+impl BodyKind {
+    /// Whether find searches the body as its view renders it, rather than
+    /// in the code [`searched`] gives.
+    fn searched_rendered(&self) -> bool {
+        match self {
+            Self::Thought | Self::Markdown => true,
+            Self::Code { .. } => false,
+        }
+    }
+}
+
+/// The text a step's details draw as Markdown, as the step holds it.
+#[derive(Clone, Copy)]
+enum Details<'a> {
+    Thought(&'a str),
+    Markdown(&'a str),
+    Code { language: &'a str, text: &'a str },
+}
+
+/// What `step`'s details draw as Markdown, if they draw any: a thought, or
+/// a tool card's Markdown or code body. [`BodyView`] and find tell which
+/// by it.
+fn details(step: Step<'_>) -> Option<Details<'_>> {
+    match step {
+        Step::Thought(thought) => Some(Details::Thought(thought.text())),
+        Step::Tool(tool) => match tool.card().map(rho_ui_core::ToolCard::body)? {
+            ToolBody::Markdown(text) => Some(Details::Markdown(text)),
+            ToolBody::Code { language, text } => Some(Details::Code { language, text }),
+            ToolBody::None | ToolBody::Text(_) | ToolBody::Search(_) => None,
+        },
+    }
 }
 
 /// A step's details as Markdown, as its text view is given it.
 struct MarkdownBody<'a> {
     kind: BodyKind,
     source: Cow<'a, str>,
-    /// Where in `source` the text [`searched`] gives lies: a code body's
-    /// fence comes before it.
-    shown: Range<usize>,
-    /// How many earlier lines of a code body [`tail`] hid.
-    hidden: usize,
 }
 
-/// The Markdown `step`'s details draw, if they draw any: a thought, or a
-/// tool card's Markdown or code body.
+/// The Markdown `step`'s details draw, if they draw any.
 fn markdown_body(step: Step<'_>) -> Option<MarkdownBody<'_>> {
-    fn whole(kind: BodyKind, text: &str) -> MarkdownBody<'_> {
-        MarkdownBody {
-            kind,
-            shown: 0..text.len(),
-            source: Cow::Borrowed(text),
-            hidden: 0,
-        }
-    }
-    match step {
-        Step::Thought(thought) => Some(whole(BodyKind::Thought, thought.text())),
-        Step::Tool(tool) => match tool.card().map(rho_ui_core::ToolCard::body)? {
-            ToolBody::Markdown(text) => Some(whole(BodyKind::Markdown, text)),
-            ToolBody::Code { language, text } => Some(markdown_body_of_code(language, text)),
-            ToolBody::None | ToolBody::Text(_) | ToolBody::Search(_) => None,
-        },
-    }
+    let whole = |kind, text| MarkdownBody {
+        kind,
+        source: Cow::Borrowed(text),
+    };
+    Some(match details(step)? {
+        Details::Thought(text) => whole(BodyKind::Thought, text),
+        Details::Markdown(text) => whole(BodyKind::Markdown, text),
+        Details::Code { language, text } => markdown_body_of_code(language, text),
+    })
 }
 
-/// The text view of an open step's Markdown details, made when they first
-/// open, so find can highlight in it (Kit's highlights live on a view's
+/// The text view of a step's Markdown details, made when they first open,
+/// which find marks its matches in (Kit's highlights live on a view's
 /// state).
 pub(crate) struct BodyView {
     /// The step's entry index.
@@ -267,8 +293,6 @@ pub(crate) struct BodyView {
     kind: BodyKind,
     state: Entity<TextViewState>,
     source: String,
-    shown: Range<usize>,
-    hidden: usize,
     _relayout: Subscription,
 }
 
@@ -282,12 +306,7 @@ impl BodyView {
         relayout: impl Fn(&mut App) + 'static,
         cx: &mut App,
     ) -> Option<Self> {
-        let MarkdownBody {
-            kind,
-            source,
-            shown,
-            hidden,
-        } = markdown_body(step)?;
+        let MarkdownBody { kind, source } = markdown_body(step)?;
         let state = cx.new(|cx| TextViewState::markdown(&source, cx));
         let relayout = cx.observe(&state, move |_, cx| relayout(cx));
         Some(Self {
@@ -295,8 +314,6 @@ impl BodyView {
             kind,
             state,
             source: source.into_owned(),
-            shown,
-            hidden,
             _relayout: relayout,
         })
     }
@@ -311,7 +328,7 @@ impl BodyView {
                 .update(cx, |state, cx| state.set_text(&body.source, cx));
             self.source = body.source.into_owned();
         }
-        (self.kind, self.shown, self.hidden) = (body.kind, body.shown, body.hidden);
+        self.kind = body.kind;
     }
 
     pub(crate) fn state(&self) -> &Entity<TextViewState> {
@@ -319,29 +336,46 @@ impl BodyView {
     }
 
     /// The view's text as it parsed it, if it has parsed what it was last
-    /// given, so `range` of the text [`searched`] gives for the step maps
-    /// onto it ([`Self::rendered_range`]).
+    /// given: until then find's matches in it may index older text, and a
+    /// code body's can't map onto it ([`Self::marked_range`]).
     pub(crate) fn rendered(&self, cx: &App) -> Option<RenderedText> {
         let rendered = self.state.read(cx).rendered_text();
         (rendered.source() == self.source).then_some(rendered)
     }
 
-    /// Where `range` of the step's searched text is in `rendered`, if it
-    /// draws any of it.
-    pub(crate) fn rendered_range(
+    /// The text find searches for a thought or a tool's Markdown body: what
+    /// the view renders, as of its last parse. `None` for a code body,
+    /// searched in its code ([`searched`]).
+    pub(crate) fn searched_text(&self, cx: &App) -> Option<RenderedText> {
+        self.kind
+            .searched_rendered()
+            .then(|| self.state.read(cx).rendered_text())
+    }
+
+    /// Where find's match `range` in `field` lies in `rendered`, the view's
+    /// parsed text, if it draws any of it: a [`Field::Body`] match as it
+    /// is, a [`Field::Code`] match mapped from the code [`searched`] gives.
+    pub(crate) fn marked_range(
         &self,
         rendered: &RenderedText,
+        field: Field,
         range: &Range<usize>,
     ) -> Option<Range<usize>> {
-        let start = self.shown.start;
-        rendered.range_for_source(start + range.start..start + range.end)
+        match (field, &self.kind) {
+            (Field::Body, kind) if kind.searched_rendered() => Some(range.clone()),
+            (Field::Code, BodyKind::Code { shown, .. }) => {
+                let start = shown.start;
+                rendered.range_for_source(start + range.start..start + range.end)
+            }
+            _ => None,
+        }
     }
 
     fn render(&self) -> AnyElement {
         let view = TextView::new(&self.state).selectable(true);
         match self.kind {
             BodyKind::Thought | BodyKind::Markdown => view.into_any_element(),
-            BodyKind::Code => tailed(self.hidden, code_view(view)).into_any_element(),
+            BodyKind::Code { hidden, .. } => tailed(hidden, code_view(view)).into_any_element(),
         }
     }
 }
@@ -564,7 +598,8 @@ fn details_body(step: Step<'_>, state: StepState<'_>, cx: &App) -> AnyElement {
         find,
         ..
     } = state;
-    let output_height = state.height(|field| matches!(field, Field::Output(_) | Field::Body));
+    let output_height =
+        state.height(|field| matches!(field, Field::Output(_) | Field::Body | Field::Code));
     match step {
         Step::Thought(_) => {
             let text = body.map_or_else(|| div().into_any_element(), BodyView::render);
@@ -925,12 +960,24 @@ fn shown_tail(text: &str) -> &str {
     tail(text.trim_end()).0
 }
 
+/// The Markdown of `step`'s details if find searches them as they render
+/// ([`BodyKind::searched_rendered`]): a thought's, or a tool card's
+/// Markdown body.
+pub(crate) fn rendered_body(step: Step<'_>) -> Option<&str> {
+    match details(step)? {
+        Details::Thought(text) | Details::Markdown(text) => Some(text),
+        Details::Code { .. } => None,
+    }
+}
+
 /// What find searches in `step`, each text as its part of the transcript
-/// draws it: a tool's line, its command, notes and output, or a thought.
-/// The file changes a call shows in a diff aren't searched.
+/// draws it: a tool's line, its command, notes, output and code body. A
+/// thought and a Markdown body are searched as they render instead
+/// ([`rendered_body`]). The file changes a call shows in a diff
+/// aren't searched.
 pub(crate) fn searched(step: Step<'_>) -> Vec<(Field, Cow<'_, str>)> {
     let tool = match step {
-        Step::Thought(thought) => return vec![(Field::Body, Cow::Borrowed(thought.text()))],
+        Step::Thought(_) => return Vec::new(),
         Step::Tool(tool) => tool,
     };
     let mut texts = vec![(Field::Line, Cow::Owned(step_label(step).to_string()))];
@@ -939,14 +986,14 @@ pub(crate) fn searched(step: Step<'_>) -> Vec<(Field, Cow<'_, str>)> {
     let notes = note_texts(tool).enumerate();
     texts.extend(notes.map(|(n, (text, _))| (Field::Note(n), Cow::Borrowed(text))));
     match tool.card().map(rho_ui_core::ToolCard::body) {
-        Some(ToolBody::None) => {}
+        // A Markdown body is searched as it renders ([`rendered_body`]).
+        Some(ToolBody::None | ToolBody::Markdown(_)) => {}
         Some(ToolBody::Text(text)) => {
             texts.push((Field::Output(0), Cow::Borrowed(shown_tail(text))));
         }
-        // As [`markdown_body`] shows them.
-        Some(ToolBody::Markdown(text)) => texts.push((Field::Body, Cow::Borrowed(text))),
+        // As [`markdown_body_of_code`] shows it.
         Some(ToolBody::Code { text, .. }) => {
-            texts.push((Field::Body, Cow::Borrowed(shown_tail(text))));
+            texts.push((Field::Code, Cow::Borrowed(shown_tail(text))));
         }
         Some(ToolBody::Search(lines)) => {
             texts.extend(lines.iter().enumerate().map(|(n, line)| {
@@ -1056,10 +1103,11 @@ fn markdown_body_of_code<'a>(language: &str, text: &'a str) -> MarkdownBody<'a> 
     let fence = "`".repeat(longest_ticks.max(2) + 1);
     let start = fence.len() + language.len() + 1;
     MarkdownBody {
-        kind: BodyKind::Code,
+        kind: BodyKind::Code {
+            shown: start..start + text.len(),
+            hidden,
+        },
         source: Cow::Owned(format!("{fence}{language}\n{text}\n{fence}")),
-        shown: start..start + text.len(),
-        hidden,
     }
 }
 

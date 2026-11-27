@@ -3209,12 +3209,15 @@ fn find_steps_through_matches_into_folded_work() {
         is_visible(window, "worked-2") && !is_visible(window, "details-2")
     });
     let entries = ui.session().entries().to_vec();
+    // The current match's entry, by its first line or as a thought.
     let kind = |current: Option<(usize, Field)>| {
-        current.map(|(entry, field)| match &entries[entry] {
-            Entry::Agent(message) => (message.text().lines().next().map(str::to_owned), field),
-            Entry::Thought(_) => (Some(format!("thought {entry}")), field),
-            _ => (None, field),
-        })
+        let (entry, field) = current?;
+        let what = match &entries[entry] {
+            Entry::Agent(message) => message.text().lines().next()?.to_owned(),
+            Entry::Thought(_) => format!("thought {entry}"),
+            _ => String::new(),
+        };
+        Some((what, field))
     };
     let app = ui.app.clone();
     let state = move |ui: &mut Harness| {
@@ -3236,14 +3239,15 @@ fn find_steps_through_matches_into_folded_work() {
     });
     ui.act(|window, cx| window.input("WALK", cx));
     // In each turn: the thought's "walker" and "walk", the search's
-    // `src/n/walk.rs`, the command's `walk(n)`, and the answer's "walks".
-    // The first match from the top of the view on is current: turn 1's
-    // answer, near the end.
+    // `src/n/walk.rs`, the command's `walk(n)`, and the answer's "walks";
+    // not the address of the thought's link, which doesn't show. The first
+    // match from the top of the view on is current: turn 1's answer, near
+    // the end.
     ui.wait_for_label("find-count", "10 of 15");
     let (_, current, bottom) = state(&mut ui);
     assert_eq!(
         kind(current),
-        Some((Some("## Answer 1".to_owned()), Field::Part(0)))
+        Some(("## Answer 1".to_owned(), Field::Part(0)))
     );
     ui.shot("found");
 
@@ -3259,10 +3263,7 @@ fn find_steps_through_matches_into_folded_work() {
         is_visible(window, "details-2")
     });
     let (_, current, top) = state(&mut ui);
-    assert_eq!(
-        kind(current),
-        Some((Some("thought 2".to_owned()), Field::Body))
-    );
+    assert_eq!(kind(current), Some(("thought 2".to_owned(), Field::Body)));
     assert!(top < bottom, "scrolled up from item {bottom} to {top}");
     ui.cx.advance_clock(Duration::from_secs(1));
     ui.shot("in-fold");
@@ -3272,6 +3273,16 @@ fn find_steps_through_matches_into_folded_work() {
     ui.wait_for_label("find-count", "15 of 15");
     ui.act(|window, cx| window.press("enter", cx));
     ui.wait_for_label("find-count", "1 of 15");
+
+    // A phrase that reads across bold in a thought, "The **tree** walk",
+    // is found as it reads. The shortcut selects the query to type over.
+    ui.act(|window, cx| window.press("secondary-f", cx));
+    ui.act(|window, cx| window.input("tree walk", cx));
+    ui.wait_for_label("find-count", "1 of 3");
+    let (_, current, _) = state(&mut ui);
+    assert_eq!(kind(current), Some(("thought 2".to_owned(), Field::Body)));
+    ui.cx.advance_clock(Duration::from_secs(1));
+    ui.shot("across-bold");
 
     // Escape closes it from outside its field too, rather than stopping
     // the turn as it does with no bar open.

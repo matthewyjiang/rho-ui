@@ -449,7 +449,7 @@ impl Transcript {
                 self.remeasure(self.run_of(before, entries), cx);
             }
         }
-        self.find_again(seen_entries..entries.len(), entries, cx);
+        self.find_changed(seen_entries..entries.len(), entries, cx);
     }
 
     /// The rail row `row` shows, if it shows one, with its entry: a card,
@@ -561,11 +561,11 @@ impl Transcript {
                 body.update(step, cx);
             }
         }
+        self.find_changed(ix..ix + 1, entries, cx);
         // Open before its patch or body came: their views are made now.
         if self.details.get(ix).is_some_and(|open| open.is_open()) {
             self.open_views(ix, entries, cx);
         }
-        self.find_again(ix..ix + 1, entries, cx);
         if let Some(row) = self.timeline.row_of(ix) {
             self.remeasure(row..row + 1, cx);
         }
@@ -596,7 +596,7 @@ impl Transcript {
         };
         if let Some(body) = BodyView::new(ix, step, relayout, cx) {
             self.bodies.push(body);
-            self.find_again(ix..ix + 1, entries, cx);
+            self.find_opened(ix, entries, cx);
         }
     }
 

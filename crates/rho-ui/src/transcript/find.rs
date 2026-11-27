@@ -5,9 +5,10 @@
 //! It searches what the user can read, in the session's data rather than in
 //! laid-out rows, so it finds what lies off screen or folded away: prompts,
 //! replies and notices as their Markdown renders (the text Kit's view of
-//! each holds, parsed whether or not it is drawn), and each step's line,
-//! command, notes and output as [`work::searched`] lists them. A match the
-//! user moves to opens the folds around it, which stay open, as a browser's
+//! each holds, parsed whether or not it is drawn), thoughts and tools'
+//! Markdown as it would render, and each step's line, command, notes,
+//! output and code as [`work::searched`] lists them. A match the user moves
+//! to opens the folds around it, which stay open, as a browser's
 //! hidden-until-found text does. Diffs, compactions, surfaces and images
 //! aren't searched.
 //!
@@ -15,10 +16,13 @@
 //! and its byte range there. Markdown is marked with Kit's range
 //! highlights; text rho-ui draws itself, through [`Marks`].
 //!
-//! A step's Markdown body (a thought, a tool's Markdown) has no text view
-//! until its details open, so it is searched in its source, unlike a
-//! reply. So a match in its Markdown syntax, such as a link's address,
-//! counts but marks nothing, and one that spans emphasis isn't found.
+//! A step's Markdown details have no text view until they open, so until
+//! then a thought or a tool's Markdown body is searched in the text its
+//! view would show ([`shown::shown_text`]), worked out as the bar opens
+//! and kept until the step changes. Once they open, it is searched in its
+//! view's text, as a reply is.
+
+mod shown;
 
 use std::{cell::Cell, collections::BTreeSet, ops::Range, rc::Rc, time::Duration};
 
@@ -65,9 +69,13 @@ pub(crate) enum Field {
     /// Text `n` of a tool call's output: its text body, a line of its
     /// search results, or a text it read without a card.
     Output(usize),
-    /// A thought, or a tool card's Markdown or code body. Its ranges index
-    /// the text [`work::searched`] gives.
+    /// A thought, or a tool card's Markdown body. Its ranges index the
+    /// text its view renders, or would ([`shown::shown_text`]) before its
+    /// details open.
     Body,
+    /// A tool card's code body. Its ranges index the code
+    /// [`work::searched`] gives, which its view draws as it is.
+    Code,
 }
 
 impl Field {
@@ -83,7 +91,7 @@ impl Field {
     fn in_details(self) -> bool {
         matches!(
             self,
-            Self::Command | Self::Note(_) | Self::Output(_) | Self::Body
+            Self::Command | Self::Note(_) | Self::Output(_) | Self::Body | Self::Code
         )
     }
 }
@@ -285,10 +293,27 @@ pub(crate) struct Find {
     /// Entries whose Markdown hadn't parsed its latest text when searched:
     /// they are searched again once it has ([`Transcript::find_reparsed`]).
     pending: BTreeSet<usize>,
+    /// Per entry: the text a thought or Markdown body shows, which it is
+    /// searched in while it has no view. Kept while the bar is closed,
+    /// until the entry changes.
+    shown: Vec<Option<String>>,
     reveal: Reveal,
 }
 
 impl Find {
+    /// Works out the text entry `entry` shows, if it is a thought or a
+    /// Markdown body and that isn't known.
+    fn index_shown(&mut self, entry: usize, entries: &[Entry]) {
+        if self.shown.len() < entries.len() {
+            self.shown.resize(entries.len(), None);
+        }
+        let Some(slot @ None) = self.shown.get_mut(entry) else {
+            return;
+        };
+        let step = entries.get(entry).and_then(Entry::as_step);
+        *slot = step.and_then(work::rendered_body).map(shown::shown_text);
+    }
+
     /// The current match's field in entry `entry`, if it lies there.
     pub(crate) fn current_in(&self, entry: usize) -> Option<Field> {
         let at = self.hits.current().filter(|at| at.entry == entry)?;
@@ -444,6 +469,7 @@ impl Transcript {
     /// the top of the transcript's view on, or the last above it, which it
     /// scrolls to.
     pub(crate) fn find(&mut self, query: &str, entries: &[Entry], cx: &mut App) {
+        let was = self.find.hits.current();
         self.find.matcher = Matcher::new(query);
         self.find.hits = Hits::default();
         self.find.pending.clear();
@@ -460,6 +486,10 @@ impl Transcript {
         });
         self.paint_all(cx);
         self.reveal(entries, None, cx);
+        // The last query's current match let its row grow to hold it.
+        if let Some(row) = was.and_then(|at| self.timeline.row_of(at.entry)) {
+            self.remeasure(row..row + 1, cx);
+        }
     }
 
     /// Moves to the next or previous match, and scrolls to it.
@@ -468,6 +498,18 @@ impl Transcript {
         self.find.hits.step(direction);
         self.repaint_current(was, cx);
         self.reveal(entries, was, cx);
+    }
+
+    /// Works out the text each thought and Markdown body shows, those it
+    /// lacks, as the bar opens, so typing only searches. It parses their
+    /// Markdown at once, the first time, which takes as long as they are
+    /// long, without a bound: 0.23 s for a real session of 3,851 thoughts
+    /// (2.4 MB), 0.56 s for 1,000 thoughts of 3 KiB each (release build).
+    /// It keeps only the text.
+    pub(crate) fn prepare_find(&mut self, entries: &[Entry]) {
+        for entry in 0..entries.len() {
+            self.find.index_shown(entry, entries);
+        }
     }
 
     /// Clears the matches; what they opened stays open.
@@ -495,8 +537,38 @@ impl Transcript {
         Some((at.entry, self.find.hits.hit(at)?.field))
     }
 
-    /// Entries from `from` on are new, or entry `from` changed: they are
-    /// searched, keeping the current match.
+    /// Entries `changed` are new or changed: the text they show is worked
+    /// out again ([`Find::shown`]), and they are searched again.
+    pub(super) fn find_changed(&mut self, changed: Range<usize>, all: &[Entry], cx: &mut App) {
+        for entry in changed.clone() {
+            if let Some(shown) = self.find.shown.get_mut(entry) {
+                *shown = None;
+            }
+        }
+        self.find_again(changed, all, cx);
+    }
+
+    /// Step `entry`'s details opened and made its view, which it is
+    /// searched in from now on. In debug builds, checks that the view,
+    /// a whole parse of its text, shows what find searched until now.
+    pub(super) fn find_opened(&mut self, entry: usize, entries: &[Entry], cx: &mut App) {
+        if cfg!(debug_assertions) {
+            let body = self.bodies.iter().find(|body| body.entry == entry);
+            let rendered = body.and_then(|body| body.rendered(cx));
+            if let (Some(rendered), Some(Some(shown))) = (rendered, self.find.shown.get(entry)) {
+                assert_eq!(
+                    shown,
+                    rendered.as_str(),
+                    "shown_text differs from Kit's view"
+                );
+            }
+        }
+        self.find_again(entry..entry + 1, entries, cx);
+    }
+
+    /// Searches `entries` again, keeping the current match: as text they
+    /// hold in a view parses, or a view is made, with the text they show
+    /// unchanged.
     pub(super) fn find_again(&mut self, entries: Range<usize>, all: &[Entry], cx: &mut App) {
         if self.find.matcher.is_none() {
             return;
@@ -512,6 +584,7 @@ impl Transcript {
         self.find.hits.truncate(from);
         self.find.painted.retain(|&entry| entry < from);
         self.find.pending.retain(|&entry| entry < from);
+        self.find.shown.truncate(from);
     }
 
     /// Searches again the entries whose Markdown was still parsing, once
@@ -554,6 +627,11 @@ impl Transcript {
     /// text is pending: its matches are in the text it has, and it is
     /// searched again once it has parsed ([`Self::find_reparsed`]).
     fn search(&mut self, entry: usize, entries: &[Entry], cx: &App) {
+        // One with a view is searched in it ([`Self::search_entry`]).
+        let viewed = self.bodies.iter().any(|body| body.entry == entry);
+        if self.find.matcher.is_some() && !viewed {
+            self.find.index_shown(entry, entries);
+        }
         let hits = self.search_entry(entry, entries, cx);
         self.find.hits.set(entry, hits);
         if self.is_stale(entry, entries, cx) {
@@ -591,6 +669,20 @@ impl Transcript {
         if let Some(step) = shown.as_step() {
             for (field, text) in work::searched(step) {
                 found(field, &text);
+            }
+        }
+        // A view may show other text than a whole parse would, as while
+        // it streams, so the text it holds is searched once it has one.
+        match self.bodies.iter().find(|body| body.entry == entry) {
+            Some(body) => {
+                if let Some(rendered) = body.searched_text(cx) {
+                    found(Field::Body, rendered.as_str());
+                }
+            }
+            None => {
+                if let Some(Some(shown)) = self.find.shown.get(entry) {
+                    found(Field::Body, shown);
+                }
             }
         }
         hits.sort_by_key(Hit::key);
@@ -646,8 +738,10 @@ impl Transcript {
             painted |= !marks.is_empty();
             set_marks(&markdown.text, marks, cx);
         }
-        // A body still parsing keeps its marks until it has: Kit moves them
-        // with its text. They may still need clearing.
+        // A body's matches go on once its view has parsed what it was last
+        // given, a code body's mapped from its code ([`BodyView::marked_range`]).
+        // Until then it keeps its marks: Kit moves them with its text. They
+        // may still need clearing.
         let body = self.bodies.iter().find(|body| body.entry == entry);
         let rendered = body.map(|body| (body, body.rendered(cx)));
         painted |= matches!(rendered, Some((_, None)));
@@ -655,9 +749,8 @@ impl Transcript {
             let marks: Vec<RangeHighlight> = hits
                 .iter()
                 .enumerate()
-                .filter(|(_, hit)| hit.field == Field::Body)
                 .filter_map(|(ix, hit)| {
-                    let range = body.rendered_range(&rendered, &hit.range)?;
+                    let range = body.marked_range(&rendered, hit.field, &hit.range)?;
                     Some(RangeHighlight::new(range, background(ix)))
                 })
                 .collect();
@@ -771,14 +864,14 @@ impl Transcript {
                 };
                 (markdown.text.clone(), hit.range.clone())
             }
-            Field::Body => {
+            Field::Body | Field::Code => {
                 let Some(body) = self.bodies.iter().find(|body| body.entry == at.entry) else {
                     return;
                 };
-                let Some(range) = body
-                    .rendered(cx)
-                    .and_then(|rendered| body.rendered_range(&rendered, &hit.range))
-                else {
+                let Some(rendered) = body.rendered(cx) else {
+                    return;
+                };
+                let Some(range) = body.marked_range(&rendered, hit.field, &hit.range) else {
                     return;
                 };
                 (body.state().clone(), range)
