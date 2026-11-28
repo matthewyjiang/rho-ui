@@ -22,7 +22,10 @@ rust-version = "1.98"
 # manages agent plugins (`rho/plugins/*`) and searches sessions
 # (`rho/session/search`). It also sends each event's time and a card's
 # typed notification, each card item's urgency and tone, why a session's
-# MCP server failed, and why the agent asks its questions.
+# MCP server failed, and why the agent asks its questions. 1.7 marks a
+# setting as one machine's or read-only (`per_machine`, `read_only`), and
+# reads and writes `config.toml`'s tables (`rho/config/table/*`) and the
+# user's hooks file (`rho/hooks/file/*`), for settings sync.
 # Waiting on rho's sync PRs (#2061-#2067): pinned to an integration of
 # them until they land on main, then to a main commit.
 rho-protocol = { git = "https://github.com/matthewyjiang/rho", rev = "3e0bb3fc3f1f6cc556c805cb59206ffe52b3338c" }

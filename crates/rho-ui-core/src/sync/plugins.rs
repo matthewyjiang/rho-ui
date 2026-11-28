@@ -10,9 +10,7 @@ use std::{fmt::Write as _, path::PathBuf};
 use rho_protocol::{Plugin, PluginInstallSource, PluginScope, PluginSource, PluginTarget};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    Action, Change, Copy, GroupKind, Planned, RevertRow, RevertState, Row, RowKey, Unwritten,
-};
+use super::{apply::Unwritten, Action, Change, Copy, GroupKind, Planned, RevertRow, Row, RowKey};
 use crate::{Daemon, Enablement, IfExists, PluginError};
 
 /// A user plugin as an install can make it again on any machine.
@@ -215,11 +213,7 @@ pub(super) fn rows(from: &[Plugin], to: &[Plugin], source: &str, target: &str) -
         if there.is_some_and(|there| same(plugin, there)) {
             return None;
         }
-        let action = if there.is_some() {
-            Action::Change
-        } else {
-            Action::Add
-        };
+        let action = Action::of(Some(plugin), there);
         let copy = match from_source(plugin, source) {
             Err(origin) => {
                 let why =
@@ -385,17 +379,12 @@ pub(super) fn revert_row(
         |copy: Option<&PluginCopy>| copy.map_or_else(|| "Not installed".to_owned(), shown_copy);
     let now = match found {
         Found::Other => {
-            return RevertRow {
-                key: item.key.clone(),
-                label: item.label.clone(),
-                synced: show(after),
-                now: "copied from a folder".to_owned(),
-                before: show(before),
-                state: RevertState::Blocked(
-                    "It's a copy of a folder now, which Revert won't replace".to_owned(),
-                ),
-                item: None,
-            };
+            return RevertRow::blocked(
+                item,
+                [show(before), show(after)],
+                "copied from a folder".to_owned(),
+                "It's a copy of a folder now, which Revert won't replace".to_owned(),
+            );
         }
         Found::Copy(copy) => Some(copy),
         Found::Absent => None,

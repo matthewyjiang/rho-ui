@@ -4,8 +4,6 @@
 //! (`rho/hooks/file/*`). Each has its own revision, which a write sends
 //! back; a stale one is refused as [`DaemonError::Conflict`].
 
-use std::path::PathBuf;
-
 use rho_protocol::{
     methods, ConfigRevision, ConfigTable, ConfigTableGetParams, ConfigTableSetParams, ErrorCode,
     HooksFileGetParams, HooksFileSetParams, TableChange, TableEntry,
@@ -25,8 +23,6 @@ pub struct TableRead {
 /// The user's hooks file as [`Daemon::hooks_file`] read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HooksFileRead {
-    /// Where it is, or would be, on the daemon's machine.
-    pub path: PathBuf,
     /// The file's revision, which a write sends back.
     pub revision: ConfigRevision,
     /// Its whole text; `None` when there is no file.
@@ -58,7 +54,7 @@ impl Daemon {
     }
 
     /// Writes `changes` to `table`, all of them or none, against
-    /// `revision`; returns the table's new revision.
+    /// `revision`.
     ///
     /// # Errors
     ///
@@ -70,13 +66,12 @@ impl Daemon {
         table: ConfigTable,
         revision: ConfigRevision,
         changes: Vec<TableChange>,
-    ) -> Result<ConfigRevision, DaemonError> {
+    ) -> Result<(), DaemonError> {
         let params = ConfigTableSetParams::new(table, revision, changes);
-        let set = self
-            .client
+        self.client
             .request::<methods::ConfigTableSet>(&params)
             .await?;
-        Ok(set.revision)
+        Ok(())
     }
 
     /// The user's hooks file. `None` from a daemon older than reading it.
@@ -88,7 +83,6 @@ impl Daemon {
         let params = HooksFileGetParams::new();
         match self.client.request::<methods::HooksFileGet>(&params).await {
             Ok(read) => Ok(Some(HooksFileRead {
-                path: read.path,
                 revision: read.revision,
                 text: read.text,
             })),
@@ -98,7 +92,7 @@ impl Daemon {
     }
 
     /// Replaces the user's hooks file with `text`, or deletes it when
-    /// `None`, against `revision`; returns the file's new revision.
+    /// `None`, against `revision`.
     ///
     /// # Errors
     ///
@@ -109,12 +103,11 @@ impl Daemon {
         &self,
         revision: ConfigRevision,
         text: Option<String>,
-    ) -> Result<ConfigRevision, DaemonError> {
+    ) -> Result<(), DaemonError> {
         let params = HooksFileSetParams::new(revision, text);
-        let set = self
-            .client
+        self.client
             .request::<methods::HooksFileSet>(&params)
             .await?;
-        Ok(set.revision)
+        Ok(())
     }
 }

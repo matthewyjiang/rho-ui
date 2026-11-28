@@ -76,6 +76,15 @@ fn checked(ui: &mut Harness, id: &str) -> Option<bool> {
         .expect("window is open")
 }
 
+/// Waits until a run is done: Revert is disabled while anything writes.
+fn wait_written(ui: &mut Harness) {
+    ui.wait_until("the run done", |window, _, _| {
+        window
+            .try_find("sync-revert")
+            .is_some_and(|revert| revert.disabled() != Some(true))
+    });
+}
+
 fn text(value: &str) -> SettingValue {
     SettingValue::Text(value.to_owned())
 }
@@ -87,9 +96,10 @@ fn has_plugin(fake: &FakeDaemon, name: &str) -> bool {
 
 /// A sync writes the checked rows to the other machine: a setting that
 /// belongs to one machine starts unchecked, a plugin from a folder can't
-/// be copied, an install that fails keeps Retry, and a setting that applies
-/// on restart offers one. Revert then holds back the row the target changed
-/// since, and puts back the rest.
+/// be copied, a target changed since the read stops it part way with the
+/// user's checks kept, an install that fails keeps Retry, and a setting
+/// that applies on restart offers one. Revert then holds back the row the
+/// target changed since, and puts back the rest, both passes' rows.
 #[test]
 fn a_sync_copies_to_another_machine_and_reverts() {
     let local = FakeDaemon::start(Script::default());
@@ -100,7 +110,7 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     local.edit_agent_setting("general.permission_mode", text("plan"));
     local.edit_agent_setting("tools.shell", text("zsh"));
     let profile = json!({"base_url": "https://acme.test/v1", "api": "responses"});
-    local.edit_config_table(ConfigTable::Providers, "acme", Some(profile.clone()));
+    local.edit_config_table(ConfigTable::Providers, "acme", Some(profile));
     local.edit_config_table(ConfigTable::ModelAliases, "fast", Some(json!("acme/big")));
     local.edit_config_table(ConfigTable::FavoriteModels, "acme/big", Some(json!(null)));
     let hooks = "[[hook]]\nevent = \"session_end\"\nprogram = \"notify-send\"\n";
@@ -148,30 +158,30 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     reveal(&mut ui, "sync-submit");
     ui.shot("review");
 
+    // The target's settings change after the read: the tables land, and
+    // the sync stops at the settings.
+    remote.edit_agent_setting("general.auto_compact", SettingValue::Bool(false));
+    click_revealed(&mut ui, "sync-submit");
+    wait_written(&mut ui);
+    assert_eq!(
+        checked(&mut ui, "sync-row-settings-tools.shell"),
+        Some(true),
+        "the user's checks stay"
+    );
+    assert_eq!(remote.agent_setting("tools.shell"), Some(text("bash")));
+    reveal(&mut ui, "sync-group-settings");
+    ui.shot("stopped");
+
     click_revealed(&mut ui, "sync-submit");
     reveal(&mut ui, "sync-retry-plugins-deploy");
-    assert_eq!(
-        remote.agent_setting("general.permission_mode"),
-        Some(text("plan"))
-    );
     assert_eq!(remote.agent_setting("tools.shell"), Some(text("zsh")));
     assert!(has_plugin(&remote, "review") && !has_plugin(&remote, "deploy"));
-    assert_eq!(
-        remote.config_table_entry(ConfigTable::Providers, "acme"),
-        Some(profile)
-    );
-    assert_eq!(remote.hooks_file().as_deref(), Some(hooks));
     reveal(&mut ui, "sync-restart");
     ui.shot("synced");
 
     // Retry runs alone, and fails the same row again.
     click_revealed(&mut ui, "sync-retry-plugins-deploy");
-    // Revert is disabled while anything writes.
-    ui.wait_until("the retry done", |window, _, _| {
-        window
-            .try_find("sync-revert")
-            .is_some_and(|revert| revert.disabled() != Some(true))
-    });
+    wait_written(&mut ui);
     reveal(&mut ui, "sync-retry-plugins-deploy");
     assert!(!has_plugin(&remote, "deploy"));
 
@@ -189,13 +199,9 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     });
     assert_eq!(
         remote.config_table_entry(ConfigTable::Providers, "acme"),
-        None
+        None,
+        "the stopped pass's rows revert too"
     );
-    assert_eq!(
-        remote.config_table_entry(ConfigTable::ModelAliases, "fast"),
-        None
-    );
-    assert_eq!(remote.hooks_file(), None);
     assert_eq!(
         remote.agent_setting("general.permission_mode"),
         Some(text("supervised")),

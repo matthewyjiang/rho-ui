@@ -4,11 +4,12 @@
 use rho_ui_core::{
     agent_settings::SettingValue,
     fake_daemon::{FakeDaemon, Script},
-    sync::{self, RowKey, Side},
+    sync::{self, Pass, RowKey, Side, Snapshot},
     ConfigTable, Daemon, DaemonEvents, PluginInstallSource,
 };
 use serde_json::json;
 use smol::block_on;
+use std::collections::BTreeSet;
 
 async fn connect(fake: &FakeDaemon) -> (Daemon, DaemonEvents) {
     Daemon::connect(fake.target())
@@ -93,5 +94,39 @@ fn a_stale_store_stops_the_sync_and_a_refused_one_fails_alone() {
             Some(text("plan"))
         );
         assert!(has_lint());
+    });
+}
+
+/// A retried row overwrites what the target holds when it is retried, not
+/// what it held at the sync, so Revert puts back the target's own edit made
+/// in between.
+#[test]
+fn revert_after_a_retry_restores_what_the_retry_overwrote() {
+    let laptop = FakeDaemon::start(Script::default());
+    let target = FakeDaemon::start(Script::default());
+    let synced = "[[hook]]\nprogram = \"/nonexistent/lint.sh\"\n";
+    laptop.edit_hooks_file(Some(synced));
+    block_on(async {
+        let (from, _from_events) = connect(&laptop).await;
+        let (to, _to_events) = connect(&target).await;
+        let diff = sync::diff(&read("laptop", &from).await, &read("box", &to).await);
+        let written = sync::apply(&to, diff.plan(&diff.initially_checked())).await;
+        let [failure] = written.failed.as_slice() else {
+            panic!("the hooks file fails: its program is missing on box");
+        };
+        let snapshot = Snapshot::after(None, Pass::Sync, &written, 0);
+
+        target.edit_hooks_file(Some("# mine\n"));
+        target.add_hook_programs();
+        let retried = sync::retry(&to, "box".to_owned(), failure).await;
+        assert!(retried.failed.is_empty());
+        assert_eq!(target.hooks_file().as_deref(), Some(synced));
+
+        let snapshot =
+            Snapshot::after(snapshot, Pass::More, &retried, 0).expect("the retry landed");
+        let review = sync::review_revert(&snapshot, &read("box", &to).await);
+        let reverted = sync::apply(&to, review.plan(&BTreeSet::new())).await;
+        assert!(reverted.failed.is_empty() && !reverted.stale);
+        assert_eq!(target.hooks_file().as_deref(), Some("# mine\n"));
     });
 }

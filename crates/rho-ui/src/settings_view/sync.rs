@@ -23,7 +23,7 @@ use super::{described, status_mark, value, Mark, SettingsView, Tone, CONTROL_REM
 use crate::{
     machines::{self, DaemonAction, MachineId, Machines},
     rho_settings::RhoSettings,
-    settings_sync::{clock, Busy, Compare, Outcome, Ran, Revert, RunKind, SettingsSync},
+    settings_sync::{clock, Busy, Compare, Outcome, Ran, Revert, RunKind, SettingsSync, Stop},
 };
 
 /// The group's own state: the app's sync, which outlives the dialog.
@@ -257,11 +257,10 @@ fn banners(
         Ran::Written {
             failed,
             restart,
-            stale,
-            landed,
+            stop,
             ..
         } => {
-            if *stale && *landed == 0 {
+            if *stop == Some(Stop::Before) {
                 let again = match outcome.kind {
                     RunKind::Sync => "sync again",
                     RunKind::Revert => "revert again",
@@ -348,17 +347,26 @@ fn outcome_title(outcome: &Outcome, target: &str) -> Option<(String, Option<Stri
     let Ran::Written {
         landed,
         total,
-        stale,
+        stop,
         ..
     } = &outcome.ran
     else {
         return None;
     };
-    if *stale {
-        if *landed == 0 {
-            return None;
+    match stop {
+        Some(Stop::Before) => return None,
+        Some(Stop::PartWay) => {}
+        None => {
+            let title = match outcome.kind {
+                RunKind::Sync if landed == total => format!("Synced {total} to {target}"),
+                RunKind::Sync => format!("Synced {landed} of {total} to {target}"),
+                RunKind::Revert if landed == total => format!("Reverted {total} on {target}"),
+                RunKind::Revert => format!("Reverted {landed} of {total} on {target}"),
+            };
+            return Some((title, None));
         }
-        return Some(match outcome.kind {
+    }
+    Some(match outcome.kind {
             RunKind::Sync => (
                 format!("Stopped: {target} changed while syncing"),
                 Some(format!(
@@ -371,15 +379,7 @@ fn outcome_title(outcome: &Outcome, target: &str) -> Option<(String, Option<Stri
                     "{landed} of {total} reverted. Check what differs now, then revert again."
                 )),
             ),
-        });
-    }
-    let title = match outcome.kind {
-        RunKind::Sync if landed == total => format!("Synced {total} to {target}"),
-        RunKind::Sync => format!("Synced {landed} of {total} to {target}"),
-        RunKind::Revert if landed == total => format!("Reverted {total} on {target}"),
-        RunKind::Revert => format!("Reverted {landed} of {total} on {target}"),
-    };
-    Some((title, None))
+    })
 }
 
 /// One kind's rows, under a header that checks or unchecks them all.

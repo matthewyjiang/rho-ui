@@ -2,14 +2,15 @@
 //! through `rho/config/schema` and `rho/config/get`, written through
 //! `rho/config/set`.
 
+use rho_protocol::ConfigRevision;
 use serde::{Deserialize, Serialize};
 
-use super::{Action, Change, Copy, GroupKind, Planned, RevertRow, RevertState, Row, RowKey, Side};
+use super::{Action, Change, Copy, GroupKind, Planned, RevertRow, Row, RowKey, Side};
 use crate::agent_settings::{
     selection_name, unit_label, Applies, ModelRuntime, ModelSelection, SettingChange, SettingKey,
     SettingKind, SettingSpec, SettingValue,
 };
-use crate::AgentSettings;
+use crate::{Daemon, DaemonError};
 
 /// A setting's value on one machine, and whether its file sets it, so a
 /// write can put it back as it was: set to the value, or left to its
@@ -79,10 +80,7 @@ fn row(spec: &SettingSpec, source: &Side, target: &Side) -> Option<Row> {
         value: from.cloned(),
         set: source.settings.is_set(key) || tspec.default.as_ref() != from,
     };
-    let before = Held {
-        value: to.cloned(),
-        set: target.settings.is_set(key),
-    };
+    let before = held(target, key);
     // A setting another method changes, such as the credential store
     // through Providers, can't be written here.
     let fits = if tspec.read_only {
@@ -161,6 +159,30 @@ fn shown(value: Option<&SettingValue>, spec: &SettingSpec) -> String {
     }
 }
 
+/// Setting `key` as `side` holds it now.
+pub(super) fn held(side: &Side, key: &SettingKey) -> Held {
+    Held {
+        value: side.settings.value(key).cloned(),
+        set: side.settings.is_set(key),
+    }
+}
+
+/// Writes the settings `items` change, all at once, against `revision`.
+pub(super) async fn write(
+    target: &Daemon,
+    revision: ConfigRevision,
+    items: &[Planned],
+) -> Result<(), DaemonError> {
+    let changes = items
+        .iter()
+        .filter_map(|item| match &item.change {
+            Change::Setting { key, after, .. } => Some(after.write(key)),
+            Change::Plugin { .. } | Change::Entry { .. } | Change::Hooks { .. } => None,
+        })
+        .collect();
+    target.set_agent_settings(revision, changes).await
+}
+
 /// `item`'s row of a revert: unchanged while the target still holds what
 /// the sync wrote.
 pub(super) fn revert_row(
@@ -170,35 +192,21 @@ pub(super) fn revert_row(
     after: &Held,
     target: &Side,
 ) -> RevertRow {
-    let settings: &AgentSettings = &target.settings;
-    let now = settings.value(key);
-    let Some(spec) = settings.spec(key) else {
-        let not_set = "Not set".to_owned();
-        return RevertRow {
-            key: item.key.clone(),
-            label: item.label.clone(),
-            synced: not_set.clone(),
-            now: not_set.clone(),
-            before: not_set,
-            state: RevertState::Blocked(format!(
-                "Rho on {} no longer has this setting",
-                target.label
-            )),
-            item: None,
-        };
+    let Some(spec) = target.settings.spec(key) else {
+        let not_set = || "Not set".to_owned();
+        let why = format!("Rho on {} no longer has this setting", target.label);
+        return RevertRow::blocked(item, [not_set(), not_set()], not_set(), why);
     };
+    let now = held(target, key);
+    let values = [
+        before.value.as_ref(),
+        after.value.as_ref(),
+        now.value.as_ref(),
+    ];
     let back = Change::Setting {
         key: key.clone(),
-        before: Held {
-            value: now.cloned(),
-            set: settings.is_set(key),
-        },
+        before: now.clone(),
         after: before.clone(),
     };
-    RevertRow::of(
-        item,
-        [before.value.as_ref(), after.value.as_ref(), now],
-        |value| shown(value, spec),
-        back,
-    )
+    RevertRow::of(item, values, |value| shown(value, spec), back)
 }

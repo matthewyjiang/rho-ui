@@ -1,7 +1,10 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use rho_protocol::{
-    Applies, ConfigCategory, ConfigGetResponse, ConfigRevision, ConfigSchema, ConfigTable, Plugin,
+    Applies, ConfigCategory, ConfigGetResponse, ConfigRevision, ConfigSchema, Plugin,
     PluginInstallSource, PluginScope, PluginSource, PluginStatus, SettingChange, SettingChoice,
     SettingEntry, SettingKey, SettingKind, SettingSpec, SettingValue, TableEntry, ValueSource,
 };
@@ -93,28 +96,29 @@ fn per_machine(spec: SettingSpec) -> SettingSpec {
     }
 }
 
-/// `side` with `store` holding `entries`, read at revision `rev`.
-fn table(side: Side, store: ConfigTable, rev: &str, entries: &[(&str, Value)]) -> Side {
-    let entries = entries
-        .iter()
-        .map(|(key, value)| TableEntry::new((*key).to_owned(), value.clone()))
-        .collect();
-    side.with_table(
-        store,
-        TableRead {
-            revision: ConfigRevision::new(rev),
+/// `side` with each table of `tables` holding its entries.
+fn tables(mut side: Side, tables: &[(Table, &[(&str, Value)])]) -> Side {
+    for (table, entries) in tables {
+        let entries: Vec<TableEntry> = entries
+            .iter()
+            .map(|(key, value)| TableEntry::new((*key).to_owned(), value.clone()))
+            .collect();
+        let read = TableRead {
+            revision: ConfigRevision::new(format!("{table:?}{entries:?}")),
             entries,
-        },
-    )
+        };
+        side.tables.insert(*table, Part::Read(read));
+    }
+    side
 }
 
 /// `side` with the user's hooks file as `text`.
-fn hooks(side: Side, text: Option<&str>) -> Side {
-    side.with_hooks(HooksFileRead {
-        path: PathBuf::from("/home/me/.rho/hooks.toml"),
-        revision: ConfigRevision::new("h0"),
+fn hooks(mut side: Side, text: Option<&str>) -> Side {
+    side.hooks = Part::Read(HooksFileRead {
+        revision: ConfigRevision::new(format!("{text:?}")),
         text: text.map(str::to_owned),
-    })
+    });
+    side
 }
 
 /// Machine `label` with the settings `specs`, the file setting `set` (the
@@ -156,7 +160,13 @@ fn machine(
         errors: Vec::new(),
     };
     let settings = AgentSettings::new(schema, read, ListedModels::Unsupported);
-    Side::new(label.to_owned(), settings, Some(plugins))
+    Side {
+        label: label.to_owned(),
+        settings,
+        plugins: Some(plugins),
+        tables: BTreeMap::new(),
+        hooks: Part::Lacks,
+    }
 }
 
 fn plugin(name: &str, source: PluginSource) -> Plugin {
@@ -456,7 +466,8 @@ fn a_revert_holds_back_what_the_target_changed_since() {
     );
     let before = machine("box", specs(), &[], Vec::new());
     let diff = diff(&laptop, &before);
-    let snapshot = Snapshot::new(0, &diff.plan(&diff.initially_checked()));
+    let snapshot =
+        Snapshot::before(None, Pass::Sync, &diff.plan(&diff.initially_checked()), 0).expect("rows");
     // After the sync, the target changed the mode again, and swapped lint
     // for a copy of a folder.
     let now = machine(
@@ -542,7 +553,7 @@ fn a_snapshot_keeps_what_a_sync_first_overwrote() {
         ..landed(vec![mode.clone(), lint_item])
     };
     let snapshot = Snapshot::after(None, Pass::Sync, &synced, 0);
-    let snapshot = Snapshot::after(snapshot, Pass::Retry, &landed(vec![rest]), 1);
+    let snapshot = Snapshot::after(snapshot, Pass::More, &landed(vec![rest]), 1);
     let stale = Written {
         stale: true,
         ..Written::default()
@@ -572,46 +583,32 @@ fn a_snapshot_keeps_what_a_sync_first_overwrote() {
 
 /// A table entry or hooks file is listed only when it differs: one only
 /// the target has starts unchecked, and none can go to a rho too old to
-/// write its store. Two provider profiles with the same endpoint say which
-/// fields differ.
+/// write its store, or that couldn't read it. Two provider profiles with
+/// the same endpoint still show apart.
 #[test]
 fn a_table_or_hooks_row_follows_the_copy_policy() {
     let base = |label| machine(label, Vec::new(), &[], Vec::new());
     let ollama = json!({"base_url": "http://localhost:11434/v1"});
-    let source = table(
-        table(
-            table(
-                hooks(base("laptop"), Some("[[hook]]\n")),
-                ConfigTable::ModelAliases,
-                "a",
-                &[("fast", json!("openai/gpt-5-mini")), ("same", json!("x/y"))],
-            ),
-            ConfigTable::FavoriteModels,
-            "f",
-            &[("openai/gpt-5", Value::Null)],
-        ),
-        ConfigTable::Providers,
-        "p",
-        &[("ollama", ollama)],
+    let aliases = [("fast", json!("openai/gpt-5-mini")), ("same", json!("x/y"))];
+    let source = tables(
+        hooks(base("laptop"), Some("[[hook]]\n")),
+        &[
+            (Table::Aliases, &aliases),
+            (Table::Favorites, &[("openai/gpt-5", Value::Null)]),
+            (Table::Providers, &[("ollama", ollama)]),
+        ],
     );
-    let target = table(
-        table(
-            table(
-                hooks(base("box"), None),
-                ConfigTable::ModelAliases,
-                "a",
+    let patched = json!({"base_url": "http://localhost:11434/v1", "edit_tool": "patch"});
+    let target = tables(
+        hooks(base("box"), None),
+        &[
+            (
+                Table::Aliases,
                 &[("fast", json!("openai/gpt-5")), ("same", json!("x/y"))],
             ),
-            ConfigTable::FavoriteModels,
-            "f",
-            &[("fake/old", Value::Null)],
-        ),
-        ConfigTable::Providers,
-        "p",
-        &[(
-            "ollama",
-            json!({"base_url": "http://localhost:11434/v1", "edit_tool": "patch"}),
-        )],
+            (Table::Favorites, &[("fake/old", Value::Null)]),
+            (Table::Providers, &[("ollama", patched)]),
+        ],
     );
     let rows = |diff: &Diff| -> Vec<(String, Action, Start)> {
         diff.rows()
@@ -640,14 +637,15 @@ fn a_table_or_hooks_row_follows_the_copy_policy() {
     let profile = synced
         .rows()
         .find(|row| row.key.id == "ollama")
-        .and_then(|row| row.target.clone());
-    assert_eq!(
-        profile.as_deref(),
-        Some("http://localhost:11434/v1 · edit_tool = patch")
+        .map(|row| (row.source.clone(), row.target.clone()));
+    assert!(
+        profile.is_some_and(|(from, to)| from != to),
+        "the two profiles read apart"
     );
-    let old = diff(&source, &base("box"));
+    let mut old = base("box");
+    old.hooks = Part::Failed("not UTF-8".to_owned());
     assert_eq!(
-        rows(&old),
+        rows(&diff(&source, &old)),
         [
             ("alias:fast".to_owned(), Action::Add, Start::Cant),
             ("alias:same".to_owned(), Action::Add, Start::Cant),
@@ -659,8 +657,9 @@ fn a_table_or_hooks_row_follows_the_copy_policy() {
 }
 
 /// A sync writes the stores in an order where nothing names a provider
-/// the target lacks yet, plugins last; a revert writes them in reverse, and
-/// holds back an entry the target changed since.
+/// the target lacks yet, plugins last; a revert writes them in reverse,
+/// holds back an entry the target changed since, and writes nothing for
+/// one the target already holds as it was.
 #[test]
 fn stores_sync_in_dependency_order_and_revert_in_reverse() {
     let modes = ["auto", "plan"];
@@ -673,19 +672,21 @@ fn stores_sync_in_dependency_order_and_revert_in_reverse() {
             Some(_) => vec![plugin("lint", git("https://github.com/acme/lint", "a1"))],
             None => Vec::new(),
         };
-        let side = machine(label, vec![choice(&modes, "auto")], &set, plugins);
-        let side = table(
-            side,
-            ConfigTable::ModelAliases,
-            "a",
-            &[("fast", json!(alias))],
-        );
-        let side = table(side, ConfigTable::FavoriteModels, "f", &[]);
         let providers: &[(&str, Value)] = match mode {
             Some(_) => &[("acme", json!({"base_url": "https://acme.test/v1"}))],
             None => &[],
         };
-        hooks(table(side, ConfigTable::Providers, "p", providers), hook)
+        let side = machine(label, vec![choice(&modes, "auto")], &set, plugins);
+        let aliases = [("fast", json!(alias))];
+        let side = tables(
+            side,
+            &[
+                (Table::Aliases, &aliases),
+                (Table::Favorites, &[]),
+                (Table::Providers, providers),
+            ],
+        );
+        hooks(side, hook)
     };
     let laptop = side("laptop", Some("plan"), "acme/big", Some("[[hook]]\n"));
     let before = side("box", None, "fake/small", None);
@@ -696,21 +697,17 @@ fn stores_sync_in_dependency_order_and_revert_in_reverse() {
         order(&plan),
         ["acme", "alias:fast", "c.mode", "file", "lint"]
     );
-    let snapshot = Snapshot::new(0, &plan);
-    let mut now = side("box", Some("plan"), "acme/big", Some("[[hook]]\n"));
-    now = table(
-        now,
-        ConfigTable::ModelAliases,
-        "a2",
-        &[("fast", json!("fake/edited"))],
-    );
+    let snapshot = Snapshot::before(None, Pass::Sync, &plan, 0).expect("rows");
+    // Since the sync, the target edited the alias and deleted the hooks
+    // file it got.
+    let now = side("box", Some("plan"), "fake/edited", None);
     let review = review_revert(&snapshot, &now);
     let changed: Vec<_> = review.changed().map(|row| row.key.id.as_str()).collect();
     assert_eq!(changed, ["alias:fast"]);
-    assert_eq!(
-        order(&review.plan(&BTreeSet::new())),
-        ["file", "c.mode", "acme", "lint"]
-    );
+    let reverted = review.plan(&BTreeSet::new());
+    let settled: Vec<_> = reverted.settled.iter().map(|i| i.key.id.as_str()).collect();
+    assert_eq!(settled, ["file"]);
+    assert_eq!(order(&reverted), ["file", "c.mode", "acme", "lint"]);
     let anyway: BTreeSet<_> = review.changed().map(|row| row.key.clone()).collect();
     assert_eq!(
         order(&review.plan(&anyway)),

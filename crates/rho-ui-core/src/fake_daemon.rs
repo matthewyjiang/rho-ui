@@ -924,12 +924,19 @@ impl FakeDaemon {
 
     /// Replaces the user's hooks file with `text`, or deletes it when
     /// `None`, as a hand edit does. A hook whose program is under
-    /// `/nonexistent/` makes a write of the file fail.
+    /// `/nonexistent/` makes a write of the file fail, until
+    /// [`Self::add_hook_programs`].
     pub fn edit_hooks_file(&self, text: Option<&str>) {
         self.service
             .lock()
             .config_files
             .edit_hooks(text.map(str::to_owned));
+    }
+
+    /// Puts the programs under `/nonexistent/` in place, so a hooks file
+    /// that runs them writes.
+    pub fn add_hook_programs(&self) {
+        self.service.lock().config_files.add_programs();
     }
 
     /// The user's hooks file now.

@@ -1,8 +1,13 @@
 //! The fake daemon's `config.toml` tables (`rho/config/table/*`) and the
-//! user's hooks file (`rho/hooks/file/*`): each its own revision, which a
-//! write must send back, as rho's daemon checks them.
+//! user's hooks file (`rho/hooks/file/*`): each its own revision, a digest
+//! of what it holds, which a write must send back, as rho's daemon checks
+//! them.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::PathBuf,
+};
 
 use rho_protocol::{
     ConfigRevision, ConfigTable, ConfigTableGetResponse, ConfigTableSetParams, ErrorCode,
@@ -10,36 +15,48 @@ use rho_protocol::{
 };
 use serde_json::Value;
 
-/// One table: its entries in order, and how many writes it has had.
+/// The revision of `content`: equal content, equal revision.
+fn revision(content: &impl Hash) -> ConfigRevision {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    ConfigRevision::new(format!("{:x}", hasher.finish()))
+}
+
+/// One table's entries, in order.
 #[derive(Debug, Default)]
 struct Table {
     entries: Vec<TableEntry>,
-    writes: usize,
 }
 
 impl Table {
-    fn revision(&self, table: ConfigTable) -> ConfigRevision {
-        ConfigRevision::new(format!("{table:?}-{}", self.writes))
+    fn revision(&self) -> ConfigRevision {
+        let content: Vec<(&str, String)> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.value.to_string()))
+            .collect();
+        revision(&content)
     }
 }
 
 /// The fake's tables and hooks file.
 #[derive(Debug, Default)]
 pub(super) struct FakeConfigFiles {
-    tables: BTreeMap<String, Table>,
+    tables: HashMap<ConfigTable, Table>,
     hooks: Option<String>,
-    hooks_writes: usize,
+    /// The programs under `/nonexistent/` are there after all.
+    programs_present: bool,
 }
 
 impl FakeConfigFiles {
     fn table(&mut self, table: ConfigTable) -> &mut Table {
-        self.tables.entry(format!("{table:?}")).or_default()
+        self.tables.entry(table).or_default()
     }
 
     /// Answers `rho/config/table/get`.
     pub(super) fn get_table(&mut self, table: ConfigTable) -> ConfigTableGetResponse {
         let read = self.table(table);
-        ConfigTableGetResponse::new(read.revision(table), read.entries.clone())
+        ConfigTableGetResponse::new(read.revision(), read.entries.clone())
     }
 
     /// Answers `rho/config/table/set`: every change, or none. A favorite
@@ -50,7 +67,7 @@ impl FakeConfigFiles {
     ) -> Result<ConfigRevision, RpcError> {
         let table = params.table;
         let read = self.table(table);
-        if params.revision != read.revision(table) {
+        if params.revision != read.revision() {
             return Err(RpcError::new(
                 ErrorCode::ConfigConflict,
                 "the table changed since it was read",
@@ -85,18 +102,20 @@ impl FakeConfigFiles {
                 }
             }
         }
-        Ok(self.write_table(table, entries))
+        let read = self.table(table);
+        read.entries = entries;
+        Ok(read.revision())
     }
 
     /// Puts `key` of `table` as `value`, or removes it when `None`, as a
     /// hand edit of `config.toml` does.
     pub(super) fn edit_table(&mut self, table: ConfigTable, key: &str, value: Option<Value>) {
-        let mut entries = self.table(table).entries.clone();
-        entries.retain(|entry| entry.key != key);
-        if let Some(value) = value {
-            entries.push(TableEntry::new(key.to_owned(), value));
+        let entries = &mut self.table(table).entries;
+        match (entries.iter_mut().find(|entry| entry.key == key), value) {
+            (Some(entry), Some(value)) => entry.value = value,
+            (None, Some(value)) => entries.push(TableEntry::new(key.to_owned(), value)),
+            (_, None) => entries.retain(|entry| entry.key != key),
         }
-        self.write_table(table, entries);
     }
 
     /// `key` of `table`, if it has it.
@@ -108,58 +127,52 @@ impl FakeConfigFiles {
             .map(|entry| entry.value.clone())
     }
 
-    fn write_table(&mut self, table: ConfigTable, entries: Vec<TableEntry>) -> ConfigRevision {
-        let read = self.table(table);
-        read.entries = entries;
-        read.writes += 1;
-        read.revision(table)
-    }
-
-    fn hooks_revision(&self) -> ConfigRevision {
-        ConfigRevision::new(format!("hooks-{}", self.hooks_writes))
-    }
-
     /// Answers `rho/hooks/file/get`.
     pub(super) fn get_hooks(&self) -> HooksFileGetResponse {
         HooksFileGetResponse::new(
             PathBuf::from("/home/fake/.rho/hooks.toml"),
-            self.hooks_revision(),
+            revision(&self.hooks),
             self.hooks.clone(),
         )
     }
 
     /// Answers `rho/hooks/file/set`. A hook whose program is under
-    /// `/nonexistent/` is missing here, so the file is refused, as rho
-    /// refuses a program named by a path the machine lacks.
+    /// `/nonexistent/` is missing here, until [`Self::add_programs`], so
+    /// the file is refused, as rho refuses a program named by a path the
+    /// machine lacks; as there, the text is checked before the revision.
     pub(super) fn set_hooks(
         &mut self,
         params: HooksFileSetParams,
     ) -> Result<ConfigRevision, RpcError> {
-        if params.revision != self.hooks_revision() {
-            return Err(RpcError::new(
-                ErrorCode::ConfigConflict,
-                "the hooks file changed since it was read",
-            ));
-        }
         if params
             .text
             .as_deref()
-            .is_some_and(|text| text.contains("/nonexistent/"))
+            .is_some_and(|text| !self.programs_present && text.contains("/nonexistent/"))
         {
             return Err(RpcError::new(
                 ErrorCode::InvalidParams,
                 "a hook's program under /nonexistent/ doesn't exist on this machine",
             ));
         }
-        self.edit_hooks(params.text);
-        Ok(self.hooks_revision())
+        if params.revision != revision(&self.hooks) {
+            return Err(RpcError::new(
+                ErrorCode::ConfigConflict,
+                "the hooks file changed since it was read",
+            ));
+        }
+        self.hooks = params.text;
+        Ok(revision(&self.hooks))
     }
 
     /// Replaces the hooks file with `text`, or deletes it, as a hand edit
     /// does.
     pub(super) fn edit_hooks(&mut self, text: Option<String>) {
         self.hooks = text;
-        self.hooks_writes += 1;
+    }
+
+    /// Puts the programs under `/nonexistent/` in place.
+    pub(super) fn add_programs(&mut self) {
+        self.programs_present = true;
     }
 
     /// The hooks file's text.
