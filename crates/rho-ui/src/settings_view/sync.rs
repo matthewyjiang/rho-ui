@@ -17,15 +17,13 @@ use gpui_kit::component::{
 use gpui_kit::{
     rems, App, Context, Entity, ParentElement as _, SharedString, Styled as _, Subscription,
 };
-use rho_ui_core::sync::{
-    Action, Group, Refusal, RevertRow, RevertState, Row, RowKey, RowState, Snapshot,
-};
+use rho_ui_core::sync::{Action, Group, RevertRow, RevertState, Row, RowKey, RowState, Snapshot};
 
 use super::{described, status_mark, value, Mark, SettingsView, Tone, CONTROL_REMS};
 use crate::{
     machines::{self, DaemonAction, MachineId, Machines},
     rho_settings::RhoSettings,
-    settings_sync::{clock, Busy, Compare, Outcome, Ran, Revert, RunKind, SettingsSync},
+    settings_sync::{clock, Busy, Compare, Outcome, Ran, Revert, RunKind, SettingsSync, Stop},
 };
 
 /// The group's own state: the app's sync, which outlives the dialog.
@@ -69,7 +67,7 @@ impl SettingsView {
         let machines = self.machine_list.read(cx);
         let mut head = SettingGroup::new()
             .title("Sync")
-            .description("Copy Rho's settings and your plugins from one machine to another.");
+            .description("Copy Rho's settings, models, provider profiles, hooks and plugins from one machine to another.");
         let Some(to) = sync.to().cloned() else {
             return vec![head.item(SettingItem::new(
                 "Machines",
@@ -221,8 +219,8 @@ fn banners(
     let mut items = Vec::new();
     let title = outcome
         .and_then(|outcome| outcome_title(outcome, target))
-        .or_else(|| revertible.map(|at| format!("Last sync to {target} · {}", clock(at))));
-    if let Some(title) = title {
+        .or_else(|| revertible.map(|at| (format!("Last sync to {target} · {}", clock(at)), None)));
+    if let Some((title, stopped)) = title {
         let revert = revertible.map(|_| {
             let (entity, busy) = (entity.clone(), busy.cloned());
             SettingField::render(move |options, _, _| {
@@ -237,9 +235,13 @@ fn banners(
                     .on_click(move |_, _, cx| entity.update(cx, SettingsSync::start_revert))
             })
         });
-        let note = revertible.map(|_| {
-            let days = Snapshot::KEEP_FOR / (24 * 60 * 60);
-            format!("Revert puts back what {target} had before, for {days} days after the sync.")
+        let note = stopped.or_else(|| {
+            revertible.map(|_| {
+                let days = Snapshot::KEEP_FOR / (24 * 60 * 60);
+                format!(
+                    "Revert puts back what {target} had before, for {days} days after the sync."
+                )
+            })
         });
         let field = revert.unwrap_or_else(|| value("", Tone::Muted));
         items.push(described(SettingItem::new(title, field), note));
@@ -248,13 +250,24 @@ fn banners(
         return items;
     };
     let (failed, restart) = match &outcome.ran {
-        Ran::Refused(refusal) => {
-            items.push(refused_item(outcome.kind, refusal, target));
+        Ran::Unread(why) => {
+            items.push(unwritten_item(outcome.kind, why.clone(), target));
             return items;
         }
         Ran::Written {
             failed, restart, ..
-        } => (failed, restart),
+        } => {
+            if outcome.ran.stop() == Some(Stop::Before) {
+                let again = match outcome.kind {
+                    RunKind::Sync => "sync again",
+                    RunKind::Revert => "revert again",
+                };
+                let why =
+                    format!("It changed since it was read. Check what differs now, then {again}.");
+                items.push(unwritten_item(outcome.kind, why, target));
+            }
+            (failed, restart)
+        }
     };
     let verb = match outcome.kind {
         RunKind::Sync => "sync",
@@ -278,61 +291,83 @@ fn banners(
         items.push(SettingItem::new(title, field).description(failure.reason.clone()));
     }
     if !restart.is_empty() {
-        let (machines, machine) = (machine_list.clone(), outcome.target.clone());
-        let label = SharedString::from(format!("Restart {target}"));
-        let field = SettingField::render(move |options, _, _| {
-            let (machines, machine) = (machines.clone(), machine.clone());
-            Button::new("sync-restart")
-                .outline()
-                .with_size(options.size())
-                .label(label.clone())
-                .on_click(move |_, _, cx| {
-                    machines::ask(&machines, DaemonAction::Restart(machine.clone()), cx);
-                })
-        });
-        let title = format!(
-            "{} {} once {target}'s Rho restarts",
-            restart.join(", "),
-            if restart.len() == 1 {
-                "applies"
-            } else {
-                "apply"
-            },
-        );
-        items.push(
-            SettingItem::new(title, field)
-                .description("Or leave it: they apply whenever its daemon next starts."),
-        );
+        items.push(restart_item(restart, &outcome.target, target, machine_list));
     }
     items
 }
 
+/// One prompt to restart `machine`, `target`, for the settings that apply
+/// only then.
+fn restart_item(
+    restart: &[String],
+    machine: &MachineId,
+    target: &str,
+    machine_list: &Entity<Machines>,
+) -> SettingItem {
+    let (machines, machine) = (machine_list.clone(), machine.clone());
+    let label = SharedString::from(format!("Restart {target}"));
+    let field = SettingField::render(move |options, _, _| {
+        let (machines, machine) = (machines.clone(), machine.clone());
+        Button::new("sync-restart")
+            .outline()
+            .with_size(options.size())
+            .label(label.clone())
+            .on_click(move |_, _, cx| {
+                machines::ask(&machines, DaemonAction::Restart(machine.clone()), cx);
+            })
+    });
+    let title = format!(
+        "{} {} once {target}'s Rho restarts",
+        restart.join(", "),
+        if restart.len() == 1 {
+            "applies"
+        } else {
+            "apply"
+        },
+    );
+    SettingItem::new(title, field)
+        .description("Or leave it: they apply whenever its daemon next starts.")
+}
+
 /// Why a run wrote nothing, and what to do about it.
-fn refused_item(kind: RunKind, refusal: &Refusal, target: &str) -> SettingItem {
-    let (title, again) = match kind {
-        RunKind::Sync => (format!("Nothing was synced to {target}"), "sync again"),
-        RunKind::Revert => (format!("Nothing was reverted on {target}"), "revert again"),
-    };
-    let why = match refusal {
-        Refusal::Stale => format!(
-            "Its settings changed since they were read. Check what differs now, then {again}."
-        ),
-        Refusal::Failed(why) => why.clone(),
+fn unwritten_item(kind: RunKind, why: String, target: &str) -> SettingItem {
+    let title = match kind {
+        RunKind::Sync => format!("Nothing was synced to {target}"),
+        RunKind::Revert => format!("Nothing was reverted on {target}"),
     };
     SettingItem::new(title, value("", Tone::Muted)).description(why)
 }
 
-/// What the last run wrote, as its banner's title; `None` when it wrote
-/// nothing.
-fn outcome_title(outcome: &Outcome, target: &str) -> Option<String> {
+/// What the last run wrote, as its banner's title, with what a run that
+/// stopped part way left; `None` when it wrote nothing.
+fn outcome_title(outcome: &Outcome, target: &str) -> Option<(String, Option<String>)> {
     let Ran::Written { landed, total, .. } = &outcome.ran else {
         return None;
     };
-    Some(match outcome.kind {
-        RunKind::Sync if landed == total => format!("Synced {total} to {target}"),
-        RunKind::Sync => format!("Synced {landed} of {total} to {target}"),
-        RunKind::Revert if landed == total => format!("Reverted {total} on {target}"),
-        RunKind::Revert => format!("Reverted {landed} of {total} on {target}"),
+    let whole = landed == total;
+    Some(match (outcome.ran.stop(), outcome.kind) {
+        (Some(Stop::Before), _) => return None,
+        (Some(Stop::PartWay), RunKind::Sync) => {
+            let note = format!(
+                "{landed} of {total} landed, and Revert undoes them. Check what differs now, then sync again."
+            );
+            (
+                format!("Stopped: {target} changed while syncing"),
+                Some(note),
+            )
+        }
+        (Some(Stop::PartWay), RunKind::Revert) => {
+            let note =
+                format!("{landed} of {total} reverted. Check what differs now, then revert again.");
+            (
+                format!("Stopped: {target} changed while reverting"),
+                Some(note),
+            )
+        }
+        (None, RunKind::Sync) if whole => (format!("Synced {total} to {target}"), None),
+        (None, RunKind::Sync) => (format!("Synced {landed} of {total} to {target}"), None),
+        (None, RunKind::Revert) if whole => (format!("Reverted {total} on {target}"), None),
+        (None, RunKind::Revert) => (format!("Reverted {landed} of {total} on {target}"), None),
     })
 }
 
@@ -437,6 +472,7 @@ fn row_lines(row: &Row, target: &str) -> Vec<String> {
             row.one_machine
                 .then(|| "Belongs to one machine.".to_owned()),
         )
+        .chain(row.note.clone())
         .chain(reason)
         .collect()
 }
