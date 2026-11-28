@@ -132,6 +132,8 @@ pub(super) struct FakeConfig {
     state: watch::Sender<Arc<ConfigGetResponse>>,
     /// Who made each write, in order: write `n` made revision `rn`.
     writers: Vec<Option<ConfigWriter>>,
+    /// How many `rho/config/get` requests it answered.
+    reads: usize,
 }
 
 impl FakeConfig {
@@ -158,6 +160,7 @@ impl FakeConfig {
             schema,
             state,
             writers: Vec::new(),
+            reads: 0,
         }
     }
 
@@ -166,10 +169,11 @@ impl FakeConfig {
     }
 
     /// The current state, and every later one, for `rho/config/get`.
-    pub(super) fn watch(&self, namespace: &ConfigNamespace) -> Result<ConfigWatch, RpcError> {
+    pub(super) fn watch(&mut self, namespace: &ConfigNamespace) -> Result<ConfigWatch, RpcError> {
         if *namespace != ConfigNamespace::Agent {
             return Err(only_agent());
         }
+        self.reads += 1;
         Ok(ConfigWatch::new(self.state.subscribe()))
     }
 
@@ -231,6 +235,18 @@ impl FakeConfig {
         };
         values.insert(SettingKey::new(key), entry);
         self.write(values, None);
+    }
+
+    /// Moves the revision with no value changed, as a hand edit of a key
+    /// `values` don't carry does, such as an agent model's auth profile.
+    pub(super) fn move_revision(&mut self) {
+        let values = self.state.borrow().values.clone();
+        self.write(values, None);
+    }
+
+    /// How many `rho/config/get` requests it answered.
+    pub(super) fn reads(&self) -> usize {
+        self.reads
     }
 
     /// Publishes `values` as the next revision, written by `writer`.

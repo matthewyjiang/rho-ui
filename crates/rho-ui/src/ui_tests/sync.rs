@@ -141,7 +141,8 @@ fn local_to_copy() -> FakeDaemon {
 /// A sync writes the checked rows to the other machine: a setting that
 /// belongs to one machine starts unchecked, a plugin from a folder can't
 /// be copied, a target changed since the read stops it part way with the
-/// user's checks kept, and the next sync joins it even after a Re-read; an
+/// user's checks kept, and the next sync joins it even after a Re-read, and
+/// a revision moved with no value since doesn't stop it; an
 /// install that fails keeps Retry, and a setting that applies on restart
 /// offers one. Revert then holds back the row the target changed since,
 /// and puts back the rest, both passes' rows.
@@ -195,6 +196,13 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         Some(false)
     );
     click_revealed(&mut ui, "sync-row-settings-tools.shell");
+    // A change box's values don't carry, such as a model's auth profile,
+    // moves its revision: the page reads again, so the sync isn't stale.
+    let reads = remote.agent_settings_reads();
+    remote.move_agent_settings_revision();
+    ui.wait_until("box read again", |_, _, _| {
+        remote.agent_settings_reads() > reads
+    });
     click_revealed(&mut ui, "sync-submit");
     reveal(&mut ui, "sync-retry-plugins-deploy");
     assert_eq!(remote.agent_setting("tools.shell"), Some(text("zsh")));

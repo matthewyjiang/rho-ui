@@ -16,7 +16,7 @@ use chrono::DateTime;
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use rho_ui_core::{
     sync::{self, Diff, Failure, GroupKind, Pass, Plan, RevertReview, RowKey, Snapshot, Written},
-    Daemon,
+    AgentSettingsChanged, Daemon,
 };
 
 use crate::{
@@ -248,6 +248,30 @@ impl SettingsSync {
             read_task: Task::ready(()),
             run_task: Task::ready(()),
         }
+    }
+
+    /// Takes in `changed`, a change to `machine`'s rho settings, for the
+    /// app's sync, if Settings made one. A change that moves only their
+    /// revision, such as an agent model's auth profile, leaves what differs
+    /// alone, but a write at the revision read before it would stop as
+    /// stale: the comparison reads both machines again, keeping the user's
+    /// checks. A change of values is left to the write, which the daemon
+    /// refuses.
+    pub(crate) fn settings_changed(
+        machine: &MachineId,
+        changed: &AgentSettingsChanged,
+        cx: &mut App,
+    ) {
+        let shared = cx.try_global::<Shared>();
+        let Some(Shared(sync)) = shared.filter(|_| changed.moves_no_value()) else {
+            return;
+        };
+        sync.clone().update(cx, |sync, cx| {
+            let compared = matches!(sync.compare, Compare::Ready { .. });
+            if compared && (sync.from == *machine || sync.to.as_ref() == Some(machine)) {
+                sync.read(sync.kept_checks(), cx);
+            }
+        });
     }
 
     pub(crate) fn from(&self) -> &MachineId {

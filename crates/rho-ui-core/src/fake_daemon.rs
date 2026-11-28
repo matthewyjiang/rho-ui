@@ -907,6 +907,18 @@ impl FakeDaemon {
         self.service.lock().config.edit(key, value);
     }
 
+    /// Moves rho's settings' revision with no value changed, as a hand
+    /// edit of a key the values don't carry does, such as an agent model's
+    /// auth profile: clients hear only the new revision.
+    pub fn move_agent_settings_revision(&self) {
+        self.service.lock().config.move_revision();
+    }
+
+    /// How many times a client read rho's settings.
+    pub fn agent_settings_reads(&self) -> usize {
+        self.service.lock().config.reads()
+    }
+
     /// Puts entry `key` of `table` as `value`, or removes it when `None`,
     /// as a hand edit of `config.toml` does: a write against the table's
     /// revision before it is refused.

@@ -81,6 +81,7 @@ use crate::{
     session_search::{self, OpenHit},
     session_view::{Link, Loading, SessionEvent, SessionView},
     settings::{Appearance, Settings},
+    settings_sync::SettingsSync,
     settings_view,
     sidebar::{ResizeSidebar, SidebarEvent, SidebarModels, SidebarState, SidebarView},
     window_chrome,
@@ -980,6 +981,7 @@ impl RhoApp {
                 }
             }
             DaemonEvent::AgentSettingsChanged(changed) => {
+                SettingsSync::settings_changed(machine, &changed, cx);
                 self.rho_settings
                     .update(cx, |settings, cx| settings.changed(machine, changed, cx));
             }

@@ -78,7 +78,8 @@ async fn settings_until(
 /// rho's settings follow every write, this app's and a hand edit's, and a
 /// write is refused as a conflict only when someone else wrote since its
 /// read: this app's own second write, sent before it heard of its first,
-/// lands.
+/// lands. A change the values don't carry still moves the revision a
+/// write is good at.
 #[test]
 fn agent_settings_follow_writes_and_refuse_stale_ones() {
     let fake = FakeDaemon::start(Script::default());
@@ -155,6 +156,21 @@ fn agent_settings_follow_writes_and_refuse_stale_ones() {
             Some(&SettingValue::Bool(true)),
             "its default"
         );
+
+        let before_auth = settings.revision().clone();
+        fake.move_agent_settings_revision();
+        settings_until(&mut events, &mut settings, |settings| {
+            *settings.revision() != before_auth
+        })
+        .await;
+        let off = SettingChange::Set {
+            key: compact.clone(),
+            value: SettingValue::Bool(false),
+        };
+        daemon
+            .set_agent_settings(settings.revision().clone(), vec![off])
+            .await
+            .expect("a write at the moved revision lands");
     });
 }
 
