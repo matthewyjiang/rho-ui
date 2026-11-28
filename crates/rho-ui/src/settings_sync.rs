@@ -176,6 +176,9 @@ pub(crate) struct SettingsSync {
     outcome: Option<Outcome>,
     revert: Option<Revert>,
     busy: Option<Busy>,
+    /// The target's settings moved their revision while the comparison
+    /// read them: read again once it is done.
+    read_again: bool,
     read_task: Task<()>,
     run_task: Task<()>,
 }
@@ -245,31 +248,39 @@ impl SettingsSync {
             outcome: None,
             revert: None,
             busy: None,
+            read_again: false,
             read_task: Task::ready(()),
             run_task: Task::ready(()),
         }
     }
 
     /// Takes in `changed`, a change to `machine`'s rho settings, for the
-    /// app's sync, if Settings made one. A change that moves only their
-    /// revision, such as an agent model's auth profile, leaves what differs
-    /// alone, but a write at the revision read before it would stop as
-    /// stale: the comparison reads both machines again, keeping the user's
-    /// checks. A change of values is left to the write, which the daemon
-    /// refuses.
+    /// app's sync, once Settings has opened it. A change to the target's
+    /// that moves only their revision, such as an agent model's auth profile, leaves what
+    /// differs alone, but a write at the revision read before it would stop
+    /// as stale: the comparison reads both machines again, keeping the
+    /// user's checks, or does once the read under way ends. A change of
+    /// values is left to the write, which the daemon refuses.
     pub(crate) fn settings_changed(
         machine: &MachineId,
         changed: &AgentSettingsChanged,
         cx: &mut App,
     ) {
-        let shared = cx.try_global::<Shared>();
-        let Some(Shared(sync)) = shared.filter(|_| changed.moves_no_value()) else {
+        if !changed.moves_no_value() {
+            return;
+        }
+        let Some(Shared(sync)) = cx.try_global::<Shared>() else {
             return;
         };
         sync.clone().update(cx, |sync, cx| {
-            let compared = matches!(sync.compare, Compare::Ready { .. });
-            if compared && (sync.from == *machine || sync.to.as_ref() == Some(machine)) {
-                sync.read(sync.kept_checks(), cx);
+            // Writes go only to the target, at its revisions.
+            if sync.to.as_ref() != Some(machine) {
+                return;
+            }
+            match sync.compare {
+                Compare::Ready { .. } => sync.read(sync.kept_checks(), cx),
+                Compare::Reading => sync.read_again = true,
+                Compare::Idle | Compare::Failed(_) => {}
             }
         });
     }
@@ -426,6 +437,7 @@ impl SettingsSync {
         };
         let (source_label, target_label) = (self.label(&self.from, cx), self.label(&to, cx));
         self.compare = Compare::Reading;
+        self.read_again = false;
         cx.notify();
         let pair = (self.from.clone(), to);
         self.read_task = cx.spawn(async move |this, cx| {
@@ -463,6 +475,9 @@ impl SettingsSync {
                     }
                     Err(error) => Compare::Failed(error.to_string().into()),
                 };
+                if std::mem::take(&mut this.read_again) {
+                    this.read(this.kept_checks(), cx);
+                }
                 cx.notify();
             });
         });
