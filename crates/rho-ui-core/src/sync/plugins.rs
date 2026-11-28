@@ -276,6 +276,7 @@ fn row(plugin: &Plugin, there: Option<&Plugin>, action: Action, copy: Copy) -> R
         one_machine: false,
         restart: false,
         note: None,
+        offer: None,
         copy,
     }
 }

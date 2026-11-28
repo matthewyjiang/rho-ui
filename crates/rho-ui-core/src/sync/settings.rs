@@ -63,6 +63,7 @@ fn row(spec: &SettingSpec, source: &Side, target: &Side) -> Option<Row> {
         one_machine: false,
         restart: false,
         note: None,
+        offer: None,
         copy,
     };
     let Some(tspec) = target.settings.spec(key) else {
@@ -177,7 +178,12 @@ pub(super) async fn write(
         .iter()
         .filter_map(|item| match &item.change {
             Change::Setting { key, after, .. } => Some(after.write(key)),
-            Change::Plugin { .. } | Change::Entry { .. } | Change::Hooks { .. } => None,
+            Change::Plugin { .. }
+            | Change::Entry { .. }
+            | Change::Hooks { .. }
+            | Change::Key { .. }
+            | Change::Mcp { .. }
+            | Change::Restore { .. } => None,
         })
         .collect();
     target.set_agent_settings(revision, changes).await

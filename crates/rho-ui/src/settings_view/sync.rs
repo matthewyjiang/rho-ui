@@ -12,23 +12,32 @@ use gpui_kit::component::{
     checkbox::Checkbox,
     h_flex,
     setting::{SettingField, SettingGroup, SettingItem},
-    Disableable as _, Sizable as _,
+    v_flex, Disableable as _, Sizable as _,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    rems, App, Context, Entity, ParentElement as _, SharedString, Styled as _, Subscription,
+    rems, App, Axis, Context, Entity, IntoElement as _, ParentElement as _, SharedString,
+    Styled as _, Subscription,
 };
-use rho_ui_core::sync::{Action, Group, RevertRow, RevertState, Row, RowKey, RowState, Snapshot};
+use rho_ui_core::sync::{
+    Action, Group, Offer, RevertRow, RevertState, Row, RowKey, RowState, Snapshot,
+};
+use rho_ui_core::{AuthStatus, AuthSummary};
 
 use super::{described, status_mark, value, Mark, SettingsView, Tone, CONTROL_REMS};
 use crate::{
+    auths::Auths,
     machines::{self, DaemonAction, MachineId, Machines},
     rho_settings::RhoSettings,
     settings_sync::{clock, Busy, Compare, Outcome, Ran, Revert, RunKind, SettingsSync, Stop},
+    sign_in,
 };
 
-/// The group's own state: the app's sync, which outlives the dialog.
+/// The group's own state: the app's sync, which outlives the dialog, and
+/// the machines' sign-ins, for the rows that sign the target in.
 pub(super) struct SyncFields {
     sync: Entity<SettingsSync>,
+    auths: Entity<Auths>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -38,6 +47,7 @@ impl SyncFields {
     pub(super) fn new(
         machines: &Entity<Machines>,
         rho_settings: &Entity<RhoSettings>,
+        auths: &Entity<Auths>,
         cx: &mut Context<'_, SettingsView>,
     ) -> Self {
         let sync = SettingsSync::shared(machines, rho_settings, cx);
@@ -48,6 +58,7 @@ impl SyncFields {
         });
         Self {
             sync,
+            auths: auths.clone(),
             _subscriptions: [shown, connected],
         }
     }
@@ -67,7 +78,7 @@ impl SettingsView {
         let machines = self.machine_list.read(cx);
         let mut head = SettingGroup::new()
             .title("Sync")
-            .description("Copy Rho's settings, models, provider profiles, hooks and plugins from one machine to another.");
+            .description("Copy Rho's settings, models, provider profiles, sign-ins, MCP servers, hooks and plugins from one machine to another.");
         let Some(to) = sync.to().cloned() else {
             return vec![head.item(SettingItem::new(
                 "Machines",
@@ -99,8 +110,13 @@ impl SettingsView {
         if let Some(revert) = sync.revert() {
             groups.push(revert_group(revert, sync, &target, &entity, cx));
         } else if let Compare::Ready { diff, checked } = sync.compare() {
+            let on = Target {
+                machine: &to,
+                label: &target,
+                auths: &self.sync.auths,
+            };
             for group in &diff.groups {
-                groups.push(diff_group(group, checked, &target, &entity));
+                groups.push(diff_group(group, checked, &on, &entity, cx));
             }
             let selected = diff.plan(checked).len();
             groups.push(submit_group(selected, sync.busy(), &target, &entity));
@@ -371,12 +387,21 @@ fn outcome_title(outcome: &Outcome, target: &str) -> Option<(String, Option<Stri
     })
 }
 
+/// The machine a sync writes to: its name, and its sign-ins, for the rows
+/// that offer one.
+struct Target<'a> {
+    machine: &'a MachineId,
+    label: &'a str,
+    auths: &'a Entity<Auths>,
+}
+
 /// One kind's rows, under a header that checks or unchecks them all.
 fn diff_group(
     group: &Group,
     checked: &BTreeSet<RowKey>,
-    target: &str,
+    target: &Target<'_>,
     entity: &Entity<SettingsSync>,
+    cx: &App,
 ) -> SettingGroup {
     let copyable: Vec<&RowKey> = group
         .rows
@@ -409,20 +434,32 @@ fn diff_group(
     let rows = group
         .rows
         .iter()
-        .map(|row| row_item(row, checked, target, entity));
+        .map(|row| row_item(row, checked, target, entity, cx));
     SettingGroup::new().item(header).items(rows)
 }
 
-/// One row: its check, or why it can't be copied, under what it changes.
+/// One row: its check, or why it can't be copied, under what it changes;
+/// for a row that offers it, what signs the target in instead.
 fn row_item(
     row: &Row,
     checked: &BTreeSet<RowKey>,
-    target: &str,
+    target: &Target<'_>,
     entity: &Entity<SettingsSync>,
+    cx: &App,
 ) -> SettingItem {
     let checked = checked.contains(&row.key);
     let id = row_id("sync-row", &row.key);
     let label = row.label.clone();
+    let lines = row_lines(row, target.label);
+    let offered = row.offer.as_ref().and_then(|offer| match offer {
+        Offer::SignIn { auth } => {
+            let profile = target.auths.read(cx).profile(target.machine, auth)?;
+            Some(sign_in_item(row, profile, target, cx))
+        }
+    });
+    if let Some(item) = offered {
+        return item.description(lines.join("\n"));
+    }
     let field = match row.state() {
         RowState::CantCopy(_) => SettingField::render(move |_, _, cx| {
             status_mark(
@@ -444,8 +481,44 @@ fn row_item(
             })
         }
     };
-    let lines = row_lines(row, target);
     SettingItem::new(row.label.clone(), field).description(lines.join("\n"))
+}
+
+/// A row whose profile signs in on the target instead: Sign in, the login's
+/// page and code while it waits, then that it signed in.
+fn sign_in_item(row: &Row, profile: &AuthSummary, target: &Target<'_>, cx: &App) -> SettingItem {
+    let ids = row_id("sync-sign-in", &row.key).to_string();
+    let logging_in = target
+        .auths
+        .read(cx)
+        .login(target.machine)
+        .is_some_and(|login| login.auth == profile.auth);
+    let (auths, machine, profile) = (
+        target.auths.clone(),
+        target.machine.clone(),
+        profile.clone(),
+    );
+    let field = SettingField::render(move |_, _, cx| {
+        let controls = if profile.status == AuthStatus::SignedIn {
+            let label = format!("{}: signed in", profile.label);
+            status_mark(ids.clone().into(), label, Mark::On, "Signed in", cx).into_any_element()
+        } else {
+            sign_in::controls(&ids, &auths, &machine, &profile, None, cx)
+        };
+        let note = auths.read(cx).note(&machine, &profile.auth).cloned();
+        v_flex()
+            .gap_1()
+            .child(controls)
+            .when_some(note.as_ref(), |this, note| {
+                this.child(sign_in::note_line(&ids, note, cx))
+            })
+    });
+    let item = SettingItem::new(row.label.clone(), field);
+    if logging_in {
+        item.layout(Axis::Vertical)
+    } else {
+        item
+    }
 }
 
 /// What a row says under its label: what syncing it changes, when it

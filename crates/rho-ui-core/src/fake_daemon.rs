@@ -157,7 +157,15 @@
 //!   `sign_in: later`. [`LOGIN_AUTH`] takes a login, whose prompt follows
 //!   at once and which waits for [`FakeDaemon::approve_login`]. The key
 //!   [`REFUSED_KEY`] is refused, and [`UNCHECKED_KEY`] saved unchecked. Credentials go to a file store the
-//!   config chose.
+//!   config chose. [`KEY_AUTH`] starts with [`SAVED_KEY`] saved;
+//!   [`FakeDaemon::set_api_key`] and [`FakeDaemon::key_from_env`] change
+//!   that as a hand edit does.
+//! - `rho/sync/*` seals saved keys and MCP secrets as `fake_daemon/secrets.rs`
+//!   says, with no crypto: each recipient's public key is unique in the
+//!   process, so two fakes in one test exchange bundles as two daemons do.
+//!   It journals the last sync's writes for `rho/sync/revert`.
+//!   `rho/mcp/config/*` reads and writes the `[mcp.servers]` that
+//!   [`FakeDaemon::edit_mcp_server`] edits by hand; it starts empty.
 //! - `rho/session/mcp` reports three MCP servers for every session: two
 //!   connected and one disabled ([`MCP_DOCS`], [`MCP_GITHUB`],
 //!   [`MCP_NOTES`]). With [`Script::mcp`] [`McpStartup::Connecting`], the
@@ -232,10 +240,11 @@ use rho_protocol::{
     serve_connection, subscription_of, AnswerStop, BuildId, CardTone, Choice, ClientEnvironment,
     CommandKind, CompactionCounts, CompactionId, CompactionStatus, CompactionTrigger, ConfigTable,
     ContentBlock, Cursor, DaemonEndpoint, DaemonInfo, DefaultAnswer, DefaultStyle, DetachReason,
-    ErrorCode, InputRequest, ModelList, PermissionMode, PlanEntry, PlanStatus, ProcessStream,
-    ProtocolVersion, Published, Publisher, Question, RestartCost, RetryReason, RpcError, Selection,
-    SessionAttachResponse, SessionEvent, StreamEvent, Subscription, ToolContent, ToolKind,
-    ToolStatus, TurnOutcome, VersionMismatch, WorktreeReport, WorktreeVerdict, PROTOCOL_VERSION,
+    ErrorCode, InputRequest, McpSecretKind, McpSecretSlot, ModelList, PermissionMode, PlanEntry,
+    PlanStatus, ProcessStream, ProtocolVersion, Published, Publisher, Question, RestartCost,
+    RetryReason, RpcError, Selection, SessionAttachResponse, SessionEvent, StreamEvent,
+    Subscription, ToolContent, ToolKind, ToolStatus, TurnOutcome, VersionMismatch, WorktreeReport,
+    WorktreeVerdict, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -259,12 +268,15 @@ mod processes;
 mod pull_requests;
 mod reports;
 mod search;
+mod secrets;
 mod service;
 mod started;
 pub mod surface;
 
 use auth::FakeAuth;
-pub use auth::{KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, UNCHECKED_KEY};
+pub use auth::{
+    KEY_AUTH, LOGIN_AUTH, LOGIN_CODE, LOGIN_URL, REFUSED_KEY, SAVED_KEY, UNCHECKED_KEY,
+};
 pub use cards::{FakeCard, FakeSubject, CARDS};
 use config::FakeConfig;
 use config_files::FakeConfigFiles;
@@ -285,6 +297,7 @@ use pull_requests::FakePullRequests;
 pub use pull_requests::{PullRequestMethods, PULL_REQUEST_BODY};
 use reports::FakeReports;
 pub use reports::ReportMethod;
+use secrets::FakeSecrets;
 use service::Fake;
 use started::{HeldChange, StartedChoice};
 
@@ -511,6 +524,12 @@ pub struct FakeDaemon {
     _runtime: Runtime,
 }
 
+/// An MCP server's secret as a test gives it: its kind, name and value.
+pub type McpSecretValue<'a> = (McpSecretKind, &'a str, &'a str);
+
+/// An MCP server's secret as a test reads it back: its kind, name and value.
+pub type McpSecretOwned = (McpSecretKind, String, String);
+
 impl FakeDaemon {
     /// Starts a daemon holding `script`, listening where rho's daemon of a
     /// rho home of its own, a temporary directory, would.
@@ -599,6 +618,63 @@ impl FakeDaemon {
     /// If no login is under way.
     pub fn approve_login(&self) {
         self.service.lock().auth.approve();
+    }
+
+    /// Signs [`LOGIN_AUTH`] in, as a login finished earlier would have.
+    pub fn sign_in_login(&self) {
+        self.service.lock().auth.sign_in_login();
+    }
+
+    /// Saves `key` for auth profile `auth`, signing it in, or with `None`
+    /// deletes its credential, signing it out, as a hand edit of the
+    /// credential store does.
+    pub fn set_api_key(&self, auth: &str, key: Option<&str>) {
+        self.service
+            .lock()
+            .auth
+            .set_key(auth, key.map(str::to_owned));
+    }
+
+    /// The API key saved for `auth` now: none for a key that comes from
+    /// the environment, or a login.
+    pub fn api_key(&self, auth: &str) -> Option<String> {
+        self.service.lock().auth.saved_key(auth).map(str::to_owned)
+    }
+
+    /// From now on `auth`'s key comes from an environment variable of the
+    /// daemon: it is signed in with no key saved, so an export reports it
+    /// missing.
+    pub fn key_from_env(&self, auth: &str) {
+        self.service.lock().auth.key_from_env(auth);
+    }
+
+    /// Puts MCP server `identity` under `[mcp.servers]` as `value` with
+    /// its secrets, each a `(kind, name, value)`, or removes it when
+    /// `None`, as a hand edit of `config.toml` does: a write against the
+    /// revision before it is refused.
+    pub fn edit_mcp_server(&self, identity: &str, server: Option<(Value, &[McpSecretValue<'_>])>) {
+        let server = server.map(|(value, secrets)| {
+            let secrets = secrets
+                .iter()
+                .map(|&(kind, name, secret)| (McpSecretSlot::new(kind, name), secret.to_owned()))
+                .collect();
+            (value, secrets)
+        });
+        self.service
+            .lock()
+            .secrets
+            .edit_mcp_server(identity, server);
+    }
+
+    /// MCP server `identity` of `[mcp.servers]` now: its value, and its
+    /// secrets, each a `(kind, name, value)`.
+    pub fn mcp_server(&self, identity: &str) -> Option<(Value, Vec<McpSecretOwned>)> {
+        let (value, secrets) = self.service.lock().secrets.mcp_server(identity)?;
+        let secrets = secrets
+            .into_iter()
+            .map(|(slot, secret)| (slot.kind, slot.name, secret))
+            .collect();
+        Some((value, secrets))
     }
 
     /// The value of variable `name` in the environment the latest
@@ -2472,6 +2548,8 @@ struct State {
     config: FakeConfig,
     /// The `config.toml` tables and the user's hooks file.
     config_files: FakeConfigFiles,
+    /// The live sync recipients, `[mcp.servers]`, and the sync journal.
+    secrets: FakeSecrets,
     /// The models a model setting may take, which every client that read
     /// them follows.
     models: watch::Sender<Arc<ModelList>>,
@@ -2613,6 +2691,7 @@ impl State {
             extra_jobs: Vec::new(),
             config: FakeConfig::new(),
             config_files: FakeConfigFiles::default(),
+            secrets: FakeSecrets::default(),
             models: watch::Sender::new(Arc::new(model_list(&MODELS))),
             auth: FakeAuth::new(&script),
             pull_requests: FakePullRequests::new(script.pull_requests),

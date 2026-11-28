@@ -75,6 +75,7 @@ mod processes;
 mod pull_requests;
 mod reports;
 mod search;
+mod sync_secrets;
 mod worktrees;
 
 pub use config_files::{HooksFileRead, TableRead};

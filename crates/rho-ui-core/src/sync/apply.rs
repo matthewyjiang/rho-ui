@@ -3,10 +3,12 @@
 
 use std::collections::BTreeMap;
 
-use rho_protocol::ConfigRevision;
+use rho_protocol::{ConfigRevision, SyncId};
 
 use super::plugins::{self, Unwritten};
-use super::{hooks, read, settings, tables, Change, Guarded, Order, Plan, Planned, Store};
+use super::{
+    hooks, journal, keys, mcp, read, settings, tables, Change, Order, Plan, Planned, Step, Store,
+};
 use crate::{Daemon, DaemonError};
 
 /// What applying a plan came to.
@@ -45,42 +47,36 @@ pub struct Failure {
     pub reason: String,
 }
 
-/// Writes `plan` to `target`'s daemon: each store's guarded rows at once,
-/// store by store, against the revision the plan read (the daemon takes
-/// it while only this client wrote since); then each unguarded row on its
-/// own. A store the daemon refuses fails its rows, and the rest go on; a
-/// stale one stops the plan.
-pub async fn apply(target: &Daemon, plan: Plan) -> Written {
+/// The two machines a run writes between: the target, and the source its
+/// secrets are sealed from, which a revert doesn't need.
+#[derive(Clone, Copy, Debug)]
+pub struct Machines<'a> {
+    /// The source's daemon; `None` for a revert.
+    pub source: Option<&'a Daemon>,
+    /// The target's daemon.
+    pub target: &'a Daemon,
+    /// The target's name, for the reasons rows give.
+    pub label: &'a str,
+}
+
+/// Writes `plan` to the target, under the sync `sync`: place by place, a
+/// store's rows at once against the revision the plan read (the daemon
+/// takes it while only this client wrote since), keys and what the journal
+/// puts back item by item; then each unguarded row on its own. A store the
+/// daemon refuses fails its rows, and the rest go on; a stale one stops
+/// the plan.
+pub async fn apply(machines: Machines<'_>, plan: Plan, sync: &SyncId) -> Written {
     let mut written = Written {
         landed: plan.settled,
         ..Written::default()
     };
-    for Guarded {
-        store,
-        revision,
-        items,
-    } in plan.guarded
-    {
-        let wrote = match store {
-            Store::Table(table) => tables::write(target, table, revision, &items).await,
-            Store::Settings => settings::write(target, revision, &items).await,
-            Store::Hooks => hooks::write(target, revision, &items).await,
-        };
-        match wrote {
-            Ok(()) => written.landed.extend(items),
-            Err(DaemonError::Conflict(_)) => {
-                written.stale = true;
-                return written;
-            }
-            Err(error) => {
-                let reason = error.to_string();
-                written.failed.extend(items.into_iter().map(|item| Failure {
-                    item,
-                    reason: reason.clone(),
-                }));
-            }
+    for step in plan.steps {
+        if let Err(Stale) = step.write(machines, sync, &mut written).await {
+            written.stale = true;
+            return written;
         }
     }
+    let target = machines.target;
     for item in plan.unguarded {
         // A plan keeps every other kind with its store.
         let Change::Plugin {
@@ -111,11 +107,104 @@ pub async fn apply(target: &Daemon, plan: Plan) -> Written {
     written
 }
 
-/// Writes failed row `failure` again to `target`'s daemon, the machine
-/// `label`. It reads the target first: a guarded row writes against its
-/// store's revision now, and overwrites what the target holds now, which
-/// Revert then puts back.
-pub async fn retry(target: &Daemon, label: String, failure: &Failure) -> Written {
+/// A store changed on the target since it was read.
+struct Stale;
+
+impl Step {
+    /// Writes this step's rows, saying in `written` how each went.
+    async fn write(
+        self,
+        machines: Machines<'_>,
+        sync: &SyncId,
+        written: &mut Written,
+    ) -> Result<(), Stale> {
+        let Machines {
+            source,
+            target,
+            label,
+        } = machines;
+        let (items, wrote) = match self {
+            Self::Guarded {
+                store,
+                revision,
+                items,
+            } => {
+                let wrote = match store {
+                    Store::Table(table) => tables::write(target, table, revision, &items).await,
+                    Store::Mcp => mcp::write(source, target, label, revision, &items, sync).await,
+                    Store::Settings => settings::write(target, revision, &items).await,
+                    Store::Hooks => hooks::write(target, revision, &items).await,
+                };
+                match wrote {
+                    Ok(()) => (items, Wrote::All),
+                    Err(DaemonError::Conflict(_)) => return Err(Stale),
+                    Err(error) => (items, Wrote::None(error.to_string())),
+                }
+            }
+            Self::Keys(items) => {
+                let wrote = match source {
+                    Some(source) => keys::write(source, target, label, &items, sync).await,
+                    None => Err("Keys come from the source, which isn't here".to_owned()),
+                };
+                (items, Wrote::of(wrote))
+            }
+            Self::Journal(items) => {
+                let wrote = journal::write(target, label, sync, &items).await;
+                (items, Wrote::of(wrote))
+            }
+        };
+        written.settle(items, wrote);
+        Ok(())
+    }
+}
+
+/// How a step's write went.
+enum Wrote {
+    /// Every row landed.
+    All,
+    /// Each row's failure, if it failed, in the rows' order.
+    Each(Vec<Option<String>>),
+    /// No row landed, for this reason.
+    None(String),
+}
+
+impl Wrote {
+    /// Each row's failure, if it failed, or why none landed.
+    fn of(each: Result<Vec<Option<String>>, String>) -> Self {
+        each.map_or_else(Self::None, Self::Each)
+    }
+}
+
+impl Written {
+    /// Says how each of `items` went, by `wrote`. A row `wrote` gives no
+    /// outcome for failed: nothing says it landed.
+    fn settle(&mut self, items: Vec<Planned>, wrote: Wrote) {
+        let mut each = match wrote {
+            Wrote::All => {
+                self.landed.extend(items);
+                return;
+            }
+            Wrote::Each(each) => each.into_iter(),
+            Wrote::None(reason) => vec![Some(reason); items.len()].into_iter(),
+        };
+        for item in items {
+            match each.next() {
+                Some(None) => self.landed.push(item),
+                Some(Some(reason)) => self.failed.push(Failure { item, reason }),
+                None => {
+                    let reason = "Rho didn't say whether it wrote it".to_owned();
+                    self.failed.push(Failure { item, reason });
+                }
+            }
+        }
+    }
+}
+
+/// Writes failed row `failure` again to the target, under the sync `sync`.
+/// It reads the target first: a guarded row writes against its store's
+/// revision now, and overwrites what the target holds now, which Revert
+/// then puts back.
+pub async fn retry(machines: Machines<'_>, failure: &Failure, sync: &SyncId) -> Written {
     let fail = |reason: String| Written {
         failed: vec![Failure {
             item: failure.item.clone(),
@@ -123,7 +212,7 @@ pub async fn retry(target: &Daemon, label: String, failure: &Failure) -> Written
         }],
         ..Written::default()
     };
-    let now = match read(label, target).await {
+    let now = match read(machines.label.to_owned(), machines.target).await {
         Ok(now) => now,
         Err(error) => return fail(error.to_string()),
     };
@@ -145,7 +234,22 @@ pub async fn retry(target: &Daemon, label: String, failure: &Failure) -> Written
             before,
             after: after.clone(),
         }),
-        plugin @ Change::Plugin { .. } => Ok(plugin.clone()),
+        Change::Mcp {
+            identity, after, ..
+        } => mcp::value(&now, identity).map(|before| Change::Mcp {
+            identity: identity.clone(),
+            before,
+            after: after.clone(),
+            // The target may have changed a secret it held the same: seal
+            // them all from the source.
+            keep: Vec::new(),
+        }),
+        // What the journal keeps goes back over what the target holds now.
+        Change::Restore { item, .. } => Ok(Change::Restore {
+            item: item.clone(),
+            overwrite: true,
+        }),
+        unread @ (Change::Plugin { .. } | Change::Key { .. }) => Ok(unread.clone()),
     };
     let item = match change {
         Ok(change) => Planned {
@@ -155,5 +259,6 @@ pub async fn retry(target: &Daemon, label: String, failure: &Failure) -> Written
         Err(why) => return fail(why),
     };
     let revisions: BTreeMap<Store, ConfigRevision> = now.revisions();
-    apply(target, Plan::new(&revisions, [item], Order::Sync)).await
+    let plan = Plan::new(&revisions, [item], Order::Sync);
+    apply(machines, plan, sync).await
 }

@@ -113,6 +113,7 @@ fn row(table: Table, key: &str, [from, to]: [Option<&Value>; 2], copy: Copy) -> 
         one_machine: false,
         restart: false,
         note: None,
+        offer: None,
         copy,
     }
 }
@@ -197,7 +198,12 @@ pub(super) async fn write(
                 },
                 None => TableChange::Remove { key: key.clone() },
             }),
-            Change::Setting { .. } | Change::Plugin { .. } | Change::Hooks { .. } => None,
+            Change::Setting { .. }
+            | Change::Plugin { .. }
+            | Change::Hooks { .. }
+            | Change::Key { .. }
+            | Change::Mcp { .. }
+            | Change::Restore { .. } => None,
         })
         .collect();
     target

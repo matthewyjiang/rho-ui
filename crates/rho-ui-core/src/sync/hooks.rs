@@ -58,6 +58,7 @@ pub(super) fn rows(source: &Side, target: &Side) -> Vec<Row> {
         one_machine: false,
         restart: false,
         note,
+        offer: None,
         copy,
     }]
 }
@@ -87,7 +88,12 @@ pub(super) async fn write(
 ) -> Result<(), DaemonError> {
     let text = items.iter().find_map(|item| match &item.change {
         Change::Hooks { after, .. } => Some(after.clone()),
-        Change::Setting { .. } | Change::Plugin { .. } | Change::Entry { .. } => None,
+        Change::Setting { .. }
+        | Change::Plugin { .. }
+        | Change::Entry { .. }
+        | Change::Key { .. }
+        | Change::Mcp { .. }
+        | Change::Restore { .. } => None,
     });
     match text {
         Some(text) => target.set_hooks_file(revision, text).await,

@@ -11,13 +11,15 @@
 //! kept in [`SyncSnapshots`], one per target, for the last sync only.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::DateTime;
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use rho_ui_core::{
     sync::{self, Diff, Failure, GroupKind, Pass, Plan, RevertReview, RowKey, Snapshot, Written},
-    AgentSettingsChanged, Daemon,
+    AgentSettingsChanged, Daemon, SyncId,
 };
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     machines::{MachineId, Machines},
@@ -207,12 +209,27 @@ enum Job {
 }
 
 /// A run under way: what it is to the target's snapshot, to which
-/// machine, the row it retries, and the snapshot from before it.
+/// machine and its daemon, the row it retries, the snapshot from before
+/// it, and the sync it writes under.
 struct Run {
     pass: Pass,
     target: MachineId,
+    daemon: Daemon,
     retried: Option<RowKey>,
     kept: Option<Snapshot>,
+    sync: SyncId,
+}
+
+/// A new name for a sync on its target: the time here, to the nanosecond,
+/// and a count of the syncs this run named, so no two share one even if
+/// the clock is off.
+fn new_sync() -> SyncId {
+    static NAMED: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let named = NAMED.fetch_add(1, Ordering::Relaxed);
+    SyncId::new(format!("rho-ui-{nanos:x}-{named}"))
 }
 
 /// The app's one sync, made when Settings first opens, and kept with the
@@ -445,7 +462,13 @@ impl SettingsSync {
                 sync::read(source_label, &source),
                 sync::read(target_label, &target)
             );
-            let compared = from.and_then(|from| Ok(sync::diff(&from, &to?)));
+            let compared = match (from, to) {
+                (Ok(from), Ok(to)) => {
+                    let secrets = sync::compare(&source, &from, &target, &to).await;
+                    Ok(sync::diff(&from, &to, &secrets))
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
             let _ = this.update(cx, |this, cx| {
                 // The user picked another pair since.
                 if (this.from.clone(), this.to.clone()) != (pair.0, Some(pair.1)) {
@@ -545,12 +568,25 @@ impl SettingsSync {
             (None, RunKind::Sync) => Busy::Syncing,
             (None, RunKind::Revert) => Busy::Reverting,
         };
+        // Secrets are sealed from the source; a revert needs none.
+        let source = match RunKind::of(pass) {
+            RunKind::Sync => {
+                let Some(source) = self.daemon(&self.from, cx) else {
+                    self.compare = Compare::Idle;
+                    cx.notify();
+                    return;
+                };
+                Some(source)
+            }
+            RunKind::Revert => None,
+        };
         let Some(daemon) = self.begin(busy, &target, cx) else {
             return;
         };
         let kept = SyncSnapshots::get(&target, cx);
+        let sync = Snapshot::writes_under(kept.as_ref(), pass).unwrap_or_else(new_sync);
         if let Job::Plan(plan) = &job {
-            let before = Snapshot::before(kept.clone(), pass, plan, time::now_unix());
+            let before = Snapshot::before(kept.clone(), pass, plan, &sync, time::now_unix());
             SyncSnapshots::set(&target, before, cx);
         }
         self.revert = None;
@@ -562,13 +598,20 @@ impl SettingsSync {
         let run = Run {
             pass,
             target,
+            daemon: daemon.clone(),
             retried,
             kept,
+            sync,
         };
         self.run_task = cx.spawn(async move |this, cx| {
+            let machines = sync::Machines {
+                source: source.as_ref(),
+                target: &daemon,
+                label: &label,
+            };
             let written = match job {
-                Job::Plan(plan) => sync::apply(&daemon, plan).await,
-                Job::Retry(failure) => sync::retry(&daemon, label, &failure).await,
+                Job::Plan(plan) => sync::apply(machines, plan, &run.sync).await,
+                Job::Retry(failure) => sync::retry(machines, &failure, &run.sync).await,
             };
             let _ = this.update(cx, |this, cx| {
                 this.busy = None;
@@ -600,10 +643,20 @@ impl SettingsSync {
         let Run {
             pass,
             target,
+            daemon,
             retried,
             kept,
+            sync,
         } = run;
-        let mut snapshot = Snapshot::after(kept, pass, &written, time::now_unix());
+        let mut snapshot = Snapshot::after(kept.clone(), pass, &written, &sync, time::now_unix());
+        if let Some(old) = Snapshot::replaced(kept, snapshot.as_ref()) {
+            // Best effort: what the target can't forget now, it does on its
+            // own once the journal expires.
+            cx.spawn(async move |_, _| {
+                let _ = sync::discard(&daemon, &old).await;
+            })
+            .detach();
+        }
         let label = self.label(&target, cx);
         if let (Some(key), Some(outcome)) = (retried, &mut self.outcome) {
             // A sync that stopped before it wrote anything starts its own
@@ -672,12 +725,13 @@ impl SettingsSync {
         };
         let label = self.label(&to, cx);
         self.run_task = cx.spawn(async move |this, cx| {
-            let target = sync::read(label, &daemon).await;
+            let target = sync::read(label.clone(), &daemon).await;
+            let journal = sync::journal(&daemon, &label, &snapshot).await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = None;
                 match target {
                     Ok(target) => {
-                        let review = sync::review_revert(&snapshot, &target);
+                        let review = sync::review_revert(&snapshot, &target, &journal);
                         if review.changed().next().is_none() {
                             let plan = review.plan(&BTreeSet::new());
                             this.run(Pass::Revert, to, Job::Plan(plan), cx);

@@ -16,20 +16,36 @@
 //! Each kind is a [`GroupKind`]: rho's settings (`rho/config/*`, in
 //! `settings.rs`), the user's agent plugins (`rho/plugins/*`, in
 //! `plugins.rs`), model aliases and favorites and provider profiles
-//! (`rho/config/table/*`, in `tables.rs`), and the user's hooks file
-//! (`rho/hooks/file/*`, in `hooks.rs`). Each kind's module reads, diffs
-//! and writes it; `apply.rs` runs a plan. A view draws a group and its rows
-//! from their fields alone, so a kind added here needs no change there.
+//! (`rho/config/table/*`, in `tables.rs`), API keys and logins
+//! (`keys.rs`), MCP servers (`rho/mcp/config/*`, in `mcp.rs`), and the
+//! user's hooks file (`rho/hooks/file/*`, in `hooks.rs`). Each kind's
+//! module reads, diffs and writes it; `apply.rs` runs a plan. A view draws
+//! a group and its rows from their fields alone, so a kind added here
+//! needs no change there.
+//!
+//! Secrets, API keys and MCP servers' header and environment values, never
+//! pass through rho-ui: the source daemon seals them to a one-time key the
+//! target issues, and only the target opens them (`secrets.rs`). The target
+//! journals what a sync replaced of them under the sync's [`SyncId`], and
+//! puts it back on Revert (`journal.rs`); a [`Snapshot`] keeps only which
+//! of them the sync wrote.
 
 mod apply;
 mod hooks;
+mod journal;
+mod keys;
+mod mcp;
 mod plugins;
+mod secrets;
 mod settings;
 mod tables;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rho_protocol::{ConfigRevision, ConfigTable, Plugin, SettingKey};
+use rho_protocol::{
+    AuthSummary, ConfigRevision, ConfigTable, McpConfigGetResponse, McpSecretSlot, Plugin,
+    SettingKey, SyncId, SyncItem,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -37,7 +53,9 @@ use crate::{AgentSettings, Daemon, DaemonError, HooksFileRead, TableRead};
 use plugins::{Found, PluginCopy};
 use settings::Held;
 
-pub use apply::{apply, retry, Failure, Written};
+pub use apply::{apply, retry, Failure, Machines, Written};
+pub use journal::{discard, journal, Journal};
+pub use secrets::{compare, Secrets};
 
 /// What a sync copies, a group of rows each, in the order a view shows
 /// them.
@@ -52,6 +70,10 @@ pub enum GroupKind {
     Models,
     /// Provider profiles: `ollama` and custom providers.
     Providers,
+    /// API keys, and logins to make on the target.
+    SignIns,
+    /// MCP servers, their secrets with them.
+    Mcp,
     /// The user's hooks file.
     Hooks,
 }
@@ -64,6 +86,8 @@ impl GroupKind {
             Self::Plugins => "Plugins",
             Self::Models => "Models",
             Self::Providers => "Provider profiles",
+            Self::SignIns => "Sign-ins",
+            Self::Mcp => "MCP servers",
             Self::Hooks => "Hooks",
         }
     }
@@ -75,6 +99,8 @@ impl GroupKind {
             Self::Plugins => "plugins",
             Self::Models => "models",
             Self::Providers => "providers",
+            Self::SignIns => "sign-ins",
+            Self::Mcp => "mcp",
             Self::Hooks => "hooks",
         }
     }
@@ -145,7 +171,21 @@ pub struct Row {
     /// What else a person should know before syncing it, such as what it
     /// leaves behind.
     pub note: Option<String>,
+    /// What the user can do on the target instead, for a row that can't be
+    /// copied.
+    pub offer: Option<Offer>,
     copy: Copy,
+}
+
+/// Something the user can do on the target for a row a sync can't copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Offer {
+    /// Run auth profile `auth`'s login on the target: logins are never
+    /// copied.
+    SignIn {
+        /// The auth profile.
+        auth: String,
+    },
 }
 
 /// Whether a row can sync, and what that writes.
@@ -188,6 +228,7 @@ impl Row {
             one_machine: false,
             restart: false,
             note: None,
+            offer: None,
             copy: Copy::Cannot(format!("Couldn't read it on {}: {why}", source.label)),
         }
     }
@@ -235,14 +276,47 @@ impl Table {
 }
 
 /// A part of rho's configuration the daemon writes only against the
-/// revision it was read at, all of a write or none: in the order a sync
-/// writes them, so a key or model reference never names a provider the
-/// target lacks yet. A revert writes them in the reverse order.
+/// revision it was read at, all of a write or none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Store {
     Table(Table),
+    Mcp,
     Settings,
     Hooks,
+}
+
+/// Where a plan writes a change, in the order a sync writes them, so a key
+/// or model reference never names a provider the target lacks yet. A
+/// revert writes them in the reverse order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Place {
+    Providers,
+    /// API keys, sealed, each saved on its own.
+    Keys,
+    Aliases,
+    Favorites,
+    /// The target's sync journal, which puts back the keys and MCP servers
+    /// a sync replaced: only a revert writes it.
+    Journal,
+    Mcp,
+    Settings,
+    Hooks,
+}
+
+impl Place {
+    /// The store the daemon guards this place's writes with; `None` for
+    /// the places it writes item by item.
+    fn store(self) -> Option<Store> {
+        match self {
+            Self::Providers => Some(Store::Table(Table::Providers)),
+            Self::Aliases => Some(Store::Table(Table::Aliases)),
+            Self::Favorites => Some(Store::Table(Table::Favorites)),
+            Self::Mcp => Some(Store::Mcp),
+            Self::Settings => Some(Store::Settings),
+            Self::Hooks => Some(Store::Hooks),
+            Self::Keys | Self::Journal => None,
+        }
+    }
 }
 
 /// One part of what a machine holds, as a sync read it.
@@ -287,6 +361,10 @@ pub struct Side {
     /// Each table read; one left out is as one an older rho lacks.
     tables: BTreeMap<Table, Part<TableRead>>,
     hooks: Part<HooksFileRead>,
+    /// Its auth profiles, signed in or not.
+    auths: Part<Vec<AuthSummary>>,
+    /// Its MCP servers, their secrets named without values.
+    mcp: Part<McpConfigGetResponse>,
 }
 
 impl Side {
@@ -309,6 +387,7 @@ impl Side {
     fn revision(&self, store: Store) -> Option<ConfigRevision> {
         match store {
             Store::Table(table) => self.table(table).read().map(|read| read.revision.clone()),
+            Store::Mcp => self.mcp.read().map(|read| read.revision.clone()),
             Store::Settings => Some(self.settings.revision().clone()),
             Store::Hooks => self.hooks.read().map(|hooks| hooks.revision.clone()),
         }
@@ -319,7 +398,7 @@ impl Side {
         Table::ALL
             .into_iter()
             .map(Store::Table)
-            .chain([Store::Settings, Store::Hooks])
+            .chain([Store::Mcp, Store::Settings, Store::Hooks])
             .filter_map(|store| Some((store, self.revision(store)?)))
             .collect()
     }
@@ -335,11 +414,13 @@ impl Side {
 pub async fn read(label: String, daemon: &Daemon) -> Result<Side, DaemonError> {
     let tables =
         futures::future::join_all(Table::ALL.map(|table| daemon.config_table(table.config())));
-    let (settings, plugins, tables, hooks) = futures::join!(
+    let (settings, plugins, tables, hooks, auths, mcp) = futures::join!(
         daemon.agent_settings(),
         daemon.plugins(None),
         tables,
         daemon.hooks_file(),
+        daemon.auths(),
+        daemon.mcp_config(),
     );
     let tables = Table::ALL
         .into_iter()
@@ -352,6 +433,8 @@ pub async fn read(label: String, daemon: &Daemon) -> Result<Side, DaemonError> {
         plugins: plugins?,
         tables,
         hooks: Part::of(hooks)?,
+        auths: Part::of(auths.map(Some))?,
+        mcp: Part::of(mcp)?,
     })
 }
 
@@ -366,8 +449,9 @@ pub struct Diff {
     revisions: BTreeMap<Store, ConfigRevision>,
 }
 
-/// Compares what `source` holds with what `target` does.
-pub fn diff(source: &Side, target: &Side) -> Diff {
+/// Compares what `source` holds with what `target` does, their secrets as
+/// `secrets` compared them.
+pub fn diff(source: &Side, target: &Side, secrets: &Secrets) -> Diff {
     let plugins = match (&source.plugins, &target.plugins) {
         (Some(from), Some(to)) => plugins::rows(from, to, &source.label, &target.label),
         // A rho older than plugins has none to compare.
@@ -385,6 +469,8 @@ pub fn diff(source: &Side, target: &Side) -> Diff {
             GroupKind::Providers,
             tables::rows(Table::Providers, source, target),
         ),
+        (GroupKind::SignIns, keys::rows(source, target, secrets)),
+        (GroupKind::Mcp, mcp::rows(source, target, secrets)),
         (GroupKind::Hooks, hooks::rows(source, target)),
     ]
     .into_iter()
@@ -461,16 +547,47 @@ enum Change {
         before: Option<String>,
         after: Option<String>,
     },
+    /// Auth profile `auth`'s API key, sealed from the source; it `replaced`
+    /// a key the target had. Its values never leave the daemons.
+    Key { auth: String, replaced: bool },
+    /// MCP server `identity`, without its secrets' values; `None` when the
+    /// target lacks it. A put fills the secrets in `keep` from the target's
+    /// own values, and the rest sealed from the source.
+    Mcp {
+        identity: String,
+        before: Option<McpServer>,
+        after: Option<McpServer>,
+        keep: Vec<McpSecretSlot>,
+    },
+    /// What the target's journal of the sync keeps of `item`, put back;
+    /// `overwrite` even though it changed since.
+    Restore { item: SyncItem, overwrite: bool },
+}
+
+/// An MCP server as the daemon reads it: its entry, without `headers` and
+/// `env`, and the names of the secrets those hold.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct McpServer {
+    /// Boxed: a JSON object is large, and a [`Change`] is kept by value.
+    value: Box<Value>,
+    secrets: Vec<McpSecretSlot>,
 }
 
 impl Change {
-    /// The store the daemon guards it in, by revision; `None` for one it
-    /// writes on its own, unguarded.
-    fn store(&self) -> Option<Store> {
+    /// Where a plan writes it; `None` for one it writes on its own, after
+    /// the rest.
+    fn place(&self) -> Option<Place> {
         match self {
-            Self::Setting { .. } => Some(Store::Settings),
-            Self::Entry { table, .. } => Some(Store::Table(*table)),
-            Self::Hooks { .. } => Some(Store::Hooks),
+            Self::Setting { .. } => Some(Place::Settings),
+            Self::Entry { table, .. } => Some(match table {
+                Table::Providers => Place::Providers,
+                Table::Aliases => Place::Aliases,
+                Table::Favorites => Place::Favorites,
+            }),
+            Self::Hooks { .. } => Some(Place::Hooks),
+            Self::Key { .. } => Some(Place::Keys),
+            Self::Mcp { .. } => Some(Place::Mcp),
+            Self::Restore { .. } => Some(Place::Journal),
             Self::Plugin { .. } => None,
         }
     }
@@ -482,6 +599,18 @@ impl Change {
             Self::Plugin { before, after, .. } => before == after,
             Self::Entry { before, after, .. } => before == after,
             Self::Hooks { before, after } => before == after,
+            Self::Mcp {
+                before,
+                after,
+                keep,
+                ..
+            } => {
+                before == after
+                    && after
+                        .as_ref()
+                        .is_none_or(|server| server.secrets.iter().all(|s| keep.contains(s)))
+            }
+            Self::Key { .. } | Self::Restore { .. } => false,
         }
     }
 
@@ -502,6 +631,15 @@ impl Change {
             (Self::Hooks { before, .. }, Self::Hooks { before: first, .. }) => {
                 first.clone_from(before);
             }
+            (Self::Mcp { before, .. }, Self::Mcp { before: first, .. }) => {
+                first.clone_from(before);
+            }
+            (
+                Self::Key { replaced, .. },
+                Self::Key {
+                    replaced: first, ..
+                },
+            ) => *first = *replaced,
             // Rows of the same key are of the same kind.
             _ => {}
         }
@@ -542,28 +680,42 @@ enum Order {
     Revert,
 }
 
-/// The rows to write to the target: first each store's guarded rows, all
-/// at once against the revision they were read at, store by store; then,
-/// unless a store was stale, the unguarded ones, each on its own. A row
-/// the target already holds as it would write needs no write at all.
+/// The rows to write to the target: first each place's rows, place by
+/// place, a store's all at once against the revision they were read at;
+/// then, unless a store was stale, the unguarded ones, each on its own. A
+/// row the target already holds as it would write needs no write at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     settled: Vec<Planned>,
-    guarded: Vec<Guarded>,
+    steps: Vec<Step>,
     unguarded: Vec<Planned>,
 }
 
-/// One store's rows of a plan, never none, and the revision they were
-/// read at.
+/// One place's rows of a plan, never none.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Guarded {
-    store: Store,
-    revision: ConfigRevision,
-    items: Vec<Planned>,
+enum Step {
+    /// A store's rows, and the revision they were read at.
+    Guarded {
+        store: Store,
+        revision: ConfigRevision,
+        items: Vec<Planned>,
+    },
+    /// API keys, sealed from the source and saved on the target.
+    Keys(Vec<Planned>),
+    /// What the target's journal of the sync puts back.
+    Journal(Vec<Planned>),
+}
+
+impl Step {
+    fn items(&self) -> &[Planned] {
+        match self {
+            Self::Guarded { items, .. } | Self::Keys(items) | Self::Journal(items) => items,
+        }
+    }
 }
 
 impl Plan {
-    /// `items`, read at `revisions`, split by store and written in
+    /// `items`, read at `revisions`, split by place and written in
     /// `order`. A row of a store the target has no revision for can't be
     /// written, and neither a diff nor a revert review offers one.
     fn new(
@@ -572,40 +724,45 @@ impl Plan {
         order: Order,
     ) -> Self {
         let mut settled = Vec::new();
-        let mut by_store: BTreeMap<Store, Vec<Planned>> = BTreeMap::new();
+        let mut by_place: BTreeMap<Place, Vec<Planned>> = BTreeMap::new();
         let mut unguarded = Vec::new();
         for item in items {
-            match item.change.store() {
+            match item.change.place() {
                 _ if item.change.is_noop() => settled.push(item),
-                Some(store) => by_store.entry(store).or_default().push(item),
+                Some(place) => by_place.entry(place).or_default().push(item),
                 None => unguarded.push(item),
             }
         }
-        let mut guarded: Vec<Guarded> = by_store
+        let mut steps: Vec<Step> = by_place
             .into_iter()
-            .filter_map(|(store, items)| {
-                let revision = revisions.get(&store)?.clone();
-                Some(Guarded {
-                    store,
-                    revision,
-                    items,
-                })
+            .filter_map(|(place, items)| match place {
+                Place::Keys => Some(Step::Keys(items)),
+                Place::Journal => Some(Step::Journal(items)),
+                _ => {
+                    let store = place.store()?;
+                    let revision = revisions.get(&store)?.clone();
+                    Some(Step::Guarded {
+                        store,
+                        revision,
+                        items,
+                    })
+                }
             })
             .collect();
         if order == Order::Revert {
-            guarded.reverse();
+            steps.reverse();
         }
         Self {
             settled,
-            guarded,
+            steps,
             unguarded,
         }
     }
 
     /// The rows it writes, in order.
     pub fn items(&self) -> impl Iterator<Item = &Planned> {
-        let guarded = self.guarded.iter().flat_map(|guarded| &guarded.items);
-        self.settled.iter().chain(guarded).chain(&self.unguarded)
+        let steps = self.steps.iter().flat_map(Step::items);
+        self.settled.iter().chain(steps).chain(&self.unguarded)
     }
 
     /// How many rows it writes.
@@ -630,6 +787,9 @@ pub struct Snapshot {
     /// The sync stopped part way, as the target changed under it: the next
     /// sync to the target is more of it ([`Pass::More`]).
     pub stopped: bool,
+    /// The sync's name on the target, whose journal keeps what it replaced
+    /// of the secrets.
+    sync: SyncId,
     items: Vec<Planned>,
 }
 
@@ -664,12 +824,19 @@ impl Snapshot {
     /// What to keep while `pass` writes `plan` at `now`, given `kept`, the
     /// snapshot from before: every row it may write, so Revert finds them
     /// if rho-ui stops as it writes.
-    pub fn before(kept: Option<Self>, pass: Pass, plan: &Plan, now: i64) -> Option<Self> {
+    pub fn before(
+        kept: Option<Self>,
+        pass: Pass,
+        plan: &Plan,
+        sync: &SyncId,
+        now: i64,
+    ) -> Option<Self> {
         match pass {
-            Pass::Sync => Some(Self::empty(now).with(plan.items())),
-            Pass::More | Pass::Retry => {
-                Some(kept.unwrap_or_else(|| Self::empty(now)).with(plan.items()))
-            }
+            Pass::Sync => Some(Self::empty(sync, now).with(plan.items())),
+            Pass::More | Pass::Retry => Some(
+                kept.unwrap_or_else(|| Self::empty(sync, now))
+                    .with(plan.items()),
+            ),
             Pass::Revert => kept,
         }
     }
@@ -681,10 +848,16 @@ impl Snapshot {
     /// overwrote, and a revert drops what it put back. A sync, or more of
     /// one, is [`Self::stopped`] if it stopped part way; a retry leaves
     /// that as it was. `None` when nothing is left.
-    pub fn after(kept: Option<Self>, pass: Pass, written: &Written, now: i64) -> Option<Self> {
+    pub fn after(
+        kept: Option<Self>,
+        pass: Pass,
+        written: &Written,
+        sync: &SyncId,
+        now: i64,
+    ) -> Option<Self> {
         let joined = |base: Option<Self>| {
             let mut next = base
-                .unwrap_or_else(|| Self::empty(now))
+                .unwrap_or_else(|| Self::empty(sync, now))
                 .with(&written.landed);
             next.stopped = written.stale;
             next
@@ -705,10 +878,41 @@ impl Snapshot {
         next.filter(|snapshot| !snapshot.items.is_empty())
     }
 
-    fn empty(at: i64) -> Self {
+    /// The sync `pass` writes under, given `kept`, the target's snapshot:
+    /// the snapshot's, unless the pass starts a sync of its own, which
+    /// needs a new one.
+    pub fn writes_under(kept: Option<&Self>, pass: Pass) -> Option<SyncId> {
+        match pass {
+            Pass::Sync => None,
+            Pass::More | Pass::Retry | Pass::Revert => kept.map(|kept| kept.sync.clone()),
+        }
+    }
+
+    /// Of `kept`, the target's snapshot before a run, the one `next`, its
+    /// snapshot after, no longer reverts: a newer sync replaced it, or a
+    /// revert ended it. The target can forget what it journaled of it.
+    pub fn replaced(kept: Option<Self>, next: Option<&Self>) -> Option<Self> {
+        kept.filter(|kept| next.map(Self::sync) != Some(kept.sync()))
+    }
+
+    /// The sync's name on the target.
+    pub fn sync(&self) -> &SyncId {
+        &self.sync
+    }
+
+    /// Whether the target's journal keeps anything of this sync: it wrote
+    /// a key or an MCP server.
+    fn journaled(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item.change, Change::Key { .. } | Change::Mcp { .. }))
+    }
+
+    fn empty(sync: &SyncId, at: i64) -> Self {
         Self {
             at,
             stopped: false,
+            sync: sync.clone(),
             items: Vec::new(),
         }
     }
@@ -811,8 +1015,9 @@ pub struct RevertReview {
     pub rows: Vec<RevertRow>,
 }
 
-/// Compares what `snapshot`'s sync wrote with what `target` holds now.
-pub fn review_revert(snapshot: &Snapshot, target: &Side) -> RevertReview {
+/// Compares what `snapshot`'s sync wrote with what `target` holds now, and
+/// with what the target's `journal` of it says of its secrets.
+pub fn review_revert(snapshot: &Snapshot, target: &Side, journal: &Journal) -> RevertReview {
     let rows = snapshot
         .items
         .iter()
@@ -836,6 +1041,25 @@ pub fn review_revert(snapshot: &Snapshot, target: &Side) -> RevertReview {
             } => tables::revert_row(item, *table, key, [before.as_ref(), after.as_ref()], target),
             Change::Hooks { before, after } => {
                 hooks::revert_row(item, [before.as_ref(), after.as_ref()], target)
+            }
+            Change::Key { auth, replaced } => {
+                let before = if *replaced { "Its own key" } else { "No key" };
+                journal::key_row(item, auth, before, journal)
+            }
+            Change::Mcp {
+                identity,
+                before,
+                after,
+                ..
+            } => {
+                let values = [before.as_ref(), after.as_ref()];
+                journal::mcp_row(item, identity, values, target, journal)
+            }
+            // A snapshot keeps what a sync wrote, never a revert.
+            Change::Restore { .. } => {
+                let none = || "Nothing".to_owned();
+                let why = "A revert wrote it, not a sync".to_owned();
+                RevertRow::blocked(item, [none(), none()], none(), why)
             }
         })
         .collect();

@@ -6,7 +6,8 @@ use std::{
 use rho_protocol::{
     Applies, ConfigCategory, ConfigGetResponse, ConfigRevision, ConfigSchema, Plugin,
     PluginInstallSource, PluginScope, PluginSource, PluginStatus, SettingChange, SettingChoice,
-    SettingEntry, SettingKey, SettingKind, SettingSpec, SettingValue, TableEntry, ValueSource,
+    SettingEntry, SettingKey, SettingKind, SettingSpec, SettingValue, SyncItem, TableEntry,
+    ValueSource,
 };
 use serde_json::{json, Value};
 
@@ -166,7 +167,14 @@ fn machine(
         plugins: Some(plugins),
         tables: BTreeMap::new(),
         hooks: Part::Lacks,
+        auths: Part::Lacks,
+        mcp: Part::Lacks,
     }
+}
+
+/// The name every sync of these tests runs under.
+fn sync_id() -> SyncId {
+    SyncId::new("sync")
 }
 
 fn plugin(name: &str, source: PluginSource) -> Plugin {
@@ -288,7 +296,7 @@ fn a_setting_row_follows_the_copy_policy() {
             }
             None => machine("box", Vec::new(), &[], Vec::new()),
         };
-        let diff = diff(&from, &to);
+        let diff = diff(&from, &to, &Secrets::none());
         let row = diff
             .rows()
             .next()
@@ -337,6 +345,7 @@ fn a_setting_write_resets_to_a_shared_default() {
         let diff = diff(
             &side("laptop", from_default, from_set),
             &side("box", to_default, to_set),
+            &Secrets::none(),
         );
         let plan = diff.plan(&diff.initially_checked());
         let writes: Vec<_> = plan
@@ -378,6 +387,7 @@ fn a_plugin_row_follows_the_copy_policy() {
     let diff = diff(
         &machine("laptop", Vec::new(), &[], source),
         &machine("box", Vec::new(), &[], target),
+        &Secrets::none(),
     );
     let rows: Vec<_> = diff
         .rows()
@@ -465,9 +475,15 @@ fn a_revert_holds_back_what_the_target_changed_since() {
         ],
     );
     let before = machine("box", specs(), &[], Vec::new());
-    let diff = diff(&laptop, &before);
-    let snapshot =
-        Snapshot::before(None, Pass::Sync, &diff.plan(&diff.initially_checked()), 0).expect("rows");
+    let diff = diff(&laptop, &before, &Secrets::none());
+    let snapshot = Snapshot::before(
+        None,
+        Pass::Sync,
+        &diff.plan(&diff.initially_checked()),
+        &sync_id(),
+        0,
+    )
+    .expect("rows");
     // After the sync, the target changed the mode again, and swapped lint
     // for a copy of a folder.
     let now = machine(
@@ -479,7 +495,7 @@ fn a_revert_holds_back_what_the_target_changed_since() {
             plugin("review", git(review, "b2")),
         ],
     );
-    let review = review_revert(&snapshot, &now);
+    let review = review_revert(&snapshot, &now, &Journal::none());
     let states: Vec<_> = review
         .rows
         .iter()
@@ -520,7 +536,8 @@ fn a_revert_holds_back_what_the_target_changed_since() {
 /// disable, so Revert removes it; a sync that wrote nothing keeps the last
 /// one, even when a row it found already written landed, and a revert
 /// drops what it put back. A sync that stopped part way is marked so the
-/// next one joins it, until one finishes.
+/// next one joins it, until one finishes. Only a sync that wrote replaces
+/// the snapshot, and with it the target's journal of the last one.
 #[test]
 fn a_snapshot_keeps_what_a_sync_first_overwrote() {
     let review = "https://github.com/acme/review";
@@ -528,7 +545,11 @@ fn a_snapshot_keeps_what_a_sync_first_overwrote() {
     let specs = || vec![choice(&modes, "auto")];
     let lint = || vec![disabled(plugin("lint", git(review, "a1")))];
     let laptop = machine("laptop", specs(), &[("c.mode", text("plan"))], lint());
-    let diff = diff(&laptop, &machine("box", specs(), &[], Vec::new()));
+    let diff = diff(
+        &laptop,
+        &machine("box", specs(), &[], Vec::new()),
+        &Secrets::none(),
+    );
     let plan = diff.plan(&diff.initially_checked());
     let [mode, lint_item] = [0, 1].map(|at| plan.items().nth(at).cloned().expect("two rows"));
     let Change::Plugin {
@@ -558,11 +579,12 @@ fn a_snapshot_keeps_what_a_sync_first_overwrote() {
         stale: true,
         ..synced
     };
-    let snapshot = Snapshot::after(None, Pass::Sync, &stopped, 0);
+    let snapshot = Snapshot::after(None, Pass::Sync, &stopped, &sync_id(), 0);
     assert!(snapshot.as_ref().is_some_and(|s| s.stopped));
-    let snapshot = Snapshot::after(snapshot, Pass::Retry, &landed(vec![rest]), 1);
-    let snapshot = Snapshot::after(snapshot, Pass::More, &landed(Vec::new()), 1);
+    let snapshot = Snapshot::after(snapshot, Pass::Retry, &landed(vec![rest]), &sync_id(), 1);
+    let snapshot = Snapshot::after(snapshot, Pass::More, &landed(Vec::new()), &sync_id(), 1);
     assert!(snapshot.as_ref().is_some_and(|s| !s.stopped));
+    let mode_again = mode.clone();
     let Change::Setting { key, after, .. } = &mode.change else {
         panic!("mode is a setting");
     };
@@ -578,27 +600,45 @@ fn a_snapshot_keeps_what_a_sync_first_overwrote() {
         stale: true,
         ..landed(vec![already])
     };
-    let snapshot = Snapshot::after(snapshot, Pass::Sync, &stale, 2).expect("kept");
+    let next = SyncId::new("next");
+    let kept = snapshot.clone();
+    let snapshot = Snapshot::after(snapshot, Pass::Sync, &stale, &next, 2).expect("kept");
+    assert!(Snapshot::replaced(kept, Some(&snapshot)).is_none());
     let box_now = machine("box", specs(), &[("c.mode", text("plan"))], lint());
     assert_eq!(
         snapshot.at, 0,
         "the sync's, not the retry's or the stale one's"
     );
     assert_eq!(
-        writes(&review_revert(&snapshot, &box_now).plan(&BTreeSet::new())),
+        writes(&review_revert(&snapshot, &box_now, &Journal::none()).plan(&BTreeSet::new())),
         [
             ("c.mode".to_owned(), Some(reset("c.mode"))),
             ("lint".to_owned(), None),
         ]
     );
-    let snapshot =
-        Snapshot::after(Some(snapshot), Pass::Revert, &landed(vec![mode]), 3).expect("lint left");
-    let left: Vec<_> = review_revert(&snapshot, &box_now)
+    let snapshot = Snapshot::after(
+        Some(snapshot),
+        Pass::Revert,
+        &landed(vec![mode]),
+        &sync_id(),
+        3,
+    )
+    .expect("lint left");
+    let left: Vec<_> = review_revert(&snapshot, &box_now, &Journal::none())
         .rows
         .into_iter()
         .map(|row| row.key.id)
         .collect();
     assert_eq!(left, ["lint"]);
+    let newer = Snapshot::after(
+        Some(snapshot.clone()),
+        Pass::Sync,
+        &landed(vec![mode_again]),
+        &next,
+        4,
+    );
+    let replaced = Snapshot::replaced(Some(snapshot), newer.as_ref());
+    assert_eq!(replaced.map(|old| old.sync().clone()), Some(sync_id()));
 }
 
 /// A table entry or hooks file is listed only when it differs: one only
@@ -635,7 +675,7 @@ fn a_table_or_hooks_row_follows_the_copy_policy() {
             .map(|row| (row.key.id.clone(), row.action, start(row)))
             .collect()
     };
-    let synced = diff(&source, &target);
+    let synced = diff(&source, &target, &Secrets::none());
     assert_eq!(
         rows(&synced),
         [
@@ -665,7 +705,7 @@ fn a_table_or_hooks_row_follows_the_copy_policy() {
     let mut old = base("box");
     old.hooks = Part::Failed("not UTF-8".to_owned());
     assert_eq!(
-        rows(&diff(&source, &old)),
+        rows(&diff(&source, &old, &Secrets::none())),
         [
             ("alias:fast".to_owned(), Action::Add, Start::Cant),
             ("alias:same".to_owned(), Action::Add, Start::Cant),
@@ -710,18 +750,18 @@ fn stores_sync_in_dependency_order_and_revert_in_reverse() {
     };
     let laptop = side("laptop", Some("plan"), "acme/big", Some("[[hook]]\n"));
     let before = side("box", None, "fake/small", None);
-    let diff = diff(&laptop, &before);
+    let diff = diff(&laptop, &before, &Secrets::none());
     let plan = diff.plan(&diff.initially_checked());
     let order = |plan: &Plan| -> Vec<String> { plan.items().map(|i| i.key.id.clone()).collect() };
     assert_eq!(
         order(&plan),
         ["acme", "alias:fast", "c.mode", "file", "lint"]
     );
-    let snapshot = Snapshot::before(None, Pass::Sync, &plan, 0).expect("rows");
+    let snapshot = Snapshot::before(None, Pass::Sync, &plan, &sync_id(), 0).expect("rows");
     // Since the sync, the target edited the alias and deleted the hooks
     // file it got.
     let now = side("box", Some("plan"), "fake/edited", None);
-    let review = review_revert(&snapshot, &now);
+    let review = review_revert(&snapshot, &now, &Journal::none());
     let changed: Vec<_> = review.changed().map(|row| row.key.id.as_str()).collect();
     assert_eq!(changed, ["alias:fast"]);
     let reverted = review.plan(&BTreeSet::new());
@@ -733,6 +773,82 @@ fn stores_sync_in_dependency_order_and_revert_in_reverse() {
         order(&review.plan(&anyway)),
         ["file", "c.mode", "alias:fast", "acme", "lint"]
     );
+}
+
+/// A key is saved once its provider profile is there, and an MCP server
+/// after the models; a revert puts back what the journal keeps before it
+/// takes out the profiles and models a key or server may name.
+#[test]
+fn keys_and_mcp_servers_take_their_place_in_the_order() {
+    let item = |kind, id: &str, change| Planned {
+        key: RowKey {
+            kind,
+            id: id.to_owned(),
+        },
+        label: id.to_owned(),
+        restart: false,
+        change,
+    };
+    let entry = |table, key: &str| Change::Entry {
+        table,
+        key: key.to_owned(),
+        before: None,
+        after: Some(json!("x")),
+    };
+    let server = McpServer {
+        value: Box::new(json!({"command": "docs-mcp"})),
+        secrets: Vec::new(),
+    };
+    let synced = [
+        item(
+            GroupKind::Mcp,
+            "docs",
+            Change::Mcp {
+                identity: "docs".to_owned(),
+                before: None,
+                after: Some(server),
+                keep: Vec::new(),
+            },
+        ),
+        item(GroupKind::Models, "alias", entry(Table::Aliases, "fast")),
+        item(
+            GroupKind::SignIns,
+            "key",
+            Change::Key {
+                auth: "acme".to_owned(),
+                replaced: false,
+            },
+        ),
+        item(
+            GroupKind::Providers,
+            "acme",
+            entry(Table::Providers, "acme"),
+        ),
+    ];
+    let restored = item(
+        GroupKind::SignIns,
+        "key",
+        Change::Restore {
+            item: SyncItem::api_key("acme"),
+            overwrite: false,
+        },
+    );
+    let revisions: BTreeMap<Store, ConfigRevision> = Table::ALL
+        .into_iter()
+        .map(Store::Table)
+        .chain([Store::Mcp])
+        .map(|store| (store, ConfigRevision::new("r0")))
+        .collect();
+    let order = |items: Vec<Planned>, order| -> Vec<String> {
+        let plan = Plan::new(&revisions, items, order);
+        plan.items().map(|item| item.key.id.clone()).collect()
+    };
+    assert_eq!(
+        order(synced.to_vec(), Order::Sync),
+        ["acme", "key", "alias", "docs"]
+    );
+    let reverted = vec![synced[1].clone(), restored, synced[3].clone()];
+    assert_eq!(order(reverted, Order::Revert), ["key", "alias", "acme"]);
 }
 
 /// What `plan` writes, row by row: a setting's write, or `None` for a

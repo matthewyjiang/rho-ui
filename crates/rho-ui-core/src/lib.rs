@@ -97,7 +97,7 @@ pub use rho_protocol::{
 };
 /// The tables of `config.toml` [`Daemon::config_table`] reads and
 /// [`Daemon::set_config_table`] writes, as rho-protocol has them.
-pub use rho_protocol::{ConfigTable, TableChange, TableEntry};
+pub use rho_protocol::{ConfigTable, McpSecretKind, SyncId, TableChange, TableEntry};
 /// What the daemon's configuration sets up, as
 /// [`Daemon::configured_mcp_servers`] and [`Daemon::configured_hooks`] list
 /// it, as rho-protocol has it.

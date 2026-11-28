@@ -1,8 +1,9 @@
-//! Settings → Machines → Sync: copying rho's settings, tables, hooks file
-//! and plugins from this machine to another, and reverting it
-//! (`settings_sync.rs`).
+//! Settings → Machines → Sync: copying rho's settings, tables, sign-ins,
+//! MCP servers, hooks file and plugins from this machine to another, and
+//! reverting it (`settings_sync.rs`).
 
-use rho_ui_core::{agent_settings::SettingValue, ConfigTable, PluginInstallSource};
+use rho_ui_core::fake_daemon::{KEY_AUTH, LOGIN_AUTH, SAVED_KEY};
+use rho_ui_core::{agent_settings::SettingValue, ConfigTable, McpSecretKind, PluginInstallSource};
 use serde_json::json;
 
 use super::configured::{scroll_page, End};
@@ -120,10 +121,13 @@ fn open_with_remote(local: FakeDaemon) -> (Harness, FakeDaemon) {
     (ui, remote)
 }
 
-/// This machine, with settings, models, a provider profile, a hooks file
-/// and a plugin from a folder to copy.
+/// This machine, with settings, models, a provider profile, an API key,
+/// an MCP server, a hooks file and a plugin from a folder to copy.
 fn local_to_copy() -> FakeDaemon {
     let local = FakeDaemon::start(Script::default());
+    local.set_api_key(KEY_AUTH, Some("laptop-key"));
+    let docs = json!({"command": "docs-mcp"});
+    local.edit_mcp_server("docs", Some((docs, &[(McpSecretKind::Env, "TOKEN", "t1")])));
     local.edit_agent_setting("general.permission_mode", text("plan"));
     local.edit_agent_setting("tools.shell", text("zsh"));
     let profile = json!({"base_url": "https://acme.test/v1", "api": "responses"});
@@ -160,6 +164,8 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         "sync-row-models-alias:fast",
         "sync-row-models-favorite:acme/big",
         "sync-row-providers-acme",
+        "sync-row-sign-ins-fake-api-key",
+        "sync-row-mcp-docs",
         "sync-row-hooks-file",
     ];
     let starts = rows.map(|id| checked(&mut ui, id));
@@ -167,7 +173,19 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     let one = Some(true);
     assert_eq!(
         starts,
-        [one, Some(false), one, one, None, one, one, one, one]
+        [
+            one,
+            Some(false),
+            one,
+            one,
+            None,
+            one,
+            one,
+            one,
+            one,
+            one,
+            one
+        ]
     );
     click_revealed(&mut ui, "sync-row-settings-tools.shell");
     reveal(&mut ui, "sync-submit");
@@ -238,4 +256,25 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         Some(text("supervised")),
         "the newer change stays"
     );
+    // What the sync replaced of the secrets comes back from box's journal.
+    assert_eq!(remote.api_key(KEY_AUTH).as_deref(), Some(SAVED_KEY));
+    assert_eq!(remote.mcp_server("docs"), None);
+}
+
+/// A login isn't copied: its row signs the target in, inline, and says so
+/// once the provider approves it.
+#[test]
+fn a_login_row_signs_the_target_in() {
+    let local = FakeDaemon::start(Script::default());
+    local.sign_in_login();
+    let (mut ui, remote) = open_with_remote(local);
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Machines");
+    click_revealed(&mut ui, "sync-sign-in-sign-ins-fake-login-login");
+    reveal(&mut ui, "sync-sign-in-sign-ins-fake-login-cancel");
+    ui.shot("sign-in");
+
+    remote.approve_login();
+    reveal(&mut ui, "sync-sign-in-sign-ins-fake-login");
+    assert!(remote.signed_in(LOGIN_AUTH));
 }
