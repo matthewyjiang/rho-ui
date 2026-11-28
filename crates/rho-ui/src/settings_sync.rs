@@ -46,16 +46,24 @@ pub(crate) enum RunKind {
     Revert,
 }
 
+impl RunKind {
+    fn of(pass: Pass) -> Self {
+        match pass {
+            Pass::Sync | Pass::More | Pass::Retry => Self::Sync,
+            Pass::Revert => Self::Revert,
+        }
+    }
+}
+
 /// What the last sync or revert came to, until the next fresh read.
 pub(crate) struct Outcome {
     pub(crate) kind: RunKind,
     pub(crate) target: MachineId,
     pub(crate) ran: Ran,
-    /// When the snapshot this run's rows are in was taken, while they are
-    /// in one of their own: a retry, or a sync after one that stopped part
-    /// way, joins it then. `None` when the run left the target's last
-    /// snapshot as it was.
-    owns: Option<i64>,
+    /// The target's snapshot holds this sync's rows, so a retry of it joins
+    /// that snapshot ([`Pass::Retry`]). Not when it wrote nothing: the
+    /// snapshot is then an earlier sync's.
+    owns: bool,
 }
 
 /// Why a run stopped short: the target changed since it was read.
@@ -82,8 +90,62 @@ pub(crate) enum Ran {
         restart: Vec<String>,
         /// The target changed since it was read, so the run stopped there:
         /// what landed before stays, and nothing after it was written.
-        stop: Option<Stop>,
+        stale: bool,
     },
+}
+
+impl Ran {
+    /// Why the run stopped short, if it did.
+    pub(crate) fn stop(&self) -> Option<Stop> {
+        match self {
+            Self::Written {
+                stale: true,
+                landed: 0,
+                ..
+            } => Some(Stop::Before),
+            Self::Written { stale: true, .. } => Some(Stop::PartWay),
+            Self::Written { stale: false, .. } | Self::Unread(_) => None,
+        }
+    }
+}
+
+impl Outcome {
+    /// Folds in the retry of its failed row `key`, which wrote `written`
+    /// to the machine `label`.
+    fn fold_retry(&mut self, key: &RowKey, written: Written, label: &str) {
+        let Ran::Written {
+            landed,
+            failed,
+            restart,
+            ..
+        } = &mut self.ran
+        else {
+            return;
+        };
+        self.owns |= written.wrote();
+        *landed += written.whole().count();
+        restart.extend(restarts(&written));
+        let Some(at) = failed.iter().position(|f| f.item.key() == key) else {
+            return;
+        };
+        if written.stale {
+            // Its row is left to retry again.
+            failed[at].reason =
+                format!("{label} changed again as it was written. Retry reads it first.");
+        } else {
+            failed.splice(at..=at, written.failed);
+        }
+    }
+}
+
+/// The rows of `written` that landed whole and apply once the target's rho
+/// restarts.
+fn restarts(written: &Written) -> Vec<String> {
+    written
+        .whole()
+        .filter(|item| item.needs_restart())
+        .map(|item| item.label().to_owned())
+        .collect()
 }
 
 /// A revert waiting on the user: the target changed some rows since the
@@ -141,14 +203,12 @@ enum Job {
     Retry(Box<Failure>),
 }
 
-/// A run under way: which way it writes, to which machine, the row it
-/// retries, what it is to the target's snapshot, and the snapshot it
-/// builds on.
+/// A run under way: what it is to the target's snapshot, to which
+/// machine, the row it retries, and the snapshot from before it.
 struct Run {
-    kind: RunKind,
+    pass: Pass,
     target: MachineId,
     retried: Option<RowKey>,
-    pass: Pass,
     kept: Option<Snapshot>,
 }
 
@@ -416,26 +476,32 @@ impl SettingsSync {
     }
 
     /// Writes the checked rows to the target, keeping what they overwrite
-    /// so the sync can be reverted.
+    /// so the sync can be reverted: more of the last sync, if it stopped
+    /// part way.
     pub(crate) fn sync(&mut self, cx: &mut Context<'_, Self>) {
         let Compare::Ready { diff, checked } = &self.compare else {
             return;
         };
         let plan = diff.plan(checked);
-        if let (false, Some(to)) = (plan.is_empty(), self.to.clone()) {
-            self.run(RunKind::Sync, to, Job::Plan(plan), cx);
-        }
+        let Some(to) = self.to.clone().filter(|_| !plan.is_empty()) else {
+            return;
+        };
+        let pass = match SyncSnapshots::get(&to, cx) {
+            Some(kept) if kept.stopped => Pass::More,
+            _ => Pass::Sync,
+        };
+        self.run(pass, to, Job::Plan(plan), cx);
     }
 
-    /// Writes `job` to `target`, then reads the two again. Before it
-    /// writes, every row it may write is saved, in case rho-ui stops as it
-    /// writes; once it is done, the snapshot keeps only what landed.
-    fn run(&mut self, kind: RunKind, target: MachineId, job: Job, cx: &mut Context<'_, Self>) {
+    /// Writes `job` to `target` as `pass`, then reads the two again. Before
+    /// a plan writes, every row it may write is saved, in case rho-ui stops
+    /// as it writes; once it is done, the snapshot keeps only what landed.
+    fn run(&mut self, pass: Pass, target: MachineId, job: Job, cx: &mut Context<'_, Self>) {
         let retried = match &job {
             Job::Retry(failure) => Some(failure.item.key().clone()),
             Job::Plan(_) => None,
         };
-        let busy = match (&retried, kind) {
+        let busy = match (&retried, RunKind::of(pass)) {
             (Some(key), _) => Busy::Retrying(key.clone()),
             (None, RunKind::Sync) => Busy::Syncing,
             (None, RunKind::Revert) => Busy::Reverting,
@@ -443,7 +509,7 @@ impl SettingsSync {
         let Some(daemon) = self.begin(busy, &target, cx) else {
             return;
         };
-        let (pass, kept) = self.pass(kind, &target, &job, cx);
+        let kept = SyncSnapshots::get(&target, cx);
         if let Job::Plan(plan) = &job {
             let before = Snapshot::before(kept.clone(), pass, plan, time::now_unix());
             SyncSnapshots::set(&target, before, cx);
@@ -455,10 +521,9 @@ impl SettingsSync {
         };
         let label = self.label(&target, cx);
         let run = Run {
-            kind,
+            pass,
             target,
             retried,
-            pass,
             kept,
         };
         self.run_task = cx.spawn(async move |this, cx| {
@@ -479,50 +544,6 @@ impl SettingsSync {
         });
     }
 
-    /// What a `kind` run of `job` to `target` is to its snapshot, and the
-    /// snapshot it builds on. A retry of a sync, or a sync after one that
-    /// stopped part way, is more of it, joining its rows while the
-    /// snapshot is still theirs; a sync before landed nothing, its rows
-    /// are in none, and they start their own.
-    fn pass(
-        &self,
-        kind: RunKind,
-        target: &MachineId,
-        job: &Job,
-        cx: &App,
-    ) -> (Pass, Option<Snapshot>) {
-        let kept = SyncSnapshots::get(target, cx);
-        if kind == RunKind::Revert {
-            return (Pass::Revert, kept);
-        }
-        let last = self
-            .outcome
-            .as_ref()
-            .filter(|outcome| outcome.kind == RunKind::Sync && outcome.target == *target);
-        let more = match (job, last) {
-            (Job::Retry(_), Some(last)) => Some(last),
-            (Job::Plan(_), Some(last))
-                if matches!(
-                    last.ran,
-                    Ran::Written {
-                        stop: Some(Stop::PartWay),
-                        ..
-                    }
-                ) =>
-            {
-                Some(last)
-            }
-            _ => None,
-        };
-        match more {
-            Some(last) => {
-                let ours = kept.filter(|kept| Some(kept.at) == last.owns);
-                (Pass::More, ours)
-            }
-            None => (Pass::Sync, kept),
-        }
-    }
-
     /// The user's checks, to keep through a read.
     fn kept_checks(&self) -> Checks {
         match &self.compare {
@@ -538,97 +559,50 @@ impl SettingsSync {
     /// the run came to; a retry folds into the outcome its row failed in.
     fn ran(&mut self, run: Run, total: usize, written: Written, cx: &mut Context<'_, Self>) {
         let Run {
-            kind,
+            pass,
             target,
             retried,
-            pass,
             kept,
         } = run;
-        // A retry saves nothing before it writes, so one that landed
-        // nothing leaves the snapshot, and which one its rows are in.
-        let owns = (retried.is_none() || !written.landed.is_empty()).then(|| {
-            let snapshot = Snapshot::after(kept, pass, &written, time::now_unix());
-            let owns = match pass {
-                Pass::Sync if written.landed.is_empty() => None,
-                Pass::Sync | Pass::More | Pass::Revert => snapshot.as_ref().map(|s| s.at),
-            };
-            SyncSnapshots::set(&target, snapshot, cx);
-            owns
-        });
-        let landed = written.whole().count();
-        let stop = written.stale.then_some(if landed == 0 {
-            Stop::Before
-        } else {
-            Stop::PartWay
-        });
-        let restart = written
-            .whole()
-            .filter(|item| item.needs_restart())
-            .map(|item| item.label().to_owned())
-            .collect();
-        let ran = Ran::Written {
-            landed,
-            total,
-            failed: written.failed,
-            restart,
-            stop,
-        };
+        let mut snapshot = Snapshot::after(kept, pass, &written, time::now_unix());
         let label = self.label(&target, cx);
-        match (retried, &mut self.outcome, ran) {
-            (
-                Some(key),
-                Some(Outcome {
-                    ran:
-                        Ran::Written {
-                            landed: before,
-                            failed,
-                            restart: also,
-                            ..
-                        },
-                    owns: owned,
-                    ..
-                }),
-                Ran::Written {
-                    failed: still,
-                    restart: more,
-                    ..
-                },
-            ) => {
-                if let Some(at) = failed.iter().position(|f| *f.item.key() == key) {
-                    if written.stale {
-                        // Its row is left to retry again.
-                        failed[at].reason = format!(
-                            "{label} changed again as it was written. Retry reads it first."
-                        );
-                    } else {
-                        failed.splice(at..=at, still);
-                    }
-                }
-                *before += landed;
-                also.extend(more);
-                if let Some(owns) = owns {
-                    *owned = owns;
-                }
+        if let (Some(key), Some(outcome)) = (retried, &mut self.outcome) {
+            // A sync that stopped before it wrote anything starts its own
+            // snapshot with a retry: the next sync is more of it.
+            if let (Some(snapshot), Pass::Sync, true) = (&mut snapshot, pass, written.wrote()) {
+                snapshot.stopped |= outcome.ran.stop().is_some();
             }
-            (_, _, ran) => {
-                self.outcome = Some(Outcome {
-                    kind,
-                    target,
-                    ran,
-                    owns: owns.flatten(),
-                });
-            }
+            outcome.fold_retry(&key, written, &label);
+        } else {
+            let kind = RunKind::of(pass);
+            let owns = kind == RunKind::Sync && (written.wrote() || pass == Pass::More);
+            let ran = Ran::Written {
+                landed: written.whole().count(),
+                total,
+                restart: restarts(&written),
+                stale: written.stale,
+                failed: written.failed,
+            };
+            self.outcome = Some(Outcome {
+                kind,
+                target: target.clone(),
+                ran,
+                owns,
+            });
         }
+        SyncSnapshots::set(&target, snapshot, cx);
         cx.notify();
     }
 
-    /// Writes what is left of failed row `key` again.
+    /// Writes what is left of failed row `key` again: as more of its sync
+    /// while the snapshot holds that sync's rows, else as a sync of its
+    /// own.
     pub(crate) fn retry(&mut self, key: &RowKey, cx: &mut Context<'_, Self>) {
         let Some(Outcome {
             kind,
             target,
             ran: Ran::Written { failed, .. },
-            ..
+            owns,
         }) = &self.outcome
         else {
             return;
@@ -636,8 +610,13 @@ impl SettingsSync {
         let Some(failure) = failed.iter().find(|failure| failure.item.key() == key) else {
             return;
         };
-        let (kind, target, job) = (*kind, target.clone(), Job::Retry(Box::new(failure.clone())));
-        self.run(kind, target, job, cx);
+        let pass = match (kind, owns) {
+            (RunKind::Revert, _) => Pass::Revert,
+            (RunKind::Sync, true) => Pass::Retry,
+            (RunKind::Sync, false) => Pass::Sync,
+        };
+        let (target, job) = (target.clone(), Job::Retry(Box::new(failure.clone())));
+        self.run(pass, target, job, cx);
     }
 
     /// Reverts the target's last sync: at once if the target still holds
@@ -662,7 +641,7 @@ impl SettingsSync {
                         let review = sync::review_revert(&snapshot, &target);
                         if review.changed().next().is_none() {
                             let plan = review.plan(&BTreeSet::new());
-                            this.run(RunKind::Revert, to, Job::Plan(plan), cx);
+                            this.run(Pass::Revert, to, Job::Plan(plan), cx);
                         } else {
                             this.revert = Some(Revert {
                                 target: to,
@@ -676,7 +655,7 @@ impl SettingsSync {
                             kind: RunKind::Revert,
                             target: to,
                             ran: Ran::Unread(error.to_string()),
-                            owns: None,
+                            owns: false,
                         });
                     }
                 }
@@ -701,7 +680,7 @@ impl SettingsSync {
             return;
         };
         let (target, plan) = (revert.target.clone(), revert.review.plan(&revert.anyway));
-        self.run(RunKind::Revert, target, Job::Plan(plan), cx);
+        self.run(Pass::Revert, target, Job::Plan(plan), cx);
     }
 
     pub(crate) fn cancel_revert(&mut self, cx: &mut Context<'_, Self>) {

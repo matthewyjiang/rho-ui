@@ -295,13 +295,13 @@ impl Side {
         self.tables.get(&table).unwrap_or(&Part::Lacks)
     }
 
-    /// Why this machine, the target, can't take rows of `part`; `None`
-    /// when it can.
-    fn cant_take<T>(&self, part: &Part<T>) -> Option<String> {
+    /// What this machine holds of `part`, or why it can't say, and so
+    /// can't take rows of it.
+    fn take<'a, T>(&self, part: &'a Part<T>) -> Result<&'a T, String> {
         match part {
-            Part::Read(_) => None,
-            Part::Lacks => Some(format!("Rho on {} is too old to take this", self.label)),
-            Part::Failed(why) => Some(format!("Couldn't read it on {}: {why}", self.label)),
+            Part::Read(read) => Ok(read),
+            Part::Lacks => Err(format!("Rho on {} is too old to take this", self.label)),
+            Part::Failed(why) => Err(format!("Couldn't read it on {}: {why}", self.label)),
         }
     }
 
@@ -627,6 +627,9 @@ impl Plan {
 pub struct Snapshot {
     /// When the sync ran, in Unix seconds.
     pub at: i64,
+    /// The sync stopped part way, as the target changed under it: the next
+    /// sync to the target is more of it ([`Pass::More`]).
+    pub stopped: bool,
     items: Vec<Planned>,
 }
 
@@ -636,9 +639,12 @@ pub struct Snapshot {
 pub enum Pass {
     /// A sync of the rows the user checked.
     Sync,
-    /// More of the last sync: a failed row of it written again, or a sync
-    /// after it stopped part way.
+    /// A sync after the last one stopped part way ([`Snapshot::stopped`]):
+    /// more of it.
     More,
+    /// A failed row of the last sync written again, while the snapshot
+    /// holds that sync's rows.
+    Retry,
     /// A revert, or a failed row of one written again.
     Revert,
 }
@@ -661,28 +667,38 @@ impl Snapshot {
     pub fn before(kept: Option<Self>, pass: Pass, plan: &Plan, now: i64) -> Option<Self> {
         match pass {
             Pass::Sync => Some(Self::empty(now).with(plan.items())),
-            Pass::More => Some(kept.unwrap_or_else(|| Self::empty(now)).with(plan.items())),
+            Pass::More | Pass::Retry => {
+                Some(kept.unwrap_or_else(|| Self::empty(now)).with(plan.items()))
+            }
             Pass::Revert => kept,
         }
     }
 
     /// What Revert can put back once `pass` wrote `written` at `now`,
-    /// given `kept`, the snapshot from before it. A sync that landed
-    /// something replaces the last one; one that landed nothing leaves it.
-    /// More of a sync joins it, each row keeping what it first overwrote,
-    /// and a revert drops what it put back. `None` when nothing is left.
+    /// given `kept`, the snapshot from before it. A sync that wrote
+    /// something replaces the last one; one that wrote nothing leaves it.
+    /// More of a sync, or a retry, joins it, each row keeping what it first
+    /// overwrote, and a revert drops what it put back. A sync, or more of
+    /// one, is [`Self::stopped`] if it stopped part way; a retry leaves
+    /// that as it was. `None` when nothing is left.
     pub fn after(kept: Option<Self>, pass: Pass, written: &Written, now: i64) -> Option<Self> {
+        let joined = |base: Option<Self>| {
+            let mut next = base
+                .unwrap_or_else(|| Self::empty(now))
+                .with(&written.landed);
+            next.stopped = written.stale;
+            next
+        };
         let next = match pass {
-            Pass::Sync if written.landed.is_empty() => kept,
-            Pass::Sync => Some(Self::empty(now).with(&written.landed)),
-            Pass::More => Some(
-                kept.unwrap_or_else(|| Self::empty(now))
-                    .with(&written.landed),
-            ),
+            Pass::Sync if !written.wrote() => kept,
+            Pass::Sync => Some(joined(None)),
+            Pass::More => Some(joined(kept)),
+            Pass::Retry => kept.map(|snapshot| snapshot.with(&written.landed)),
             Pass::Revert => kept.map(|mut snapshot| {
                 snapshot
                     .items
                     .retain(|item| !written.landed.iter().any(|landed| landed.key == item.key));
+                snapshot.stopped = false;
                 snapshot
             }),
         };
@@ -692,16 +708,18 @@ impl Snapshot {
     fn empty(at: i64) -> Self {
         Self {
             at,
+            stopped: false,
             items: Vec::new(),
         }
     }
 
     /// `self` with `items`: a row already here keeps what it first
-    /// overwrote.
+    /// overwrote, and one that changed nothing joins none.
     fn with<'a>(mut self, items: impl IntoIterator<Item = &'a Planned>) -> Self {
         for item in items {
             match self.items.iter_mut().find(|kept| kept.key == item.key) {
                 Some(kept) => kept.change = kept.change.then(&item.change),
+                None if item.change.is_noop() => {}
                 None => self.items.push(item.clone()),
             }
         }

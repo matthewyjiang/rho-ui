@@ -21,21 +21,21 @@ pub(super) fn rows(source: &Side, target: &Side) -> Vec<Row> {
         Part::Failed(why) => return vec![Row::unread(GroupKind::Hooks, ID, LABEL, source, why)],
         Part::Lacks => return Vec::new(),
     };
-    let to = target.hooks.read();
-    let there = to.and_then(|hooks| hooks.text.as_ref());
+    let to = target.take(&target.hooks);
+    let there = to.as_ref().ok().and_then(|hooks| hooks.text.as_ref());
     if from == there {
         return Vec::new();
     }
-    let copy = match target.cant_take(&target.hooks) {
-        None => Copy::Write(Change::Hooks {
+    let copy = match &to {
+        Ok(_) => Copy::Write(Change::Hooks {
             before: there.cloned(),
             after: from.cloned(),
         }),
-        Some(why) => Copy::Cannot(why),
+        Err(why) => Copy::Cannot(why.clone()),
     };
     // Replacing a file drops the target's own hooks, and a file that lands
     // leaves its programs behind.
-    let note = match (to.is_some(), from, there) {
+    let note = match (to.is_ok(), from, there) {
         (true, Some(_), Some(_)) => Some(format!(
             "Replaces {0}'s whole file, its own hooks too. The scripts its hooks run aren't copied: put them on {0} first",
             target.label
@@ -76,10 +76,7 @@ fn shown(text: &str) -> String {
 
 /// The hooks file's text as `side` holds it now, or why it can't say.
 pub(super) fn text(side: &Side) -> Result<Option<String>, String> {
-    match side.hooks.read() {
-        Some(hooks) => Ok(hooks.text.clone()),
-        None => Err(side.cant_take(&side.hooks).unwrap_or_default()),
-    }
+    side.take(&side.hooks).map(|hooks| hooks.text.clone())
 }
 
 /// Writes the file `items`, its one row, leaves, against `revision`.

@@ -517,8 +517,10 @@ fn a_revert_holds_back_what_the_target_changed_since() {
 
 /// A snapshot keeps each row a sync landed with what the row first
 /// overwrote, through a retry of a plugin that installed but didn't
-/// disable, so Revert removes it; a sync that landed nothing keeps the last
-/// one, and a revert drops what it put back.
+/// disable, so Revert removes it; a sync that wrote nothing keeps the last
+/// one, even when a row it found already written landed, and a revert
+/// drops what it put back. A sync that stopped part way is marked so the
+/// next one joins it, until one finishes.
 #[test]
 fn a_snapshot_keeps_what_a_sync_first_overwrote() {
     let review = "https://github.com/acme/review";
@@ -552,11 +554,29 @@ fn a_snapshot_keeps_what_a_sync_first_overwrote() {
         }],
         ..landed(vec![mode.clone(), lint_item])
     };
-    let snapshot = Snapshot::after(None, Pass::Sync, &synced, 0);
-    let snapshot = Snapshot::after(snapshot, Pass::More, &landed(vec![rest]), 1);
+    let stopped = Written {
+        stale: true,
+        ..synced
+    };
+    let snapshot = Snapshot::after(None, Pass::Sync, &stopped, 0);
+    assert!(snapshot.as_ref().is_some_and(|s| s.stopped));
+    let snapshot = Snapshot::after(snapshot, Pass::Retry, &landed(vec![rest]), 1);
+    let snapshot = Snapshot::after(snapshot, Pass::More, &landed(Vec::new()), 1);
+    assert!(snapshot.as_ref().is_some_and(|s| !s.stopped));
+    let Change::Setting { key, after, .. } = &mode.change else {
+        panic!("mode is a setting");
+    };
+    let already = Planned {
+        change: Change::Setting {
+            key: key.clone(),
+            before: after.clone(),
+            after: after.clone(),
+        },
+        ..mode.clone()
+    };
     let stale = Written {
         stale: true,
-        ..Written::default()
+        ..landed(vec![already])
     };
     let snapshot = Snapshot::after(snapshot, Pass::Sync, &stale, 2).expect("kept");
     let box_now = machine("box", specs(), &[("c.mode", text("plan"))], lint());

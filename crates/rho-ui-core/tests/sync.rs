@@ -114,7 +114,8 @@ fn revert_after_a_retry_restores_what_the_retry_overwrote() {
         let [failure] = written.failed.as_slice() else {
             panic!("the hooks file fails: its program is missing on box");
         };
-        let snapshot = Snapshot::after(None, Pass::Sync, &written, 0);
+        // It landed nothing, so the retry is a sync of its own.
+        assert!(!written.wrote());
 
         target.edit_hooks_file(Some("# mine\n"));
         target.add_hook_programs();
@@ -122,8 +123,7 @@ fn revert_after_a_retry_restores_what_the_retry_overwrote() {
         assert!(retried.failed.is_empty());
         assert_eq!(target.hooks_file().as_deref(), Some(synced));
 
-        let snapshot =
-            Snapshot::after(snapshot, Pass::More, &retried, 0).expect("the retry landed");
+        let snapshot = Snapshot::after(None, Pass::Sync, &retried, 0).expect("the retry landed");
         let review = sync::review_revert(&snapshot, &read("box", &to).await);
         let reverted = sync::apply(&to, review.plan(&BTreeSet::new())).await;
         assert!(reverted.failed.is_empty() && !reverted.stale);

@@ -255,12 +255,9 @@ fn banners(
             return items;
         }
         Ran::Written {
-            failed,
-            restart,
-            stop,
-            ..
+            failed, restart, ..
         } => {
-            if *stop == Some(Stop::Before) {
+            if outcome.ran.stop() == Some(Stop::Before) {
                 let again = match outcome.kind {
                     RunKind::Sync => "sync again",
                     RunKind::Revert => "revert again",
@@ -344,41 +341,33 @@ fn unwritten_item(kind: RunKind, why: String, target: &str) -> SettingItem {
 /// What the last run wrote, as its banner's title, with what a run that
 /// stopped part way left; `None` when it wrote nothing.
 fn outcome_title(outcome: &Outcome, target: &str) -> Option<(String, Option<String>)> {
-    let Ran::Written {
-        landed,
-        total,
-        stop,
-        ..
-    } = &outcome.ran
-    else {
+    let Ran::Written { landed, total, .. } = &outcome.ran else {
         return None;
     };
-    match stop {
-        Some(Stop::Before) => return None,
-        Some(Stop::PartWay) => {}
-        None => {
-            let title = match outcome.kind {
-                RunKind::Sync if landed == total => format!("Synced {total} to {target}"),
-                RunKind::Sync => format!("Synced {landed} of {total} to {target}"),
-                RunKind::Revert if landed == total => format!("Reverted {total} on {target}"),
-                RunKind::Revert => format!("Reverted {landed} of {total} on {target}"),
-            };
-            return Some((title, None));
-        }
-    }
-    Some(match outcome.kind {
-            RunKind::Sync => (
+    let whole = landed == total;
+    Some(match (outcome.ran.stop(), outcome.kind) {
+        (Some(Stop::Before), _) => return None,
+        (Some(Stop::PartWay), RunKind::Sync) => {
+            let note = format!(
+                "{landed} of {total} landed, and Revert undoes them. Check what differs now, then sync again."
+            );
+            (
                 format!("Stopped: {target} changed while syncing"),
-                Some(format!(
-                    "{landed} of {total} landed, and Revert undoes them. Check what differs now, then sync again."
-                )),
-            ),
-            RunKind::Revert => (
+                Some(note),
+            )
+        }
+        (Some(Stop::PartWay), RunKind::Revert) => {
+            let note =
+                format!("{landed} of {total} reverted. Check what differs now, then revert again.");
+            (
                 format!("Stopped: {target} changed while reverting"),
-                Some(format!(
-                    "{landed} of {total} reverted. Check what differs now, then revert again."
-                )),
-            ),
+                Some(note),
+            )
+        }
+        (None, RunKind::Sync) if whole => (format!("Synced {total} to {target}"), None),
+        (None, RunKind::Sync) => (format!("Synced {landed} of {total} to {target}"), None),
+        (None, RunKind::Revert) if whole => (format!("Reverted {total} on {target}"), None),
+        (None, RunKind::Revert) => (format!("Reverted {landed} of {total} on {target}"), None),
     })
 }
 

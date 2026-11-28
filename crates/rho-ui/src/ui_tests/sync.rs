@@ -94,19 +94,36 @@ fn has_plugin(fake: &FakeDaemon, name: &str) -> bool {
     fake.plugins(None).iter().any(|plugin| plugin.name == name)
 }
 
-/// A sync writes the checked rows to the other machine: a setting that
-/// belongs to one machine starts unchecked, a plugin from a folder can't
-/// be copied, a target changed since the read stops it part way with the
-/// user's checks kept, an install that fails keeps Retry, and a setting
-/// that applies on restart offers one. Revert then holds back the row the
-/// target changed since, and puts back the rest, both passes' rows.
-#[test]
-fn a_sync_copies_to_another_machine_and_reverts() {
-    let local = FakeDaemon::start(Script::default());
+/// The app on `local`, with the machine `box` on a fresh fake daemon,
+/// which it gives too. `box` lacks `local`'s plugins `deploy` and
+/// `review`; `deploy`'s host is out of reach, so it can't install there.
+fn open_with_remote(local: FakeDaemon) -> (Harness, FakeDaemon) {
     let remote = FakeDaemon::start(Script::default());
     let DaemonTarget::Socket(remote_socket) = remote.target() else {
         panic!("a fake daemon listens on a socket");
     };
+    remote.remove_plugin("deploy");
+    remote.remove_plugin("review");
+    let mut settings = Settings::default();
+    settings.machines = vec![RemoteMachine::new("box")];
+    settings.smooth_scroll = SmoothScroll::Off;
+    let ui = Harness::open_with(
+        "sync",
+        local.target(),
+        Some(local),
+        Machines {
+            settings,
+            remote_sockets: vec![("box".to_owned(), remote_socket)],
+            ..Machines::default()
+        },
+    );
+    (ui, remote)
+}
+
+/// This machine, with settings, models, a provider profile, a hooks file
+/// and a plugin from a folder to copy.
+fn local_to_copy() -> FakeDaemon {
+    let local = FakeDaemon::start(Script::default());
     local.edit_agent_setting("general.permission_mode", text("plan"));
     local.edit_agent_setting("tools.shell", text("zsh"));
     let profile = json!({"base_url": "https://acme.test/v1", "api": "responses"});
@@ -118,22 +135,19 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     local.install_plugin(PluginInstallSource::Path {
         path: PathBuf::from("/home/me/kit"),
     });
-    // `deploy`'s host is out of reach, so it can't install there.
-    remote.remove_plugin("deploy");
-    remote.remove_plugin("review");
-    let mut settings = Settings::default();
-    settings.machines = vec![RemoteMachine::new("box")];
-    settings.smooth_scroll = SmoothScroll::Off;
-    let mut ui = Harness::open_with(
-        "sync",
-        local.target(),
-        Some(local),
-        Machines {
-            settings,
-            remote_sockets: vec![("box".to_owned(), remote_socket)],
-            ..Machines::default()
-        },
-    );
+    local
+}
+
+/// A sync writes the checked rows to the other machine: a setting that
+/// belongs to one machine starts unchecked, a plugin from a folder can't
+/// be copied, a target changed since the read stops it part way with the
+/// user's checks kept, and the next sync joins it even after a Re-read; an
+/// install that fails keeps Retry, and a setting that applies on restart
+/// offers one. Revert then holds back the row the target changed since,
+/// and puts back the rest, both passes' rows.
+#[test]
+fn a_sync_copies_to_another_machine_and_reverts() {
+    let (mut ui, remote) = open_with_remote(local_to_copy());
     open_settings(&mut ui);
     open_settings_page(&mut ui, "Machines");
     let rows = [
@@ -168,10 +182,19 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         Some(true),
         "the user's checks stay"
     );
+    assert!(remote
+        .config_table_entry(ConfigTable::Providers, "acme")
+        .is_some());
     assert_eq!(remote.agent_setting("tools.shell"), Some(text("bash")));
     reveal(&mut ui, "sync-group-settings");
     ui.shot("stopped");
 
+    click_revealed(&mut ui, "sync-reread");
+    assert_eq!(
+        checked(&mut ui, "sync-row-settings-tools.shell"),
+        Some(false)
+    );
+    click_revealed(&mut ui, "sync-row-settings-tools.shell");
     click_revealed(&mut ui, "sync-submit");
     reveal(&mut ui, "sync-retry-plugins-deploy");
     assert_eq!(remote.agent_setting("tools.shell"), Some(text("zsh")));

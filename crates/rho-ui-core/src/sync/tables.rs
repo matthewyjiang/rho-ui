@@ -21,17 +21,18 @@ pub(super) fn rows(table: Table, source: &Side, target: &Side) -> Vec<Row> {
         }
         Part::Lacks => return Vec::new(),
     };
-    let to = target.table(table);
-    let Some(to) = to.read() else {
-        let why = target.cant_take(to).unwrap_or_default();
-        return from
-            .entries
-            .iter()
-            .map(|entry| {
-                let copy = Copy::Cannot(why.clone());
-                row(table, &entry.key, [Some(&entry.value), None], copy)
-            })
-            .collect();
+    let to = match target.take(target.table(table)) {
+        Ok(to) => to,
+        Err(why) => {
+            return from
+                .entries
+                .iter()
+                .map(|entry| {
+                    let copy = Copy::Cannot(why.clone());
+                    row(table, &entry.key, [Some(&entry.value), None], copy)
+                })
+                .collect()
+        }
     };
     let value = |key: &str| {
         to.entries
@@ -170,11 +171,8 @@ fn differing(ours: &Value, theirs: &Value) -> String {
 
 /// Entry `key` of `table` as `side` holds it now, or why it can't say.
 pub(super) fn value(side: &Side, table: Table, key: &str) -> Result<Option<Value>, String> {
-    let part = side.table(table);
-    let Some(read) = part.read() else {
-        return Err(side.cant_take(part).unwrap_or_default());
-    };
-    Ok(read
+    Ok(side
+        .take(side.table(table))?
         .entries
         .iter()
         .find(|entry| entry.key == key)

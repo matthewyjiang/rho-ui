@@ -10,7 +10,7 @@ use std::{fmt::Write as _, path::PathBuf};
 use rho_protocol::{Plugin, PluginInstallSource, PluginScope, PluginSource, PluginTarget};
 use serde::{Deserialize, Serialize};
 
-use super::{apply::Unwritten, Action, Change, Copy, GroupKind, Planned, RevertRow, Row, RowKey};
+use super::{Action, Change, Copy, GroupKind, Planned, RevertRow, Row, RowKey};
 use crate::{Daemon, Enablement, IfExists, PluginError};
 
 /// A user plugin as an install can make it again on any machine.
@@ -332,6 +332,12 @@ pub(super) async fn write(
             })
         }
     }
+}
+
+/// Why a plugin's write didn't land, and what of it is left when part did.
+pub(super) struct Unwritten {
+    pub(super) reason: String,
+    pub(super) rest: Option<Box<Change>>,
 }
 
 /// What is left of installing `after` as plugin `name` once the install

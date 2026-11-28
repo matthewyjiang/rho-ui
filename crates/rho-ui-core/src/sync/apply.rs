@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use rho_protocol::ConfigRevision;
 
-use super::{hooks, plugins, read, settings, tables, Change, Guarded, Order, Plan, Planned, Store};
+use super::plugins::{self, Unwritten};
+use super::{hooks, read, settings, tables, Change, Guarded, Order, Plan, Planned, Store};
 use crate::{Daemon, DaemonError};
 
 /// What applying a plan came to.
@@ -21,6 +22,12 @@ pub struct Written {
 }
 
 impl Written {
+    /// Whether it changed anything on the target: a row the target already
+    /// held as it would write lands without a write.
+    pub fn wrote(&self) -> bool {
+        self.landed.iter().any(|item| !item.change.is_noop())
+    }
+
     /// The rows that landed whole.
     pub fn whole(&self) -> impl Iterator<Item = &Planned> {
         self.landed
@@ -36,12 +43,6 @@ pub struct Failure {
     pub item: Planned,
     /// Why it didn't land.
     pub reason: String,
-}
-
-/// Why a row's write didn't land, and what of it is left when part did.
-pub(super) struct Unwritten {
-    pub(super) reason: String,
-    pub(super) rest: Option<Box<Change>>,
 }
 
 /// Writes `plan` to `target`'s daemon: each store's guarded rows at once,
