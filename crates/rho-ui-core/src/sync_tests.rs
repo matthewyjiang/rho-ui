@@ -1,10 +1,11 @@
 use std::{collections::BTreeSet, path::PathBuf};
 
 use rho_protocol::{
-    Applies, ConfigCategory, ConfigGetResponse, ConfigRevision, ConfigSchema, Plugin,
+    Applies, ConfigCategory, ConfigGetResponse, ConfigRevision, ConfigSchema, ConfigTable, Plugin,
     PluginInstallSource, PluginScope, PluginSource, PluginStatus, SettingChange, SettingChoice,
-    SettingEntry, SettingKey, SettingKind, SettingSpec, SettingValue, ValueSource,
+    SettingEntry, SettingKey, SettingKind, SettingSpec, SettingValue, TableEntry, ValueSource,
 };
+use serde_json::{json, Value};
 
 use super::plugins::Found;
 use super::*;
@@ -53,6 +54,8 @@ fn spec(key: &str, kind: SettingKind, default: SettingValue) -> SettingSpec {
         help: String::new(),
         applies: Applies::Immediately,
         overridable_per_project: true,
+        per_machine: false,
+        read_only: false,
     }
 }
 
@@ -74,6 +77,44 @@ fn timeout(max: u64) -> SettingSpec {
 
 fn shell() -> SettingSpec {
     restart(spec("c.shell", SettingKind::Text, text("bash")))
+}
+
+fn read_only(spec: SettingSpec) -> SettingSpec {
+    SettingSpec {
+        read_only: true,
+        ..spec
+    }
+}
+
+fn per_machine(spec: SettingSpec) -> SettingSpec {
+    SettingSpec {
+        per_machine: true,
+        ..spec
+    }
+}
+
+/// `side` with `store` holding `entries`, read at revision `rev`.
+fn table(side: Side, store: ConfigTable, rev: &str, entries: &[(&str, Value)]) -> Side {
+    let entries = entries
+        .iter()
+        .map(|(key, value)| TableEntry::new((*key).to_owned(), value.clone()))
+        .collect();
+    side.with_table(
+        store,
+        TableRead {
+            revision: ConfigRevision::new(rev),
+            entries,
+        },
+    )
+}
+
+/// `side` with the user's hooks file as `text`.
+fn hooks(side: Side, text: Option<&str>) -> Side {
+    side.with_hooks(HooksFileRead {
+        path: PathBuf::from("/home/me/.rho/hooks.toml"),
+        revision: ConfigRevision::new("h0"),
+        text: text.map(str::to_owned),
+    })
 }
 
 /// Machine `label` with the settings `specs`, the file setting `set` (the
@@ -164,7 +205,7 @@ fn link(path: &str) -> PluginSource {
 fn a_setting_row_follows_the_copy_policy() {
     type Setup = (SettingSpec, Option<SettingValue>);
     type Expected = Option<(Action, Start, bool)>;
-    let cases: [(&str, Setup, Option<Setup>, Expected); 7] = [
+    let cases: [(&str, Setup, Option<Setup>, Expected); 9] = [
         (
             "same value",
             (choice(&["auto", "plan"], "auto"), Some(text("plan"))),
@@ -206,6 +247,18 @@ fn a_setting_row_follows_the_copy_policy() {
             (shell(), Some(text("zsh"))),
             Some((shell(), None)),
             Some((Action::Change, Start::Checked, true)),
+        ),
+        (
+            "belongs to the target's machine",
+            (shell(), Some(text("zsh"))),
+            Some((per_machine(shell()), None)),
+            Some((Action::Change, Start::Unchecked, true)),
+        ),
+        (
+            "changed only through another method there",
+            (choice(&["auto", "plan"], "auto"), Some(text("plan"))),
+            Some((read_only(choice(&["auto", "plan"], "auto")), None)),
+            Some((Action::Change, Start::Cant, false)),
         ),
     ];
     for (case, (from_spec, from_value), to, expected) in cases {
@@ -280,7 +333,7 @@ fn a_setting_write_resets_to_a_shared_default() {
             .items()
             .filter_map(|item| match &item.change {
                 Change::Setting { key, after, .. } => Some(after.write(key)),
-                Change::Plugin { .. } => None,
+                _ => None,
             })
             .collect();
         assert_eq!(writes, [expected]);
@@ -453,7 +506,8 @@ fn a_revert_holds_back_what_the_target_changed_since() {
 
 /// A snapshot keeps each row a sync landed with what the row first
 /// overwrote, through a retry of a plugin that installed but didn't
-/// disable, so Revert removes it; a revert drops what it put back.
+/// disable, so Revert removes it; a sync that landed nothing keeps the last
+/// one, and a revert drops what it put back.
 #[test]
 fn a_snapshot_keeps_what_a_sync_first_overwrote() {
     let review = "https://github.com/acme/review";
@@ -476,36 +530,192 @@ fn a_snapshot_keeps_what_a_sync_first_overwrote() {
         change: plugins::left_to_disable(name, after),
         ..lint_item.clone()
     };
-    let mut snapshot = Snapshot::empty(0);
-    snapshot.after_sync(&Written {
-        landed: vec![mode.clone(), lint_item],
+    let landed = |items: Vec<Planned>| Written {
+        landed: items,
+        ..Written::default()
+    };
+    let synced = Written {
         failed: vec![Failure {
             item: rest.clone(),
             reason: String::new(),
         }],
-    });
-    snapshot.after_sync(&Written {
-        landed: vec![rest],
-        failed: Vec::new(),
-    });
-    let synced = machine("box", specs(), &[("c.mode", text("plan"))], lint());
+        ..landed(vec![mode.clone(), lint_item])
+    };
+    let snapshot = Snapshot::after(None, Pass::Sync, &synced, 0);
+    let snapshot = Snapshot::after(snapshot, Pass::Retry, &landed(vec![rest]), 1);
+    let stale = Written {
+        stale: true,
+        ..Written::default()
+    };
+    let snapshot = Snapshot::after(snapshot, Pass::Sync, &stale, 2).expect("kept");
+    let box_now = machine("box", specs(), &[("c.mode", text("plan"))], lint());
     assert_eq!(
-        writes(&review_revert(&snapshot, &synced).plan(&BTreeSet::new())),
+        snapshot.at, 0,
+        "the sync's, not the retry's or the stale one's"
+    );
+    assert_eq!(
+        writes(&review_revert(&snapshot, &box_now).plan(&BTreeSet::new())),
         [
             ("c.mode".to_owned(), Some(reset("c.mode"))),
             ("lint".to_owned(), None),
         ]
     );
-    snapshot.after_revert(&Written {
-        landed: vec![mode],
-        failed: Vec::new(),
-    });
-    let left: Vec<_> = review_revert(&snapshot, &synced)
+    let snapshot =
+        Snapshot::after(Some(snapshot), Pass::Revert, &landed(vec![mode]), 3).expect("lint left");
+    let left: Vec<_> = review_revert(&snapshot, &box_now)
         .rows
         .into_iter()
         .map(|row| row.key.id)
         .collect();
     assert_eq!(left, ["lint"]);
+}
+
+/// A table entry or hooks file is listed only when it differs: one only
+/// the target has starts unchecked, and none can go to a rho too old to
+/// write its store. Two provider profiles with the same endpoint say which
+/// fields differ.
+#[test]
+fn a_table_or_hooks_row_follows_the_copy_policy() {
+    let base = |label| machine(label, Vec::new(), &[], Vec::new());
+    let ollama = json!({"base_url": "http://localhost:11434/v1"});
+    let source = table(
+        table(
+            table(
+                hooks(base("laptop"), Some("[[hook]]\n")),
+                ConfigTable::ModelAliases,
+                "a",
+                &[("fast", json!("openai/gpt-5-mini")), ("same", json!("x/y"))],
+            ),
+            ConfigTable::FavoriteModels,
+            "f",
+            &[("openai/gpt-5", Value::Null)],
+        ),
+        ConfigTable::Providers,
+        "p",
+        &[("ollama", ollama)],
+    );
+    let target = table(
+        table(
+            table(
+                hooks(base("box"), None),
+                ConfigTable::ModelAliases,
+                "a",
+                &[("fast", json!("openai/gpt-5")), ("same", json!("x/y"))],
+            ),
+            ConfigTable::FavoriteModels,
+            "f",
+            &[("fake/old", Value::Null)],
+        ),
+        ConfigTable::Providers,
+        "p",
+        &[(
+            "ollama",
+            json!({"base_url": "http://localhost:11434/v1", "edit_tool": "patch"}),
+        )],
+    );
+    let rows = |diff: &Diff| -> Vec<(String, Action, Start)> {
+        diff.rows()
+            .map(|row| (row.key.id.clone(), row.action, start(row)))
+            .collect()
+    };
+    let synced = diff(&source, &target);
+    assert_eq!(
+        rows(&synced),
+        [
+            ("alias:fast".to_owned(), Action::Change, Start::Checked),
+            (
+                "favorite:openai/gpt-5".to_owned(),
+                Action::Add,
+                Start::Checked
+            ),
+            (
+                "favorite:fake/old".to_owned(),
+                Action::Remove,
+                Start::Unchecked
+            ),
+            ("ollama".to_owned(), Action::Change, Start::Checked),
+            ("file".to_owned(), Action::Add, Start::Checked),
+        ]
+    );
+    let profile = synced
+        .rows()
+        .find(|row| row.key.id == "ollama")
+        .and_then(|row| row.target.clone());
+    assert_eq!(
+        profile.as_deref(),
+        Some("http://localhost:11434/v1 · edit_tool = patch")
+    );
+    let old = diff(&source, &base("box"));
+    assert_eq!(
+        rows(&old),
+        [
+            ("alias:fast".to_owned(), Action::Add, Start::Cant),
+            ("alias:same".to_owned(), Action::Add, Start::Cant),
+            ("favorite:openai/gpt-5".to_owned(), Action::Add, Start::Cant),
+            ("ollama".to_owned(), Action::Add, Start::Cant),
+            ("file".to_owned(), Action::Add, Start::Cant),
+        ]
+    );
+}
+
+/// A sync writes the stores in an order where nothing names a provider
+/// the target lacks yet, plugins last; a revert writes them in reverse, and
+/// holds back an entry the target changed since.
+#[test]
+fn stores_sync_in_dependency_order_and_revert_in_reverse() {
+    let modes = ["auto", "plan"];
+    let side = |label, mode: Option<&str>, alias: &str, hook: Option<&str>| {
+        let set: Vec<_> = mode
+            .map(|mode| ("c.mode", text(mode)))
+            .into_iter()
+            .collect();
+        let plugins = match mode {
+            Some(_) => vec![plugin("lint", git("https://github.com/acme/lint", "a1"))],
+            None => Vec::new(),
+        };
+        let side = machine(label, vec![choice(&modes, "auto")], &set, plugins);
+        let side = table(
+            side,
+            ConfigTable::ModelAliases,
+            "a",
+            &[("fast", json!(alias))],
+        );
+        let side = table(side, ConfigTable::FavoriteModels, "f", &[]);
+        let providers: &[(&str, Value)] = match mode {
+            Some(_) => &[("acme", json!({"base_url": "https://acme.test/v1"}))],
+            None => &[],
+        };
+        hooks(table(side, ConfigTable::Providers, "p", providers), hook)
+    };
+    let laptop = side("laptop", Some("plan"), "acme/big", Some("[[hook]]\n"));
+    let before = side("box", None, "fake/small", None);
+    let diff = diff(&laptop, &before);
+    let plan = diff.plan(&diff.initially_checked());
+    let order = |plan: &Plan| -> Vec<String> { plan.items().map(|i| i.key.id.clone()).collect() };
+    assert_eq!(
+        order(&plan),
+        ["acme", "alias:fast", "c.mode", "file", "lint"]
+    );
+    let snapshot = Snapshot::new(0, &plan);
+    let mut now = side("box", Some("plan"), "acme/big", Some("[[hook]]\n"));
+    now = table(
+        now,
+        ConfigTable::ModelAliases,
+        "a2",
+        &[("fast", json!("fake/edited"))],
+    );
+    let review = review_revert(&snapshot, &now);
+    let changed: Vec<_> = review.changed().map(|row| row.key.id.as_str()).collect();
+    assert_eq!(changed, ["alias:fast"]);
+    assert_eq!(
+        order(&review.plan(&BTreeSet::new())),
+        ["file", "c.mode", "acme", "lint"]
+    );
+    let anyway: BTreeSet<_> = review.changed().map(|row| row.key.clone()).collect();
+    assert_eq!(
+        order(&review.plan(&anyway)),
+        ["file", "c.mode", "alias:fast", "acme", "lint"]
+    );
 }
 
 /// What `plan` writes, row by row: a setting's write, or `None` for a
@@ -522,6 +732,7 @@ fn writes(plan: &Plan) -> Vec<(String, Option<SettingChange>)> {
                 );
                 (name, None)
             }
+            change => panic!("not a setting or plugin: {change:?}"),
         })
         .collect()
 }

@@ -66,6 +66,7 @@ use crate::{
 };
 
 mod auth;
+mod config_files;
 mod configured;
 mod marks;
 mod mcp;
@@ -76,6 +77,7 @@ mod reports;
 mod search;
 mod worktrees;
 
+pub use config_files::{HooksFileRead, TableRead};
 pub use marks::SessionMark;
 pub use mcp::{ResourceAttachment, MAX_RESOURCE_TEXT_BYTES};
 pub use plugins::{Enablement, IfExists, PluginError};

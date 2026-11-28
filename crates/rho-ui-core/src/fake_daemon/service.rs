@@ -19,26 +19,27 @@ use rho_protocol::{
     AuthKeyParams, AuthKeyResponse, AuthListParams, AuthListResponse, AuthLoginCancelParams,
     AuthLoginCancelResponse, AuthLoginParams, AuthLoginResponse, AuthLogoutParams,
     AuthLogoutResponse, BackgroundStatus, BuildId, CardTone, ClientInfo, ConfigGetParams,
-    ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus,
-    DetachReason, DetailedSessionSummary, ErrorCode, HooksListParams, HooksListResponse,
-    InputAnswer, InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream,
-    McpListParams, McpListResponse, ModelListParams, ModelWatch, Operation, PermissionMode,
-    PlanApprovalAsk, PluginsInstallParams, PluginsInstallResponse, PluginsListParams,
-    PluginsListResponse, PluginsRemoveParams, PluginsRemoveResponse, PluginsSetEnabledParams,
-    PluginsSetEnabledResponse, PluginsUpdateParams, PluginsUpdateResponse, ProtocolVersion,
-    QuestionAsk, RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
-    SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
-    SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
-    SessionEvent, SessionForkParams, SessionForkResponse, SessionHoldParams, SessionHoldResponse,
-    SessionListDetailedResponse, SessionMarkParams, SessionMarkResponse, SessionMcpCatalog,
-    SessionMcpCatalogParams, SessionMcpCompleteParams, SessionMcpCompleteResponse,
-    SessionMcpInventory, SessionMcpParams, SessionMcpResourceParams, SessionMcpResourceResponse,
-    SessionNewParams, SessionNewResponse, SessionProcessesParams, SessionProcessesResponse,
-    SessionPromptParams, SessionPromptResponse, SessionPullRequestLinkParams,
-    SessionPullRequestLinkResponse, SessionPullRequestListParams, SessionPullRequestListResponse,
-    SessionPullRequestShowParams, SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
-    SessionPullRequestUnlinkResponse, SessionSearchParams, SessionSearchResponse,
-    SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
+    ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigTableGetParams, ConfigTableGetResponse,
+    ConfigTableSetParams, ConfigTableSetResponse, ConfigWatch, ContentBlock, DaemonStatus,
+    DetachReason, DetailedSessionSummary, ErrorCode, HooksFileGetParams, HooksFileGetResponse,
+    HooksFileSetParams, HooksFileSetResponse, HooksListParams, HooksListResponse, InputAnswer,
+    InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream, McpListParams,
+    McpListResponse, ModelListParams, ModelWatch, Operation, PermissionMode, PlanApprovalAsk,
+    PluginsInstallParams, PluginsInstallResponse, PluginsListParams, PluginsListResponse,
+    PluginsRemoveParams, PluginsRemoveResponse, PluginsSetEnabledParams, PluginsSetEnabledResponse,
+    PluginsUpdateParams, PluginsUpdateResponse, ProtocolVersion, QuestionAsk, RestartCost,
+    RpcError, Service, SessionAnswerParams, SessionAnswerResponse, SessionAttachParams,
+    SessionAttachResponse, SessionBackgroundStopParams, SessionBackgroundStopResponse,
+    SessionCancelParams, SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams,
+    SessionForkResponse, SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse,
+    SessionMarkParams, SessionMarkResponse, SessionMcpCatalog, SessionMcpCatalogParams,
+    SessionMcpCompleteParams, SessionMcpCompleteResponse, SessionMcpInventory, SessionMcpParams,
+    SessionMcpResourceParams, SessionMcpResourceResponse, SessionNewParams, SessionNewResponse,
+    SessionProcessesParams, SessionProcessesResponse, SessionPromptParams, SessionPromptResponse,
+    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
+    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
+    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSearchParams,
+    SessionSearchResponse, SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
     SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription, ToolKind,
     ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse,
     WorktreeVerdict, PROTOCOL_VERSION,
@@ -1360,6 +1361,36 @@ impl SettingsService for Fake {
 
     async fn set_config(&self, params: ConfigSetParams) -> Result<ConfigSetResponse, RpcError> {
         self.lock().config.set(params)
+    }
+
+    async fn get_config_table(
+        &self,
+        params: ConfigTableGetParams,
+    ) -> Result<ConfigTableGetResponse, RpcError> {
+        Ok(self.lock().config_files.get_table(params.table))
+    }
+
+    async fn set_config_table(
+        &self,
+        params: ConfigTableSetParams,
+    ) -> Result<ConfigTableSetResponse, RpcError> {
+        let revision = self.lock().config_files.set_table(params)?;
+        Ok(ConfigTableSetResponse::new(revision))
+    }
+
+    async fn read_hooks_file(
+        &self,
+        _: HooksFileGetParams,
+    ) -> Result<HooksFileGetResponse, RpcError> {
+        Ok(self.lock().config_files.get_hooks())
+    }
+
+    async fn write_hooks_file(
+        &self,
+        params: HooksFileSetParams,
+    ) -> Result<HooksFileSetResponse, RpcError> {
+        let revision = self.lock().config_files.set_hooks(params)?;
+        Ok(HooksFileSetResponse::new(revision))
     }
 
     async fn list_models(&self, _: ModelListParams) -> Result<ModelWatch, RpcError> {

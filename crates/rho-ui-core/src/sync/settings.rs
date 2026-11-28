@@ -59,9 +59,9 @@ fn row(spec: &SettingSpec, source: &Side, target: &Side) -> Option<Row> {
         source: Some(show(from)),
         target: target_value,
         action,
-        // Becomes `tspec.per_machine` with rho-protocol 1.7.0.
         one_machine: false,
         restart: false,
+        note: None,
         copy,
     };
     let Some(tspec) = target.settings.spec(key) else {
@@ -83,7 +83,14 @@ fn row(spec: &SettingSpec, source: &Side, target: &Side) -> Option<Row> {
         value: to.cloned(),
         set: target.settings.is_set(key),
     };
-    let copy = match fits(from, tspec, &target.label) {
+    // A setting another method changes, such as the credential store
+    // through Providers, can't be written here.
+    let fits = if tspec.read_only {
+        Err(format!("Change it in Providers on {}", target.label))
+    } else {
+        fits(from, tspec, &target.label)
+    };
+    let copy = match fits {
         Ok(()) => Copy::Write(Change::Setting {
             key: key.clone(),
             before,
@@ -92,6 +99,7 @@ fn row(spec: &SettingSpec, source: &Side, target: &Side) -> Option<Row> {
         Err(why) => Copy::Cannot(why),
     };
     Some(Row {
+        one_machine: tspec.per_machine,
         restart: tspec.applies == Applies::Restart,
         ..base(Action::Change, Some(show(to)), copy)
     })
@@ -163,41 +171,34 @@ pub(super) fn revert_row(
     target: &Side,
 ) -> RevertRow {
     let settings: &AgentSettings = &target.settings;
-    let spec = settings.spec(key);
-    let show = |value: Option<&SettingValue>| match spec {
-        Some(spec) => shown(value, spec),
-        None => "Not set".to_owned(),
-    };
     let now = settings.value(key);
-    let (state, back) = if spec.is_some() {
-        let state = if now == after.value.as_ref() {
-            RevertState::Unchanged
-        } else {
-            RevertState::Changed
+    let Some(spec) = settings.spec(key) else {
+        let not_set = "Not set".to_owned();
+        return RevertRow {
+            key: item.key.clone(),
+            label: item.label.clone(),
+            synced: not_set.clone(),
+            now: not_set.clone(),
+            before: not_set,
+            state: RevertState::Blocked(format!(
+                "Rho on {} no longer has this setting",
+                target.label
+            )),
+            item: None,
         };
-        let back = Planned {
-            change: Change::Setting {
-                key: key.clone(),
-                before: Held {
-                    value: now.cloned(),
-                    set: settings.is_set(key),
-                },
-                after: before.clone(),
-            },
-            ..item.clone()
-        };
-        (state, Some(back))
-    } else {
-        let why = format!("Rho on {} no longer has this setting", target.label);
-        (RevertState::Blocked(why), None)
     };
-    RevertRow {
-        key: item.key.clone(),
-        label: item.label.clone(),
-        synced: show(after.value.as_ref()),
-        now: show(now),
-        before: show(before.value.as_ref()),
-        state,
-        item: back,
-    }
+    let back = Change::Setting {
+        key: key.clone(),
+        before: Held {
+            value: now.cloned(),
+            set: settings.is_set(key),
+        },
+        after: before.clone(),
+    };
+    RevertRow::of(
+        item,
+        [before.value.as_ref(), after.value.as_ref(), now],
+        |value| shown(value, spec),
+        back,
+    )
 }

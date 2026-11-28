@@ -1,33 +1,42 @@
 //! Settings sync: a one-shot copy of what one machine's rho holds to
 //! another machine's, with Revert.
 //!
-//! [`diff`] compares two machines' [`Side`]s, as groups of rows by kind,
-//! listing only what differs; each row knows what syncing it would write
-//! and what that overwrites. [`Diff::plan`] takes the rows the user
-//! checked, and [`apply`] writes them to the target: the rows the daemon
-//! guards with a revision first, all at once, then the rest one at a time,
-//! saying which landed. A [`Snapshot`] of the plan keeps what the target
-//! held before, so [`review_revert`] can tell which rows the target changed
-//! since the sync, and [`RevertReview::plan`] puts back the rest.
+//! [`read`] reads a machine as a [`Side`], and [`diff`] compares two of
+//! them, as groups of rows by kind, listing only what differs; each row
+//! knows what syncing it would write and what that overwrites.
+//! [`Diff::plan`] takes the rows the user checked, and [`apply`] writes
+//! them to the target: first the parts of rho's configuration the daemon
+//! guards with a revision (`Store`s), each all at once, in an order that
+//! never names something the target lacks yet; then, unless one was stale,
+//! the rest one at a time. A [`Snapshot`] keeps what the target held
+//! before, so [`review_revert`] can tell which rows the target changed
+//! since the sync, and [`RevertReview::plan`] puts back the rest, in the
+//! reverse order.
 //!
 //! Each kind is a [`GroupKind`]: rho's settings (`rho/config/*`, in
-//! `settings.rs`) and the user's agent plugins (`rho/plugins/*`, in
-//! `plugins.rs`). A view draws a group and its rows from their fields
-//! alone, so a kind added here needs no change there.
+//! `settings.rs`), the user's agent plugins (`rho/plugins/*`, in
+//! `plugins.rs`), model aliases and favorites and provider profiles
+//! (`rho/config/table/*`, in `tables.rs`), and the user's hooks file
+//! (`rho/hooks/file/*`, in `hooks.rs`). A view draws a group and its rows
+//! from their fields alone, so a kind added here needs no change there.
 
+mod hooks;
 mod plugins;
 mod settings;
+mod tables;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use rho_protocol::{ConfigRevision, Plugin, SettingKey};
+use rho_protocol::{ConfigRevision, ConfigTable, Plugin, SettingKey, TableChange};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::{AgentSettings, Daemon, DaemonError};
+use crate::{AgentSettings, Daemon, DaemonError, HooksFileRead, TableRead};
 use plugins::{Found, PluginCopy};
 use settings::Held;
 
-/// What a sync copies, a group of rows each.
+/// What a sync copies, a group of rows each, in the order a view shows
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupKind {
@@ -35,6 +44,12 @@ pub enum GroupKind {
     RhoSettings,
     /// The user's agent plugins.
     Plugins,
+    /// Model aliases and favorite models.
+    Models,
+    /// Provider profiles: `ollama` and custom providers.
+    Providers,
+    /// The user's hooks file.
+    Hooks,
 }
 
 impl GroupKind {
@@ -43,6 +58,9 @@ impl GroupKind {
         match self {
             Self::RhoSettings => "Rho settings",
             Self::Plugins => "Plugins",
+            Self::Models => "Models",
+            Self::Providers => "Provider profiles",
+            Self::Hooks => "Hooks",
         }
     }
 
@@ -51,17 +69,20 @@ impl GroupKind {
         match self {
             Self::RhoSettings => "settings",
             Self::Plugins => "plugins",
+            Self::Models => "models",
+            Self::Providers => "providers",
+            Self::Hooks => "hooks",
         }
     }
 }
 
 /// One row's identity, the same in every read of the same two machines:
-/// its kind, and the setting's key or the plugin's name.
+/// its kind, and the setting's key, the plugin's name, or the entry's.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RowKey {
     /// The group it is in.
     pub kind: GroupKind,
-    /// The setting's key, or the plugin's name.
+    /// The setting's key, the plugin's name, or the entry's.
     pub id: String,
 }
 
@@ -101,12 +122,14 @@ pub struct Row {
     pub target: Option<String>,
     /// What syncing it does to the target.
     pub action: Action,
-    /// It belongs to one machine (rho-protocol 1.7.0 marks such settings
-    /// with `SettingSpec::per_machine`), so a sync leaves it unless the
-    /// user checks it.
+    /// It belongs to one machine (`SettingSpec::per_machine`), so a sync
+    /// leaves it unless the user checks it.
     pub one_machine: bool,
     /// It applies on the target only once the target's rho restarts.
     pub restart: bool,
+    /// What else a person should know before syncing it, such as what it
+    /// leaves behind.
+    pub note: Option<String>,
     copy: Copy,
 }
 
@@ -145,6 +168,56 @@ pub struct Group {
     pub rows: Vec<Row>,
 }
 
+/// A part of rho's configuration the daemon writes only against the
+/// revision it was read at, all of a write or none: in the order a sync
+/// writes them, so a key or model reference never names a provider the
+/// target lacks yet. A revert writes them in the reverse order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Store {
+    Providers,
+    Aliases,
+    Favorites,
+    Settings,
+    Hooks,
+}
+
+impl Store {
+    /// The tables a sync reads.
+    const TABLES: [Self; 3] = [Self::Providers, Self::Aliases, Self::Favorites];
+
+    /// The `rho/config/table/*` table it is, if it is one.
+    fn table(self) -> Option<ConfigTable> {
+        match self {
+            Self::Providers => Some(ConfigTable::Providers),
+            Self::Aliases => Some(ConfigTable::ModelAliases),
+            Self::Favorites => Some(ConfigTable::FavoriteModels),
+            Self::Settings | Self::Hooks => None,
+        }
+    }
+
+    /// The store `table` is, if this crate knows it.
+    fn of_table(table: ConfigTable) -> Option<Self> {
+        match table {
+            ConfigTable::Providers => Some(Self::Providers),
+            ConfigTable::ModelAliases => Some(Self::Aliases),
+            ConfigTable::FavoriteModels => Some(Self::Favorites),
+            _ => None,
+        }
+    }
+
+    /// Its name for people.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Providers => "provider profiles",
+            Self::Aliases => "model aliases",
+            Self::Favorites => "favorite models",
+            Self::Settings => "settings",
+            Self::Hooks => "hooks file",
+        }
+    }
+}
+
 /// What one machine holds, as a sync reads it.
 #[derive(Clone, Debug)]
 pub struct Side {
@@ -153,18 +226,91 @@ pub struct Side {
     settings: AgentSettings,
     /// The user's plugins; `None` from a rho older than plugins.
     plugins: Option<Vec<Plugin>>,
+    /// The tables its rho lets a client write; none from an older rho.
+    tables: BTreeMap<Store, TableRead>,
+    /// The user's hooks file; `None` from a rho older than reading it.
+    hooks: Option<HooksFileRead>,
 }
 
 impl Side {
     /// What machine `label` holds: its rho settings, and its plugins
-    /// (`None` from a rho older than plugins).
+    /// (`None` from a rho older than plugins); no tables or hooks file
+    /// until [`Self::with_table`] and [`Self::with_hooks`] add them.
     pub fn new(label: String, settings: AgentSettings, plugins: Option<Vec<Plugin>>) -> Self {
         Self {
             label,
             settings,
             plugins,
+            tables: BTreeMap::new(),
+            hooks: None,
         }
     }
+
+    /// With `table` as `read`. A table this crate doesn't know is left
+    /// out.
+    #[must_use]
+    pub fn with_table(mut self, table: ConfigTable, read: TableRead) -> Self {
+        if let Some(store) = Store::of_table(table) {
+            self.tables.insert(store, read);
+        }
+        self
+    }
+
+    /// With the user's hooks file as `hooks`.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: HooksFileRead) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// The revision a write to `store` sends, if this machine has it.
+    fn revision(&self, store: Store) -> Option<ConfigRevision> {
+        match store {
+            Store::Settings => Some(self.settings.revision().clone()),
+            Store::Hooks => self.hooks.as_ref().map(|hooks| hooks.revision.clone()),
+            table => self.tables.get(&table).map(|read| read.revision.clone()),
+        }
+    }
+
+    /// Every revision this machine has, by store.
+    fn revisions(&self) -> BTreeMap<Store, ConfigRevision> {
+        [Store::Settings, Store::Hooks]
+            .into_iter()
+            .chain(Store::TABLES)
+            .filter_map(|store| Some((store, self.revision(store)?)))
+            .collect()
+    }
+}
+
+/// Reads what `daemon`'s machine, `label`, holds, all at once.
+///
+/// # Errors
+///
+/// Fails if any read does; a part an older rho lacks is left out instead.
+pub async fn read(label: String, daemon: &Daemon) -> Result<Side, DaemonError> {
+    let (settings, plugins, providers, aliases, favorites, hooks) = futures::join!(
+        daemon.agent_settings(),
+        daemon.plugins(None),
+        daemon.config_table(ConfigTable::Providers),
+        daemon.config_table(ConfigTable::ModelAliases),
+        daemon.config_table(ConfigTable::FavoriteModels),
+        daemon.hooks_file(),
+    );
+    let mut side = Side::new(label, settings?, plugins?);
+    let tables = [
+        (ConfigTable::Providers, providers?),
+        (ConfigTable::ModelAliases, aliases?),
+        (ConfigTable::FavoriteModels, favorites?),
+    ];
+    for (table, read) in tables {
+        if let Some(read) = read {
+            side = side.with_table(table, read);
+        }
+    }
+    if let Some(hooks) = hooks? {
+        side = side.with_hooks(hooks);
+    }
+    Ok(side)
 }
 
 /// What differs between two machines, by kind, in the order a view shows
@@ -173,22 +319,31 @@ impl Side {
 pub struct Diff {
     /// The kinds with a difference, each with its rows.
     pub groups: Vec<Group>,
-    /// The target's settings revision the rows were read at, which every
-    /// write sends.
-    revision: ConfigRevision,
+    /// The target's revisions the rows were read at, which the writes
+    /// send.
+    revisions: BTreeMap<Store, ConfigRevision>,
 }
 
 /// Compares what `source` holds with what `target` does.
 pub fn diff(source: &Side, target: &Side) -> Diff {
-    let settings = settings::rows(source, target);
     let plugins = match (&source.plugins, &target.plugins) {
         (Some(from), Some(to)) => plugins::rows(from, to, &source.label, &target.label),
         // A rho older than plugins has none to compare.
         _ => Vec::new(),
     };
+    let models = [Store::Aliases, Store::Favorites]
+        .into_iter()
+        .flat_map(|store| tables::rows(store, source, target))
+        .collect();
     let groups = [
-        (GroupKind::RhoSettings, settings),
+        (GroupKind::RhoSettings, settings::rows(source, target)),
         (GroupKind::Plugins, plugins),
+        (GroupKind::Models, models),
+        (
+            GroupKind::Providers,
+            tables::rows(Store::Providers, source, target),
+        ),
+        (GroupKind::Hooks, hooks::rows(source, target)),
     ]
     .into_iter()
     .filter(|(_, rows)| !rows.is_empty())
@@ -196,7 +351,7 @@ pub fn diff(source: &Side, target: &Side) -> Diff {
     .collect();
     Diff {
         groups,
-        revision: target.settings.revision().clone(),
+        revisions: target.revisions(),
     }
 }
 
@@ -219,8 +374,8 @@ impl Diff {
             .collect()
     }
 
-    /// What syncing the `checked` rows writes, in the diff's order. A row
-    /// that can't be copied is never in it.
+    /// What syncing the `checked` rows writes. A row that can't be copied
+    /// is never in it.
     pub fn plan(&self, checked: &BTreeSet<RowKey>) -> Plan {
         let items = self
             .rows()
@@ -234,7 +389,7 @@ impl Diff {
                 }),
                 Copy::Cannot(_) => None,
             });
-        Plan::new(&self.revision, items)
+        Plan::new(&self.revisions, items, Order::Sync)
     }
 }
 
@@ -252,35 +407,53 @@ enum Change {
         before: Option<PluginCopy>,
         after: Option<PluginCopy>,
     },
+    /// An entry of a table, as JSON; `None` when the table lacks it.
+    Entry {
+        store: Store,
+        key: String,
+        before: Option<Value>,
+        after: Option<Value>,
+    },
+    /// The user's hooks file's text; `None` when there is no file.
+    Hooks {
+        before: Option<String>,
+        after: Option<String>,
+    },
 }
 
 impl Change {
-    /// Whether the daemon writes it only against the revision it was read
-    /// at, refusing it as stale once another client wrote since.
-    fn is_guarded(&self) -> bool {
+    /// The store the daemon guards it in, by revision; `None` for one it
+    /// writes on its own, unguarded.
+    fn store(&self) -> Option<Store> {
         match self {
-            Self::Setting { .. } => true,
-            Self::Plugin { .. } => false,
+            Self::Setting { .. } => Some(Store::Settings),
+            Self::Entry { store, .. } => Some(*store),
+            Self::Hooks { .. } => Some(Store::Hooks),
+            Self::Plugin { .. } => None,
         }
     }
 
     /// This change, then `later` to the same thing: what this one
     /// overwrote, and what `later` left.
     fn then(&self, later: &Self) -> Self {
-        match (self, later) {
-            (Self::Setting { before, .. }, Self::Setting { key, after, .. }) => Self::Setting {
-                key: key.clone(),
-                before: before.clone(),
-                after: after.clone(),
-            },
-            (Self::Plugin { before, .. }, Self::Plugin { name, after, .. }) => Self::Plugin {
-                name: name.clone(),
-                before: before.clone(),
-                after: after.clone(),
-            },
+        let mut combined = later.clone();
+        match (self, &mut combined) {
+            (Self::Setting { before, .. }, Self::Setting { before: first, .. }) => {
+                first.clone_from(before);
+            }
+            (Self::Plugin { before, .. }, Self::Plugin { before: first, .. }) => {
+                first.clone_from(before);
+            }
+            (Self::Entry { before, .. }, Self::Entry { before: first, .. }) => {
+                first.clone_from(before);
+            }
+            (Self::Hooks { before, .. }, Self::Hooks { before: first, .. }) => {
+                first.clone_from(before);
+            }
             // Rows of the same key are of the same kind.
-            _ => later.clone(),
+            _ => {}
         }
+        combined
     }
 }
 
@@ -310,42 +483,63 @@ impl Planned {
     }
 }
 
-/// The rows to write to the target: first the guarded ones, all at once
-/// against the revision they were read at, then, once those landed, the
-/// unguarded ones, each on its own. So a sync refused as stale writes
-/// nothing.
+/// Which way a plan writes the stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    Sync,
+    Revert,
+}
+
+/// The rows to write to the target: first each store's guarded rows, all
+/// at once against the revision they were read at, store by store; then,
+/// unless a store was stale, the unguarded ones, each on its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
-    guarded: Option<Guarded>,
+    guarded: Vec<Guarded>,
     unguarded: Vec<Planned>,
 }
 
-/// A plan's guarded rows, never none, and the revision they were read at.
+/// One store's rows of a plan, never none, and the revision they were
+/// read at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Guarded {
+    store: Store,
     revision: ConfigRevision,
     items: Vec<Planned>,
 }
 
 impl Plan {
-    /// `items`, read at `revision`, split by whether they are guarded.
-    fn new(revision: &ConfigRevision, items: impl IntoIterator<Item = Planned>) -> Self {
-        let (guarded, unguarded): (Vec<_>, Vec<_>) =
-            items.into_iter().partition(|item| item.change.is_guarded());
-        let guarded = (!guarded.is_empty()).then(|| Guarded {
-            revision: revision.clone(),
-            items: guarded,
-        });
-        Self { guarded, unguarded }
-    }
-
-    /// `failure`'s row alone, to write again. Only an unguarded row fails
-    /// alone, so it needs no revision.
-    pub fn retry(failure: &Failure) -> Self {
-        Self {
-            guarded: None,
-            unguarded: vec![failure.item.clone()],
+    /// `items`, read at `revisions`, split by store and written in
+    /// `order`. A row of a store the target has no revision for can't be
+    /// written, and a diff never lists one.
+    fn new(
+        revisions: &BTreeMap<Store, ConfigRevision>,
+        items: impl IntoIterator<Item = Planned>,
+        order: Order,
+    ) -> Self {
+        let mut by_store: BTreeMap<Store, Vec<Planned>> = BTreeMap::new();
+        let mut unguarded = Vec::new();
+        for item in items {
+            match item.change.store() {
+                Some(store) => by_store.entry(store).or_default().push(item),
+                None => unguarded.push(item),
+            }
         }
+        let mut guarded: Vec<Guarded> = by_store
+            .into_iter()
+            .filter_map(|(store, items)| {
+                let revision = revisions.get(&store)?.clone();
+                Some(Guarded {
+                    store,
+                    revision,
+                    items,
+                })
+            })
+            .collect();
+        if order == Order::Revert {
+            guarded.reverse();
+        }
+        Self { guarded, unguarded }
     }
 
     /// The rows it writes, in order.
@@ -361,12 +555,13 @@ impl Plan {
 
     /// Whether it writes nothing.
     pub fn is_empty(&self) -> bool {
-        self.guarded.is_none() && self.unguarded.is_empty()
+        self.guarded.is_empty() && self.unguarded.is_empty()
     }
 }
 
 /// What the target held before a sync wrote to it, kept so the sync can be
 /// reverted: the sync's rows, each with what it overwrote. Saved as JSON.
+/// It never holds a secret: no kind here has one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// When the sync ran, in Unix seconds.
@@ -374,25 +569,28 @@ pub struct Snapshot {
     items: Vec<Planned>,
 }
 
+/// What a run of [`apply`] was, for what it leaves of the target's
+/// [`Snapshot`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// A sync of the rows the user checked.
+    Sync,
+    /// One failed row of a sync, written again.
+    Retry,
+    /// A revert, or one failed row of one written again.
+    Revert,
+}
+
 impl Snapshot {
-    /// How long a snapshot is kept after its sync, in seconds: 7 days, the
-    /// span rho's sync design (for the methods still to come) gives the
-    /// target daemon's journal of overwritten secrets, so both expire
-    /// together. rho-protocol 1.6.0 has no such journal yet.
+    /// How long a snapshot is kept after its sync, in seconds: 7 days, as
+    /// long as the target daemon keeps its sync journal of overwritten
+    /// secrets (`rho/sync/*`), so both expire together.
     pub const KEEP_FOR: i64 = 7 * 24 * 60 * 60;
 
     /// Whether the snapshot is past [`Self::KEEP_FOR`] at `now`, in Unix
     /// seconds, and should be dropped.
     pub fn is_expired(&self, now: i64) -> bool {
         now.saturating_sub(self.at) >= Self::KEEP_FOR
-    }
-
-    /// Nothing yet, for a sync at `at`.
-    pub fn empty(at: i64) -> Self {
-        Self {
-            at,
-            items: Vec::new(),
-        }
     }
 
     /// All of `plan`'s rows, before it is applied at `at`: what Revert
@@ -404,27 +602,43 @@ impl Snapshot {
         }
     }
 
-    /// Whether it has nothing left to revert.
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+    /// What Revert can put back once `pass` wrote `written` at `now`,
+    /// given `kept`, the snapshot from before it. A sync that landed
+    /// something replaces the last one; one that landed nothing leaves it.
+    /// A retried row joins its sync, keeping what it first overwrote, and
+    /// a revert drops what it put back. `None` when nothing is left.
+    pub fn after(kept: Option<Self>, pass: Pass, written: &Written, now: i64) -> Option<Self> {
+        let next = match pass {
+            Pass::Sync if written.landed.is_empty() => kept,
+            Pass::Sync => Some(Self::empty(now).landing(written)),
+            Pass::Retry => Some(kept.unwrap_or_else(|| Self::empty(now)).landing(written)),
+            Pass::Revert => kept.map(|mut snapshot| {
+                snapshot
+                    .items
+                    .retain(|item| !written.landed.iter().any(|landed| landed.key == item.key));
+                snapshot
+            }),
+        };
+        next.filter(|snapshot| !snapshot.items.is_empty())
     }
 
-    /// Adds what a sync, or a retry of one of its rows, `written` to the
-    /// target. A row already here keeps what it first overwrote.
-    pub fn after_sync(&mut self, written: &Written) {
+    fn empty(at: i64) -> Self {
+        Self {
+            at,
+            items: Vec::new(),
+        }
+    }
+
+    /// `self` with `written`'s landed rows: a row already here keeps what
+    /// it first overwrote.
+    fn landing(mut self, written: &Written) -> Self {
         for item in &written.landed {
             match self.items.iter_mut().find(|kept| kept.key == item.key) {
                 Some(kept) => kept.change = kept.change.then(&item.change),
                 None => self.items.push(item.clone()),
             }
         }
-    }
-
-    /// Drops what a revert `written` put back: the rest can still be
-    /// reverted.
-    pub fn after_revert(&mut self, written: &Written) {
-        self.items
-            .retain(|item| !written.landed.iter().any(|landed| landed.key == item.key));
+        self
     }
 }
 
@@ -458,10 +672,40 @@ pub struct RevertRow {
     item: Option<Planned>,
 }
 
+impl RevertRow {
+    /// `item`'s row, whose values `show` gives: unchanged while the target
+    /// holds `now` equal to `after`, what the sync wrote. Reverting writes
+    /// `back`, from `now` to `before`.
+    fn of<T: PartialEq>(
+        item: &Planned,
+        [before, after, now]: [Option<&T>; 3],
+        show: impl Fn(Option<&T>) -> String,
+        back: Change,
+    ) -> Self {
+        let state = if now == after {
+            RevertState::Unchanged
+        } else {
+            RevertState::Changed
+        };
+        Self {
+            key: item.key.clone(),
+            label: item.label.clone(),
+            synced: show(after),
+            now: show(now),
+            before: show(before),
+            state,
+            item: Some(Planned {
+                change: back,
+                ..item.clone()
+            }),
+        }
+    }
+}
+
 /// A sync's rows as the target holds them now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevertReview {
-    revision: ConfigRevision,
+    revisions: BTreeMap<Store, ConfigRevision>,
     /// The sync's rows, in its order.
     pub rows: Vec<RevertRow>,
 }
@@ -483,10 +727,19 @@ pub fn review_revert(snapshot: &Snapshot, target: &Side) -> RevertReview {
                 let found = Found::of(name, target.plugins.as_deref().unwrap_or_default());
                 plugins::revert_row(item, name, before.as_ref(), after.as_ref(), &found)
             }
+            Change::Entry {
+                store,
+                key,
+                before,
+                after,
+            } => tables::revert_row(item, *store, key, [before.as_ref(), after.as_ref()], target),
+            Change::Hooks { before, after } => {
+                hooks::revert_row(item, [before.as_ref(), after.as_ref()], target)
+            }
         })
         .collect();
     RevertReview {
-        revision: target.settings.revision().clone(),
+        revisions: target.revisions(),
         rows,
     }
 }
@@ -511,36 +764,20 @@ impl RevertReview {
                 RevertState::Blocked(_) => false,
             })
             .filter_map(|row| row.item.clone());
-        Plan::new(&self.revision, items)
+        Plan::new(&self.revisions, items, Order::Revert)
     }
 }
 
 /// What applying a plan came to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Applied {
-    /// The guarded rows were refused, so nothing was written.
-    Refused(Refusal),
-    /// The guarded rows landed, and the unguarded ones were written.
-    Written(Written),
-}
-
-/// Why the target refused a plan's guarded rows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    /// Its settings changed since they were read: read them again.
-    Stale,
-    /// It refused them, in the daemon's words.
-    Failed(String),
-}
-
-/// The rows a plan wrote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Written {
     /// The rows that landed, in order, with those that landed only in part.
     pub landed: Vec<Planned>,
-    /// The rows that didn't, or only in part, in order: an unguarded row
-    /// each.
+    /// The rows that didn't, or only in part, in order, each with why.
     pub failed: Vec<Failure>,
+    /// A store changed on the target since it was read, so the plan
+    /// stopped there: nothing after it was written, plugins included.
+    pub stale: bool,
 }
 
 impl Written {
@@ -567,28 +804,36 @@ struct Unwritten {
     rest: Option<Box<Change>>,
 }
 
-/// Writes `plan` to `target`'s daemon: its guarded rows at once, against
-/// the revision the plan read (the daemon takes it while only this client
-/// wrote since); then, only if they landed, each unguarded row on its own,
-/// so one refusal fails its row alone.
-pub async fn apply(target: &Daemon, plan: Plan) -> Applied {
+/// Writes `plan` to `target`'s daemon: each store's guarded rows at once,
+/// store by store, against the revision the plan read (the daemon takes
+/// it while only this client wrote since); then each unguarded row on its
+/// own. A store the daemon refuses fails its rows, and the rest go on; a
+/// stale one stops the plan.
+pub async fn apply(target: &Daemon, plan: Plan) -> Written {
     let mut written = Written::default();
-    if let Some(Guarded { revision, items }) = plan.guarded {
-        let changes = items
-            .iter()
-            .filter_map(|item| match &item.change {
-                Change::Setting { key, after, .. } => Some(after.write(key)),
-                Change::Plugin { .. } => None,
-            })
-            .collect();
-        match target.set_agent_settings(revision, changes).await {
-            Ok(()) => written.landed = items,
-            Err(DaemonError::Conflict(_)) => return Applied::Refused(Refusal::Stale),
-            Err(error) => return Applied::Refused(Refusal::Failed(error.to_string())),
+    for Guarded {
+        store,
+        revision,
+        items,
+    } in plan.guarded
+    {
+        match write_store(target, store, revision, &items).await {
+            Ok(()) => written.landed.extend(items),
+            Err(DaemonError::Conflict(_)) => {
+                written.stale = true;
+                return written;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                written.failed.extend(items.into_iter().map(|item| Failure {
+                    item,
+                    reason: reason.clone(),
+                }));
+            }
         }
     }
     for item in plan.unguarded {
-        // A plan keeps settings with the guarded rows.
+        // A plan keeps every other kind with its store.
         let Change::Plugin {
             name,
             before,
@@ -597,8 +842,7 @@ pub async fn apply(target: &Daemon, plan: Plan) -> Applied {
         else {
             continue;
         };
-        let result = plugins::write(target, name, before.as_ref(), after.as_ref()).await;
-        match result {
+        match plugins::write(target, name, before.as_ref(), after.as_ref()).await {
             Ok(()) => written.landed.push(item),
             Err(Unwritten { reason, rest }) => {
                 let left = match rest {
@@ -615,7 +859,98 @@ pub async fn apply(target: &Daemon, plan: Plan) -> Applied {
             }
         }
     }
-    Applied::Written(written)
+    written
+}
+
+/// Writes `items`, all of `store`, in one request against `revision`.
+async fn write_store(
+    target: &Daemon,
+    store: Store,
+    revision: ConfigRevision,
+    items: &[Planned],
+) -> Result<(), DaemonError> {
+    if let Some(table) = store.table() {
+        let changes = items
+            .iter()
+            .filter_map(|item| match &item.change {
+                Change::Entry { key, after, .. } => Some(match after {
+                    Some(value) => TableChange::Put {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                    None => TableChange::Remove { key: key.clone() },
+                }),
+                _ => None,
+            })
+            .collect();
+        return target
+            .set_config_table(table, revision, changes)
+            .await
+            .map(drop);
+    }
+    if store == Store::Settings {
+        let changes = items
+            .iter()
+            .filter_map(|item| match &item.change {
+                Change::Setting { key, after, .. } => Some(after.write(key)),
+                _ => None,
+            })
+            .collect();
+        return target.set_agent_settings(revision, changes).await;
+    }
+    // The hooks file is one row.
+    let text = items.iter().find_map(|item| match &item.change {
+        Change::Hooks { after, .. } => Some(after.clone()),
+        _ => None,
+    });
+    target
+        .set_hooks_file(revision, text.flatten())
+        .await
+        .map(drop)
+}
+
+/// Writes failed row `failure` again: a guarded one against its store's
+/// revision as the target holds it now.
+pub async fn retry(target: &Daemon, failure: &Failure) -> Written {
+    let item = failure.item.clone();
+    let mut revisions = BTreeMap::new();
+    if let Some(store) = item.change.store() {
+        match revision_now(target, store).await {
+            Ok(revision) => {
+                revisions.insert(store, revision);
+            }
+            Err(error) => {
+                return Written {
+                    failed: vec![Failure {
+                        item,
+                        reason: error.to_string(),
+                    }],
+                    ..Written::default()
+                };
+            }
+        }
+    }
+    apply(target, Plan::new(&revisions, [item], Order::Sync)).await
+}
+
+/// `store`'s revision as `target` holds it now.
+async fn revision_now(target: &Daemon, store: Store) -> Result<ConfigRevision, DaemonError> {
+    let gone = || DaemonError::Refused(format!("Rho there no longer has its {}", store.name()));
+    if let Some(table) = store.table() {
+        return target
+            .config_table(table)
+            .await?
+            .map(|read| read.revision)
+            .ok_or_else(gone);
+    }
+    if store == Store::Settings {
+        return Ok(target.agent_settings().await?.revision().clone());
+    }
+    target
+        .hooks_file()
+        .await?
+        .map(|hooks| hooks.revision)
+        .ok_or_else(gone)
 }
 
 #[cfg(test)]

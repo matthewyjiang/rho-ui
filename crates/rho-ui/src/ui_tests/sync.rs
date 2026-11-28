@@ -1,7 +1,9 @@
-//! Settings → Machines → Sync: copying rho's settings and plugins from
-//! this machine to another, and reverting it (`settings_sync.rs`).
+//! Settings → Machines → Sync: copying rho's settings, tables, hooks file
+//! and plugins from this machine to another, and reverting it
+//! (`settings_sync.rs`).
 
-use rho_ui_core::{agent_settings::SettingValue, PluginInstallSource};
+use rho_ui_core::{agent_settings::SettingValue, ConfigTable, PluginInstallSource};
+use serde_json::json;
 
 use super::configured::{scroll_page, End};
 use super::*;
@@ -9,9 +11,9 @@ use super::*;
 /// How far one step of [`shown`] scrolls the page.
 const STEP: f32 = 80.;
 
-/// The most steps [`shown`] takes: twice the 14 the deepest row here,
-/// Revert's button under its review, measured at.
-const STEPS: usize = 30;
+/// The most steps [`shown`] takes: twice the 22 the deepest element here,
+/// the Sync button under every group, measured at.
+const STEPS: usize = 44;
 
 /// Room under the dialog's top for the page title.
 const TITLE_ROOM: f32 = 60.;
@@ -83,10 +85,11 @@ fn has_plugin(fake: &FakeDaemon, name: &str) -> bool {
     fake.plugins(None).iter().any(|plugin| plugin.name == name)
 }
 
-/// A sync writes the checked rows to the other machine: a plugin from a
-/// folder can't be copied, an install that fails keeps Retry, and a
-/// setting that applies on restart offers one. Revert then holds back the
-/// row the target changed since, and puts back the rest.
+/// A sync writes the checked rows to the other machine: a setting that
+/// belongs to one machine starts unchecked, a plugin from a folder can't
+/// be copied, an install that fails keeps Retry, and a setting that applies
+/// on restart offers one. Revert then holds back the row the target changed
+/// since, and puts back the rest.
 #[test]
 fn a_sync_copies_to_another_machine_and_reverts() {
     let local = FakeDaemon::start(Script::default());
@@ -96,6 +99,12 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     };
     local.edit_agent_setting("general.permission_mode", text("plan"));
     local.edit_agent_setting("tools.shell", text("zsh"));
+    let profile = json!({"base_url": "https://acme.test/v1", "api": "responses"});
+    local.edit_config_table(ConfigTable::Providers, "acme", Some(profile.clone()));
+    local.edit_config_table(ConfigTable::ModelAliases, "fast", Some(json!("acme/big")));
+    local.edit_config_table(ConfigTable::FavoriteModels, "acme/big", Some(json!(null)));
+    let hooks = "[[hook]]\nevent = \"session_end\"\nprogram = \"notify-send\"\n";
+    local.edit_hooks_file(Some(hooks));
     local.install_plugin(PluginInstallSource::Path {
         path: PathBuf::from("/home/me/kit"),
     });
@@ -123,13 +132,19 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         "sync-row-plugins-deploy",
         "sync-row-plugins-review",
         "sync-row-plugins-kit",
+        "sync-row-models-alias:fast",
+        "sync-row-models-favorite:acme/big",
+        "sync-row-providers-acme",
+        "sync-row-hooks-file",
     ];
     let starts = rows.map(|id| checked(&mut ui, id));
-    // The folder plugin has no checkbox.
+    // The shell belongs to one machine; the folder plugin has no checkbox.
+    let one = Some(true);
     assert_eq!(
         starts,
-        [Some(true), Some(true), Some(true), Some(true), None]
+        [one, Some(false), one, one, None, one, one, one, one]
     );
+    click_revealed(&mut ui, "sync-row-settings-tools.shell");
     reveal(&mut ui, "sync-submit");
     ui.shot("review");
 
@@ -141,6 +156,11 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     );
     assert_eq!(remote.agent_setting("tools.shell"), Some(text("zsh")));
     assert!(has_plugin(&remote, "review") && !has_plugin(&remote, "deploy"));
+    assert_eq!(
+        remote.config_table_entry(ConfigTable::Providers, "acme"),
+        Some(profile)
+    );
+    assert_eq!(remote.hooks_file().as_deref(), Some(hooks));
     reveal(&mut ui, "sync-restart");
     ui.shot("synced");
 
@@ -167,6 +187,15 @@ fn a_sync_copies_to_another_machine_and_reverts() {
     ui.wait_until("the rest put back", |_, _, _| {
         remote.agent_setting("tools.shell") == Some(text("bash")) && !has_plugin(&remote, "review")
     });
+    assert_eq!(
+        remote.config_table_entry(ConfigTable::Providers, "acme"),
+        None
+    );
+    assert_eq!(
+        remote.config_table_entry(ConfigTable::ModelAliases, "fast"),
+        None
+    );
+    assert_eq!(remote.hooks_file(), None);
     assert_eq!(
         remote.agent_setting("general.permission_mode"),
         Some(text("supervised")),

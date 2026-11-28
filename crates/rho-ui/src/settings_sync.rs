@@ -1,5 +1,6 @@
-//! Settings → Machines → Sync: copying rho's settings and the user's
-//! plugins from one machine to another, once, with Revert. The diff, the
+//! Settings → Machines → Sync: copying rho's settings, provider profiles,
+//! model aliases and favorites, the user's hooks file and plugins from one
+//! machine to another, once, with Revert. The diff, the
 //! plan and what Revert puts back are [`rho_ui_core::sync`]'s; this holds
 //! which two machines are compared, which rows the user checked, and the
 //! last sync's outcome, and runs the reads and writes on the machines'
@@ -14,11 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::DateTime;
 use gpui_kit::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use rho_ui_core::{
-    sync::{
-        self, Applied, Diff, Failure, GroupKind, Plan, Refusal, RevertReview, RowKey, Side,
-        Snapshot,
-    },
-    Daemon, DaemonError,
+    sync::{self, Diff, Failure, GroupKind, Pass, Plan, RevertReview, RowKey, Snapshot, Written},
+    Daemon,
 };
 
 use crate::{
@@ -57,9 +55,9 @@ pub(crate) struct Outcome {
 
 /// How a run went.
 pub(crate) enum Ran {
-    /// The target refused its guarded rows, or couldn't be read for a
-    /// revert: nothing was written.
-    Refused(Refusal),
+    /// The target couldn't be read for a revert, in the daemon's words:
+    /// nothing was written.
+    Unread(String),
     Written {
         /// How many rows landed whole, of how many it wrote.
         landed: usize,
@@ -68,6 +66,9 @@ pub(crate) enum Ran {
         failed: Vec<Failure>,
         /// The landed rows that apply once the target's rho restarts.
         restart: Vec<String>,
+        /// The target changed since it was read, so the run stopped there:
+        /// what landed before stays, and nothing after it was written.
+        stale: bool,
     },
 }
 
@@ -111,7 +112,7 @@ enum Checks {
     /// After a run wrote: what still differs, left unchecked, under its
     /// outcome.
     AfterRun,
-    /// After a run the target refused: the user's checks of the rows still
+    /// After a run stopped as stale: the user's checks of the rows still
     /// listed, `checked` of those it `listed`; a new row starts as it
     /// would.
     Kept {
@@ -120,9 +121,15 @@ enum Checks {
     },
 }
 
+/// What a run writes: a plan, or what is left of one failed row.
+enum Job {
+    Plan(Plan),
+    Retry(Box<Failure>),
+}
+
 /// A run under way: which way it writes, to which machine, the row it
-/// retries, and the target's snapshot from before it, which a refusal
-/// leaves as it was.
+/// retries, and the target's snapshot from before it, which a sync that
+/// lands nothing leaves as it was.
 struct Run {
     kind: RunKind,
     target: MachineId,
@@ -324,8 +331,8 @@ impl SettingsSync {
         let pair = (self.from.clone(), to);
         self.read_task = cx.spawn(async move |this, cx| {
             let (from, to) = futures::join!(
-                read_side(source_label, &source),
-                read_side(target_label, &target)
+                sync::read(source_label, &source),
+                sync::read(target_label, &target)
             );
             let compared = from.and_then(|from| Ok(sync::diff(&from, &to?)));
             let _ = this.update(cx, |this, cx| {
@@ -393,21 +400,18 @@ impl SettingsSync {
         };
         let plan = diff.plan(checked);
         if let (false, Some(to)) = (plan.is_empty(), self.to.clone()) {
-            self.run(RunKind::Sync, to, plan, None, cx);
+            self.run(RunKind::Sync, to, Job::Plan(plan), cx);
         }
     }
 
-    /// Writes `plan` to `target`, then reads the two again. Before a sync
+    /// Writes `job` to `target`, then reads the two again. Before a sync
     /// writes, what it overwrites is saved, in case rho-ui stops as it
     /// writes; once it is done, the snapshot keeps only what landed.
-    fn run(
-        &mut self,
-        kind: RunKind,
-        target: MachineId,
-        plan: Plan,
-        retried: Option<RowKey>,
-        cx: &mut Context<'_, Self>,
-    ) {
+    fn run(&mut self, kind: RunKind, target: MachineId, job: Job, cx: &mut Context<'_, Self>) {
+        let retried = match &job {
+            Job::Retry(failure) => Some(failure.item.key().clone()),
+            Job::Plan(_) => None,
+        };
         let busy = match (&retried, kind) {
             (Some(key), _) => Busy::Retrying(key.clone()),
             (None, RunKind::Sync) => Busy::Syncing,
@@ -417,11 +421,14 @@ impl SettingsSync {
             return;
         };
         let kept = SyncSnapshots::get(&target, cx);
-        if kind == RunKind::Sync && retried.is_none() {
-            SyncSnapshots::set(&target, Some(Snapshot::new(time::now_unix(), &plan)), cx);
+        if let (RunKind::Sync, Job::Plan(plan)) = (kind, &job) {
+            SyncSnapshots::set(&target, Some(Snapshot::new(time::now_unix(), plan)), cx);
         }
         self.revert = None;
-        let total = plan.len();
+        let total = match &job {
+            Job::Plan(plan) => plan.len(),
+            Job::Retry(_) => 1,
+        };
         let run = Run {
             kind,
             target,
@@ -429,14 +436,18 @@ impl SettingsSync {
             kept,
         };
         self.run_task = cx.spawn(async move |this, cx| {
-            let applied = sync::apply(&daemon, plan).await;
+            let written = match job {
+                Job::Plan(plan) => sync::apply(&daemon, plan).await,
+                Job::Retry(failure) => sync::retry(&daemon, &failure).await,
+            };
             let _ = this.update(cx, |this, cx| {
                 this.busy = None;
-                let checks = match &applied {
-                    Applied::Written(_) => Checks::AfterRun,
-                    Applied::Refused(_) => this.kept_checks(),
+                let checks = if written.stale {
+                    this.kept_checks()
+                } else {
+                    Checks::AfterRun
                 };
-                this.ran(run, total, applied, cx);
+                this.ran(run, total, written, cx);
                 this.read(checks, cx);
             });
         });
@@ -455,47 +466,30 @@ impl SettingsSync {
 
     /// Keeps in the snapshot what Revert can still put back, and says what
     /// the run came to; a retry folds into the outcome its row failed in.
-    fn ran(&mut self, run: Run, total: usize, applied: Applied, cx: &mut Context<'_, Self>) {
+    fn ran(&mut self, run: Run, total: usize, written: Written, cx: &mut Context<'_, Self>) {
         let Run {
             kind,
             target,
             retried,
             kept,
         } = run;
-        let now = time::now_unix();
-        let snapshot = match (&applied, kind) {
-            (Applied::Written(written), RunKind::Sync) => {
-                // A fresh sync replaces the last one; a retry adds to it.
-                let mut snapshot = match retried {
-                    None => Snapshot::empty(now),
-                    Some(_) => kept.unwrap_or_else(|| Snapshot::empty(now)),
-                };
-                snapshot.after_sync(written);
-                Some(snapshot)
-            }
-            (Applied::Written(written), RunKind::Revert) => kept.map(|mut snapshot| {
-                snapshot.after_revert(written);
-                snapshot
-            }),
-            (Applied::Refused(_), _) => kept,
+        let pass = match (kind, &retried) {
+            (RunKind::Sync, None) => Pass::Sync,
+            (RunKind::Sync, Some(_)) => Pass::Retry,
+            (RunKind::Revert, _) => Pass::Revert,
         };
-        SyncSnapshots::set(
-            &target,
-            snapshot.filter(|snapshot| !snapshot.is_empty()),
-            cx,
-        );
-        let ran = match applied {
-            Applied::Refused(refusal) => Ran::Refused(refusal),
-            Applied::Written(written) => Ran::Written {
-                landed: written.whole().count(),
-                total,
-                restart: written
-                    .whole()
-                    .filter(|item| item.needs_restart())
-                    .map(|item| item.label().to_owned())
-                    .collect(),
-                failed: written.failed,
-            },
+        let snapshot = Snapshot::after(kept, pass, &written, time::now_unix());
+        SyncSnapshots::set(&target, snapshot, cx);
+        let ran = Ran::Written {
+            landed: written.whole().count(),
+            total,
+            restart: written
+                .whole()
+                .filter(|item| item.needs_restart())
+                .map(|item| item.label().to_owned())
+                .collect(),
+            stale: written.stale,
+            failed: written.failed,
         };
         match (retried, &mut self.outcome, ran) {
             (
@@ -514,10 +508,14 @@ impl SettingsSync {
                     landed: more,
                     failed: still,
                     restart: also,
+                    stale,
                     ..
                 },
             ) => {
-                if let Some(at) = failed.iter().position(|f| *f.item.key() == key) {
+                // A retry the target refused as stale leaves its row to
+                // retry again.
+                if let (false, Some(at)) = (stale, failed.iter().position(|f| *f.item.key() == key))
+                {
                     failed.splice(at..=at, still);
                 }
                 *landed += more;
@@ -543,8 +541,8 @@ impl SettingsSync {
         let Some(failure) = failed.iter().find(|failure| failure.item.key() == key) else {
             return;
         };
-        let (kind, target, plan) = (*kind, target.clone(), Plan::retry(failure));
-        self.run(kind, target, plan, Some(key.clone()), cx);
+        let (kind, target, job) = (*kind, target.clone(), Job::Retry(Box::new(failure.clone())));
+        self.run(kind, target, job, cx);
     }
 
     /// Reverts the target's last sync: at once if the target still holds
@@ -561,7 +559,7 @@ impl SettingsSync {
         };
         let label = self.label(&to, cx);
         self.run_task = cx.spawn(async move |this, cx| {
-            let target = read_side(label, &daemon).await;
+            let target = sync::read(label, &daemon).await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = None;
                 match target {
@@ -569,7 +567,7 @@ impl SettingsSync {
                         let review = sync::review_revert(&snapshot, &target);
                         if review.changed().next().is_none() {
                             let plan = review.plan(&BTreeSet::new());
-                            this.run(RunKind::Revert, to, plan, None, cx);
+                            this.run(RunKind::Revert, to, Job::Plan(plan), cx);
                         } else {
                             this.revert = Some(Revert {
                                 target: to,
@@ -582,7 +580,7 @@ impl SettingsSync {
                         this.outcome = Some(Outcome {
                             kind: RunKind::Revert,
                             target: to,
-                            ran: Ran::Refused(Refusal::Failed(error.to_string())),
+                            ran: Ran::Unread(error.to_string()),
                         });
                     }
                 }
@@ -607,7 +605,7 @@ impl SettingsSync {
             return;
         };
         let (target, plan) = (revert.target.clone(), revert.review.plan(&revert.anyway));
-        self.run(RunKind::Revert, target, plan, None, cx);
+        self.run(RunKind::Revert, target, Job::Plan(plan), cx);
     }
 
     pub(crate) fn cancel_revert(&mut self, cx: &mut Context<'_, Self>) {
@@ -615,13 +613,6 @@ impl SettingsSync {
             cx.notify();
         }
     }
-}
-
-/// What `daemon`'s machine holds, as a sync reads it.
-async fn read_side(label: String, daemon: &Daemon) -> Result<Side, DaemonError> {
-    let settings = daemon.agent_settings().await?;
-    let plugins = daemon.plugins(None).await?;
-    Ok(Side::new(label, settings, plugins))
 }
 
 /// `at`, in Unix seconds, as a wall-clock time here.

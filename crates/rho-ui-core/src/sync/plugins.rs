@@ -281,6 +281,7 @@ fn row(plugin: &Plugin, there: Option<&Plugin>, action: Action, copy: Copy) -> R
         action,
         one_machine: false,
         restart: false,
+        note: None,
         copy,
     }
 }
@@ -382,42 +383,27 @@ pub(super) fn revert_row(
 ) -> RevertRow {
     let show =
         |copy: Option<&PluginCopy>| copy.map_or_else(|| "Not installed".to_owned(), shown_copy);
-    let (now, state, back) = match found {
-        Found::Other => (
-            "copied from a folder".to_owned(),
-            RevertState::Blocked(
-                "It's a copy of a folder now, which Revert won't replace".to_owned(),
-            ),
-            None,
-        ),
-        Found::Absent | Found::Copy(_) => {
-            let now = match found {
-                Found::Copy(copy) => Some(copy),
-                _ => None,
+    let now = match found {
+        Found::Other => {
+            return RevertRow {
+                key: item.key.clone(),
+                label: item.label.clone(),
+                synced: show(after),
+                now: "copied from a folder".to_owned(),
+                before: show(before),
+                state: RevertState::Blocked(
+                    "It's a copy of a folder now, which Revert won't replace".to_owned(),
+                ),
+                item: None,
             };
-            let state = if now == after {
-                RevertState::Unchanged
-            } else {
-                RevertState::Changed
-            };
-            let back = Planned {
-                change: Change::Plugin {
-                    name: name.to_owned(),
-                    before: now.cloned(),
-                    after: before.cloned(),
-                },
-                ..item.clone()
-            };
-            (show(now), state, Some(back))
         }
+        Found::Copy(copy) => Some(copy),
+        Found::Absent => None,
     };
-    RevertRow {
-        key: item.key.clone(),
-        label: item.label.clone(),
-        synced: show(after),
-        now,
-        before: show(before),
-        state,
-        item: back,
-    }
+    let back = Change::Plugin {
+        name: name.to_owned(),
+        before: now.cloned(),
+        after: before.cloned(),
+    };
+    RevertRow::of(item, [before, after, now], show, back)
 }

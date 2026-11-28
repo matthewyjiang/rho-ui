@@ -7274,9 +7274,8 @@ dependencies = [
 
 [[package]]
 name = "rho-protocol"
-version = "1.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab838143d422dc103237ed7ee576ec18502cd21fe0ed2c6fd4b303b5f01f2a4f"
+version = "1.7.0"
+source = "git+https://github.com/matthewyjiang/rho?rev=3e0bb3fc3f1f6cc556c805cb59206ffe52b3338c#3e0bb3fc3f1f6cc556c805cb59206ffe52b3338c"
 dependencies = [
  "schemars",
  "serde",

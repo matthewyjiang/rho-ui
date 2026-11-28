@@ -38,10 +38,11 @@ pub use background::{BackgroundId, BackgroundKind, BackgroundStatus, BackgroundW
 pub use completion::{mcp_command, ArgumentAsk, ArgumentValue, Completion, Edit, Mention};
 pub use daemon::{
     Daemon, DaemonError, DaemonEvent, DaemonEvents, DaemonInfo, DaemonStatus, DaemonTarget,
-    Detached, Enablement, Excerpt, ExcerptRole, IfExists, Location, PendingUpgrade, PluginError,
-    PromptKey, PullRequestError, Report, ReportError, ReportedWorktree, ResourceAttachment,
-    RestartCost, SearchHit, SearchPage, SessionId, SessionMark, SessionSummary, SurfaceActionError,
-    Unsteered, VersionFix, VersionMismatch, LEAD_AGENT, MAX_RESOURCE_TEXT_BYTES,
+    Detached, Enablement, Excerpt, ExcerptRole, HooksFileRead, IfExists, Location, PendingUpgrade,
+    PluginError, PromptKey, PullRequestError, Report, ReportError, ReportedWorktree,
+    ResourceAttachment, RestartCost, SearchHit, SearchPage, SessionId, SessionMark, SessionSummary,
+    SurfaceActionError, TableRead, Unsteered, VersionFix, VersionMismatch, LEAD_AGENT,
+    MAX_RESOURCE_TEXT_BYTES,
 };
 pub use input::{
     Answer, ChoiceKind, Form, InputChoice, InputId, InputRequest, Question, QuestionChoice,
@@ -94,6 +95,9 @@ pub use rho_protocol::{
     PullRequestThreadState, PullRequestTrouble, PullRequestVerdict, SessionPullRequestLinkResponse,
     SessionPullRequestShowResponse, SessionPullRequests,
 };
+/// The tables of `config.toml` [`Daemon::config_table`] reads and
+/// [`Daemon::set_config_table`] writes, as rho-protocol has them.
+pub use rho_protocol::{ConfigTable, TableChange, TableEntry};
 /// What the daemon's configuration sets up, as
 /// [`Daemon::configured_mcp_servers`] and [`Daemon::configured_hooks`] list
 /// it, as rho-protocol has it.

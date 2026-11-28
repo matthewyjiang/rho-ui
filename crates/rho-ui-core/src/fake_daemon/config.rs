@@ -33,6 +33,8 @@ fn spec(
         help: help.to_owned(),
         applies,
         overridable_per_project: true,
+        per_machine: key == "tools.shell",
+        read_only: false,
     }
 }
 
