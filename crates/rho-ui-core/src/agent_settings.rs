@@ -57,6 +57,14 @@ pub enum ListedModels {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSettingsChanged(pub(crate) Changed);
 
+impl AgentSettingsChanged {
+    /// Whether it moved only the settings' revision, no value: a change to
+    /// a key the values don't carry, such as an agent model's auth profile.
+    pub fn moves_no_value(&self) -> bool {
+        matches!(&self.0, Changed::Config(changed) if changed.values.is_empty())
+    }
+}
+
 /// What an [`AgentSettingsChanged`] changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Changed {

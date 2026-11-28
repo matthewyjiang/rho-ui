@@ -1,7 +1,7 @@
 //! The fake daemon's sign-ins: two auth profiles, [`KEY_AUTH`], which
 //! every session runs on, and [`LOGIN_AUTH`], and the credential store.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use rho_protocol::{
     login_relay, AuthKeyParams, AuthKeyResponse, AuthKind, AuthLoginCancelParams,
@@ -32,13 +32,28 @@ pub const LOGIN_URL: &str = "https://fake.example/login";
 /// The code a device-code login's prompt asks for.
 pub const LOGIN_CODE: &str = "FAKE-CODE";
 
+/// The key [`KEY_AUTH`] has saved when it starts signed in.
+pub const SAVED_KEY: &str = "fake-key-0";
+
 /// The fake's credentials, and the login under way, if any.
 #[derive(Debug)]
 pub(super) struct FakeAuth {
-    signed_in: BTreeSet<&'static str>,
+    /// The profiles signed in, by ID, each with what signs it in.
+    credentials: BTreeMap<String, Credential>,
     store: CredentialStoreStatus,
     login: Option<Login>,
     logins: u64,
+}
+
+/// What signs a profile in.
+#[derive(Debug)]
+enum Credential {
+    /// An API key saved in the credential store.
+    Key(String),
+    /// An API key in the daemon's environment, which isn't saved.
+    FromEnv,
+    /// An interactive login's tokens.
+    Login,
 }
 
 #[derive(Debug)]
@@ -62,8 +77,8 @@ impl FakeAuth {
             unreachable: None,
         };
         Self {
-            signed_in: (!script.signed_out)
-                .then_some(KEY_AUTH)
+            credentials: (!script.signed_out)
+                .then(|| (KEY_AUTH.to_owned(), Credential::Key(SAVED_KEY.to_owned())))
                 .into_iter()
                 .collect(),
             store,
@@ -73,7 +88,51 @@ impl FakeAuth {
     }
 
     pub(super) fn is_signed_in(&self, auth: &str) -> bool {
-        self.signed_in.contains(auth)
+        self.credentials.contains_key(auth)
+    }
+
+    /// The kind of profile `auth`, if the daemon has it.
+    pub(super) fn kind(auth: &str) -> Option<AuthKind> {
+        PROFILES
+            .iter()
+            .find(|&&(id, _, _)| id == auth)
+            .map(|&(_, _, kind)| kind)
+    }
+
+    /// The API key saved for `auth`: none for a key from the environment
+    /// or a login.
+    pub(super) fn saved_key(&self, auth: &str) -> Option<&str> {
+        match self.credentials.get(auth)? {
+            Credential::Key(key) => Some(key.as_str()),
+            Credential::FromEnv | Credential::Login => None,
+        }
+    }
+
+    /// Saves `key` for `auth`, signing it in, or with `None` deletes its
+    /// credential, signing it out. Nothing checks the key.
+    pub(super) fn set_key(&mut self, auth: &str, key: Option<String>) {
+        match key {
+            Some(key) => {
+                self.credentials
+                    .insert(auth.to_owned(), Credential::Key(key));
+            }
+            None => {
+                self.credentials.remove(auth);
+            }
+        }
+    }
+
+    /// `auth`'s key comes from the daemon's environment from now on: it
+    /// is signed in, with no key saved.
+    pub(super) fn key_from_env(&mut self, auth: &str) {
+        self.credentials
+            .insert(auth.to_owned(), Credential::FromEnv);
+    }
+
+    /// Signs [`LOGIN_AUTH`] in, as a finished login does.
+    pub(super) fn sign_in_login(&mut self) {
+        self.credentials
+            .insert(LOGIN_AUTH.to_owned(), Credential::Login);
     }
 
     pub(super) fn store(&self) -> CredentialStoreStatus {
@@ -120,7 +179,7 @@ impl FakeAuth {
             reason: UncheckedReason::Unreachable,
             message: "HTTP 404".to_owned(),
         });
-        self.signed_in.insert(auth);
+        self.set_key(auth, Some(params.key.trim().to_owned()));
         Ok(AuthKeyResponse {
             unchecked,
             ..AuthKeyResponse::default()
@@ -128,7 +187,7 @@ impl FakeAuth {
     }
 
     pub(super) fn logout(&mut self, params: &AuthLogoutParams) -> AuthLogoutResponse {
-        self.signed_in.remove(params.auth.as_str());
+        self.credentials.remove(params.auth.as_str());
         AuthLogoutResponse {}
     }
 
@@ -181,7 +240,8 @@ impl FakeAuth {
     /// in, and the login succeeds.
     pub(super) fn approve(&mut self) {
         let login = self.login.take().expect("a login under way");
-        self.signed_in.insert(login.auth);
+        self.credentials
+            .insert(login.auth.to_owned(), Credential::Login);
         login.relay.finish(LoginOutcome::Succeeded);
     }
 

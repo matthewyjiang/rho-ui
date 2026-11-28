@@ -19,29 +19,34 @@ use rho_protocol::{
     AuthKeyParams, AuthKeyResponse, AuthListParams, AuthListResponse, AuthLoginCancelParams,
     AuthLoginCancelResponse, AuthLoginParams, AuthLoginResponse, AuthLogoutParams,
     AuthLogoutResponse, BackgroundStatus, BuildId, CardTone, ClientInfo, ConfigGetParams,
-    ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigWatch, ContentBlock, DaemonStatus,
-    DetachReason, DetailedSessionSummary, ErrorCode, HooksListParams, HooksListResponse,
-    InputAnswer, InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream,
-    McpListParams, McpListResponse, ModelListParams, ModelWatch, Operation, PermissionMode,
-    PlanApprovalAsk, PluginsInstallParams, PluginsInstallResponse, PluginsListParams,
-    PluginsListResponse, PluginsRemoveParams, PluginsRemoveResponse, PluginsSetEnabledParams,
-    PluginsSetEnabledResponse, PluginsUpdateParams, PluginsUpdateResponse, ProtocolVersion,
-    QuestionAsk, RestartCost, RpcError, Service, SessionAnswerParams, SessionAnswerResponse,
-    SessionAttachParams, SessionAttachResponse, SessionBackgroundStopParams,
-    SessionBackgroundStopResponse, SessionCancelParams, SessionCancelResponse, SessionChange,
-    SessionEvent, SessionForkParams, SessionForkResponse, SessionHoldParams, SessionHoldResponse,
-    SessionListDetailedResponse, SessionMarkParams, SessionMarkResponse, SessionMcpCatalog,
-    SessionMcpCatalogParams, SessionMcpCompleteParams, SessionMcpCompleteResponse,
-    SessionMcpInventory, SessionMcpParams, SessionMcpResourceParams, SessionMcpResourceResponse,
-    SessionNewParams, SessionNewResponse, SessionProcessesParams, SessionProcessesResponse,
-    SessionPromptParams, SessionPromptResponse, SessionPullRequestLinkParams,
-    SessionPullRequestLinkResponse, SessionPullRequestListParams, SessionPullRequestListResponse,
-    SessionPullRequestShowParams, SessionPullRequestShowResponse, SessionPullRequestUnlinkParams,
-    SessionPullRequestUnlinkResponse, SessionSearchParams, SessionSearchResponse,
-    SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
-    SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription, ToolKind,
-    ToolStatus, TurnOutcome, UnsteerOutcome, WorktreePruneParams, WorktreePruneResponse,
-    WorktreeVerdict, PROTOCOL_VERSION,
+    ConfigSchema, ConfigSetParams, ConfigSetResponse, ConfigTableGetParams, ConfigTableGetResponse,
+    ConfigTableSetParams, ConfigTableSetResponse, ConfigWatch, ContentBlock, DaemonStatus,
+    DetachReason, DetailedSessionSummary, ErrorCode, HooksFileGetParams, HooksFileGetResponse,
+    HooksFileSetParams, HooksFileSetResponse, HooksListParams, HooksListResponse, InputAnswer,
+    InputAsker, InputRequest, InputRequestId, InputTimeout, LoginStream, McpConfigGetParams,
+    McpConfigGetResponse, McpConfigSetParams, McpConfigSetResponse, McpListParams, McpListResponse,
+    ModelListParams, ModelWatch, Operation, PermissionMode, PlanApprovalAsk, PluginsInstallParams,
+    PluginsInstallResponse, PluginsListParams, PluginsListResponse, PluginsRemoveParams,
+    PluginsRemoveResponse, PluginsSetEnabledParams, PluginsSetEnabledResponse, PluginsUpdateParams,
+    PluginsUpdateResponse, ProtocolVersion, QuestionAsk, RestartCost, RpcError, Service,
+    SessionAnswerParams, SessionAnswerResponse, SessionAttachParams, SessionAttachResponse,
+    SessionBackgroundStopParams, SessionBackgroundStopResponse, SessionCancelParams,
+    SessionCancelResponse, SessionChange, SessionEvent, SessionForkParams, SessionForkResponse,
+    SessionHoldParams, SessionHoldResponse, SessionListDetailedResponse, SessionMarkParams,
+    SessionMarkResponse, SessionMcpCatalog, SessionMcpCatalogParams, SessionMcpCompleteParams,
+    SessionMcpCompleteResponse, SessionMcpInventory, SessionMcpParams, SessionMcpResourceParams,
+    SessionMcpResourceResponse, SessionNewParams, SessionNewResponse, SessionProcessesParams,
+    SessionProcessesResponse, SessionPromptParams, SessionPromptResponse,
+    SessionPullRequestLinkParams, SessionPullRequestLinkResponse, SessionPullRequestListParams,
+    SessionPullRequestListResponse, SessionPullRequestShowParams, SessionPullRequestShowResponse,
+    SessionPullRequestUnlinkParams, SessionPullRequestUnlinkResponse, SessionSearchParams,
+    SessionSearchResponse, SessionSteerParams, SessionSteerResponse, SessionSurfaceActionParams,
+    SessionSurfaceActionResponse, SessionWorktree, SettingsService, SignIn, Subscription,
+    SyncCompareParams, SyncCompareResponse, SyncDiscardParams, SyncDiscardResponse,
+    SyncExportParams, SyncExportResponse, SyncImportKeysParams, SyncImportKeysResponse,
+    SyncRecipientParams, SyncRecipientResponse, SyncRevertParams, SyncRevertResponse,
+    SyncStatusParams, SyncStatusResponse, ToolKind, ToolStatus, TurnOutcome, UnsteerOutcome,
+    WorktreePruneParams, WorktreePruneResponse, WorktreeVerdict, PROTOCOL_VERSION,
 };
 
 use super::{
@@ -1362,6 +1367,36 @@ impl SettingsService for Fake {
         self.lock().config.set(params)
     }
 
+    async fn get_config_table(
+        &self,
+        params: ConfigTableGetParams,
+    ) -> Result<ConfigTableGetResponse, RpcError> {
+        Ok(self.lock().config_files.get_table(params.table))
+    }
+
+    async fn set_config_table(
+        &self,
+        params: ConfigTableSetParams,
+    ) -> Result<ConfigTableSetResponse, RpcError> {
+        let revision = self.lock().config_files.set_table(params)?;
+        Ok(ConfigTableSetResponse::new(revision))
+    }
+
+    async fn read_hooks_file(
+        &self,
+        _: HooksFileGetParams,
+    ) -> Result<HooksFileGetResponse, RpcError> {
+        Ok(self.lock().config_files.get_hooks())
+    }
+
+    async fn write_hooks_file(
+        &self,
+        params: HooksFileSetParams,
+    ) -> Result<HooksFileSetResponse, RpcError> {
+        let revision = self.lock().config_files.set_hooks(params)?;
+        Ok(HooksFileSetResponse::new(revision))
+    }
+
     async fn list_models(&self, _: ModelListParams) -> Result<ModelWatch, RpcError> {
         Ok(ModelWatch::new(self.lock().models.subscribe()))
     }
@@ -1413,5 +1448,69 @@ impl SettingsService for Fake {
         params: PluginsRemoveParams,
     ) -> Result<PluginsRemoveResponse, RpcError> {
         self.lock().plugins_remove(&params)
+    }
+
+    async fn sync_recipient(
+        &self,
+        _: SyncRecipientParams,
+    ) -> Result<SyncRecipientResponse, RpcError> {
+        Ok(SyncRecipientResponse::new(self.lock().secrets.recipient()))
+    }
+
+    async fn sync_export(&self, params: SyncExportParams) -> Result<SyncExportResponse, RpcError> {
+        let state = self.lock();
+        state.secrets.export(&state.auth, params)
+    }
+
+    async fn sync_compare(
+        &self,
+        params: SyncCompareParams,
+    ) -> Result<SyncCompareResponse, RpcError> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        state.secrets.compare(&state.auth, &params.sealed)
+    }
+
+    async fn sync_import_keys(
+        &self,
+        params: SyncImportKeysParams,
+    ) -> Result<SyncImportKeysResponse, RpcError> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        state.secrets.import_keys(&mut state.auth, &params)
+    }
+
+    async fn sync_status(&self, params: SyncStatusParams) -> Result<SyncStatusResponse, RpcError> {
+        let state = self.lock();
+        state.secrets.status(&state.auth, &params.sync)
+    }
+
+    async fn sync_revert(&self, params: SyncRevertParams) -> Result<SyncRevertResponse, RpcError> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        state.secrets.revert(&mut state.auth, params)
+    }
+
+    async fn sync_discard(
+        &self,
+        params: SyncDiscardParams,
+    ) -> Result<SyncDiscardResponse, RpcError> {
+        self.lock().secrets.discard(&params.sync)?;
+        Ok(SyncDiscardResponse::default())
+    }
+
+    async fn mcp_config_get(
+        &self,
+        _: McpConfigGetParams,
+    ) -> Result<McpConfigGetResponse, RpcError> {
+        Ok(self.lock().secrets.mcp_config())
+    }
+
+    async fn mcp_config_set(
+        &self,
+        params: McpConfigSetParams,
+    ) -> Result<McpConfigSetResponse, RpcError> {
+        let revision = self.lock().secrets.set_mcp(params)?;
+        Ok(McpConfigSetResponse::new(revision))
     }
 }

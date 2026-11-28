@@ -1,7 +1,10 @@
-//! Settings → Machines → Sync: copying rho's settings and plugins from
-//! this machine to another, and reverting it (`settings_sync.rs`).
+//! Settings → Machines → Sync: copying rho's settings, tables, sign-ins,
+//! MCP servers, hooks file and plugins from this machine to another, and
+//! reverting it (`settings_sync.rs`).
 
-use rho_ui_core::{agent_settings::SettingValue, PluginInstallSource};
+use rho_ui_core::fake_daemon::{KEY_AUTH, LOGIN_AUTH, SAVED_KEY};
+use rho_ui_core::{agent_settings::SettingValue, ConfigTable, McpSecretKind, PluginInstallSource};
+use serde_json::json;
 
 use super::configured::{scroll_page, End};
 use super::*;
@@ -9,9 +12,9 @@ use super::*;
 /// How far one step of [`shown`] scrolls the page.
 const STEP: f32 = 80.;
 
-/// The most steps [`shown`] takes: twice the 14 the deepest row here,
-/// Revert's button under its review, measured at.
-const STEPS: usize = 30;
+/// The most steps [`shown`] takes: twice the 22 the deepest element here,
+/// the Sync button under every group, measured at.
+const STEPS: usize = 44;
 
 /// Room under the dialog's top for the page title.
 const TITLE_ROOM: f32 = 60.;
@@ -74,6 +77,15 @@ fn checked(ui: &mut Harness, id: &str) -> Option<bool> {
         .expect("window is open")
 }
 
+/// Waits until a run is done: Revert is disabled while anything writes.
+fn wait_written(ui: &mut Harness) {
+    ui.wait_until("the run done", |window, _, _| {
+        window
+            .try_find("sync-revert")
+            .is_some_and(|revert| revert.disabled() != Some(true))
+    });
+}
+
 fn text(value: &str) -> SettingValue {
     SettingValue::Text(value.to_owned())
 }
@@ -83,29 +95,20 @@ fn has_plugin(fake: &FakeDaemon, name: &str) -> bool {
     fake.plugins(None).iter().any(|plugin| plugin.name == name)
 }
 
-/// A sync writes the checked rows to the other machine: a plugin from a
-/// folder can't be copied, an install that fails keeps Retry, and a
-/// setting that applies on restart offers one. Revert then holds back the
-/// row the target changed since, and puts back the rest.
-#[test]
-fn a_sync_copies_to_another_machine_and_reverts() {
-    let local = FakeDaemon::start(Script::default());
+/// The app on `local`, with the machine `box` on a fresh fake daemon,
+/// which it gives too. `box` lacks `local`'s plugins `deploy` and
+/// `review`; `deploy`'s host is out of reach, so it can't install there.
+fn open_with_remote(local: FakeDaemon) -> (Harness, FakeDaemon) {
     let remote = FakeDaemon::start(Script::default());
     let DaemonTarget::Socket(remote_socket) = remote.target() else {
         panic!("a fake daemon listens on a socket");
     };
-    local.edit_agent_setting("general.permission_mode", text("plan"));
-    local.edit_agent_setting("tools.shell", text("zsh"));
-    local.install_plugin(PluginInstallSource::Path {
-        path: PathBuf::from("/home/me/kit"),
-    });
-    // `deploy`'s host is out of reach, so it can't install there.
     remote.remove_plugin("deploy");
     remote.remove_plugin("review");
     let mut settings = Settings::default();
     settings.machines = vec![RemoteMachine::new("box")];
     settings.smooth_scroll = SmoothScroll::Off;
-    let mut ui = Harness::open_with(
+    let ui = Harness::open_with(
         "sync",
         local.target(),
         Some(local),
@@ -115,6 +118,41 @@ fn a_sync_copies_to_another_machine_and_reverts() {
             ..Machines::default()
         },
     );
+    (ui, remote)
+}
+
+/// This machine, with settings, models, a provider profile, an API key,
+/// an MCP server, a hooks file and a plugin from a folder to copy.
+fn local_to_copy() -> FakeDaemon {
+    let local = FakeDaemon::start(Script::default());
+    local.set_api_key(KEY_AUTH, Some("laptop-key"));
+    let docs = json!({"command": "docs-mcp"});
+    local.edit_mcp_server("docs", Some((docs, &[(McpSecretKind::Env, "TOKEN", "t1")])));
+    local.edit_agent_setting("general.permission_mode", text("plan"));
+    local.edit_agent_setting("tools.shell", text("zsh"));
+    let profile = json!({"base_url": "https://acme.test/v1", "api": "responses"});
+    local.edit_config_table(ConfigTable::Providers, "acme", Some(profile));
+    local.edit_config_table(ConfigTable::ModelAliases, "fast", Some(json!("acme/big")));
+    local.edit_config_table(ConfigTable::FavoriteModels, "acme/big", Some(json!(null)));
+    let hooks = "[[hook]]\nevent = \"session_end\"\nprogram = \"notify-send\"\n";
+    local.edit_hooks_file(Some(hooks));
+    local.install_plugin(PluginInstallSource::Path {
+        path: PathBuf::from("/home/me/kit"),
+    });
+    local
+}
+
+/// A sync writes the checked rows to the other machine: a setting that
+/// belongs to one machine starts unchecked, a plugin from a folder can't
+/// be copied, a target changed since the read stops it part way with the
+/// user's checks kept, and the next sync joins it even after a Re-read, and
+/// a revision moved with no value since doesn't stop it; an
+/// install that fails keeps Retry, and a setting that applies on restart
+/// offers one. Revert then holds back the row the target changed since,
+/// and puts back the rest, both passes' rows.
+#[test]
+fn a_sync_copies_to_another_machine_and_reverts() {
+    let (mut ui, remote) = open_with_remote(local_to_copy());
     open_settings(&mut ui);
     open_settings_page(&mut ui, "Machines");
     let rows = [
@@ -123,22 +161,68 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         "sync-row-plugins-deploy",
         "sync-row-plugins-review",
         "sync-row-plugins-kit",
+        "sync-row-models-alias:fast",
+        "sync-row-models-favorite:acme/big",
+        "sync-row-providers-acme",
+        "sync-row-sign-ins-fake-api-key",
+        "sync-row-mcp-docs",
+        "sync-row-hooks-file",
     ];
     let starts = rows.map(|id| checked(&mut ui, id));
-    // The folder plugin has no checkbox.
+    // The shell belongs to one machine; the folder plugin has no checkbox.
+    let one = Some(true);
     assert_eq!(
         starts,
-        [Some(true), Some(true), Some(true), Some(true), None]
+        [
+            one,
+            Some(false),
+            one,
+            one,
+            None,
+            one,
+            one,
+            one,
+            one,
+            one,
+            one
+        ]
     );
+    click_revealed(&mut ui, "sync-row-settings-tools.shell");
     reveal(&mut ui, "sync-submit");
     ui.shot("review");
 
+    // The target's settings change after the read: the tables land, and
+    // the sync stops at the settings.
+    remote.edit_agent_setting("general.auto_compact", SettingValue::Bool(false));
+    click_revealed(&mut ui, "sync-submit");
+    wait_written(&mut ui);
+    assert_eq!(
+        checked(&mut ui, "sync-row-settings-tools.shell"),
+        Some(true),
+        "the user's checks stay"
+    );
+    assert!(remote
+        .config_table_entry(ConfigTable::Providers, "acme")
+        .is_some());
+    assert_eq!(remote.agent_setting("tools.shell"), Some(text("bash")));
+    reveal(&mut ui, "sync-group-settings");
+    ui.shot("stopped");
+
+    click_revealed(&mut ui, "sync-reread");
+    assert_eq!(
+        checked(&mut ui, "sync-row-settings-tools.shell"),
+        Some(false)
+    );
+    click_revealed(&mut ui, "sync-row-settings-tools.shell");
+    // A change box's values don't carry, such as a model's auth profile,
+    // moves its revision: the page reads again, so the sync isn't stale.
+    let reads = remote.agent_settings_reads();
+    remote.move_agent_settings_revision();
+    ui.wait_until("box read again", |_, _, _| {
+        remote.agent_settings_reads() > reads
+    });
     click_revealed(&mut ui, "sync-submit");
     reveal(&mut ui, "sync-retry-plugins-deploy");
-    assert_eq!(
-        remote.agent_setting("general.permission_mode"),
-        Some(text("plan"))
-    );
     assert_eq!(remote.agent_setting("tools.shell"), Some(text("zsh")));
     assert!(has_plugin(&remote, "review") && !has_plugin(&remote, "deploy"));
     reveal(&mut ui, "sync-restart");
@@ -146,12 +230,7 @@ fn a_sync_copies_to_another_machine_and_reverts() {
 
     // Retry runs alone, and fails the same row again.
     click_revealed(&mut ui, "sync-retry-plugins-deploy");
-    // Revert is disabled while anything writes.
-    ui.wait_until("the retry done", |window, _, _| {
-        window
-            .try_find("sync-revert")
-            .is_some_and(|revert| revert.disabled() != Some(true))
-    });
+    wait_written(&mut ui);
     reveal(&mut ui, "sync-retry-plugins-deploy");
     assert!(!has_plugin(&remote, "deploy"));
 
@@ -168,8 +247,34 @@ fn a_sync_copies_to_another_machine_and_reverts() {
         remote.agent_setting("tools.shell") == Some(text("bash")) && !has_plugin(&remote, "review")
     });
     assert_eq!(
+        remote.config_table_entry(ConfigTable::Providers, "acme"),
+        None,
+        "the stopped pass's rows revert too"
+    );
+    assert_eq!(
         remote.agent_setting("general.permission_mode"),
         Some(text("supervised")),
         "the newer change stays"
     );
+    // What the sync replaced of the secrets comes back from box's journal.
+    assert_eq!(remote.api_key(KEY_AUTH).as_deref(), Some(SAVED_KEY));
+    assert_eq!(remote.mcp_server("docs"), None);
+}
+
+/// A login isn't copied: its row signs the target in, inline, and says so
+/// once the provider approves it.
+#[test]
+fn a_login_row_signs_the_target_in() {
+    let local = FakeDaemon::start(Script::default());
+    local.sign_in_login();
+    let (mut ui, remote) = open_with_remote(local);
+    open_settings(&mut ui);
+    open_settings_page(&mut ui, "Machines");
+    click_revealed(&mut ui, "sync-sign-in-sign-ins-fake-login-login");
+    reveal(&mut ui, "sync-sign-in-sign-ins-fake-login-cancel");
+    ui.shot("sign-in");
+
+    remote.approve_login();
+    reveal(&mut ui, "sync-sign-in-sign-ins-fake-login");
+    assert!(remote.signed_in(LOGIN_AUTH));
 }
